@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multi-Calendar Best Practices — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Multi-Calendar Best Practices</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-06</span></div>
+    <h1>Multi-Calendar Best Practices</h1>
+<h2>What this covers</h2>
+<p>This article collects planning, naming, and operational guidelines for models that use more than one calendar type. Following these practices avoids the most common multi-calendar mistakes: ambiguous joins, runaway aggregate counts, and NULL period values from insufficient date coverage.</p>
+<h2>Planning</h2>
+<p>Decide which calendar types you need before creating hierarchies. Questions to answer:</p>
+<ol><li><strong>Who consumes the reports?</strong> Finance uses fiscal, retail ops uses 4-4-5, logistics uses ISO weeks, legal may need Hijri or Thai Buddhist. Map each audience to a calendar type.</li><li><strong>How many date columns does your fact table have?</strong> Each date column that needs time-intelligence variants needs a time hierarchy with the appropriate calendar type. Two date columns using the same calendar type need separate hierarchies.</li><li><strong>Do you need cross-calendar comparison?</strong> Comparing fiscal YTD to standard YTD on the same measure requires two hierarchies with different calendar types linked to the same base measure — this creates two variant measures (e.g. <code>revenue_ytd</code> and <code>revenue_ytd_fiscal</code>).</li><li><strong>Do you need a physical calendar table?</strong> For standard, fiscal, ISO, and Hijri calendars, the hierarchy&#x27;s calendar type is sufficient — period boundaries are computed from SQL expressions. Calendar tables are needed for retail 4-4-5 (irregular period patterns), dense date enumeration, or custom period definitions.</li></ol>
+<h2>Naming conventions</h2>
+<div class="table-wrapper"><table><thead><tr><th>Object</th><th>Pattern</th><th>Example</th></tr></thead><tbody><tr><td>Calendar table</td><td><code>calendar_&lt;type&gt;</code></td><td><code>calendar_fiscal</code>, <code>calendar_445</code></td></tr><tr><td>Dimension alias</td><td><code>&lt;fact_column&gt;_&lt;type&gt;</code></td><td><code>order_date_fiscal</code></td></tr><tr><td>Hierarchy</td><td><code>&lt;type&gt; Calendar</code></td><td><code>Fiscal Calendar</code>, <code>ISO Week Calendar</code></td></tr><tr><td>Time variant</td><td><code>&lt;base&gt;_&lt;variant&gt;</code> (auto)</td><td><code>revenue_ytd</code>, <code>revenue_ytd_fiscal</code></td></tr></tbody></table></div>
+<p>Consistent naming across the model makes it immediately clear which calendar system any given object belongs to.</p>
+<h2>One calendar per date column</h2>
+<p>Do not reuse the same calendar alias for two different date columns. The query router resolves the join path from the dimension&#x27;s associated calendar. If two dimensions share an alias, the router cannot determine which join to use, and the query may silently produce wrong results or fail.</p>
+<p>If two date columns need the same calendar type, create separate aliases:</p>
+<ul><li><code>order_date</code> → alias <code>order_date_standard</code></li><li><code>ship_date</code> → alias <code>ship_date_standard</code></li></ul>
+<h2>Calendar coverage</h2>
+<p>The calendar table must cover your entire fact data range plus headroom:</p>
+<ul><li><strong>Past:</strong> At least as far back as your oldest fact row. If your data starts in 2018, the calendar must start no later than 2018-01-01.</li><li><strong>Future:</strong> At least 3 years ahead. Users running YTD or rolling-12-month variants need future dates in the calendar to avoid NULL boundaries.</li><li><strong>Check coverage periodically.</strong> If your fact data grows beyond the calendar range, new dates silently lose time-intelligence capability.</li></ul>
+<h2>Aggregate routing impact</h2>
+<p>Each distinct calendar type × grain combination creates a different query pattern. The aggregate matcher and predictive aggregate builder treat <code>(revenue, standard_hierarchy.year)</code> and <code>(revenue, fiscal_hierarchy.fiscal_year)</code> as separate grains. This means:</p>
+<ul><li>More calendar types → more distinct query patterns → more aggregates needed for full coverage.</li><li>The predictive builder accounts for this — it scores by ROI, not by raw count — but storage budgets may need to increase.</li><li>If a calendar type is rarely queried, the aggregate for it may never pass the ROI threshold and those queries will always route to source.</li><li>Expression-based variants (those without a calendar table) are not materialised in pre-aggregates — they always rewrite over the base measure at query time. This reduces aggregate storage but means these variants do not benefit from pre-aggregation.</li></ul>
+<h2>When NOT to use multiple calendar types</h2>
+<p>If all your reporting is standard Gregorian, one time hierarchy with calendar type <code>standard</code> is sufficient. Signs that you don&#x27;t need a second calendar type:</p>
+<ul><li>Nobody asks for fiscal, retail, or non-Gregorian dates.</li><li>Your company&#x27;s fiscal year starts in January (standard and fiscal are identical).</li><li>You only have one date column per fact table.</li></ul>
+<p>Adding calendar types you don&#x27;t query adds complexity to the variant resolver. If you don&#x27;t need a physical calendar table (retail 4-4-5, dense enumeration), don&#x27;t create one — set the calendar type directly on the hierarchy.</p>
+<h2>Common mistakes</h2>
+<div class="table-wrapper"><table><thead><tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr></thead><tbody><tr><td>Two standard calendars on one source</td><td>Ambiguous dropdown in dimension dialog</td><td>Unbind the duplicate</td></tr><tr><td>Calendar range too short (when using calendar table)</td><td>YTD returns NULL for recent dates</td><td>Extend the calendar range</td></tr><tr><td>Forgot to bind after manual DDL</td><td>Calendar table exists on source but system doesn&#x27;t know about it</td><td>Bind the existing table</td></tr><tr><td>Mixing calendar types in one pivot</td><td>Nonsensical cross-calendar numbers</td><td>Filter to one calendar type per query</td></tr><tr><td>Aliases not created for shared calendar</td><td>Wrong join path selected</td><td>Create aliases per date column</td></tr><tr><td>No calendar type on hierarchy</td><td>Period-boundary variants show as &quot;not eligible&quot;</td><td>Set a calendar type on the time hierarchy</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="../concepts/calendar-types.html">Calendar Types</a></li><li><a href="configure-calendar-table.html">Configure Calendar Table</a></li><li><a href="associate-calendar-with-dimensions.html">Associate Calendar with Dimensions</a></li><li><a href="configure-time-variants.html">Configure Time Variants</a></li></ul>
+<nav class="page-nav"><a href="associate-calendar-with-dimensions.html" class="page-nav-btn prev">&larr; Associate Calendar with Dimensions</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="measure-query-panel.html" class="page-nav-btn next">Measure Query Panel &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

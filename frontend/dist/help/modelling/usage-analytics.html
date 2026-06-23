@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Usage Analytics — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Usage Analytics</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-15</span></div>
+    <h1>Usage Analytics</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/usage-analytics-tab.png" alt="Live Usage Analytics tab from Model Builder."></figure>
+<h2>What this covers</h2>
+<p>Usage Analytics is a read-only Model Builder tab that shows how a deployed model is being queried. It helps modellers understand adoption, latency, aggregate hit rate, common measures, and query patterns that may deserve new aggregates or pockets.</p>
+<h2>What to look at first</h2>
+<div class="table-wrapper"><table><thead><tr><th>Metric</th><th>What it tells you</th></tr></thead><tbody><tr><td>Query volume</td><td>Whether the model is actively used and when traffic peaks.</td></tr><tr><td>Aggregate hit rate</td><td>How often queries are served from aggregate tables instead of live source scans.</td></tr><tr><td>Average or median latency</td><td>Whether users experience the model as interactive.</td></tr><tr><td>Top measures</td><td>Which business metrics are driving workload.</td></tr><tr><td>Top aggregates</td><td>Which acceleration objects are earning their storage and refresh cost.</td></tr><tr><td>Acceleration rate</td><td>The overall share of query work served from an aggregate or pocket instead of scanning the source. A rising rate means your acceleration objects are doing more of the heavy lifting; a falling one is a prompt to look at what stopped matching.</td></tr><tr><td>Top missed measures</td><td>The measures most often requested by queries that still fell through to the source. Anything already served from an aggregate or pocket is <em>not</em> counted here, so this list points straight at what is worth accelerating next.</td></tr><tr><td>Miss patterns</td><td>Repeated live queries that the optimizer may be able to accelerate.</td></tr></tbody></table></div>
+<h2>How to use the tab</h2>
+<p>Start with the trend, then inspect the detail. A high query volume with a low aggregate hit rate usually means the model is valuable but under-accelerated. A low query volume with many aggregates suggests over-building or a model that has not been adopted. A few top measures dominating traffic should guide aggregate grains and refresh SLAs.</p>
+<p>Usage Analytics is also useful after a deploy. Compare the post-deploy latency and hit-rate movement with the Model Health cold-start section. If a new model version caused more live routing, inspect query misses and aggregate validity.</p>
+<h2>Common decisions</h2>
+<div class="table-wrapper"><table><thead><tr><th>Observation</th><th>Likely action</th></tr></thead><tbody><tr><td>High live-route count on the same grain</td><td>Create or approve an aggregate for that grain.</td></tr><tr><td>Queries repeatedly filter to the same narrow subset</td><td>Consider a pocket table.</td></tr><tr><td>One aggregate has no hits over the evaluation window</td><td>Retire it or let the lifecycle policy remove it.</td></tr><tr><td>A newly deployed model is slower than the previous version</td><td>Check invalid aggregates, changed dimensions, and route badge reasons.</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="configure-aggregates.html">Configure Aggregates</a></li><li><a href="predictive-aggregates.html">Predictive Aggregates</a></li><li><a href="aggregate-lifecycle.html">Aggregate Lifecycle</a></li><li><a href="../querying/live-vs-aggregate.html">Live vs Aggregate</a></li></ul>
+<nav class="page-nav"><a href="use-the-ai-optimiser.html" class="page-nav-btn prev">&larr; Use the AI Optimiser</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="configure-row-security.html" class="page-nav-btn next">Configure Row Security &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

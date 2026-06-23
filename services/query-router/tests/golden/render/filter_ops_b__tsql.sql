@@ -1,0 +1,1 @@
+SELECT [f].[region] AS [region], SUM([f].[amount]) AS [amount] FROM [demo].[sales] AS [f] WHERE [f].[qty] >= 1 AND [f].[qty] < 100 AND NOT [f].[region] IN ('ANTARCTICA') AND [f].[region] LIKE 'E%' AND [f].[region] IS NULL GROUP BY [f].[region]

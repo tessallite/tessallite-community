@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Pixodesk SVG (https://pixodesk.com) -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 440" text-rendering="geometricPrecision" shape-rendering="geometricPrecision">
+  <defs>
+    <marker id="arrow" refX="8" refY="3" markerHeight="6" markerWidth="8" orient="auto">
+      <path fill="#006c35" d="M0,0L8,3L0,6L0,0z"/>
+    </marker>
+  </defs>
+  <text fill="#006c35" text-anchor="middle" font-family="Inter, sans-serif" font-size="14" font-weight="700" xml:space="preserve" x="240" y="24" data-gn-el-type="text" style="white-space:pre"><tspan>Role Hierarchy</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" xml:space="preserve" transform="translate(5, 0)" x="30" y="240" data-gn-el-type="text" style="white-space:pre"><tspan>More access</tspan></text>
+  <path stroke="#cbd5e1" stroke-width="1.5" d="M30,100L30,360"/>
+  <path fill="#6b7280" d="M30,88L25,104L35,104"/>
+  <path stroke="#cbd5e1" stroke-dasharray="3 3" d="M75,124L405,124"/>
+  <path stroke="#cbd5e1" stroke-dasharray="3 3" d="M75,214L405,214"/>
+  <path stroke="#cbd5e1" stroke-dasharray="3 3" d="M75,304L405,304"/>
+  <rect fill="#eff7f3" stroke="#006c35" stroke-width="2" rx="10" ry="0" x="80" y="80" width="320" height="44"/>
+  <text fill="#333333" text-anchor="middle" font-family="Inter, sans-serif" font-size="13" font-weight="600" xml:space="preserve" x="240" y="106" data-gn-el-type="text" style="white-space:pre"><tspan>System Admin</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" xml:space="preserve" x="240" y="142" data-gn-el-type="text" style="white-space:pre"><tspan>Manages the platform installation</tspan></text>
+  <rect fill="#eff7f3" stroke="#006c35" stroke-width="1.5" rx="10" ry="0" x="80" y="170" width="320" height="44"/>
+  <text fill="#333333" text-anchor="middle" font-family="Inter, sans-serif" font-size="13" font-weight="600" xml:space="preserve" x="240" y="196" data-gn-el-type="text" style="white-space:pre"><tspan>Tenant Admin</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" xml:space="preserve" x="240" y="232" data-gn-el-type="text" style="white-space:pre"><tspan>Manages workspace users and settings</tspan></text>
+  <rect fill="#f2f7f4" stroke="#cbd5e1" stroke-width="1.5" rx="10" ry="0" x="80" y="260" width="320" height="44"/>
+  <text fill="#333333" text-anchor="middle" font-family="Inter, sans-serif" font-size="13" font-weight="600" xml:space="preserve" x="240" y="286" data-gn-el-type="text" style="white-space:pre"><tspan>Modeller</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" xml:space="preserve" x="240" y="322" data-gn-el-type="text" style="white-space:pre"><tspan>Builds and maintains models</tspan></text>
+  <rect fill="#f2f7f4" stroke="#cbd5e1" stroke-width="1.5" rx="10" ry="0" x="80" y="350" width="320" height="44"/>
+  <text fill="#333333" text-anchor="middle" font-family="Inter, sans-serif" font-size="13" font-weight="600" xml:space="preserve" x="240" y="376" data-gn-el-type="text" style="white-space:pre"><tspan>Analyst / Viewer</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" xml:space="preserve" x="240" y="412" data-gn-el-type="text" style="white-space:pre"><tspan>Queries data, connects BI tools</tspan></text>
+</svg>

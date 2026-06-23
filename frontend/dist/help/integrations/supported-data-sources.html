@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Supported Data Sources — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Supported Data Sources</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-18</span></div>
+    <h1>Supported Data Sources</h1>
+
+<h2>What this covers</h2>
+<p>Tessallite connects to backend data sources to read raw data and write pre-aggregated summaries. This article lists every supported source, its driver, connection parameters, and permission requirements.</p>
+
+<h2>Summary</h2>
+<div class="table-wrapper"><table><thead><tr><th>Data source</th><th>Identifier quoting</th><th>Driver</th><th>Auth method</th><th>Status</th></tr></thead><tbody>
+<tr><td>PostgreSQL</td><td><code>"double-quote"</code></td><td>asyncpg (bundled)</td><td>Username / password</td><td>GA</td></tr>
+<tr><td>Amazon Redshift</td><td><code>"double-quote"</code></td><td>asyncpg (bundled)</td><td>Username / password</td><td>GA</td></tr>
+<tr><td>BigQuery</td><td><code>`backtick`</code></td><td>google-cloud-bigquery (bundled)</td><td>Service account JSON key</td><td>GA</td></tr>
+<tr><td>Snowflake</td><td><code>"double-quote"</code></td><td>snowflake-connector-python (optional)</td><td>Username / password</td><td>GA</td></tr>
+<tr><td>Hadoop / Spark</td><td><code>`backtick`</code></td><td>pyhive (bundled)</td><td>None, LDAP, or Kerberos</td><td>GA</td></tr>
+<tr><td>SQL Server</td><td><code>[bracket]</code></td><td>aioodbc / pyodbc (optional)</td><td>Username / password</td><td>GA</td></tr>
+</tbody></table></div>
+
+<h2>PostgreSQL</h2>
+<p>Driver bundled. No additional installation required.</p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>
+<tr><td>Host</td><td>Hostname or IP of the PostgreSQL server</td></tr>
+<tr><td>Port</td><td><code>5432</code> (default)</td></tr>
+<tr><td>Database</td><td>PostgreSQL database name</td></tr>
+<tr><td>User</td><td>PostgreSQL user with read access to source schemas</td></tr>
+<tr><td>Password</td><td>PostgreSQL user password</td></tr>
+</tbody></table></div>
+<p><strong>Compatible managed services</strong>: AWS RDS for PostgreSQL, Azure Database for PostgreSQL, Google Cloud SQL for PostgreSQL, Supabase, Neon.</p>
+<p><strong>Permissions required</strong>: <code>USAGE</code> on source schemas, <code>SELECT</code> on source tables. For aggregate writes: <code>CREATE TABLE</code>, <code>INSERT</code>, <code>DROP TABLE</code> on the target schema.</p>
+<p><strong>Default schema</strong>: <code>public</code>.</p>
+
+<h2>Amazon Redshift</h2>
+<p>Uses the same asyncpg driver as PostgreSQL (Redshift is wire-compatible). No additional driver installation required.</p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>
+<tr><td>Host</td><td>Redshift cluster endpoint</td></tr>
+<tr><td>Port</td><td><code>5439</code> (default)</td></tr>
+<tr><td>Database</td><td>Redshift database name</td></tr>
+<tr><td>User</td><td>Redshift user</td></tr>
+<tr><td>Password</td><td>Redshift user password</td></tr>
+</tbody></table></div>
+<p><strong>Permissions required</strong>: <code>SELECT</code> on source tables. For aggregate writes: <code>CREATE TABLE</code>, <code>INSERT</code>, <code>DROP TABLE</code> on the target schema.</p>
+<p><strong>Default schema</strong>: <code>public</code>.</p>
+
+<h2>BigQuery</h2>
+<p>Tessallite connects to BigQuery via the google-cloud-bigquery Python client library. No JDBC JAR is needed for the Tessallite backend; the Simba JDBC driver is only needed if BI tools connect to Tessallite's JDBC gateway.</p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>
+<tr><td>GCP project ID</td><td>Your Google Cloud project ID</td></tr>
+<tr><td>Dataset name</td><td>BigQuery dataset containing source tables</td></tr>
+<tr><td>Service account key</td><td>JSON key content pasted into the credentials field</td></tr>
+</tbody></table></div>
+<p><strong>Permissions required</strong>: Service account must have <code>bigquery.jobs.create</code> and <code>bigquery.tables.getData</code> IAM roles. For aggregate writes, add <code>bigquery.tables.create</code>, <code>bigquery.tables.updateData</code>, and <code>bigquery.tables.delete</code>.</p>
+<p><strong>Query dialect</strong>: Standard SQL.</p>
+
+<h2>Snowflake</h2>
+<p>Requires <code>snowflake-connector-python</code>. Install the optional dependency: <code>pip install tessallite-shared[snowflake]</code>.</p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>
+<tr><td>Account</td><td>Snowflake account identifier (e.g. <code>xy12345.us-east-1.aws</code>)</td></tr>
+<tr><td>Username</td><td>Snowflake user</td></tr>
+<tr><td>Password</td><td>Snowflake user password</td></tr>
+<tr><td>Database</td><td>Snowflake database name</td></tr>
+<tr><td>Schema</td><td>Default schema (default: <code>PUBLIC</code>)</td></tr>
+<tr><td>Warehouse</td><td>Compute warehouse for query execution</td></tr>
+<tr><td>Role</td><td>Session role (optional)</td></tr>
+</tbody></table></div>
+<p><strong>Permissions required</strong>: <code>USAGE</code> on the warehouse and database, <code>SELECT</code> on source tables. For aggregate writes: <code>CREATE TABLE</code>, <code>INSERT</code>, <code>DROP TABLE</code> on the target schema.</p>
+<p><strong>Default schema</strong>: <code>PUBLIC</code>.</p>
+
+<h2>Hadoop / Spark Thrift Server</h2>
+<p>Hive Thrift driver (pyhive) is bundled with Tessallite.</p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>
+<tr><td>Host</td><td>Hostname or IP of the Spark Thrift Server</td></tr>
+<tr><td>Port</td><td><code>10000</code> (default)</td></tr>
+<tr><td>Database</td><td>Hive/Spark database name</td></tr>
+<tr><td>Authentication</td><td><code>NOSASL</code> (default) or <code>LDAP</code></td></tr>
+</tbody></table></div>
+<p><strong>Tested with</strong>: Apache Spark 3.x Thrift Server, Apache Hive 3.x.</p>
+<p><strong>LDAP authentication</strong>: Provide username and password when auth method is set to LDAP.</p>
+<p><strong>Default database</strong>: <code>default</code>.</p>
+
+<h2>SQL Server</h2>
+<p>Requires <code>aioodbc</code> (async wrapper over pyodbc) and an ODBC driver. Install the optional dependency: <code>pip install tessallite-shared[sqlserver]</code>.</p>
+<p>The ODBC driver must also be installed on the Tessallite host. The default is <code>ODBC Driver 17 for SQL Server</code> from Microsoft.</p>
+
+<h3>Installing the ODBC driver</h3>
+<p><strong>Debian / Ubuntu:</strong></p>
+<pre><code>curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -
+curl https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list \
+  &gt; /etc/apt/sources.list.d/mssql-release.list
+apt-get update &amp;&amp; ACCEPT_EULA=Y apt-get install -y msodbcsql17</code></pre>
+<p><strong>Docker</strong>: Add the above to your Dockerfile or use a base image that includes the driver.</p>
+
+<h3>Connection parameters</h3>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>
+<tr><td>Host</td><td>Hostname or IP of the SQL Server instance</td></tr>
+<tr><td>Port</td><td><code>1433</code> (default)</td></tr>
+<tr><td>Database</td><td>SQL Server database name</td></tr>
+<tr><td>Username</td><td>SQL Server login</td></tr>
+<tr><td>Password</td><td>SQL Server login password</td></tr>
+<tr><td>Schema</td><td>Default schema (default: <code>dbo</code>)</td></tr>
+<tr><td>ODBC Driver</td><td>Driver name (default: <code>ODBC Driver 17 for SQL Server</code>)</td></tr>
+<tr><td>Encrypt</td><td>Whether to encrypt the connection (optional)</td></tr>
+<tr><td>Trust Server Certificate</td><td>Accept self-signed certificates (optional, non-production)</td></tr>
+</tbody></table></div>
+<p><strong>Compatible managed services</strong>: Azure SQL Database, Azure SQL Managed Instance, AWS RDS for SQL Server, Google Cloud SQL for SQL Server.</p>
+<p><strong>Permissions required</strong>: <code>SELECT</code> on source tables in the connected database. For aggregate writes: <code>CREATE TABLE</code>, <code>INSERT</code>, <code>DROP TABLE</code>, and <code>ALTER</code> on the target schema.</p>
+<p><strong>Identifier quoting</strong>: SQL Server uses bracket quoting (<code>[schema].[table]</code>). Tessallite handles this automatically through the connector quoting layer.</p>
+<p><strong>Default schema</strong>: <code>dbo</code>.</p>
+
+<h2>Choosing a source type</h2>
+<ul>
+<li><strong>PostgreSQL and Redshift</strong> use the same asyncpg driver. Redshift is identified separately so Tessallite can apply Redshift-specific SQL dialect rules.</li>
+<li><strong>BigQuery</strong> requires a GCP service account. Tessallite communicates via the BigQuery client library, not JDBC.</li>
+<li><strong>Snowflake</strong> and <strong>SQL Server</strong> are optional dependencies. Install them only if you connect to those sources.</li>
+<li><strong>Hadoop/Spark</strong> is for environments running a Hive Thrift Server.</li>
+</ul>
+
+<h2>Related</h2>
+<ul>
+<li><a href="jdbc-connection-guide.html">JDBC Connection Guide</a></li>
+<li><a href="bi-compatibility.html">BI Tool Compatibility Matrix</a></li>
+<li><a href="api-authentication.html">API Authentication</a></li>
+<li><a href="../troubleshooting/aggregates-not-building.html">Aggregates Not Building</a></li>
+<li><a href="../troubleshooting/common-errors.html">Common Errors</a></li>
+</ul>
+
+<nav class="page-nav"><a href="powerbi-connection-guide.html" class="page-nav-btn prev">&larr; Power BI Connection Guide</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="api-authentication.html" class="page-nav-btn next">API Authentication &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

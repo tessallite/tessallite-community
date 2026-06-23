@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Named List Parameterisation — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Named List Parameterisation</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-05-23</span></div>
+    <h1>Named List Parameterisation</h1>
+<h2>What this covers</h2>
+<p>Named lists can be made dynamic by using parameterised expressions — MDX patterns that change their result based on external inputs like the current date, a user-selected slicer value, or a cell reference. This page explains three parameterisation strategies: time-relative expressions, measure-driven filters, and Excel cell references that flow into CUBE formulas.</p>
+<h2>Strategy 1: Time-relative MDX functions</h2>
+<p>MDX provides built-in functions that compute sets relative to a point in time. Because these evaluate at query time, the list stays current without manual updates.</p>
+<h3>Last N periods</h3>
+<p>Return the last 12 months from the current month:</p>
+<pre><code>LastPeriods(12, [Date].[Calendar].[Month].CurrentMember)</code></pre>
+<p>If the date hierarchy has a default member set to the current month, <code>CurrentMember</code> resolves automatically. Otherwise, specify the anchor:</p>
+<pre><code>LastPeriods(12, [Date].[Calendar].[Month].&amp;[202605])</code></pre>
+<h3>Year-to-date</h3>
+<p>Return all months from January to the current month:</p>
+<pre><code>YTD([Date].[Calendar].[Month].CurrentMember)</code></pre>
+<h3>Periods-to-date at a higher grain</h3>
+<p>Return all days in the current quarter:</p>
+<pre><code>PeriodsToDate(
+  [Date].[Calendar].[Quarter],
+  [Date].[Calendar].[Day].CurrentMember
+)</code></pre>
+<h3>Parallel period comparison</h3>
+<p>Return the same month last year:</p>
+<pre><code>ParallelPeriod(
+  [Date].[Calendar].[Year], 1,
+  [Date].[Calendar].[Month].CurrentMember
+)</code></pre>
+<h2>Strategy 2: Measure-driven thresholds</h2>
+<p>Use <code>Filter</code> with a measure threshold to create lists that adapt as data changes. The threshold value is baked into the expression but can be updated by editing the named list.</p>
+<h3>Members above a threshold</h3>
+<p>All products with inventory below the reorder point:</p>
+<pre><code>Filter(
+  [Product].[SKU].Members,
+  [Measures].[Current Inventory] &lt; [Measures].[Reorder Point]
+)</code></pre>
+<h3>Percentage-based filtering</h3>
+<p>Top contributors that account for 80% of revenue (Pareto):</p>
+<pre><code>TopPercent(
+  [Product].[Category].Members,
+  80,
+  [Measures].[Total Revenue]
+)</code></pre>
+<h3>Combining time and measure filters</h3>
+<p>Products with growing revenue (this year vs. last year):</p>
+<pre><code>Filter(
+  [Product].[Category].Members,
+  ([Measures].[Total Revenue], [Date].[Calendar].[Year].&amp;[2026])
+    &gt; ([Measures].[Total Revenue], [Date].[Calendar].[Year].&amp;[2025])
+)</code></pre>
+<h2>Strategy 3: Excel cell references in CUBE formulas</h2>
+<p>When a named list is inserted into a workbook as <code>CUBESET</code> + <code>CUBERANKEDMEMBER</code> formulas, you can make the set expression reference other cells. This lets end users change parameters without editing MDX.</p>
+<h3>Parameterising a Top N count</h3>
+<p>Instead of a fixed count, reference a cell:</p>
+<div class="table-wrapper"><table><thead><tr><th>Cell</th><th>Content</th></tr></thead><tbody><tr><td>B1</td><td><code>10</code> (user-editable count)</td></tr><tr><td>A1</td><td><code>=CUBESET(&quot;Tessallite&quot;,&quot;TopCount([Product].[Category].Members,&quot;&amp;B1&amp;&quot;,[Measures].[Total Revenue])&quot;,&quot;Top Products&quot;)</code></td></tr><tr><td>A2</td><td><code>=CUBERANKEDMEMBER(&quot;Tessallite&quot;,A1,1)</code></td></tr></tbody></table></div>
+<p>When the user changes B1 from <code>10</code> to <code>5</code>, the set recalculates to show only 5 members.</p>
+<h3>Parameterising a threshold</h3>
+<div class="table-wrapper"><table><thead><tr><th>Cell</th><th>Content</th></tr></thead><tbody><tr><td>B1</td><td><code>10000</code> (minimum revenue threshold)</td></tr><tr><td>A1</td><td><code>=CUBESET(&quot;Tessallite&quot;,&quot;Filter([Customer].[Name].Members,[Measures].[Total Revenue] &gt; &quot;&amp;B1&amp;&quot;)&quot;,&quot;High-Value Customers&quot;)</code></td></tr></tbody></table></div>
+<h3>Parameterising a time period</h3>
+<div class="table-wrapper"><table><thead><tr><th>Cell</th><th>Content</th></tr></thead><tbody><tr><td>B1</td><td><code>202605</code> (year-month key, user-editable)</td></tr><tr><td>A1</td><td><code>=CUBESET(&quot;Tessallite&quot;,&quot;LastPeriods(12,[Date].[Calendar].[Month].&amp;[&quot;&amp;B1&amp;&quot;])&quot;,&quot;Rolling 12 Months&quot;)</code></td></tr></tbody></table></div>
+<h3>Using CUBEMEMBER as a slicer</h3>
+<p>A <code>CUBEMEMBER</code> cell can act as a slicer that feeds into <code>CUBEVALUE</code>:</p>
+<div class="table-wrapper"><table><thead><tr><th>Cell</th><th>Formula</th></tr></thead><tbody><tr><td>D1</td><td><code>=CUBEMEMBER(&quot;Tessallite&quot;,&quot;[Geography].[Region].[North America]&quot;)</code></td></tr><tr><td>D2</td><td><code>=CUBEVALUE(&quot;Tessallite&quot;,&quot;[Measures].[Total Revenue]&quot;,D1)</code></td></tr></tbody></table></div>
+<p>Change D1 to a different region, and D2 recalculates. You can wire a data-validation dropdown to D1&#x27;s input to build a user-friendly slicer.</p>
+<h2>Refresh behaviour</h2>
+<ul><li>CUBE formulas recalculate when the workbook refreshes (<strong>Data → Refresh All</strong> or Ctrl+Alt+F5).</li><li>Time-relative expressions (<code>CurrentMember</code>, <code>YTD</code>, <code>LastPeriods</code>) re-evaluate against the server&#x27;s current date at refresh time.</li><li>Cell-referenced parameters update immediately when the referenced cell changes — the formula triggers a recalculation.</li><li>The underlying XMLA connection caches metadata for the session. If the model is redeployed while the workbook is open, close and reopen the workbook or re-establish the connection to pick up schema changes.</li></ul>
+<h2>Limitations</h2>
+<ul><li><strong>No user prompts at refresh.</strong> Unlike parameterised SQL queries in some tools, CUBE formulas do not prompt the user for input. Use cell references (Strategy 3) to achieve the same effect.</li><li><strong>String escaping.</strong> Member keys containing special characters (<code>]</code>, <code>&quot;</code>) must be escaped in the MDX expression. The named list builder handles this automatically; if writing Advanced MDX by hand, double the closing bracket (<code>]]</code>) inside member references.</li><li><strong>Set size.</strong> Very large sets (thousands of members) may cause slow formula evaluation. Use <code>TopCount</code> or <code>Filter</code> to keep sets to a practical size.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="named-list-mdx-composition.html">Named List MDX Composition</a></li><li><a href="excel-add-in.html">Tessallite Excel Add-in</a></li><li><a href="excel-pivottable-features.html">Excel PivotTable Features</a></li><li><a href="../modelling/define-hierarchies.html">Define Hierarchies</a></li></ul>
+<nav class="page-nav"><a href="named-list-mdx-composition.html" class="page-nav-btn prev">&larr; Named List MDX Composition</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="powerbi-connection-guide.html" class="page-nav-btn next">Power BI Connection Guide &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

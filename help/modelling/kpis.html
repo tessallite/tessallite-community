@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KPIs — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>KPIs</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-06-14</span></div>
+    <h1>KPIs</h1>
+
+<h2>What this covers</h2>
+<p>How to create, manage, and certify KPIs inside Model Builder. Tessallite provides two creation paths:</p>
+<ol>
+  <li><strong>Business Builder</strong> &mdash; a guided form where you pick measures, time windows, and filters from dropdowns. No expression language required. Best for business users.</li>
+  <li><strong>Advanced KPI Wizard</strong> &mdash; a 5-step wizard with full control over expressions, thresholds, governance, and formula editor. Best for modellers and power users.</li>
+</ol>
+<p>For a full conceptual overview including the expression language reference, scorecard, alerts, and integrations, see <a href="../concepts/kpis.html">KPIs (concept)</a>.</p>
+
+<h2>Before you start</h2>
+<ul>
+  <li>You must have a model open in Model Builder with at least one measure defined.</li>
+  <li>If you plan to use time intelligence functions (<code>prior_period</code>, <code>moving_avg</code>, etc.), assign a time dimension to the KPI.</li>
+  <li>If you plan to use KPI hierarchies (composite KPIs), create child KPIs before assigning a parent.</li>
+</ul>
+
+<h2>Creating a KPI (Business Builder)</h2>
+<p>The Business Builder is the default creation path. Click <strong>Add KPI</strong> in the KPIs panel to open it.</p>
+
+<h3>Name</h3>
+<p>Enter a descriptive name for your KPI. This is the label that appears in dashboards, scorecards, and BI tool queries. Choose a name that a business user would recognise, such as &ldquo;Monthly Revenue Growth&rdquo; or &ldquo;Customer Retention Rate&rdquo;.</p>
+
+<h3>Formula type</h3>
+<p>The formula picker organises the eleven formula types into three categories. Toggle between the categories using the segmented bar at the top, then click a formula card to select it. Each card shows a short description and an icon &mdash; click the one that matches what you want to measure.</p>
+<p>After selecting a formula card, the builder shows the relevant controls for that type. The sections below walk through each type with a realistic business scenario, step-by-step instructions, and guidance on when to use it.</p>
+
+<h4>Single measure</h4>
+<p><strong>What it does:</strong> Aggregates one measure from your model using a function you choose (sum, average, min, max, count, or count distinct).</p>
+<p><strong>When to use it:</strong> You want to track one number over time &mdash; total revenue, average order value, maximum delivery days, or the count of invoices in a period. This is the most common formula type and the right starting point for most KPIs.</p>
+<p><strong>Scenario:</strong> Your operations team wants to track the average number of days between order placement and delivery, measured monthly.</p>
+<p><strong>How to build it:</strong></p>
+<ol>
+  <li>Open the KPI Business Builder (click <strong>Add KPI</strong> in the KPIs panel).</li>
+  <li>Give it a name: &ldquo;Average Delivery Days&rdquo;.</li>
+  <li>In the formula picker, select the <strong>Measure</strong> category, then click the <strong>Single measure</strong> card.</li>
+  <li>From the <strong>Measure</strong> dropdown, select &ldquo;days_to_deliver&rdquo; (or whatever your delivery-time measure is called).</li>
+  <li>From the <strong>Aggregation</strong> dropdown, select <strong>Average</strong>. The other options are Sum (total), Min (fastest), Max (slowest), Count (how many rows), and Count Distinct (how many unique values).</li>
+  <li>In the <strong>Time window</strong> section, pick &ldquo;Invoice Date&rdquo; as the time dimension and &ldquo;Last complete month&rdquo; as the preset. This ensures you always see a full month of data, not a partial one.</li>
+  <li>Click <strong>Preview</strong> to see the current value.</li>
+  <li>Set direction to <strong>Lower is better</strong> (fewer delivery days = better).</li>
+  <li>Set a static target (e.g. 5 days) and configure threshold bands.</li>
+  <li>Click <strong>Save</strong>.</li>
+</ol>
+<blockquote><strong>Tip:</strong> If you pick &ldquo;Count Distinct&rdquo; as the aggregation, the system counts unique values of the measure column. For counting unique values of a dimension (like unique customers), use the <strong>Count distinct</strong> formula type instead.</blockquote>
+
+<h4>Count records</h4>
+<p><strong>What it does:</strong> Counts the total number of rows (records) that match your time window and filters. No measure selection needed &mdash; it counts rows, not values.</p>
+<p><strong>When to use it:</strong> You want to know &ldquo;how many&rdquo; without caring about a specific numeric column. Examples: total orders this month, number of support tickets, number of transactions, number of deliveries.</p>
+<p><strong>Scenario:</strong> The finance team wants a KPI showing the total number of invoices issued last month.</p>
+<p><strong>How to build it:</strong></p>
+<ol>
+  <li>Open the KPI Business Builder.</li>
+  <li>Name: &ldquo;Monthly Invoice Count&rdquo;.</li>
+  <li>Select the <strong>Measure</strong> category, then click the <strong>Count records</strong> card. No further formula controls appear &mdash; the system counts all rows.</li>
+  <li>In <strong>Time window</strong>, select &ldquo;Invoice Date&rdquo; and preset &ldquo;Last complete month&rdquo;.</li>
+  <li>Optionally add a <strong>Filter</strong> to exclude cancelled invoices: click Add filter, select &ldquo;Invoice Status&rdquo;, operator &ldquo;not equals&rdquo;, value &ldquo;Cancelled&rdquo;.</li>
+  <li>Click <strong>Preview</strong> to see the count.</li>
+  <li>Direction: <strong>Higher is better</strong> (more invoices = more business).</li>
+  <li>Save.</li>
+</ol>
+<blockquote><strong>Tip:</strong> Count records counts ALL rows. If you have one row per invoice line item (not per invoice), the count will be line items, not invoices. In that case, use <strong>Count distinct</strong> on the invoice ID dimension instead.</blockquote>
+
+<h4>Count distinct</h4>
+<p><strong>What it does:</strong> Counts the number of unique (distinct) values of a chosen dimension. Unlike count records which counts rows, this counts unique identifiers.</p>
+<p><strong>When to use it:</strong> You want to know &ldquo;how many different things&rdquo; &mdash; distinct customers who ordered, distinct products sold, distinct regions with activity.</p>
+<p><strong>Scenario:</strong> The sales team wants to track how many unique customers placed at least one order last quarter.</p>
+<p><strong>How to build it:</strong></p>
+<ol>
+  <li>Open the KPI Business Builder.</li>
+  <li>Name: &ldquo;Active Customers (Quarterly)&rdquo;.</li>
+  <li>Select the <strong>Measure</strong> category, click the <strong>Count distinct</strong> card.</li>
+  <li>From the <strong>Dimension</strong> dropdown, select &ldquo;Customer ID&rdquo; (or &ldquo;Customer Name&rdquo; &mdash; whichever represents one customer per value).</li>
+  <li>In <strong>Time window</strong>, select &ldquo;Order Date&rdquo; and preset &ldquo;Last complete quarter&rdquo;.</li>
+  <li>Click <strong>Preview</strong>.</li>
+  <li>Direction: <strong>Higher is better</strong>.</li>
+  <li>Save.</li>
+</ol>
+<blockquote><strong>Tip:</strong> Choose the dimension carefully. Counting distinct &ldquo;Customer Name&rdquo; works if names are unique. If two customers share a name, count distinct &ldquo;Customer ID&rdquo; instead.</blockquote>
+
+<h4>Ratio</h4>
+<p><strong>What it does:</strong> Divides one measure (numerator) by another measure (denominator). The system uses safe division internally, so you never get a divide-by-zero error &mdash; it returns null instead.</p>
+<p><strong>When to use it:</strong> You want a rate, efficiency metric, or unit economics figure. Examples: revenue per employee, cost per unit, selling price divided by cost, defect rate (defects / total items).</p>
+<p><strong>Scenario:</strong> The procurement team wants to track the markup ratio: selling price divided by cost.</p>
+<p><strong>How to build it:</strong></p>
+<ol>
+  <li>Open the KPI Business Builder.</li>
+  <li>Name: &ldquo;Selling Price to Cost Ratio&rdquo;.</li>
+  <li>Select the <strong>Compare</strong> category, click the <strong>Ratio</strong> card.</li>
+  <li>In the <strong>Numerator</strong> dropdown, select &ldquo;Selling Price&rdquo;.</li>
+  <li>In the <strong>Denominator</strong> dropdown, select &ldquo;Cost Total&rdquo;.</li>
+  <li>In <strong>Time window</strong>, select &ldquo;Last complete month&rdquo;.</li>
+  <li>Click <strong>Preview</strong>. You should see a number like 1.45 (meaning selling price is 1.45x the cost).</li>
+  <li>Direction: <strong>Higher is better</strong>.</li>
+  <li>Set format to decimal (2 places) or use a unit label like &ldquo;x&rdquo;.</li>
+  <li>Save.</li>
+</ol>
+<blockquote><strong>Important:</strong> The time window and filters apply to both numerator and denominator equally. If you filter to &ldquo;Country = Germany&rdquo;, both measures are calculated for Germany only.</blockquote>
+<blockquote><strong>Tip:</strong> For percentage ratios (like conversion rate), multiply by 100 in your mind or set the format token to percentage. The raw ratio 0.12 means 12%.</blockquote>
+
+<h4>Compare periods</h4>
+<p><strong>What it does:</strong> Compares the current period value to a prior period. Produces a variance (difference), percentage change, or both.</p>
+<p><strong>When to use it:</strong> You want to answer &ldquo;how is this period compared to the previous one?&rdquo; &mdash; month-over-month revenue change, quarter-over-quarter growth, year-over-year comparison.</p>
+<p><strong>Scenario:</strong> The executive team wants a KPI showing this month&rsquo;s revenue compared to last month.</p>
+<p><strong>How to build it:</strong></p>
+<ol>
+  <li>Open the KPI Business Builder.</li>
+  <li>Name: &ldquo;Revenue MoM Change&rdquo;.</li>
+  <li>Select the <strong>Compare</strong> category, click the <strong>Compare periods</strong> card.</li>
+  <li>Select the <strong>Measure</strong>: &ldquo;Revenue&rdquo;.</li>
+  <li>Select the <strong>Comparison type</strong>: &ldquo;Prior period&rdquo; (or &ldquo;Same period last year&rdquo; for YoY).</li>
+  <li>Select the <strong>Period grain</strong>: &ldquo;Month&rdquo;.</li>
+  <li>In <strong>Time window</strong>, select &ldquo;This month&rdquo; (the system automatically calculates last month for comparison).</li>
+  <li>Click <strong>Preview</strong>. You see the current value, the comparison value, and the variance.</li>
+  <li>Direction: <strong>Higher is better</strong>.</li>
+  <li>Save.</li>
+</ol>
+<blockquote><strong>Tip:</strong> &ldquo;Last complete month&rdquo; is safer than &ldquo;This month&rdquo; if you want full-period comparisons without partial data.</blockquote>
+
+<h4>Compare measures</h4>
+<p><strong>What it does:</strong> Compares two different measures to produce a variance (absolute or percentage). Unlike ratio which divides, this subtracts or calculates percentage variance.</p>
+<p><strong>When to use it:</strong> You want to track the gap between two related numbers &mdash; actual vs budget, revenue vs cost, forecast vs actual.</p>
+<p><strong>Scenario:</strong> Finance wants to track the absolute variance between actual revenue and budgeted revenue.</p>
+<p><strong>How to build it:</strong></p>
+<ol>
+  <li>Open the KPI Business Builder.</li>
+  <li>Name: &ldquo;Revenue vs Budget Variance&rdquo;.</li>
+  <li>Select the <strong>Compare</strong> category, click the <strong>Compare measures</strong> card.</li>
+  <li>Select the <strong>Primary measure</strong>: &ldquo;Actual Revenue&rdquo;.</li>
+  <li>Select the <strong>Comparison measure</strong>: &ldquo;Budget Revenue&rdquo;.</li>
+  <li>Select the <strong>Variance type</strong>: &ldquo;Absolute&rdquo; (or &ldquo;Percentage&rdquo; for a % gap).</li>
+  <li>In <strong>Time window</strong>, select &ldquo;Last complete month&rdquo;.</li>
+  <li>Click <strong>Preview</strong>. Positive means actual exceeded budget.</li>
+  <li>Direction: <strong>Higher is better</strong> (over-budget is good for revenue).</li>
+  <li>Save.</li>
+</ol>
+
+<h4>Target comparison</h4>
+<p><strong>What it does:</strong> Compares a measure&rsquo;s current value against its target. Shows attainment percentage, absolute variance from target, or percentage variance from target.</p>
+<p><strong>When to use it:</strong> You have a specific goal number (set as the KPI target) and want the KPI to show how close you are.</p>
+<p><strong>Scenario:</strong> Sales has a quarterly target of 500,000 and wants to see attainment percentage.</p>
+<p><strong>How to build it:</strong></p>
+<ol>
+  <li>Open the KPI Business Builder.</li>
+  <li>Name: &ldquo;Quarterly Revenue Attainment&rdquo;.</li>
+  <li>Select the <strong>Compare</strong> category, click the <strong>Target comparison</strong> card.</li>
+  <li>Select the <strong>Measure</strong>: &ldquo;Revenue&rdquo;.</li>
+  <li>Select the <strong>Comparison mode</strong>: &ldquo;Attainment %&rdquo; (value / target * 100).</li>
+  <li>In <strong>Time window</strong>, select &ldquo;This quarter&rdquo;.</li>
+  <li>Set <strong>Target type</strong> to &ldquo;Static value&rdquo; and enter 500000.</li>
+  <li>Click <strong>Preview</strong>. You see something like 78% (meaning 78% of target reached so far).</li>
+  <li>Direction: <strong>Higher is better</strong>.</li>
+  <li>Save.</li>
+</ol>
+<blockquote><strong>Tip:</strong> You can also set the target from a measure (e.g. a &ldquo;Planned Revenue&rdquo; column in your data) instead of typing a static number.</blockquote>
+
+<h4>Moving average</h4>
+<p><strong>What it does:</strong> Calculates the rolling average of a measure over a specified number of periods. Smooths out short-term fluctuations to reveal trends.</p>
+<p><strong>When to use it:</strong> You want a smoothed trend line rather than jumpy period-to-period values. Common in manufacturing (defect rate smoothing), finance (rolling returns), and operations (moving average of processing time).</p>
+<p><strong>Scenario:</strong> Quality control wants a 3-month moving average of the defect rate percentage to detect gradual quality drift.</p>
+<p><strong>How to build it:</strong></p>
+<ol>
+  <li>Open the KPI Business Builder.</li>
+  <li>Name: &ldquo;Defect Rate (3-Month Moving Avg)&rdquo;.</li>
+  <li>Select the <strong>Analyze</strong> category, click the <strong>Moving average</strong> card.</li>
+  <li>Select the <strong>Measure</strong>: &ldquo;Defect Rate Pct&rdquo;.</li>
+  <li>Set the <strong>Window size</strong> to 3.</li>
+  <li>Set the <strong>Grain</strong> to &ldquo;Month&rdquo; (each period in the average is one month).</li>
+  <li>In <strong>Time window</strong>, select &ldquo;Last 12 months&rdquo; (so there is enough history to calculate the 3-month window).</li>
+  <li>Click <strong>Preview</strong>.</li>
+  <li>Direction: <strong>Lower is better</strong> (fewer defects = better).</li>
+  <li>Save.</li>
+</ol>
+<blockquote><strong>Pitfall: Averaging a percentage.</strong> If the measure is already a percentage (like defect rate), the moving average simply averages those percentages. This is mathematically correct only if each period has roughly the same volume. If January had 100 items and February had 10,000 items, a simple average of their defect rates gives January&rsquo;s rate equal weight to February&rsquo;s &mdash; which may not be what you want. In that case, consider creating a ratio KPI (total defects / total items) with a trailing-sum time calculation on both numerator and denominator.</blockquote>
+
+<h4>Exception / SLA</h4>
+<p><strong>What it does:</strong> Measures how well a threshold or service-level agreement is being met. Three sub-types: compliance percentage (% of records meeting the rule), breach count (how many records violate it), or backlog (count of currently open items past the threshold).</p>
+<p><strong>When to use it:</strong> You have a business rule with a numeric boundary &mdash; &ldquo;deliveries must arrive within 5 days&rdquo;, &ldquo;response time must be under 2 hours&rdquo;, &ldquo;invoices must be paid within 30 days&rdquo; &mdash; and want to measure how often that rule is met or broken.</p>
+<p><strong>Scenario:</strong> Logistics has an SLA that 95% of orders must be delivered within 5 days.</p>
+<p><strong>How to build it:</strong></p>
+<ol>
+  <li>Open the KPI Business Builder.</li>
+  <li>Name: &ldquo;Delivery SLA Compliance&rdquo;.</li>
+  <li>Select the <strong>Analyze</strong> category, click the <strong>Exception / SLA</strong> card.</li>
+  <li>Select the <strong>SLA type</strong>: &ldquo;Compliance %&rdquo; (alternatively &ldquo;Breach count&rdquo; or &ldquo;Backlog&rdquo;).</li>
+  <li>Select the <strong>Measure</strong> to evaluate: &ldquo;Days to Deliver&rdquo;.</li>
+  <li>Set the <strong>Comparator</strong>: &ldquo;less than or equal&rdquo;.</li>
+  <li>Set the <strong>Threshold value</strong>: 5.</li>
+  <li>In <strong>Time window</strong>, select &ldquo;Last complete month&rdquo;.</li>
+  <li>Click <strong>Preview</strong>. You see a percentage like 92.3% (meaning 92.3% of deliveries met the 5-day rule).</li>
+  <li>Direction: <strong>Higher is better</strong> (for compliance %; for breach count use Lower is better).</li>
+  <li>Set a static target of 95 (the SLA target) and configure threshold bands.</li>
+  <li>Save.</li>
+</ol>
+<blockquote><strong>Tip:</strong> Use &ldquo;Breach count&rdquo; when you want to know the absolute number of violations (e.g. 47 late deliveries). Use &ldquo;Backlog&rdquo; when you are tracking currently-open items that have already exceeded the threshold (e.g. 12 invoices overdue past 30 days right now).</blockquote>
+
+<h4>Share and rank</h4>
+<p><strong>What it does:</strong> Calculates a measure&rsquo;s share of the total, or ranks dimension members by a measure. Sub-types: share of total (percentage), rank (ordinal position), or top N contribution (what fraction the top N members contribute).</p>
+<p><strong>When to use it:</strong> You want to understand relative contribution or position &mdash; market share by region, rank of a product by revenue, or what percentage of sales come from the top 5 customers.</p>
+<p><strong>Scenario:</strong> Marketing wants to know what percentage of total revenue comes from the &ldquo;Enterprise&rdquo; customer segment.</p>
+<p><strong>How to build it:</strong></p>
+<ol>
+  <li>Open the KPI Business Builder.</li>
+  <li>Name: &ldquo;Enterprise Revenue Share&rdquo;.</li>
+  <li>Select the <strong>Analyze</strong> category, click the <strong>Share and rank</strong> card.</li>
+  <li>Select the <strong>Share type</strong>: &ldquo;Share of total&rdquo; (or &ldquo;Rank&rdquo; or &ldquo;Top N contribution&rdquo;).</li>
+  <li>Select the <strong>Measure</strong>: &ldquo;Revenue&rdquo;.</li>
+  <li>Select the <strong>Dimension</strong> to partition by: &ldquo;Customer Segment&rdquo;.</li>
+  <li>In <strong>Filters</strong>, add: Customer Segment equals &ldquo;Enterprise&rdquo;.</li>
+  <li>In <strong>Time window</strong>, select &ldquo;Last complete quarter&rdquo;.</li>
+  <li>Click <strong>Preview</strong>. You see something like 42% (Enterprise contributes 42% of total revenue).</li>
+  <li>Direction: <strong>Higher is better</strong>.</li>
+  <li>Save.</li>
+</ol>
+<blockquote><strong>Tip:</strong> &ldquo;Top N contribution&rdquo; answers &ldquo;how concentrated is our revenue?&rdquo; If the top 3 customers contribute 80% of revenue, that is a concentration risk worth monitoring.</blockquote>
+
+<h4>Composite score</h4>
+<p><strong>What it does:</strong> Combines multiple measures into a single weighted score. Each input measure gets a weight (summing to 1.0 or 100%), and the result is the weighted combination.</p>
+<p><strong>When to use it:</strong> You want a single health index that blends several dimensions &mdash; customer satisfaction score (combining NPS + retention + response time), supplier quality index, or operational health combining several metrics.</p>
+<p><strong>Scenario:</strong> Operations wants a single &ldquo;Supplier Health Score&rdquo; combining on-time delivery (weight 40%), defect rate (weight 30%), and cost competitiveness (weight 30%).</p>
+<p><strong>How to build it:</strong></p>
+<ol>
+  <li>Open the KPI Business Builder.</li>
+  <li>Name: &ldquo;Supplier Health Score&rdquo;.</li>
+  <li>Select the <strong>Analyze</strong> category, click the <strong>Composite score</strong> card.</li>
+  <li>Add components:
+    <ul>
+      <li>Measure: &ldquo;On Time Delivery Pct&rdquo;, Weight: 0.4</li>
+      <li>Measure: &ldquo;Quality Score&rdquo;, Weight: 0.3</li>
+      <li>Measure: &ldquo;Cost Competitiveness Score&rdquo;, Weight: 0.3</li>
+    </ul>
+  </li>
+  <li>The system calculates: (On Time * 0.4) + (Quality * 0.3) + (Cost * 0.3).</li>
+  <li>In <strong>Time window</strong>, select &ldquo;Last complete month&rdquo;.</li>
+  <li>Click <strong>Preview</strong>.</li>
+  <li>Direction: <strong>Higher is better</strong>.</li>
+  <li>Save.</li>
+</ol>
+<blockquote><strong>Important:</strong> Composite scores work best when all input measures are on comparable scales (e.g. all are 0-100 percentages). If one measure is in dollars and another is a count, the weighted sum is meaningless. Normalise the inputs first (create each as a separate KPI on a 0-100 scale) and then combine.</blockquote>
+
+<blockquote><strong>Nesting composites:</strong> A composite KPI can itself be a child of another composite &mdash; its weighted score feeds the parent, normalised against its own target like any other child. Nesting is limited to 5 composite levels and circular references are rejected; both cases produce a clear error instead of a wrong number. See <a href="../concepts/kpis.html">KPI concepts</a> for the full scoring rules, including how weights renormalise and why viewers with different privileges can see different composite scores.</blockquote>
+
+<blockquote><strong>Broken inputs are flagged:</strong> If one of a composite's child KPIs fails to evaluate (a broken formula, a query error), the composite still scores from its working children but shows a <strong>Degraded</strong> badge on its scorecard card naming the broken child. A child that simply has no data is dropped quietly. See <a href="../concepts/kpis.html">KPI concepts</a> for the difference between a broken input and no data.</blockquote>
+
+<h3>Time calculation (optional)</h3>
+<p>Most formula types offer a &ldquo;+ Add time calculation&rdquo; link below the formula controls. Clicking it adds a secondary time-variant calculation that transforms the base formula&rsquo;s result over time. This is different from the time window &mdash; the time window says &ldquo;look at data from last month&rdquo;, while the time calculation says &ldquo;compare this month to last month&rdquo; or &ldquo;average across the last 3 months&rdquo;.</p>
+<p><strong>When to use it:</strong> You already have a base formula (like Sum of Revenue) and you want the KPI to automatically do something comparative or rolling with it. Without a time calculation, the KPI just shows the raw value for the chosen time window. With a time calculation, it can show change, trend, or smoothed values.</p>
+<p><strong>How the two layers work together:</strong></p>
+<ul>
+  <li>Base formula: Sum of Revenue</li>
+  <li>Time window: Last 12 months</li>
+  <li>Time calculation: YoY growth %</li>
+</ul>
+<p>Result: The system calculates this month&rsquo;s revenue and compares it to the same month one year ago, showing the percentage change. The &ldquo;Last 12 months&rdquo; time window ensures there is enough historical data for the year-ago comparison to work.</p>
+<p><strong>Available calculations and when to use each:</strong></p>
+<p><strong>Current</strong> &mdash; No transformation. The KPI shows the raw value from the base formula for the chosen time window. Use this (or leave the time calculation empty) when you just want a straight number.</p>
+<p><strong>Prior period</strong> &mdash; Shows the value from the previous period (previous month, previous quarter, etc., depending on the grain you select). Use this when you want the KPI to answer &ldquo;what was the number last period?&rdquo; &mdash; useful as a reference point alongside a current-value KPI, or for building dashboards that show &ldquo;current vs previous&rdquo; side by side.</p>
+<p><strong>Period to date</strong> &mdash; Running total from the start of the current period. For example, &ldquo;Quarter to date revenue&rdquo; sums all revenue from the start of this quarter through today. Use this when you want to track cumulative progress toward a periodic goal. The grain control determines what &ldquo;period&rdquo; means: select &ldquo;Quarter&rdquo; for QTD, &ldquo;Year&rdquo; for YTD, &ldquo;Month&rdquo; for MTD.</p>
+<p><strong>Trailing sum</strong> &mdash; Rolling sum over the last N periods. For example, &ldquo;trailing 12-month revenue&rdquo; sums the last 12 complete months. Use this when you want a rolling total that smooths out seasonal patterns. Set the <strong>number of periods</strong> (e.g. 12) and the <strong>grain</strong> (e.g. Month). The result is always a sum, not an average.</p>
+<p><strong>Moving average</strong> &mdash; Rolling average over the last N periods. For example, &ldquo;3-month moving average of defect rate&rdquo; averages the last 3 months. Use this to smooth noisy metrics and reveal underlying trends. Set the <strong>number of periods</strong> and <strong>grain</strong>. This is mathematically equivalent to trailing sum divided by N.</p>
+<p><strong>Lag</strong> &mdash; Value from exactly N periods ago. &ldquo;Lag 1 month&rdquo; shows last month&rsquo;s value. &ldquo;Lag 3 quarters&rdquo; shows the value from 3 quarters back. Use this when you need a historical reference point at a fixed offset &mdash; for example, showing &ldquo;what was our headcount 6 months ago&rdquo; alongside the current headcount.</p>
+<p><strong>Lead</strong> &mdash; Value from N periods in the future. Only meaningful if your data includes forecasts or future-dated records. Rarely used in actuals-based KPIs.</p>
+<p><strong>Percentage change</strong> &mdash; The percentage difference between the current period and the prior period: <code>(current - prior) / prior * 100</code>. Use this for month-over-month or quarter-over-quarter growth rates without needing to build a ratio formula. A positive number means growth; a negative number means decline.</p>
+<p><strong>YoY value</strong> &mdash; The value from exactly one year ago (same period, prior year). Use this when seasonality makes month-over-month comparisons misleading &mdash; comparing December to December is more meaningful than comparing December to November in retail, for example.</p>
+<p><strong>YoY growth %</strong> &mdash; The year-over-year percentage change: <code>(this year - last year) / last year * 100</code>. This is the most common growth KPI in business reporting. Use it whenever you need to show annual growth while accounting for seasonality.</p>
+<p><strong>CAGR</strong> &mdash; Compound Annual Growth Rate. Calculates the smoothed annual growth rate over multiple years, assuming constant compounding. Use this for long-horizon metrics where you want to communicate &ldquo;we grew at X% per year on average over the last 5 years&rdquo;. Requires multiple years of data.</p>
+<p><strong>Practical guidance:</strong></p>
+<ul>
+  <li>If you just want &ldquo;this month&rsquo;s number&rdquo;, leave time calculation empty or set it to Current.</li>
+  <li>If you want &ldquo;how much did it change from last month&rdquo;, use Percentage change.</li>
+  <li>If you want &ldquo;how does this month compare to the same month last year&rdquo;, use YoY growth %.</li>
+  <li>If you want a smoothed trend line, use Moving average.</li>
+  <li>If you want a running total, use Trailing sum or Period to date.</li>
+  <li>If your metric is noisy (varies wildly month to month), moving average is your friend.</li>
+  <li>If your business is seasonal (retail, travel, agriculture), YoY comparisons are more honest than month-over-month.</li>
+</ul>
+
+<h3>Time window</h3>
+<p>The time window defines which data is included in the KPI calculation. It answers the question: &ldquo;calculate this number using data from when to when?&rdquo;</p>
+<p>Every KPI should have a time window unless it is measuring an all-time cumulative value. Without a time window, the KPI evaluates against ALL data in the model &mdash; which is rarely what you want for an operational metric.</p>
+<p><strong>Choosing a time dimension:</strong> If your model has multiple date columns (Order Date, Invoice Date, Ship Date, Payment Date), you must pick one. Choose the date that best represents &ldquo;when did this business event happen&rdquo; for the question you are answering:</p>
+<ul>
+  <li>Tracking delivery performance? Use Ship Date or Delivery Date.</li>
+  <li>Tracking revenue? Use Invoice Date (when the revenue was recognised).</li>
+  <li>Tracking customer activity? Use Order Date (when the customer acted).</li>
+</ul>
+<p><strong>Available presets:</strong></p>
+<p><strong>Relative presets</strong> lock to calendar boundaries:</p>
+<ul>
+  <li><strong>Today</strong> &mdash; just today&rsquo;s data. Useful for real-time operational dashboards.</li>
+  <li><strong>This week / month / quarter / year</strong> &mdash; from the start of the current period through today. Gives you the in-progress total.</li>
+  <li><strong>Last week / month / quarter / year</strong> &mdash; the entire previous calendar period. Useful for review meetings where you discuss completed periods.</li>
+  <li><strong>Last complete week / month / quarter / year</strong> &mdash; same as &ldquo;last&rdquo;, but explicitly avoids any partial current-period data. Use this when you want guaranteed apples-to-apples comparisons between periods.</li>
+</ul>
+<p><strong>Rolling presets</strong> count backward from today regardless of calendar boundaries:</p>
+<ul>
+  <li><strong>Last 7 / 14 / 30 / 90 days</strong> &mdash; a sliding window. &ldquo;Last 30 days&rdquo; always includes exactly 30 days of data, regardless of whether a month boundary falls inside it.</li>
+  <li><strong>Last 3 / 6 / 12 months</strong> &mdash; a sliding window of complete months. &ldquo;Last 12 months&rdquo; always includes 12 full months ending with the most recent complete month.</li>
+</ul>
+<p><strong>Custom range</strong> &mdash; specify exact start and end dates. Use this for one-off analysis or KPIs tied to a fixed campaign period (e.g. &ldquo;Black Friday 2025 to Cyber Monday 2025&rdquo;).</p>
+<p><strong>The &ldquo;Include incomplete period&rdquo; checkbox:</strong></p>
+<p>This controls whether the current (still-in-progress) period is included. Example: today is June 15. &ldquo;Last complete month&rdquo; gives you all of May. If you tick &ldquo;Include incomplete period&rdquo;, you also get June 1-15. This matters because partial months always look lower than complete months &mdash; if your KPI shows &ldquo;revenue last month&rdquo; and includes a half-month, the number drops every time a new month starts. Generally, leave this unticked for reporting KPIs and tick it for real-time monitoring KPIs.</p>
+<p><strong>Best practices:</strong></p>
+<ul>
+  <li>For executive review KPIs (monthly board packs, quarterly reviews): use &ldquo;Last complete month/quarter&rdquo;. The number is final and will not change tomorrow.</li>
+  <li>For operational dashboards (daily standups, real-time monitoring): use &ldquo;Last 7 days&rdquo; or &ldquo;Last 30 days&rdquo; rolling windows. These update every day and always show fresh data.</li>
+  <li>For growth KPIs with time calculations (YoY, MoM): use a window wide enough to include the comparison period. If you are calculating YoY growth for this month, the window needs to include the same month from last year. &ldquo;Last 12 months&rdquo; or &ldquo;Last 13 months&rdquo; works well.</li>
+  <li>For SLA KPIs: use &ldquo;Last complete month&rdquo; so you measure compliance for a finished period.</li>
+</ul>
+
+<h3>Filters</h3>
+<p>Filters restrict the KPI to a specific business slice. Without filters, the KPI calculates across ALL data in the model (within the time window). With filters, it only includes rows that match your conditions.</p>
+<p><strong>When to use filters:</strong> Whenever your KPI is scoped to a specific segment, region, product line, status, or any other dimension value. Examples: &ldquo;Revenue for Germany only&rdquo;, &ldquo;Delivery days excluding cancelled orders&rdquo;, &ldquo;Customer count for Enterprise segment&rdquo;.</p>
+<p><strong>How to add a filter:</strong></p>
+<ol>
+  <li>Click <strong>Add filter</strong> in the filter bar.</li>
+  <li>A dimension picker appears. Select the dimension you want to filter on (e.g. &ldquo;Country&rdquo;, &ldquo;Customer Segment&rdquo;, &ldquo;Order Status&rdquo;).</li>
+  <li>Choose an operator and enter the value(s).</li>
+  <li>The filter appears as a chip below the bar showing a readable summary like &ldquo;Country = Germany&rdquo;.</li>
+  <li>Click the chip to edit it. Click the X on the chip to remove it.</li>
+  <li>Add multiple filters &mdash; they combine with AND logic (all conditions must be true).</li>
+</ol>
+<p><strong>Available operators:</strong></p>
+<table>
+  <thead><tr><th>Operator</th><th>What it does</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Equals</strong></td><td>Exact match, one value</td><td>Country = Germany</td></tr>
+    <tr><td><strong>Not equals</strong></td><td>Exclude one value</td><td>Status not equals Cancelled</td></tr>
+    <tr><td><strong>In</strong></td><td>Match any of several values</td><td>Region in (EMEA, APAC, Americas)</td></tr>
+    <tr><td><strong>Not in</strong></td><td>Exclude several values</td><td>Product not in (Discontinued, Sample)</td></tr>
+    <tr><td><strong>Greater than</strong></td><td>Numeric comparison</td><td>Order Value &gt; 1000</td></tr>
+    <tr><td><strong>Greater than or equal</strong></td><td>Inclusive numeric</td><td>Days to Deliver &gt;= 5</td></tr>
+    <tr><td><strong>Less than</strong></td><td>Numeric comparison</td><td>Quantity &lt; 100</td></tr>
+    <tr><td><strong>Less than or equal</strong></td><td>Inclusive numeric</td><td>Response Time &lt;= 2</td></tr>
+    <tr><td><strong>Between</strong></td><td>Inclusive range</td><td>Age between 18 and 65</td></tr>
+    <tr><td><strong>Like</strong></td><td>Pattern match (% wildcard)</td><td>Product Name like %Premium%</td></tr>
+    <tr><td><strong>Not like</strong></td><td>Exclude pattern</td><td>Category not like %Test%</td></tr>
+    <tr><td><strong>Is null</strong></td><td>Missing values only</td><td>Ship Date is null (not yet shipped)</td></tr>
+    <tr><td><strong>Is not null</strong></td><td>Has a value</td><td>Email is not null (has contact info)</td></tr>
+    <tr><td><strong>Top N</strong></td><td>Top N by a measure</td><td>Top 10 customers by Revenue</td></tr>
+    <tr><td><strong>Bottom N</strong></td><td>Bottom N by a measure</td><td>Bottom 5 products by Margin</td></tr>
+  </tbody>
+</table>
+<p><strong>Autocomplete for categorical values:</strong> When you select &ldquo;Equals&rdquo;, &ldquo;In&rdquo;, or &ldquo;Not in&rdquo; on a categorical dimension (like Country or Product Family), the value picker queries the actual data and shows an autocomplete dropdown. Start typing and matching values appear. This prevents typos &mdash; you always select real values from your data.</p>
+<p><strong>Date dimension filters:</strong> When you filter on a date dimension, the editor shows date input fields instead of text fields. You can enter specific dates or use relative expressions.</p>
+
+<h3>Using named lists in KPI filters</h3>
+<p>A <strong>named list</strong> is a saved, reusable set of dimension members. Instead of typing &ldquo;Germany, France, Italy, Spain, Portugal&rdquo; into every KPI that needs a &ldquo;Western Europe&rdquo; filter, you create a named list once and reference it everywhere.</p>
+<p><strong>What is a named list?</strong></p>
+<p>A named list is a pre-defined set of values for a dimension. It can be:</p>
+<ul>
+  <li><strong>Static</strong> &mdash; a fixed list of values (e.g. &ldquo;Enterprise Customers&rdquo; = [Acme Corp, BigCo, MegaInc]).</li>
+  <li><strong>Dynamic (Top/Bottom N)</strong> &mdash; automatically resolves to the top or bottom N members by a measure at evaluation time (e.g. &ldquo;Top 20 Products by Revenue&rdquo; recalculates every time the KPI is evaluated).</li>
+  <li><strong>Query-based</strong> &mdash; the members are determined by a query that runs at evaluation time.</li>
+</ul>
+<p>Named lists are created and managed separately (see the <a href="named-sets.html">Named Lists</a> help page). Once created, they can be used in any KPI filter, any pivot query, or any dashboard slicer.</p>
+<p><strong>Why use named lists instead of typing values directly?</strong></p>
+<ol>
+  <li><strong>Consistency across KPIs.</strong> If you have 15 KPIs filtered to &ldquo;Strategic Accounts&rdquo;, changing the list in one place updates all 15 KPIs. Without named lists, you would edit each KPI individually.</li>
+  <li><strong>Dynamic membership.</strong> A &ldquo;Top 10 Customers by Revenue&rdquo; named list re-evaluates every month. The KPI always reflects the CURRENT top 10, not the top 10 from when you built it.</li>
+  <li><strong>Governance.</strong> Named lists can be certified, documented, and version-controlled. Everyone in the organisation uses the same definition of &ldquo;Western Europe&rdquo; or &ldquo;Premium Products&rdquo;.</li>
+  <li><strong>Complex logic without complexity.</strong> A named list can encode complex membership rules (top N, conditional logic, exclusions) that would be impossible to express in a simple filter.</li>
+</ol>
+<p><strong>How to use a named list in a KPI filter:</strong></p>
+<ol>
+  <li>In the KPI Business Builder, click <strong>Add filter</strong>.</li>
+  <li>Select the dimension (e.g. &ldquo;Customer Name&rdquo;).</li>
+  <li>Set the operator to <strong>In</strong> (or <strong>Not in</strong> to exclude list members).</li>
+  <li>In the value picker, switch to <strong>Named List</strong> mode (toggle or tab at the top of the picker).</li>
+  <li>Select your named list from the dropdown (e.g. &ldquo;Strategic Accounts&rdquo;).</li>
+  <li>The filter chip shows: &ldquo;Customer Name in [Strategic Accounts]&rdquo;.</li>
+  <li>At evaluation time, the system resolves the named list to its current members and applies them as a WHERE IN clause.</li>
+</ol>
+<p><strong>Example scenario:</strong> The CFO wants separate KPIs for &ldquo;Top 20 Accounts&rdquo; and &ldquo;Long Tail Accounts&rdquo;. Instead of maintaining two lists of customer names:</p>
+<ol>
+  <li>Create a named list &ldquo;Top 20 Accounts&rdquo; with type &ldquo;Top N&rdquo;, dimension &ldquo;Customer Name&rdquo;, measure &ldquo;Revenue&rdquo;, N = 20.</li>
+  <li>KPI &ldquo;Top 20 Revenue&rdquo; uses filter: Customer Name <strong>in</strong> [Top 20 Accounts].</li>
+  <li>KPI &ldquo;Long Tail Revenue&rdquo; uses filter: Customer Name <strong>not in</strong> [Top 20 Accounts].</li>
+  <li>Every month, the list re-resolves. If a new customer enters the top 20, both KPIs update automatically.</li>
+</ol>
+<blockquote><strong>Pitfall:</strong> If you use a static named list and your data changes (a customer name gets corrected, a product is renamed), the named list keeps the OLD value until someone updates it. Dynamic lists (Top N) do not have this problem because they re-resolve from fresh data.</blockquote>
+
+<h3>Using parameters in KPI filters</h3>
+<p>A <strong>parameter</strong> is a placeholder value that can be supplied at runtime. Instead of hard-coding &ldquo;Country = Germany&rdquo; into the KPI, you create a parameter called <code>$Region</code> with a default value of &ldquo;Germany&rdquo;. When the KPI is evaluated, the caller can override the parameter to &ldquo;France&rdquo; or &ldquo;APAC&rdquo; without changing the KPI definition.</p>
+<p><strong>What is a parameter?</strong></p>
+<p>A parameter is a named variable with:</p>
+<ul>
+  <li>A <strong>name</strong> (e.g. <code>$HQ_Region</code>, <code>$Reporting_Year</code>, <code>$Product_Line</code>)</li>
+  <li>A <strong>data type</strong> (text, number, date)</li>
+  <li>A <strong>default value</strong> (used when no override is provided)</li>
+  <li>Optionally a <strong>list of allowed values</strong> (restricts what callers can pass)</li>
+</ul>
+<p>Parameters live at the model level and can be referenced by any KPI, query, or dashboard in that model.</p>
+<p><strong>When to use parameters vs fixed filters:</strong></p>
+<table>
+  <thead><tr><th>Situation</th><th>Use fixed filter</th><th>Use parameter</th></tr></thead>
+  <tbody>
+    <tr><td>KPI always measures one segment</td><td>Yes</td><td>No</td></tr>
+    <tr><td>KPI is reused by different teams for their own region</td><td>No</td><td>Yes</td></tr>
+    <tr><td>KPI is embedded in a dashboard with a region selector</td><td>No</td><td>Yes</td></tr>
+    <tr><td>KPI is scheduled for snapshot and needs a consistent scope</td><td>Yes (or parameter with default)</td><td>Yes (with a meaningful default)</td></tr>
+    <tr><td>KPI is used in BI tools where users select a slicer</td><td>No</td><td>Yes</td></tr>
+  </tbody>
+</table>
+<p><strong>How to use a parameter in a KPI filter:</strong></p>
+<ol>
+  <li>In the KPI Business Builder, click <strong>Add filter</strong>.</li>
+  <li>Select the dimension (e.g. &ldquo;Region&rdquo;).</li>
+  <li>Set the operator (e.g. &ldquo;Equals&rdquo;).</li>
+  <li>Instead of typing a fixed value, switch the filter mode from <strong>Fixed</strong> to <strong>Parameter</strong>.</li>
+  <li>Enter the <strong>parameter name</strong> (e.g. <code>$Region</code>).</li>
+  <li>Enter the <strong>default value</strong> (e.g. &ldquo;All&rdquo; or &ldquo;EMEA&rdquo;). The default is used whenever the KPI is evaluated without an explicit override &mdash; including scheduled snapshots.</li>
+  <li>The filter chip shows: &ldquo;Region = $Region (default: EMEA)&rdquo;.</li>
+</ol>
+<p><strong>Example scenario: One KPI, five regional teams.</strong></p>
+<p>The company has a &ldquo;Monthly Revenue&rdquo; KPI. The global team wants ALL regions. EMEA wants only EMEA. Americas wants only Americas.</p>
+<p>Without parameters, you would create 5 identical KPIs with different hard-coded region filters. With parameters:</p>
+<ol>
+  <li>Create one KPI: &ldquo;Monthly Revenue&rdquo;.</li>
+  <li>Add a parameter filter: Region equals <code>$Region</code>, default &ldquo;All&rdquo;.</li>
+  <li>The global dashboard evaluates it without overriding <code>$Region</code> &mdash; gets all regions.</li>
+  <li>The EMEA dashboard passes <code>$Region = &ldquo;EMEA&rdquo;</code> &mdash; gets EMEA only.</li>
+  <li>The Americas dashboard passes <code>$Region = &ldquo;Americas&rdquo;</code> &mdash; gets Americas only.</li>
+  <li>Scheduled snapshots use the default (&ldquo;All&rdquo;) and capture the global number.</li>
+</ol>
+<p>One KPI definition. Multiple consumers. No duplication.</p>
+<p><strong>Example scenario: Parameterised date range.</strong></p>
+<p>Finance wants the same KPI evaluated for different fiscal years depending on the report:</p>
+<ol>
+  <li>Create a parameter filter on &ldquo;Fiscal Year&rdquo; with parameter name <code>$FY</code>, default &ldquo;FY2025&rdquo;.</li>
+  <li>Year-end report overrides with <code>$FY = &ldquo;FY2025&rdquo;</code>.</li>
+  <li>Planning report overrides with <code>$FY = &ldquo;FY2026&rdquo;</code> (using forecast data).</li>
+  <li>The KPI definition stays the same.</li>
+</ol>
+<p><strong>Important rules for parameters and scheduled snapshots:</strong></p>
+<ul>
+  <li>Every parameterised filter MUST have a default value. If a KPI is scheduled for daily/weekly snapshots, the scheduler evaluates it without user interaction. Without a default, the evaluation would fail.</li>
+  <li>Choose defaults carefully. The default determines what the scheduled snapshot captures. If you default to &ldquo;All&rdquo;, your snapshot history records the global number. If you default to &ldquo;EMEA&rdquo;, it only records EMEA.</li>
+  <li>If you need snapshots for MULTIPLE parameter values (e.g. one for EMEA and one for Americas), create separate KPIs with different fixed filters, or set up multiple snapshot schedules with parameter overrides.</li>
+</ul>
+<p><strong>Combining named lists and parameters:</strong></p>
+<p>You can combine both in a single KPI. For example:</p>
+<ul>
+  <li>Filter 1: Customer Name <strong>in</strong> [Strategic Accounts] (named list, dynamic)</li>
+  <li>Filter 2: Region <strong>equals</strong> <code>$Region</code> (parameter, default &ldquo;All&rdquo;)</li>
+</ul>
+<p>This KPI measures strategic accounts in whichever region the caller specifies. The named list provides the &ldquo;who&rdquo; (dynamic membership), and the parameter provides the &ldquo;where&rdquo; (caller-controlled scope).</p>
+
+<h3>Preview</h3>
+<p>Above the Preview button, a summary line shows a plain-English description of what the KPI will calculate based on your current selections. For example: &ldquo;Average of Days to Deliver | for Last complete month | where Country = Germany&rdquo;. This updates live as you change the formula, time window, and filters.</p>
+<p>Click <strong>Preview</strong> to evaluate the KPI against live data. The system compiles your business selections into a semantic query, routes it through the query engine, and returns:</p>
+<ul>
+  <li><strong>Current value</strong> &mdash; the calculated number (e.g. &ldquo;4.2 days&rdquo;).</li>
+  <li><strong>Target</strong> &mdash; if you set a target, the target value is shown alongside.</li>
+  <li><strong>Status</strong> &mdash; if thresholds are configured, a green/amber/red status chip appears.</li>
+  <li><strong>Trend</strong> &mdash; if trend is configured, an arrow shows improving/declining/flat.</li>
+  <li><strong>Evaluation time</strong> &mdash; how long the calculation took (e.g. &ldquo;Evaluated in 42 ms&rdquo;).</li>
+</ul>
+<p><strong>Show SQL button:</strong> After a successful preview, a <strong>Show SQL</strong> button appears next to the Preview button. Click it to reveal the semantic SQL that the system generated from your business selections. This is useful for:</p>
+<ul>
+  <li>Understanding exactly what the KPI is calculating under the hood.</li>
+  <li>Debugging unexpected values (inspect the WHERE clause, GROUP BY, or time boundaries).</li>
+  <li>Communicating the KPI logic to a technical colleague.</li>
+  <li>Verifying that filters and time windows are applied correctly.</li>
+</ul>
+<p>The SQL shown is the <em>semantic</em> query (using model column names), not the final database-dialect SQL. The query router translates it to the correct syntax for your data source (PostgreSQL, BigQuery, Snowflake, etc.) at execution time.</p>
+
+<h3>Advanced settings</h3>
+<p>Click <strong>Advanced</strong> to expand additional fields:</p>
+<ul>
+  <li><strong>Description</strong> &mdash; a longer explanation of the KPI.</li>
+  <li><strong>Display folder</strong> &mdash; organise KPIs into groups for the scorecard and BI tools.</li>
+  <li><strong>Format token</strong> &mdash; number formatting (currency, percentage, decimal, integer, custom).</li>
+  <li><strong>Unit label</strong> &mdash; the unit displayed alongside the value (e.g. &ldquo;USD&rdquo;, &ldquo;%&rdquo;, &ldquo;orders&rdquo;).</li>
+  <li><strong>Generated expression</strong> (read-only) &mdash; the technical expression the system generated from your selections.</li>
+</ul>
+
+<h3>Escape hatch: Open Advanced Editor</h3>
+<p>If you need capabilities beyond what the Business Builder offers (custom expressions, composite hierarchies, governance workflows), click <strong>Open advanced editor</strong> in the dialog footer. A warning appears: editing in the advanced wizard may detach the KPI from the guided builder if unsupported fields are changed. Click <strong>Continue</strong> to proceed to the full wizard.</p>
+
+<h2>Creating a KPI (Advanced Wizard)</h2>
+<p>Click <strong>Advanced KPI</strong> in the KPIs panel header to open the 5-step wizard directly.</p>
+<ol>
+  <li>Open a model in Model Builder and click <strong>KPIs</strong> in the Toolbelt (left sidebar).</li>
+  <li>Click <strong>Add KPI</strong>. The wizard dialog opens.</li>
+  <li>Walk through the five steps:</li>
+</ol>
+
+<h3>Step 1: Type and formula</h3>
+<ul>
+  <li>Select a <strong>KPI type</strong> (simple measure, ratio, variance, growth rate, moving window, or composite).</li>
+  <li>Select the measures that feed the expression. For ratio types, select numerator and denominator measures. For variance, select value and comparison measures.</li>
+  <li>The expression is generated automatically from your selections. You can also edit it directly.</li>
+  <li>The expression preview shows the formula that will be saved.</li>
+</ul>
+<p><strong>Using templates:</strong> If you start from a template (via the formula editor&rsquo;s template gallery), the expression may contain placeholder measure names like <code>measure(&quot;Revenue&quot;)</code>. The wizard detects these and shows a <strong>Map Template Measures</strong> section at the top of Step 1. For each placeholder, select the corresponding measure from your model using the dropdown. The expression is rewritten automatically as you map each reference.</p>
+
+<h3>Step 2: Target and direction</h3>
+<ul>
+  <li>Choose a <strong>target type</strong>: no target, static value, from a measure, prior period value, or custom expression.</li>
+  <li>If static, enter the target value.</li>
+  <li>Choose the <strong>direction</strong>: higher is better, lower is better, or closer is better.</li>
+</ul>
+
+<h3>Step 3: Thresholds</h3>
+<ul>
+  <li>Choose an <strong>evaluation type</strong>: percentage of target, absolute variance, percentage variance, z-score, or percentile rank.</li>
+  <li>Start from a <strong>preset</strong> (standard 3-band, standard 4-band, tight tolerance, centred deviation) or configure custom bands.</li>
+  <li>When you change the <strong>direction</strong> in Step 2, the wizard automatically switches to the recommended preset. For example, &ldquo;closer is better&rdquo; auto-selects the centred preset. If you have already customised bands, the auto-switch is skipped so your edits are preserved.</li>
+  <li>Each band has a label, colour, min value, and max value. Add or remove bands (up to 5) as needed.</li>
+  <li><strong>Reorder bands</strong> using the up/down arrow buttons next to each band. Band boundaries are recalculated to stay contiguous when you reorder.</li>
+  <li><strong>Pick a colour</strong> by clicking the colour swatch next to each band. A popover opens with a palette of 12 curated colours. For advanced use, type a custom hex code (e.g. <code>#4CAF50</code>) in the text field below the palette.</li>
+  <li>Enable <strong>colour-blind-safe palette</strong> if required.</li>
+</ul>
+
+<h3>Step 4: Display and formatting</h3>
+<ul>
+  <li>Set the <strong>display name</strong>, <strong>description</strong>, and <strong>display folder</strong>.</li>
+  <li>Choose a <strong>number format</strong> (currency, percentage, integer, decimal, custom).</li>
+  <li>Choose a <strong>visual presentation</strong> (traffic light, gauge, bullet chart, RAG bar, progress ring, thermometer). Each option in the picker carries a one-line description of what it draws.</li>
+  <li>Set <strong>unit label</strong> and <strong>null display value</strong>.</li>
+  <li>Configure <strong>trend</strong> settings: comparison period (day, week, month, quarter, year) and sparkline periods.</li>
+  <li>Choose an <strong>indicator type</strong> (none, leading, lagging).</li>
+  <li>Select a <strong>time dimension</strong> (required for time intelligence functions).</li>
+  <li>Choose an <strong>aggregation mode</strong> (automatic, aggregate first, row first, pre-aggregated, or aggregate of aggregate). If you choose aggregate of aggregate, additional fields appear: inner aggregation function, inner grain column, and outer aggregation function.</li>
+  <li>Optionally set a <strong>parent KPI</strong> and <strong>weight</strong> for composite hierarchies.</li>
+  <li>For non-draft KPIs, configure <strong>historical snapshots</strong>: capture frequency and retention.</li>
+</ul>
+
+<h4>Choosing a visual presentation</h4>
+<p>Every presentation type plots the same underlying status, so the visual, the
+coloured band, and the status badge always tell one consistent story. Pick the
+shape that fits how people read the metric:</p>
+<ul>
+  <li><strong>Traffic light</strong> — a three-lamp signal with the lamp matching the status lit (green / amber / red). Best for a glance-and-go board where the only question is "are we good?" Use when the exact number matters less than the state.</li>
+  <li><strong>Gauge</strong> — a circular dial with a needle over coloured threshold bands. Best for "percent of target" style metrics where people expect a speedometer feel.</li>
+  <li><strong>Bullet chart</strong> — a horizontal bar that grows to the value, riding over translucent band lanes, with a target marker at the threshold you must reach. Best for value-versus-target comparisons in a compact, dense layout.</li>
+  <li><strong>RAG bar</strong> — a solid red/amber/green track with a marker at the value. Best when the band the value falls into is the headline, not the precise position.</li>
+  <li><strong>Progress ring</strong> — a circular ring that fills toward the target and is coloured by status, with the percent shown in the centre. Best for completion or attainment metrics ("78% of goal").</li>
+  <li><strong>Thermometer</strong> — a vertical column that rises through the bands. Best for "how full / how high" metrics where a rising level is the natural mental model.</li>
+</ul>
+<p>Avoid switching types card-to-card on the same board without reason; a
+consistent shape makes a scorecard faster to scan.</p>
+
+<h3>Step 5: Review</h3>
+<ul>
+  <li>Review the generated expression and target expression.</li>
+  <li>Live validation shows whether the expression is valid, with error details if not.</li>
+  <li>For certified/deprecated KPIs: governance actions (certify, deprecate, revert) are available.</li>
+  <li>Version history is shown for existing KPIs.</li>
+  <li>Click <strong>Save KPI</strong> to create or update.</li>
+</ul>
+
+<h2>Creating a KPI (Formula editor)</h2>
+<p>Click the <strong>Formula editor</strong> button (code icon) in the wizard title bar to switch to formula mode.</p>
+<ul>
+  <li>Write the KPI expression directly using the formula language.</li>
+  <li>The <strong>function picker</strong> on the right lists all 21 available functions with descriptions and insert buttons.</li>
+  <li><strong>Templates</strong> offer pre-built expressions for common KPI patterns.</li>
+  <li>Live validation runs as you type.</li>
+</ul>
+<p>Switch back to wizard mode at any time with the <strong>Wizard mode</strong> button.</p>
+
+<h2>Editing a KPI</h2>
+<p>Click a KPI in the Toolbelt list to open it in the wizard. All steps are pre-filled with the current values. Change any field and click <strong>Save</strong>. Each save creates a new version.</p>
+
+<h2>Deleting a KPI</h2>
+<p>Click the delete icon next to a KPI in the Toolbelt list. A confirmation dialog warns about dependencies. For composite KPIs, delete children before the parent.</p>
+
+<h2>Certifying and deprecating</h2>
+<p>From the wizard review step (Step 5) or from the KPI list:</p>
+<ul>
+  <li><strong>Certify</strong>: marks the KPI as approved for organisational use. Only the KPI owner or an admin can certify.</li>
+  <li><strong>Deprecate</strong>: marks the KPI as no longer recommended. Optionally specify a replacement KPI. Deprecated KPIs are excluded from the agent&rsquo;s context.</li>
+  <li><strong>Revert</strong>: returns a certified or deprecated KPI to draft status.</li>
+</ul>
+
+<h2>Deploying a KPI</h2>
+<p>A KPI follows the <strong>same deploy rule as a model</strong>: BI tools only see KPIs that are deployed. A KPI you are still building stays a draft — visible to you in the Builder and the Scorecard, but hidden from Excel, Power BI, and the <code>$KPIs</code> catalogue that BI tools browse. This lets you draft and preview a KPI without exposing a half-finished number to the whole organisation.</p>
+<p>Deploy a KPI the same way you deploy a model: once you are happy with the preview, deploy it so downstream tools pick it up. Undeploy it again to pull it back from BI catalogues without deleting it — its definition and version history stay intact.</p>
+<p><strong>Certifying and deploying are different things, and they are independent.</strong> Certifying is a <em>governance</em> stamp ("this KPI is approved and trustworthy"). Deploying controls <em>visibility</em> to BI tools. A KPI can be certified but undeployed (approved, not yet published), or deployed but uncertified (published for early use, not yet formally blessed). Decide each one separately.</p>
+
+<h2>KPI Scorecard</h2>
+<p>The KPI Scorecard is the <strong>KPIs</strong> tab in the Model Builder tab bar (alongside Canvas, Query, Model Health, and Analytics). It shows all KPIs in a model with their current values, status colours, trend arrows, and sparkline charts.</p>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/kpi-scorecard.png" alt="The KPI Scorecard for the acme demo ModelX. The summary bar reads 6 total KPIs — 3 Good, 1 Warning, 2 Poor. The Sales Performance folder shows Avg Transaction Value (bullet chart, $2,504.71, On Track), Gross Margin % (72.5%, On Track), and Net Sales (bullet chart, $141.5M, Near Target), each with a value, goal, gap-to-goal, and status badge."></figure>
+<p>You can narrow the board several ways, and the filters combine:</p>
+<ul>
+  <li><strong>Certification</strong> — All, Certified only, or Deprecated.</li>
+  <li><strong>Display folder</strong> — show one folder, or all folders.</li>
+  <li><strong>Indicator type</strong> — show only Leading, only Lagging, or Unclassified KPIs. (Leading indicators predict where a number is heading; lagging ones report where it has already been.)</li>
+  <li><strong>Viewing as persona</strong> — preview the board exactly as a chosen persona would see it. KPIs that reference a measure outside that persona's scope drop out of view, so you can confirm what each audience is allowed to see before you publish. Choose "Default (no persona)" to see everything you are allowed to see.</li>
+  <li>Click a KPI card to open it in the wizard.</li>
+</ul>
+<p><strong>The gauge always agrees with itself.</strong> On a card with a gauge, the needle, the coloured band it sits in, and the status badge (the RAG light) always tell the same story — the platform plots all three from one position the server worked out, so the needle can never land in a green band while the badge shows red. This holds even for "lower is better" KPIs and for percentile or z-score thresholds, where the good and bad ends are reversed.</p>
+
+<h2>Snapshot scheduling</h2>
+<p>In Step 4 of the wizard (only for non-draft KPIs):</p>
+<ol>
+  <li>Under <strong>Historical snapshots</strong>, select a <strong>capture frequency</strong> (hourly, daily, weekly, monthly, quarterly, or none).</li>
+  <li>Set the <strong>retention</strong> (how many snapshots to keep, 7 to 365).</li>
+  <li>The system stores the cron schedule internally. You never need to write cron expressions.</li>
+</ol>
+<p>Snapshots are captured by the scheduler service and stored in the <code>kpi_snapshots</code> table.</p>
+
+<h2>Tips and best practices</h2>
+
+<h3>Formula selection</h3>
+<ul>
+  <li>Start with the simplest formula type that answers your question. &ldquo;Single measure&rdquo; covers most KPIs. Only reach for ratio, composite, or compare-periods when you genuinely need two values combined.</li>
+  <li>If you need percentage change over time, use the time calculation (Percentage change or YoY growth %) rather than building a ratio between current and prior period measures. The time calculation handles the time-shifting automatically.</li>
+  <li>For rate-based KPIs (conversion rate, defect rate), decide whether the source data already stores a rate (then use single measure with average aggregation) or whether you need to divide two counts (then use ratio).</li>
+</ul>
+
+<h3>Time windows and time calculations</h3>
+<ul>
+  <li>Always set a time window unless you genuinely want an all-time cumulative.</li>
+  <li>For rolling comparisons, make the time window wider than the comparison offset. A YoY growth KPI needs at least 13 months of data in the window.</li>
+  <li>&ldquo;Last complete month&rdquo; is almost always safer than &ldquo;Last month&rdquo; for reporting. It avoids partial-period distortion.</li>
+  <li>Moving averages require N+1 periods of history. A 3-month moving average with &ldquo;Last 3 months&rdquo; as the window only has data for 3 periods &mdash; the first period&rsquo;s average will be based on just 1 value. Use &ldquo;Last 12 months&rdquo; to give the average enough runway.</li>
+</ul>
+
+<h3>Filters, named lists, and parameters</h3>
+<ul>
+  <li>Use <code>safe_div()</code> in the advanced editor for all division to avoid divide-by-zero errors.</li>
+  <li>For KPIs shared across teams, prefer parameters over hard-coded filters. One KPI definition with a <code>$Region</code> parameter replaces five region-specific KPI clones.</li>
+  <li>Use named lists whenever you find yourself typing the same set of values into multiple KPIs. The named list becomes the single source of truth.</li>
+  <li>&ldquo;Top N&rdquo; named lists are ideal for concentration analysis. Combine &ldquo;in Top 10&rdquo; and &ldquo;not in Top 10&rdquo; filters on separate KPIs to see head vs tail behaviour.</li>
+  <li>Combine multiple filters with care. Filters use AND logic: &ldquo;Country = Germany AND Segment = Enterprise&rdquo; means the KPI only includes German enterprise customers. If you accidentally over-filter, the KPI may return null (no matching data).</li>
+</ul>
+
+<h3>Performance and evaluation</h3>
+<ul>
+  <li>Use the <strong>Preview</strong> button frequently while building. It catches configuration errors early.</li>
+  <li>Click <strong>Show SQL</strong> after preview to verify the generated query makes sense.</li>
+  <li>For composite KPIs, create child KPIs first, then create the parent with <code>kpi(&quot;Child1&quot;) * literal(0.5) + kpi(&quot;Child2&quot;) * literal(0.5)</code> in the advanced editor.</li>
+  <li>If a preview returns null, check: (1) does the time window cover dates that actually have data? (2) do the filter values exist in the data? (3) is the measure populated for the filtered slice?</li>
+</ul>
+
+<h3>Governance</h3>
+<ul>
+  <li>Certify KPIs once they are validated and approved for organisational use.</li>
+  <li>Use display folders to group related KPIs (e.g. &ldquo;Finance / Revenue&rdquo;, &ldquo;Ops / Delivery&rdquo;).</li>
+  <li>Add descriptions explaining the business meaning, not the technical formula. &ldquo;Percentage of orders delivered within 5 business days&rdquo; is better than &ldquo;SLA compliance where days_to_deliver &lt;= 5&rdquo;.</li>
+</ul>
+
+<h2>Related</h2>
+<ul>
+  <li><a href="../concepts/kpis.html">KPIs (concept)</a> &mdash; full conceptual reference including expression language, scorecard, alerts, and agent integration.</li>
+  <li><a href="define-measures.html">Define Measures</a> &mdash; create the measures that KPIs reference.</li>
+  <li><a href="named-sets.html">Named Lists</a> &mdash; reusable dimension member selections.</li>
+  <li><a href="impact-analysis.html">Impact Analysis</a> &mdash; check where KPIs are used downstream.</li>
+</ul>
+
+<nav class="page-nav"><a href="named-sets.html" class="page-nav-btn prev">&larr; Named Lists</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="data-preview.html" class="page-nav-btn next">Data Preview &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

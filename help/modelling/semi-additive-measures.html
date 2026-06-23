@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Semi-Additive Measures — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Semi-Additive Measures</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-24</span></div>
+<h1>Semi-Additive Measures</h1>
+<h2>What this covers</h2>
+<p>Some numbers should never be added up across time. This page explains what semi-additive measures are, why they matter, and how to configure them so that Excel PivotTables, query results, and dashboards show correct subtotals and grand totals.</p>
+
+<h2>What "additive" means</h2>
+<p>Most business measures are <strong>additive</strong>: you can safely sum them across any dimension. Revenue earned in January plus revenue earned in February equals revenue for Q1. Revenue from the US plus revenue from Europe equals global revenue. Adding up works in every direction.</p>
+
+<h2>What "semi-additive" means</h2>
+<p>Some measures are <strong>semi-additive</strong>: they can be summed across most dimensions, but <strong>not across time</strong>. The most common examples:</p>
+<table>
+<thead><tr><th>Measure</th><th>Why you cannot sum across time</th></tr></thead>
+<tbody>
+<tr><td><strong>Account balance</strong></td><td>Your bank balance on Jan 31 plus your balance on Feb 28 does not equal your Q1 balance. Your Q1 balance is the Feb 28 number (the last value).</td></tr>
+<tr><td><strong>Headcount</strong></td><td>If you had 100 employees in January and 105 in February, your Q1 headcount is 105, not 205.</td></tr>
+<tr><td><strong>Inventory on hand</strong></td><td>500 units on Jan 31 plus 480 on Feb 28 does not equal 980 for Q1. The answer is 480.</td></tr>
+<tr><td><strong>Open support tickets</strong></td><td>42 open tickets on Monday plus 38 on Tuesday does not mean 80 total. The point-in-time count is what matters.</td></tr>
+</tbody>
+</table>
+
+<h3>What goes wrong when you sum a semi-additive measure</h3>
+<p>Imagine a simple bank account balance over three months:</p>
+<table>
+<thead><tr><th>Month</th><th>Balance</th></tr></thead>
+<tbody>
+<tr><td>January</td><td>$100</td></tr>
+<tr><td>February</td><td>$150</td></tr>
+<tr><td>March</td><td>$200</td></tr>
+</tbody>
+</table>
+<p>If Tessallite sums these to produce a Q1 subtotal, the PivotTable would show <strong>$450</strong>. That is wrong &mdash; the real Q1 ending balance is <strong>$200</strong>. The analyst sees $450, believes it, and makes a decision based on an inflated number. This is the core risk of misconfigured aggregation.</p>
+
+<h2>Aggregation types</h2>
+<p>Tessallite supports six aggregation types. Choose the one that matches the business meaning of your measure:</p>
+<table>
+<thead><tr><th>Aggregation</th><th>Subtotal behaviour</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><strong>sum</strong></td><td>Add up all values.</td><td>Revenue, quantity sold, cost, transactions.</td></tr>
+<tr><td><strong>last_non_empty</strong></td><td>Take the last non-null value along the time axis. Sum across non-time dimensions.</td><td>Account balance, headcount, inventory, any point-in-time snapshot.</td></tr>
+<tr><td><strong>max</strong></td><td>Take the maximum value.</td><td>Peak concurrent users, highest temperature, record high.</td></tr>
+<tr><td><strong>min</strong></td><td>Take the minimum value.</td><td>Lowest temperature, minimum stock level.</td></tr>
+<tr><td><strong>count_distinct</strong></td><td>Count unique values (not composable &mdash; re-queries the source).</td><td>Unique customers, unique products sold.</td></tr>
+<tr><td><strong>average</strong></td><td>Compute the weighted average (not composable &mdash; re-queries the source).</td><td>Average order value, average response time.</td></tr>
+</tbody>
+</table>
+
+<blockquote><strong>By Account is not yet available.</strong> You may see a <strong>By Account</strong> behaviour listed in the semi-additive dropdown shown as <em>(not yet supported)</em> and greyed out. This mode would let each account in an account dimension carry its own additivity rule (some accounts sum over time, some take the last balance). The per-account aggregation engine is not implemented yet, so the option is disabled and a query that uses it is rejected with a clear message rather than returning a wrong number. Use <strong>last_non_empty</strong> for balance-style accounts in the meantime.</blockquote>
+
+<h2>How to configure a semi-additive measure</h2>
+<ol>
+<li>Open the model in the <strong>Model Builder</strong>.</li>
+<li>Select the measure in the <strong>Measures</strong> panel.</li>
+<li>Change the <strong>Default aggregation</strong> dropdown from <code>sum</code> to the correct type (e.g., <code>last_non_empty</code> for a balance measure).</li>
+<li>Save the model.</li>
+</ol>
+<p>That is all. No Excel-side configuration is needed. When an Excel user creates a PivotTable with this measure, Tessallite automatically applies the correct aggregation for subtotals and grand totals.</p>
+
+<h2>How Excel users see semi-additive measures</h2>
+<p>Excel users do not need to know about semi-additive aggregation. The PivotTable renders subtotals and grand totals using the aggregation type set by the modeller.</p>
+
+<p><strong>Wrong (measure configured as sum):</strong></p>
+<table>
+<thead><tr><th>Month</th><th>Balance</th></tr></thead>
+<tbody>
+<tr><td>January</td><td>$100</td></tr>
+<tr><td>February</td><td>$150</td></tr>
+<tr><td>March</td><td>$200</td></tr>
+<tr><td><strong>Q1 Subtotal</strong></td><td><strong>$450</strong></td></tr>
+</tbody>
+</table>
+
+<p><strong>Correct (measure configured as last_non_empty):</strong></p>
+<table>
+<thead><tr><th>Month</th><th>Balance</th></tr></thead>
+<tbody>
+<tr><td>January</td><td>$100</td></tr>
+<tr><td>February</td><td>$150</td></tr>
+<tr><td>March</td><td>$200</td></tr>
+<tr><td><strong>Q1 Subtotal</strong></td><td><strong>$200</strong></td></tr>
+</tbody>
+</table>
+
+<p>The only difference is the modeller's aggregation setting. The Excel user sees correct numbers without any manual intervention.</p>
+
+<h2>How it works internally</h2>
+<p>When Tessallite generates subtotals for a PivotTable, the subtotal engine reads each measure's aggregation type from the model metadata. For <code>sum</code>, <code>min</code>, and <code>max</code>, subtotals are computed from the detail rows already fetched. For <code>last_non_empty</code>, the engine identifies the time dimension in the query, finds the last non-null value along that axis for each partition, and uses that as the subtotal. For <code>count_distinct</code> and <code>average</code>, the engine issues a supplementary query to the source database at the subtotal grain, because these aggregations are not composable from pre-aggregated rows.</p>
+
+<h2>Common mistakes</h2>
+<table>
+<thead><tr><th>Mistake</th><th>Consequence</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Leaving a balance measure as <code>sum</code></td><td>Subtotals show inflated numbers</td><td>Change to <code>last_non_empty</code></td></tr>
+<tr><td>Using <code>last_non_empty</code> for a revenue measure</td><td>Subtotals show only the last period's revenue, not the total</td><td>Change to <code>sum</code></td></tr>
+<tr><td>Using <code>average</code> when you mean <code>sum / count</code></td><td>Subtotals may differ from a calculated ratio</td><td>Use a calculated measure for ratios</td></tr>
+</tbody>
+</table>
+
+<h2>Related</h2>
+<ul>
+<li><a href="define-measures.html">Define Measures</a></li>
+<li><a href="calculated-measures.html">Calculated Measures</a></li>
+<li><a href="configure-aggregates.html">Configure Aggregates</a></li>
+</ul>
+<nav class="page-nav"><a href="define-measures.html" class="page-nav-btn prev">&larr; Define Measures</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="calculated-measures.html" class="page-nav-btn next">Calculated Measures &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Upgrade — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>Upgrade</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Upgrade</h1>
+<h2>What this covers</h2>
+<p>How to upgrade a running Tessallite installation to a new version for both local (Docker Compose) and GCP deployments. Includes database backup, image update, health verification, and rollback procedure.</p>
+<blockquote><strong>Warning:</strong> Always back up the internal PostgreSQL database before upgrading. A new version may apply schema migrations that cannot be reversed automatically.</blockquote>
+<h2>Local upgrade (Docker Compose)</h2>
+<ol><li><strong>Back up the internal database.</strong></li></ol>
+<p>``<code>bash docker compose exec postgres pg_dump -U tessallite tessallite &gt; backup.sql </code>`<code> Store </code>backup.sql` outside the Docker volume before continuing.</p>
+<ol><li><strong>Pull the new images.</strong></li></ol>
+<p>``<code>bash docker compose pull </code>``</p>
+<ol><li><strong>Apply the new containers.</strong></li></ol>
+<p>``<code>bash docker compose up -d </code>`` Docker Compose restarts each service with the new image in dependency order.</p>
+<ol><li><strong>Verify service health.</strong></li></ol>
+<p>``<code>bash docker compose ps </code>`<code> All services should show status </code>Up<code>. For any service showing </code>Exit<code> or </code>Restarting<code>: </code>`<code>bash docker compose logs -f SERVICE_NAME </code>``</p>
+<ol><li><strong>Verify the database migration version.</strong></li></ol>
+<p>``<code>bash curl http://localhost:3000/api/health </code>`<code> Confirm the </code>db_migration` field matches the expected version in the release notes.</p>
+<h2>GCP upgrade (Cloud Run)</h2>
+<ol><li><strong>Back up Cloud SQL.</strong></li></ol>
+<p>``<code>bash gcloud sql backups create --instance=INSTANCE_NAME </code>`` Verify the backup appears in the Cloud SQL backups list before continuing.</p>
+<ol><li><strong>Update each service image.</strong> For each Cloud Run service:</li></ol>
+<p>``<code>bash gcloud run services update SERVICE_NAME \ --image IMAGE_REPOSITORY/SERVICE_NAME:NEW_TAG \ --region REGION </code>`` Update in this order: model-service, query-router, optimizer, scheduler, frontend, gateway.</p>
+<ol><li><strong>Verify each service after update.</strong></li></ol>
+<p>``<code>bash curl https://SERVICE_URL/api/health </code>`<code> Confirm </code>{&quot;status&quot;:&quot;ok&quot;}` before updating the next service.</p>
+<ol><li><strong>Verify the migration version</strong> on the frontend service:</li></ol>
+<p>``<code>bash curl https://FRONTEND_URL/api/health </code>`<code> Confirm the </code>db_migration` field matches the expected version.</p>
+<h2>Rollback</h2>
+<p>If a service fails after upgrade:</p>
+<ul><li><strong>Local:</strong> Pin the previous image tag in <code>docker-compose.yml</code>, run <code>docker compose up -d</code>, then restore:</li></ul>
+<p>``<code>bash docker compose exec -T postgres psql -U tessallite tessallite &lt; backup.sql </code>``</p>
+<ul><li><strong>GCP:</strong> Roll back the Cloud Run revision from the Cloud Console (Revisions tab &gt; select previous revision &gt; Send all traffic). Then restore Cloud SQL from the manual backup created in step 1.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="teardown.html">Teardown</a></li><li><a href="deploy-local.html">Deploy Locally</a></li><li><a href="deploy-gcp.html">Deploy on GCP</a></li><li><a href="../integrations/jdbc-connection-guide.html">JDBC Connection Guide</a></li></ul>
+<nav class="page-nav"><a href="teardown.html" class="page-nav-btn prev">&larr; Teardown</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="../integrations/jdbc-connection-guide.html" class="page-nav-btn next">JDBC Connection Guide &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

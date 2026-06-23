@@ -1,0 +1,412 @@
+"""
+Model CRUD routes.
+
+Role requirements:
+  GET (list / get)  → viewer+
+  POST              → modeler+
+  PATCH             → modeler+
+  DELETE            → admin
+"""
+from __future__ import annotations
+
+import secrets
+from typing import Any
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func, select
+
+from shared.audit.logger import audit
+from shared.webhooks.dispatcher import emit_webhook
+from shared.db.models import (
+    AggregateDefinition,
+    DataSource,
+    Model,
+    ModelVersion,
+    ProjectConnection,
+)
+from src.api._cascade_delete import delete_model_cascade
+from shared.db.session import get_tenant_db
+from shared.schemas.pydantic_models import ModelCreate, ModelResponse, ModelUpdate
+from src.auth.middleware import CurrentEmbedUser, CurrentUser, enforce_model_scope, get_current_user
+from src.auth.rbac import require_role
+from src.licensing_guard import enforce_create_cap
+
+router = APIRouter(prefix="/projects/{project_id}/models", tags=["models"])
+
+
+def _enforce_embed_project_scope(current_user: CurrentUser, project_id: UUID) -> None:
+    """Block embed users whose project_ids claim excludes this project."""
+    if isinstance(current_user, CurrentEmbedUser):
+        if current_user.project_ids is not None:
+            if str(project_id).lower() not in [p.lower() for p in current_user.project_ids]:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Embed token does not grant access to this project",
+                )
+
+
+async def _build_trust_meta(db, model: Model) -> dict:
+    """Phase 5 of the semantic-layer plan: assemble the freshness / source /
+    owner trust signals the gateway uses to render Excel column tooltips
+    and synthetic info measures.
+
+    `last_refreshed_at` is the most recent aggregate refresh timestamp on
+    the model, falling back to the model's own updated_at if there are no
+    aggregates yet. `source_system` is the connection type of the model's
+    first DataSource. `owner` is empty until a future iteration adds an
+    owner column to the Model entity.
+    """
+    last_refreshed = None
+    agg_result = await db.execute(
+        select(AggregateDefinition.last_refreshed_at)
+        .where(AggregateDefinition.model_id == model.id)
+        .where(AggregateDefinition.last_refreshed_at.is_not(None))
+        .order_by(AggregateDefinition.last_refreshed_at.desc())
+        .limit(1)
+    )
+    last_refreshed_row = agg_result.scalar_one_or_none()
+    if last_refreshed_row is not None:
+        last_refreshed = last_refreshed_row.isoformat()
+    else:
+        last_refreshed = model.updated_at.isoformat() if model.updated_at else None
+
+    source_system: str | None = None
+    src_result = await db.execute(
+        select(DataSource).where(DataSource.model_id == model.id).limit(1)
+    )
+    src = src_result.scalar_one_or_none()
+    if src is not None:
+        conn = await db.get(ProjectConnection, src.project_connection_id)
+        source_system = conn.connection_type if conn else src.source_type
+
+    return {
+        "last_refreshed_at": last_refreshed,
+        "source_system": source_system,
+        "owner": "",
+    }
+
+
+def _attach_trust(meta: dict, response: ModelResponse) -> ModelResponse:
+    response.trust_meta = meta
+    return response
+
+
+async def _resolve_version_numbers(
+    db, model: Model
+) -> tuple[int | None, int | None]:
+    """Return (last_saved_version_number, deployed_version_number).
+
+    Both are None when the model has no saved versions. The deployed number
+    is None when the model is undeployed even if saves exist. The frontend
+    toolbar chip ("Saved v5", "Deployed v3") renders directly from these.
+    """
+    last_saved_row = await db.execute(
+        select(ModelVersion.version_number)
+        .where(ModelVersion.model_id == model.id)
+        .order_by(ModelVersion.version_number.desc())
+        .limit(1)
+    )
+    last_saved = last_saved_row.scalar_one_or_none()
+
+    deployed_number: int | None = None
+    if model.deployed_version_id is not None:
+        deployed_row = await db.execute(
+            select(ModelVersion.version_number).where(
+                ModelVersion.id == model.deployed_version_id
+            )
+        )
+        deployed_number = deployed_row.scalar_one_or_none()
+
+    return last_saved, deployed_number
+
+
+async def _decorate_response(db, model: Model) -> ModelResponse:
+    response = ModelResponse.model_validate(model)
+    last_saved, deployed_number = await _resolve_version_numbers(db, model)
+    response.last_saved_version_number = last_saved
+    response.deployed_version_number = deployed_number
+    return _attach_trust(await _build_trust_meta(db, model), response)
+
+
+@router.post(
+    "",
+    response_model=ModelResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[require_role("modeler")],
+)
+async def create_model(
+    project_id: UUID,
+    body: ModelCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> ModelResponse:
+    async for db in get_tenant_db(current_user.tenant_id):
+        async def _count_models() -> int:
+            # Total models across the whole own tenant (all projects), not per project.
+            r = await db.execute(select(func.count()).select_from(Model))
+            return int(r.scalar() or 0)
+
+        await enforce_create_cap("model", _count_models)
+
+        existing = await db.execute(
+            select(Model).where(Model.project_id == project_id, Model.slug == body.slug)
+        )
+        existing_model = existing.scalar_one_or_none()
+        if existing_model:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Model with slug '{body.slug}' already exists",
+            )
+        # seed is a 12-char random string used for deterministic aggregate naming
+        seed = secrets.token_hex(6)  # 6 bytes = 12 hex chars
+        payload = body.model_dump(exclude_none=True)
+        payload["display_name"] = payload.get("display_name") or body.slug
+        payload["status"] = "active"
+        model = Model(project_id=project_id, seed=seed, **payload)
+        db.add(model)
+        await db.flush()
+        await audit(
+            db, action="model.create", severity="info",
+            actor_email=current_user.email,
+            target_type="model", target_id=model.id,
+            target_name=model.display_name,
+        )
+        await db.commit()
+        await db.refresh(model)
+        return await _decorate_response(db, model)
+
+
+async def _decorate_models_batch(db, models: list[Model]) -> list[ModelResponse]:
+    """Decorate many models with O(1) grouped queries instead of O(5/model).
+
+    F-013-12: ``_decorate_response`` runs 2 version queries + 2 trust-meta
+    queries per model. On a project with N models, ``GET /models`` issued 4N+
+    round-trips, and the gateway fans this out per project on XMLA catalog
+    discovery. This batches the version-number lookup, the latest-refresh
+    lookup, and the source/connection lookup into one query each across all
+    models in the project, then assembles per-model responses in memory.
+    """
+    if not models:
+        return []
+    model_ids = [m.id for m in models]
+
+    # 1. Last-saved version number per model (max version_number).
+    last_saved_rows = await db.execute(
+        select(
+            ModelVersion.model_id,
+            func.max(ModelVersion.version_number),
+        )
+        .where(ModelVersion.model_id.in_(model_ids))
+        .group_by(ModelVersion.model_id)
+    )
+    last_saved_by_model: dict[UUID, int] = {
+        mid: n for mid, n in last_saved_rows.all()
+    }
+
+    # 2. Deployed version number per model (only for models with a pointer).
+    deployed_pointer_ids = [
+        m.deployed_version_id for m in models if m.deployed_version_id is not None
+    ]
+    deployed_number_by_version: dict[UUID, int] = {}
+    if deployed_pointer_ids:
+        dep_rows = await db.execute(
+            select(ModelVersion.id, ModelVersion.version_number).where(
+                ModelVersion.id.in_(deployed_pointer_ids)
+            )
+        )
+        deployed_number_by_version = {vid: n for vid, n in dep_rows.all()}
+
+    # 3. Latest aggregate refresh timestamp per model.
+    refresh_rows = await db.execute(
+        select(
+            AggregateDefinition.model_id,
+            func.max(AggregateDefinition.last_refreshed_at),
+        )
+        .where(
+            AggregateDefinition.model_id.in_(model_ids),
+            AggregateDefinition.last_refreshed_at.is_not(None),
+        )
+        .group_by(AggregateDefinition.model_id)
+    )
+    last_refresh_by_model: dict[UUID, Any] = {
+        mid: ts for mid, ts in refresh_rows.all()
+    }
+
+    # 4. First DataSource per model + its connection type. Fetch all sources
+    #    for the project's models, then resolve connection types in one pass.
+    src_rows = await db.execute(
+        select(DataSource).where(DataSource.model_id.in_(model_ids))
+    )
+    first_source_by_model: dict[UUID, DataSource] = {}
+    for src in src_rows.scalars().all():
+        # ORM has no created_at ordering guarantee here, but trust-meta only
+        # needs *a* source; keep the first seen per model (matches the prior
+        # single-row `.limit(1)` behaviour, which was itself unordered).
+        first_source_by_model.setdefault(src.model_id, src)
+    conn_ids = {
+        s.project_connection_id for s in first_source_by_model.values()
+    }
+    conn_type_by_id: dict[UUID, str] = {}
+    if conn_ids:
+        conn_rows = await db.execute(
+            select(ProjectConnection.id, ProjectConnection.connection_type).where(
+                ProjectConnection.id.in_(conn_ids)
+            )
+        )
+        conn_type_by_id = {cid: ctype for cid, ctype in conn_rows.all()}
+
+    out: list[ModelResponse] = []
+    for m in models:
+        response = ModelResponse.model_validate(m)
+        response.last_saved_version_number = last_saved_by_model.get(m.id)
+        response.deployed_version_number = (
+            deployed_number_by_version.get(m.deployed_version_id)
+            if m.deployed_version_id is not None
+            else None
+        )
+        ts = last_refresh_by_model.get(m.id)
+        if ts is not None:
+            last_refreshed = ts.isoformat()
+        else:
+            last_refreshed = m.updated_at.isoformat() if m.updated_at else None
+        src = first_source_by_model.get(m.id)
+        source_system: str | None = None
+        if src is not None:
+            source_system = conn_type_by_id.get(
+                src.project_connection_id, src.source_type
+            )
+        meta = {
+            "last_refreshed_at": last_refreshed,
+            "source_system": source_system,
+            "owner": "",
+        }
+        out.append(_attach_trust(meta, response))
+    return out
+
+
+@router.get("", response_model=list[ModelResponse])
+async def list_models(
+    project_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    _: None = require_role("viewer"),
+) -> list[ModelResponse]:
+    _enforce_embed_project_scope(current_user, project_id)
+    async for db in get_tenant_db(current_user.tenant_id):
+        result = await db.execute(
+            select(Model).where(Model.project_id == project_id).order_by(Model.slug)
+        )
+        models = result.scalars().all()
+        embed_ids = None
+        if isinstance(current_user, CurrentEmbedUser) and current_user.model_ids:
+            embed_ids = set(current_user.model_ids)
+        visible = [
+            m for m in models
+            if embed_ids is None or str(m.id) in embed_ids
+        ]
+        return await _decorate_models_batch(db, visible)
+
+
+@router.get("/{model_id}", response_model=ModelResponse)
+async def get_model(
+    project_id: UUID,
+    model_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    _: None = require_role("viewer"),
+) -> ModelResponse:
+    _enforce_embed_project_scope(current_user, project_id)
+    enforce_model_scope(current_user, str(model_id))
+    async for db in get_tenant_db(current_user.tenant_id):
+        m = await db.get(Model, model_id)
+        if m is None or m.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Model not found")
+        return await _decorate_response(db, m)
+
+
+@router.patch(
+    "/{model_id}",
+    response_model=ModelResponse,
+    dependencies=[require_role("modeler")],
+)
+async def update_model(
+    project_id: UUID,
+    model_id: UUID,
+    body: ModelUpdate,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> ModelResponse:
+    async for db in get_tenant_db(current_user.tenant_id):
+        m = await db.get(Model, model_id)
+        if m is None or m.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Model not found")
+        updates = body.model_dump(exclude_unset=True)
+        old_slug = m.slug
+        new_slug = updates.get("slug")
+        if new_slug and new_slug != old_slug:
+            existing = await db.execute(
+                select(Model).where(
+                    Model.project_id == project_id,
+                    Model.slug == new_slug,
+                    Model.id != model_id,
+                )
+            )
+            existing_model = existing.scalar_one_or_none()
+            if existing_model:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Model with slug '{new_slug}' already exists",
+                )
+            if "display_name" not in updates and (not m.display_name or m.display_name == old_slug):
+                updates["display_name"] = new_slug
+        if "display_name" in updates and (updates["display_name"] is None or not str(updates["display_name"]).strip()):
+            updates["display_name"] = new_slug or m.slug
+        for key, val in updates.items():
+            setattr(m, key, val)
+        await audit(
+            db, action="model.update", severity="info",
+            actor_email=current_user.email,
+            target_type="model", target_id=m.id,
+            target_name=m.display_name,
+            detail={"fields": list(updates.keys())},
+        )
+        await db.commit()
+        await db.refresh(m)
+        return await _decorate_response(db, m)
+
+
+@router.delete(
+    "/{model_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    # Model deletion is a model-level setup action: a project modeller owns the
+    # full model lifecycle (create/edit/deploy/delete). Tenant/project admins
+    # inherit it. Project rename/disable/delete stay above modeller — see the
+    # Explorer RBAC matrix (docs/architecture/architecture_explorer-rbac-matrix.md).
+    dependencies=[require_role("modeler")],
+)
+async def delete_model(
+    project_id: UUID,
+    model_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+) -> None:
+    async for db in get_tenant_db(current_user.tenant_id):
+        m = await db.get(Model, model_id)
+        if m is None or m.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Model not found")
+        model_name = m.display_name
+        errors = await delete_model_cascade(db, model_id)
+        if errors:
+            await db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model deletion failed at: {'; '.join(errors)}",
+            )
+        await audit(
+            db, action="model.delete", severity="critical",
+            actor_email=current_user.email,
+            target_type="model", target_id=model_id,
+            target_name=model_name,
+        )
+        await db.commit()
+        await emit_webhook(current_user.tenant_id, "model.deleted", {
+            "model_id": str(model_id),
+            "model_name": model_name,
+            "actor": current_user.email,
+        })

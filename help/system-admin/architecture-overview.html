@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Architecture Overview — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>Architecture Overview</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-05-23</span></div>
+    <h1>Architecture Overview</h1>
+<figure class="illustration"><img class="illustration" src="../assets/illustrations/architecture-overview.svg" alt="Architecture diagram showing the seven Tessallite services, the internal PostgreSQL database, the optional monitoring stack, and their connections to external BI tools and user data sources."></figure>
+
+<h2>What this covers</h2>
+<p>The seven services that make up the Tessallite platform, the internal database, the optional monitoring stack, how data flows through the system, multi-tenant isolation, and where aggregates and pocket tables are physically stored.</p>
+
+<h2>Clients</h2>
+<p>Five types of client connect to the platform:</p>
+<table>
+<thead><tr><th>Client</th><th>Protocol</th><th>Connects to</th></tr></thead>
+<tbody>
+<tr><td><strong>BI tools</strong> (DBeaver, Tableau, Superset, psycopg2)</td><td>JDBC (port 5433)</td><td>gateway</td></tr>
+<tr><td><strong>Excel via XMLA</strong> (PivotTables, Power BI)</td><td>XMLA/HTTP (port 8080)</td><td>gateway</td></tr>
+<tr><td><strong>Excel Add-in</strong> (Office.js task pane)</td><td>HTTPS (port 3443)</td><td>frontend (nginx proxy)</td></tr>
+<tr><td><strong>Conversational Client</strong> (standalone chat app)</td><td>HTTP</td><td>model-service (auth), agent-service (chat)</td></tr>
+<tr><td><strong>Tessallite Frontend</strong> (browser SPA)</td><td>HTTP/HTTPS (port 3000/3443)</td><td>frontend (nginx proxy to all services)</td></tr>
+</tbody>
+</table>
+<p>The <strong>Excel Add-in</strong> is a React-based Office.js task pane (<code>excel-plugin/</code>) embedded inside Excel. It provides a Report Builder, Ask Tessallite chat panel, CUBE formula wizard, drill-through, persona switching, and query trace.</p>
+<p>The <strong>Conversational Client</strong> is a standalone chat-first web application (<code>conversational-client/</code>) with a Flask SSE proxy backend and a React/MUI frontend. It connects directly to model-service for authentication and agent-service for conversations, or through the frontend proxy.</p>
+
+<h2>Service map</h2>
+<pre><code>Clients
+  |-- BI tools (DBeaver, Tableau, Superset) ---&gt; gateway :5433 JDBC
+  |-- Excel PivotTables / Power BI -----------&gt; gateway :8080 XMLA
+  |-- Excel Add-in --------------------------&gt; frontend :3443 HTTPS
+  |-- Conversational Client ------------------&gt; model-service / agent-service
+  +-- Tessallite Frontend (browser) ----------&gt; frontend :3000 HTTP
+                                                    |
+                      nginx reverse proxy to all backend services
+                                                    |
+              +-------------+-------------+-------------+-------------+
+              |             |             |             |             |
+        model-service query-router   optimizer    scheduler   agent-service
+           :8001        :8000         :8000        :8000        :8000
+
+                                    [ PostgreSQL :5432 ]
+
+Optional (standalone Docker Compose in monitoring/):
+  [ prometheus :9090 ]       Metrics collection (scrapes all 7 services)
+  [ grafana    :3001 ]       Dashboard UI (21 panels, 3 sections)
+</code></pre>
+
+<h2>Services</h2>
+
+<h3>gateway</h3>
+<p>The public entry point for query traffic from BI tools. Exposes two protocol endpoints:</p>
+<ul>
+<li><strong>JDBC</strong> (port 5433) &mdash; a PostgreSQL wire protocol listener for DBeaver, Tableau, Superset, psycopg2, and other JDBC-compatible tools.</li>
+<li><strong>XMLA</strong> (port 8080) &mdash; an HTTP/SOAP endpoint for Excel and Power BI. Handles DISCOVER (catalogue browsing) and EXECUTE (DAX/MDX queries).</li>
+</ul>
+<p>Gateway authenticates callers via Basic auth or Bearer JWT, translates incoming queries, and forwards them to query-router. Personas are resolved from the JDBC <code>dbname</code> or XMLA <code>Catalog</code> property.</p>
+
+<h3>model-service</h3>
+<p>The semantic layer and platform API (port 8001). This is the central API server that external clients (conversational client, Excel add-in, embed consumers, MCP server) connect to for authentication, model metadata, and management operations. Stores and serves all model metadata: projects, connections, tables, joins, dimensions, measures, hierarchies, aggregates, pocket tables, personas, row-security rules, data-quality rules, alerts, and audit logs. Provides authentication, RBAC, user management, import/export, and the embed token API. In local Docker deployment, reached through the frontend nginx proxy. In GCP Cloud Run, runs as a standalone public service.</p>
+
+<h3>query-router</h3>
+<p>Receives queries from gateway, the frontend, the Excel add-in, and the agent (port 8000). Parses SQL or DAX, binds to the semantic model, applies persona gates and row-security filters, checks for matching aggregates or pocket tables, rewrites the query if a faster route exists, executes against the data source, and returns results with a route trace.</p>
+
+<h3>optimizer</h3>
+<p>Reads the query miss log and scores candidate aggregates by ROI (port 8000). When a candidate exceeds the score threshold, it surfaces as a build recommendation. AI-assisted mode uses an LLM to analyze miss patterns.</p>
+
+<h3>scheduler</h3>
+<p>Builds and refreshes aggregate and pocket tables in the user's target schema (port 8000). Two refresh modes: full (DROP + CTAS) and incremental (watermark-based DELETE + INSERT). Runs on configurable cron schedules with hourly schema drift detection and daily retirement sweeps.</p>
+
+<h3>agent-service</h3>
+<p>The conversational AI backend (port 8000). Translates natural-language questions into semantic queries via the query-router pipeline and returns answers with citations and chart visualisations. Supports Claude, GPT, and Gemini with session memory, judge rubrics, cross-model recipes, and glossary alias maps.</p>
+
+<h3>frontend</h3>
+<p>Web management interface (ports 3000/3443). Nginx serves a React 18 + MUI SPA with the Workspace Explorer, Model Builder canvas, Query panel, Agent chat, and Admin panels. Nginx proxies all API calls to backend services so the browser never makes cross-origin requests.</p>
+
+<h2>Internal PostgreSQL database</h2>
+<p>Tessallite runs its own PostgreSQL 15 instance (port 5432, internal only) with a multi-schema architecture:</p>
+<table>
+<thead><tr><th>Schema</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>tessallite_system</code></td><td>Platform-level metadata: system tenants, revoked embed tokens</td></tr>
+<tr><td><code>&lt;tenant&gt;_meta</code></td><td>Per-tenant model metadata: projects, connections, models, dimensions, measures, aggregates, query logs, alerts, audit trail</td></tr>
+<tr><td><code>&lt;tenant&gt;_aggregates</code></td><td>Per-tenant materialised aggregate and pocket tables (when target is internal DB)</td></tr>
+</tbody>
+</table>
+<blockquote>The internal PostgreSQL database is not exposed outside the container network. No BI tool or user application should connect to it directly.</blockquote>
+
+<h2>Multi-tenant isolation</h2>
+<p>Each tenant gets its own PostgreSQL schemas. Connection credentials are Fernet-encrypted. Tenant resolution happens via JWT claims or JDBC <code>dbname</code> parameter. Tenants cannot access each other's schemas.</p>
+
+<h2>Data flow</h2>
+<ol>
+<li>A BI tool sends a query to <strong>gateway</strong> via JDBC or XMLA.</li>
+<li>Gateway authenticates the caller and translates the query.</li>
+<li>Gateway forwards the translated query to <strong>query-router</strong>.</li>
+<li>Query-router parses, binds to the semantic model, and applies persona/security gates.</li>
+<li>Query-router checks for aggregate/pocket matches:
+  <ul>
+    <li><strong>Match found:</strong> rewrites query to target the pre-built table.</li>
+    <li><strong>No match:</strong> routes to raw source tables and records a miss.</li>
+  </ul>
+</li>
+<li>Query-router executes and returns results through gateway to the BI tool.</li>
+</ol>
+<p>In parallel: <strong>optimizer</strong> reads the miss log to score candidates; <strong>scheduler</strong> refreshes aggregates on cron; <strong>agent-service</strong> handles natural-language queries.</p>
+
+<h2>Where aggregates and pocket tables live</h2>
+<p>Aggregate and pocket tables are written to the <strong>user's own data source</strong> in the configured target schema. Tessallite stores only the definition and build status. Supported targets: PostgreSQL, BigQuery, Spark/Hive, SQL Server.</p>
+
+<h2>Stateless service design</h2>
+<p>All seven services keep no local state. All persistent state lives in PostgreSQL. Any service can be stopped, restarted, or scaled without data loss.</p>
+
+<h2>Optional monitoring stack</h2>
+<p>A standalone Prometheus + Grafana stack in <code>monitoring/</code> at the workspace root. Runs as its own Docker Compose project, connected via the shared <code>tessallite_net</code> network. Scrapes all 7 services with 21-panel Grafana dashboard covering service health, query routing, and per-model usage. Entirely optional. See <a href="monitoring-stack.html">Monitoring Stack</a>.</p>
+
+<h2>Port summary</h2>
+<table>
+<thead><tr><th>Service</th><th>Port</th><th>Protocol</th><th>Used by</th></tr></thead>
+<tbody>
+<tr><td>gateway (JDBC)</td><td>5433</td><td>PostgreSQL wire</td><td>BI tools via JDBC</td></tr>
+<tr><td>gateway (XMLA)</td><td>8080</td><td>HTTP/XMLA</td><td>Excel, Power BI via XMLA</td></tr>
+<tr><td>frontend</td><td>3000 / 3443</td><td>HTTP / HTTPS</td><td>All users (web browser)</td></tr>
+<tr><td>model-service</td><td>8001</td><td>HTTP</td><td>Frontend proxy, gateway, agent-service, conversational client, Excel add-in, embed consumers</td></tr>
+<tr><td>query-router</td><td>8000</td><td>HTTP</td><td>Internal</td></tr>
+<tr><td>optimizer</td><td>8000</td><td>HTTP</td><td>Internal</td></tr>
+<tr><td>scheduler</td><td>8000</td><td>HTTP</td><td>Internal</td></tr>
+<tr><td>agent-service</td><td>8000</td><td>HTTP</td><td>Frontend proxy, Excel add-in, conversational client, embed consumers</td></tr>
+<tr><td>PostgreSQL</td><td>5432</td><td>PostgreSQL</td><td>Services only</td></tr>
+<tr><td>Prometheus</td><td>9090</td><td>HTTP</td><td>Monitoring (optional)</td></tr>
+<tr><td>Grafana</td><td>3001</td><td>HTTP</td><td>Monitoring (optional)</td></tr>
+</tbody>
+</table>
+
+<h2>Technology stack</h2>
+<table>
+<thead><tr><th>Concern</th><th>Technology</th></tr></thead>
+<tbody>
+<tr><td>Backend</td><td>Python 3.12, FastAPI, SQLAlchemy 2.0 (async), asyncpg, Pydantic 2</td></tr>
+<tr><td>Query parsing</td><td>sqlglot (SQL), tree-sitter (DAX/MDX)</td></tr>
+<tr><td>Frontend</td><td>TypeScript, React 18, Vite, MUI 5, Zustand, ReactFlow, TanStack Query</td></tr>
+<tr><td>Database</td><td>PostgreSQL 15</td></tr>
+<tr><td>Gateway</td><td>Custom JDBC (PG wire), XMLA/SOAP (HTTP)</td></tr>
+<tr><td>LLM providers</td><td>Claude, GPT, Gemini</td></tr>
+<tr><td>Scheduling</td><td>APScheduler with PostgreSQL advisory locks</td></tr>
+<tr><td>Packaging</td><td>UV, npm, Docker</td></tr>
+<tr><td>Monitoring</td><td>Prometheus, Grafana, nginx-prometheus-exporter</td></tr>
+</tbody>
+</table>
+
+<h2>Related</h2>
+<ul>
+<li><a href="service-reference.html">Service Reference</a></li>
+<li><a href="deploy-local.html">Deploy Locally</a></li>
+<li><a href="deploy-gcp.html">Deploy on GCP</a></li>
+<li><a href="configure-environment-variables.html">Configure Environment Variables</a></li>
+<li><a href="monitoring-stack.html">Monitoring Stack</a></li>
+</ul>
+
+  </main>
+  <footer class="page-nav">
+    <a href="../admin/scheduler-sla.html">&larr; Refresh SLA Declarations</a> |
+    <a href="../index.html">Home</a> |
+    <a href="deploy-local.html">Deploy Locally &rarr;</a>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Roles and Permissions — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Concepts</span> / <span>Roles and Permissions</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin, system-admin</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Roles and Permissions</h1>
+<h2>What this covers</h2>
+<p>This article describes the four roles in Tessallite, what each role can do, and how roles are assigned and take effect.</p>
+<h2>The four roles</h2>
+<h3>System Admin</h3>
+<p>The System Admin manages the Tessallite installation itself. There is one system admin per installation. This role is defined by environment variables set during deployment — it is not stored in the application database and cannot be created or removed through the interface.</p>
+<p>The System Admin can:</p>
+<ul><li>Create and list workspaces</li><li>Create users within any workspace</li><li>Access the System Administration screen</li></ul>
+<p>The System Admin cannot access workspace-level content, including projects, models, and data.</p>
+<h3>Tenant Admin</h3>
+<p>The Tenant Admin manages users and settings within a single workspace. Multiple users in the same workspace can hold the Tenant Admin role.</p>
+<p>The Tenant Admin can:</p>
+<ul><li>Invite and remove users</li><li>Assign roles to users within the workspace</li><li>Configure workspace settings</li></ul>
+<h3>Modeller</h3>
+<p>The Modeller builds and maintains data models. This role is assigned per project within a workspace.</p>
+<p>The Modeller can:</p>
+<ul><li>Create and edit projects and models</li><li>Add data source connections</li><li>Define tables, joins, dimensions, and measures</li><li>Configure aggregates and refresh schedules</li><li>View diagnostics and model health</li><li>Run queries and view results</li></ul>
+<h3>Analyst / Viewer</h3>
+<p>The Analyst connects BI tools and queries data. This role is assigned per project.</p>
+<p>The Analyst can:</p>
+<ul><li>Connect via JDBC or XMLA</li><li>Run queries</li><li>View data returned by the model</li></ul>
+<p>The Analyst cannot:</p>
+<ul><li>Edit models, dimensions, measures, or joins</li><li>Add or remove data sources</li><li>Manage users</li></ul>
+<h2>How roles are assigned</h2>
+<p>The Tenant Admin assigns workspace-level roles (Tenant Admin) from the Admin panel. Project-level roles (Modeller, Viewer) are assigned from the project&#x27;s Access settings.</p>
+<p>Role changes take effect immediately. There is no caching or delay.</p>
+<h2>Role hierarchy</h2>
+<p>Roles are ordered from lowest to highest access:</p>
+<p>Analyst → Modeller → Tenant Admin → System Admin</p>
+<p>A user with a higher role holds all capabilities of the roles below it in the hierarchy.</p>
+<figure class="illustration"><img class="illustration" src="../assets/illustrations/role-hierarchy.svg" alt="Tessallite role hierarchy from least to most access"></figure>
+<h2>Permissions reference</h2>
+<div class="table-wrapper"><table><thead><tr><th>Action</th><th>System Admin</th><th>Tenant Admin</th><th>Modeller</th><th>Analyst</th></tr></thead><tbody><tr><td>Create workspaces</td><td>Yes</td><td>No</td><td>No</td><td>No</td></tr><tr><td>Manage workspace users</td><td>No</td><td>Yes</td><td>No</td><td>No</td></tr><tr><td>Create / edit models</td><td>No</td><td>No</td><td>Yes</td><td>No</td></tr><tr><td>Configure aggregates</td><td>No</td><td>No</td><td>Yes</td><td>No</td></tr><tr><td>Connect BI tools</td><td>No</td><td>No</td><td>Yes</td><td>Yes</td></tr><tr><td>Run queries</td><td>No</td><td>No</td><td>Yes</td><td>Yes</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="../admin/manage-users.html">Manage users</a></li><li><a href="../admin/manage-roles.html">Manage roles</a></li><li><a href="workspaces-and-tenants.html">Workspaces and tenants</a></li></ul>
+<nav class="page-nav"><a href="model-health.html" class="page-nav-btn prev">&larr; Model Health</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="calendar-types.html" class="page-nav-btn next">Calendar Types &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Common Errors — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Troubleshooting</span> / <span>Common Errors</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">all</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Common Errors</h1>
+<h2>What this covers</h2>
+<p>A reference table of error messages returned by Tessallite services and the Gateway, grouped by category.</p>
+<h2>Connection errors</h2>
+<div class="table-wrapper"><table><thead><tr><th>Error message</th><th>Likely cause</th><th>Resolution</th></tr></thead><tbody><tr><td><code>FATAL: database &quot;X&quot; does not exist</code></td><td>Workspace slug wrong in Database field</td><td>Verify slug with Tenant Admin. Slug is case-sensitive.</td></tr><tr><td><code>FATAL: password authentication failed for user &quot;X&quot;</code></td><td>Wrong username or password</td><td>Use Tessallite email and password. Reset via Admin panel if needed.</td></tr><tr><td><code>Connection refused (port 5433)</code></td><td>Gateway not running or wrong host</td><td>Check: <code>docker compose ps gateway</code>. Verify hostname and port.</td></tr><tr><td><code>SSL SYSCALL error: EOF detected</code></td><td>Server requires SSL, client not configured</td><td>Append <code>?sslmode=require</code> to the JDBC URL or enable SSL in client settings.</td></tr></tbody></table></div>
+<h2>Query errors</h2>
+<div class="table-wrapper"><table><thead><tr><th>Error message</th><th>Likely cause</th><th>Resolution</th></tr></thead><tbody><tr><td><code>ERROR: column &quot;X&quot; does not exist</code></td><td>Schema drift — column renamed or removed in source</td><td>Model Builder → Health tab → fix schema drift → re-publish and rebuild aggregates.</td></tr><tr><td><code>ERROR: Query timeout exceeded</code></td><td>Query exceeded workspace timeout</td><td>Increase timeout in Workspace Settings, or ask Modeller to build a matching aggregate.</td></tr><tr><td><code>ERROR: permission denied for schema &quot;X&quot;</code></td><td>DB user lacks read access to source schema</td><td>Grant <code>USAGE</code> on schema and <code>SELECT</code> on tables to the Tessallite database user.</td></tr></tbody></table></div>
+<h2>Aggregate errors</h2>
+<div class="table-wrapper"><table><thead><tr><th>Error message</th><th>Likely cause</th><th>Resolution</th></tr></thead><tbody><tr><td><code>Aggregate build failed: write permission denied</code></td><td>Scheduler cannot write to target schema</td><td>Grant <code>CREATE TABLE</code>, <code>INSERT</code>, <code>DROP TABLE</code> on target schema. See <a href="aggregates-not-building.html">Aggregates Not Building</a>.</td></tr><tr><td><code>Aggregate build failed: source timeout</code></td><td>Source query timed out during aggregate build</td><td>Reduce aggregate grain or increase source query timeout.</td></tr><tr><td><code>Aggregate retired</code></td><td>Optimizer retired unused aggregate</td><td>Re-create manually in Model Builder, or lower the retirement threshold.</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="excel-connection-problems.html">Excel Connection Problems</a></li><li><a href="query-returns-wrong-results.html">Query Returns Wrong Results</a></li><li><a href="aggregates-not-building.html">Aggregates Not Building</a></li><li><a href="service-not-starting.html">Service Not Starting</a></li><li><a href="../integrations/jdbc-connection-guide.html">JDBC Connection Guide</a></li></ul>
+<nav class="page-nav"><a href="service-not-starting.html" class="page-nav-btn prev">&larr; Service Not Starting</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="../index.html" class="page-nav-btn next">Tessallite Help &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

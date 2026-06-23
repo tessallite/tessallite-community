@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Canvas Undo/Redo — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Canvas Undo/Redo</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-06-12</span></div>
+<h1>Canvas Undo/Redo</h1>
+
+<h2>What this covers</h2>
+<p>The Model Canvas records your editing actions and lets you step backwards and forwards through them with <strong>Ctrl+Z</strong> (undo) and <strong>Ctrl+Y</strong> (redo). This page explains what gets tracked, what happens when you reload the page, the keyboard shortcuts, and the toolbar buttons.</p>
+
+<h2>What is tracked</h2>
+<p>One user action equals one undo step. The canvas tracks four kinds of actions:</p>
+<table>
+<thead><tr><th>Action</th><th>What undo does</th></tr></thead>
+<tbody>
+<tr><td><strong>Moving a table</strong> (one drag gesture, however far)</td><td>Puts the table back where the drag started.</td></tr>
+<tr><td><strong>Applying a layout preset</strong> (radial, hierarchical, compact)</td><td>Restores every table to its position before the redraw &mdash; the whole redraw is one step.</td></tr>
+<tr><td><strong>Renaming a table</strong></td><td>Restores the previous display name.</td></tr>
+<tr><td><strong>Creating or deleting a join</strong></td><td>Deletes the created join, or recreates the deleted one.</td></tr>
+</tbody>
+</table>
+<p>The very first drag is immediately undoable &mdash; move a table, press Ctrl+Z, and it snaps back. Undo always reverses the <strong>most recent</strong> action first; pressing it again walks further back, one action at a time. Redo replays the undone actions in order. Making a new change after an undo clears the redo history, just like a text editor.</p>
+
+<h2>How to undo and redo</h2>
+<h3>Keyboard shortcuts</h3>
+<table>
+<thead><tr><th>Shortcut</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><strong>Ctrl+Z</strong> (Windows) / <strong>Cmd+Z</strong> (Mac)</td><td>Undo the most recent action</td></tr>
+<tr><td><strong>Ctrl+Y</strong> (Windows) / <strong>Cmd+Y</strong> (Mac)</td><td>Redo the last undone action</td></tr>
+</tbody>
+</table>
+
+<h3>Toolbar buttons</h3>
+<p>The canvas toolbar shows <strong>Undo</strong> and <strong>Redo</strong> buttons. When there is nothing to undo or redo, the corresponding button is greyed out (disabled). The disabled state updates immediately after each action.</p>
+
+<h2>What survives a reload</h2>
+<p>Two different things are at play here, and they behave differently:</p>
+<ul>
+<li><strong>The result of an undo or redo is saved.</strong> When undo moves a table back, that restored position is written to the model&#x27;s saved layout exactly as if you had dragged it there yourself. Reload the page and the table is still where the undo put it. The same goes for renames and join changes &mdash; they are real model edits.</li>
+<li><strong>The history stack itself is session-scoped.</strong> Refreshing the page or switching models clears the list of steps you could undo or redo. You cannot reload and then undo something from before the reload.</li>
+</ul>
+<p>In practice: undo freely, reload safely &mdash; but do your undoing before you leave the page.</p>
+
+<h2>Limitations</h2>
+<ul>
+<li>Dimension, measure, and other property edits are not undoable from the canvas toolbar &mdash; change them back from their panels.</li>
+<li>The stack has a fixed maximum depth. Very long editing sessions may lose the earliest steps.</li>
+<li>The history stack clears on reload or when you switch to a different model (see above &mdash; the <em>results</em> of your undos are kept).</li>
+</ul>
+
+<h2>Related</h2>
+<ul>
+<li><a href="model-canvas-tour.html">Model Canvas Tour</a></li>
+<li><a href="define-joins.html">Define Joins</a></li>
+<li><a href="define-dimensions.html">Define Dimensions</a></li>
+</ul>
+<nav class="page-nav"><a href="model-canvas-tour.html" class="page-nav-btn prev">&larr; Model Canvas Tour</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="define-joins.html" class="page-nav-btn next">Define Joins &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

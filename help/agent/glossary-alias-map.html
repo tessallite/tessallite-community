@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Author the glossary alias map — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Agent</span> / <span>Author the glossary alias map</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-26</span></div>
+    <h1>Author the glossary alias map</h1>
+<h2>What this covers</h2>
+<p>The glossary alias map is the per-model context the agent reads alongside the project brief. It teaches the answer LLM how a model is shaped, what its measures actually mean, and how to disambiguate the abbreviations users type. This article explains the parts of the glossary, why each part matters for answer quality, and how to write entries that hold up under real questions.</p>
+<h2>Why a glossary</h2>
+<p>Two facts shape the design. First, an LLM is a pattern matcher; without grounding it will pick the most-likely-looking measure even when wrong. Second, every business invents its own shorthand — <em>gross</em>, <em>NMV</em>, <em>take rate</em> — and analysts type that shorthand into the chat box.</p>
+<p>The glossary closes both gaps. For each allow-listed model, the modeller writes a short overview, lists the analytical questions the model is good at, and supplies a disambiguation table for the abbreviations real users send. The agent sees this on every turn that touches the model. Without a glossary the agent still works, but answer quality is markedly worse: routing decisions become guesses, refusals climb, and the judge verdict trends warn or fail.</p>
+<h2>The four parts</h2>
+<p>Each glossary entry is per-model. Open <em>Project Agent → Models</em> and pick a model to edit.</p>
+<h3>1. Model overview</h3>
+<p>Two to four sentences describing what the model is. Avoid cataloguing measures here — the engine already exposes those. Instead, describe the <em>grain</em>, the <em>time window</em>, and the <em>use case</em>. A good overview answers &quot;what is this model for, and what is it not for&quot;.</p>
+<blockquote>Orders fact at the order-line grain, going back 36 months. Use this for revenue, units, and basket analysis. Do not use this for inventory or for forward-looking forecasts.</blockquote>
+<h3>2. Analytical capabilities</h3>
+<p>Free-form prose. List the kinds of questions this model can answer well: &quot;trends by month, region, product category&quot;, &quot;year-on-year comparisons&quot;, &quot;top-N by any dimension&quot;. Be specific about scope: a sentence noting what the model <em>cannot</em> answer is as valuable as listing what it can.</p>
+<h3>3. Abbreviation conflict rules</h3>
+<p>The most directly load-bearing field. List each business term that is ambiguous in your context, and the rule for resolving it. The agent reads this verbatim. Two patterns work well:</p>
+<ul><li><strong>Defaults.</strong> &quot;By default, <em>revenue</em> means net revenue (sales after discounts and returns).&quot;</li><li><strong>Discriminators.</strong> &quot;When the user says <em>gross</em>, prefer the gross-revenue measure; when they say <em>net</em>, prefer net revenue. If they say <em>revenue</em> without qualifier, ask a clarifying question.&quot;</li></ul>
+<p>If a term is unambiguous, do not add a rule for it — every line you add is read on every turn. Reserve this space for terms the LLM will otherwise get wrong.</p>
+<h3>4. Example questions</h3>
+<p>Five to ten worked examples. Each entry pairs a question with a short note on how it should decompose: which measure, which dimension, which time window. The agent uses these as in-context exemplars; the eval runner uses them as a regression suite.</p>
+<blockquote>Q: How did Q3 stack up against last year?<br>Decompose: revenue measure, by month dimension, time window = current quarter vs same quarter prior year.</blockquote>
+<p>The questions you list here are the canon for <em>Run eval</em>. Pick questions that exercise the model&#x27;s edges — questions a casual user actually asks, plus a few that test the boundary cases the abbreviation rules govern.</p>
+<h2>Auto-derived sections</h2>
+<p>Three sections are populated automatically and surface in the same panel: an aggregates summary, a calendar alias list, and a dimension alias list. These are read-only — they are derived from the published model. If the model changes, click <em>Refresh derived</em> on the model context page (or <em>Refresh all</em> on the project agent page) to re-pull them. The agent reads the derived sections so an analyst question naming a calendar alias or a dimension alias resolves to the right physical column without the modeller writing those mappings by hand.</p>
+<h2>How the LLM uses the glossary</h2>
+<p>When a question lands, the prompt assembler concatenates: the project brief, then for each allow-listed model the four glossary parts plus the auto-derived sections, then the tool spec, then any conversation history, then the user message. The LLM emits a tool call. The first model it picks is influenced strongly by the example questions and the abbreviation rules; the measure and dimension it picks are influenced by the auto-derived alias lists.</p>
+<p>In practice this means a vague question like &quot;how were units last week&quot; will route to the model whose example questions mention units, with <code>units</code> resolved against the alias rules. A long, accurate glossary noticeably reduces clarify and refuse rates.</p>
+<h2>A worked example</h2>
+<p>The bundled <code>modelx</code> in the demo tenant ships with a minimal glossary. Here is a fuller version that demonstrates the four parts on a familiar shape.</p>
+<p><strong>Overview.</strong></p>
+<blockquote>Orders fact at the order-line grain, 36 months. Use for revenue, units, and basket analysis. Not suitable for inventory or returns analysis — those live in <code>model_returns</code>.</blockquote>
+<p><strong>Analytical capabilities.</strong></p>
+<blockquote>Trends by month/quarter/year. Year-on-year comparisons (the engine handles same-period-prior-year via the calendar alias). Top-N by region, category, or merchant. Drill from totals into the contributing rows via the merchant dimension.</blockquote>
+<p><strong>Abbreviation conflict rules.</strong></p>
+<blockquote>By default, <em>revenue</em> means net revenue (after discounts and returns).<br>When the user says <em>gross</em>, prefer <code>revenue_gross</code>.<br><em>Units</em> means line-item quantity. Do not interpret as &quot;active customers&quot;.<br><em>Last month</em> means the previous calendar month, not the trailing 30 days.</blockquote>
+<p><strong>Example questions.</strong></p>
+<blockquote>Q: What were sales last month?<br>Decompose: net revenue, time window previous calendar month.<br><br>Q: Top 10 merchants by revenue this quarter.<br>Decompose: net revenue by merchant, current quarter, sorted descending, limit 10.<br><br>Q: How are units trending year-on-year?<br>Decompose: units by month, current 12 months vs prior 12 months.</blockquote>
+<h2>Common pitfalls</h2>
+<ul><li><strong>Long overviews.</strong> A six-paragraph overview crowds out the example questions. Two to four sentences is the right length.</li><li><strong>Generic example questions.</strong> &quot;Show me the data&quot; teaches nothing. Each example should name a measure, a dimension, and a time window.</li><li><strong>Abbreviation rules for unambiguous terms.</strong> They cost tokens and add no value.</li><li><strong>Not refreshing derived sections after a model change.</strong> The auto-derived calendar/dimension lists are a snapshot. Refresh after every meaningful model edit.</li><li><strong>Forgetting cross-model rules.</strong> If two models share a term that means different things, write the rule on <em>both</em> model glossaries. The agent reads each model&#x27;s section in isolation.</li></ul>
+<h2>Related reading</h2>
+<ul><li><a href="configure-agent.html">Configure your project agent</a></li><li><a href="write-a-judge-rubric.html">Write a judge rubric</a></li><li><a href="cross-model-recipes.html">Cross-model calculation recipes</a></li></ul>
+<nav class="page-nav"><a href="project-personas.html" class="page-nav-btn prev">&larr; Project-Level Personas</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="write-a-judge-rubric.html" class="page-nav-btn next">Write a judge rubric &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

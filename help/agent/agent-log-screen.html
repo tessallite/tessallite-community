@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agent log screen — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Agent</span> / <span>Agent log screen</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">admin</span><span class="updated">Updated 2026-04-28</span></div>
+    <h1>Agent log screen</h1>
+<h2>What this covers</h2>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/agent-log-live.png" alt="Live Agent Log route for a project."></figure>
+<p>The agent log screen is a full-trace audit viewer for every conversational agent turn in a project. It lets tenant administrators and project modellers inspect what happened during any agent interaction: the user&#x27;s question, the LLM&#x27;s reasoning, the queries it chose, the answers it produced, how the judge evaluated those answers, and how tokens were spent. This article explains the purpose of the log screen, how to enable it, how to read the trace data, and how to use it effectively for quality assurance and troubleshooting.</p>
+<h2>Why the log screen exists</h2>
+<p>The conversational agent sits between users and the data layer. When an answer is wrong, slow, or refused, someone needs to understand why. The chat interface shows the outcome, but not the machinery behind it. The log screen exposes that machinery: every decision the agent made, every query it ran, every judgement it received.</p>
+<p>Without the log screen, troubleshooting an incorrect answer requires reading backend service logs, correlating timestamps, and piecing together fragments. The log screen puts the full trace in one table, filterable and expandable, accessible from a browser.</p>
+<p>Common use cases:</p>
+<ul><li><strong>Answer quality review.</strong> After enabling the agent for a new team, a modeller reviews the first week of turns to check whether the agent is interpreting questions correctly and choosing the right measures and dimensions.</li><li><strong>Judge calibration.</strong> An administrator examines turns where the judge verdict is &quot;fail&quot; or &quot;warn&quot; to decide whether the rubric is too strict, too lenient, or missing a case.</li><li><strong>Token cost investigation.</strong> A spike in the cost dashboard prompts a look at recent turns to find which questions are consuming disproportionate tokens.</li><li><strong>User support.</strong> A user reports that the agent gave a surprising answer. An administrator searches for the question, opens the trace, and reads the thought process and physical SQL to determine what happened.</li></ul>
+<h2>Enabling the log screen</h2>
+<p>The log screen is controlled by a project-level toggle.</p>
+<ol><li>Open <strong>Tenant Administration</strong> and select the project.</li><li>Click the gear icon to open the project configuration drawer.</li><li>Navigate to <strong>Setup</strong> under the Conversational Agent section.</li><li>The &quot;Enable conversational agent&quot; toggle must be on. Below it, toggle <strong>Agent log screen enabled</strong>.</li><li>Click <strong>Save</strong>.</li></ol>
+<p>After saving and closing the configuration drawer, a history icon appears in the project header bar, next to the chat icon. Clicking it opens the log screen in a new browser tab.</p>
+<p>The toggle is independent of other agent settings. Disabling the log screen does not delete any trace data; it only hides the entry point. Re-enabling it restores access to all existing turns.</p>
+<h2>Reading the log table</h2>
+<p>The log screen opens to a table of agent turns, ordered by conversation (most recently active first) and then by turn position within each conversation. Each row shows one question-and-answer cycle.</p>
+<h3>Summary columns</h3>
+<div class="table-wrapper"><table><thead><tr><th>Column</th><th>What it shows</th></tr></thead><tbody><tr><td>Timestamp</td><td>When the turn was created.</td></tr><tr><td>User</td><td>The identity of the person who asked the question.</td></tr><tr><td>Question</td><td>The user&#x27;s message, truncated to fit the row.</td></tr><tr><td>Status</td><td>Whether the turn completed normally (ok), was refused by a guardrail (refused), or failed (error).</td></tr><tr><td>Verdict</td><td>The judge&#x27;s evaluation: pass, warn, fail, or blank if no judge was configured.</td></tr><tr><td>Route</td><td>How the query was served: from an aggregate, from the base table, or via a recipe.</td></tr><tr><td>Rows</td><td>How many data rows the query returned.</td></tr><tr><td>Tokens</td><td>Input and output token counts for the LLM calls in this turn.</td></tr><tr><td>Latency</td><td>Wall-clock time from question to answer.</td></tr></tbody></table></div>
+<h3>Expanding a row</h3>
+<p>Click any row to expand it. The expanded view is split into two columns.</p>
+<p><strong>Left column — the agent&#x27;s work:</strong></p>
+<ul><li><strong>Prompt sent to LLM.</strong> The full payload sent to the language model: the system prompt (containing model context, glossary, conversation history, and tool spec) and the user message. This is the complete input the LLM received, useful for diagnosing why the LLM made a particular choice.</li><li><strong>Raw LLM response.</strong> The unprocessed text the language model returned before it was parsed into a tool call. Inspecting this reveals whether the LLM produced a valid tool call, hallucinated a function name, or returned free-form text that the parser could not interpret.</li><li><strong>Thought process.</strong> The LLM&#x27;s internal reasoning about what the question is asking and how to answer it.</li><li><strong>LLM plan.</strong> The structured plan the LLM produced: which model to query, which measures and dimensions, which filters.</li><li><strong>Semantic query.</strong> The abstract query expressed in business terms before it was translated to physical SQL.</li><li><strong>Physical SQL.</strong> The actual SQL statement that ran against the source or aggregate table.</li><li><strong>Answer.</strong> The prose answer the agent returned to the user.</li></ul>
+<p><strong>Right column — evaluation and feedback:</strong></p>
+<ul><li><strong>Citations.</strong> The measures and dimensions the answer references, with their values.</li><li><strong>Judge reasoning.</strong> The judge LLM&#x27;s explanation of its verdict.</li><li><strong>Judge metrics.</strong> Numerical scores the judge assigned (relevance, accuracy, completeness, or whatever the rubric defines).</li><li><strong>Guardrail actions.</strong> Any safety-policy or content-rule actions that fired during the turn.</li><li><strong>User feedback.</strong> Thumbs-up/down votes and comments left by the user, if feedback is enabled.</li></ul>
+<h2>Using the filters</h2>
+<p>The filter bar at the top of the screen narrows the table to specific turns.</p>
+<ul><li><strong>From / To.</strong> Date range. Both are inclusive. Useful for reviewing a specific period after a model change or a new rubric deployment.</li><li><strong>User.</strong> Filters by the caller&#x27;s identity. Use this to review one person&#x27;s experience or to find turns from a specific API caller.</li><li><strong>Question contains.</strong> Free-text substring search against the user&#x27;s message. Use this to find turns about a specific metric or topic.</li><li><strong>Search button.</strong> Applies the filters. The record count updates to show how many turns match.</li></ul>
+<p>Filters are combined with AND logic. Pagination resets to page one after each search.</p>
+<h2>Best practices</h2>
+<p><strong>Review early and often.</strong> The first few days after enabling the agent for a new audience are the most valuable time to use the log screen. Patterns of misinterpretation surface quickly: the agent may map a common business term to the wrong dimension, or choose an aggregate that does not cover the requested grain.</p>
+<p><strong>Use the judge verdict as a triage signal.</strong> Sort your attention by verdict. Turns with &quot;fail&quot; need investigation. Turns with &quot;warn&quot; need a judgment call — is the rubric too conservative, or is the answer genuinely borderline? Turns with &quot;pass&quot; still deserve a spot check, because a rubric can have blind spots.</p>
+<p><strong>Compare the semantic query to the physical SQL.</strong> When the answer is wrong, the gap between intent and execution is usually visible here. If the semantic query looks correct but the physical SQL is wrong, the problem is in the query rewriting layer or in a stale aggregate. If the semantic query is wrong, the problem is in how the LLM interpreted the question — check the glossary, the model context, or the example questions.</p>
+<p><strong>Watch token usage patterns.</strong> High token counts on simple questions may indicate that the model context is too verbose, that the LLM is over-reasoning, or that the rubric is prompting excessive judge output. The log screen makes these patterns visible without needing to query the cost API.</p>
+<p><strong>Combine with the judge rubric.</strong> The log screen shows what the judge scored; the rubric controls how it scores. If the log screen reveals that the judge is consistently failing turns that a human would pass, the rubric needs revision. If the judge is passing turns that look wrong, the rubric is missing a criterion.</p>
+<h2>Related reading</h2>
+<ul><li><a href="configure-agent.html">Configure your project agent</a></li><li><a href="write-a-judge-rubric.html">Write a judge rubric</a></li><li><a href="cross-model-recipes.html">Cross-model calculation recipes</a></li></ul>
+<nav class="page-nav"><a href="cross-model-recipes.html" class="page-nav-btn prev">&larr; Cross-model calculation recipes</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="session-memory.html" class="page-nav-btn next">Agent Session Memory &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

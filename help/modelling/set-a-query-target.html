@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Set a Query Target — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Set a Query Target</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Set a Query Target</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/query-target-settings.png" alt="Model Builder — query target settings."></figure>
+<h2>What this covers</h2>
+<p>The query target is the database schema or dataset where Tessallite writes pre-aggregated summary tables. The Scheduler service must be able to connect to this location with write access. This article explains what the query target is, how to configure it in Model Builder, and how to choose between writing to the same data source or a separate one.</p>
+<h2>What is the query target?</h2>
+<p>When Tessallite builds an aggregate, it executes a query against the source data and writes the result as a summary table in the query target. When a BI tool submits a query that matches an available aggregate, Tessallite reads from the summary table instead of the full fact table. This is what produces the speed improvement.</p>
+<p>The query target must be:</p>
+<ul><li>A schema or dataset on a data source that is already connected to Tessallite.</li><li>Writable by the credentials the Scheduler service uses to connect to that data source.</li><li>Accessible at the time the Scheduler runs its refresh jobs. If the connection is unavailable during a scheduled refresh, the build fails.</li></ul>
+<h2>Required permissions on the target schema</h2>
+<div class="table-wrapper"><table><thead><tr><th>Permission</th><th>Why it is needed</th></tr></thead><tbody><tr><td><code>CREATE TABLE</code></td><td>Tessallite creates a new summary table for each aggregate on first build.</td></tr><tr><td><code>INSERT</code></td><td>Tessallite writes rows into the summary table on each refresh.</td></tr><tr><td><code>DROP TABLE</code></td><td>Tessallite drops and recreates the summary table on each full refresh to remove stale data.</td></tr></tbody></table></div>
+<blockquote><strong>Warning:</strong> The Scheduler service connects using the credentials stored in the data source connection, not the credentials of the logged-in user. Verify that the connection&#x27;s service account has these permissions on the target schema before saving.</blockquote>
+<h2>Same-source versus separate-target</h2>
+<div class="table-wrapper"><table><thead><tr><th>Scenario</th><th>When to use it</th><th>Considerations</th></tr></thead><tbody><tr><td>Same source</td><td>Source schema allows writes; you want to keep aggregates close to the data they summarise.</td><td>Simpler to set up. Aggregates and source tables share the same connection. One less data source to manage.</td></tr><tr><td>Separate target</td><td>Source schema is read-only; you want to isolate aggregate storage; or you are using BigQuery and want aggregates in a dedicated dataset to control billing and IAM.</td><td>Requires a second connection configured in Tessallite. Gives cleaner separation between raw data and Tessallite-managed tables. Common pattern for BigQuery deployments.</td></tr></tbody></table></div>
+<h2>Steps</h2>
+<ol><li>Open the model in Model Builder.</li><li>Click <strong>Settings</strong> in the Toolbelt (left sidebar). The Drawer (right panel) shows the model settings.</li><li>Scroll to the <strong>Query Target</strong> section.</li><li>Select the <strong>Connection</strong> from the dropdown. This lists all data source connections configured in Tessallite. Choose the connection for the database where you want aggregates written.</li><li>Enter the <strong>Schema / dataset name</strong>. This is the schema (PostgreSQL, Snowflake, Redshift) or dataset (BigQuery) inside the selected connection where summary tables will be created. The schema must already exist; Tessallite does not create it.</li><li>Click <strong>Save</strong>. Tessallite validates that the Scheduler service can reach the target with the expected permissions. If validation fails, an error message describes which permission or connection step failed.</li></ol>
+<blockquote><strong>Note:</strong> If validation passes but an aggregate build later fails with a permission error, the most likely cause is that the schema-level grant was applied but the connection&#x27;s service account has a table-level override blocking it. Review the grants on the target schema directly in the data warehouse.</blockquote>
+<h2>What happens if the target is unreachable</h2>
+<p>If the Scheduler cannot connect to the query target when a refresh runs, the aggregate&#x27;s status changes to <strong>Error</strong>. The failure is recorded in the Scheduler log and shown in the Health tab. No data is written. Previously built summary tables remain in place, so existing queries that matched those aggregates continue to be served, but the data may become stale if the source has been updated.</p>
+<h2>Related</h2>
+<ul><li><a href="define-measures.html">Define Measures</a></li><li><a href="configure-aggregates.html">Configure Aggregates</a></li><li><a href="../concepts/aggregates.html">Aggregates (concept)</a></li></ul>
+<nav class="page-nav"><a href="curate-drill-through.html" class="page-nav-btn prev">&larr; Curate drill-through</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="configure-aggregates.html" class="page-nav-btn next">Configure Aggregates &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

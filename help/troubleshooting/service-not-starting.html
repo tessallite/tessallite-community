@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Service Not Starting — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Troubleshooting</span> / <span>Service Not Starting</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Service Not Starting</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/service-not-starting-terminal.png" alt="Terminal — service in restart loop with ECONNREFUSED logs."></figure>
+<h2>What this covers</h2>
+<p>Diagnosing a Tessallite service that fails to start, exits immediately, or restarts in a loop. This article applies to Docker Compose deployments.</p>
+<h2>General diagnostic approach</h2>
+<ol><li><strong>Check status</strong>: <code>docker compose ps</code> — look for Exit or Restarting status.</li><li><strong>Read logs</strong>: <code>docker compose logs --tail=50 SERVICE_NAME</code></li><li><strong>Fix the underlying cause</strong> (see table below).</li><li><strong>Restart</strong>: <code>docker compose restart SERVICE_NAME</code></li><li><strong>Verify</strong>: <code>docker compose ps</code> — confirm the service shows Up.</li></ol>
+<p>Check the health endpoint after services are up:</p>
+<pre><code>curl http://localhost:3000/api/health</code></pre>
+<p>A response of <code>{&quot;status&quot;:&quot;ok&quot;}</code> confirms the Frontend service is running and can reach the database.</p>
+<h2>Common causes by service</h2>
+<div class="table-wrapper"><table><thead><tr><th>Service</th><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr></thead><tbody><tr><td><code>postgres</code></td><td>Exits immediately</td><td>Data directory permissions wrong or volume initialised with different user</td><td><code>docker compose down -v &amp;&amp; docker compose up -d</code> (warning: deletes all data volumes)</td></tr><tr><td><code>model-service</code></td><td>Restarts in loop</td><td>Cannot connect to internal PostgreSQL — wrong DB_HOST, DB_USER, or DB_PASS</td><td>Verify env vars in <code>.env</code>. Start postgres first, wait for healthy status, then start model-service.</td></tr><tr><td><code>gateway</code></td><td>Exits with &quot;address already in use&quot;</td><td>Another process holds port 5433 or 8080</td><td>Stop the conflicting process, or change <code>GATEWAY_PORT_JDBC</code> / <code>GATEWAY_PORT_XMLA</code> in <code>.env</code>.</td></tr><tr><td><code>frontend</code></td><td>Exits with &quot;SESSION_SECRET not set&quot;</td><td>SESSION_SECRET env var missing from <code>.env</code></td><td>Add <code>SESSION_SECRET=&lt;long random string&gt;</code> to <code>.env</code> and restart.</td></tr><tr><td><code>scheduler</code></td><td>Restarts after a few minutes</td><td>Cannot connect to target schema or source database</td><td>Verify source connection params and target schema permissions. See <a href="aggregates-not-building.html">Aggregates Not Building</a>.</td></tr><tr><td>Any service</td><td>&quot;Cannot connect to postgres&quot; on startup</td><td>Service started before postgres was ready</td><td><code>docker compose restart SERVICE_NAME</code> once postgres shows healthy.</td></tr></tbody></table></div>
+<h2>Startup order</h2>
+<p>On first run, postgres takes 10–20 seconds to initialise. If multiple services fail simultaneously after a fresh install:</p>
+<pre><code>docker compose up -d postgres
+docker compose ps   # wait until postgres shows (healthy)
+docker compose up -d</code></pre>
+<h2>Related</h2>
+<ul><li><a href="aggregates-not-building.html">Aggregates Not Building</a></li><li><a href="common-errors.html">Common Errors</a></li><li><a href="../integrations/api-authentication.html">API Authentication</a></li></ul>
+<nav class="page-nav"><a href="aggregates-not-building.html" class="page-nav-btn prev">&larr; Aggregates Not Building</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="common-errors.html" class="page-nav-btn next">Common Errors &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

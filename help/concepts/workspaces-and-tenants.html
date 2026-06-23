@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Workspaces and Tenants — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Concepts</span> / <span>Workspaces and Tenants</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">all (primarily tenant-admin, system-admin)</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Workspaces and Tenants</h1>
+<h2>What this covers</h2>
+<p>This article explains what workspaces (tenants) are in Tessallite, how the organisational hierarchy works, and what is isolated between workspaces.</p>
+<h2>The hierarchy</h2>
+<p>Tessallite organises all data and access in four levels.</p>
+<h3>Platform</h3>
+<p>The platform is the Tessallite installation as a whole. It is managed by the System Admin. It contains one or more workspaces. No content exists outside of a workspace — the platform is the containing boundary.</p>
+<h3>Workspace (Tenant)</h3>
+<p>A workspace is an isolated environment for one organisation or team. Each workspace is fully separated from every other workspace. It has its own user accounts, projects, models, data source connections, and physical database. Nothing is shared between workspaces.</p>
+<p>A workspace is identified by its slug — a short, URL-safe name set at creation time. The slug cannot be changed after the workspace is created. It is used in the JDBC connection string as the database name and in the XMLA URL path.</p>
+<p>Only the System Admin can create workspaces.</p>
+<h3>Project</h3>
+<p>A project is a collection of related models within a workspace. Projects group models by subject area, team, or purpose. A workspace can contain as many projects as needed. Projects are created by Modellers or Tenant Admins.</p>
+<h3>Model</h3>
+<p>A model is a definition of one business fact. A model specifies which source tables are used, how they join together, which dimensions are available for slicing, which measures are available for computation, and how aggregates should be built. A project can contain multiple models, one per business fact.</p>
+<h2>What workspace isolation means in practice</h2>
+<p>A user in workspace A cannot see or access anything in workspace B.</p>
+<p>The JDBC connection&#x27;s <code>database</code> parameter must match the workspace slug exactly. Connecting with the wrong slug results in an authentication failure.</p>
+<p>Each workspace has its own user database. User accounts are not shared between workspaces. Granting a user access in one workspace has no effect on any other workspace.</p>
+<h2>Workspace slugs</h2>
+<p>A slug is a short identifier using lowercase letters, numbers, and hyphens. Spaces are not permitted.</p>
+<p>Examples: <code>acme</code>, <code>sales-team</code>, <code>analytics</code></p>
+<p>The slug appears in two places:</p>
+<ul><li>JDBC database name: <code>host:5433/acme</code></li><li>XMLA URL path: <code>/api/v1/xmla/acme</code></li></ul>
+<p>The slug is set when the System Admin creates the workspace. It cannot be modified after creation.</p>
+<h2>Hierarchy at a glance</h2>
+<figure class="illustration"><img class="illustration" src="../assets/illustrations/tenant-workspace-hierarchy.svg" alt="Tessallite four-level organisational hierarchy"></figure>
+<div class="table-wrapper"><table><thead><tr><th>Level</th><th>Who manages it</th><th>What it contains</th></tr></thead><tbody><tr><td>Platform</td><td>System Admin</td><td>All workspaces</td></tr><tr><td>Workspace</td><td>Tenant Admin</td><td>Projects, users, data source connections</td></tr><tr><td>Project</td><td>Modeller</td><td>Models</td></tr><tr><td>Model</td><td>Modeller</td><td>Tables, joins, dimensions, measures, aggregates</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="roles-and-permissions.html">Roles and permissions</a></li><li><a href="projects-and-models.html">Projects and models</a></li><li><a href="../admin/create-a-workspace.html">Create a workspace</a></li></ul>
+<nav class="page-nav"><a href="../getting-started/connect-excel.html" class="page-nav-btn prev">&larr; Connect Excel via XMLA</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="projects-and-models.html" class="page-nav-btn next">Projects and Models &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Import from dbt — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Import from dbt</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-22</span></div>
+<h1>Import from dbt</h1>
+<h2>What this covers</h2>
+<p>If your team already defines metrics in dbt, you can bootstrap a Tessallite model from a dbt project instead of building it by hand. The importer reads dbt's <code>semantic_models</code> and <code>metrics</code> and maps them onto Tessallite tables, dimensions, and measures, giving you a working model to review, connect, and deploy.</p>
+<h2>What gets imported</h2>
+<table><thead><tr><th>dbt concept</th><th>Tessallite equivalent</th></tr></thead><tbody><tr><td><code>semantic_model</code></td><td>A model table (the entity it is defined on becomes the source table)</td></tr><tr><td><code>entity</code> (primary / foreign)</td><td>Join keys used to relate tables</td></tr><tr><td><code>dimension</code> (categorical)</td><td>A dimension</td></tr><tr><td><code>dimension</code> (time, with grain)</td><td>A time dimension with its grain</td></tr><tr><td><code>measure</code></td><td>A measure with its aggregation (sum, count, average, and so on)</td></tr><tr><td><code>metric</code> (simple)</td><td>A measure or calculated measure</td></tr><tr><td><code>metric</code> (ratio / derived / cumulative)</td><td>Imported with a warning for manual review</td></tr></tbody></table>
+<h2>Run the import</h2>
+<p>Provide the dbt definitions either as a single <code>schema.yml</code> (or the project's <code>semantic_models</code> YAML) or as a zip of the dbt project. The importer accepts dbt v1.7 and later.</p>
+<p><strong>From the API:</strong></p>
+<pre><code>curl -X POST http://localhost:3000/api/v1/projects/&lt;project_id&gt;/import/dbt \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@my_dbt_project.zip"</code></pre>
+<p>The response reports how many models, dimensions, and measures were created, and lists any metrics that need manual follow-up.</p>
+<h2>After importing</h2>
+<ol><li><strong>Bind a connection.</strong> The imported model references table and column names from dbt but has no live credentials. Attach a data source so Tessallite can read the underlying tables — see <a href="manage-connections.html">Manage Connections</a>.</li><li><strong>Review classifications.</strong> Confirm the fact and dimension tables, join keys, and measure aggregations are what you expect. Adjust on the canvas as needed.</li><li><strong>Resolve metric warnings.</strong> Ratio, derived, and cumulative metrics are imported as a best effort; rebuild them as <a href="calculated-measures.html">Calculated Measures</a> or <a href="configure-time-variants.html">time variants</a> where the warning asks you to.</li><li><strong>Save and deploy.</strong> Once the model validates, save a version and deploy it so BI tools and the agent can query it — see <a href="deploy-a-model.html">Deploy a Model</a>.</li></ol>
+<h2>Limitations</h2>
+<ul><li>The importer maps structure and definitions, not data. You still bind a live connection to query.</li><li>Complex metric types (ratio, derived, cumulative) generate warnings and may need to be re-expressed as calculated measures or time variants.</li><li>dbt tests and freshness checks are not imported; use <a href="data-quality-rules.html">Data Quality Rules</a> for equivalent validation in Tessallite.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="create-a-project.html">Create a Project</a></li><li><a href="add-a-data-source.html">Add a Data Source</a></li><li><a href="calculated-measures.html">Calculated Measures</a></li><li><a href="export-and-import-a-model.html">Export and Import a Model</a></li></ul>
+<nav class="page-nav"><a href="export-and-import-a-project.html" class="page-nav-btn prev">&larr; Export and Import a Project</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="model-templates.html" class="page-nav-btn next">Model Templates &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

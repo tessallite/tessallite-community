@@ -1,0 +1,1 @@
+Live Model Builder source/table preview path for modely, showing the Sources & Targets drawer and the data preview entry point or preview state for a selected table.

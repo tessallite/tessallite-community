@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Teardown — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>Teardown</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Teardown</h1>
+<h2>What this covers</h2>
+<p>How to remove a Tessallite deployment for both local (Docker Compose) and GCP targets. Covers what data is destroyed, what is left behind, and how to clean up aggregate tables in your data source.</p>
+<h2>What teardown destroys</h2>
+<p>A full teardown removes:</p>
+<ul><li>All workspace metadata (workspaces, users, connection definitions)</li><li>All semantic model definitions (tables, joins, dimensions, measures, aggregates)</li><li>The query miss log and optimizer recommendations</li><li>Aggregate build history and refresh schedules</li></ul>
+<p>Teardown does <strong>not</strong> remove:</p>
+<ul><li>Your source data — Tessallite never writes to your source tables.</li><li>Aggregate tables built in your target schema. These are plain tables in your data source and must be dropped manually.</li></ul>
+<h2>Local teardown (Docker Compose)</h2>
+<h3>Stop containers, preserve data</h3>
+<pre><code>docker compose down</code></pre>
+<p>Running <code>docker compose up -d</code> afterward restores the platform with all data intact.</p>
+<h3>Stop containers and delete all data</h3>
+<blockquote><strong>Warning:</strong> <code>docker compose down -v</code> deletes all Tessallite metadata permanently. Workspaces, models, and aggregate definitions cannot be recovered. Aggregate data tables in your source must be dropped manually if you want to remove them.</blockquote>
+<pre><code>docker compose down -v</code></pre>
+<p>This removes the <code>tessallite_pgdata</code> named volume. All records in the internal PostgreSQL database are permanently deleted.</p>
+<h3>Remove aggregate tables from your data source</h3>
+<p>After running <code>docker compose down -v</code>, connect to your data source and drop aggregate tables from the target schema. Tessallite creates aggregate tables with names beginning with <code>_tess_</code> by default. Verify the naming pattern in your workspace connection settings before dropping.</p>
+<h2>GCP teardown</h2>
+<p>Delete resources in this order:</p>
+<ol><li>Delete each Cloud Run service:</li></ol>
+<p>``<code>bash gcloud run services delete SERVICE_NAME --region REGION </code>`` Repeat for: gateway, query-router, model-service, optimizer, scheduler, frontend.</p>
+<ol><li>Delete the Cloud SQL instance:</li></ol>
+<p>``<code>bash gcloud sql instances delete INSTANCE_NAME </code>`` This permanently deletes the internal database and all Tessallite metadata.</p>
+<ol><li>Delete load balancer forwarding rules and backend services via the Cloud Console: Network Services &gt; Load Balancing.</li></ol>
+<ol><li>Delete the service account:</li></ol>
+<p>``<code>bash gcloud iam service-accounts delete SERVICE_ACCOUNT_EMAIL </code>``</p>
+<ol><li>Delete secrets from Secret Manager if used:</li></ol>
+<p>``<code>bash gcloud secrets delete tessallite-db-pass gcloud secrets delete tessallite-session-secret </code>``</p>
+<ol><li>Optionally drop aggregate tables from your data source. Connect to your data warehouse and drop them manually.</li></ol>
+<blockquote><strong>Warning:</strong> Deleting the Cloud SQL instance is irreversible. Back up the database before proceeding if you may need the model definitions or workspace configuration later.</blockquote>
+<h2>Related</h2>
+<ul><li><a href="upgrade.html">Upgrade</a></li><li><a href="deploy-local.html">Deploy Locally</a></li><li><a href="deploy-gcp.html">Deploy on GCP</a></li></ul>
+<nav class="page-nav"><a href="service-reference.html" class="page-nav-btn prev">&larr; Service Reference</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="upgrade.html" class="page-nav-btn next">Upgrade &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

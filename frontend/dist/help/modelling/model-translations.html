@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Model Translations (i18n) — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Model Translations (i18n)</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-24</span></div>
+<h1>Model Translations (i18n)</h1>
+
+<h2>What this covers</h2>
+<p>Multi-language model metadata lets you provide translated display names for dimensions, measures, hierarchies, and other model entities. When a user selects a locale in the Explorer, all entity labels switch to that language.</p>
+
+<h2>How it works</h2>
+<p>Translations are stored in the <code>entity_translations</code> table, keyed by <strong>(model_id, entity_type, entity_id, field_name, locale)</strong>. Each row maps a specific field on a specific entity to a translated string in a specific locale.</p>
+<p>When a user sets their display locale via the <strong>Locale selector</strong> in the Explorer, the frontend fetches all translations for the active model and locale. Entity labels throughout the UI are resolved using a simple fallback: if a translation exists for the current locale, show it; otherwise, show the original name.</p>
+
+<h2>Setting the display locale</h2>
+<ol>
+<li>Open the <strong>Workspace Explorer</strong> or the <strong>Model Builder</strong>.</li>
+<li>Click the <strong>Locale selector</strong> dropdown (near the user avatar or toolbar).</li>
+<li>Choose a locale (e.g., <code>fr</code>, <code>de</code>, <code>ja</code>, <code>ar</code>).</li>
+<li>All entity labels in the current view update immediately.</li>
+</ol>
+<p>The selected locale is stored in the browser session and persists across page navigations within the same session but resets on logout.</p>
+
+<h2>Managing translations</h2>
+<p>Translations are managed via the REST API. There is no GUI editor yet.</p>
+
+<h3>Upsert a single translation</h3>
+<pre><code>PUT /api/v1/projects/{project_id}/models/{model_id}/translations
+
+{
+  "entity_type": "dimension",
+  "entity_id": "uuid-of-the-dimension",
+  "field_name": "display_name",
+  "locale": "fr",
+  "translated_text": "Cat&eacute;gorie de produit"
+}</code></pre>
+
+<h3>Bulk upsert</h3>
+<pre><code>POST /api/v1/projects/{project_id}/models/{model_id}/translations/bulk</code></pre>
+<p>Body: an array of translation objects. The response returns only the rows that were successfully upserted. Skipped items are logged server-side with the array index and reason.</p>
+
+<h3>List translations</h3>
+<pre><code>GET /api/v1/projects/{project_id}/models/{model_id}/translations?locale=fr</code></pre>
+
+<h3>Delete a translation</h3>
+<pre><code>DELETE /api/v1/projects/{project_id}/models/{model_id}/translations/{id}</code></pre>
+
+<h2>Supported entity types</h2>
+<table>
+<thead><tr><th>Entity type</th><th>Typical field_name</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td><code>dimension</code></td><td><code>display_name</code></td><td>&ldquo;Product Category&rdquo; &rarr; &ldquo;Cat&eacute;gorie de produit&rdquo;</td></tr>
+<tr><td><code>measure</code></td><td><code>display_name</code></td><td>&ldquo;Revenue&rdquo; &rarr; &ldquo;Chiffre d&rsquo;affaires&rdquo;</td></tr>
+<tr><td><code>hierarchy</code></td><td><code>display_name</code></td><td>&ldquo;Date Hierarchy&rdquo; &rarr; &ldquo;Hi&eacute;rarchie de dates&rdquo;</td></tr>
+<tr><td><code>level</code></td><td><code>display_name</code></td><td>&ldquo;Quarter&rdquo; &rarr; &ldquo;Trimestre&rdquo;</td></tr>
+</tbody>
+</table>
+
+<h2>Security</h2>
+<p>All translation endpoints verify that the specified model belongs to the specified project. Attempting to manage translations for a model in a different project returns <strong>404 Not Found</strong>.</p>
+
+<h2>Related</h2>
+<ul>
+<li><a href="define-dimensions.html">Define Dimensions</a></li>
+<li><a href="define-measures.html">Define Measures</a></li>
+<li><a href="model-templates.html">Model Templates</a></li>
+</ul>
+<nav class="page-nav"><a href="model-templates.html" class="page-nav-btn prev">&larr; Model Templates</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="model-details.html" class="page-nav-btn next">Model Details &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

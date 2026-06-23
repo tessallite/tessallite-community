@@ -1,0 +1,1 @@
+Screenshot of the System Configuration tab with a yellow Alert banner at the top reading "3 setting(s) require a service restart. Recently changed: scheduler.refresh_check_minute, xmla.session_ttl_seconds, frontend.dev_server_port". A "How to restart" button appears on the right side of the banner. Below the banner is the normal accordion list of settings. Dimensions: 1280x300px.

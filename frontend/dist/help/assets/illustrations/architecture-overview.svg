@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Pixodesk SVG (https://pixodesk.com) -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 520" text-rendering="geometricPrecision" shape-rendering="geometricPrecision">
+  <defs>
+    <marker id="arr" refX="10" refY="3.5" markerHeight="7" markerWidth="10" orient="auto">
+      <path fill="#006c35" d="M0,0L10,3.5L0,7"/>
+    </marker>
+    <marker id="arr-ext" refX="10" refY="3.5" markerHeight="7" markerWidth="10" orient="auto">
+      <path fill="#555555" d="M0,0L10,3.5L0,7"/>
+    </marker>
+  </defs>
+  <path fill="#ffffff" d="M800,0L800,520L0,520L0,0L800,0z"/>
+  <rect fill="#f5f5f5" stroke="#aaaaaa" stroke-width="1.5" stroke-dasharray="4 2" rx="4" ry="0" x="20" y="180" width="120" height="60"/>
+  <text fill="#555555" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" font-weight="600" xml:space="preserve" x="80" y="207" data-gn-el-type="text" style="white-space:pre"><tspan>BI Tools</tspan></text>
+  <text fill="#777777" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="80" y="224" data-gn-el-type="text" style="white-space:pre"><tspan>JDBC · XMLA</tspan></text>
+  <rect fill="#f2f7f4" stroke="#006c35" stroke-width="1.5" rx="8" ry="0" x="160" y="30" width="480" height="440"/>
+  <text fill="#006c35" text-anchor="middle" font-family="Inter, sans-serif" font-size="12" font-weight="600" xml:space="preserve" x="400" y="55" data-gn-el-type="text" style="white-space:pre"><tspan>Tessallite Platform</tspan></text>
+  <rect fill="#ffffff" stroke="#006c35" stroke-width="2" rx="6" ry="0" x="180" y="170" width="140" height="80"/>
+  <text fill="#006c35" text-anchor="middle" font-family="Inter, sans-serif" font-size="12" font-weight="600" xml:space="preserve" x="250" y="200" data-gn-el-type="text" style="white-space:pre"><tspan>gateway</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="250" y="218" data-gn-el-type="text" style="white-space:pre"><tspan>JDBC :5433</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="250" y="234" data-gn-el-type="text" style="white-space:pre"><tspan>XMLA :8080</tspan></text>
+  <rect fill="#ffffff" stroke="#006c35" stroke-width="2" rx="6" ry="0" x="370" y="100" width="140" height="70"/>
+  <text fill="#006c35" text-anchor="middle" font-family="Inter, sans-serif" font-size="12" font-weight="600" xml:space="preserve" x="440" y="132" data-gn-el-type="text" style="white-space:pre"><tspan>query-router</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="440" y="150" data-gn-el-type="text" style="white-space:pre"><tspan>routes queries</tspan></text>
+  <rect fill="#ffffff" stroke="#006c35" stroke-width="2" rx="6" ry="0" x="370" y="220" width="140" height="70"/>
+  <text fill="#006c35" text-anchor="middle" font-family="Inter, sans-serif" font-size="12" font-weight="600" xml:space="preserve" x="440" y="252" data-gn-el-type="text" style="white-space:pre"><tspan>model-service</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="440" y="270" data-gn-el-type="text" style="white-space:pre"><tspan>semantic layer</tspan></text>
+  <rect fill="#ffffff" stroke="#2e8b57" stroke-width="1.5" rx="6" ry="0" x="180" y="340" width="140" height="70"/>
+  <text fill="#2e8b57" text-anchor="middle" font-family="Inter, sans-serif" font-size="12" font-weight="600" xml:space="preserve" x="250" y="372" data-gn-el-type="text" style="white-space:pre"><tspan>optimizer</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="250" y="390" data-gn-el-type="text" style="white-space:pre"><tspan>scores candidates</tspan></text>
+  <rect fill="#ffffff" stroke="#2e8b57" stroke-width="1.5" rx="6" ry="0" x="370" y="340" width="140" height="70"/>
+  <text fill="#2e8b57" text-anchor="middle" font-family="Inter, sans-serif" font-size="12" font-weight="600" xml:space="preserve" x="440" y="372" data-gn-el-type="text" style="white-space:pre"><tspan>scheduler</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="440" y="390" data-gn-el-type="text" style="white-space:pre"><tspan>builds aggregates</tspan></text>
+  <rect fill="#ffffff" stroke="#006c35" stroke-width="1.5" rx="6" ry="0" x="555" y="220" width="70" height="80"/>
+  <text fill="#006c35" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" font-weight="600" xml:space="preserve" x="590" y="260" data-gn-el-type="text" style="white-space:pre"><tspan>frontend</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" xml:space="preserve" x="590" y="276" data-gn-el-type="text" style="white-space:pre"><tspan>:3000</tspan></text>
+  <rect fill="#eaf4ff" stroke="#4472ca" stroke-width="1.5" rx="6" ry="0" x="555" y="340" width="70" height="70"/>
+  <text fill="#4472ca" text-anchor="middle" font-family="Inter, sans-serif" font-size="10" font-weight="600" xml:space="preserve" x="590" y="372" data-gn-el-type="text" style="white-space:pre"><tspan>Postgres</tspan></text>
+  <text fill="#4472ca" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" xml:space="preserve" x="590" y="388" data-gn-el-type="text" style="white-space:pre"><tspan>internal</tspan></text>
+  <text fill="#4472ca" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" xml:space="preserve" x="590" y="402" data-gn-el-type="text" style="white-space:pre"><tspan>:5432</tspan></text>
+  <rect fill="#f5f5f5" stroke="#aaaaaa" stroke-width="1.5" stroke-dasharray="4 2" rx="4" ry="0" x="660" y="180" width="120" height="60"/>
+  <text fill="#555555" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" font-weight="600" xml:space="preserve" x="720" y="207" data-gn-el-type="text" style="white-space:pre"><tspan>Data Source</tspan></text>
+  <text fill="#777777" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="720" y="224" data-gn-el-type="text" style="white-space:pre"><tspan>PG · BQ · Spark</tspan></text>
+  <path stroke="#555555" stroke-width="1.5" marker-end="url(#arr-ext)" d="M140,210L178,210"/>
+  <path stroke="#006c35" stroke-width="1.5" marker-end="url(#arr)" d="M320,195L368,155"/>
+  <path stroke="#006c35" stroke-width="1.5" marker-end="url(#arr)" d="M440,170L440,218"/>
+  <path stroke="#006c35" stroke-dasharray="4 2" marker-end="url(#arr)" d="M430,218L430,172"/>
+  <path fill="none" stroke="#2e8b57" stroke-width="1.5" marker-end="url(#arr)" d="M440,290L439.4782,309.7006L249.3755,307.3738L250,338"/>
+  <path stroke="#2e8b57" stroke-width="1.5" marker-end="url(#arr)" d="M440,290L440,338"/>
+  <path stroke="#006c35" stroke-width="1.5" stroke-dasharray="6 2" marker-end="url(#arr)" d="M510,135L658,205"/>
+  <path fill="none" stroke="#2e8b57" stroke-width="1.5" stroke-dasharray="6 2" transform="translate(0.1936, 15.6785)" marker-end="url(#arr)" d="M496.0431,393.945L495.656,426.4393L746.319,427.1288L751.9323,223.1385"/>
+  <path stroke="#006c35" stroke-dasharray="4 2" marker-end="url(#arr)" d="M555,260L512,260"/>
+  <path stroke="#4472ca" stroke-width="1.5" marker-end="url(#arr)" d="M555,340L512,290"/>
+  <path stroke="#4472ca" stroke-dasharray="4 2" d="M590,340L590,300"/>
+  <text fill="#555555" font-family="JetBrains Mono, monospace" font-size="9" xml:space="preserve" x="148" y="205" data-gn-el-type="text" style="white-space:pre"><tspan>5433/8080</tspan></text>
+  <text fill="#006c35" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" xml:space="preserve" x="690" y="168" data-gn-el-type="text" style="white-space:pre"><tspan>raw / agg query</tspan></text>
+  <text fill="#2e8b57" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" xml:space="preserve" x="690" y="285" data-gn-el-type="text" style="white-space:pre"><tspan>build aggregate</tspan></text>
+  <path stroke="#006c35" stroke-width="1.5" marker-end="url(#arr)" d="M30,490L60,490"/>
+  <text fill="#333333" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" x="68" y="494" data-gn-el-type="text" style="white-space:pre"><tspan>Query path</tspan></text>
+  <path stroke="#2e8b57" stroke-width="1.5" marker-end="url(#arr)" d="M160,490L190,490"/>
+  <text fill="#333333" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" x="198" y="494" data-gn-el-type="text" style="white-space:pre"><tspan>Aggregate build path</tspan></text>
+  <path stroke="#4472ca" stroke-width="1.5" marker-end="url(#arr)" d="M340,490L370,490"/>
+  <text fill="#333333" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" x="378" y="494" data-gn-el-type="text" style="white-space:pre"><tspan>Internal persistence</tspan></text>
+  <path stroke="#555555" stroke-dasharray="4 2" marker-end="url(#arr-ext)" d="M510,490L540,490"/>
+  <text fill="#333333" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" x="548" y="494" data-gn-el-type="text" style="white-space:pre"><tspan>External boundary</tspan></text>
+</svg>

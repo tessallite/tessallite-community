@@ -1,0 +1,306 @@
+{
+  "version": 1,
+  "families": {
+    "kpi": [
+      {
+        "id": "kpi_single_measure",
+        "shape": "kpi",
+        "match": {"axes": 0, "values": 1},
+        "renderer_binding": {"chart": "kpi", "value": "value"},
+        "required_constraints": ["single_row_preferred"],
+        "data_quality_checks": [],
+        "fallback": "table",
+        "narration_fact_contract": "kpi"
+      },
+      {
+        "id": "kpi_multi_measure_set",
+        "shape": "kpi_set",
+        "match": {"axes": 0, "min_values": 2, "max_values": 8},
+        "renderer_binding": {"chart": "kpi", "cards": "values"},
+        "required_constraints": ["one_result_row"],
+        "data_quality_checks": [],
+        "fallback": "table",
+        "narration_fact_contract": "kpi_set"
+      }
+    ],
+    "category_breakdown": [
+      {
+        "id": "single_category_breakdown",
+        "shape": "breakdown",
+        "match": {"categories": 1, "values": 1},
+        "renderer_binding": {"chart": "bar", "x": "category", "y": "value"},
+        "required_constraints": ["category_cardinality_within_limit"],
+        "data_quality_checks": ["category_limit"],
+        "fallback": "table",
+        "narration_fact_contract": "breakdown"
+      },
+      {
+        "id": "single_category_multi_measure",
+        "shape": "grouped_comparison",
+        "match": {"categories": 1, "min_values": 2, "max_values": 6},
+        "renderer_binding": {"chart": "grouped_bar", "x": "category", "y": "values"},
+        "required_constraints": ["values_comparable"],
+        "data_quality_checks": [],
+        "fallback": "table",
+        "narration_fact_contract": "grouped_comparison"
+      }
+    ],
+    "ranking_composition": [
+      {
+        "id": "ranking_top",
+        "shape": "ranking",
+        "match": {"intent": "ranking", "categories": 1, "min_values": 1},
+        "renderer_binding": {"chart": "h_bar", "y": "category", "x": "value"},
+        "required_constraints": ["sort_or_ranking_intent"],
+        "data_quality_checks": ["ranking"],
+        "fallback": "table",
+        "narration_fact_contract": "ranking"
+      },
+      {
+        "id": "composition_single_category",
+        "shape": "stacked_composition",
+        "match": {"intent": "composition", "categories": 1, "values": 1},
+        "renderer_binding": {"chart": "pie", "segment": "category", "value": "value"},
+        "required_constraints": ["part_of_whole_intent", "positive_values"],
+        "data_quality_checks": ["pie_suitable"],
+        "fallback": "table",
+        "narration_fact_contract": "composition"
+      }
+    ],
+    "temporal": [
+      {
+        "id": "time_series_single_measure",
+        "shape": "time_series",
+        "match": {"temporal": 1, "values": 1},
+        "renderer_binding": {"chart": "line", "x": "temporal", "y": "value"},
+        "required_constraints": ["stable_temporal_key"],
+        "data_quality_checks": ["time_series"],
+        "fallback": "table",
+        "narration_fact_contract": "time_series"
+      },
+      {
+        "id": "time_series_multi_measure",
+        "shape": "multi_metric_time",
+        "match": {"temporal": 1, "min_values": 2, "max_values": 6},
+        "renderer_binding": {"chart": "multi_line_wide", "x": "temporal", "lines": "values"},
+        "required_constraints": ["stable_temporal_key"],
+        "data_quality_checks": ["time_series"],
+        "fallback": "table",
+        "narration_fact_contract": "multi_metric_time"
+      },
+      {
+        "id": "multi_series_time",
+        "shape": "multi_series_time",
+        "match": {"intent": "separate_series", "temporal": 1, "categories": 1, "values": 1},
+        "renderer_binding": {"chart": "multi_line", "x": "temporal", "series": "category", "y": "value"},
+        "required_constraints": ["stable_temporal_key", "series_limit"],
+        "data_quality_checks": ["time_series", "multi_series"],
+        "fallback": "table",
+        "narration_fact_contract": "multi_series_time"
+      },
+      {
+        "id": "year_part_time_series",
+        "shape": "time_series",
+        "match": {"temporal": 2, "values": 1},
+        "renderer_binding": {"chart": "line", "x": "period", "y": "value"},
+        "required_constraints": ["stable_temporal_key"],
+        "data_quality_checks": ["time_series"],
+        "fallback": "table",
+        "narration_fact_contract": "time_series"
+      },
+      {
+        "id": "year_part_multi_series_time",
+        "shape": "multi_series_time",
+        "match": {"intent": "separate_series", "temporal": 2, "categories": 1, "values": 1},
+        "renderer_binding": {"chart": "multi_line", "x": "period", "series": "category", "y": "value"},
+        "required_constraints": ["stable_temporal_key", "series_limit"],
+        "data_quality_checks": ["time_series", "multi_series"],
+        "fallback": "table",
+        "narration_fact_contract": "multi_series_time"
+      },
+      {
+        "id": "year_part_time_series_by_category",
+        "shape": "multi_series_time",
+        "match": {"temporal": 2, "categories": 1, "values": 1},
+        "renderer_binding": {"chart": "multi_line", "x": "period", "series": "category", "y": "value"},
+        "required_constraints": ["stable_temporal_key", "series_limit"],
+        "data_quality_checks": ["time_series", "multi_series"],
+        "fallback": "table",
+        "narration_fact_contract": "multi_series_time"
+      },
+      {
+        "id": "year_part_multi_metric_time",
+        "shape": "multi_metric_time",
+        "match": {"temporal": 2, "min_values": 2, "max_values": 6},
+        "renderer_binding": {"chart": "multi_line_wide", "x": "period", "lines": "values"},
+        "required_constraints": ["stable_temporal_key"],
+        "data_quality_checks": ["time_series"],
+        "fallback": "table",
+        "narration_fact_contract": "multi_metric_time"
+      },
+      {
+        "id": "time_series_by_category",
+        "shape": "multi_series_time",
+        "match": {"temporal": 1, "categories": 1, "values": 1},
+        "renderer_binding": {"chart": "multi_line", "x": "temporal", "series": "category", "y": "value"},
+        "required_constraints": ["stable_temporal_key", "series_limit"],
+        "data_quality_checks": ["time_series", "multi_series"],
+        "fallback": "table",
+        "narration_fact_contract": "multi_series_time"
+      },
+      {
+        "id": "temporal_two_category_matrix",
+        "shape": "matrix",
+        "match": {"temporal": 1, "categories": 2, "values": 1},
+        "renderer_binding": {},
+        "required_constraints": ["too_many_chart_axes"],
+        "data_quality_checks": ["matrix_size"],
+        "fallback": "table",
+        "narration_fact_contract": "matrix"
+      },
+      {
+        "id": "temporal_two_part_two_category_matrix",
+        "shape": "matrix",
+        "match": {"temporal": 2, "categories": 2, "values": 1},
+        "renderer_binding": {},
+        "required_constraints": ["too_many_chart_axes"],
+        "data_quality_checks": ["matrix_size"],
+        "fallback": "table",
+        "narration_fact_contract": "matrix"
+      }
+    ],
+    "matrix_detail_distribution": [
+      {
+        "id": "matrix_two_categories",
+        "shape": "matrix",
+        "match": {"categories": 2, "values": 1},
+        "renderer_binding": {"chart": "stacked_bar", "x": "primary_category", "series": "secondary_category", "y": "value"},
+        "required_constraints": ["two_independent_grouping_axes"],
+        "data_quality_checks": ["matrix_size", "additive_values"],
+        "fallback": "table",
+        "narration_fact_contract": "matrix"
+      },
+      {
+        "id": "detail_representable_table",
+        "shape": "detail_table",
+        "match": {"intent": "detail"},
+        "renderer_binding": {},
+        "required_constraints": ["representable_by_current_tools"],
+        "data_quality_checks": ["table_size"],
+        "fallback": "table",
+        "narration_fact_contract": "detail_table"
+      },
+      {
+        "id": "distribution_existing_bucket",
+        "shape": "distribution",
+        "match": {"intent": "distribution", "categories": 1, "values": 1},
+        "renderer_binding": {"chart": "bar", "x": "bucket", "y": "value"},
+        "required_constraints": ["bucket_axis_exists"],
+        "data_quality_checks": ["bucket_order"],
+        "fallback": "table",
+        "narration_fact_contract": "distribution"
+      }
+    ],
+    "review_table_coverage": [
+      {"id": "ambiguous_role_shape", "shape": "unsupported", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["ambiguity_unresolved"], "data_quality_checks": [], "fallback": "clarify", "narration_fact_contract": "ambiguous_shape"},
+      {"id": "chart_disabled", "shape": "unsupported", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["chart_selector_none"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "chart_disabled"},
+      {"id": "comparison_two_filtered_kpis", "shape": "grouped_comparison", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "grouped_bar"}, "required_constraints": ["aligned_branch_labels"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "grouped_comparison"},
+      {"id": "composition_single_category_many", "shape": "stacked_composition", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "h_bar"}, "required_constraints": ["share_intent"], "data_quality_checks": ["pie_suitable"], "fallback": "table", "narration_fact_contract": "composition"},
+      {"id": "compound_multi_metric_by_time", "shape": "multi_metric_time", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "multi_line_wide"}, "required_constraints": ["stable_temporal_key"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "multi_metric_time"},
+      {"id": "compound_ratio_by_category", "shape": "breakdown", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["aligned_category_branches"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "compound_metric"},
+      {"id": "compound_ratio_by_time", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "line"}, "required_constraints": ["aligned_stable_temporal_key"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "compound_metric"},
+      {"id": "compound_ratio_by_time_series", "shape": "multi_series_time", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "multi_line"}, "required_constraints": ["aligned_temporal_and_series_keys"], "data_quality_checks": ["time_series", "multi_series"], "fallback": "table", "narration_fact_contract": "compound_metric"},
+      {"id": "compound_ratio_kpi", "shape": "kpi", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "kpi"}, "required_constraints": ["denominator_nonzero_handling"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "compound_metric"},
+      {"id": "correlation_candidate", "shape": "unsupported", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["statistical_calculation_not_enabled"], "data_quality_checks": [], "fallback": "clarify", "narration_fact_contract": "unsupported"},
+      {"id": "count_by_category", "shape": "breakdown", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["count_value_selected"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "breakdown"},
+      {"id": "count_by_time", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "line"}, "required_constraints": ["stable_temporal_key"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "time_series"},
+      {"id": "count_by_time_and_category", "shape": "multi_series_time", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "multi_line"}, "required_constraints": ["stable_temporal_key"], "data_quality_checks": ["time_series", "multi_series"], "fallback": "table", "narration_fact_contract": "multi_series_time"},
+      {"id": "distribution_generated_bucket", "shape": "unsupported", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["bucket_generation_not_enabled"], "data_quality_checks": [], "fallback": "clarify", "narration_fact_contract": "unsupported"},
+      {"id": "empty_result", "shape": "unsupported", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["zero_rows"], "data_quality_checks": ["empty_result"], "fallback": "table", "narration_fact_contract": "empty_result"},
+      {"id": "filtered_breakdown", "shape": "breakdown", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["filters_validated"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "breakdown"},
+      {"id": "filtered_kpi", "shape": "kpi", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "kpi"}, "required_constraints": ["filters_validated"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "kpi"},
+      {"id": "filtered_time_series", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "line"}, "required_constraints": ["filters_validated", "stable_temporal_key"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "time_series"},
+      {"id": "grouped_comparison_multi_value", "shape": "grouped_comparison", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "grouped_bar"}, "required_constraints": ["non_additive_or_independent_values"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "grouped_comparison"},
+      {"id": "kpi_count", "shape": "kpi", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "kpi"}, "required_constraints": ["count_value_numeric"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "kpi"},
+      {"id": "kpi_multi_measure_too_many", "shape": "kpi_set", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["too_many_kpi_cards"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "kpi_set"},
+      {"id": "kpi_single_computed_metric", "shape": "kpi", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "kpi"}, "required_constraints": ["computed_result_numeric"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "compound_metric"},
+      {"id": "list_distinct_values", "shape": "detail_table", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["list_intent_no_measure"], "data_quality_checks": ["table_size"], "fallback": "table", "narration_fact_contract": "detail_table"},
+      {"id": "matrix_temporal_category", "shape": "matrix", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["matrix_intent"], "data_quality_checks": ["matrix_size"], "fallback": "table", "narration_fact_contract": "matrix"},
+      {"id": "matrix_two_categories_multi_measure", "shape": "matrix", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["two_grouping_axes"], "data_quality_checks": ["matrix_size"], "fallback": "table", "narration_fact_contract": "matrix"},
+      {"id": "moving_average_time", "shape": "unsupported", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["ad_hoc_window_calculation_phase_required"], "data_quality_checks": [], "fallback": "clarify", "narration_fact_contract": "unsupported"},
+      {"id": "multi_series_time_many_series", "shape": "multi_series_time", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["series_limit_exceeded"], "data_quality_checks": ["multi_series"], "fallback": "table", "narration_fact_contract": "multi_series_time"},
+      {"id": "multi_series_time_multi_measure", "shape": "unsupported", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["ambiguous_series_vs_measure_lines"], "data_quality_checks": [], "fallback": "clarify", "narration_fact_contract": "ambiguous_shape"},
+      {"id": "multi_series_time_year_month_parts", "shape": "multi_series_time", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "multi_line"}, "required_constraints": ["stable_year_month_key"], "data_quality_checks": ["time_series", "multi_series"], "fallback": "table", "narration_fact_contract": "multi_series_time"},
+      {"id": "ordinal_bucket_breakdown", "shape": "distribution", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["bucket_order_known"], "data_quality_checks": ["bucket_order"], "fallback": "table", "narration_fact_contract": "distribution"},
+      {"id": "percent_of_total_by_category", "shape": "stacked_composition", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["denominator_scope_defined"], "data_quality_checks": ["pie_suitable"], "fallback": "table", "narration_fact_contract": "composition"},
+      {"id": "percent_of_total_by_time_category", "shape": "multi_series_time", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "multi_line"}, "required_constraints": ["denominator_scope_defined"], "data_quality_checks": ["time_series", "multi_series"], "fallback": "table", "narration_fact_contract": "composition"},
+      {"id": "period_over_period_kpi", "shape": "kpi", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "kpi"}, "required_constraints": ["period_windows_explicit"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "compound_metric"},
+      {"id": "period_over_period_time", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "line"}, "required_constraints": ["period_alignment_explicit"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "compound_metric"},
+      {"id": "ranking_bottom", "shape": "ranking", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "h_bar"}, "required_constraints": ["bottom_sort_ascending"], "data_quality_checks": ["ranking"], "fallback": "table", "narration_fact_contract": "ranking"},
+      {"id": "ranking_multi_measure", "shape": "ranking", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "grouped_bar"}, "required_constraints": ["ranking_metric_selected"], "data_quality_checks": ["ranking"], "fallback": "table", "narration_fact_contract": "ranking"},
+      {"id": "running_total_time", "shape": "unsupported", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["ad_hoc_running_calculation_phase_required"], "data_quality_checks": [], "fallback": "clarify", "narration_fact_contract": "unsupported"},
+      {"id": "single_category_breakdown_many_rows", "shape": "breakdown", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["category_limit_exceeded"], "data_quality_checks": ["category_limit"], "fallback": "table", "narration_fact_contract": "breakdown"},
+      {"id": "single_category_calculated_measure", "shape": "breakdown", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["model_measure_metadata_present"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "breakdown"},
+      {"id": "single_category_many_measures", "shape": "grouped_comparison", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["too_many_grouped_measures"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "grouped_comparison"},
+      {"id": "single_category_non_additive_calculated", "shape": "breakdown", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["non_additive_measure"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "breakdown"},
+      {"id": "single_row_with_category", "shape": "kpi", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "kpi"}, "required_constraints": ["single_row_category_context"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "kpi"},
+      {"id": "small_table_requested", "shape": "detail_table", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["user_requested_table"], "data_quality_checks": ["table_size"], "fallback": "table", "narration_fact_contract": "detail_table"},
+      {"id": "stacked_composition_multi_value", "shape": "stacked_composition", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "stacked_bar"}, "required_constraints": ["additive_part_values"], "data_quality_checks": ["additive_values"], "fallback": "table", "narration_fact_contract": "composition"},
+      {"id": "temporal_category_breakdown", "shape": "multi_series_time", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "multi_line"}, "required_constraints": ["trend_intent_uses_category_as_series"], "data_quality_checks": ["time_series", "multi_series"], "fallback": "table", "narration_fact_contract": "multi_series_time"},
+      {"id": "temporal_category_no_trend", "shape": "detail_table", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["temporal_axis_incidental"], "data_quality_checks": ["table_size"], "fallback": "table", "narration_fact_contract": "detail_table"},
+      {"id": "temporal_part_hour_profile", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["hour_order_map"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "time_series"},
+      {"id": "temporal_part_month_profile", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["month_order_map"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "time_series"},
+      {"id": "temporal_part_week_profile", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["week_order_map"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "time_series"},
+      {"id": "temporal_part_weekday_profile", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["weekday_order_map"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "time_series"},
+      {"id": "temporal_two_categories", "shape": "matrix", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["too_many_chart_axes"], "data_quality_checks": ["matrix_size"], "fallback": "table", "narration_fact_contract": "matrix"},
+      {"id": "temporal_two_categories_rollup", "shape": "multi_series_time", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "multi_line"}, "required_constraints": ["deterministic_axis_selection"], "data_quality_checks": ["time_series", "multi_series"], "fallback": "clarify", "narration_fact_contract": "multi_series_time"},
+      {"id": "three_axis_temporal_cube", "shape": "matrix", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["too_many_axes"], "data_quality_checks": ["matrix_size"], "fallback": "table", "narration_fact_contract": "matrix"},
+      {"id": "three_category_cube", "shape": "matrix", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["too_many_axes"], "data_quality_checks": ["matrix_size"], "fallback": "table", "narration_fact_contract": "matrix"},
+      {"id": "time_series_date_hour_parts", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "line"}, "required_constraints": ["stable_date_hour_key"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "time_series"},
+      {"id": "time_series_many_measures", "shape": "multi_metric_time", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["too_many_line_measures"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "multi_metric_time"},
+      {"id": "time_series_month_part_only", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["same_year_or_repair_required"], "data_quality_checks": ["time_series"], "fallback": "clarify", "narration_fact_contract": "time_series"},
+      {"id": "time_series_year_month_parts", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "line"}, "required_constraints": ["stable_year_month_key"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "time_series"},
+      {"id": "time_series_year_quarter_parts", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "line"}, "required_constraints": ["stable_year_quarter_key"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "time_series"},
+      {"id": "time_series_year_week_parts", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "line"}, "required_constraints": ["stable_year_week_key"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "time_series"},
+      {"id": "time_variant_measure_breakdown", "shape": "breakdown", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["time_variant_metadata_present"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "time_variant_measure"},
+      {"id": "time_variant_measure_kpi", "shape": "kpi", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "kpi"}, "required_constraints": ["time_variant_metadata_present"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "time_variant_measure"},
+      {"id": "time_variant_measure_trend", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "line"}, "required_constraints": ["time_variant_metadata_present", "stable_temporal_key"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "time_variant_measure"},
+      {"id": "unsupported_many_axes_many_values", "shape": "unsupported", "match": {"intent": "coverage_only"}, "renderer_binding": {}, "required_constraints": ["too_many_axes_and_values"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "unsupported"},
+      {"id": "variance_by_category", "shape": "breakdown", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "bar"}, "required_constraints": ["comparison_basis_explicit"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "compound_metric"},
+      {"id": "variance_by_time", "shape": "time_series", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "line"}, "required_constraints": ["comparison_basis_explicit", "stable_temporal_key"], "data_quality_checks": ["time_series"], "fallback": "table", "narration_fact_contract": "compound_metric"},
+      {"id": "variance_kpi", "shape": "kpi", "match": {"intent": "coverage_only"}, "renderer_binding": {"chart": "kpi"}, "required_constraints": ["comparison_basis_explicit"], "data_quality_checks": [], "fallback": "table", "narration_fact_contract": "compound_metric"}
+    ],
+    "guards": [
+      {
+        "id": "unsupported_no_values",
+        "shape": "unsupported",
+        "match": {"max_values": 0},
+        "renderer_binding": {},
+        "required_constraints": ["value_required_or_list_intent"],
+        "data_quality_checks": [],
+        "fallback": "clarify",
+        "narration_fact_contract": "unsupported"
+      },
+      {
+        "id": "raw_record_request",
+        "shape": "unsupported",
+        "match": {"intent": "raw_records"},
+        "renderer_binding": {},
+        "required_constraints": ["future_detail_drill_tool_required"],
+        "data_quality_checks": [],
+        "fallback": "clarify",
+        "narration_fact_contract": "unsupported_raw_records"
+      },
+      {
+        "id": "scatter_candidate",
+        "shape": "unsupported",
+        "match": {"intent": "scatter"},
+        "renderer_binding": {},
+        "required_constraints": ["scatter_renderer_not_enabled"],
+        "data_quality_checks": [],
+        "fallback": "table",
+        "narration_fact_contract": "unsupported_renderer"
+      }
+    ]
+  }
+}

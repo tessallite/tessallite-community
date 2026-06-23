@@ -1,0 +1,1 @@
+Screenshot of the New Tenant dialog. A modal dialog with two fields: Slug (text input, placeholder 'e.g. acme') and Display Name (text input). A Cancel button and a Create button at the bottom. The Create button is primary green. Dimensions: 800x400px (dialog only).

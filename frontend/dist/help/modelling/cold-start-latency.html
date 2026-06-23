@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cold-start Latency — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Cold-start Latency</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-25</span></div>
+    <h1>Cold-start Latency</h1>
+<h2>What this covers</h2>
+<p>Every deploy resets the warm cache. The <strong>Cold-start Latency</strong> dashboard, on the <strong>Model Health</strong> tab, lets the modeller see exactly what happens to query latency in the seconds and minutes after a deploy — whether predictive aggregates absorbed the first BI users, or whether queries fell through to the source.</p>
+<h2>Where it lives</h2>
+<p>Open Model Builder → <strong>Model Health</strong> tab → <strong>Cold-start latency</strong> section. It sits between <em>Model information</em> and <em>Model alerts</em>.</p>
+<p>The section is empty until the model has been deployed at least once.</p>
+<h2>What you see</h2>
+<h3>Stat cards</h3>
+<div class="table-wrapper"><table><thead><tr><th>Card</th><th>Meaning</th></tr></thead><tbody><tr><td><strong>Deployed</strong></td><td>Timestamp of the most recent deploy.</td></tr><tr><td><strong>Samples</strong></td><td>The number of queries observed since that deploy, capped by the configured <code>sample_size</code> (default 25).</td></tr><tr><td><strong>Median (post-deploy)</strong></td><td>Median execution time across the sampled queries.</td></tr><tr><td><strong>P95 (post-deploy)</strong></td><td>95th-percentile execution time across the sampled queries.</td></tr><tr><td><strong>Baseline median (Nd before)</strong></td><td>Median execution time across the N days of queries <em>before</em> the deploy (default 14). The bar to compare against.</td></tr></tbody></table></div>
+<h3>The chart</h3>
+<p>An inline SVG bar chart, one bar per sample in deploy order:</p>
+<ul><li><strong>Green bar</strong> — query was served by an aggregate (predictive or otherwise). The <code>aggregate_id</code> from the query log is non-null.</li><li><strong>Blue bar</strong> — query fell through to the source.</li><li><strong>Dashed red horizontal line</strong> — <code>baseline_median_ms</code>. Bars below the line ran faster than the pre-deploy median; bars above ran slower.</li></ul>
+<p>Hover any bar for a tooltip with the sample sequence, execution time, and aggregate flag.</p>
+<h2>How to read it</h2>
+<p>A healthy post-deploy chart looks like:</p>
+<ul><li>Most bars green (aggregates picked up the load).</li><li>Bar heights at or below the dashed line (no regression versus pre-deploy).</li><li>Clear convergence — even the first bars are not orders of magnitude taller than later ones.</li></ul>
+<p>A predictive-aggregate misfire looks like:</p>
+<ul><li>Many blue bars (queries falling through to source).</li><li>Bar heights well above the dashed line.</li><li>Missing patterns visible in the <strong>Aggregate Lifecycle</strong> panel (no <code>built</code> events for the predicted candidates, or <code>failed</code> events instead).</li></ul>
+<p>A capacity issue looks like:</p>
+<ul><li>Mostly green bars but all of them taller than the dashed line — aggregates are matching but the source warehouse itself is slower than it was before the deploy.</li></ul>
+<h2>API</h2>
+<p>The section reads from <code>GET /api/v1/models/{model_id}/cold-start</code>:</p>
+<div class="table-wrapper"><table><thead><tr><th>Query param</th><th>Default</th><th>Meaning</th></tr></thead><tbody><tr><td><code>sample_size</code></td><td><code>25</code></td><td>Cap on the number of post-deploy queries to render.</td></tr><tr><td><code>baseline_days</code></td><td><code>14</code></td><td>Window of pre-deploy queries used to compute the baseline median.</td></tr></tbody></table></div>
+<p>The endpoint reads <code>Model.last_deployed_at</code> and joins against <code>query_logs.created_at</code>. Pre-deploy percentile is computed inline (median + p95) on at most 2,000 rows from the baseline window.</p>
+<h2>When the section is empty</h2>
+<ul><li><em>&quot;Model has not been deployed yet&quot;</em> — <code>Model.last_deployed_at</code> is null. Deploy the model and revisit.</li><li><em>&quot;No queries observed since the last deploy&quot;</em> — the model is deployed but nobody has issued a query yet.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="predictive-aggregates.html">Predictive Aggregates</a></li><li><a href="aggregate-lifecycle.html">Aggregate Lifecycle</a></li><li><a href="../concepts/model-health.html">Model Health (concept)</a></li><li><a href="view-diagnostics.html">View Diagnostics</a></li></ul>
+<nav class="page-nav"><a href="aggregate-lifecycle.html" class="page-nav-btn prev">&larr; Aggregate Lifecycle</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="configure-pocket-tables.html" class="page-nav-btn next">Configure Pocket Tables &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

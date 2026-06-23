@@ -1,0 +1,1 @@
+Live Model Builder canvas for acme-demo modely showing the top tabs, save/deploy controls, toolbelt, and the graph of model tables.

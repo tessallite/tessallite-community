@@ -1,0 +1,1 @@
+Screenshot of the Model Builder Health tab showing a red Error row: "Aggregate build failed: write permission denied — daily_revenue_by_country — Scheduler cannot write to schema 'tessallite_agg'." The aggregate node visible in the Canvas behind the panel shows a red "Error" badge on the "daily_revenue_by_country" aggregate. Dimensions: 1280x700px.

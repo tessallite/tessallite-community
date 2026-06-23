@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Project Settings — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Project Settings</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-04-27</span></div>
+    <h1>Project Settings</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/project-settings-panel.png" alt="Project configuration drawer — General tab on a seed project."></figure>
+<h2>What this covers</h2>
+<p>Every project in Tessallite carries its own configuration drawer — a right-hand pane with nine focused tabs covering connections, LLM provider configurations, and the seven groups that drive the conversational agent. This page explains how to open the drawer, which tab owns what, and the resolver chain that ties project settings to model overrides.</p>
+<h2>Why the drawer</h2>
+<p>Connections, LLM configurations, and the agent&#x27;s brief, safety policy, knowledge map, and judge configuration are all <em>project-scoped</em> — the same connection or LLM bundle is reused across every model in the project, and the agent answers questions across the project&#x27;s models. Putting these on a single drawer keeps the model toolbox lean and avoids the temptation to redefine the same connection twice.</p>
+<h2>Opening the drawer</h2>
+<ol><li>Open <strong>Tenant Administration → Projects</strong>.</li><li>On the row of the project you want to configure, click the <strong>gear</strong> icon. The drawer opens from the right.</li><li>Use the tab strip across the top of the drawer to switch sections. The tab strip scrolls horizontally on narrow screens.</li></ol>
+<h2>The nine tabs</h2>
+<div class="table-wrapper"><table><thead><tr><th>Tab</th><th>What it owns</th><th>Typical edits</th></tr></thead><tbody><tr><td><strong>Connections</strong></td><td>The project&#x27;s pool of source / target connections (PostgreSQL, BigQuery, Hadoop / Spark Hive Thrift). Models and aggregates pick from this pool.</td><td>Add, edit, test, retire connections.</td></tr><tr><td><strong>LLM Configurations</strong></td><td>Named LLM provider bundles — OpenAI, Anthropic, Gemini, DeepSeek, GLM, Ollama. Each row carries the provider, model, API key, max tokens, temperature, and timeout.</td><td>Create one bundle per LLM you want available to the project&#x27;s agent and judge.</td></tr><tr><td><strong>General</strong></td><td>The agent master switch and a few global agent toggles.</td><td>Turn the agent on or off.</td></tr><tr><td><strong>Identity &amp; Tone</strong></td><td>Display name, project brief, agent role, tone preset, tone overrides, brand guidelines, disclosure text.</td><td>Set the brand-facing voice and the one-paragraph project context the LLM sees on every turn.</td></tr><tr><td><strong>Knowledge</strong></td><td>The glossary alias map and any project-level knowledge that grounds the agent.</td><td>Tune which terms map to which measures or dimensions.</td></tr><tr><td><strong>Safety</strong></td><td>Safety policy and content rules.</td><td>Add forbidden topics, content directives.</td></tr><tr><td><strong>LLM &amp; Judge</strong></td><td>Pickers for the answer LLM and the judge LLM (bound to the LLM Configurations tab), plus judge mode (sync / async), judge rubric, judge block visibility.</td><td>Pick which configured LLMs power the agent and the judge.</td></tr><tr><td><strong>Webhook</strong></td><td>Outbound webhook URL and signing secret for agent events.</td><td>Wire turn metadata into a downstream system.</td></tr><tr><td><strong>Retention</strong></td><td>How long agent conversations and traces are kept.</td><td>Tighten retention to meet compliance windows.</td></tr></tbody></table></div>
+<p>All nine tabs are direct CRUD — each tab edits its own dedicated table on the agent service or model service, not the registry. Connections write to <code>project_connections</code>, LLM Configurations write to <code>llm_provider_configs</code>, and the seven agent tabs all read and write a single <code>project_agent_configs</code> row through <code>/agent/config</code>.</p>
+<h2>How saves work</h2>
+<p>Each agent tab carries one <strong>Save</strong> button at the bottom; it persists the entire <code>ProjectAgentConfig</code> record in one PUT. Switching between agent tabs preserves the in-progress draft until you save or close the drawer. There is no per-row override or reset — the row either holds the value you saved, or the column default that ships with the schema.</p>
+<p>Project settings apply to every model in the project. The allow-list and per-model context are also managed from this drawer (LLM &amp; Judge tab and Knowledge tab respectively).</p>
+<h2>Editing a setting</h2>
+<ol><li>Open the drawer (see above) and switch to the relevant tab.</li><li>Adjust the fields you need to change. The Save button at the bottom of the tab persists every field on the agent record in one call.</li><li>Click <strong>Save</strong>. A success toast confirms the write; the form re-loads with the saved values so you can verify.</li><li>To revert a field, change it back to the desired value and click Save again. There is no separate undo path.</li></ol>
+<h2>Best practices</h2>
+<ul><li><strong>Define connections and LLM configs once.</strong> A common mistake is adding a second OpenAI bundle &quot;for the judge&quot; with the same key. Reuse a single bundle and pick it twice — once on the answer LLM picker, once on the judge LLM picker.</li><li><strong>Keep the project brief short.</strong> It is read on every agent turn; long briefs crowd out the per-model context.</li><li><strong>Test connections before turning on the agent.</strong> A failing connection in the agent&#x27;s allow-list returns errors at chat time. Open the connection&#x27;s row and run <em>Test</em> before flipping the General → Enable switch.</li></ul>
+<h2>Common pitfalls</h2>
+<ul><li><strong>Editing a connection while a refresh runs.</strong> Saving a connection mid-refresh leaves the in-flight job on the old credentials. Pause aggregate refreshes, edit, then resume.</li><li><strong>Picking an LLM bundle the project does not have.</strong> The picker dropdown is bound to <em>this project&#x27;s</em> LLM Configurations. If a bundle is missing, add it on the LLM Configurations tab first.</li><li><strong>Treating the seven agent tabs as a wizard.</strong> They are not ordered — you can save Identity, Safety, and Judge in any order. The agent reads the current state of all seven on every turn.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="../agent/configure-agent.html">Configure the conversational agent</a></li><li><a href="model-configuration.html">Model configuration</a></li><li><a href="../system-admin/system-configuration.html">System Configuration</a></li><li><a href="workspace-settings.html">Workspace Settings</a></li></ul>
+<nav class="page-nav"><a href="workspace-settings.html" class="page-nav-btn prev">&larr; Workspace Settings</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="model-configuration.html" class="page-nav-btn next">Model Configuration &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

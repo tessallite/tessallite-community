@@ -1,0 +1,12 @@
+Tessallite
+Copyright 2026 Tessallite Ltd.
+
+Tessallite Community source is source-available, not open-source. See `LICENSE`
+for the source-available terms and `LICENSE-SOURCE-AVAILABLE.md` for scope
+notes.
+
+Some Community and Enterprise artifacts may include closed or proprietary
+Tessallite components that are not covered by the source-available license. See
+`LICENSING.md`, `LICENSE-COMMUNITY.md`, `LICENSE-ENTERPRISE.md`,
+`OPEN-CLOSED-SPLIT.md`, and `THIRD_PARTY_NOTICES.md` for scope, runtime terms,
+component boundaries, and third-party notices.

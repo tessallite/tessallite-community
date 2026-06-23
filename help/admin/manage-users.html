@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Manage Users — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Manage Users</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Manage Users</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/admin-users-tab.png" alt="Admin panel Users tab listing tenant users."></figure>
+<h2>What this covers</h2>
+<p>This article covers all user management tasks available to a Tenant Admin: viewing the user list, inviting new users, removing users, resetting passwords, and reading user details.</p>
+<h2>Navigating to the user list</h2>
+<ol><li>Sign in to your workspace.</li><li>In the workspace sidebar, click <strong>Admin</strong>.</li><li>Click the <strong>Users</strong> tab.</li></ol>
+<p>The Users tab displays all users in the workspace with their email address, role, last-active timestamp, and project memberships.</p>
+<h2>Inviting a user</h2>
+<ol><li>On the Users tab, click <strong>Invite User</strong>.</li><li>Enter the user&#x27;s email address.</li><li>Select the role to assign: Tenant Admin, Modeller, Analyst, or <code>model_technical</code>.</li><li>Click <strong>Send Invitation</strong>.</li></ol>
+<p>The user receives an email containing a one-time invitation link, valid for 48 hours. On first sign-in, the user sets their own password.</p>
+<p>The <code>model_technical</code> choice is a special <strong>audience</strong> role rather than a permission level: it pins the user to the technical persona for column-level security and data tags, and grants no project access on its own. Pick it only for users who should see technical column detail; they will still need a project-level Viewer or Modeller binding to open a project. See <a href="manage-roles.html">Manage roles</a> and <a href="../modelling/configure-personas.html">Configure personas</a>.</p>
+<h3>If the invitation expires</h3>
+<p>Return to the Users tab. The invited user appears with status <strong>Invitation expired</strong>. Click <strong>Resend</strong> next to their row. A new invitation link is generated; the old link is invalidated.</p>
+<h2>Removing a user</h2>
+<ol><li>On the Users tab, find the user you want to remove.</li><li>Click <strong>Remove</strong> in that user&#x27;s row.</li><li>Confirm the action in the dialog.</li></ol>
+<p>Removal takes effect immediately. All active sessions are invalidated. Historical activity (query logs, model edits) is retained.</p>
+<p>A Tenant Admin cannot remove another Tenant Admin. Only the System Admin can remove or demote a Tenant Admin.</p>
+<h2>Resetting a user&#x27;s password</h2>
+<ol><li>On the Users tab, click the user&#x27;s name to open their detail view.</li><li>Click <strong>Reset Password</strong>.</li><li>Confirm in the dialog.</li></ol>
+<p>The user receives a password reset link valid for 24 hours. Their current password remains active until they complete the reset.</p>
+<h2>Viewing user details</h2>
+<p>Clicking a user&#x27;s name opens a detail panel showing:</p>
+<ul><li><strong>Last active</strong>: timestamp of the user&#x27;s most recent authenticated request.</li><li><strong>Assigned role</strong>: the workspace-level role currently in effect.</li><li><strong>Project memberships</strong>: the projects the user can access and their role within each.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="manage-roles.html">Manage Roles</a></li><li><a href="create-a-workspace.html">Create a Workspace</a></li><li><a href="../concepts/roles-and-permissions.html">Roles and Permissions (concepts)</a></li></ul>
+<nav class="page-nav"><a href="create-a-workspace.html" class="page-nav-btn prev">&larr; Create a Workspace</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="manage-roles.html" class="page-nav-btn next">Manage Roles &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

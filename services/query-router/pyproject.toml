@@ -1,0 +1,41 @@
+[project]
+name = "query-router"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.111.0",
+    "prometheus-client>=0.20.0",
+    "uvicorn[standard]>=0.29.0",
+    "sqlalchemy>=2.0.30",
+    "asyncpg>=0.29.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "sqlglot>=23.0.0",
+    "python-jose[cryptography]>=3.3.0",
+    "cryptography>=42.0.0",
+    "httpx>=0.27.0",
+    "google-cloud-bigquery>=3.0.0",
+    "google-auth>=2.0.0",
+    "db-dtypes>=1.0.0",
+    "pyhive>=0.7.0",
+    "thrift>=0.16.0",
+    "pure-sasl>=0.6.2",
+    "snowflake-connector-python>=3.6.0",
+    "aioodbc>=0.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = [".", "../../"]
+testpaths = ["tests"]
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests requiring mocked DB",
+    "e2e: End-to-end tests requiring running services",
+]

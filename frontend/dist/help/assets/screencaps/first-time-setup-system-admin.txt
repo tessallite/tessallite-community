@@ -1,0 +1,1 @@
+Screenshot of the System Administration screen, reached after signing in as system admin. The screen shows a list of workspaces (tenants) with columns for Slug, Display Name, and Created. A 'New Tenant' button appears in the top right. Dimensions: 1280x800px.

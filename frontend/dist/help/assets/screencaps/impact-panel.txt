@@ -1,0 +1,1 @@
+Live Impact drawer for modely, opened from the Model Builder toolbelt, showing downstream asset tracking and source-audit impact controls.

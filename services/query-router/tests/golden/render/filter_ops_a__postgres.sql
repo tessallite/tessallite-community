@@ -1,0 +1,1 @@
+SELECT "f"."region" AS "region", SUM("f"."amount") AS "amount" FROM "demo"."sales" AS "f" WHERE "f"."qty" > 5 AND "f"."qty" <= 100 AND "f"."region" != 'X' AND "f"."region" IN ('EMEA', 'APAC') AND "f"."region" IS NOT NULL GROUP BY "f"."region"

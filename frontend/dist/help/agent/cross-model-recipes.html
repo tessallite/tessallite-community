@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cross-model calculation recipes — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Agent</span> / <span>Cross-model calculation recipes</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-26</span></div>
+    <h1>Cross-model calculation recipes</h1>
+<h2>What this covers</h2>
+<p>A <em>recipe</em> is a multi-step calculation the agent can run against more than one model in a single turn. Recipes solve the class of analytical questions whose answer requires combining numbers from different fact tables — questions a single semantic query cannot answer. This article explains when a recipe is the right tool, how the recipe spec is shaped, how the engine executes it, and how to author recipes that the agent picks up reliably.</p>
+<h2>Why recipes exist</h2>
+<p>The semantic engine answers single-model questions: one fact table, one set of measures and dimensions, one time window. That covers most questions, but not all. Some questions are inherently multi-model:</p>
+<ul><li><strong>A ratio across facts.</strong> &quot;What was inventory turnover last quarter?&quot; requires <code>cogs</code> from the orders fact and <code>avg_inventory</code> from the stock fact.</li><li><strong>A funnel across facts.</strong> &quot;How many of last week&#x27;s signups placed an order in the same week?&quot; requires the signups fact and the orders fact.</li><li><strong>A re-baselining.</strong> &quot;Express last month&#x27;s revenue as a percentage of the trailing twelve months&quot; requires two queries against the same model with different time windows.</li></ul>
+<p>The agent could in principle ask each query and stitch the result together in narration, but in practice that path is unreliable: the LLM forgets which numbers it has, the citations get muddled, and the judge has no clean structure to evaluate. A recipe gives the engine a deterministic plan to execute and the LLM a single result to narrate.</p>
+<h2>What a recipe is</h2>
+<p>A recipe is a small JSON document a modeller authors. It has:</p>
+<ul><li><strong>A name and description.</strong> Human-readable. The description is what the answer LLM reads when deciding whether to call the recipe.</li><li><strong>Parameters.</strong> Named placeholders the user&#x27;s question fills in (typically a time window, a region, a category).</li><li><strong>Steps.</strong> An ordered list of single-model queries. Each step pins to a model in the project&#x27;s allow-list, names its measures, dimensions, filters, and limit, and is given a step name.</li><li><strong>A combine expression.</strong> A small formula that combines the step results into a single value or table. You build it from blocks rather than typing text: each block is either a <strong>number</strong>, a <strong>step measure</strong> (pick one of your steps, then one of its measures from drop-downs), or an <strong>operation</strong> (divide, multiply, subtract, round, and so on) whose inputs are themselves blocks. Nest blocks to express things like &quot;divide one step&#x27;s measure by another, multiply by 100, then round to 2 decimals&quot;. Leave the combine set to <em>None</em> when the recipe simply runs the queries side-by-side. Because you choose steps and measures from lists, the references are always valid — and a step can be named anything (even a word like <code>global</code>) without confusing the formula.</li><li><strong>Notes.</strong> Free text. Read by the judge as a hint about what good output looks like.</li></ul>
+<p>Recipes live under <em>Tenant Administration → Projects → \&lt;project&gt; → Conversational agent → Recipes</em>. The same surface is exposed via the recipes API.</p>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/agent-recipes.png" alt="Recipes sub-tab — recipe list with the inline editor open, showing parameters, steps, and combine expression."></figure>
+<h2>When to write a recipe</h2>
+<p>Write a recipe when:</p>
+<ul><li>The answer requires data from two or more facts that share at least one dimension.</li><li>The combine is stable (a fixed formula or a fixed ordering) and worth registering as a first-class capability.</li><li>Users are asking the question often enough that they would benefit from a single-shot answer instead of stringing multiple turns together.</li></ul>
+<p>Do <strong>not</strong> write a recipe when:</p>
+<ul><li>A single-model query answers the question. The semantic engine is faster, cheaper, and better-tested.</li><li>The combine logic is bespoke per question. Free-form combines belong in narration, not in a recipe.</li><li>The dimensions diverge across facts. If two facts grain at incompatible levels (e.g., daily orders vs. monthly inventory snapshots), the combine produces a misleading number. Reshape the underlying models first.</li></ul>
+<h2>Anatomy of a recipe</h2>
+<p>A worked example. The recipe answers &quot;what is inventory turnover for [time window]&quot; by dividing COGS by average inventory.</p>
+<pre><code>{
+  &quot;name&quot;: &quot;Inventory turnover&quot;,
+  &quot;description&quot;: &quot;Inventory turnover is COGS divided by average inventory over the same window. Call this when the user asks about stock turn or how fast inventory moves.&quot;,
+  &quot;parameters&quot;: [
+    {
+      &quot;name&quot;: &quot;window&quot;,
+      &quot;description&quot;: &quot;The time window the question is about.&quot;,
+      &quot;resolves_to_glossary_entity&quot;: true
+    }
+  ],
+  &quot;steps&quot;: [
+    {
+      &quot;name&quot;: &quot;cogs&quot;,
+      &quot;model_id&quot;: &quot;&lt;orders model id&gt;&quot;,
+      &quot;measures&quot;: [&quot;cogs&quot;],
+      &quot;dimensions&quot;: [],
+      &quot;filters&quot;: [{&quot;name&quot;: &quot;order_date&quot;, &quot;op&quot;: &quot;in_window&quot;, &quot;value&quot;: &quot;{window}&quot;}],
+      &quot;limit&quot;: 1
+    },
+    {
+      &quot;name&quot;: &quot;avg_inventory&quot;,
+      &quot;model_id&quot;: &quot;&lt;stock model id&gt;&quot;,
+      &quot;measures&quot;: [&quot;avg_inventory&quot;],
+      &quot;dimensions&quot;: [],
+      &quot;filters&quot;: [{&quot;name&quot;: &quot;snapshot_date&quot;, &quot;op&quot;: &quot;in_window&quot;, &quot;value&quot;: &quot;{window}&quot;}],
+      &quot;limit&quot;: 1
+    }
+  ],
+  &quot;combine&quot;: {&quot;op&quot;: &quot;div&quot;, &quot;args&quot;: [
+    {&quot;ref&quot;: {&quot;step&quot;: &quot;cogs&quot;, &quot;measure&quot;: &quot;cogs&quot;}},
+    {&quot;ref&quot;: {&quot;step&quot;: &quot;avg_inventory&quot;, &quot;measure&quot;: &quot;avg_inventory&quot;}}
+  ]},
+  &quot;notes&quot;: &quot;Express the answer as a unitless ratio with two decimal places. Mention the window.&quot;
+}</code></pre>
+<p>The engine resolves <code>{window}</code> from the user&#x27;s question via the glossary, runs the two queries against their respective models, evaluates the combine, and returns the value plus the two underlying step results. The narration LLM turns this into prose. The judge sees the combine and the step rows and verifies the answer against them.</p>
+<h2>How the LLM picks a recipe</h2>
+<p>The answer LLM is shown the description and parameters of every recipe in the project. When the user&#x27;s question matches a recipe&#x27;s description well, the LLM emits a <code>run_recipe</code> tool call instead of a <code>query</code> tool call. Two practical implications:</p>
+<ul><li><strong>Descriptions matter.</strong> The LLM picks recipes by description match. Write descriptions that name the metric the recipe computes (&quot;inventory turnover&quot;, &quot;year-on-year change&quot;, &quot;conversion funnel&quot;) in the same words your users use.</li><li><strong>Avoid overlapping recipes.</strong> If two recipes have nearly identical descriptions, the LLM picks one essentially at random. Merge them or differentiate the descriptions sharply.</li></ul>
+<h2>Common pitfalls</h2>
+<ul><li><strong>Mismatched grains.</strong> When two steps return different dimension sets, the engine combines them against the <em>finest</em> shared grain. A step that returns a single value — for example a company-wide total — is <strong>broadcast</strong> across every row of the more detailed step, so each detailed row gets the correct combined value rather than the total being applied once and the rest silently dropped. Where the grains genuinely cannot be lined up — neither is a clean refinement of the other — the engine does <strong>not</strong> guess: it returns the rows as a visible <strong>stack</strong> instead of a single combined number, so you can see at a glance that the combine did not line up. If you see a stacked result where you expected one number, re-grain the steps (filter each step to a common dimension set) so the combine has an unambiguous shape.</li><li><strong>Empty step results.</strong> The scalar functions a combine can use (<code>round</code>, <code>abs</code>, <code>min</code>, <code>max</code>, <code>sum</code>) pass a missing value straight through as a blank result instead of erroring — so a step that returns no rows yields a blank combined answer rather than crashing the whole turn. Division by zero behaves the same way: it produces a blank, not an error. If a blank should be read as "no data" rather than "zero", say so in the recipe note so the narration explains it.</li><li><strong>Hard-coded time windows.</strong> Embedding &quot;last 30 days&quot; in the steps locks the recipe to one window. Use a parameter instead.</li><li><strong>Combines that hide divisions by zero.</strong> If the denominator step can return zero, add a note in the recipe so the narration explicitly handles it.</li><li><strong>Recipes that wrap a single query.</strong> If the recipe has one step and no combine, it is just a query. Use a query.</li><li><strong>Forgetting to allow-list both models.</strong> A recipe that references a model not on the agent&#x27;s allow-list refuses at execution time. Allow-list every model named by every recipe.</li></ul>
+<h2>Operating recipes</h2>
+<p>After authoring a recipe, exercise it:</p>
+<ol><li>Open the <em>Chat</em> tab and ask the question the recipe is meant to answer. Check that the trace drawer shows a <code>run_recipe</code> plan, that each step ran, and that the combine value matches a hand calculation.</li><li>Watch the judge verdict on the <em>Metrics → Recent calibration</em> table. If the judge consistently warns or fails on recipe answers, the rubric needs a section that judges combine values explicitly.</li><li>Add the question to the per-model glossary&#x27;s <em>Example questions</em> so the eval runner exercises the recipe path on every run.</li></ol>
+<h2>Related reading</h2>
+<ul><li><a href="configure-agent.html">Configure your project agent</a></li><li><a href="glossary-alias-map.html">Author the glossary alias map</a></li><li><a href="write-a-judge-rubric.html">Write a judge rubric</a></li></ul>
+<nav class="page-nav"><a href="write-a-judge-rubric.html" class="page-nav-btn prev">&larr; Write a judge rubric</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="agent-log-screen.html" class="page-nav-btn next">Agent log screen &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

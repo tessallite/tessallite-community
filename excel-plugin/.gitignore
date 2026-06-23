@@ -1,0 +1,3 @@
+# Dev certificates
+*.pfx
+*.p12

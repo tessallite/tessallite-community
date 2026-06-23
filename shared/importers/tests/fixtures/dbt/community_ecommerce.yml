@@ -1,0 +1,168 @@
+# dbt 1.7+ semantic model — Community E-commerce Project
+# Source: Composite of community dbt-metricflow patterns (GitHub)
+# Tests: non_additive_dimension, list-format filters, conversion metric,
+#        measures with labels, multiple saved_queries
+semantic_models:
+  - name: orders
+    description: Order header table with one row per order.
+    model: ref('stg_orders')
+    label: Orders
+    defaults:
+      agg_time_dimension: order_date
+    entities:
+      - name: order_id
+        type: primary
+      - name: customer
+        type: foreign
+        expr: customer_id
+    dimensions:
+      - name: order_date
+        type: time
+        label: Order Date
+        type_params:
+          time_granularity: day
+      - name: order_status
+        type: categorical
+        label: Order Status
+        description: pending, processing, shipped, delivered, returned
+      - name: country
+        type: categorical
+        label: Country
+    measures:
+      - name: order_amount
+        agg: sum
+        expr: total_amount
+        label: Order Amount
+        description: Total order value including tax and shipping
+      - name: order_count
+        agg: count
+        label: Order Count
+      - name: unique_customers
+        agg: count_distinct
+        expr: customer_id
+        label: Unique Customers
+      - name: avg_order_value
+        agg: average
+        expr: total_amount
+        label: Average Order Value
+      - name: latest_order_amount
+        agg: max
+        expr: total_amount
+        label: Largest Order
+        non_additive_dimension:
+          name: order_date
+          agg: max
+          window_choice: max
+
+  - name: sessions
+    description: Website session table for conversion tracking.
+    model: ref('stg_sessions')
+    label: Sessions
+    entities:
+      - name: session_id
+        type: primary
+      - name: customer
+        type: foreign
+        expr: user_id
+    dimensions:
+      - name: session_start
+        type: time
+        label: Session Start
+        type_params:
+          time_granularity: day
+      - name: traffic_source
+        type: categorical
+        label: Traffic Source
+      - name: device_type
+        type: categorical
+        label: Device Type
+    measures:
+      - name: session_count
+        agg: count
+        label: Sessions
+      - name: bounce_count
+        agg: sum
+        expr: is_bounce
+        label: Bounces
+
+metrics:
+  - name: total_revenue
+    type: simple
+    label: Total Revenue
+    type_params:
+      measure: order_amount
+
+  - name: completed_orders
+    type: simple
+    label: Completed Orders
+    description: Orders that reached delivered status
+    type_params:
+      measure: order_count
+    filter:
+      - where_sql_template: "{{ Dimension('order_status') }} = 'delivered'"
+
+  - name: repeat_purchase_rate
+    type: ratio
+    label: Repeat Purchase Rate
+    description: Fraction of customers who ordered more than once
+    type_params:
+      numerator:
+        name: unique_customers
+        filter:
+          - where_sql_template: "{{ Dimension('order_status') }} = 'delivered'"
+      denominator:
+        name: unique_customers
+
+  - name: conversion_rate
+    type: conversion
+    label: Conversion Rate
+    description: Session-to-order conversion
+    type_params:
+      entity: customer
+      calculation: conversions
+      base_measure: session_count
+      conversion_measure: order_count
+      constant_properties:
+        - base_property: session_start
+          conversion_property: order_date
+
+  - name: revenue_per_session
+    type: derived
+    label: Revenue per Session
+    type_params:
+      expr: order_amount / session_count
+      metrics:
+        - name: order_amount
+        - name: session_count
+
+  - name: cumulative_orders
+    type: cumulative
+    label: Cumulative Orders
+    type_params:
+      measure: order_count
+      window: 90
+      grain_to_date: quarter
+
+saved_queries:
+  - name: executive_dashboard
+    description: High-level KPIs for executive reporting
+    label: Executive Dashboard
+    query_params:
+      metrics:
+        - total_revenue
+        - completed_orders
+        - unique_customers
+      group_by:
+        - TimeDimension('order_date', 'month')
+        - Dimension('country')
+
+  - name: marketing_funnel
+    description: Traffic-to-conversion funnel metrics
+    label: Marketing Funnel
+    query_params:
+      metrics:
+        - conversion_rate
+        - revenue_per_session
+      group_by:
+        - Dimension('traffic_source')
+        - Dimension('device_type')

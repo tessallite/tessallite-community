@@ -1,0 +1,275 @@
+"""Cross-tenant snapshot rewriter (Phase 6).
+
+Takes an export bundle produced by ``snapshot_model`` (or wrapped via
+the export endpoint) and produces a *new* snapshot with:
+
+  - every primary key replaced by a fresh UUID
+  - every foreign-key reference rewritten to track the new PKs
+  - ``project_connection_id`` on data_sources / data_targets remapped
+    via the caller-supplied mapping (per F-11: connections never travel
+    cross-tenant; the importer must rebind to local connections)
+
+The rewritten snapshot is then handed to ``rehydrate_into_live`` against
+a freshly-created Model row. No existing model state is touched.
+"""
+from __future__ import annotations
+
+import copy
+import uuid
+from typing import Any
+from uuid import UUID
+
+
+_UUID_LEN = 36
+
+
+def _is_uuid_string(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != _UUID_LEN or value.count("-") != 4:
+        return False
+    try:
+        UUID(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _fresh() -> str:
+    return str(uuid.uuid4())
+
+
+def _collect_pks(snapshot: dict[str, Any]) -> dict[str, str]:
+    """Walk the snapshot and produce {old_uuid: new_uuid} for every PK we know about."""
+    mapping: dict[str, str] = {}
+
+    # Tables, columns, UDAs, joins, dimensions, measures, sources, targets:
+    # each row's "id" is a primary key in its respective table. v2 families
+    # whose top-level rows carry a flat "id" are listed here too.
+    for key in (
+        "tables", "columns", "user_defined_attributes", "joins",
+        "dimensions", "measures", "data_sources", "data_targets",
+        "lineage_mappings",
+        # Bug-1022: kpis and named_sets were never PK-remapped, so any
+        # snapshot import into the same tenant 500'd on kpis_pkey /
+        # named_sets_pkey collisions.
+        "kpis", "named_sets",
+        # v2 — flat rows
+        "drill_through_sets", "calendar_tables",
+        "personas", "row_security_rules",
+        "aggregate_lifecycle_events",
+        "source_join_statistics",
+        # F-008-09 — data tags (column_ids / persona_tag_restrictions
+        # references are rewritten by the generic UUID pass via the
+        # column / persona / tag pk entries).
+        "data_tags",
+        # v3 (F-013-06) — model-scoped config families with flat "id" PKs.
+        # data_quality_rules.target_id and entity_translations.entity_id are
+        # soft references to measures/dimensions/etc; the generic UUID pass
+        # rewrites them once those families' PKs are in the map. model_alias_map
+        # is a single dict keyed by model_id (no own PK) and is rewritten by the
+        # model-PK entry, so it is not listed here.
+        "model_parameters",
+        "data_quality_rules",
+        "entity_translations",
+    ):
+        for row in snapshot.get(key, []) or []:
+            old = row.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+
+    # Hierarchies have nested levels (and level attributes); each carries its own PK.
+    for h in snapshot.get("hierarchies", []) or []:
+        old = h.get("id")
+        if _is_uuid_string(old) and old not in mapping:
+            mapping[old] = _fresh()
+        for lvl in h.get("levels", []) or []:
+            old = lvl.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+            for attr in lvl.get("attributes", []) or []:
+                old = attr.get("id")
+                if _is_uuid_string(old) and old not in mapping:
+                    mapping[old] = _fresh()
+
+    # Aggregates have nested columns and refresh_policy.
+    for a in snapshot.get("aggregates", []) or []:
+        old = a.get("id")
+        if _is_uuid_string(old) and old not in mapping:
+            mapping[old] = _fresh()
+        for c in a.get("columns", []) or []:
+            old = c.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+        rp = a.get("refresh_policy")
+        if isinstance(rp, dict):
+            old = rp.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+
+    # AI scheduler config row PK (if any)
+    sched = snapshot.get("ai_scheduler_config")
+    if isinstance(sched, dict):
+        old = sched.get("id")
+        if _is_uuid_string(old) and old not in mapping:
+            mapping[old] = _fresh()
+
+    # v3 (F-013-06) — refresh_sla_config is a single dict with its own "id" PK.
+    # Without a fresh PK, a same-tenant clone would collide on
+    # refresh_sla_configs_pkey. (model_alias_map keys on model_id only and is
+    # remapped via the model PK; data_quality_rules / model_parameters /
+    # entity_translations are handled in the list loop above.)
+    sla = snapshot.get("refresh_sla_config")
+    if isinstance(sla, dict):
+        old = sla.get("id")
+        if _is_uuid_string(old) and old not in mapping:
+            mapping[old] = _fresh()
+
+    # v2 — Pockets carry nested predicates + refresh_policy.
+    for p in snapshot.get("pockets", []) or []:
+        old = p.get("id")
+        if _is_uuid_string(old) and old not in mapping:
+            mapping[old] = _fresh()
+        for pr in p.get("predicates", []) or []:
+            old = pr.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+        rp = p.get("refresh_policy")
+        if isinstance(rp, dict):
+            old = rp.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+
+    # v2 — Glossary entries carry nested synonyms + attachments.
+    for g in snapshot.get("glossary_entries", []) or []:
+        old = g.get("id")
+        if _is_uuid_string(old) and old not in mapping:
+            mapping[old] = _fresh()
+        for s in g.get("synonyms", []) or []:
+            old = s.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+        for a in g.get("attachments", []) or []:
+            old = a.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+
+    # v2 — Source statistics carry nested column statistics.
+    for st in snapshot.get("source_statistics", []) or []:
+        old = st.get("id")
+        if _is_uuid_string(old) and old not in mapping:
+            mapping[old] = _fresh()
+        for c in st.get("columns", []) or []:
+            old = c.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+
+    # uda_column_refs PK (if present in the row)
+    for r in snapshot.get("uda_column_refs", []) or []:
+        old = r.get("id")
+        if _is_uuid_string(old) and old not in mapping:
+            mapping[old] = _fresh()
+
+    # Model PK (top-level "model" dict carries the old model id)
+    m = snapshot.get("model") or {}
+    old = m.get("id")
+    if _is_uuid_string(old) and old not in mapping:
+        mapping[old] = _fresh()
+
+    return mapping
+
+
+def _rewrite_node(node: Any, pk_map: dict[str, str]) -> Any:
+    """Recursively rewrite any UUID-shaped string that appears as a key value.
+
+    Only string values are rewritten. Keys are left alone (we never key by UUID).
+    """
+    if isinstance(node, dict):
+        return {k: _rewrite_node(v, pk_map) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_rewrite_node(v, pk_map) for v in node]
+    if isinstance(node, str) and _is_uuid_string(node) and node in pk_map:
+        return pk_map[node]
+    return node
+
+
+def _remap_connections(
+    snapshot: dict[str, Any], connection_mapping: dict[str, str]
+) -> tuple[dict[str, Any], list[str]]:
+    """Replace ``project_connection_id`` on every source/target.
+
+    Returns (snapshot, missing) where ``missing`` lists the source/target
+    display names whose connection id had no mapping entry. The caller
+    decides whether to fail the import or accept partial rebinding.
+    """
+    missing: list[str] = []
+    for s in snapshot.get("data_sources", []) or []:
+        old = s.get("project_connection_id")
+        if isinstance(old, str) and old in connection_mapping:
+            s["project_connection_id"] = connection_mapping[old]
+        else:
+            missing.append(f"source:{s.get('display_name') or s.get('id')}")
+    for t in snapshot.get("data_targets", []) or []:
+        old = t.get("project_connection_id")
+        if isinstance(old, str) and old in connection_mapping:
+            t["project_connection_id"] = connection_mapping[old]
+        else:
+            missing.append(f"target:{t.get('display_name') or t.get('id')}")
+    return snapshot, missing
+
+
+def _strip_cross_tenant_only_refs(snapshot: dict[str, Any]) -> None:
+    """Null out fields that reference rows living outside the per-model
+    snapshot scope (tenant or system) so a cross-tenant import doesn't
+    import a stale FK to a row that doesn't exist in the target tenant.
+
+    Currently:
+      - ``model.llm_config_id`` references ``llm_provider_configs`` which
+        is a tenant-level table. The target tenant may have a different
+        active config or none at all; the FK is ON DELETE SET NULL, but
+        an INSERT with a non-existent llm_config_id would still error.
+        Strip it; the user re-selects an LLM config post-import.
+      - ``glossary_entries[].created_by`` carries the source-tenant user
+        UUID, which doesn't exist in the target tenant. No FK constraint
+        on this column, but leaving the value in place silently links
+        glossary entries to phantom users. Strip it.
+    """
+    m = snapshot.get("model")
+    if isinstance(m, dict) and m.get("llm_config_id"):
+        m["llm_config_id"] = None
+    for g in snapshot.get("glossary_entries", []) or []:
+        if g.get("created_by"):
+            g["created_by"] = None
+
+
+def prepare_snapshot_for_import(
+    snapshot: dict[str, Any],
+    *,
+    new_model_id: UUID,
+    connection_mapping: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Rewrite a snapshot for cross-tenant import.
+
+    The returned snapshot is safe to feed into ``rehydrate_into_live``
+    against a freshly-created Model row whose id is ``new_model_id``.
+
+    Returns (snapshot, missing_connections).
+    """
+    snapshot = copy.deepcopy(snapshot)
+
+    # Step 1: collect all old PKs and assign new ones.
+    pk_map = _collect_pks(snapshot)
+    # Force the model PK to the caller-chosen new id (so the freshly
+    # inserted Model row matches what we rehydrate into).
+    old_model_id = (snapshot.get("model") or {}).get("id")
+    if isinstance(old_model_id, str):
+        pk_map[old_model_id] = str(new_model_id)
+
+    # Step 2: rewrite every UUID-shaped value anywhere in the tree.
+    snapshot = _rewrite_node(snapshot, pk_map)
+
+    # Step 3: strip references to rows outside the per-model snapshot
+    # scope (these can't survive a tenant boundary).
+    _strip_cross_tenant_only_refs(snapshot)
+
+    # Step 4: rebind project_connection_id values via the caller mapping.
+    snapshot, missing = _remap_connections(snapshot, connection_mapping or {})
+    return snapshot, missing

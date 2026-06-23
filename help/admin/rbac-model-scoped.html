@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Model-Scoped RBAC — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Model-Scoped RBAC</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant_admin</span><span class="updated">Updated 2026-06-12</span></div>
+    <h1>Model-Scoped RBAC</h1>
+<h2>What this covers</h2>
+<p>Model-scoped RBAC lets you grant a user a different access level on a specific model than they have at the project level. This page explains the binding hierarchy, the fallback rules, and when model-scoped bindings are the right tool.</p>
+<h2>The binding hierarchy</h2>
+<p>Access in Tessallite is determined by checking bindings in this order:</p>
+<p><strong>Workspace-admin bypass:</strong> <code>tenant_admin</code> and <code>system_admin</code> users skip binding checks entirely and can access any project and model. For everyone else, bindings are checked in this order:</p><ol><li><strong>Model-scoped binding</strong> — <code>user_access_bindings</code> with <code>model_id</code> set. Takes precedence for operations on that specific model.</li><li><strong>Project-scoped binding</strong> — <code>user_access_bindings</code> with <code>project_id</code> set and <code>model_id</code> null. Used when no model-scoped binding exists.</li><li><strong>Bootstrap rule</strong> — If the project has <strong>no bindings at all</strong>, any signed-in workspace user is treated as the project&#x27;s admin. This open period ends the moment the first binding is saved, and each use is recorded in the audit log as <code>rbac.bootstrap_admin_grant</code>. See <a href="manage-roles.html">Manage Roles — the bootstrap rule</a> for why this is deliberate and how to close it early.</li></ol>
+<p>If none of these match, the request is rejected with 403.</p>
+<h2>Why model-scoped bindings exist</h2>
+<p>The typical use case is a project with multiple models where different teams own different models:</p>
+<ul><li>The Data Engineering team needs <code>modeler</code> rights on the raw-data model but should be <code>viewer</code> only on the marketing attribution model.</li><li>An external partner can be granted <code>viewer</code> on one model without having any access to the rest of the project.</li><li>A model under active development can be scoped to <code>modeler</code>-only access while all other models in the project remain available to viewers.</li></ul>
+<p>Without model-scoped bindings, you would need a separate project per team — duplicating connections, targets, and shared dimension definitions.</p>
+<h2>Creating a model-scoped binding</h2>
+<ol><li>Open <strong>Tenant Administration → Projects → [your project] → Access</strong>.</li><li>Locate the user row.</li><li>Click the model-scope icon next to the user&#x27;s role chip.</li><li>Select the target model from the dropdown.</li><li>Select the role to grant on that model.</li><li>Save.</li></ol>
+<p>Or via API:</p>
+<pre><code>POST /api/v1/projects/{project_id}/access
+{
+  &quot;user_id&quot;: &quot;&lt;uuid&gt;&quot;,
+  &quot;role&quot;: &quot;modeler&quot;,
+  &quot;model_id&quot;: &quot;&lt;uuid&gt;&quot;
+}</code></pre>
+<h2>Revoking a model-scoped binding</h2>
+<p>Delete the specific model-scoped binding. The user retains their project-level binding for other models.</p>
+<pre><code>DELETE /api/v1/projects/{project_id}/access/{binding_id}</code></pre>
+<h2>Interaction with row security and personas</h2>
+<p>Model-scoped bindings control which CRUD operations a user can perform on model metadata. They do not affect which rows the user sees in queries. Row security and persona restrictions apply independently of the binding level.</p>
+<h2>Roles reference</h2>
+<div class="table-wrapper"><table><thead><tr><th>Role</th><th>What it permits</th></tr></thead><tbody><tr><td><code>viewer</code></td><td>Read model metadata, run queries, view diagnostics</td></tr><tr><td><code>modeler</code></td><td>All viewer rights plus create/edit/delete dimensions, measures, aggregates, rules</td></tr><tr><td><code>admin</code></td><td>All modeler rights plus manage connections, targets, deploy/undeploy</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="manage-roles.html">Manage Roles</a></li><li><a href="../modelling/configure-row-security.html">Configure Row Security</a></li><li><a href="project-settings.html">Project Settings</a></li></ul>
+<nav class="page-nav"><a href="manage-roles.html" class="page-nav-btn prev">&larr; Manage Roles</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="workspace-settings.html" class="page-nav-btn next">Workspace Settings &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

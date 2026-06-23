@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Embed API — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Embed API</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">developer</span><span class="updated">Updated 2026-05-19</span></div>
+<h1>Embed API</h1>
+<h2>What this covers</h2>
+<p>The Embed API lets third-party applications embed Tessallite's conversational agent or query capabilities inside their own products. Instead of requiring users to log in to Tessallite directly, the host application requests a scoped, time-limited token from its backend, then passes it to the embedded component. The end user never sees Tessallite credentials.</p>
+<h2>How embedding works</h2>
+<ol>
+<li>The ISV backend authenticates to Tessallite as a tenant admin and calls <code>POST /api/v1/auth/embed-token</code>.</li>
+<li>Tessallite returns a signed JWT with restricted scope (tenant, persona, models, capabilities, expiry).</li>
+<li>The ISV backend passes the token to the browser (in page props, a cookie, or via a server-rendered attribute).</li>
+<li>The browser-side embed component (iframe or React component) uses the token for all Tessallite API calls.</li>
+<li>When the token nears expiry, the component fires a callback; the ISV backend requests a fresh token.</li>
+</ol>
+<p>No Tessallite login page is shown. The end user's identity comes from the <code>user_identity</code> field in the token request, which appears in Tessallite's audit log.</p>
+<h2>Requesting an embed token</h2>
+<p><strong>Endpoint:</strong> <code>POST /api/v1/auth/embed-token</code></p>
+<p><strong>Authentication:</strong> Requires a tenant admin or system admin JWT (via cookie or Bearer header).</p>
+<table>
+<thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>tenant_id</code></td><td>string</td><td>yes</td><td>-</td><td>Target tenant slug</td></tr>
+<tr><td><code>user_identity</code></td><td>string</td><td>yes</td><td>-</td><td>Display name for audit trail</td></tr>
+<tr><td><code>persona_id</code></td><td>string</td><td>no</td><td>null</td><td>Lock to this persona's permissions</td></tr>
+<tr><td><code>model_ids</code></td><td>string[]</td><td>no</td><td>null</td><td>Restrict visible models</td></tr>
+<tr><td><code>capabilities</code></td><td>string[]</td><td>no</td><td>all</td><td>Allowed features: query, chat, explore</td></tr>
+<tr><td><code>expiry_minutes</code></td><td>integer</td><td>no</td><td>180</td><td>Token lifetime (min 5, max 1440)</td></tr>
+</tbody>
+</table>
+<h2>Scope fields</h2>
+<p><strong>persona_id</strong> locks the session to a specific persona. All row-level security filters and measure/dimension access rules for that persona apply. If omitted, the embedded user sees the default (unfiltered) view.</p>
+<p><strong>model_ids</strong> restricts which models the token can access. Any query or chat request targeting a model not in the list returns 403. If omitted, all models in the tenant are accessible.</p>
+<p><strong>capabilities</strong> controls which features the embed can use:</p>
+<ul>
+<li><code>query</code> — execute semantic queries via the query-router</li>
+<li><code>chat</code> — use the conversational agent</li>
+<li><code>explore</code> — browse model metadata (dimensions, measures, hierarchies)</li>
+</ul>
+<p>If a capability is excluded, API calls to the corresponding service return 403.</p>
+<h2>Token lifetime</h2>
+<p>The default token lifetime is 3 hours (180 minutes), long enough for demos and presentations without interruption. The maximum is 24 hours (1440 minutes). The minimum is 5 minutes.</p>
+<p>For production embedding, set the expiry shorter (30-60 minutes) and implement token refresh via the <code>onTokenExpiring</code> callback in the embed component.</p>
+<h2>Revoking a token early</h2>
+<p>A token normally stays valid until it expires. If a token leaks, or you simply want to cut a session short before its expiry, you can revoke it:</p>
+<p><strong>Endpoint:</strong> <code>DELETE /api/v1/auth/embed-token/{jti}</code></p>
+<p>The <code>{jti}</code> is the token's unique ID — the <code>jti</code> claim inside the signed JWT you minted. Only a tenant admin may revoke. Once revoked, the token stops working within about a minute (the platform refreshes its revocation list roughly once a minute), and every query or chat call made with it returns 403. The revocation is recorded in the Audit Log as <code>embed_token.revoked</code>. The platform cleans up the revocation record automatically once the token would have expired anyway (at most 24 hours, the maximum token lifetime), so the blocklist never grows without bound.</p>
+<p>Revocation fails safe: if the platform cannot confirm a token is still valid, it refuses the request rather than letting it through. Build a revoke call into your "sign out" or "rotate credentials" flow so a leaked link can be cut off immediately rather than waiting out its expiry.</p>
+<h2>CORS configuration</h2>
+<p>Embedded components load from the ISV's domain. Set the <code>ALLOWED_EMBED_ORIGINS</code> environment variable (comma-separated):</p>
+<pre><code>ALLOWED_EMBED_ORIGINS=https://app.customer.com,https://portal.customer.com</code></pre>
+<p>This is merged with the standard <code>CORS_ORIGINS</code> setting. Both model-service and agent-service read it.</p>
+<h2>Example: Python</h2>
+<pre><code>import requests
+
+TESSALLITE_URL = &quot;http://localhost:3000&quot;
+
+# 1. Log in as tenant admin
+login = requests.post(f&quot;{TESSALLITE_URL}/api/v1/auth/login&quot;, json={
+    &quot;tenant_id&quot;: &quot;acme-demo&quot;,
+    &quot;email&quot;: &quot;admin@acme-demo.com&quot;,
+    &quot;password&quot;: &quot;acme-demo&quot;,
+})
+cookies = login.cookies
+
+# 2. Request an embed token
+resp = requests.post(
+    f&quot;{TESSALLITE_URL}/api/v1/auth/embed-token&quot;,
+    json={
+        &quot;tenant_id&quot;: &quot;acme-demo&quot;,
+        &quot;user_identity&quot;: &quot;viewer@customer.com&quot;,
+        &quot;capabilities&quot;: [&quot;chat&quot;],
+        &quot;expiry_minutes&quot;: 60,
+    },
+    cookies=cookies,
+)
+embed_token = resp.json()[&quot;token&quot;]</code></pre>
+<h2>Example: curl</h2>
+<pre><code># Get admin session cookie
+curl -s -c cookies.txt -X POST http://localhost:3000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"acme-demo","email":"admin@acme-demo.com","password":"acme-demo"}'
+
+# Request embed token
+curl -s -b cookies.txt -X POST http://localhost:3000/api/v1/auth/embed-token \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tenant_id": "acme-demo",
+    "user_identity": "demo-viewer",
+    "capabilities": ["query", "chat"],
+    "expiry_minutes": 180
+  }'</code></pre>
+<h2>Security considerations</h2>
+<ul>
+<li>Embed tokens carry no password. Treat them as bearer tokens: anyone with the token can use it until it expires <strong>or until you revoke it</strong> (see <em>Revoking a token early</em> above). If a token leaks, revoke it immediately rather than waiting for it to expire.</li>
+<li>Never expose admin credentials used to mint embed tokens in client-side code. The minting call must happen server-side.</li>
+<li>Use HTTPS in production. Embed tokens transmitted over plain HTTP can be intercepted.</li>
+<li>Set <code>ALLOWED_EMBED_ORIGINS</code> to specific domains in production. Do not use <code>*</code> outside of development.</li>
+<li>The <code>user_identity</code> field is logged in the audit trail. Use a meaningful identifier so admins can trace embedded usage.</li>
+</ul>
+<h2>Related</h2>
+<ul><li><a href="api-authentication.html">API Authentication</a></li><li><a href="api-reference.html">API Reference</a></li><li><a href="headless-api.html">Headless API</a></li></ul>
+<nav class="page-nav"><a href="headless-api.html" class="page-nav-btn prev">&larr; Headless API</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="embed-agent-chat.html" class="page-nav-btn next">Embed Agent Chat &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

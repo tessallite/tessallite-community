@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Named List MDX Composition — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Named List MDX Composition</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-05-23</span></div>
+    <h1>Named List MDX Composition</h1>
+<h2>What this covers</h2>
+<p>Named lists (called named sets in the underlying OLAP model) define reusable groups of dimension members. The Report Builder offers four builder types — Fixed Members, Top N, Filter, and Advanced MDX. This page explains the MDX expression that each builder type produces, how to read and hand-edit it, and how the resulting set is consumed by Excel CUBE formulas.</p>
+<h2>How named lists become MDX</h2>
+<p>Every named list ultimately resolves to an MDX set expression stored in the <code>expression</code> field. The visual builders generate this expression automatically; Advanced MDX lets you type it directly.</p>
+<div class="table-wrapper"><table><thead><tr><th>Builder type</th><th>What it does</th><th>Generated MDX pattern</th></tr></thead><tbody><tr><td>Fixed Members</td><td>Enumerates specific members by key</td><td><code>{[Dimension].[Hierarchy].[Member1], [Dimension].[Hierarchy].[Member2], ...}</code></td></tr><tr><td>Top N</td><td>Picks the top or bottom N members ranked by a measure</td><td><code>TopCount([Dimension].[Hierarchy].Members, N, [Measures].[Measure Name])</code> or <code>BottomCount(...)</code></td></tr><tr><td>Filter</td><td>Keeps members matching one or more conditions</td><td><code>Filter([Dimension].[Hierarchy].Members, [Measures].[Revenue] &gt; 1000)</code></td></tr><tr><td>Advanced MDX</td><td>Freeform expression</td><td>Whatever you type — the engine validates it at save time</td></tr></tbody></table></div>
+<h2>Fixed Members</h2>
+<p>Fixed Members is the simplest builder. You pick dimension members from a list, and Tessallite wraps them in an MDX set literal.</p>
+<p><strong>Example:</strong> A named list called &quot;Top Regions&quot; containing three specific regions:</p>
+<pre><code>{[Geography].[Region].[North America],
+ [Geography].[Region].[Europe],
+ [Geography].[Region].[Asia Pacific]}</code></pre>
+<p>This expression is static — it always returns the same three members regardless of underlying data changes. Use Fixed Members when the list is curated by a human and should not change automatically.</p>
+<h2>Top N (Dynamic)</h2>
+<p>Top N selects the N highest- or lowest-ranked members by a measure. The result changes when the data changes — if a new region overtakes an existing one, it appears in the list on the next query.</p>
+<p><strong>Example:</strong> Top 5 products by revenue:</p>
+<pre><code>TopCount(
+  [Product].[Category].Members,
+  5,
+  [Measures].[Total Revenue]
+)</code></pre>
+<p>For bottom-ranking (e.g. worst-performing stores), the builder uses <code>BottomCount</code>:</p>
+<pre><code>BottomCount(
+  [Store].[Name].Members,
+  10,
+  [Measures].[Profit Margin]
+)</code></pre>
+<h2>Filter</h2>
+<p>Filter keeps every member that satisfies one or more conditions. Use it when &quot;top N&quot; is too rigid — for example, &quot;all products with revenue above $10,000&quot; regardless of how many there are.</p>
+<p><strong>Example:</strong> Customers with order count above 50:</p>
+<pre><code>Filter(
+  [Customer].[Name].Members,
+  [Measures].[Order Count] &gt; 50
+)</code></pre>
+<p>Multiple conditions are combined with <code>AND</code>:</p>
+<pre><code>Filter(
+  [Customer].[Name].Members,
+  [Measures].[Order Count] &gt; 50
+    AND [Measures].[Total Revenue] &gt; 10000
+)</code></pre>
+<h2>Advanced MDX</h2>
+<p>Advanced MDX accepts any valid MDX set expression. Use it when the visual builders cannot express what you need — for example, a CrossJoin, an Except, or a time-relative calculation.</p>
+<p><strong>Common patterns:</strong></p>
+<p>Cross-join two dimensions:</p>
+<pre><code>CrossJoin(
+  {[Geography].[Region].[North America], [Geography].[Region].[Europe]},
+  [Product].[Category].Members
+)</code></pre>
+<p>Exclude specific members:</p>
+<pre><code>Except(
+  [Product].[Category].Members,
+  {[Product].[Category].[Discontinued]}
+)</code></pre>
+<p>Last 12 months:</p>
+<pre><code>LastPeriods(12, [Date].[Calendar].[Month].&amp;[202605])</code></pre>
+<h2>How named lists appear in CUBE formulas</h2>
+<p>When you insert a named list from the Report Builder, the add-in generates a <code>CUBESET</code> formula followed by one <code>CUBERANKEDMEMBER</code> per visible row:</p>
+<div class="table-wrapper"><table><thead><tr><th>Cell</th><th>Formula</th></tr></thead><tbody><tr><td>A1</td><td><code>=CUBESET(&quot;Tessallite&quot;,&quot;{[Geography].[Region].[North America],[Geography].[Region].[Europe],[Geography].[Region].[Asia Pacific]}&quot;,&quot;Top Regions&quot;)</code></td></tr><tr><td>A2</td><td><code>=CUBERANKEDMEMBER(&quot;Tessallite&quot;,A1,1)</code></td></tr><tr><td>A3</td><td><code>=CUBERANKEDMEMBER(&quot;Tessallite&quot;,A1,2)</code></td></tr><tr><td>A4</td><td><code>=CUBERANKEDMEMBER(&quot;Tessallite&quot;,A1,3)</code></td></tr></tbody></table></div>
+<p>To add a measure column, use <code>CUBEVALUE</code> referencing the same dimension member:</p>
+<div class="table-wrapper"><table><thead><tr><th>Cell</th><th>Formula</th></tr></thead><tbody><tr><td>B2</td><td><code>=CUBEVALUE(&quot;Tessallite&quot;,&quot;[Measures].[Total Revenue]&quot;,A2)</code></td></tr><tr><td>B3</td><td><code>=CUBEVALUE(&quot;Tessallite&quot;,&quot;[Measures].[Total Revenue]&quot;,A3)</code></td></tr></tbody></table></div>
+<p>The <code>CUBESET</code> recalculates on workbook refresh. For dynamic lists (Top N, Filter), the members returned may change each time.</p>
+<h2>Validation</h2>
+<p>The engine validates the MDX expression when you save a named list:</p>
+<ul><li><strong>Syntax check:</strong> The expression must parse as a valid MDX set expression.</li><li><strong>Member resolution:</strong> Referenced dimensions and hierarchies must exist in the deployed model.</li><li><strong>Evaluation:</strong> A preview query runs the expression and returns the first 100 members so you can confirm the result before saving.</li></ul>
+<p>If validation fails, the error message identifies the problematic portion of the expression.</p>
+<h2>Related</h2>
+<ul><li><a href="excel-add-in.html">Tessallite Excel Add-in</a></li><li><a href="named-list-parameterisation.html">Named List Parameterisation</a></li><li><a href="../modelling/define-dimensions.html">Define Dimensions</a></li><li><a href="../modelling/define-measures.html">Define Measures</a></li></ul>
+<nav class="page-nav"><a href="excel-add-in.html" class="page-nav-btn prev">&larr; Excel Add-in</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="named-list-parameterisation.html" class="page-nav-btn next">Named List Parameterisation &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

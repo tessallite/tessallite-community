@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Alert Configuration — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Alert Configuration</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeler</span><span class="updated">Updated 2026-05-23</span></div>
+    <h1>Alert Configuration</h1>
+
+<h2>What this covers</h2>
+<p>Tessallite can send email and Slack notifications when platform lifecycle events occur: aggregate refresh failures, schema drift, SLA breaches, query failure spikes, aggregate retirements, and upstream refresh failures. This page explains how alert routing works, how to configure routes, and best practices for operational alerting.</p>
+
+<h2>How alerting works</h2>
+<p>The alert system consists of three layers:</p>
+<ol>
+  <li><strong>Event emitters</strong> — the scheduler, query-router, and optimizer emit events when something operationally significant happens.</li>
+  <li><strong>Notification routes</strong> — per-tenant configuration records that map event types to delivery channels. Each route specifies an event type, a channel (email or Slack), the channel target (recipients or webhook URL), and an enabled flag.</li>
+  <li><strong>Senders</strong> — the SMTP email sender and the Slack webhook sender. These are configured at the system level via environment variables.</li>
+</ol>
+<p>When a lifecycle event fires, the dispatcher looks up all enabled notification routes for that event type, deduplicates within a 5-minute window, and dispatches to each matching channel.</p>
+
+<h2>Supported events</h2>
+<div class="table-wrapper">
+<table>
+  <thead><tr><th>Event</th><th>Trigger</th><th>Typical action</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Refresh Failure</strong></td><td>A scheduled aggregate refresh fails (full or incremental).</td><td>Investigate the source database or refresh query. Check the Diagnostics panel for the error detail.</td></tr>
+    <tr><td><strong>Schema Drift</strong></td><td>The daily schema drift sweep detects column additions, removals, or type changes in a source table.</td><td>Review the Schema Changes panel. Column removals are always flagged as breaking. Type changes on dimensions or measures are breaking.</td></tr>
+    <tr><td><strong>SLA Breach</strong></td><td>The hourly SLA monitor finds an aggregate whose freshness exceeds the configured SLA threshold.</td><td>Check the SLA Configuration panel for the breached aggregate. Verify the source database is accessible and the refresh schedule is running.</td></tr>
+    <tr><td><strong>Query Failure Spike</strong></td><td>More than 10 queries fail within a 5-minute window in the query-router.</td><td>Check the Query Log for the error pattern. Common causes: source database down, credential rotation, or connection pool exhaustion.</td></tr>
+    <tr><td><strong>Aggregate Retired</strong></td><td>The daily retirement sweep removes aggregates that exceed the per-model cap.</td><td>Review the retired aggregates in the Diagnostics panel. If important aggregates were retired, increase the model's aggregate limit.</td></tr>
+    <tr><td><strong>Upstream Refresh Failed</strong></td><td>A scheduled refresh did not run because an upstream refresh it depends on failed first.</td><td>Fix the upstream refresh, then re-run the dependent job. Check the Scheduler Dependencies for the chain order — a failure early in the chain blocks everything that depends on it.</td></tr>
+    <tr><td><strong>KPI Status Change</strong></td><td>A KPI's computed status transitions (e.g., Good&rarr;Warning or Warning&rarr;Poor).</td><td>Check the KPI Scorecard for the current status and trend. Status changes often indicate a developing issue that may need attention before it becomes critical.</td></tr>
+    <tr><td><strong>KPI Trend Alert</strong></td><td>A KPI's trend direction changes (e.g., Improving&rarr;Declining or Flat&rarr;Declining).</td><td>Review the KPI trend in the Scorecard. A declining trend is an early warning that the KPI may move from its current status to a worse one.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Configuring alert routes</h2>
+<p>Open any model in the Model Builder. Click the <strong>Alerts</strong> icon in the toolbelt (bell icon, near the bottom). This opens the Alerts panel.</p>
+
+<h3>Adding a route</h3>
+<ol>
+  <li>Click <strong>Add Route</strong>.</li>
+  <li>Select the <strong>Event Type</strong> — the lifecycle event that triggers the alert.</li>
+  <li>Select the <strong>Channel</strong> — Email or Slack.</li>
+  <li>For <strong>Email</strong>: enter one or more recipient email addresses, separated by commas.</li>
+  <li>For <strong>Slack</strong>: enter the Slack incoming webhook URL for your channel.</li>
+  <li>For <strong>KPI events</strong>: optionally enter a <strong>KPI Name</strong> to restrict the alert to a specific KPI (leave blank to match all KPIs). For <strong>KPI Threshold Breach</strong>, set the <strong>Threshold</strong> ratio — a value like 0.8 triggers an alert when the KPI value drops below 80% of its goal.</li>
+  <li>Toggle <strong>Enabled</strong> on (enabled by default).</li>
+  <li>Click <strong>Create</strong>.</li>
+</ol>
+
+<h3>Editing and deleting routes</h3>
+<p>Hover over any row in the alert routes table to reveal action buttons. Click the edit icon to modify the route, or the delete icon to remove it. Use the toggle switch to enable or disable a route without deleting it.</p>
+
+<h3>Testing a route</h3>
+<p>Click the send icon on any row to dispatch a test alert through the configured channel. The test result appears inline. If the test fails, check the channel configuration (SMTP settings for email, webhook URL validity for Slack).</p>
+
+<h2>Deduplication</h2>
+<p>The dispatcher suppresses duplicate alerts within a 5-minute window. If the same event type fires repeatedly for the same channel target, only the first alert is sent. This prevents notification storms during cascading failures.</p>
+<p>The window resets after 5 minutes, so the next occurrence after the window will trigger a fresh alert.</p>
+
+<h2>SMTP email setup</h2>
+<p>Email alerts require SMTP configuration at the system level. These settings are environment variables (not per-tenant):</p>
+<div class="table-wrapper">
+<table>
+  <thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead>
+  <tbody>
+    <tr><td><code>SMTP_HOST</code></td><td>SMTP server hostname. If empty, email sending is disabled.</td><td>(empty)</td></tr>
+    <tr><td><code>SMTP_PORT</code></td><td>SMTP server port.</td><td>587</td></tr>
+    <tr><td><code>SMTP_TLS</code></td><td>Enable STARTTLS.</td><td>true</td></tr>
+    <tr><td><code>SMTP_USER</code></td><td>SMTP authentication username. Leave empty for unauthenticated relays.</td><td>(empty)</td></tr>
+    <tr><td><code>SMTP_PASSWORD</code></td><td>SMTP authentication password.</td><td>(empty)</td></tr>
+    <tr><td><code>SMTP_FROM</code></td><td>Sender address for alert emails.</td><td>noreply@tessallite.local</td></tr>
+  </tbody>
+</table>
+</div>
+<p>If <code>SMTP_HOST</code> is not set, the email sender logs a warning and skips delivery. Alert routes with email channels will silently fail until SMTP is configured.</p>
+
+<h2>Slack webhook setup</h2>
+<p>Slack alerts use incoming webhooks. To set up:</p>
+<ol>
+  <li>In your Slack workspace, go to <strong>Apps</strong> &gt; <strong>Incoming Webhooks</strong>.</li>
+  <li>Create a new webhook and select the target channel.</li>
+  <li>Copy the webhook URL (starts with <code>https://hooks.slack.com/services/</code>).</li>
+  <li>Paste it into the alert route's Webhook URL field.</li>
+</ol>
+<p>Each alert route can target a different Slack channel by using a different webhook URL.</p>
+
+<h2>API reference</h2>
+<p>All endpoints require modeler-level access.</p>
+<div class="table-wrapper">
+<table>
+  <thead><tr><th>Endpoint</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>GET /api/v1/projects/{id}/notifications</code></td><td>List all notification routes for the project.</td></tr>
+    <tr><td><code>POST /api/v1/projects/{id}/notifications</code></td><td>Create a new notification route.</td></tr>
+    <tr><td><code>PUT /api/v1/projects/{id}/notifications/{route_id}</code></td><td>Update an existing route.</td></tr>
+    <tr><td><code>DELETE /api/v1/projects/{id}/notifications/{route_id}</code></td><td>Delete a route.</td></tr>
+    <tr><td><code>POST /api/v1/projects/{id}/notifications/test</code></td><td>Send a test alert through the specified channel configuration.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Best practices</h2>
+<ul>
+  <li><strong>Start with refresh failures and schema drift.</strong> These are the two events most likely to require immediate operator attention.</li>
+  <li><strong>Use Slack for high-frequency events</strong> (query failure spikes) and email for low-frequency ones (schema drift, SLA breaches).</li>
+  <li><strong>Do not route all events to the same channel.</strong> Notification fatigue leads to ignored alerts. Be selective about what generates a notification.</li>
+  <li><strong>Test routes after creation.</strong> Use the test button to verify delivery before relying on the route during an incident.</li>
+  <li><strong>Review disabled routes periodically.</strong> Disabling a route during maintenance and forgetting to re-enable it is a common source of missed alerts.</li>
+</ul>
+
+  </main>
+  <footer class="site-footer"><p>Tessallite Documentation</p></footer>
+<nav class="page-nav"><a href="query-log.html" class="page-nav-btn prev">&larr; Query Log</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="sso-configuration.html" class="page-nav-btn next">SSO Configuration &rarr;</a></nav>
+</body>
+</html>

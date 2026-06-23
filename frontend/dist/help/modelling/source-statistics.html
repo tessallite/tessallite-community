@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Source Statistics — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Source Statistics</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-15</span></div>
+    <h1>Source Statistics</h1>
+    <h2>What this covers</h2>
+    <p>The <strong>Source Statistics</strong> panel shows table and column profiling data collected from model sources. Tessallite uses these statistics to explain data shape, identify low-cardinality dimensions, and feed optimiser decisions for aggregates and query routing.</p>
+    <p>This page is for the Source Statistics drawer, not predictive aggregates. Predictive aggregates are recommendations; source statistics are the measured facts those recommendations can use.</p>
+    <h2>What the panel shows</h2>
+    <div class="table-wrapper"><table><thead><tr><th>Area</th><th>Meaning</th></tr></thead><tbody><tr><td>Source selector</td><td>Chooses the model source whose table statistics are displayed.</td></tr><tr><td>Recompute</td><td>Runs the profiler again for the selected source.</td></tr><tr><td>Table rows and bytes</td><td>Approximate size signals used for modelling and optimisation decisions.</td></tr><tr><td>Column null rate</td><td>Share of profiled rows where the column is null.</td></tr><tr><td>Distinct values</td><td>Cardinality estimate for filtering, grouping, and aggregate grain choices.</td></tr><tr><td>Refresh cadence</td><td>How often Tessallite should consider statistics stale for that table.</td></tr></tbody></table></div>
+    <h2>Recompute options</h2>
+    <ul><li>Use the default sample for ordinary modelling guidance.</li><li>Use a custom sample when the table is large and the default is too small to represent skewed data.</li><li>Use a full scan only when accuracy matters more than profiling cost.</li></ul>
+    <h2>How to read the output</h2>
+    <p>High distinct counts are useful for identifiers but usually poor aggregate grains. Low distinct counts are often good dimension candidates, especially for status, channel, geography, product family, and calendar attributes.</p>
+    <p>A high null percentage does not automatically make a column unusable. It means analysts need to understand whether null is meaningful, missing, or caused by incomplete source modelling.</p>
+    <h2>Related</h2>
+    <ul><li><a href="table-auto-analysis.html">Table Auto-Analysis</a></li><li><a href="use-the-ai-optimiser.html">Use the AI Optimiser</a></li><li><a href="configure-aggregates.html">Configure Aggregates</a></li></ul>
+    <nav class="page-nav"><a href="add-tables-to-a-model.html" class="page-nav-btn prev">&larr; Add Tables to a Model</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="table-auto-analysis.html" class="page-nav-btn next">Table Auto-Analysis &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>
