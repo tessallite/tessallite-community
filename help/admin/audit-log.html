@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Audit Log — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Audit Log</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-06-12</span></div>
+    <h1>Audit Log</h1>
+<h2>What this covers</h2>
+<p>The audit log records a trail of significant actions across the tenant: who did what, when, and to which object. This page explains what is logged, how to configure the logging level, how to search and export the log, and how to set a retention policy.</p>
+<h2>Why audit logging matters</h2>
+<p>Compliance and governance require a record of material changes to data models, user accounts, security rules, and platform settings. Without an audit trail, investigating an incident means sifting through service logs or guessing from database state. The audit log gives tenant administrators a single, searchable, exportable record of every significant action, anchored to the actor who performed it.</p>
+<p>Beyond compliance, the audit log is a diagnostic tool. When a model behaves unexpectedly after a settings change, the log shows exactly which setting was changed, by whom, and when — without needing shell access.</p>
+<h2>What is logged</h2>
+<p>Events fall into six categories. Each event records the actor (email), the action performed, the target object (type, ID, and display name), a severity level, a JSONB detail payload with action-specific context, and the actor&#x27;s IP address when available.</p>
+<div class="table-wrapper"><table><thead><tr><th>Category</th><th>Example actions</th></tr></thead><tbody><tr><td>Model lifecycle</td><td><code>model.create</code>, <code>model.deploy</code>, <code>model.undeploy</code>, <code>model.revert</code>, <code>model.delete</code></td></tr><tr><td>Connections</td><td><code>connection.create</code>, <code>connection.update</code>, <code>connection.delete</code></td></tr><tr><td>Users</td><td><code>user.create</code>, <code>user.delete</code>, <code>user.role_change</code>, <code>user.password_reset</code></td></tr><tr><td>Security</td><td>Row-security rule create/update/delete, persona changes, <code>rbac.bootstrap_admin_grant</code> (open-project bootstrap access — see <a href="manage-roles.html">Manage Roles</a>)</td></tr><tr><td>Settings</td><td>Tenant, project, and model setting changes</td></tr><tr><td>Refresh SLAs</td><td><code>refresh_sla_config.create</code>, <code>refresh_sla_config.update</code>, <code>refresh_sla_config.delete</code></td></tr><tr><td>Notification routes</td><td><code>notification_route.create</code>, <code>notification_route.update</code>, <code>notification_route.delete</code></td></tr><tr><td>Authentication</td><td><code>auth.login_success</code>, <code>auth.login_failure</code></td></tr></tbody></table></div>
+<p>Refresh-SLA and notification-route changes are recorded at <strong>warn</strong> severity, with the project, the target object, and the fields that changed. For notification routes the audit detail deliberately <strong>omits the channel configuration</strong>, so a Slack webhook URL or other channel secret is never written into the audit log.</p>
+<h2>Audit log level</h2>
+<p>The <code>AUDIT_LOG_LEVEL</code> tenant setting controls which events are recorded. The four levels form a hierarchy — each level includes everything in the levels above it:</p>
+<ul><li><strong>off</strong> — no events recorded.</li><li><strong>critical</strong> — authentication failures, security changes, and destructive actions (deletes, undeploys, reverts).</li><li><strong>warn</strong> — adds model deploy/undeploy, user CRUD, and settings changes.</li><li><strong>info</strong> (default) — adds all remaining CRUD, query execution logging, and connection changes.</li></ul>
+<p>Set the level in <em>Admin &gt; Settings</em>. Changes take effect immediately — no service restart required.</p>
+<p>Choose your level based on compliance requirements. Most organisations start with <code>info</code> and tighten to <code>warn</code> or <code>critical</code> only if storage or noise becomes a concern. Setting <code>off</code> is appropriate only for development environments where no compliance obligation exists.</p>
+<h2>Viewing the audit log</h2>
+<p>Navigate to <em>Admin &gt; Audit Log</em>. The page is available to tenant administrators only.</p>
+<h3>Filter bar</h3>
+<p>Five filters narrow the results:</p>
+<ul><li><strong>Actor email</strong> — substring match against the actor&#x27;s email address.</li><li><strong>Action</strong> — exact match against the action string (e.g., <code>model.deploy</code>).</li><li><strong>Target type</strong> — filter by object category (<code>model</code>, <code>user</code>, <code>connection</code>, <code>setting</code>).</li><li><strong>Severity</strong> — <code>info</code>, <code>warn</code>, or <code>critical</code>.</li><li><strong>Date range</strong> — <code>from</code> and <code>to</code> dates (both inclusive).</li></ul>
+<p>Filters combine with AND logic. Clear a filter to remove it.</p>
+<h3>Results table</h3>
+<p>Each row shows:</p>
+<div class="table-wrapper"><table><thead><tr><th>Column</th><th>Content</th></tr></thead><tbody><tr><td>Timestamp</td><td>When the event occurred (local time).</td></tr><tr><td>Actor</td><td>Email of the user or &quot;system&quot; for automated actions.</td></tr><tr><td>Action</td><td>The action string.</td></tr><tr><td>Target</td><td>Object type and display name.</td></tr><tr><td>Severity</td><td>Colour-coded chip.</td></tr><tr><td>Detail</td><td>Expandable — click to see the full JSONB payload.</td></tr></tbody></table></div>
+<p>The table paginates. Default page size is 50.</p>
+<h3>CSV export</h3>
+<p>Click <strong>Export CSV</strong> to download the current filtered results. The export respects all active filters and includes the full detail payload as a JSON string column.</p>
+<h2>Retention</h2>
+<p>The <code>AUDIT_RETENTION_DAYS</code> tenant setting controls how long events are kept:</p>
+<ul><li>Default: <strong>365 days</strong>.</li><li>Minimum: <strong>30 days</strong>.</li><li>Set to <strong>0</strong> for indefinite retention (events are never auto-deleted).</li></ul>
+<p>A daily scheduler job (<code>audit_purge</code>) deletes events older than the retention threshold. The job runs once per day per tenant.</p>
+<p>Shortening the retention period does not delete existing events retroactively on the next save — it takes effect on the next scheduler run. If you need to purge immediately, reduce the setting and wait for the next daily run, or contact a system administrator.</p>
+<h2>API reference</h2>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Endpoint</th><th>Purpose</th></tr></thead><tbody><tr><td>GET</td><td><code>/api/v1/admin/audit-events</code></td><td>List events (paginated, filterable by <code>actor_email</code>, <code>action</code>, <code>target_type</code>, <code>severity</code>, <code>from_date</code>, <code>to_date</code>, <code>limit</code>, <code>offset</code>)</td></tr><tr><td>GET</td><td><code>/api/v1/admin/audit-events/export</code></td><td>CSV download with the same filter parameters</td></tr></tbody></table></div>
+<p>Both require <code>tenant_admin</code> role.</p>
+<h2>Best practices</h2>
+<ul><li><strong>Start with <code>info</code> level.</strong> You can always tighten later. Starting restrictive means you miss the events you did not know you needed.</li><li><strong>Set retention to match your compliance window.</strong> If your organisation requires 2 years of audit records, set <code>AUDIT_RETENTION_DAYS</code> to 730.</li><li><strong>Export periodically.</strong> For long-term archival, schedule a CSV export to your document management system. The audit log is not a permanent archive — it lives in the tenant&#x27;s meta schema and is subject to retention policy.</li><li><strong>Review after security incidents.</strong> Filter by <code>severity=critical</code> and the incident timeframe to see authentication failures and security changes.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="workspace-settings.html">Workspace Settings</a></li><li><a href="manage-users.html">Manage Users</a></li><li><a href="manage-roles.html">Manage Roles</a></li></ul>
+<nav class="page-nav"><a href="model-configuration.html" class="page-nav-btn prev">&larr; Model Configuration</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="query-log.html" class="page-nav-btn next">Query Log &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

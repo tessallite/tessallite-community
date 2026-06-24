@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Data Tags — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Data Tags</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-06-12</span></div>
+    <h1>Data Tags</h1>
+<h2>What this covers</h2>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/data-tags-panel.png" alt="Live Data Tags drawer opened from Model Builder."></figure>
+<p>Data tags are user-defined labels that group columns by sensitivity, category, or business domain. Tags serve two purposes: they document which columns carry sensitive data (making models auditable), and they drive column-level access control when combined with persona restrictions (see <a href="column-level-security.html">Column-Level Security</a>). This article explains how to create, assign, and manage data tags.</p>
+<h2>Before you start</h2>
+<ul><li>You need at least one model with tables and columns added. See <a href="add-tables-to-a-model.html">Add Tables to a Model</a>.</li><li>Tags are model-scoped. Each model has its own tag namespace.</li></ul>
+<h2>What data tags are not</h2>
+<p>Tags are for access control and governance, not data classification. They tell Tessallite &quot;this column is PII&quot; so the platform can restrict it — they don&#x27;t tell the data lake &quot;this column is PII&quot; for compliance scanning. Classification belongs at the source; tagging belongs at the semantic layer.</p>
+<h2>Creating a tag</h2>
+<ol><li>Open the <strong>Data Tags</strong> panel in Model Builder (Toolbelt sidebar).</li><li>Click <strong>Add Tag</strong>.</li><li>Enter a <strong>tag name</strong> (e.g. <code>PII</code>, <code>Financial</code>, <code>Internal Only</code>).</li><li>Optionally enter a <strong>description</strong> explaining what the tag means and who should have access.</li><li>Assign columns in the <strong>Columns</strong> section (you can also do this later — see below).</li><li>Click <strong>Create</strong>.</li></ol>
+<h2>Assigning columns to a tag</h2>
+<ol><li>In the Data Tags panel, click the edit (pencil) icon on the tag — or do this while creating it.</li><li>In the <strong>Columns</strong> section of the dialog, choose a <strong>Table</strong> from the dropdown.</li><li>Tick the columns the tag should cover. Each assigned column appears as a chip labelled <code>table_name.column_name</code>; click the chip&#x27;s &times; to remove it.</li><li>Repeat with other tables if the tag spans more than one.</li><li>Click <strong>Update</strong> (or <strong>Create</strong>). The tagged columns now show a tag chip in the table editor&#x27;s <strong>Attributes</strong> tab.</li></ol>
+<p>You can assign the same column to multiple tags (e.g. <code>customers.email</code> could be both <code>PII</code> and <code>Contact Info</code>).</p>
+<h2>Grouping strategy</h2>
+<p>Choose a tagging strategy that matches your governance model:</p>
+<div class="table-wrapper"><table><thead><tr><th>Strategy</th><th>Tags</th><th>Best for</th></tr></thead><tbody><tr><td>By sensitivity</td><td><code>PII</code>, <code>Sensitive</code>, <code>Financial</code>, <code>Public</code></td><td>Regulatory compliance (GDPR, HIPAA)</td></tr><tr><td>By audience</td><td><code>External</code>, <code>Internal</code>, <code>Executive</code></td><td>Role-based access in multi-persona models</td></tr><tr><td>By domain</td><td><code>Customer</code>, <code>Product</code>, <code>Finance</code></td><td>Large models with cross-functional teams</td></tr></tbody></table></div>
+<p>Whichever strategy you choose, apply it consistently. Mixed strategies make persona restrictions harder to reason about.</p>
+<h2>Viewing tags in the model</h2>
+<p>Tagged columns display a small tag chip next to the column name in the table editor&#x27;s <strong>Attributes</strong> tab (double-click a table on the canvas to open it). The lineage graph shows a &quot;N tagged cols&quot; count on semantic nodes that have tagged columns. The Data Tags panel itself lists every tag with its assigned columns — expand a tag row to see them.</p>
+<h2>Best practices</h2>
+<ul><li><strong>Tag new columns promptly.</strong> Untagged columns are visible to all personas by default. If you add a new column to a tagged table, remember to tag it if it contains sensitive data.</li><li><strong>Use descriptive tag names.</strong> <code>PII</code> is better than <code>Tag1</code>. The name appears in persona restrictions, audit logs, and tag chips.</li><li><strong>Review tags when the model changes.</strong> Source schema drift may add columns that need tagging. Run schema refresh, then review untagged columns.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="column-level-security.html">Column-Level Security</a></li><li><a href="configure-personas.html">Configure Personas</a></li><li><a href="configure-row-security.html">Configure Row Security</a></li></ul>
+<nav class="page-nav"><a href="configure-row-security.html" class="page-nav-btn prev">&larr; Configure Row Security</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="column-level-security.html" class="page-nav-btn next">Column-Level Security &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

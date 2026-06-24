@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pivot Conditional Formatting — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Pivot Conditional Formatting</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-24</span></div>
+<h1>Pivot Conditional Formatting</h1>
+
+<h2>What this covers</h2>
+<p>The Measure Query Panel (pivot grid) supports three kinds of cell-level conditional formatting: <strong>colour scale</strong>, <strong>data bars</strong>, and <strong>threshold</strong>. This page explains each kind, how to configure it, and what the visual output looks like.</p>
+
+<h2>Kinds of conditional formatting</h2>
+
+<h3>Colour scale</h3>
+<p>Cells are shaded on a gradient between two colours based on their value relative to the minimum and maximum in the result set. Low values receive one colour, high values receive the other, and values in between are interpolated.</p>
+<p>Use colour scales when you want a heatmap effect across your pivot grid.</p>
+
+<h3>Data bars</h3>
+<p>Each cell shows a horizontal bar whose width is proportional to the cell value relative to the maximum value in the result set. The bar renders behind the number so both the bar and the value are visible.</p>
+<p>Use data bars when you want a quick visual comparison of relative magnitudes.</p>
+
+<h3>Threshold</h3>
+<p>Cells are coloured based on whether their value is above or below a user-defined threshold. Values above the threshold receive one colour and values at or below receive another.</p>
+<p>When threshold mode is selected, a <strong>value input field</strong> appears in the control bar so you can type the threshold number. The field is only visible when the kind is set to threshold.</p>
+
+<h2>How to use it</h2>
+<ol>
+<li>Open the <strong>Measure Query Panel</strong> (Pivot tab) in the Model Builder.</li>
+<li>Run a query so the grid is populated.</li>
+<li>In the controls above the grid, find the <strong>Conditional Format</strong> dropdown.</li>
+<li>Select one of: <strong>Color Scale</strong>, <strong>Data Bars</strong>, or <strong>Threshold</strong>.</li>
+<li>For threshold mode, enter the boundary value in the text field that appears.</li>
+<li>The grid updates immediately. To remove formatting, select <strong>None</strong> from the dropdown.</li>
+</ol>
+
+<h2>Notes</h2>
+<ul>
+<li>Conditional formatting is applied per-session and is not saved with the model. Refreshing the page or changing the query resets it.</li>
+<li>Formatting applies to all numeric measure columns in the grid. It does not apply to dimension labels or row/column headers.</li>
+<li>Colour choices use the Tessallite palette by default and are not currently user-customisable.</li>
+</ul>
+
+<h2>Related</h2>
+<ul>
+<li><a href="measure-query-panel.html">Measure Query Panel</a></li>
+<li><a href="query-panel.html">Query Panel</a></li>
+<li><a href="define-measures.html">Define Measures</a></li>
+</ul>
+<nav class="page-nav"><a href="measure-query-panel.html" class="page-nav-btn prev">&larr; Measure Query Panel</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="query-panel.html" class="page-nav-btn next">Query Panel &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

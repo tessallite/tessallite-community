@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aggregates Not Building — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Troubleshooting</span> / <span>Aggregates Not Building</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Aggregates Not Building</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/aggregate-build-error.png" alt="Health tab — aggregate build failed (write permission denied)."></figure>
+<h2>What this covers</h2>
+<p>Diagnosing situations where aggregates fail to build, are stuck building, or never appear. Aggregates are built by the Tessallite Scheduler service. Most failures trace back to a connectivity, permission, or configuration problem.</p>
+<h2>Symptom reference</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>Resolution</th></tr></thead><tbody><tr><td>Aggregate stuck in &quot;Building&quot; for &gt;30 minutes</td><td>Scheduler service crashed</td><td>Check: <code>docker compose ps scheduler</code>. If Exit/Restarting, read logs: <code>docker compose logs --tail=50 scheduler</code>. Restart: <code>docker compose restart scheduler</code>.</td></tr><tr><td>Aggregate status shows &quot;Error&quot;</td><td>Build query failed</td><td>Model Builder → Health tab → &quot;Aggregate build failed&quot; → expand for error message.</td></tr><tr><td>&quot;write permission denied on target schema&quot;</td><td>DB user cannot write to aggregate target schema</td><td>Grant <code>CREATE TABLE</code>, <code>INSERT</code>, <code>DROP TABLE</code> on target schema to the Tessallite database user.</td></tr><tr><td>&quot;source query timeout&quot;</td><td>Source query exceeded timeout during aggregate build</td><td>Increase query timeout in Workspace Settings, or reduce the aggregate grain.</td></tr><tr><td>&quot;source connection refused&quot;</td><td>Source data source not reachable</td><td>Verify source connection params in project settings. Confirm source DB is running and reachable from Tessallite host.</td></tr><tr><td>No new aggregates after AI Optimizer run</td><td>Miss log is empty — no queries captured yet</td><td>Run several queries via a BI tool first, then re-open Optimizer.</td></tr><tr><td>AI Optimizer suggests nothing with query history</td><td>Score threshold too high</td><td>Reduce <code>OPTIMIZER_SCORE_THRESHOLD</code> env var and restart Optimizer service.</td></tr><tr><td>Existing aggregate disappears</td><td>Optimizer retired unused aggregate</td><td>Re-create manually in Model Builder, or lower the retirement threshold.</td></tr></tbody></table></div>
+<h2>View Scheduler logs</h2>
+<pre><code>docker compose logs -f scheduler</code></pre>
+<p>The <code>-f</code> flag streams new lines. Press Ctrl+C to stop. Look for <code>ERROR</code> or <code>FATAL</code> entries.</p>
+<p>For Cloud Run or other managed deployments, access logs through the platform&#x27;s log viewer filtered by the scheduler service name.</p>
+<h2>Common permission grant (PostgreSQL)</h2>
+<p>Run as a database superuser:</p>
+<pre><code>GRANT USAGE ON SCHEMA target_schema TO tessallite_user;
+GRANT CREATE ON SCHEMA target_schema TO tessallite_user;
+GRANT INSERT, SELECT, DROP ON ALL TABLES IN SCHEMA target_schema TO tessallite_user;</code></pre>
+<p>Replace <code>target_schema</code> and <code>tessallite_user</code> with the values from your data source configuration.</p>
+<h2>Related</h2>
+<ul><li><a href="query-returns-wrong-results.html">Query Returns Wrong Results</a></li><li><a href="service-not-starting.html">Service Not Starting</a></li><li><a href="common-errors.html">Common Errors</a></li><li><a href="../integrations/supported-data-sources.html">Supported Data Sources</a></li></ul>
+<nav class="page-nav"><a href="field-compatibility-warnings.html" class="page-nav-btn prev">&larr; Field Compatibility Warnings</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="service-not-starting.html" class="page-nav-btn next">Service Not Starting &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deploy Tessallite to Google Cloud Platform — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Getting Started</span> / <span>Deploy Tessallite to Google Cloud Platform</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Deploy Tessallite to Google Cloud Platform</h1>
+<h2>What this covers</h2>
+<p>Deploying Tessallite to Google Cloud Platform using Cloud Run. The deploy script handles all steps.</p>
+<h2>Before you start</h2>
+<ul><li>Role required: System Admin.</li><li>A Google Cloud project with billing enabled is required.</li><li>The gcloud CLI must be installed and authenticated. Run <code>gcloud auth login</code> before proceeding.</li><li>Docker must be installed and running on your machine.</li><li>The following GCP APIs must be enabled: Cloud Run, Container Registry, Secret Manager, Cloud SQL. The script enables them automatically if your account has permission.</li></ul>
+<h2>Steps</h2>
+<ol><li>Open a terminal and navigate to <code>deploy/gcp/</code>.</li><li>Run the deploy script. On Windows, type <code>deploy.bat</code>. On Mac or Linux, type <code>./deploy.sh</code>.</li><li>When prompted, enter your GCP project ID and the region you want to deploy to (for example, <code>us-central1</code>).</li><li>The script enables the required GCP APIs, creates a Cloud SQL PostgreSQL 15 instance, creates four secrets in Secret Manager (encryption key, JWT key, database URL, database password), and sets IAM permissions for the Cloud Run service account.</li><li>The script builds Docker images for all services and pushes them to Container Registry.</li><li>The script deploys five services to Cloud Run in order: Model Service first, then Query Router, Optimizer, Scheduler, and Gateway.</li><li>The script runs database migrations and creates the first workspace and admin user. It prints prompts for the workspace slug and admin credentials.</li><li>When deployment completes, the script prints the public URL of each service. The Gateway&#x27;s XMLA endpoint is reachable immediately. Note the Gateway URL — this is what Excel and Power BI connect to.</li></ol>
+<h2>JDBC on GCP</h2>
+<p>Cloud Run does not route raw TCP traffic. The JDBC endpoint (PostgreSQL wire protocol, port 5433) requires a separate TCP load balancer. For Excel and Power BI connections using XMLA, no load balancer is needed — the HTTPS URL works directly.</p>
+<h2>Re-running the script</h2>
+<p>The script skips completed steps. To force a step to re-run, set its flag to <code>0</code> in <code>deploy/gcp/config.env</code>.</p>
+<h2>Updating after code changes</h2>
+<p>Re-run the script. It always rebuilds images and redeploys services, even if other steps are skipped.</p>
+<h2>Removing the deployment</h2>
+<p>Run <code>teardown.bat</code> or <code>./teardown.sh</code> from <code>deploy/gcp/</code>. This removes Cloud Run services, Cloud SQL, and secrets from Secret Manager.</p>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr></thead><tbody><tr><td>&quot;API not enabled&quot;</td><td>Script could not enable APIs automatically</td><td>Enable them manually in the GCP console and re-run</td></tr><tr><td>Build fails</td><td>Docker not running or network issue</td><td>Start Docker and check connectivity</td></tr><tr><td>JDBC connection refused</td><td>No TCP load balancer configured</td><td>Set up a Network Load Balancer or use XMLA instead</td></tr><tr><td>Services show unhealthy</td><td>Secrets not created before deploy</td><td>Re-run; the script creates secrets before deploying</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="install-local.html">Install locally</a></li><li><a href="first-time-setup.html">First-time setup</a></li><li><a href="../system-admin/configure-environment-variables.html">Configure environment variables</a></li></ul>
+<nav class="page-nav"><a href="install-local.html" class="page-nav-btn prev">&larr; Install Tessallite Locally</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="connect-a-bi-tool.html" class="page-nav-btn next">Connect a BI Tool via JDBC &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

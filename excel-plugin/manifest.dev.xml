@@ -1,0 +1,264 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<OfficeApp
+  xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+  xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
+  xsi:type="TaskPaneApp">
+
+  <Id>e3ae536b-1d2f-44fd-bdc4-e01b5a7597d2</Id>
+  <Version>1.0.0.0</Version>
+  <ProviderName>Tessallite</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="Tessallite (Dev)"/>
+  <Description DefaultValue="Governed semantic layer insights inside Excel — local dev."/>
+
+  <IconUrl DefaultValue="https://localhost:3443/excel-plugin/assets/icon-32.png"/>
+  <HighResolutionIconUrl DefaultValue="https://localhost:3443/excel-plugin/assets/icon-80.png"/>
+
+  <SupportUrl DefaultValue="https://tessallite.com/support"/>
+
+  <AppDomains>
+    <AppDomain>https://localhost:3443</AppDomain>
+  </AppDomains>
+
+  <Hosts>
+    <Host Name="Workbook"/>
+  </Hosts>
+
+  <DefaultSettings>
+    <SourceLocation DefaultValue="https://localhost:3443/excel-plugin/index.html"/>
+  </DefaultSettings>
+
+  <Permissions>ReadWriteDocument</Permissions>
+
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_1">
+    <Hosts>
+      <Host xsi:type="Workbook">
+        <Requirements>
+          <Sets DefaultMinVersion="1.1">
+            <Set Name="ExcelApi" MinVersion="1.1"/>
+          </Sets>
+        </Requirements>
+        <AllFormFactors>
+          <ExtensionPoint xsi:type="CustomFunctions">
+            <CustomFunctions>
+              <Page>
+                <SourceLocation resid="Tessallite.Functions.Page.Url"/>
+              </Page>
+              <Metadata>
+                <SourceLocation resid="Tessallite.Functions.Metadata.Url"/>
+              </Metadata>
+              <Namespace resid="Tessallite.Functions.Namespace"/>
+            </CustomFunctions>
+          </ExtensionPoint>
+        </AllFormFactors>
+        <DesktopFormFactor>
+          <GetStarted>
+            <Title resid="GetStarted.Title"/>
+            <Description resid="GetStarted.Description"/>
+            <LearnMoreUrl resid="GetStarted.LearnMoreUrl"/>
+          </GetStarted>
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="Tessallite.Group">
+                <Label resid="Tessallite.GroupLabel"/>
+                <Icon>
+                  <bt:Image size="16" resid="Tessallite.Icon16"/>
+                  <bt:Image size="32" resid="Tessallite.Icon32"/>
+                  <bt:Image size="80" resid="Tessallite.Icon80"/>
+                </Icon>
+                <Control xsi:type="Button" id="Tessallite.Connect">
+                  <Label resid="Tessallite.Connect.Label"/>
+                  <Supertip>
+                    <Title resid="Tessallite.Connect.Label"/>
+                    <Description resid="Tessallite.Connect.Tooltip"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Tessallite.Icon16"/>
+                    <bt:Image size="32" resid="Tessallite.Icon32"/>
+                    <bt:Image size="80" resid="Tessallite.Icon80"/>
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>Connect</TaskpaneId>
+                    <SourceLocation resid="Tessallite.Connect.Url"/>
+                  </Action>
+                </Control>
+                <Control xsi:type="Button" id="Tessallite.Ask">
+                  <Label resid="Tessallite.Ask.Label"/>
+                  <Supertip>
+                    <Title resid="Tessallite.Ask.Label"/>
+                    <Description resid="Tessallite.Ask.Tooltip"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Tessallite.Ask.Icon16"/>
+                    <bt:Image size="32" resid="Tessallite.Ask.Icon32"/>
+                    <bt:Image size="80" resid="Tessallite.Ask.Icon80"/>
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>Ask</TaskpaneId>
+                    <SourceLocation resid="Tessallite.Ask.Url"/>
+                  </Action>
+                </Control>
+                <Control xsi:type="Button" id="Tessallite.ReportBuilder">
+                  <Label resid="Tessallite.ReportBuilder.Label"/>
+                  <Supertip>
+                    <Title resid="Tessallite.ReportBuilder.Label"/>
+                    <Description resid="Tessallite.ReportBuilder.Tooltip"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Tessallite.ReportBuilder.Icon16"/>
+                    <bt:Image size="32" resid="Tessallite.ReportBuilder.Icon32"/>
+                    <bt:Image size="80" resid="Tessallite.ReportBuilder.Icon80"/>
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>ReportBuilder</TaskpaneId>
+                    <SourceLocation resid="Tessallite.ReportBuilder.Url"/>
+                  </Action>
+                </Control>
+                <Control xsi:type="Button" id="Tessallite.Chart">
+                  <Label resid="Tessallite.Chart.Label"/>
+                  <Supertip>
+                    <Title resid="Tessallite.Chart.Label"/>
+                    <Description resid="Tessallite.Chart.Tooltip"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Tessallite.Chart.Icon16"/>
+                    <bt:Image size="32" resid="Tessallite.Chart.Icon32"/>
+                    <bt:Image size="80" resid="Tessallite.Chart.Icon80"/>
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>Chart</TaskpaneId>
+                    <SourceLocation resid="Tessallite.Chart.Url"/>
+                  </Action>
+                </Control>
+                <Control xsi:type="Button" id="Tessallite.Pivot">
+                  <Label resid="Tessallite.Pivot.Label"/>
+                  <Supertip>
+                    <Title resid="Tessallite.Pivot.Label"/>
+                    <Description resid="Tessallite.Pivot.Tooltip"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Tessallite.Pivot.Icon16"/>
+                    <bt:Image size="32" resid="Tessallite.Pivot.Icon32"/>
+                    <bt:Image size="80" resid="Tessallite.Pivot.Icon80"/>
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>Pivot</TaskpaneId>
+                    <SourceLocation resid="Tessallite.Pivot.Url"/>
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+          <ExtensionPoint xsi:type="ContextMenu">
+            <OfficeMenu id="ContextMenuCell">
+              <Control xsi:type="Menu" id="Tessallite.ContextMenu">
+                <Label resid="Tessallite.ContextMenu.Label"/>
+                <Supertip>
+                  <Title resid="Tessallite.ContextMenu.Label"/>
+                  <Description resid="Tessallite.ContextMenu.Tooltip"/>
+                </Supertip>
+                <Icon>
+                  <bt:Image size="16" resid="Tessallite.Icon16"/>
+                  <bt:Image size="32" resid="Tessallite.Icon32"/>
+                  <bt:Image size="80" resid="Tessallite.Icon80"/>
+                </Icon>
+                <Items>
+                  <Item id="Tessallite.DrillThrough">
+                    <Label resid="Tessallite.DrillThrough.Label"/>
+                    <Supertip>
+                      <Title resid="Tessallite.DrillThrough.Label"/>
+                      <Description resid="Tessallite.DrillThrough.Tooltip"/>
+                    </Supertip>
+                    <Icon>
+                      <bt:Image size="16" resid="Tessallite.Icon16"/>
+                      <bt:Image size="32" resid="Tessallite.Icon32"/>
+                      <bt:Image size="80" resid="Tessallite.Icon80"/>
+                    </Icon>
+                    <Action xsi:type="ShowTaskpane">
+                      <TaskpaneId>DrillThrough</TaskpaneId>
+                      <SourceLocation resid="Tessallite.DrillThrough.Url"/>
+                    </Action>
+                  </Item>
+                  <Item id="Tessallite.AskFromSelection">
+                    <Label resid="Tessallite.AskFromSelection.Label"/>
+                    <Supertip>
+                      <Title resid="Tessallite.AskFromSelection.Label"/>
+                      <Description resid="Tessallite.AskFromSelection.Tooltip"/>
+                    </Supertip>
+                    <Icon>
+                      <bt:Image size="16" resid="Tessallite.Icon16"/>
+                      <bt:Image size="32" resid="Tessallite.Icon32"/>
+                      <bt:Image size="80" resid="Tessallite.Icon80"/>
+                    </Icon>
+                    <Action xsi:type="ShowTaskpane">
+                      <TaskpaneId>AskFromSelection</TaskpaneId>
+                      <SourceLocation resid="Tessallite.AskFromSelection.Url"/>
+                    </Action>
+                  </Item>
+                </Items>
+              </Control>
+            </OfficeMenu>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+
+    <Resources>
+      <bt:Images>
+        <bt:Image id="Tessallite.Icon16" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-16.png"/>
+        <bt:Image id="Tessallite.Icon32" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-32.png"/>
+        <bt:Image id="Tessallite.Icon80" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-80.png"/>
+        <bt:Image id="Tessallite.Ask.Icon16" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-16.png"/>
+        <bt:Image id="Tessallite.Ask.Icon32" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-32.png"/>
+        <bt:Image id="Tessallite.Ask.Icon80" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-80.png"/>
+        <bt:Image id="Tessallite.ReportBuilder.Icon16" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-16.png"/>
+        <bt:Image id="Tessallite.ReportBuilder.Icon32" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-32.png"/>
+        <bt:Image id="Tessallite.ReportBuilder.Icon80" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-80.png"/>
+        <bt:Image id="Tessallite.Chart.Icon16" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-16.png"/>
+        <bt:Image id="Tessallite.Chart.Icon32" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-32.png"/>
+        <bt:Image id="Tessallite.Chart.Icon80" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-80.png"/>
+        <bt:Image id="Tessallite.Pivot.Icon16" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-16.png"/>
+        <bt:Image id="Tessallite.Pivot.Icon32" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-32.png"/>
+        <bt:Image id="Tessallite.Pivot.Icon80" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-80.png"/>
+      </bt:Images>
+      <bt:Urls>
+        <bt:Url id="GetStarted.LearnMoreUrl" DefaultValue="https://tessallite.com/docs"/>
+        <bt:Url id="Tessallite.Connect.Url" DefaultValue="https://localhost:3443/excel-plugin/index.html"/>
+        <bt:Url id="Tessallite.Ask.Url" DefaultValue="https://localhost:3443/excel-plugin/index.html?mode=ask"/>
+        <bt:Url id="Tessallite.ReportBuilder.Url" DefaultValue="https://localhost:3443/excel-plugin/index.html?mode=report-builder"/>
+        <bt:Url id="Tessallite.Chart.Url" DefaultValue="https://localhost:3443/excel-plugin/index.html?mode=ask"/>
+        <bt:Url id="Tessallite.Pivot.Url" DefaultValue="https://localhost:3443/excel-plugin/index.html?mode=report-builder"/>
+        <bt:Url id="Tessallite.DrillThrough.Url" DefaultValue="https://localhost:3443/excel-plugin/index.html?mode=ask"/>
+        <bt:Url id="Tessallite.AskFromSelection.Url" DefaultValue="https://localhost:3443/excel-plugin/index.html?mode=ask"/>
+        <bt:Url id="Tessallite.Functions.Page.Url" DefaultValue="https://localhost:3443/excel-plugin/functions.html"/>
+        <bt:Url id="Tessallite.Functions.Metadata.Url" DefaultValue="https://localhost:3443/excel-plugin/functions.json"/>
+      </bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="GetStarted.Title" DefaultValue="Tessallite"/>
+        <bt:String id="Tessallite.Functions.Namespace" DefaultValue="TESS"/>
+        <bt:String id="Tessallite.GroupLabel" DefaultValue="Tessallite"/>
+        <bt:String id="Tessallite.Connect.Label" DefaultValue="Connect"/>
+        <bt:String id="Tessallite.Ask.Label" DefaultValue="Ask"/>
+        <bt:String id="Tessallite.ReportBuilder.Label" DefaultValue="Report Builder"/>
+        <bt:String id="Tessallite.Chart.Label" DefaultValue="Chart"/>
+        <bt:String id="Tessallite.Pivot.Label" DefaultValue="Pivot"/>
+        <bt:String id="Tessallite.ContextMenu.Label" DefaultValue="Tessallite"/>
+        <bt:String id="Tessallite.DrillThrough.Label" DefaultValue="Drill Through"/>
+        <bt:String id="Tessallite.AskFromSelection.Label" DefaultValue="Ask From Selection"/>
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="GetStarted.Description" DefaultValue="Governed semantic layer insights inside Excel."/>
+        <bt:String id="Tessallite.Connect.Tooltip" DefaultValue="Sign in to Tessallite or switch profiles."/>
+        <bt:String id="Tessallite.Ask.Tooltip" DefaultValue="Ask Tessallite a business question."/>
+        <bt:String id="Tessallite.ReportBuilder.Tooltip" DefaultValue="Build a report from semantic measures and dimensions."/>
+        <bt:String id="Tessallite.Chart.Tooltip" DefaultValue="Insert a native Excel chart from the latest Tessallite result."/>
+        <bt:String id="Tessallite.Pivot.Tooltip" DefaultValue="Insert a local Excel PivotTable from the latest Tessallite result."/>
+        <bt:String id="Tessallite.ContextMenu.Tooltip" DefaultValue="Tessallite governed analytics actions."/>
+        <bt:String id="Tessallite.DrillThrough.Tooltip" DefaultValue="Drill through the selected cell to see detail rows."/>
+        <bt:String id="Tessallite.AskFromSelection.Tooltip" DefaultValue="Ask Tessallite about the selected data."/>
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>

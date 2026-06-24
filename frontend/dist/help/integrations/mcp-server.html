@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCP Server — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>MCP Server</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">developer</span><span class="updated">Updated 2026-05-24</span></div>
+<h1>MCP Server (Model Context Protocol)</h1>
+<p>The Tessallite MCP server lets AI assistants &mdash; Claude Desktop, Cursor, Claude Code, and any MCP-compatible client &mdash; query your semantic layer directly. The assistant can list models, inspect structure, run governed queries, view history, and trigger refreshes without custom REST integration.</p>
+<h2>What the MCP server can do</h2>
+<table>
+<thead><tr><th>Tool</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>list_models</code></td><td>List projects, or list models within a project</td></tr>
+<tr><td><code>describe_model</code></td><td>Full model structure: dimensions, measures, hierarchies, joins</td></tr>
+<tr><td><code>execute_query</code></td><td>Run SQL through the semantic layer with aggregate routing</td></tr>
+<tr><td><code>get_query_history</code></td><td>Recent queries with execution times and routing decisions</td></tr>
+<tr><td><code>list_aggregates</code></td><td>Materialised aggregates with status, grain, and size</td></tr>
+<tr><td><code>trigger_refresh</code></td><td>Trigger an aggregate refresh for a specific model (needs a tenant-admin account)</td></tr>
+</tbody>
+</table>
+<p>All queries go through Tessallite's query router. Aggregate routing, persona-based security, and row-level filters are enforced exactly as they are for BI tool queries.</p>
+<p><code>trigger_refresh</code> is an administrative action: the scheduler requires a tenant-admin credential. If you configure the MCP server with a viewer or modeler account, every other tool works but <code>trigger_refresh</code> returns a per-aggregate "FAILED (403 ...)" line. Use a tenant-admin (or a service account granted the tenant-admin role) if you need refresh.</p>
+<h2>How it runs (transport)</h2>
+<p>The MCP server speaks the MCP <strong>stdio</strong> transport — the assistant launches it as a child process and talks to it over standard input/output. It is not an HTTP service and has no SSE/HTTP listener, so it cannot be deployed as a long-running Cloud Run service; run it locally next to the assistant (the <code>command</code>/<code>args</code> config below) or via <code>docker run</code> with stdio attached.</p>
+<p><strong>Reaching the backend.</strong> <code>TESSALLITE_URL</code> must point at the model service and <code>TESSALLITE_QUERY_URL</code> at the query router. In a standard local Docker deployment the backend container ports may not be published on the host (nginx fronts them), so <code>http://localhost:8001</code> will not resolve — point the variables at the nginx-proxied address your browser uses (for example the app domain, with the service path the reverse proxy exposes) or publish the backend ports for local development. The Endpoints panel in the app pre-fills these values for your deployment.</p>
+<h2>Prerequisites</h2>
+<ul>
+<li>Python 3.10 or later</li>
+<li>A running Tessallite instance (local or cloud)</li>
+<li>A Tessallite user account with access to the target project</li>
+</ul>
+<h2>Installation</h2>
+<p>From the monorepo:</p>
+<pre><code>cd tessallite/mcp-server
+pip install .</code></pre>
+<p>Standalone:</p>
+<pre><code>pip install tessallite-mcp</code></pre>
+<h2>Configuration</h2>
+<p>The server reads configuration from environment variables:</p>
+<table>
+<thead><tr><th>Variable</th><th>Required</th><th>Default</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>TESSALLITE_URL</code></td><td>Yes</td><td><code>http://localhost:8001</code></td><td>Model service base URL</td></tr>
+<tr><td><code>TESSALLITE_QUERY_URL</code></td><td>No</td><td><code>http://localhost:8002</code></td><td>Query router base URL</td></tr>
+<tr><td><code>TESSALLITE_SCHEDULER_URL</code></td><td>No</td><td><code>http://localhost:8004</code></td><td>Scheduler base URL</td></tr>
+<tr><td><code>TESSALLITE_TENANT_ID</code></td><td>Yes</td><td>&mdash;</td><td>Tenant slug to authenticate against</td></tr>
+<tr><td><code>TESSALLITE_EMAIL</code></td><td>Yes</td><td>&mdash;</td><td>User email for JWT login</td></tr>
+<tr><td><code>TESSALLITE_PASSWORD</code></td><td>Yes</td><td>&mdash;</td><td>User password</td></tr>
+<tr><td><code>TESSALLITE_ROW_LIMIT</code></td><td>No</td><td><code>1000</code></td><td>Maximum rows returned per query</td></tr>
+</tbody>
+</table>
+<h2>Claude Desktop setup</h2>
+<p>Add to your Claude Desktop configuration (<code>claude_desktop_config.json</code>):</p>
+<pre><code>{
+  "mcpServers": {
+    "tessallite": {
+      "command": "tessallite-mcp",
+      "env": {
+        "TESSALLITE_URL": "http://localhost:8001",
+        "TESSALLITE_QUERY_URL": "http://localhost:8002",
+        "TESSALLITE_SCHEDULER_URL": "http://localhost:8004",
+        "TESSALLITE_TENANT_ID": "acme-demo",
+        "TESSALLITE_EMAIL": "admin@acme-demo.com",
+        "TESSALLITE_PASSWORD": "acme-demo"
+      }
+    }
+  }
+}</code></pre>
+<p>If installed from source:</p>
+<pre><code>{
+  "mcpServers": {
+    "tessallite": {
+      "command": "python",
+      "args": ["-m", "src.server"],
+      "cwd": "/path/to/tessallite/mcp-server",
+      "env": {
+        "TESSALLITE_URL": "http://localhost:8001",
+        "TESSALLITE_TENANT_ID": "acme-demo",
+        "TESSALLITE_EMAIL": "admin@acme-demo.com",
+        "TESSALLITE_PASSWORD": "acme-demo"
+      }
+    }
+  }
+}</code></pre>
+<h2>Cursor setup</h2>
+<p>Add to <code>.cursor/mcp.json</code> in your project or global settings:</p>
+<pre><code>{
+  "mcpServers": {
+    "tessallite": {
+      "command": "tessallite-mcp",
+      "env": {
+        "TESSALLITE_URL": "http://localhost:8001",
+        "TESSALLITE_TENANT_ID": "acme-demo",
+        "TESSALLITE_EMAIL": "admin@acme-demo.com",
+        "TESSALLITE_PASSWORD": "acme-demo"
+      }
+    }
+  }
+}</code></pre>
+<h2>Claude Code setup</h2>
+<p>Add to <code>.claude/settings.json</code>:</p>
+<pre><code>{
+  "mcpServers": {
+    "tessallite": {
+      "command": "tessallite-mcp",
+      "env": {
+        "TESSALLITE_URL": "http://localhost:8001",
+        "TESSALLITE_TENANT_ID": "acme-demo",
+        "TESSALLITE_EMAIL": "admin@acme-demo.com",
+        "TESSALLITE_PASSWORD": "acme-demo"
+      }
+    }
+  }
+}</code></pre>
+<h2>Docker</h2>
+<pre><code>docker build -t tessallite-mcp tessallite/mcp-server/
+
+docker run --rm \
+  -e TESSALLITE_URL=http://host.docker.internal:8001 \
+  -e TESSALLITE_QUERY_URL=http://host.docker.internal:8002 \
+  -e TESSALLITE_SCHEDULER_URL=http://host.docker.internal:8004 \
+  -e TESSALLITE_TENANT_ID=acme-demo \
+  -e TESSALLITE_EMAIL=admin@acme-demo.com \
+  -e TESSALLITE_PASSWORD=acme-demo \
+  tessallite-mcp</code></pre>
+<h2>Security</h2>
+<ul>
+<li>The MCP server authenticates using standard JWT login credentials.</li>
+<li>All queries respect persona-based security and row-level filters.</li>
+<li>Query results are capped at <code>TESSALLITE_ROW_LIMIT</code> rows.</li>
+<li>All queries are logged in the query log via the query router.</li>
+</ul>
+<p>Use a service account with appropriate permissions rather than a personal admin account in production.</p>
+<h2>Troubleshooting</h2>
+<ul>
+<li><strong>Connection refused.</strong> Verify the Tessallite services are running and the URLs are correct. For Docker, use <code>host.docker.internal</code> to reach the host network.</li>
+<li><strong>Authentication failed.</strong> Check tenant ID, email, and password. The MCP server uses the same login endpoint as the web UI.</li>
+<li><strong>Empty model list.</strong> The authenticated user may not have access to any projects. Check user access bindings in the admin panel.</li>
+<li><strong>Queries return no results.</strong> The user's persona may restrict visible measures or apply row-level filters that exclude all data. Try with a user that has broader access.</li>
+</ul>
+<h2>Related</h2>
+<ul><li><a href="api-authentication.html">API Authentication</a></li><li><a href="api-reference.html">API Reference</a></li><li><a href="headless-api.html">Headless API</a></li></ul>
+<nav class="page-nav"><a href="embed-agent-chat.html" class="page-nav-btn prev">&larr; Embed Agent Chat</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="solidatus-integration.html" class="page-nav-btn next">Solidatus Integration &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

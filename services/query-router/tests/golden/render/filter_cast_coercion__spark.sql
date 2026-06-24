@@ -1,0 +1,1 @@
+SELECT (CAST(`f`.`event_ts` AS DATE)) AS `event_day`, SUM(`f`.`amount`) AS `amount` FROM `demo`.`sales` AS `f` WHERE (CAST(`f`.`event_ts` AS DATE)) = CAST('2024-01-15' AS DATE) GROUP BY (CAST(`f`.`event_ts` AS DATE))

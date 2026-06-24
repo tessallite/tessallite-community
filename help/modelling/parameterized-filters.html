@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Parameterized Filters — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Parameterized Filters</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeler</span><span class="updated">Updated 2026-05-01</span></div>
+    <h1>Parameterized Filters</h1>
+<h2>What this covers</h2>
+<p>A parameterized filter is a named placeholder in a model&#x27;s query predicates that is resolved to a concrete value at query time. This page explains what parameters are, when to use them, how to define them, how values are resolved, and how BI tools pass parameter values through JDBC session variables.</p>
+<h2>What parameters solve</h2>
+<p>Many analytical models include filters that vary by user, session, or audience — a region code, a date range, a product category. Without parameters, the modeller has three unsatisfying options: hard-code a default (inflexible), define separate models per filter value (duplication), or rely on downstream tools to append WHERE clauses (inconsistent).</p>
+<p>Parameters give the modeller a single declaration point for each variable filter. The query engine resolves the value from the most authoritative source available, substitutes it into the SQL, and handles type-aware expansion (IN lists, BETWEEN ranges, quoted strings). The model stays clean; the variability moves to the parameter layer.</p>
+<h2>Parameter types</h2>
+<div class="table-wrapper"><table><thead><tr><th>Type</th><th>Value shape</th><th>SQL expansion</th></tr></thead><tbody><tr><td><code>string</code></td><td>A single text value</td><td><code>= &#x27;value&#x27;</code></td></tr><tr><td><code>number</code></td><td>A single numeric value</td><td><code>= value</code></td></tr><tr><td><code>multi_value</code></td><td>A list of text values</td><td><code>IN (&#x27;a&#x27;, &#x27;b&#x27;, &#x27;c&#x27;)</code></td></tr><tr><td><code>date_range</code></td><td>An object with <code>from</code> and <code>to</code></td><td><code>BETWEEN &#x27;from&#x27; AND &#x27;to&#x27;</code></td></tr><tr><td><code>boolean</code></td><td><code>true</code> or <code>false</code></td><td><code>= TRUE</code> or <code>= FALSE</code></td></tr></tbody></table></div>
+<p>Type validation happens at resolution time. A <code>multi_value</code> parameter supplied with a single string is auto-wrapped into a one-element list. A <code>number</code> parameter supplied with a non-numeric value fails with a clear error.</p>
+<h2>Defining a parameter</h2>
+<ol><li>Open a model in Model Builder.</li><li>Click the <strong>Parameters</strong> icon in the toolbelt to open the Parameters panel.</li><li>Click <strong>Add Parameter</strong>.</li><li>Fill in:</li></ol>
+<ul><li><strong>Name</strong> — must be <code>@</code> followed by a letter or underscore, then any mix of letters, digits, and underscores (e.g. <code>@region</code>, <code>@date_start</code>, <code>@_internal</code>). A name like <code>@1region</code> (digit first) or <code>@my-param</code> (hyphen) is rejected with a clear error, because the query engine has to recognise <code>@name</code> as a single token during substitution — a name that started with a digit or contained punctuation could not be told apart from the surrounding SQL.</li><li><strong>Display name</strong> — optional friendly label shown in admin UIs.</li><li><strong>Type</strong> — one of the five types above.</li><li><strong>Default value</strong> — the value used when no higher-precedence source provides one. Type-dependent: a string for <code>string</code>, a number for <code>number</code>, a JSON array for <code>multi_value</code>, a <code>{&quot;from&quot;: ..., &quot;to&quot;: ...}</code> object for <code>date_range</code>, or <code>true</code>/<code>false</code> for <code>boolean</code>.</li><li><strong>Allowed values</strong> — optional whitelist for <code>string</code>, <code>multi_value</code>, and <code>number</code> parameters. When set, any resolved value outside the list is rejected at resolution time with a clear error, so a stray or malicious filter value can never reach the source. For <code>multi_value</code>, <em>every</em> member must be on the list. Number lists are checked numerically, so a declared <code>[10, 20]</code> matches a resolved <code>10</code> or <code>"10"</code>. A <code>date_range</code> parameter does <strong>not</strong> take an allowed-values list — a whitelist has no meaning for a from/to range, so the list is ignored there; constrain a date range with its <code>from</code>/<code>to</code> bounds instead.</li><li><strong>Description</strong> — optional documentation.</li></ul>
+<ol><li>Click <strong>Save</strong>.</li></ol>
+<p>Parameters are unique per model by name. Attempting to create a duplicate name returns HTTP 409.</p>
+<h2>Resolution order</h2>
+<p>When a query references a parameter, the engine resolves its value using three sources, in order of precedence (highest first):</p>
+<ol><li><strong>Persona default filter.</strong> If the query is bound to a persona and that persona defines a default filter matching the parameter, the persona&#x27;s value wins.</li><li><strong>JDBC session variable.</strong> If the BI tool set <code>app.&lt;param_name&gt;</code> via a <code>SET</code> command earlier in the session, that value is used.</li><li><strong>Model default value.</strong> The default defined on the parameter definition.</li></ol>
+<p>If no value is available from any source and the parameter has no default, the query fails with a structured error naming the unresolved parameter.</p>
+<h2>JDBC session variables</h2>
+<p>BI tools connected via JDBC (port 5433) can set parameter values per session using the standard PostgreSQL <code>SET</code> command:</p>
+<pre><code>SET app.region = &#x27;APAC&#x27;;
+SET app.date_start = &#x27;2025-01-01&#x27;;
+SET app.date_end = &#x27;2025-12-31&#x27;;</code></pre>
+<p>The <code>app.</code> prefix is required. Session variables persist for the lifetime of the JDBC connection and are cleared when the client disconnects.</p>
+<p>This mechanism works with any PostgreSQL-compatible client: DBeaver, Tableau (custom SQL), psycopg2, JDBC drivers. The gateway captures the SET commands and passes the values to the query router as part of the query context.</p>
+<h2>Worked example</h2>
+<p>A modeller defines two parameters on the <code>sales</code> model:</p>
+<div class="table-wrapper"><table><thead><tr><th>Name</th><th>Type</th><th>Default</th></tr></thead><tbody><tr><td><code>@region</code></td><td><code>string</code></td><td><code>&quot;ALL&quot;</code></td></tr><tr><td><code>@report_date</code></td><td><code>date_range</code></td><td><code>{&quot;from&quot;: &quot;2025-01-01&quot;, &quot;to&quot;: &quot;2025-12-31&quot;}</code></td></tr></tbody></table></div>
+<p>A DBeaver user connects and runs:</p>
+<pre><code>SET app.region = &#x27;EMEA&#x27;;
+SELECT country, SUM(revenue) FROM sales WHERE region = @region GROUP BY country;</code></pre>
+<p>The query engine resolves <code>@region</code> to <code>&#x27;EMEA&#x27;</code> (from the session variable, which takes precedence over the default). The <code>@report_date</code> parameter is not referenced in this query, so it is not resolved.</p>
+<p>A different user connects via a persona that defines <code>default_filters: {&quot;region&quot;: &quot;APAC&quot;}</code>. Their query:</p>
+<pre><code>SELECT country, SUM(revenue) FROM sales WHERE region = @region GROUP BY country;</code></pre>
+<p>The engine resolves <code>@region</code> to <code>&#x27;APAC&#x27;</code> — the persona filter takes precedence over both the session variable (not set in this session) and the model default.</p>
+<h2>Editing and deleting parameters</h2>
+<ul><li><strong>Edit</strong> — click the pencil icon on a parameter row. All fields except the name are editable. Changing the type clears the default value and allowed values.</li><li><strong>Delete</strong> — click the delete icon and confirm. Queries that reference a deleted parameter will fail at resolution time until the reference is removed or the parameter is recreated.</li></ul>
+<h2>Best practices</h2>
+<ul><li><strong>Use parameters for values that vary by audience.</strong> If every user sees the same filter, a regular WHERE clause is simpler.</li><li><strong>Set sensible defaults.</strong> A parameter without a default requires every caller to supply a value. Use a default that returns a safe, non-empty result set.</li><li><strong>Constrain with allowed values.</strong> For <code>string</code> and <code>multi_value</code> parameters, an allowed-values list prevents unexpected filter values and makes the parameter self-documenting.</li><li><strong>Name consistently.</strong> Adopt a convention like <code>@report_date_start</code>, <code>@report_date_end</code>, <code>@region_filter</code> so parameters are recognisable in queries.</li></ul>
+<h2>API reference</h2>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Endpoint</th><th>Purpose</th></tr></thead><tbody><tr><td>GET</td><td><code>/api/v1/models/{model_id}/parameters</code></td><td>List model parameters</td></tr><tr><td>POST</td><td><code>/api/v1/models/{model_id}/parameters</code></td><td>Create a parameter</td></tr><tr><td>PUT</td><td><code>/api/v1/models/{model_id}/parameters/{id}</code></td><td>Update a parameter</td></tr><tr><td>DELETE</td><td><code>/api/v1/models/{model_id}/parameters/{id}</code></td><td>Delete a parameter</td></tr></tbody></table></div>
+<p>All require <code>modeler</code> role on the model&#x27;s project.</p>
+<h2>Related</h2>
+<ul><li><a href="configure-personas.html">Configure Personas</a> — persona default filters interact with parameter resolution</li><li><a href="define-dimensions.html">Define Dimensions</a></li><li><a href="../integrations/jdbc-connection-guide.html">JDBC Connection Guide</a></li></ul>
+<nav class="page-nav"><a href="configure-personas.html" class="page-nav-btn prev">&larr; Configure Personas</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="data-quality-rules.html" class="page-nav-btn next">Data Quality Rules &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

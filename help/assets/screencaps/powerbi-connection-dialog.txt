@@ -1,0 +1,1 @@
+Screenshot of the Power BI Desktop "Get Data" dialog with "PostgreSQL database" selected. The Server field is filled with "analytics.example.com:5433". The Database field is filled with "acme". The Data Connectivity mode radio buttons show "DirectQuery" selected. The "OK" button is active in the bottom right. Dimensions: 800x500px.

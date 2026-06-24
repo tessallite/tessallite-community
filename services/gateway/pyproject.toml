@@ -1,0 +1,45 @@
+[project]
+name = "gateway"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "httpx>=0.27.0",
+    "python-jose[cryptography]>=3.3.0",
+    "cryptography>=42.0.0",
+    "google-auth>=2.0.0",
+    "ldap3>=2.9.1",
+    "lxml>=5.2.0",
+    "defusedxml>=0.7.1",
+    "sqlglot>=23.0.0",
+    "slowapi>=0.1.9",
+    "pyhive>=0.7.0",
+    "thrift>=0.16.0",
+    "pure-sasl>=0.6.2",
+    # System-settings resolver pulls per-service tuning knobs from the system DB.
+    "sqlalchemy>=2.0.30",
+    "asyncpg>=0.29.0",
+    "prometheus-client>=0.20.0",
+    # Tree-sitter parser for DAX/MDX (Phase 2 block A)
+    "tree-sitter>=0.21,<0.22",
+    "setuptools>=69.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = [".", "../../"]
+testpaths = ["tests"]
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests requiring mocked DB",
+    "e2e: End-to-end tests requiring running services",
+]

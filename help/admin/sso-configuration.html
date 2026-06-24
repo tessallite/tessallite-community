@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SSO Configuration — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>SSO Configuration</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-05-01</span></div>
+    <h1>SSO Configuration</h1>
+<h2>What this covers</h2>
+<p>Tessallite supports SAML 2.0 and OpenID Connect (OIDC) for single sign-on. This page explains how SSO works, how to configure each protocol, how to set up group-to-role mappings, and what happens when a user signs in via SSO for the first time.</p>
+<h2>How SSO fits into the authentication chain</h2>
+<p>Tessallite authenticates users through a chain of backends. Each tenant can enable one or more of: <code>local</code> (username/password), <code>ldap</code>, <code>gcp_iam</code>, <code>saml</code>, and <code>oidc</code>. The login page adapts to show the available options — when <code>saml</code> or <code>oidc</code> is enabled, a <strong>Sign in with SSO</strong> button appears alongside the standard credential form.</p>
+<p>SAML and OIDC are redirect-based. The user&#x27;s browser is sent to the identity provider (IdP) for authentication. After successful authentication, the browser is redirected back to Tessallite, which validates the response, creates or updates the local user record, and issues a JWT for the session.</p>
+<h2>SAML 2.0 setup</h2>
+<h3>Step 1 — Register Tessallite as a Service Provider</h3>
+<p>Tessallite publishes its SP metadata at:</p>
+<pre><code>GET /api/v1/auth/saml/metadata</code></pre>
+<p>Download this XML and upload it to your IdP (Auth0, Google Workspace, Okta, AD FS, or any SAML 2.0 IdP). The metadata contains the entity ID and the Assertion Consumer Service (ACS) URL.</p>
+<h3>Step 2 — Configure the IdP in Tessallite</h3>
+<p>In the tenant settings, provide:</p>
+<div class="table-wrapper"><table><thead><tr><th>Setting</th><th>Purpose</th></tr></thead><tbody><tr><td><code>SAML_IDP_METADATA_URL</code></td><td>URL to the IdP&#x27;s SAML metadata (Tessallite fetches it automatically). Use this OR the XML field below — not both.</td></tr><tr><td><code>SAML_IDP_METADATA_XML</code></td><td>Paste the IdP metadata XML directly. Use when the metadata URL is not accessible from the Tessallite host.</td></tr><tr><td><code>SAML_SP_ENTITY_ID</code></td><td>The entity ID Tessallite uses to identify itself. Must match what is registered in the IdP.</td></tr></tbody></table></div>
+<h3>Step 3 — Map attributes</h3>
+<p>The IdP sends user attributes in the SAML assertion. Tessallite reads three:</p>
+<div class="table-wrapper"><table><thead><tr><th>Setting</th><th>Default</th><th>What it maps to</th></tr></thead><tbody><tr><td><code>SAML_ATTR_EMAIL</code></td><td>NameID</td><td>The user&#x27;s email address (used as the primary identifier).</td></tr><tr><td><code>SAML_ATTR_DISPLAY_NAME</code></td><td>(none)</td><td>The user&#x27;s display name.</td></tr><tr><td><code>SAML_ATTR_GROUPS</code></td><td>(none)</td><td>A multi-valued attribute containing group memberships. Required for group-to-role mapping.</td></tr></tbody></table></div>
+<p>Defaults work for Auth0 and Google Workspace. Other IdPs may use different attribute names — check your IdP&#x27;s attribute configuration.</p>
+<h3>SAML endpoints</h3>
+<div class="table-wrapper"><table><thead><tr><th>Endpoint</th><th>Method</th><th>Purpose</th></tr></thead><tbody><tr><td><code>/api/v1/auth/saml/metadata</code></td><td>GET</td><td>Returns SP metadata XML for IdP registration.</td></tr><tr><td><code>/api/v1/auth/saml/login</code></td><td>GET</td><td>Initiates the SSO flow (redirects to IdP).</td></tr><tr><td><code>/api/v1/auth/saml/acs</code></td><td>POST</td><td>Receives the SAML assertion from the IdP.</td></tr></tbody></table></div>
+<h2>OIDC setup</h2>
+<h3>Step 1 — Register Tessallite with the IdP</h3>
+<p>Create an OAuth 2.0 / OIDC client in your IdP. Set the redirect URI to:</p>
+<pre><code>GET /api/v1/auth/oidc/callback</code></pre>
+<p>Note the client ID and client secret.</p>
+<h3>Step 2 — Configure the IdP in Tessallite</h3>
+<div class="table-wrapper"><table><thead><tr><th>Setting</th><th>Purpose</th></tr></thead><tbody><tr><td><code>OIDC_ISSUER</code></td><td>The issuer URL. Tessallite fetches <code>.well-known/openid-configuration</code> from this URL to discover endpoints.</td></tr><tr><td><code>OIDC_CLIENT_ID</code></td><td>The client ID from step 1.</td></tr><tr><td><code>OIDC_CLIENT_SECRET</code></td><td>The client secret from step 1. Stored Fernet-encrypted at rest.</td></tr><tr><td><code>OIDC_SCOPES</code></td><td>OAuth scopes to request. Default: <code>openid email profile</code>.</td></tr><tr><td><code>OIDC_GROUPS_CLAIM</code></td><td>The claim name in the ID token containing group memberships. Default: <code>groups</code>.</td></tr></tbody></table></div>
+<h3>OIDC endpoints</h3>
+<div class="table-wrapper"><table><thead><tr><th>Endpoint</th><th>Method</th><th>Purpose</th></tr></thead><tbody><tr><td><code>/api/v1/auth/oidc/login</code></td><td>GET</td><td>Initiates the authorization-code flow (redirects to IdP).</td></tr><tr><td><code>/api/v1/auth/oidc/callback</code></td><td>GET</td><td>Receives the authorization code, exchanges it for tokens.</td></tr></tbody></table></div>
+<h2>Group-to-role mapping</h2>
+<p>Both SSO backends extract group memberships from the IdP response (SAML assertion attribute or OIDC ID token claim). Group-to-role mappings tell Tessallite which Tessallite role to assign for each IdP group.</p>
+<h3>How it works</h3>
+<ol><li>On each SSO login, Tessallite reads the user&#x27;s groups from the IdP response.</li><li>It looks up every group name in the <code>idp_group_role_mappings</code> table.</li><li>For each match, it creates or updates a <code>UserAccessBinding</code> entry with the mapped role and project scope.</li><li>If none of the user&#x27;s groups match any mapping, the user inherits the tenant&#x27;s JIT default role.</li></ol>
+<h3>Managing mappings</h3>
+<p>Navigate to <em>Admin &gt; Settings &gt; Group Mappings</em>. Each mapping has three fields:</p>
+<ul><li><strong>IdP group name</strong> — the exact group name as sent by the IdP (case-sensitive).</li><li><strong>Project</strong> — the project to scope the role to. Leave blank for a tenant-wide mapping.</li><li><strong>Role</strong> — <code>admin</code>, <code>modeler</code>, or <code>viewer</code>.</li></ul>
+<p>A group can map to different roles in different projects. A single user who belongs to multiple groups receives the union of all matching roles.</p>
+<p>The API is <code>GET/POST/PUT/DELETE /api/v1/admin/group-mappings</code> (tenant admin only).</p>
+<h2>What ends up inside the login token</h2>
+<p>When a user signs in through SAML or OIDC, Tessallite does <strong>not</strong> copy every attribute the identity provider sends into the session token. It keeps only what it actually needs:</p>
+<ul><li>the attributes your <strong>row-security rules</strong> reference (so those rules can evaluate per-user), and</li><li>any extra attribute names you explicitly list in <code>AUTH_JWT_CLAIMS_ALLOWLIST</code> (comma-separated).</li></ul>
+<p>Everything else the identity provider released is dropped. This keeps the token small and stops attributes a rule never uses from riding along inside it.</p>
+<p>There is a size limit, <code>AUTH_JWT_CLAIMS_MAX_BYTES</code> (4096 bytes by default). If the attributes Tessallite must keep do not fit inside that cap, the login is <strong>refused with HTTP 413</strong> rather than quietly trimming an attribute a rule depends on. That is deliberate: a silently-dropped attribute would make a row-security rule match the wrong rows, so Tessallite fails the login rather than risk leaking data to the wrong person.</p>
+<p><strong>If an admin sees a 413 on login</strong>, the fix is one of: shorten the identity provider's attribute <em>values</em>, narrow which attributes the row-security rules reference, or raise <code>AUTH_JWT_CLAIMS_MAX_BYTES</code>. Every dropped attribute name is logged, so the service logs tell you exactly what was trimmed.</p>
+<h2>JIT user creation</h2>
+<p>When a user authenticates via SSO for the first time and no local user record exists, Tessallite automatically creates one. The new user&#x27;s:</p>
+<ul><li><strong>Email</strong> comes from the SAML assertion or OIDC ID token.</li><li><strong>Display name</strong> comes from the mapped attribute/claim (if configured).</li><li><strong>Auth source</strong> is set to <code>saml</code> or <code>oidc</code>.</li><li><strong>Role</strong> is determined by group-to-role mappings, falling back to the JIT default role.</li></ul>
+<p>Users with a non-local auth source cannot change their password via Tessallite — the identity provider manages their credentials.</p>
+<h2>Best practices</h2>
+<ul><li><strong>Test with one user first.</strong> Enable SSO, sign in yourself, and verify the attribute mapping before rolling out to the team.</li><li><strong>Keep local auth enabled as a fallback.</strong> Until SSO is stable, keep <code>local</code> in the <code>AUTH_BACKENDS</code> list so administrators can still sign in with credentials if the IdP is unreachable.</li><li><strong>Set <code>SAML_ATTR_GROUPS</code> or <code>OIDC_GROUPS_CLAIM</code> early.</strong> Group-to-role mapping only works when the IdP sends group information. Some IdPs require explicit configuration to include groups in the assertion or token.</li><li><strong>Use tenant-wide mappings sparingly.</strong> A tenant-wide <code>admin</code> mapping gives the group admin access to every project. Prefer project-scoped mappings for least-privilege.</li></ul>
+<h2>Troubleshooting</h2>
+<ul><li><strong>&quot;Sign in with SSO&quot; button does not appear.</strong> Check that <code>saml</code> or <code>oidc</code> is listed in the <code>AUTH_BACKENDS</code> tenant setting and that the IdP configuration fields are non-empty.</li><li><strong>&quot;Invalid assertion&quot; error after redirect.</strong> The SP entity ID in Tessallite does not match what is registered in the IdP, or the ACS URL is wrong. Compare the SP metadata XML with the IdP&#x27;s configuration.</li><li><strong>User created but has no project access.</strong> The user&#x27;s IdP groups do not match any entry in group-to-role mappings, and the JIT default role is <code>viewer</code> (which may have no project bindings). Add the appropriate mapping.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="manage-users.html">Manage Users</a></li><li><a href="manage-roles.html">Manage Roles</a></li><li><a href="workspace-settings.html">Workspace Settings</a></li></ul>
+<nav class="page-nav"><a href="alert-configuration.html" class="page-nav-btn prev">&larr; Alert Configuration</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="group-mappings.html" class="page-nav-btn next">SSO Group Mappings &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

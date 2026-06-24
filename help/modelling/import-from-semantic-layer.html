@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Import from a Semantic Layer Tool — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Import from a Semantic Layer Tool</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-21</span></div>
+<h1>Import from a Semantic Layer Tool</h1>
+<h2>What this covers</h2>
+<p>Tessallite can import semantic model definitions from three external platforms: <strong>dbt</strong> (MetricFlow v1.7+), <strong>AtScale</strong> (SML), and <strong>Cube.dev</strong>. The importer reads your existing YAML definitions and produces a Tessallite model with dimensions, measures, hierarchies, and a default persona. This article covers what each importer supports, what gets converted, and what needs manual setup after import.</p>
+<h2>Supported formats</h2>
+<table>
+<thead><tr><th>Platform</th><th>Input format</th><th>Key construct</th></tr></thead>
+<tbody>
+<tr><td>dbt MetricFlow</td><td>YAML with <code>semantic_models:</code> and <code>metrics:</code> keys</td><td>Semantic models, metrics, saved queries</td></tr>
+<tr><td>AtScale SML</td><td>Multi-file YAML project (models, datasets, dimensions, metrics, calculations)</td><td>SML object types with <code>object_type:</code> key</td></tr>
+<tr><td>Cube.dev</td><td>YAML with <code>cubes:</code> key</td><td>Cubes with measures, dimensions, joins</td></tr>
+</tbody>
+</table>
+<h2>What gets imported</h2>
+<p>All three importers produce the same Tessallite bundle format. The table below shows what transfers and what needs manual attention.</p>
+<table>
+<thead><tr><th>Concept</th><th>dbt</th><th>AtScale</th><th>Cube.dev</th></tr></thead>
+<tbody>
+<tr><td>Tables</td><td>From <code>model</code> ref</td><td>From datasets</td><td>From <code>sql_table</code></td></tr>
+<tr><td>Columns</td><td>From measure/dimension <code>expr</code></td><td>From dataset columns</td><td>From measure/dimension <code>sql</code></td></tr>
+<tr><td>Measures</td><td>Mapped (sum, count, count_distinct, average, min, max, median, percentile)</td><td>Mapped (20 calculation methods including sum, count, average, min, max, median, percentile, stddev)</td><td>Mapped (count, count_distinct, sum, avg, min, max, number, running_total)</td></tr>
+<tr><td>Dimensions</td><td>categorical and time</td><td>standard, time, degenerate</td><td>string, number, time, boolean, geo</td></tr>
+<tr><td>Hierarchies</td><td>Auto-generated from time dimensions</td><td>From dimension hierarchy/level definitions</td><td>Explicit + auto-generated from time dimensions</td></tr>
+<tr><td>Joins</td><td>Warning only (foreign entities signal relationships)</td><td>From model relationships</td><td>From cube join definitions</td></tr>
+<tr><td>Format strings</td><td>Not available</td><td>Preserved from metric format field</td><td>Preserved from measure format field</td></tr>
+<tr><td>Personas</td><td>Default "Everyone" created</td><td>Default "Everyone" created</td><td>Default "Everyone" created; private cubes skipped</td></tr>
+</tbody>
+</table>
+<h2>What needs manual setup after import</h2>
+<p>Every import produces a warnings list that tells you exactly what needs attention. Common post-import tasks:</p>
+<ol>
+<li><strong>Connections</strong> &mdash; The imported model has no database connections. Bind each table to a Tessallite connection pointing to your database.</li>
+<li><strong>Joins</strong> &mdash; dbt imports produce join warnings from foreign entities. AtScale and Cube imports map joins automatically, but review them for correctness.</li>
+<li><strong>Calculated measures</strong> &mdash; dbt derived/ratio/cumulative metrics, AtScale MDX calculations, and Cube rolling_window/multi_stage measures all produce warnings. Create equivalent calculated measures in Tessallite.</li>
+<li><strong>Row security</strong> &mdash; AtScale row_security objects produce a security warning. Configure personas and row-level security rules in Tessallite.</li>
+<li><strong>Deploy</strong> &mdash; Save and deploy the model to make it available via XMLA and JDBC.</li>
+</ol>
+<h2>How to import</h2>
+<h3>Via the API</h3>
+<pre><code>POST /api/v1/projects/{project_id}/import/{format}</code></pre>
+<p>Where <code>{format}</code> is <code>dbt</code>, <code>atscale</code>, or <code>cube</code>. Send the YAML file (or a zip of the project directory for multi-file formats) as a file upload.</p>
+<p>The response includes:</p>
+<ul>
+<li><code>models_parsed</code> &mdash; number of models found</li>
+<li><code>warnings</code> &mdash; items that need manual attention</li>
+<li><code>bundle</code> &mdash; the full Tessallite project bundle (JSON)</li>
+</ul>
+<h3>Via the UI</h3>
+<ol>
+<li>Open your project in the Explorer.</li>
+<li>Click <strong>Import</strong> next to <strong>Add Model</strong>.</li>
+<li>Select the import format (dbt, AtScale, or Cube).</li>
+<li>Upload your YAML file or project zip.</li>
+<li>Review the parsed models and warnings.</li>
+<li>Click <strong>Import</strong> to create the model.</li>
+</ol>
+<h2>Tips</h2>
+<ul>
+<li><strong>Multi-file projects:</strong> dbt and Cube importers scan all <code>.yml</code> and <code>.yaml</code> files in a zip. AtScale imports expect the standard SML directory layout (models/, datasets/, dimensions/, metrics/, calculations/).</li>
+<li><strong>Private/hidden items:</strong> Cube cubes, dimensions, and measures marked <code>public: false</code> are excluded from import. AtScale metrics with <code>is_hidden: true</code> are imported but may warrant review.</li>
+<li><strong>Labels:</strong> All three importers use label/title fields as display names when available, falling back to humanized versions of the slug.</li>
+<li><strong>Unsupported aggregations:</strong> Any aggregation type not in the mapping table defaults to <code>sum</code> with a warning.</li>
+</ul>
+<h2>Import from a data catalog</h2>
+<p>Besides YAML files, Tessallite can pull table and column metadata straight from a running <strong>data catalog</strong> — <strong>DataHub</strong>, <strong>OpenMetadata</strong>, or <strong>Alation</strong> — and build a starter model from it. Use this when your tables are already catalogued and you would rather not hand-write a model from scratch. This is a <em>live API</em> import, not a file upload: Tessallite calls the catalog's API at import time and reads what it returns.</p>
+<p><strong>How it works.</strong> You give Tessallite the catalog's API URL and an API token, and optionally a dataset filter to limit which tables come across. Tessallite reads the catalogued tables and columns and creates a model where <strong>numeric columns become measures</strong> and the rest become <strong>dimensions</strong>. The model is created <strong>undeployed</strong> and bound to a <strong>placeholder connection</strong> — you point it at the real source database and review the model before you deploy and query.</p>
+<p><strong>To run it:</strong></p>
+<ol><li>Open the Model Builder and choose <strong>Import</strong>.</li><li>Pick <strong>Data catalog (DataHub / OpenMetadata / Alation)</strong> as the format.</li><li>Choose the <strong>Catalog system</strong>, then paste the <strong>Catalog API URL</strong> and an <strong>API token</strong>.</li><li>Optionally set a <strong>Dataset filter</strong> to import only datasets whose name matches a pattern. Leave it blank to import everything the catalog returns.</li><li>Optionally set a <strong>Model name</strong>, then run the import. Tessallite reports how many models, tables, measures, and dimensions it created, plus any warnings.</li></ol>
+<p><strong>What needs your attention afterwards:</strong></p>
+<ul><li>The starter model is a <em>first draft</em>. Numeric-vs-dimension is a guess based on column type, so re-classify anything that came across the wrong way (an ID column that is numeric but is really a dimension, for example).</li><li>Configure the <strong>real source connection</strong> before you preview or deploy — the import uses a placeholder that cannot run queries.</li><li><strong>Joins and hierarchies are not inferred</strong> from the catalog. Add them by hand once the tables are in, the same as any other model.</li></ul>
+<p><strong>Tip:</strong> give the API token a <em>read-only</em> catalog role. Tessallite only reads metadata; it never needs write access to your catalog.</p>
+<h2>Related</h2>
+<ul>
+<li><a href="export-and-import-a-model.html">Export and Import a Model</a></li>
+<li><a href="export-and-import-a-project.html">Export and Import a Project</a></li>
+<li><a href="import-from-dbt.html">Import from dbt</a></li>
+<li><a href="define-measures.html">Define Measures</a></li>
+<li><a href="define-dimensions.html">Define Dimensions</a></li>
+</ul>
+<nav class="page-nav"><a href="import-from-dbt.html" class="page-nav-btn prev">&larr; Import from dbt</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="../agent/agent-chat.html" class="page-nav-btn next">Agent Chat &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

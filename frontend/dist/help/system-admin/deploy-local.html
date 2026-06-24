@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deploy Locally — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>Deploy Locally</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-06-14</span></div>
+    <h1>Deploy Locally</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/deploy-local-docker-ps.png" alt="Terminal — `docker compose ps` showing all services healthy."></figure>
+<h2>What this covers</h2>
+<p>Detailed configuration reference for a local Docker Compose deployment. This complements the guided install article in Getting Started. It covers environment variable configuration, volume management, resource requirements, and debug logging.</p>
+<h2>Requirements</h2>
+<ul><li>Docker Desktop 24 or later with Compose v2.</li><li>Minimum 2 CPUs and 4 GB RAM for a development deployment. 4 CPUs and 8 GB RAM recommended for sustained use.</li><li>Ports 5433, 8080, 3000, and 3443 free on the host. (3000 serves the web UI over plain HTTP; 3443 serves it over HTTPS — see below.)</li></ul>
+<h2>Starting and stopping</h2>
+<pre><code># Start all services in the background
+docker compose up -d
+
+# Check service status
+docker compose ps
+
+# Stream logs for a specific service
+docker compose logs -f query-router
+
+# Stop all services (data volumes preserved)
+docker compose down</code></pre>
+<h2>Accessing the web UI (HTTP and HTTPS)</h2>
+<p>A local deployment serves the web UI two ways:</p>
+<ul><li><strong><code>http://localhost:3000</code></strong> — plain HTTP. Fine for everyday browser use on your own machine.</li><li><strong><code>https://localhost:3443</code></strong> — HTTPS, using a locally-generated certificate. This is the address you use for the <strong>Excel add-in</strong>: Microsoft Office only loads add-ins served over HTTPS, so the add-in's manifest points at <code>https://localhost:3443</code>, not the HTTP port.</li></ul>
+<p>The HTTPS certificate for <code>localhost:3443</code> is created during deployment (the certificate step, <code>03b_certs</code>). It is a self-signed development certificate, so a browser may warn you the first time — that warning is expected for local development and does not apply to a real deployment, which serves over a trusted certificate. If the Excel add-in cannot connect, confirm port 3443 is free and that the certificate step ran successfully.</p>
+<h2>Persistent data</h2>
+<p>Tessallite uses one named volume: <code>tessallite_pgdata</code> — stores workspace metadata, model definitions, aggregate build history, and the query miss log.</p>
+<p>This volume persists across <code>docker compose down</code> and <code>docker compose up</code> cycles. To delete it and all Tessallite data, use <code>docker compose down -v</code>. See the Teardown article for details.</p>
+<h2>Environment variable configuration</h2>
+<p>Copy <code>.env.example</code> to <code>.env</code> in the same directory as <code>docker-compose.yml</code>. Docker Compose reads this file automatically. The minimum required values are:</p>
+<pre><code>POSTGRES_PASSWORD=your-strong-password
+CREDENTIAL_ENCRYPTION_KEY=your-fernet-key-here
+JWT_SECRET_KEY=your-jwt-secret-minimum-32-characters
+SYSTEM_ADMIN_PASSWORD=your-admin-password</code></pre>
+<p>Never commit <code>.env</code> to source control — it is listed in <code>.gitignore</code>. Change all four values from their placeholder defaults before running in any shared environment. See <a href="configure-environment-variables.html">Configure Environment Variables</a> for the full variable list and how to generate the Fernet key.</p>
+<h2>Environment variable reference</h2>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Required</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>POSTGRES_PASSWORD</code></td><td>Yes</td><td>—</td><td>Password for the internal PostgreSQL user. Docker Compose uses this to build the connection URL for every service.</td></tr>
+<tr><td><code>CREDENTIAL_ENCRYPTION_KEY</code></td><td>Yes</td><td>—</td><td>Fernet key for encrypting source database credentials. Generate with <code>python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"</code></td></tr>
+<tr><td><code>JWT_SECRET_KEY</code></td><td>Yes</td><td>—</td><td>Signs user session tokens. Minimum 32 characters.</td></tr>
+<tr><td><code>SYSTEM_ADMIN_EMAIL</code></td><td>No</td><td><code>admin@tessallite.local</code></td><td>System admin login email.</td></tr>
+<tr><td><code>SYSTEM_ADMIN_PASSWORD</code></td><td>Yes</td><td>—</td><td>System admin password.</td></tr>
+<tr><td><code>JDBC_PORT</code></td><td>No</td><td><code>5433</code></td><td>Host port for the JDBC listener.</td></tr>
+<tr><td><code>XMLA_PORT</code></td><td>No</td><td><code>8080</code></td><td>Host port for the XMLA listener.</td></tr>
+<tr><td><code>LOG_LEVEL</code></td><td>No</td><td><code>info</code></td><td>One of: <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>.</td></tr>
+</tbody></table></div>
+<h2>Enabling debug logging</h2>
+<pre><code>LOG_LEVEL=debug</code></pre>
+<p>Add this to your <code>.env</code> file. Debug output is high volume — use it for short-duration troubleshooting only.</p>
+<h2>Related</h2>
+<ul><li><a href="architecture-overview.html">Architecture Overview</a></li><li><a href="configure-environment-variables.html">Configure Environment Variables</a></li><li><a href="../getting-started/install-local.html">Install Tessallite Locally</a></li></ul>
+<nav class="page-nav"><a href="architecture-overview.html" class="page-nav-btn prev">&larr; Architecture Overview</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="deploy-gcp.html" class="page-nav-btn next">Deploy on GCP &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

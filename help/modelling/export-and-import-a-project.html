@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Export and Import a Project — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Export and Import a Project</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-05-28</span></div>
+    <h1>Export and Import a Project</h1>
+<h2>What this covers</h2>
+<p>Project-level export captures an entire project as a single JSON file: every model, connection, LLM configuration, agent setup, cross-model recipe, and project setting. You can import this bundle to create a brand-new project in the same tenant (or a different one), or to replace an existing project wholesale. This is the recommended way to promote a project between environments (dev, UAT, prod) and to snapshot before destructive testing.</p>
+<p>This article covers export options, the import workflow, how connections and credentials are handled, and what happens to materialized objects after import.</p>
+<h2>Opening the dialog</h2>
+<p>Project import and export are accessed from a single <strong>Import / Export</strong> button (swap-arrows icon) in the Explorer sidebar, below the tenant card. This button is visible to admin users only. Clicking it opens a dialog with two tabs: <strong>Import</strong> and <strong>Export</strong>.</p>
+<h2>When to use project export vs model export</h2>
+<div class="table-wrapper"><table><thead><tr><th>Scenario</th><th>Use</th></tr></thead><tbody><tr><td>Move one model between projects</td><td><a href="export-and-import-a-model.html">Model export</a></td></tr><tr><td>Promote an entire project (all models, config, connections) to another environment</td><td>Project export</td></tr><tr><td>Snapshot a project before running destructive automated tests</td><td>Project export</td></tr><tr><td>Back up a single model before editing</td><td><a href="export-and-import-a-model.html">Model export</a></td></tr><tr><td>Clone a project within the same tenant under a different slug</td><td>Project export in create mode</td></tr></tbody></table></div>
+<h2>Before you start</h2>
+<ul><li><strong>Export</strong> requires the Admin role on the project.</li><li><strong>Import</strong> requires Tenant Admin or System Admin privileges.</li><li>If you plan to include credentials in the export, choose a passphrase at least 8 characters long. You will need the same passphrase on import.</li></ul>
+<h2>Exporting a project</h2>
+<ol><li>In the Explorer sidebar, click the <strong>Import / Export</strong> button.</li><li>Switch to the <strong>Export</strong> tab.</li><li>Select the project you want to export from the dropdown.</li><li>Choose which sections to include under <strong>Included in export</strong>:</li></ol>
+<div class="table-wrapper"><table><thead><tr><th>Section</th><th>Default</th><th>What it contains</th></tr></thead><tbody><tr><td>Connections</td><td>On</td><td>Connection configs (host, port, database, etc.)</td></tr><tr><td>LLM Configurations</td><td>On</td><td>AI provider endpoints, model names, parameters</td></tr><tr><td>Agent Configuration</td><td>On</td><td>Agent persona, judge rubrics, model contexts, webhook URL</td></tr><tr><td>Cross-Model Recipes</td><td>On</td><td>Multi-model calculation recipes</td></tr><tr><td>Project Settings</td><td>On</td><td>All key-value project settings</td></tr><tr><td>Access Bindings</td><td>Off</td><td>User-role assignments for the project and its models</td></tr></tbody></table></div>
+<ol><li>Optionally check <strong>Include credentials (connections, API keys)</strong>. When enabled, two passphrase fields appear. Enter and confirm a passphrase (minimum 8 characters). Credentials are encrypted with this passphrase using PBKDF2 key derivation and Fernet symmetric encryption. Without the passphrase, the encrypted data is unreadable.</li><li>Click <strong>Export</strong>. The browser downloads a file named <code>{slug}-export-{date}.json</code>.</li></ol>
+<p>Models are always included regardless of section selection.</p>
+<h2>What is and is not in a project export</h2>
+<div class="table-wrapper"><table><thead><tr><th>In the export</th><th>Not in the export</th></tr></thead><tbody><tr><td>Project metadata (slug, display name, active flag)</td><td>Source data, target data, query results</td></tr><tr><td>All models with full snapshots and version history</td><td>Query logs, miss logs, alert history</td></tr><tr><td>Connection configurations</td><td>System-level and tenant-level settings</td></tr><tr><td>LLM provider configurations</td><td>Materialized aggregate data</td></tr><tr><td>Agent configuration, rubrics, model contexts</td><td>Agent conversation history</td></tr><tr><td>Cross-model recipes</td><td>Scheduler run history</td></tr><tr><td>Project settings</td><td>Pocket table data</td></tr><tr><td>Access bindings (optional)</td><td></td></tr><tr><td>Credentials (optional, encrypted)</td><td></td></tr></tbody></table></div>
+<h2>Importing a project</h2>
+<ol><li>In the Explorer sidebar, click the <strong>Import / Export</strong> button. The dialog opens on the <strong>Import</strong> tab by default.</li><li>Click <strong>Choose project export file (.json)</strong> and select the bundle.</li><li>The dialog shows a summary: project name, model count, included sections, and whether credentials are present.</li><li>If the bundle includes credentials, enter the passphrase used during export.</li><li>Choose an import mode:</li></ol>
+<h3>Create new project</h3>
+<p>Creates a fresh project. The slug defaults to the exported slug but can be overridden. If the slug already exists in the tenant, the import fails with an error asking you to choose a different slug or use replace mode.</p>
+<h3>Replace existing project</h3>
+<p>Deletes all existing content in the target project (models, connections, LLM configs, agent config, recipes, settings, access bindings) and restores everything from the bundle. The project slug must match an existing project. A confirmation dialog warns that this action cannot be undone.</p>
+<ol><li>Optionally override slugs:</li></ol>
+<ul><li><strong>Project slug</strong> and <strong>display name</strong>: change the target project identity.</li><li><strong>Model slug overrides</strong>: expand the model slug section to rename individual models on import.</li></ul>
+<ol><li><strong>Connection mapping</strong>: if the bundle includes connections, the dialog shows each exported connection with its type. Connections are resolved in this order:</li></ol>
+<ul><li>If credentials are included, each connection can be created new or mapped to an existing connection.</li><li>If credentials are not included, each connection must be mapped to an existing connection of matching type.</li><li>When creating new connections from a bundle with credentials, the credentials are decrypted with your passphrase and re-encrypted under the target tenant&#x27;s system key.</li></ul>
+<ol><li>Optionally check <strong>Override existing connections with exported credentials</strong> to update credentials on mapped connections.</li></ol>
+<ol><li><strong>Preview before applying (replace mode).</strong> Before committing a destructive replace, run a <strong>dry run</strong> first. A dry run does not touch the target project at all — it does not decrypt credentials, delete anything, or create anything, and it does not even need the export passphrase. Instead it returns a <em>plan</em> showing exactly how many objects in each section (models, connections, personas, and so on) would be deleted and recreated if you went ahead. Review the counts; if they look right, run the real import. This turns "replace wholesale" from a leap of faith into a checked step.</li><li>Click <strong>Import</strong>.</li></ol>
+<h2>After import</h2>
+<p>After a successful import, the dialog shows a summary with any warnings and required actions.</p>
+<h3>What resets on import</h3>
+<ul><li><strong>Aggregates</strong> are set to <strong>pending</strong>. They need a refresh cycle to build their physical tables.</li><li><strong>Pocket tables</strong> are set to <strong>stale</strong>. They rebuild on the next scheduled or manual refresh.</li><li><strong>Deployed version</strong> is cleared. Each imported model starts as an undeployed draft. You must explicitly deploy each model before it serves queries through BI tools or the query router.</li></ul>
+<h3>Why materialized objects reset</h3>
+<p>Aggregates and pockets are physical tables in the target database. The exported bundle contains their definitions (which measures, which dimensions, which refresh schedule) but not the data. Resetting their status tells the scheduler to rebuild them from scratch against the target&#x27;s actual data connections.</p>
+<h3>Post-import checklist</h3>
+<ol><li>Review any warnings shown in the import result.</li><li>For each model: open the Model Builder, verify the data source connections are correct, then Save and Deploy.</li><li>If the project uses the conversational agent, verify the LLM configuration and re-test the agent.</li><li>Run a manual refresh to trigger aggregate and pocket rebuilds.</li></ol>
+<h2>Tips</h2>
+<ul><li>Export bundles are stable JSON. You can commit them to version control for auditing or rollback.</li><li>Use create mode for environment promotion (dev to UAT) and replace mode for resetting a project to a known state.</li><li>When credentials are not included, you must have matching connections already set up in the target tenant before importing.</li><li>Access bindings reference users by identity (email). If a user does not exist in the target tenant, the binding is skipped with a warning.</li><li>The import runs in a single database transaction. If any step fails, everything rolls back cleanly.</li></ul>
+<h2>Related articles</h2>
+<ul><li><a href="export-and-import-a-model.html">Export and Import a Model</a></li><li><a href="save-and-version-a-model.html">Save and Version a Model</a></li><li><a href="deploy-a-model.html">Deploy a Model</a></li><li><a href="../admin/project-settings.html">Project Settings</a></li></ul>
+<nav class="page-nav"><a href="export-and-import-a-model.html" class="page-nav-btn prev">&larr; Export and Import a Model</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="import-from-dbt.html" class="page-nav-btn next">Import from dbt &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,1 @@
+Screenshot of the Model Builder Canvas showing three aggregate nodes. One node ("daily_revenue_by_country") is selected and highlighted. Its Drawer is open on the right showing the aggregate name, a status badge reading "Stale — last built 14 hours ago", and a "Refresh Now" button. The other two aggregate nodes in the Canvas show "Ready" status badges. Dimensions: 1280x800px.

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>View Diagnostics — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>View Diagnostics</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-04</span></div>
+    <h1>View Diagnostics</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/model-health-tab.png" alt="Model Builder — Health tab."></figure>
+<h2>What this covers</h2>
+<p>The Health tab in Model Builder surfaces errors and warnings about your model&#x27;s structure. This article explains how to open the Health tab, what the severity levels mean, and how to interpret and resolve each type of issue.</p>
+<h2>Opening the Health tab</h2>
+<ol><li>Open your project in Model Builder.</li><li>Click the <strong>Health</strong> tab at the top of the Toolbelt panel on the right side of the screen.</li><li>The diagnostic list loads immediately. It reflects the current saved state of the model — unsaved Canvas changes are not included.</li></ol>
+<p>The Health tab is read-only. You make corrections in the Canvas, Drawer, or source schema, then return to the Health tab to confirm the issue has cleared.</p>
+<h2>Severity levels</h2>
+<div class="table-wrapper"><table><thead><tr><th>Severity</th><th>Meaning</th><th>Effect on the model</th></tr></thead><tbody><tr><td><strong>Error</strong></td><td>A structural problem that prevents correct operation</td><td>Blocks aggregate build; affected aggregates cannot be built until resolved</td></tr><tr><td><strong>Warning</strong></td><td>A condition that degrades performance or correctness without fully blocking operation</td><td>Query routing may be impaired; aggregates may return stale or sub-optimal results</td></tr><tr><td><strong>Info</strong></td><td>An advisory observation with no immediate operational impact</td><td>No blocking effect; the model continues to function normally</td></tr></tbody></table></div>
+<h2>Navigating to an affected object</h2>
+<p>Click any row in the diagnostic list. The Canvas scrolls to and highlights the affected table, join, dimension, or measure. The Drawer for that object opens automatically so you can inspect and edit its configuration.</p>
+<h2>Diagnostic reference</h2>
+<div class="table-wrapper"><table><thead><tr><th>Issue</th><th>Severity</th><th>Cause</th><th>Resolution</th></tr></thead><tbody><tr><td>Join column missing</td><td>Error</td><td>A column used in a join definition no longer exists in the source schema, typically because the source table was altered.</td><td>Open the join in the Drawer. Update the join to use a column that still exists, or remove the join if it is no longer needed.</td></tr><tr><td>Measure on non-numeric column</td><td>Error</td><td>A measure (sum, average, etc.) targets a column with a text or boolean data type.</td><td>Open the measure in the Drawer. Change the source column to a numeric column, or change the measure type to Count if counting rows is the intent.</td></tr><tr><td>Fact table missing</td><td>Error</td><td>No table in the model is designated as the fact table.</td><td>Open the relevant table&#x27;s Drawer and change its Type to <strong>Fact</strong>.</td></tr><tr><td>Schema drift detected</td><td>Warning</td><td>The source table&#x27;s column list has changed since the model was last synced.</td><td>Run a schema sync from the table Drawer or trigger a workspace-wide sync from workspace settings.</td></tr><tr><td>Aggregate refresh overdue</td><td>Warning</td><td>An aggregate has not been refreshed within its expected window.</td><td>Open the Scheduler panel, check the aggregate&#x27;s last-refresh status, and re-run the refresh manually if needed.</td></tr><tr><td>Unused dimension</td><td>Info</td><td>A dimension is defined in the model but has never appeared in a query.</td><td>No immediate action required. Consider removing it to keep the model clean if it is not expected to be used.</td></tr></tbody></table></div>
+<h2>Resolving errors before building aggregates</h2>
+<p>Any Error-severity diagnostic blocks the aggregate build process for the affected objects. Resolve all Errors first, save the model, then proceed to build or schedule aggregates.</p>
+<h2>Route trace</h2>
+<p>For a query that has already run, the Diagnostics panel can show <strong>why</strong> it took the route it did. Open the query's detail and click <strong>Show route trace</strong> to expand the stored decision trail — how the query was parsed and bound, which aggregates or pocket tables were considered, why each was accepted or skipped, and which engine finally served the result. Click <strong>Hide route trace</strong> to collapse it.</p>
+<p>This is the fastest way to answer "why was this query slow?" or "why did it hit the source instead of my aggregate?". The trace usually points straight at the cause: an aggregate that was missing, stale, or simply did not match the query's shape. If a query has no stored trace yet, the panel says <strong>"No stored trace for this query"</strong> — run the query again to capture one.</p>
+<h2>Source statistics (BigQuery and Spark)</h2>
+<p>Tessallite collects column-level statistics from your data sources to inform aggregate design and model health. The statistics collector works differently depending on the source type:</p>
+<div class="table-wrapper"><table><thead><tr><th>Source type</th><th>Statistics method</th><th>Precision</th></tr></thead><tbody><tr><td>PostgreSQL</td><td><code>pg_stats</code> system catalog (no extra query)</td><td>Exact (from ANALYZE)</td></tr><tr><td>BigQuery</td><td><code>INFORMATION_SCHEMA.COLUMN_FIELD_PATHS</code> + <code>APPROX_COUNT_DISTINCT</code></td><td>Approximate cardinality (HyperLogLog)</td></tr><tr><td>Spark / Hive</td><td><code>DESCRIBE EXTENDED</code> + <code>ANALYZE TABLE COMPUTE STATISTICS</code></td><td>Exact (from COMPUTE STATISTICS)</td></tr></tbody></table></div>
+<p><strong>What statistics are collected:</strong></p>
+<ul><li>Row count per table</li><li>Cardinality (distinct value count) per column</li><li>NULL percentage per column</li><li>Min/max values for numeric and date columns</li></ul>
+<p><strong>How to trigger a refresh:</strong> Statistics are collected automatically during schema sync. For non-PostgreSQL sources, you can also trigger a manual refresh from the table&#x27;s Drawer by clicking <strong>Refresh Statistics</strong>.</p>
+<p><strong>Precision differences:</strong> BigQuery uses <code>APPROX_COUNT_DISTINCT</code>, which is based on HyperLogLog and may differ from the exact count by up to 1-2% for high-cardinality columns. PostgreSQL and Spark provide exact counts. The Diagnostics panel displays an &quot;(approx)&quot; label next to BigQuery cardinality values.</p>
+<h2>Related</h2>
+<ul><li><a href="view-model-lineage.html">View Model Lineage</a></li><li><a href="use-the-ai-optimiser.html">Use the AI Optimiser</a></li><li><a href="../concepts/model-health.html">Model Health</a></li></ul>
+<nav class="page-nav"><a href="view-model-lineage.html" class="page-nav-btn prev">&larr; View Model Lineage</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="save-and-version-a-model.html" class="page-nav-btn next">Save and Version a Model &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

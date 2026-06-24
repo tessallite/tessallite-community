@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Manage Aggregate Schedules — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Manage Aggregate Schedules</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Manage Aggregate Schedules</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/scheduler-panel.png" alt="Scheduler panel listing aggregate refresh jobs."></figure>
+<h2>What this covers</h2>
+<p>Aggregate schedules control when the Scheduler service refreshes each aggregate. This article explains the two places where schedules are managed, how to write and use cron expressions, how to pause a schedule, and what the Stale status means.</p>
+<h2>Two places to manage schedules</h2>
+<h3>Option 1: Canvas → Drawer</h3>
+<ol><li>In Model Builder, locate the aggregate in the Canvas.</li><li>Click the aggregate to select it.</li><li>In the Drawer, find the <strong>Refresh Schedule</strong> field.</li><li>Enter a cron expression or select a preset.</li><li>Click <strong>Save</strong>. The new schedule takes effect at the next scheduled run time.</li></ol>
+<h3>Option 2: Scheduler panel</h3>
+<ol><li>From the workspace sidebar, click <strong>Scheduler</strong>.</li><li>The Scheduler panel opens, showing all aggregates across all models in the workspace.</li><li>Locate the aggregate by model or aggregate name, then click its schedule field to edit it inline.</li><li>Click <strong>Save</strong>.</li></ol>
+<h2>Scheduler panel columns</h2>
+<div class="table-wrapper"><table><thead><tr><th>Column</th><th>Description</th></tr></thead><tbody><tr><td>Model</td><td>The model this aggregate belongs to.</td></tr><tr><td>Aggregate name</td><td>The name assigned to the aggregate in Model Builder.</td></tr><tr><td>Last refreshed</td><td>Timestamp of the most recent completed refresh run.</td></tr><tr><td>Next scheduled</td><td>When the Scheduler will next attempt a refresh.</td></tr><tr><td>Status</td><td>Ready, Building, Stale, or Paused.</td></tr><tr><td>Actions</td><td>Run now, Pause / Resume, Edit schedule.</td></tr></tbody></table></div>
+<h2>Cron expression reference</h2>
+<p>Tessallite uses standard five-field cron syntax: <code>minute hour day-of-month month day-of-week</code>.</p>
+<div class="table-wrapper"><table><thead><tr><th>Preset</th><th>Cron expression</th><th>Meaning</th></tr></thead><tbody><tr><td>Hourly</td><td><code>0 * * * *</code></td><td>Runs at the top of every hour.</td></tr><tr><td>Daily at 02:00</td><td><code>0 2 * * *</code></td><td>Runs once per day at 2:00 AM.</td></tr><tr><td>Weekly on Sunday 03:00</td><td><code>0 3 * * 0</code></td><td>Runs once per week, Sunday at 3:00 AM.</td></tr><tr><td>Every 15 minutes</td><td><code>*/15 * * * *</code></td><td>Runs at :00, :15, :30, and :45 past every hour.</td></tr></tbody></table></div>
+<p>All times are evaluated in UTC unless the server&#x27;s <code>SCHEDULER_TZ</code> environment variable is set to an IANA timezone identifier.</p>
+<h2>Pausing a schedule</h2>
+<p>In the Scheduler panel, click the <strong>Active</strong> toggle to switch it off. The aggregate retains its data and continues to serve queries, but the Scheduler will not attempt any further refreshes until the toggle is switched back on. A paused aggregate displays status <strong>Paused</strong> in the panel.</p>
+<h2>Running a refresh immediately</h2>
+<p>In the Scheduler panel, click <strong>Run now</strong> in the Actions column. The aggregate&#x27;s status changes to <strong>Building</strong> for the duration of the run. This does not affect the regular schedule.</p>
+<h2>Viewing refresh history</h2>
+<ol><li>In the Scheduler panel, click the aggregate name.</li><li>A history drawer opens showing the last 10 refresh runs.</li><li>Each entry shows start time, duration, and outcome (Success or Failed).</li><li>For failed runs, click <strong>View log</strong> to see the full Scheduler log for that run.</li></ol>
+<h2>Stale status</h2>
+<p>An aggregate is marked <strong>Stale</strong> when its last successful refresh completed more than twice the schedule interval ago. Stale aggregates continue to serve queries using their existing data, but the data may be older than expected.</p>
+<h2>Related</h2>
+<ul><li><a href="use-the-ai-optimiser.html">Use the AI Optimiser</a></li><li><a href="configure-aggregates.html">Configure Aggregates</a></li><li><a href="run-a-refresh.html">Run a Refresh</a></li><li><a href="../admin/workspace-settings.html">Workspace Settings</a></li></ul>
+<nav class="page-nav"><a href="run-a-refresh.html" class="page-nav-btn prev">&larr; Run a Refresh</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="scheduler-dependencies.html" class="page-nav-btn next">Scheduler Dependencies &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

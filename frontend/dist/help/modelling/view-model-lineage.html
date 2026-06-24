@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>View Model Lineage — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>View Model Lineage</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>View Model Lineage</h1>
+<figure class="illustration"><img class="illustration" src="../assets/illustrations/model-lineage.svg" alt="Model lineage diagram: source dimension tables on the left connect into the central fact table via join edges; the fact table connects to aggregate nodes on the right showing their grain and measures."></figure>
+<h2>What this covers</h2>
+<p>The Lineage view displays a read-only directed graph showing how data flows through the model — from source tables into the fact table, and from the fact table into each aggregate. This article explains how to open the Lineage view, what each node and edge type represents, and what you can learn from the graph.</p>
+<h2>How to open the Lineage view</h2>
+<ol><li>Open the model in Model Builder.</li><li>In the Toolbelt (left sidebar), click <strong>Lineage</strong>. Alternatively, select the <strong>Lineage</strong> tab at the top of the Model Builder canvas area.</li><li>The lineage graph renders automatically. It reflects the current saved state of the model. Unsaved changes in the Canvas are not shown.</li></ol>
+<blockquote><strong>Note:</strong> The lineage graph is regenerated each time you open the view. On large models with many source tables and aggregates, rendering may take a few seconds.</blockquote>
+<h2>Node types</h2>
+<div class="table-wrapper"><table><thead><tr><th>Node type</th><th>Visual style</th><th>What it represents</th></tr></thead><tbody><tr><td>Source table</td><td>Rectangle with a table icon</td><td>A dim_aggregate or dim_detail table joined into the model. Shown with the schema-qualified table name.</td></tr><tr><td>Fact table</td><td>Rectangle, highlighted with a distinct fill colour</td><td>The central fact table of the model. There is exactly one per model.</td></tr><tr><td>Aggregate</td><td>Rounded rectangle with a dashed border</td><td>A pre-aggregated summary table, either manually configured or auto-created by the Optimizer. The grain (selected dimensions) is listed inside the node.</td></tr></tbody></table></div>
+<h2>Edge types</h2>
+<div class="table-wrapper"><table><thead><tr><th>Edge type</th><th>Direction</th><th>What it represents</th></tr></thead><tbody><tr><td>Join edge</td><td>Source table → Fact table</td><td>A join defined in the model between a dimension table and the fact table. Labelled with the join key columns.</td></tr><tr><td>Aggregate edge</td><td>Fact table → Aggregate</td><td>The definition of an aggregate: which dimensions (grain) and which measures the aggregate covers. Hovering over the edge shows the full dimension and measure list.</td></tr></tbody></table></div>
+<h2>What lineage is useful for</h2>
+<ul><li><strong>Understanding aggregate coverage:</strong> Identify which aggregates draw from which source tables. If a source table is being considered for a schema change, the lineage graph shows which aggregates will be affected and need to be rebuilt.</li><li><strong>Identifying unused aggregates:</strong> Aggregates with no downstream query patterns appear in the graph with no outbound edges. These are candidates for deletion to reduce Scheduler load.</li><li><strong>Planning schema changes:</strong> Before renaming or dropping a source column, check the lineage view to see which dimensions or measures reference that column, and therefore which aggregates depend on it.</li><li><strong>Onboarding:</strong> A new team member can read the lineage graph to understand the full model structure without having to click through each aggregate individually.</li></ul>
+<h2>Limitations</h2>
+<ul><li>The lineage view is read-only. All changes to the model are made in the Canvas view.</li><li>The graph reflects only the saved model state. Unsaved Canvas changes do not appear.</li><li>Query patterns (which BI queries matched which aggregates) are visible in the Optimizer panel, not in the lineage view.</li><li>Auto-created aggregates from the Optimizer appear in the lineage graph alongside manually configured ones. There is no visual distinction in the lineage view between the two origins; check the Aggregates list in the Toolbelt to see the origin label.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="run-a-refresh.html">Run a Refresh</a></li><li><a href="view-diagnostics.html">View Diagnostics</a></li><li><a href="use-the-ai-optimiser.html">Use the AI Optimiser</a></li></ul>
+<nav class="page-nav"><a href="schema-changes.html" class="page-nav-btn prev">&larr; Schema Changes</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="view-diagnostics.html" class="page-nav-btn next">View Diagnostics &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

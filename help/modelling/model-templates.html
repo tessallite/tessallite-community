@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Model Templates — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Model Templates</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-24</span></div>
+<h1>Model Templates</h1>
+
+<h2>What this covers</h2>
+<p>Model templates are pre-built starter kits that give you a head start when creating a new model. Instead of defining every dimension, measure, hierarchy, and join from scratch, you pick a template and get a working structure imported automatically.</p>
+
+<h2>Available templates</h2>
+
+<h3>E-Commerce (Revenue Analytics)</h3>
+<p>A star schema for online retail: orders fact table with dimensions for product, customer, geography, and date. Includes measures for revenue, order count, average order value, and return rate. Hierarchies for product category and geography.</p>
+
+<h3>SaaS Metrics (ARR/MRR/Churn)</h3>
+<p>Subscription-business model with a subscriptions fact table and dimensions for plan, customer segment, and cohort. Includes measures for MRR, ARR, churn rate, expansion revenue, and net revenue retention. Date hierarchies for monthly and annual reporting.</p>
+
+<h3>Financial Reporting (GL/PnL/Balance Sheet)</h3>
+<p>General ledger model with journal entries as the fact table and dimensions for account, cost centre, department, and entity. Includes measures for debit, credit, net amount, and balance. Account hierarchy for chart of accounts roll-up.</p>
+
+<h2>How to use a template</h2>
+<ol>
+<li>Open the <strong>Workspace Explorer</strong>.</li>
+<li>Click <strong>Create Model</strong> on any project card.</li>
+<li>In the Create Model dialog, click <strong>Choose a template</strong> to open the template gallery.</li>
+<li>Browse or search templates by category. Each card shows the template name, category, and a preview of what entities will be imported.</li>
+<li>Click a template to select it, then click <strong>Create</strong>.</li>
+<li>The model is created first, then the template structure is imported automatically.</li>
+</ol>
+<p>If the template import fails for any reason, the empty model is still created. You can manually import the template later using <strong>Project menu &gt; Import</strong>.</p>
+
+<h2>What gets imported</h2>
+<p>Templates import the same structure as a model export bundle:</p>
+<ul>
+<li>Dimensions (with display names, data types, and folders)</li>
+<li>Measures (with aggregation types and format strings)</li>
+<li>Hierarchies (with levels and time units)</li>
+<li>Joins (relationships between fact and dimension tables)</li>
+<li>Personas (if the template includes audience definitions)</li>
+</ul>
+<p>Templates do <strong>not</strong> import connections or data. You still need to connect your own data source and map the template&rsquo;s table references to your actual tables.</p>
+
+<h2>Related</h2>
+<ul>
+<li><a href="create-a-project.html">Create a Project</a></li>
+<li><a href="export-and-import-a-model.html">Export and Import a Model</a></li>
+<li><a href="import-from-dbt.html">Import from dbt</a></li>
+</ul>
+<nav class="page-nav"><a href="import-from-dbt.html" class="page-nav-btn prev">&larr; Import from dbt</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="model-translations.html" class="page-nav-btn next">Model Translations &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

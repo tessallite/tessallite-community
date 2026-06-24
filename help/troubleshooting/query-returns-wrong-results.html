@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Query Returns Wrong Results — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Troubleshooting</span> / <span>Query Returns Wrong Results</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Query Returns Wrong Results</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/health-tab-wrong-results.png" alt="Model Health tab — warning + error rows that explain wrong query results."></figure>
+<h2>What this covers</h2>
+<p>Diagnosing incorrect values returned by Tessallite queries. If values are wrong, the cause is almost always in the model definition, data freshness, or the underlying source data — not in the routing layer.</p>
+<h2>Step 1 — Check the measure definition</h2>
+<p>Open <strong>Model Builder</strong> and navigate to the measure returning unexpected values.</p>
+<ul><li>Verify the source column is correct. A column rename in the source table can produce wrong results if schema drift has not been detected.</li><li>Verify the aggregation type: SUM, COUNT, COUNT DISTINCT, AVG, MIN, MAX.</li><li>Check whether any filters are applied to the measure definition.</li></ul>
+<h2>Step 2 — Check for grain mismatch</h2>
+<p>If a query asks for totals and an aggregate exists at a finer grain, Tessallite re-aggregates the pre-built summary. This is correct for additive measures but produces wrong results for COUNT DISTINCT.</p>
+<p>If the query uses COUNT DISTINCT and returns a value that is too high, no exact-grain aggregate exists for that query pattern. Ask your Modeller to build an aggregate at the exact grain required, or reformulate the query to match an existing aggregate grain.</p>
+<h2>Step 3 — Check for stale data</h2>
+<p>In Model Builder, check the status column for each aggregate:</p>
+<div class="table-wrapper"><table><thead><tr><th>Status</th><th>Meaning</th></tr></thead><tbody><tr><td>Ready</td><td>Aggregate is current</td></tr><tr><td>Stale</td><td>Source has changed since last build — run a refresh</td></tr><tr><td>Building</td><td>Refresh in progress — wait for completion</td></tr><tr><td>Error</td><td>Last build failed — see <a href="aggregates-not-building.html">Aggregates Not Building</a></td></tr></tbody></table></div>
+<h2>Step 4 — Check for schema drift</h2>
+<ol><li>Open <strong>Model Builder</strong>.</li><li>Select the project.</li><li>Go to the <strong>Health</strong> tab.</li><li>Look for &quot;Schema drift detected&quot; warnings.</li><li>Update the model to reference the correct column, re-publish, and rebuild aggregates.</li></ol>
+<h2>Step 5 — Compare with a direct query</h2>
+<p>Run the equivalent query directly against the source database (bypassing Tessallite). If the direct query also returns wrong values, the problem is in the source data. If the direct query returns correct values, return to Steps 1–4.</p>
+<h2>A query now returns an error where it used to "work"</h2>
+<p>Tessallite was deliberately made stricter, so a couple of cases that used to be <em>guessed</em> silently now fail with a clear error instead. If a query that ran before now errors, this is usually why — and the error is the safer outcome:</p>
+<ul><li><strong>An unrecognised filter operator is rejected</strong> instead of being quietly treated as equals (<code>=</code>). Previously a typo or an unsupported operator could slip through as an equality match and return the wrong rows; now it stops with an error. Check the operator on the filter and use one the model supports.</li><li><strong>Sorting by a column the query does not actually select is rejected</strong> instead of being matched to a guessed table. Previously an <code>ORDER BY</code> on an unknown column could be silently bound to the wrong column; now it errors. Add the column to the query, or sort by one that is already present.</li></ul>
+<p>A clear error is better than a result that <em>looks</em> right but was built on a guess. Fix the operator or the sort column and re-run — you are not losing a feature, you are being protected from a silently wrong answer.</p>
+<h2>Related</h2>
+<ul><li><a href="../concepts/query-routing.html">Query Routing</a></li><li><a href="aggregates-not-building.html">Aggregates Not Building</a></li><li><a href="common-errors.html">Common Errors</a></li><li><a href="excel-connection-problems.html">Excel Connection Problems</a></li></ul>
+<nav class="page-nav"><a href="excel-connection-problems.html" class="page-nav-btn prev">&larr; Excel Connection Problems</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="field-compatibility-warnings.html" class="page-nav-btn next">Field Compatibility Warnings &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

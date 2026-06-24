@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Model Configuration — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Model Configuration</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-04-27</span></div>
+    <h1>Model Configuration</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/model-configuration-tab.png" alt="Model Builder — Settings panel, Configuration sub-tab."></figure>
+<h2>What this covers</h2>
+<p>The Configuration sub-tab inside the Model Builder Settings panel lets you override per-model knobs that only make sense for an individual model. It is laid out as five focused tabs — Aggregates, AI Optimizer, Pocket, Predictive, Limits — so a modeller can tune the parts of the cube that matter without scanning a wall of unrelated settings.</p>
+<h2>Where to find it</h2>
+<ol><li>Open the Model Builder for the model you want to configure.</li><li>Click the <strong>Settings</strong> icon in the toolbelt (right side).</li><li>Switch to the <strong>Configuration</strong> sub-tab. It is the last tab in the Settings panel and is only available while a model is open.</li></ol>
+<h2>How overrides work</h2>
+<p>Every row is a pure override. The placeholder shows the value currently inherited from the project level, which itself may fall back to system defaults. Save a value to override; leave the field blank and click <strong>Save</strong>, or click <strong>Clear</strong>, to remove the override and inherit again. The resolver walks <strong>model → project → system → registry default</strong> and returns the first non-null value, so a model override only applies to that single model.</p>
+<h2>The five tabs</h2>
+<h3>Aggregates</h3>
+<p>Per-model defaults for the materialised aggregate pipeline:</p>
+<ul><li><strong>Default aggregate cron</strong> — applied to a new aggregate on this model when no explicit schedule is set.</li><li><strong>Refresh window and timeout</strong> — bounds the scheduler&#x27;s per-aggregate run.</li></ul>
+<p>Override these when a single model has unusually heavy aggregates that need a slower cadence than the project&#x27;s other models.</p>
+<h3>AI Optimizer</h3>
+<p>Knobs for the optimiser sweep that proposes new aggregates on this model:</p>
+<ul><li><strong>Cron</strong> — when the optimiser runs.</li><li><strong>Lookback hours</strong> — how far back the optimiser reads telemetry to pick candidates.</li><li><strong>Max creates per run</strong> and <strong>auto-create cap per sweep</strong> — upper bounds on what the optimiser can materialise unattended.</li><li><strong>Confidence threshold</strong> — recommendations below this are dropped.</li></ul>
+<p>Override these when a model has a different signal density than the project default — high-traffic models often want a tighter cron and a higher cap; low-traffic models can run with a longer lookback.</p>
+<h3>Pocket</h3>
+<p>Pocket-table behaviour for this model:</p>
+<ul><li>Tenant-scoping defaults, refresh cadence, and the allowed refresh policies.</li></ul>
+<p>Override only when the model has a tenant-shape that differs from the project&#x27;s other models.</p>
+<h3>Predictive</h3>
+<p>Predictive-aggregate generation for this model — promotion thresholds, retention horizon, and which models seed candidates. Override per-model when the model&#x27;s measure set or query mix justifies a different policy.</p>
+<h3>Limits</h3>
+<p>Per-model ceilings (aggregate count, row count, retention). All limits default to &quot;no cap&quot;; leaving the field blank means the system enforces no model-specific limit. Override when one model needs a stricter quota for cost or compliance reasons.</p>
+<h2>Inheritance preview</h2>
+<p>Each row&#x27;s caption reads <em>Inherits: <code>&lt;value&gt;</code></em> and shows the value the resolver would return if the override were cleared. When you save a value, the row gets an &quot;Overridden&quot; chip and the input now drives the resolver. Clearing returns the row to the inherited state immediately — there is no soft-delete, no draft state.</p>
+<h2>Best practices</h2>
+<ul><li><strong>Override late.</strong> Start with project-level defaults. Only push a setting to the model level when telemetry shows the model behaves differently from its peers.</li><li><strong>Document why.</strong> When an override survives a code review, leave a one-line note in the model&#x27;s description so the next modeller does not &quot;tidy it up&quot; to match the project default.</li><li><strong>Watch for drift.</strong> If three or four models in the same project carry the same override, lift it to the project level and clear the per-model rows.</li></ul>
+<h2>Common pitfalls</h2>
+<ul><li><strong>Treating limits as recommendations.</strong> A blank limit means <em>no cap</em>, not &quot;use the system default&quot;. If you want a default cap, set it at the project or system level.</li><li><strong>Setting an aggregate cron that conflicts with the optimiser.</strong> A model whose <code>aggregate.default_cron</code> runs at the same minute as <code>ai_scheduler.cron</code> can starve the scheduler of capacity. Stagger them.</li><li><strong>Tuning the confidence threshold without a baseline.</strong> The threshold is meaningful only against a stable telemetry base. If you have just published the model, leave it inherited until you have a week of usage data.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="project-settings.html">Project settings</a></li><li><a href="../modelling/manage-aggregate-schedules.html">Manage aggregate schedules</a></li><li><a href="../modelling/use-the-ai-optimiser.html">Use the AI optimiser</a></li></ul>
+<nav class="page-nav"><a href="project-settings.html" class="page-nav-btn prev">&larr; Project Settings</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="audit-log.html" class="page-nav-btn next">Audit Log &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 480" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#006C35"/>
+    </marker>
+  </defs>
+
+  <rect width="800" height="480" fill="#F2F7F4"/>
+
+  <text x="400" y="36" text-anchor="middle" font-size="20" font-weight="700" fill="#333333">Setting resolution — precedence chain</text>
+  <text x="400" y="60" text-anchor="middle" font-size="13" fill="#555555">A read returns the first non-null value walking down. Writes happen at exactly one level.</text>
+
+  <!-- Five stacked boxes -->
+  <g>
+    <rect x="220" y="90"  width="360" height="50" rx="6" fill="#006C35" stroke="#006C35"/>
+    <text x="400" y="115" text-anchor="middle" font-size="15" font-weight="600" fill="#FFFFFF">Model setting</text>
+    <text x="400" y="132" text-anchor="middle" font-size="11" fill="#FFFFFF">model_settings — per-model override (highest precedence)</text>
+
+    <rect x="220" y="160" width="360" height="50" rx="6" fill="#2E8B57" stroke="#006C35"/>
+    <text x="400" y="185" text-anchor="middle" font-size="15" font-weight="600" fill="#FFFFFF">Project setting</text>
+    <text x="400" y="202" text-anchor="middle" font-size="11" fill="#FFFFFF">project_settings — per-project override</text>
+
+    <rect x="220" y="230" width="360" height="50" rx="6" fill="#5BAA7B" stroke="#006C35"/>
+    <text x="400" y="255" text-anchor="middle" font-size="15" font-weight="600" fill="#FFFFFF">Tenant setting</text>
+    <text x="400" y="272" text-anchor="middle" font-size="11" fill="#FFFFFF">tenant_settings — per-tenant default</text>
+
+    <rect x="220" y="300" width="360" height="50" rx="6" fill="#A8D5BA" stroke="#006C35"/>
+    <text x="400" y="325" text-anchor="middle" font-size="15" font-weight="600" fill="#333333">System setting</text>
+    <text x="400" y="342" text-anchor="middle" font-size="11" fill="#333333">system_settings — platform-wide default</text>
+
+    <rect x="220" y="370" width="360" height="50" rx="6" fill="#FFFFFF" stroke="#B8860B" stroke-dasharray="4 3"/>
+    <text x="400" y="395" text-anchor="middle" font-size="15" font-weight="600" fill="#B8860B">Registry default</text>
+    <text x="400" y="412" text-anchor="middle" font-size="11" fill="#B8860B">shared/config/registry.py — final fallback</text>
+  </g>
+
+  <!-- Arrows -->
+  <path d="M180,115 L180,395" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrowhead)"/>
+  <text x="100" y="240" text-anchor="middle" font-size="13" font-weight="600" fill="#006C35">read</text>
+  <text x="100" y="260" text-anchor="middle" font-size="11" fill="#555555">walks down</text>
+  <text x="100" y="278" text-anchor="middle" font-size="11" fill="#555555">until non-null</text>
+
+  <path d="M620,395 L620,115" stroke="#B8860B" stroke-width="2" fill="none" stroke-dasharray="6 3"/>
+  <circle cx="620" cy="395" r="4" fill="#B8860B"/>
+  <polygon points="620,108 615,118 625,118" fill="#B8860B"/>
+  <text x="700" y="240" text-anchor="middle" font-size="13" font-weight="600" fill="#B8860B">fallback</text>
+  <text x="700" y="260" text-anchor="middle" font-size="11" fill="#555555">if every</text>
+  <text x="700" y="278" text-anchor="middle" font-size="11" fill="#555555">level is unset</text>
+
+  <!-- Legend -->
+  <g transform="translate(220,448)">
+    <rect width="14" height="14" fill="#006C35"/>
+    <text x="22" y="12" font-size="11" fill="#333333">Editable per scope</text>
+    <rect x="180" y="0" width="14" height="14" fill="#FFFFFF" stroke="#B8860B" stroke-dasharray="3 2"/>
+    <text x="202" y="12" font-size="11" fill="#333333">Compile-time default</text>
+  </g>
+</svg>

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Named Lists (Named Sets) — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Named Lists</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-06-14</span></div>
+    <h1>Named Lists (Named Sets)</h1>
+<h2>What this covers</h2>
+<p>A named list (also called a named set) is a reusable collection of dimension members stored within a semantic model. Named lists let modellers pre-define member selections &mdash; top customers, active product categories, regional groupings &mdash; that BI tool users can apply as filters, row sets, or column sets without rebuilding the selection each time. This article explains the different types of named lists, how to create and preview them, and how they surface in BI tools and the Excel plugin.</p>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/named-sets-panel.png" alt="The Named Sets panel for the acme demo ModelX. Four named lists are listed as cards, each with its type chip (Dynamic for the Top/Bottom-N sets, Filtered for the rule-based one), a Session scope chip, Edit and Delete actions, a plain-language description, and a display folder. The sets are Top 5 and Bottom 5 Countries by Revenue (Geography), Top 10 Channels by Revenue (Channels), and High-Revenue Account Types (Accounts). Buttons at the top offer From template and Add set."></figure>
+<p>Each card shows the list's type and scope at a glance, a description for the people who will use it, and the display folder it is grouped under. A <strong>Dynamic</strong> list (Top/Bottom-N) re-ranks itself on every query as the data changes; a <strong>Filtered</strong> list re-evaluates its rule; a <strong>Fixed</strong> list always returns the exact members you chose.</p>
+<h2>Types of named lists</h2>
+<div class="table-wrapper"><table><thead><tr><th>Type</th><th>Description</th><th>When to use</th></tr></thead><tbody><tr><td><strong>Fixed members</strong></td><td>A hand-picked list of specific dimension members.</td><td>When the members are stable and known in advance &mdash; e.g., a list of strategic accounts.</td></tr><tr><td><strong>Top N / Bottom N</strong></td><td>A dynamic list ranking members by a measure and returning the top or bottom N.</td><td>When the list should update automatically as data changes &mdash; e.g., top 10 products by revenue.</td></tr><tr><td><strong>Filtered</strong></td><td>Members matching one or more conditions on dimension attributes.</td><td>When membership is defined by business rules &mdash; e.g., customers in a specific region with orders above a threshold.</td></tr><tr><td><strong>Advanced MDX</strong></td><td>A raw MDX set expression.</td><td>When the other builder types cannot express the required logic. Preview is not available for raw MDX; deploy the model and use a BI tool to see results.</td></tr></tbody></table></div>
+<h2>Before you start</h2>
+<ul><li>You must have a model open in Model Builder with at least one dimension defined.</li><li>For Top N lists, the ranking measure must already exist in the model.</li><li>For Filtered lists, the dimension must have queryable attributes.</li></ul>
+<h2>Creating a named list</h2>
+<ol><li>Open a model in Model Builder and click <strong>Named Lists</strong> in the Toolbelt (left sidebar).</li><li>Click <strong>Add Named List</strong>. The Drawer opens with a blank definition form.</li><li>Enter a <strong>Name</strong> (internal identifier, must be unique within the model).</li><li>Optionally enter a <strong>Display name</strong> (label shown in BI tools) and <strong>Description</strong>.</li><li>Select the <strong>List type</strong> &mdash; Fixed, Top N, Filtered, or Advanced MDX.</li><li>Configure the type-specific fields:
+  <ul><li><strong>Fixed:</strong> select the dimension, then pick individual members.</li><li><strong>Top N:</strong> select the dimension, ranking measure, count, and direction (top or bottom).</li><li><strong>Filtered:</strong> select the dimension, then add filter conditions with logic (AND/OR).</li><li><strong>Advanced MDX:</strong> enter a raw MDX set expression.</li></ul></li><li>Click <strong>Preview</strong> to see the resolved members (not available for Advanced MDX).</li><li>Click <strong>Save</strong>. The named list is available to BI tools after model deployment.</li></ol>
+<h2>Previewing members</h2>
+<p>Click the preview icon on any named list card to see the resolved members inline. The preview runs a query through the Query Router and returns up to 100 members. For Advanced MDX expressions, preview is not supported &mdash; deploy the model and query via Excel or Power BI using an XMLA connection to see results.</p>
+<h2>Using named lists in BI tools</h2>
+<p>After model deployment, named lists appear as named sets in the XMLA metadata catalogue. In Excel, use <strong>CUBESET</strong> and <strong>CUBERANKEDMEMBER</strong> formulas to reference them. The Tessallite Excel plugin provides one-click insertion of these formulas from the Report Builder panel.</p>
+<h2>Certification and governance</h2>
+<p>Named lists support the same certification lifecycle as other model entities:</p>
+<div class="table-wrapper"><table><thead><tr><th>Status</th><th>Meaning</th></tr></thead><tbody><tr><td><strong>Draft</strong></td><td>Work in progress; visible to modellers only.</td></tr><tr><td><strong>Shared</strong></td><td>Available to all users but not yet certified.</td></tr><tr><td><strong>Certified</strong></td><td>Reviewed and approved for production use.</td></tr><tr><td><strong>Deprecated</strong></td><td>Scheduled for removal; a replacement may be specified.</td></tr></tbody></table></div>
+<p>Version history tracks changes to the definition, and impact analysis shows where each named list is used across workbooks and dashboards.</p>
+<h2>Related</h2>
+<ul><li><a href="define-dimensions.html">Define Dimensions</a></li><li><a href="define-measures.html">Define Measures</a></li><li><a href="impact-analysis.html">Impact Analysis</a></li><li><a href="kpis.html">KPIs</a></li></ul>
+<nav class="page-nav"><a href="impact-analysis.html" class="page-nav-btn prev">&larr; Impact Analysis</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="kpis.html" class="page-nav-btn next">KPIs &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

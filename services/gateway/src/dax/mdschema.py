@@ -1,0 +1,1820 @@
+"""
+Expert Directive Compliant MDSCHEMA rowset builder.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Any
+
+from shared.config.bootstrap import system_snapshot_get
+from shared.schemas.measure_formats import format_token_to_mdx
+# Import branding constants from constants for Expert Directive 2.6
+from src.dax.constants import PROVIDER_VERSION, SERVER_NAME
+from src.dax.member_uname import (
+    ancestor_key_path_from_parent_chain,
+    member_filter_matches,
+    parse_member_uname,
+    qualify_member_uname,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _meta_created() -> str:
+    return str(system_snapshot_get("xmla.metadata_created_at"))
+
+
+def _meta_modified() -> str:
+    return str(system_snapshot_get("xmla.metadata_modified_at"))
+
+
+def _datasource_url_fallback() -> str:
+    return str(system_snapshot_get("xmla.datasource_url_fallback"))
+
+_CFG_PATH = Path(__file__).parent / "mdschema_config.json"
+_cfg: dict = json.loads(_CFG_PATH.read_text())
+
+
+_ROWSETS = _cfg["rowsets"]
+_AGG_CODES: dict[str, int] = _cfg["measure_aggregator_codes"]
+_TYPE_CODES: dict[str, int] = _cfg["data_type_codes"]
+_SCHEMA_GUIDS: dict[str, str] = _cfg.get("schema_guids", {})
+
+_ROWSET_NS = "urn:schemas-microsoft-com:xml-analysis:rowset"
+_SQL_NS    = "urn:schemas-microsoft-com:xml-sql"
+
+def build_discover_response(
+    request_type: str,
+    catalog_name: str,
+    model_id: str,
+    measures: list[dict[str, Any]],
+    dimensions: list[dict[str, Any]],
+    endpoint_url: str = "",
+    properties: dict[str, str] | None = None,
+    restrictions: dict[str, list[str]] | None = None,
+    tenant_models: list[dict[str, Any]] | None = None,
+    member_data: dict[str, dict] | None = None,
+    trust_meta: dict[str, Any] | None = None,
+    hierarchy_defs: list[dict[str, Any]] | None = None,  # kept for caller compat
+    named_sets: list[dict[str, Any]] | None = None,
+    kpis: list[dict[str, Any]] | None = None,
+) -> str:
+    rtype = request_type.upper()
+
+    if rtype == "DISCOVER_SCHEMA_ROWSETS":
+        return _build_schema_rowsets_xml()
+
+    rows = _get_rows(
+        rtype, catalog_name, model_id, measures, dimensions, endpoint_url,
+        properties or {}, restrictions or {}, tenant_models or [], member_data or {},
+        trust_meta or {}, named_sets or [], kpis or [],
+    )
+
+    col_defs = _ROWSETS[rtype]["columns"] if rtype in _ROWSETS else [{"name": k, "type": "string"} for k in (rows[0].keys() if rows else [])]
+    return _build_rowset_xml(col_defs, rows)
+
+def _build_rowset_xml(col_defs: list[dict], rows: list[dict[str, str]]) -> str:
+    """
+    Render a MSOLAP-compatible rowset string with proper XSD types.
+    Column definitions from mdschema_config.json specify name, type, required,
+    and maxOccurs — matching OlaPy's exact XSD output (confirmed working with Excel).
+    """
+    col_elements = ""
+    for cdef in col_defs:
+        name = cdef["name"]
+        xsd_type = cdef.get("type", "string")
+        required = cdef.get("required", False)
+        max_occurs = cdef.get("maxOccurs", "")
+        attrs = ""
+        if max_occurs:
+            attrs += f' maxOccurs="{max_occurs}"'
+        if not required:
+            attrs += ' minOccurs="0"'
+        col_elements += f'<xs:element{attrs} name="{name}" sql:field="{name}" type="{xsd_type}"/>'
+
+    schema = (
+        f'<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:sql="{_SQL_NS}" elementFormDefault="qualified" '
+        f'targetNamespace="{_ROWSET_NS}">'
+        f'<xs:element name="root"><xs:complexType>'
+        f'<xs:sequence maxOccurs="unbounded" minOccurs="0">'
+        f'<xs:element name="row" type="row"/>'
+        f'</xs:sequence></xs:complexType></xs:element>'
+        f'<xs:simpleType name="uuid"><xs:restriction base="string">'
+        f'<xs:pattern value="[0-9a-zA-Z]{{8}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{12}}"/>'
+        f'</xs:restriction></xs:simpleType>'
+        f'<xs:complexType name="xmlDocument"><xs:sequence><xs:any/></xs:sequence></xs:complexType>'
+        f'<xs:complexType name="row"><xs:sequence>{col_elements}</xs:sequence></xs:complexType>'
+        f'</xs:schema>'
+    )
+
+    # Only emit columns that are either present in the row data or REQUIRED.
+    # Optional columns (minOccurs="0") can safely be absent from XML — MSOLAP
+    # handles missing optional elements correctly. The original null-column crash
+    # was caused by required columns being missing, not optional ones.
+    # Emitting ALL columns (including optional uuid/boolean) with bad defaults
+    # breaks MDSCHEMA_CUBES and other rowsets.
+    _TYPE_DEFAULTS = {
+        "string": "", "uuid": "00000000-0000-0000-0000-000000000000",
+        "int": "0", "unsignedInt": "0", "unsignedShort": "0",
+        "unsignedLong": "0", "short": "0", "boolean": "false",
+        "dateTime": _meta_created(), "double": "0", "float": "0",
+        "decimal": "0",
+    }
+    required_cols: set[str] = set()
+    col_type_map: dict[str, str] = {}
+    for cdef in col_defs:
+        col_type_map[cdef["name"]] = cdef.get("type", "string")
+        if cdef.get("required", False):
+            required_cols.add(cdef["name"])
+
+    col_names = [cdef["name"] for cdef in col_defs]
+    rows_xml = ""
+    for row_dict in rows:
+        cells = ""
+        for col in col_names:
+            if col in row_dict:
+                cells += f"<{col}>{_xe(str(row_dict[col]))}</{col}>"
+            elif col in required_cols:
+                # Required column missing from data — emit type-appropriate default
+                default = _TYPE_DEFAULTS.get(col_type_map.get(col, "string"), "")
+                cells += f"<{col}>{_xe(default)}</{col}>"
+            # else: optional column not in data — skip it (safe for MSOLAP)
+        rows_xml += f"<row>{cells}</row>"
+
+    return (
+        f'<return><root xmlns="{_ROWSET_NS}"'
+        f' xmlns:xsd="http://www.w3.org/2001/XMLSchema"'
+        f' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        f"{schema}{rows_xml}</root></return>"
+    )
+
+def _build_schema_rowsets_xml() -> str:
+    """
+    Build DISCOVER_SCHEMA_ROWSETS response matching OlaPy format exactly.
+    OlaPy confirmed working with Excel — match its output byte-for-byte.
+
+    Key OlaPy differences from previous Tessallite version:
+    - GUIDs without braces
+    - Restriction types use unqualified "string" not "xsd:string"
+    - xs: prefix (not xsd:)
+    - SchemaGuid type is "uuid" (custom simpleType)
+    - RestrictionsMask type is "unsignedLong"
+    - maxOccurs/minOccurs on xs:sequence not xs:element
+    - Includes uuid simpleType and xmlDocument complexType
+    """
+    # Restrictions matching OlaPy's exact schema roster and restriction lists.
+    # Types use unqualified names (no "xsd:" prefix) to match OlaPy format.
+    _RESTRICTIONS: dict[str, list[tuple[str, str]]] = {
+        "DBSCHEMA_TABLES": [
+            ("TABLE_CATALOG", "string"), ("TABLE_SCHEMA", "string"),
+            ("TABLE_NAME", "string"), ("TABLE_TYPE", "string"),
+            ("TABLE_OLAP_TYPE", "string"),
+        ],
+        "DISCOVER_DATASOURCES": [
+            ("DataSourceName", "string"), ("URL", "string"),
+            ("ProviderName", "string"), ("ProviderType", "string"),
+            ("AuthenticationMode", "string"),
+        ],
+        "DISCOVER_INSTANCES": [("INSTANCE_NAME", "string")],
+        "DISCOVER_KEYWORDS": [("Keyword", "string")],
+        "DBSCHEMA_CATALOGS": [("CATALOG_NAME", "string")],
+        "DISCOVER_LITERALS": [("LiteralName", "string")],
+        "DISCOVER_PROPERTIES": [("PropertyName", "string")],
+        "DISCOVER_SCHEMA_ROWSETS": [("SchemaName", "string")],
+        "DMSCHEMA_MINING_MODELS": [
+            ("MODEL_CATALOG", "string"), ("MODEL_SCHEMA", "string"),
+            ("MODEL_NAME", "string"), ("MODEL_TYPE", "string"),
+            ("SERVICE_NAME", "string"), ("SERVICE_TYPE_ID", "unsignedInt"),
+            ("MINING_STRUCTURE", "string"),
+        ],
+        "MDSCHEMA_ACTIONS": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("ACTION_NAME", "string"),
+            ("ACTION_TYPE", "int"), ("COORDINATE", "string"),
+            ("COORDINATE_TYPE", "int"), ("INVOCATION", "int"),
+            ("CUBE_SOURCE", "unsignedShort"),
+        ],
+        "MDSCHEMA_CUBES": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("CUBE_SOURCE", "unsignedShort"),
+            ("BASE_CUBE_NAME", "string"),
+        ],
+        "MDSCHEMA_DIMENSIONS": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("DIMENSION_NAME", "string"),
+            ("DIMENSION_UNIQUE_NAME", "string"), ("CUBE_SOURCE", "unsignedShort"),
+            ("DIMENSION_VISIBILITY", "unsignedShort"),
+        ],
+        "MDSCHEMA_FUNCTIONS": [
+            ("LIBRARY_NAME", "string"), ("INTERFACE_NAME", "string"),
+            ("FUNCTION_NAME", "string"), ("ORIGIN", "int"),
+        ],
+        "MDSCHEMA_HIERARCHIES": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("DIMENSION_UNIQUE_NAME", "string"),
+            ("HIERARCHY_NAME", "string"), ("HIERARCHY_UNIQUE_NAME", "string"),
+            ("HIERARCHY_ORIGIN", "unsignedShort"), ("CUBE_SOURCE", "unsignedShort"),
+            ("HIERARCHY_VISIBILITY", "unsignedShort"),
+        ],
+        "MDSCHEMA_INPUT_DATASOURCES": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("DATASOURCE_NAME", "string"), ("DATASOURCE_TYPE", "string"),
+        ],
+        "MDSCHEMA_KPIS": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("KPI_NAME", "string"),
+            ("CUBE_SOURCE", "unsignedShort"),
+        ],
+        "MDSCHEMA_LEVELS": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("DIMENSION_UNIQUE_NAME", "string"),
+            ("HIERARCHY_UNIQUE_NAME", "string"), ("LEVEL_NAME", "string"),
+            ("LEVEL_UNIQUE_NAME", "string"), ("LEVEL_ORIGIN", "unsignedShort"),
+            ("CUBE_SOURCE", "unsignedShort"), ("LEVEL_VISIBILITY", "unsignedShort"),
+        ],
+        "MDSCHEMA_MEASUREGROUPS": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("MEASUREGROUP_NAME", "string"),
+        ],
+        "MDSCHEMA_MEASUREGROUP_DIMENSIONS": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("MEASUREGROUP_NAME", "string"),
+            ("DIMENSION_UNIQUE_NAME", "string"), ("DIMENSION_VISIBILITY", "unsignedShort"),
+        ],
+        "MDSCHEMA_MEASURES": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("MEASURE_NAME", "string"),
+            ("MEASURE_UNIQUE_NAME", "string"), ("MEASUREGROUP_NAME", "string"),
+            ("CUBE_SOURCE", "unsignedShort"), ("MEASURE_VISIBILITY", "unsignedShort"),
+        ],
+        "MDSCHEMA_MEMBERS": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("DIMENSION_UNIQUE_NAME", "string"),
+            ("HIERARCHY_UNIQUE_NAME", "string"), ("LEVEL_UNIQUE_NAME", "string"),
+            ("LEVEL_NUMBER", "unsignedInt"), ("MEMBER_NAME", "string"),
+            ("MEMBER_UNIQUE_NAME", "string"), ("MEMBER_CAPTION", "string"),
+            ("MEMBER_TYPE", "int"), ("TREE_OP", "int"),
+            ("CUBE_SOURCE", "unsignedShort"),
+        ],
+        "MDSCHEMA_PROPERTIES": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("DIMENSION_UNIQUE_NAME", "string"),
+            ("HIERARCHY_UNIQUE_NAME", "string"), ("LEVEL_UNIQUE_NAME", "string"),
+            ("MEMBER_UNIQUE_NAME", "string"), ("PROPERTY_NAME", "string"),
+            ("PROPERTY_TYPE", "string"), ("PROPERTY_CONTENT_TYPE", "string"),
+            ("PROPERTY_ORIGIN", "unsignedShort"), ("CUBE_SOURCE", "unsignedShort"),
+            ("PROPERTY_VISIBILITY", "unsignedShort"),
+        ],
+        "MDSCHEMA_SETS": [
+            ("CATALOG_NAME", "string"), ("SCHEMA_NAME", "string"),
+            ("CUBE_NAME", "string"), ("SET_NAME", "string"),
+            ("SCOPE", "int"),
+        ],
+    }
+
+    # Schema order matching OlaPy exactly (OlaPy starts with DBSCHEMA_TABLES)
+    _OLAPY_ORDER = [
+        "DBSCHEMA_TABLES", "DISCOVER_DATASOURCES", "DISCOVER_INSTANCES",
+        "DISCOVER_KEYWORDS", "DBSCHEMA_CATALOGS", "DISCOVER_LITERALS",
+        "DISCOVER_PROPERTIES", "DISCOVER_SCHEMA_ROWSETS",
+        "DMSCHEMA_MINING_MODELS", "MDSCHEMA_ACTIONS", "MDSCHEMA_CUBES",
+        "MDSCHEMA_DIMENSIONS", "MDSCHEMA_FUNCTIONS", "MDSCHEMA_HIERARCHIES",
+        "MDSCHEMA_INPUT_DATASOURCES", "MDSCHEMA_KPIS", "MDSCHEMA_LEVELS",
+        "MDSCHEMA_MEASUREGROUPS", "MDSCHEMA_MEASUREGROUP_DIMENSIONS",
+        "MDSCHEMA_MEASURES", "MDSCHEMA_MEMBERS", "MDSCHEMA_PROPERTIES",
+        "MDSCHEMA_SETS",
+    ]
+
+    rows_xml = ""
+    for name in _OLAPY_ORDER:
+        guid = _SCHEMA_GUIDS.get(name, "")
+        restrictions = _RESTRICTIONS.get(name, [])
+        mask = (1 << len(restrictions)) - 1 if restrictions else 0
+
+        # Each restriction in its own <Restrictions> element (matches OlaPy)
+        restriction_xml = ""
+        for rname, rtype in restrictions:
+            restriction_xml += (
+                f"<Restrictions>"
+                f"<Name>{_xe(rname)}</Name><Type>{_xe(rtype)}</Type>"
+                f"</Restrictions>"
+            )
+
+        # OlaPy uses no braces around GUIDs
+        guid_xml = guid if guid else ""
+        rows_xml += (
+            f"<row>"
+            f"<SchemaName>{_xe(name)}</SchemaName>"
+            f"<SchemaGuid>{guid_xml}</SchemaGuid>"
+            f"{restriction_xml}"
+            f"<RestrictionsMask>{mask}</RestrictionsMask>"
+            f"</row>"
+        )
+
+    # XSD matching OlaPy format: uuid simpleType, xmlDocument complexType,
+    # maxOccurs/minOccurs on sequence, SchemaGuid type=uuid, RestrictionsMask type=unsignedLong
+    schema = (
+        f'<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:sql="{_SQL_NS}" elementFormDefault="qualified" '
+        f'targetNamespace="{_ROWSET_NS}">'
+        f'<xs:element name="root"><xs:complexType>'
+        f'<xs:sequence maxOccurs="unbounded" minOccurs="0">'
+        f'<xs:element name="row" type="row"/>'
+        f'</xs:sequence></xs:complexType></xs:element>'
+        f'<xs:simpleType name="uuid"><xs:restriction base="string">'
+        f'<xs:pattern value="[0-9a-zA-Z]{{8}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{12}}"/>'
+        f'</xs:restriction></xs:simpleType>'
+        f'<xs:complexType name="xmlDocument"><xs:sequence><xs:any/></xs:sequence></xs:complexType>'
+        f'<xs:complexType name="row"><xs:sequence>'
+        f'<xs:element minOccurs="0" name="SchemaName" sql:field="SchemaName" type="string"/>'
+        f'<xs:element minOccurs="0" name="SchemaGuid" sql:field="SchemaGuid" type="uuid"/>'
+        f'<xs:element maxOccurs="unbounded" minOccurs="0" name="Restrictions" sql:field="Restrictions">'
+        f'<xs:complexType><xs:sequence>'
+        f'<xs:element minOccurs="0" name="Name" sql:field="Name" type="string"/>'
+        f'<xs:element minOccurs="0" name="Type" sql:field="Type" type="string"/>'
+        f'</xs:sequence></xs:complexType></xs:element>'
+        f'<xs:element minOccurs="0" name="Description" sql:field="Description" type="string"/>'
+        f'<xs:element minOccurs="0" name="RestrictionsMask" sql:field="RestrictionsMask" type="unsignedLong"/>'
+        f'</xs:sequence></xs:complexType>'
+        f'</xs:schema>'
+    )
+
+    return (
+        f'<return><root xmlns="{_ROWSET_NS}"'
+        f' xmlns:xsd="http://www.w3.org/2001/XMLSchema"'
+        f' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        f"{schema}{rows_xml}</root></return>"
+    )
+
+def _build_trust_footer_xmla(trust_meta: dict[str, Any] | None) -> str:
+    """Phase 5 of the semantic-layer plan: append freshness / source /
+    owner to every XMLA description so Excel pivot field-list tooltips
+    surface provenance without the user leaving the workbook.
+
+    Returns "" when no signals are available so callers can append
+    unconditionally without emitting an empty parenthetical.
+    """
+    if not trust_meta:
+        return ""
+    parts: list[str] = []
+    last = trust_meta.get("last_refreshed_at")
+    if last:
+        cleaned = str(last).split(".")[0].replace("T", " ")
+        parts.append(f"last refreshed {cleaned}")
+    src = trust_meta.get("source_system")
+    if src:
+        parts.append(f"source: {src}")
+    owner = trust_meta.get("owner")
+    if owner:
+        parts.append(f"owner: {owner}")
+    return f"({', '.join(parts)})" if parts else ""
+
+
+def _with_footer(description: str, footer: str) -> str:
+    if not footer:
+        return description or ""
+    if not description:
+        return footer
+    return f"{description}\n{footer}"
+
+
+def _get_rows(rtype, catalog, model_id, measures, dimensions, url, properties, restrictions, tenant_models, member_data, trust_meta, named_sets, kpis):
+    if rtype == "DISCOVER_DATASOURCES": return _rows_datasources(url)
+    if rtype == "DISCOVER_PROPERTIES": return _rows_properties(restrictions, catalog)
+    if rtype == "DISCOVER_LITERALS": return _rows_literals()
+    if rtype in ("MDSCHEMA_CATALOGS", "DBSCHEMA_CATALOGS"): return _rows_catalogs(catalog, tenant_models)
+    if rtype == "MDSCHEMA_CUBES": return _rows_cubes(catalog, tenant_models)
+    if rtype == "MDSCHEMA_DIMENSIONS": return _rows_dimensions(catalog, dimensions, member_data, trust_meta)
+    if rtype == "MDSCHEMA_MEASURES": return _rows_measures(catalog, measures, trust_meta)
+    if rtype == "DBSCHEMA_TABLES": return _rows_tables(catalog, measures, dimensions, trust_meta)
+    if rtype == "DBSCHEMA_COLUMNS": return _rows_columns(catalog, measures, dimensions, trust_meta)
+    if rtype == "MDSCHEMA_HIERARCHIES": return _rows_hierarchies(catalog, dimensions, measures, member_data, properties, trust_meta)
+    if rtype == "MDSCHEMA_LEVELS": return _rows_levels(catalog, dimensions, member_data, trust_meta)
+    if rtype == "MDSCHEMA_MEASUREGROUPS": return _rows_measuregroups(catalog, measures)
+    if rtype == "MDSCHEMA_MEASUREGROUP_DIMENSIONS": return _rows_measuregroup_dimensions(catalog, dimensions, measures)
+    if rtype == "MDSCHEMA_MEMBERS": return _rows_members(catalog, measures, dimensions, restrictions, member_data)
+    if rtype == "MDSCHEMA_PROPERTIES": return _rows_md_properties(catalog, dimensions, measures, restrictions)
+    if rtype == "MDSCHEMA_SETS": return _rows_sets(catalog, named_sets)
+    if rtype == "MDSCHEMA_KPIS": return _rows_kpis(catalog, kpis, measures)
+    return []
+
+def _row(name: str, value: Any, access: str = "Read", ptype: str = "string") -> dict[str, str]:
+    # OlaPy (working with Excel) uses PascalCase column names, not UPPER_CASE.
+    # MSOLAP maps columns by name — wrong case = invisible to Excel.
+    return {
+        "PropertyName": name,
+        "PropertyDescription": name,
+        "PropertyType": ptype,
+        "PropertyAccessType": access,
+        "IsRequired": "false",
+        "Value": str(value),
+    }
+
+def _rows_properties(restrictions: dict[str, list[str]], catalog: str = "") -> list[dict[str, str]]:
+    # Properties matching OlaPy (confirmed working with Excel).
+    # Catalog Value MUST echo the active catalog name — OlaPy does this.
+    # Without it, Excel concludes the catalog doesn't exist.
+    rows = [
+        _row("ServerName", SERVER_NAME),
+        _row("ProviderVersion", PROVIDER_VERSION),
+        _row("MdpropMdxSubqueries", "15", ptype="int"),
+        _row("MdpropMdxDrillFunctions", "3", ptype="int"),
+        _row("MdpropMdxNamedSets", "15", ptype="int"),
+        # Catalog MUST be ReadWrite with the current catalog echoed as Value.
+        _row("Catalog", catalog, access="ReadWrite"),
+        _row("Content", "SchemaData", access="ReadWrite"),
+        _row("Format", "Tabular", access="ReadWrite"),
+        _row("AxisFormat", "TupleFormat", access="ReadWrite"),
+        _row("DataSourceInfo", "-", access="ReadWrite"),
+    ]
+
+    # Excel sends mixed-case tags in Restrictions (<PROPERTY_NAME> or <PropertyName>).
+    name_filter = restrictions.get("PROPERTY_NAME") or restrictions.get("PropertyName")
+
+    if name_filter:
+        requested = set(name_filter)
+        # 1. Keep templated rows that were requested
+        filtered_rows = [row for row in rows if row["PropertyName"] in requested]
+
+        # 2. Add stub rows for any requested names we didn't have a template for
+        existing_names = {r["PropertyName"] for r in filtered_rows}
+        for missing in requested - existing_names:
+            filtered_rows.append(_row(missing, ""))
+
+        return filtered_rows
+
+    return rows
+
+
+def _rows_datasources(url):
+    """
+    Return a datasource matching OlaPy's format (confirmed working with Excel).
+    OlaPy column names: DataSourceName, DataSourceDescription, URL,
+    DataSourceInfo, ProviderName, ProviderType, AuthenticationMode (PascalCase).
+    """
+    datasource_url = url or _datasource_url_fallback()
+    return [{
+        "DataSourceName": SERVER_NAME,
+        "DataSourceDescription": "Tessallite Semantic Aggregation Layer",
+        "URL": datasource_url,
+        "DataSourceInfo": "-",
+        "ProviderName": SERVER_NAME,
+        "ProviderType": "MDP",
+        "AuthenticationMode": "Authenticated",
+    }]
+
+def _rows_literals() -> list[dict[str, str]]:
+    """DISCOVER_LITERALS — matching OlaPy output exactly (16 rows)."""
+    def _lit(name, value="", invalid="", invalid_start="", max_len="-1", enum_val="0"):
+        row = {"LiteralName": name, "LiteralMaxLength": max_len, "LiteralNameEnumValue": enum_val}
+        if value: row["LiteralValue"] = value
+        if invalid: row["LiteralInvalidChars"] = invalid
+        if invalid_start: row["LiteralInvalidStartingChars"] = invalid_start
+        return row
+    return [
+        _lit("DBLITERAL_CATALOG_NAME", invalid=".", invalid_start="0123456789", max_len="24", enum_val="2"),
+        _lit("DBLITERAL_CATALOG_SEPARATOR", value=".", max_len="0", enum_val="3"),
+        _lit("DBLITERAL_COLUMN_ALIAS", invalid="'\"[]", invalid_start="0123456789", enum_val="5"),
+        _lit("DBLITERAL_COLUMN_NAME", invalid=".", invalid_start="0123456789", enum_val="6"),
+        _lit("DBLITERAL_CORRELATION_NAME", invalid="'\"[]", invalid_start="0123456789", enum_val="7"),
+        _lit("DBLITERAL_CUBE_NAME", invalid=".", invalid_start="0123456789", enum_val="21"),
+        _lit("DBLITERAL_DIMENSION_NAME", invalid=".", invalid_start="0123456789", enum_val="22"),
+        _lit("DBLITERAL_LEVEL_NAME", invalid=".", invalid_start="0123456789", enum_val="24"),
+        _lit("DBLITERAL_MEMBER_NAME", invalid=".", invalid_start="0123456789", enum_val="25"),
+        _lit("DBLITERAL_PROCEDURE_NAME", invalid=".", invalid_start="0123456789", enum_val="14"),
+        _lit("DBLITERAL_PROPERTY_NAME", invalid=".", invalid_start="0123456789", enum_val="26"),
+        _lit("DBLITERAL_QUOTE_PREFIX", value="[", enum_val="15"),
+        _lit("DBLITERAL_QUOTE_SUFFIX", value="]", enum_val="28"),
+        _lit("DBLITERAL_TABLE_NAME", invalid=".", invalid_start="0123456789", enum_val="17"),
+        _lit("DBLITERAL_TEXT_COMMAND", enum_val="18"),
+        _lit("DBLITERAL_USER_NAME", max_len="0", enum_val="19"),
+    ]
+
+def _rows_catalogs(catalog, tenant_models):
+    """MDSCHEMA_CATALOGS — Phase 8 persona-as-catalog emits the base
+    business catalog ``<slug>`` plus one ``<slug>_<persona.slug>``
+    sibling per persona attached to the model. Callers must attach a
+    ``personas`` list to each model dict (empty list is fine) before
+    calling this function.
+
+    Every row must carry the full column set declared in the
+    MDSCHEMA_CATALOGS rowset config (CATALOG_NAME, DESCRIPTION, ROLES,
+    DATE_MODIFIED, COMPATIBILITY_LEVEL, TYPE) — missing keys trip
+    strict clients that inspect the schema before rendering.
+    """
+    def _row(cname: str, description: str) -> dict:
+        return {
+            "CATALOG_NAME": cname,
+            "DESCRIPTION": description,
+            "ROLES": "",
+            "DATE_MODIFIED": _meta_created(),
+            "COMPATIBILITY_LEVEL": "1600",
+            "TYPE": "1",
+        }
+
+    if tenant_models:
+        rows = []
+        for m in tenant_models:
+            base = m.get("slug") or m.get("display_name") or str(m.get("id", ""))
+            display = m.get("display_name", "")
+            variants: list[tuple[str, str]] = [("", "")]
+            for persona in (m.get("personas") or []):
+                pslug = persona.get("slug")
+                if not pslug:
+                    continue
+                plabel = persona.get("description") or persona.get("name") or pslug
+                variants.append((f"_{pslug}", f" ({plabel})"))
+            for suffix, label_suffix in variants:
+                cname = f"{base}{suffix}"
+                if catalog and cname != catalog:
+                    continue
+                rows.append(_row(cname, f"{display}{label_suffix}".strip()))
+        if rows:
+            return rows
+    if catalog:
+        return [_row(catalog, "")]
+    return []
+
+def _rows_cubes(catalog, tenant_models=None):
+    """MDSCHEMA_CUBES — one cube per catalog. Phase 8 persona-as-catalog
+    exposes each model as the business base plus one cube per persona
+    (``<slug>_<persona.slug>``). When the client requests the full cube
+    list without a catalog restriction, every model × persona pair is
+    emitted. Callers must attach a ``personas`` list to each model dict
+    (empty list is fine).
+    """
+    def _cube_row(cat_name: str, description: str = "") -> dict:
+        return {
+            "CATALOG_NAME": cat_name,
+            "SCHEMA_NAME": "",
+            "CUBE_NAME": cat_name,
+            "CUBE_TYPE": "CUBE",
+            "CUBE_GUID": "00000000-0000-0000-0000-000000000000",
+            "CREATED_ON": _meta_created(),
+            "LAST_SCHEMA_UPDATE": _meta_modified(),
+            "SCHEMA_UPDATED_BY": "",
+            "LAST_DATA_UPDATE": _meta_modified(),
+            "DATA_UPDATED_BY": "",
+            "DESCRIPTION": description,
+            "IS_DRILLTHROUGH_ENABLED": "true",
+            "IS_LINKABLE": "false",
+            "IS_WRITE_ENABLED": "false",
+            "IS_SQL_ENABLED": "false",
+            "CUBE_CAPTION": cat_name,
+            "BASE_CUBE_NAME": cat_name,
+            "CUBE_SOURCE": "1",
+        }
+
+    if not catalog:
+        if not tenant_models:
+            return []
+        rows: list[dict] = []
+        for m in tenant_models:
+            base = m.get("slug") or m.get("display_name") or str(m.get("id", ""))
+            display = m.get("display_name", "")
+            variants: list[tuple[str, str]] = [("", "")]
+            for persona in (m.get("personas") or []):
+                pslug = persona.get("slug")
+                if not pslug:
+                    continue
+                plabel = persona.get("description") or persona.get("name") or pslug
+                variants.append((f"_{pslug}", f" ({plabel})"))
+            for suffix, label in variants:
+                rows.append(_cube_row(f"{base}{suffix}", f"{display}{label}".strip()))
+        return rows
+    return [_cube_row(catalog, "")]
+
+def _effective_hidden(obj: dict) -> bool:
+    """Compute whether a dimension or measure should be hidden from
+    the end-user XMLA catalog.
+
+    The gateway composes three signals into one decision:
+
+    - ``is_hidden``: raw modeler toggle. Always wins when True.
+    - ``is_invalid``: the Phase-1 structural validity flag. Invalid
+      objects are hidden from the catalog so Excel can't pick them,
+      but the query router still handles cached pivots via the
+      source fallback + alert path.
+    - ``redundant_partner``: the Phase-3 Rule C3 cascade. If a
+      dimension / measure is a join-partner of a fact-side column,
+      it is redundant to include in the catalog — hide it so the
+      modeler (and Excel) sees only the canonical fact-side entry.
+
+    Callers that need to distinguish these cases (e.g. the Model
+    Health tab) should read the raw fields directly; the gateway
+    only needs the composed answer.
+    """
+    if obj.get("is_hidden"):
+        return True
+    if obj.get("is_invalid"):
+        return True
+    if obj.get("redundant_partner"):
+        return True
+    return False
+
+
+def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
+    """MDSCHEMA_DIMENSIONS — one row per non-hidden dimension + Measures.
+
+    Phase 1 of the semantic-layer plan: emits the dimension's friendly
+    `display_name` as DIMENSION_CAPTION, the business `description` as
+    DIMENSION_DESCRIPTION, drops dimensions where the cascaded `is_hidden`
+    flag is true, and now correctly marks visible dimensions as visible
+    (the prior implementation hardcoded DIMENSION_IS_VISIBLE to "false").
+    Phase 5: every description is suffixed with the trust footer so
+    Excel tooltips surface freshness / source / owner inline.
+    """
+    rows = []
+    footer = _build_trust_footer_xmla(trust_meta)
+    visible_dims = [d for d in dims if not _effective_hidden(d)]
+    for i, d in enumerate(visible_dims):
+        dname = d.get("name", "")
+        caption = d.get("display_name") or dname
+        description = _with_footer(
+            d.get("effective_description") or d.get("description") or "",
+            footer,
+        )
+        dim_data = member_data.get(dname, {})
+        card = str(len(dim_data.get("members", [])) or 23)
+        dim_type = "1" if d.get("is_time_dim", False) else "3"
+        rows.append({
+            "CATALOG_NAME": catalog,
+            "SCHEMA_NAME": "",
+            "CUBE_NAME": catalog,
+            "DIMENSION_NAME": dname,
+            "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+            "DIMENSION_GUID": "00000000-0000-0000-0000-000000000000",
+            "DIMENSION_CAPTION": caption,
+            "DIMENSION_ORDINAL": str(i),
+            "DIMENSION_TYPE": dim_type,
+            "DIMENSION_CARDINALITY": card,
+            "DEFAULT_HIERARCHY": f"[{dname}].[{dname}]",
+            "DESCRIPTION": description,
+            "IS_VIRTUAL": "false",
+            "IS_READWRITE": "false",
+            "DIMENSION_UNIQUE_SETTINGS": "1",
+            "DIMENSION_MASTER_NAME": dname,
+            "DIMENSION_IS_VISIBLE": "true",
+        })
+    # OlaPy also returns a [Measures] dimension
+    rows.append({
+        "CATALOG_NAME": catalog,
+        "SCHEMA_NAME": "",
+        "CUBE_NAME": catalog,
+        "DIMENSION_NAME": "Measures",
+        "DIMENSION_UNIQUE_NAME": "[Measures]",
+        "DIMENSION_GUID": "00000000-0000-0000-0000-000000000000",
+        "DIMENSION_CAPTION": "Measures",
+        "DIMENSION_ORDINAL": str(len(visible_dims)),
+        "DIMENSION_TYPE": "2",
+        "DIMENSION_CARDINALITY": "0",
+        "DEFAULT_HIERARCHY": "[Measures]",
+        "DESCRIPTION": "",
+        "IS_VIRTUAL": "false",
+        "IS_READWRITE": "false",
+        "DIMENSION_UNIQUE_SETTINGS": "1",
+        "DIMENSION_MASTER_NAME": "Measures",
+        "DIMENSION_IS_VISIBLE": "true",
+    })
+    return rows
+
+_AGG_TO_XMLA = {
+    "sum": "1",
+    "count": "2",
+    "min": "3",
+    "max": "4",
+    "avg": "5",
+    "average": "5",
+    "var": "6",
+    "std": "7",
+    "count_distinct": "127",
+    "distinctcount": "127",
+}
+
+def _rows_measures(catalog, measures, trust_meta=None):
+    """MDSCHEMA_MEASURES — one row per non-hidden measure.
+
+    Phase 1 of the semantic-layer plan: emits friendly captions, business
+    descriptions and display folders so Excel pivot field lists render
+    measures inside expandable groups with helpful tooltips.
+    Phase 5: each description is suffixed with the trust footer.
+    """
+    rows = []
+    footer = _build_trust_footer_xmla(trust_meta)
+    for m in measures:
+        if _effective_hidden(m):
+            continue
+        mname = m.get("name", "")
+        caption = m.get("display_name") or mname
+        description = _with_footer(
+            m.get("effective_description") or m.get("description") or "",
+            footer,
+        )
+        folder = m.get("display_folder") or ""
+        agg_code = _AGG_TO_XMLA.get((m.get("default_agg") or "sum").lower(), "1")
+        group_name = "default"
+        rows.append({
+            "CATALOG_NAME": catalog,
+            "SCHEMA_NAME": "",
+            "CUBE_NAME": catalog,
+            "MEASURE_NAME": mname,
+            "MEASURE_UNIQUE_NAME": f"[Measures].[{mname}]",
+            "MEASURE_CAPTION": caption,
+            "MEASURE_GUID": "00000000-0000-0000-0000-000000000000",
+            "MEASURE_AGGREGATOR": agg_code,
+            "DATA_TYPE": "5",
+            "NUMERIC_PRECISION": "16",
+            "NUMERIC_SCALE": "-1",
+            "MEASURE_UNITS": "",
+            "DESCRIPTION": description,
+            "EXPRESSION": "",
+            "MEASURE_IS_VISIBLE": "true",
+            "LEVELS_LIST": "",
+            "MEASURE_NAME_SQL_COLUMN_NAME": mname,
+            "MEASURE_UNQUALIFIED_CAPTION": caption,
+            "MEASUREGROUP_NAME": group_name,
+            "MEASURE_DISPLAY_FOLDER": folder,
+            # Bug-5432: report the measure's SSAS/.NET FORMAT_STRING (translated
+            # from the Tessallite format token) so Excel/Power BI format cells.
+            "DEFAULT_FORMAT_STRING": format_token_to_mdx(m.get("format")) or "",
+        })
+    return rows
+
+def _rows_tables(catalog, measures, dimensions, trust_meta=None):
+    """
+    DBSCHEMA_TABLES — Excel sends this after selecting a database to list
+    available tables. In SSAS, each cube appears as a table. We return the
+    cube plus individual dimension tables and the Measures table.
+
+    Phase 1 of the semantic-layer plan: hidden dimensions are skipped, and
+    each row carries a DESCRIPTION populated from the dimension's business
+    description.
+    Phase 5: descriptions are suffixed with the trust footer.
+    """
+    name = catalog
+    now = _meta_modified()
+    footer = _build_trust_footer_xmla(trust_meta)
+    rows = [{
+        "TABLE_CATALOG": name, "TABLE_NAME": name,
+        "TABLE_TYPE": "TABLE",
+        "DATE_CREATED": now, "DATE_MODIFIED": now,
+        "DESCRIPTION": _with_footer("", footer),
+    }]
+    for d in dimensions:
+        if _effective_hidden(d):
+            continue
+        dname = d.get("name", "")
+        rows.append({
+            "TABLE_CATALOG": name, "TABLE_NAME": dname,
+            "TABLE_TYPE": "TABLE",
+            "DATE_CREATED": now, "DATE_MODIFIED": now,
+            "DESCRIPTION": _with_footer(
+                d.get("effective_description") or d.get("description") or "",
+                footer,
+            ),
+        })
+    return rows
+
+
+def _rows_columns(catalog, measures, dimensions, trust_meta=None):
+    """DBSCHEMA_COLUMNS — columns within tables.
+
+    Phase 1 of the semantic-layer plan: hidden measures and dimensions are
+    skipped, and each column carries a DESCRIPTION populated from the
+    semantic object's business description.
+    Phase 5: descriptions are suffixed with the trust footer.
+    """
+    name = catalog
+    rows = []
+    ordinal = 1
+    footer = _build_trust_footer_xmla(trust_meta)
+    for m in measures:
+        if _effective_hidden(m):
+            continue
+        mname = m.get("name", "")
+        rows.append({
+            "TABLE_CATALOG": name, "TABLE_NAME": name,
+            "COLUMN_NAME": mname, "ORDINAL_POSITION": str(ordinal),
+            "IS_NULLABLE": "true", "DATA_TYPE": "5",
+            "NUMERIC_PRECISION": "19", "NUMERIC_SCALE": "4",
+            "DESCRIPTION": _with_footer(
+                m.get("effective_description") or m.get("description") or "",
+                footer,
+            ),
+        })
+        ordinal += 1
+    for d in dimensions:
+        if _effective_hidden(d):
+            continue
+        dname = d.get("name", "")
+        rows.append({
+            "TABLE_CATALOG": name, "TABLE_NAME": dname,
+            "COLUMN_NAME": dname, "ORDINAL_POSITION": "1",
+            "IS_NULLABLE": "true", "DATA_TYPE": "130",
+            "DESCRIPTION": d.get("effective_description") or d.get("description") or "",
+        })
+    return rows
+
+
+def _dimension_level_names(dimension: dict, dim_data: dict | None = None) -> list[str]:
+    levels = dimension.get("levels") or (dim_data or {}).get("levels") or []
+    if levels:
+        if isinstance(levels[0], dict):
+            ordered = sorted(levels, key=lambda item: int(item.get("ordinal", 0)))
+            names = [str(item.get("name", "")).strip() for item in ordered if str(item.get("name", "")).strip()]
+            if names:
+                return names
+        else:
+            names = [str(item).strip() for item in levels if str(item).strip()]
+            if names:
+                return names
+    return [dimension.get("name", "")]
+
+
+def _dimension_members_by_level(dim_data: dict | None) -> dict[int, list[dict]]:
+    if not dim_data:
+        return {}
+    by_level_raw = dim_data.get("members_by_level")
+    if isinstance(by_level_raw, dict):
+        out: dict[int, list[dict]] = {}
+        for key, members in by_level_raw.items():
+            try:
+                idx = int(key)
+            except Exception:
+                continue
+            out[idx] = list(members or [])
+        return out
+    flat = list(dim_data.get("members") or [])
+    if flat:
+        return {0: flat}
+    return {}
+
+
+def _resolve_member_key_path(
+    mem: dict,
+    mname: str,
+    parent_name: str,
+    level_idx: int,
+    members_by_level: dict[int, list[dict]],
+    member_filter: str | None,
+) -> list[str]:
+    """Ancestor-first key path for a DISCOVER member (Bug-3617 Phase 2).
+
+    Resolution priority:
+      1. The explicit ``key_path`` the preview supplied (parent-less whole-level
+         enumeration of a single-table hierarchy — Phase 0.5b).
+      2. The chain walked up ``members_by_level`` via parent links (whole-hierarchy
+         enumeration where all ancestor levels are loaded). Member names == keys in
+         the discovery data, so the walked name path IS the key path.
+      3. Drill case (only the target level loaded): reconstruct the parent path
+         from the inbound canonical ``member_filter`` restriction — Excel echoes
+         the parent's canonical uname when expanding children, so its key path is
+         the ancestor prefix; ``self`` requests carry the member's own full path.
+      4. Single-key fallback (root level, flat dimension, or a caption-only client).
+    """
+    explicit = mem.get("key_path")
+    if explicit:
+        return [str(k) for k in explicit]
+    mem_key = str(mem.get("key") or mname)
+    walked = ancestor_key_path_from_parent_chain(
+        mname, level_idx, parent_name, members_by_level
+    )
+    if len(walked) >= level_idx + 1:
+        return walked
+    if member_filter:
+        _h, _l, fgrammar, fpath = parse_member_uname(member_filter)
+        if fgrammar == "key" and fpath:
+            # filter is this member (self) -> its full path; else it is the parent
+            # being expanded -> prefix the parent path onto this member's key(s).
+            if walked and walked[-1] == fpath[-1]:
+                return fpath
+            return fpath + (walked or [mem_key])
+    return walked or [mem_key]
+
+
+def _member_name_from_unique(member_unique_name: str | None) -> str | None:
+    """Deepest member key of a MEMBER_UNIQUE_NAME, via the single grammar parser.
+
+    Bug-3617 (Phase 1): routed through ``parse_member_uname`` so a canonical
+    name (``[Dim].[Hier].[Level].&[2025]&[4]``) yields the member key ``4`` — the
+    old flat regex returned the LEVEL name (``Level``) for that shape. Caption
+    form is unchanged (``[Dim].[Hier].[4]`` -> ``4``). Returns None for the
+    (All)/Measures/invalid forms (each handled on its own path).
+    """
+    _hier, _level, grammar, key_path = parse_member_uname(member_unique_name)
+    if grammar in ("invalid", "all", "measure") or not key_path:
+        return None
+    return key_path[-1]
+
+
+def _rows_hierarchies(catalog, dimensions, measures=None, member_data=None, properties=None, trust_meta=None):
+    """MDSCHEMA_HIERARCHIES — one hierarchy per dimension + Measures.
+    Values match OlaPy: HIERARCHY_ORIGIN=1, DIMENSION_UNIQUE_SETTINGS=1,
+    DEFAULT_MEMBER on Measures hierarchy. Phase 5 appends the trust
+    footer to every DESCRIPTION."""
+    if member_data is None:
+        member_data = {}
+    if properties is None:
+        properties = {}
+    name = catalog
+    rows = []
+    footer = _build_trust_footer_xmla(trust_meta)
+    app_name = (properties.get("SspropInitAppName") or "").strip().lower()
+    format_name = (properties.get("Format") or "").strip().upper()
+    # Align with OlaPy's Excel-specific compatibility tweak from its filters
+    # branch: avoid emitting ALL_MEMBER for Excel discover requests.
+    include_all_member = format_name == "TABULAR" and "excel" not in app_name
+    visible_dimensions = [d for d in dimensions if not _effective_hidden(d)]
+    for i, d in enumerate(visible_dimensions):
+        dname = d.get("name", "")
+        caption = d.get("display_name") or dname
+        description = _with_footer(
+            d.get("effective_description") or d.get("description") or "",
+            footer,
+        )
+        folder = d.get("display_folder") or ""
+        dim_data = member_data.get(dname, {})
+        hier = f"[{dname}].[{dname}]"
+        members_by_level = _dimension_members_by_level(dim_data)
+        # Count root-level members for cardinality when available.
+        card = str(len(members_by_level.get(0, []))) if members_by_level.get(0) else "6"
+        # All member — points to the (All) level member.
+        # LEVEL_UNIQUE_NAME uses [(All)], MEMBER_UNIQUE_NAME uses [All] (SSAS convention).
+        all_member = f"{hier}.[All]"
+        dim_type = "1" if d.get("is_time_dim", False) else "3"
+        row = {
+            "CATALOG_NAME": name, "CUBE_NAME": name,
+            "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+            "HIERARCHY_NAME": dname,
+            "HIERARCHY_UNIQUE_NAME": hier,
+            "HIERARCHY_CAPTION": caption,
+            "DIMENSION_TYPE": dim_type,
+            "HIERARCHY_CARDINALITY": card,
+            "DEFAULT_MEMBER": all_member,
+            "DESCRIPTION": description,
+            "STRUCTURE": "0",
+            "IS_VIRTUAL": "false",
+            "IS_READWRITE": "false",
+            "DIMENSION_UNIQUE_SETTINGS": "1",
+            "DIMENSION_IS_VISIBLE": "true",
+            "HIERARCHY_ORDINAL": "1",
+            "DIMENSION_IS_SHARED": "true",
+            "HIERARCHY_IS_VISIBLE": "true",
+            "HIERARCHY_ORIGIN": "1",
+            "INSTANCE_SELECTION": "0",
+            "HIERARCHY_DISPLAY_FOLDER": folder,
+        }
+        if include_all_member:
+            row["ALL_MEMBER"] = all_member
+        rows.append(row)
+    # Measures hierarchy — DEFAULT_MEMBER pointing to first measure
+    first_measure = ""
+    if measures:
+        first_measure = measures[0].get("name", "")
+    default_member = f"[Measures].[{first_measure}]" if first_measure else ""
+    meas_row = {
+        "CATALOG_NAME": name, "CUBE_NAME": name,
+        "DIMENSION_UNIQUE_NAME": "[Measures]",
+        "HIERARCHY_NAME": "Measures",
+        "HIERARCHY_UNIQUE_NAME": "[Measures]",
+        "HIERARCHY_CAPTION": "Measures",
+        "DIMENSION_TYPE": "2",
+        "HIERARCHY_CARDINALITY": "0",
+        "DEFAULT_MEMBER": default_member,
+        "STRUCTURE": "0",
+        "IS_VIRTUAL": "false",
+        "IS_READWRITE": "false",
+        "DIMENSION_UNIQUE_SETTINGS": "1",
+        "DIMENSION_IS_VISIBLE": "true",
+        "HIERARCHY_ORDINAL": "1",
+        "DIMENSION_IS_SHARED": "true",
+        "HIERARCHY_IS_VISIBLE": "true",
+        "HIERARCHY_ORIGIN": "1",
+        "INSTANCE_SELECTION": "0",
+    }
+    rows.append(meas_row)
+    return rows
+
+
+_TIME_LEVEL_TYPES = {
+    "year": "20", "years": "20",
+    "half_year": "36", "half_years": "36", "semester": "36",
+    "quarter": "68", "quarters": "68",
+    "month": "132", "months": "132",
+    "week": "516", "weeks": "516",
+    "day": "1028", "days": "1028", "date": "1028",
+}
+
+
+def _time_level_type(level_name: str) -> str:
+    """Map a time hierarchy level name to the XMLA MDLEVEL_TYPE constant."""
+    return _TIME_LEVEL_TYPES.get(level_name.lower(), "0")
+
+
+def _rows_levels(catalog, dimensions, member_data, trust_meta=None):
+    """MDSCHEMA_LEVELS — levels per hierarchy + MeasuresLevel.
+    Every hierarchy must have an (All) level at LEVEL_NUMBER=0 (LEVEL_TYPE=1)
+    followed by the data level at LEVEL_NUMBER=1.  Without the (All) level
+    MSOLAP rejects the cube schema and loops on MDSCHEMA_CUBES.
+
+    Phase 1 of the semantic-layer plan: hidden dimensions are skipped, and
+    each level carries the dimension's friendly caption and description.
+    Phase 5: descriptions are suffixed with the trust footer.
+    """
+    name = catalog
+    rows = []
+    footer = _build_trust_footer_xmla(trust_meta)
+    for d in dimensions:
+        if _effective_hidden(d):
+            continue
+        dname = d.get("name", "")
+        caption = d.get("display_name") or dname
+        description = _with_footer(
+            d.get("effective_description") or d.get("description") or "",
+            footer,
+        )
+        dim_data = member_data.get(dname, {})
+        members_by_level = _dimension_members_by_level(dim_data)
+        level_names = _dimension_level_names(d, dim_data)
+        hier = f"[{dname}].[{dname}]"
+
+        # (All) level is always level 0 — MSOLAP requires it to match
+        # the ALL_MEMBER / DEFAULT_MEMBER declared in MDSCHEMA_HIERARCHIES.
+        rows.append({
+            "CATALOG_NAME": name, "CUBE_NAME": name,
+            "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+            "HIERARCHY_UNIQUE_NAME": hier,
+            "LEVEL_NAME": "(All)",
+            "LEVEL_UNIQUE_NAME": f"{hier}.[(All)]",
+            "LEVEL_CAPTION": "(All)",
+            "LEVEL_NUMBER": "0",
+            "LEVEL_CARDINALITY": "1",
+            "LEVEL_TYPE": "1",  # MDLEVEL_TYPE_ALL
+            "CUSTOM_ROLLUP_SETTINGS": "0",
+            "LEVEL_UNIQUE_SETTINGS": "1",
+            "LEVEL_IS_VISIBLE": "false",
+            "LEVEL_DBTYPE": "130",
+            "LEVEL_KEY_CARDINALITY": "1",
+            "LEVEL_ORIGIN": "2",
+            "DESCRIPTION": description,
+        })
+
+        # Regular hierarchy levels.
+        is_time = d.get("is_time_dim", False)
+        for idx, level_name in enumerate(level_names):
+            card = str(len(members_by_level.get(idx, [])))
+            level_caption = caption if level_name == dname else level_name
+            level_type = "0"
+            if is_time:
+                level_type = _time_level_type(level_name)
+            rows.append({
+                "CATALOG_NAME": name, "CUBE_NAME": name,
+                "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+                "HIERARCHY_UNIQUE_NAME": hier,
+                "LEVEL_NAME": level_name,
+                "LEVEL_UNIQUE_NAME": f"{hier}.[{level_name}]",
+                "LEVEL_CAPTION": level_caption,
+                "LEVEL_NUMBER": str(idx + 1),
+                "LEVEL_CARDINALITY": card,
+                "LEVEL_TYPE": level_type,
+                "CUSTOM_ROLLUP_SETTINGS": "0",
+                "LEVEL_UNIQUE_SETTINGS": "0",
+                "LEVEL_IS_VISIBLE": "true",
+                "LEVEL_DBTYPE": "130",
+                "LEVEL_KEY_CARDINALITY": "1",
+                "LEVEL_ORIGIN": "2",
+                "DESCRIPTION": description,
+            })
+    # Measures level
+    rows.append({
+        "CATALOG_NAME": name, "CUBE_NAME": name,
+        "DIMENSION_UNIQUE_NAME": "[Measures]",
+        "HIERARCHY_UNIQUE_NAME": "[Measures]",
+        "LEVEL_NAME": "MeasuresLevel",
+        "LEVEL_UNIQUE_NAME": "[Measures]",
+        "LEVEL_CAPTION": "MeasuresLevel",
+        "LEVEL_NUMBER": "0",
+        "LEVEL_CARDINALITY": "0",
+        "LEVEL_TYPE": "0",
+        "CUSTOM_ROLLUP_SETTINGS": "0",
+        "LEVEL_UNIQUE_SETTINGS": "0",
+        "LEVEL_IS_VISIBLE": "true",
+        "LEVEL_DBTYPE": "130",
+        "LEVEL_KEY_CARDINALITY": "1",
+        "LEVEL_ORIGIN": "2",
+    })
+    return rows
+
+
+def _rows_members(
+    catalog: str,
+    measures: list[dict],
+    dimensions: list[dict],
+    restrictions: dict[str, list[str]],
+    member_data: dict[str, dict] | None = None,
+) -> list[dict]:
+    """
+    MDSCHEMA_MEMBERS — return members for dimensions/measures.
+    Excel queries this for filter dropdowns and member validation.
+    Uses member_data for real dimension members from the database.
+    """
+    if member_data is None:
+        member_data = {}
+    name = catalog
+    # Normalize restriction keys to uppercase for case-insensitive matching
+    _norm_restrictions: dict[str, list[str]] = {}
+    for k, v in restrictions.items():
+        _norm_restrictions[k.upper()] = v
+
+    hier_filter = (_norm_restrictions.get("HIERARCHY_UNIQUE_NAME") or [None])[0]
+    dim_filter = (_norm_restrictions.get("DIMENSION_UNIQUE_NAME") or [None])[0]
+    level_filter = (_norm_restrictions.get("LEVEL_UNIQUE_NAME") or [None])[0]
+    member_filter = (_norm_restrictions.get("MEMBER_UNIQUE_NAME") or [None])[0]
+    tree_op = (_norm_restrictions.get("TREE_OP") or [None])[0]
+    tree_op_int = int(tree_op) if tree_op else 0
+    rows: list[dict] = []
+
+    # If asking for children/descendants of a non-measure member, do NOT include measures
+    skip_measures = False
+    if member_filter and not member_filter.startswith("[Measures]"):
+        skip_measures = True
+    if hier_filter and hier_filter != "[Measures]":
+        skip_measures = True
+    if dim_filter and dim_filter != "[Measures]":
+        skip_measures = True
+
+    # Measure members — MEMBER_TYPE=3 (MDMEMBER_TYPE_MEASURE per SSAS spec)
+    if not skip_measures:
+        if not level_filter or level_filter == "[Measures]":
+            for m in measures:
+                mname = m.get("name", "")
+                uname = f"[Measures].[{mname}]"
+                if member_filter and member_filter != uname:
+                    # Measures don't have a parent-child tree — exact match only
+                    continue
+                rows.append({
+                    "CATALOG_NAME": name,
+                    "CUBE_NAME": name,
+                    "DIMENSION_UNIQUE_NAME": "[Measures]",
+                    "HIERARCHY_UNIQUE_NAME": "[Measures]",
+                    "LEVEL_UNIQUE_NAME": "[Measures]",
+                    "LEVEL_NUMBER": "0",
+                    "MEMBER_ORDINAL": "0",
+                    "MEMBER_NAME": mname,
+                    "MEMBER_UNIQUE_NAME": f"[Measures].[{mname}]",
+                    "MEMBER_TYPE": "3",
+                    "MEMBER_CAPTION": mname,
+                    "CHILDREN_CARDINALITY": "0",
+                    "PARENT_LEVEL": "0",
+                    "PARENT_COUNT": "0",
+                    "MEMBER_KEY": mname,
+                    "IS_PLACEHOLDERMEMBER": "false",
+                    "IS_DATAMEMBER": "false",
+                })
+
+    # Dimension members from member_data (real database values)
+    for d in dimensions:
+        dname = d.get("name", "")
+        dim_uname = f"[{dname}]"
+        hier = f"[{dname}].[{dname}]"
+
+        # Apply DIMENSION_UNIQUE_NAME restriction
+        if dim_filter and dim_filter != dim_uname:
+            continue
+        # Apply HIERARCHY_UNIQUE_NAME restriction
+        if hier_filter and hier_filter != hier:
+            continue
+
+        dim_data = member_data.get(dname) or {}
+        level_names = _dimension_level_names(d, dim_data)
+        members_by_level = _dimension_members_by_level(dim_data)
+        root_members = members_by_level.get(0, [])
+        all_level_uname = f"{hier}.[(All)]"
+        all_member_uname = f"{hier}.[All]"
+        # Bug-3617 (Phase 2): emit the canonical ancestor-qualified uname only for
+        # MULTI-LEVEL hierarchies — that is where caption-form members collide
+        # (month 4 of 2025 vs 2026) and where the Execute SUBTOTAL axis already
+        # emits the canonical key form, so this restores DISCOVER<->Execute parity.
+        # FLAT dimensions (one level) never collide and the non-subtotal Execute
+        # axis keeps caption form, so they stay caption form here too — no mismatch.
+        is_multi_level = len(level_names) > 1
+        parsed_member_name = _member_name_from_unique(member_filter)
+        # Bug-5431: full ancestor key path of the filter member (canonical input),
+        # used for TREE_OP parent(2)/siblings(4)/ancestors(32) matching.
+        _f_hier, _f_level, _f_grammar, filt_path = parse_member_uname(member_filter)
+
+        # Emit the (All) member unless restrictions explicitly exclude it.
+        emit_all = not level_filter or level_filter in (all_level_uname, all_member_uname)
+        if member_filter:
+            if member_filter == all_member_uname:
+                # Excel uses TREE_OP to request self/children/descendants from [All].
+                # Respect it here instead of always returning both the All member and
+                # every child. Returning the wrong set confuses filter/unselect flows.
+                if tree_op_int:
+                    emit_all = bool(tree_op_int & 8)
+            else:
+                # A specific data member excludes the synthetic All member.
+                emit_all = False
+
+        if emit_all:
+            rows.append({
+                "CATALOG_NAME": name,
+                "CUBE_NAME": name,
+                "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+                "HIERARCHY_UNIQUE_NAME": hier,
+                "LEVEL_UNIQUE_NAME": all_level_uname,
+                "LEVEL_NUMBER": "0",
+                "MEMBER_ORDINAL": "0",
+                "MEMBER_NAME": "All",
+                "MEMBER_UNIQUE_NAME": all_member_uname,
+                "MEMBER_TYPE": "2",  # MDMEMBER_TYPE_ALL
+                "MEMBER_CAPTION": f"All {dname}",
+                "CHILDREN_CARDINALITY": str(len(root_members)),
+                "PARENT_LEVEL": "0",
+                "PARENT_COUNT": "0",
+                "MEMBER_KEY": "All",
+                "IS_PLACEHOLDERMEMBER": "false",
+                "IS_DATAMEMBER": "false",
+            })
+
+        for level_idx, level_name in enumerate(level_names):
+            members = members_by_level.get(level_idx, [])
+            if not members:
+                continue
+            level_uname = f"{hier}.[{level_name}]"
+            # Bug-5431: parent(2)/siblings(4)/ancestors(32) also span levels other
+            # than level_filter, so don't filter them out by level here.
+            _cross_level_tree_op = bool(
+                tree_op_int & 1 or tree_op_int & 16 or tree_op_int & 2
+                or tree_op_int & 4 or tree_op_int & 32
+            )
+            if (
+                level_filter
+                and not (member_filter and tree_op_int and _cross_level_tree_op)
+                and level_filter != level_uname
+            ):
+                continue
+
+            for mem in members:
+                mname = str(mem.get("name", ""))
+                parent_name = str(mem.get("parent") or "")
+                # Bug-3617 (Phase 1/2): resolve the member's ancestor-first key
+                # path ONCE, then use it for BOTH the dual-grammar matcher and the
+                # canonical emit so DISCOVER and the matcher agree on identity.
+                mem_caption = str(mem.get("caption") or mname)
+                mem_key_path = _resolve_member_key_path(
+                    mem, mname, parent_name, level_idx, members_by_level, member_filter,
+                )
+                mem_uname = (
+                    qualify_member_uname(hier, level_name, mem_key_path)
+                    if is_multi_level else f"{hier}.[{mname}]"
+                )
+                matches_self = member_filter_matches(
+                    member_filter,
+                    candidate_hier_bracket=hier,
+                    candidate_level_name=level_name,
+                    candidate_key_path=mem_key_path,
+                    candidate_caption=mem_caption,
+                )
+
+                if member_filter:
+                    if tree_op_int:
+                        want_self = bool(tree_op_int & 8)
+                        want_children = bool(tree_op_int & 1)
+                        want_descendants = bool(tree_op_int & 16)
+                        want_parent = bool(tree_op_int & 2)
+                        want_siblings = bool(tree_op_int & 4)
+                        want_ancestors = bool(tree_op_int & 32)
+                        include = False
+                        if member_filter == all_member_uname:
+                            if want_children and level_idx == 0:
+                                include = True
+                            elif want_descendants and level_idx >= 0:
+                                include = True
+                        else:
+                            if want_self and matches_self:
+                                include = True
+                            elif (want_children or want_descendants) and parsed_member_name:
+                                parent_name = str(mem.get("parent") or "")
+                                if parent_name == parsed_member_name:
+                                    include = True
+                            # Bug-5431: parent / ancestors / siblings via the
+                            # canonical filter key path (filt_path). Each compares
+                            # this candidate's key path to the filter member's.
+                            elif want_parent and filt_path and mem_key_path == list(filt_path[:-1]):
+                                include = True
+                            elif (
+                                want_ancestors and filt_path
+                                and 0 < len(mem_key_path) < len(filt_path)
+                                and list(filt_path[: len(mem_key_path)]) == mem_key_path
+                            ):
+                                include = True
+                            elif (
+                                want_siblings and filt_path
+                                and len(mem_key_path) == len(filt_path)
+                                and mem_key_path[:-1] == list(filt_path[:-1])
+                            ):
+                                include = True
+                        if not include:
+                            continue
+                    elif not matches_self:
+                        continue
+
+                next_level_members = members_by_level.get(level_idx + 1, [])
+                child_count = sum(1 for m in next_level_members if str(m.get("parent") or "") == mname)
+
+                # Bug-3617 (Phase 2): canonical SSAS member identity. MEMBER_UNIQUE_NAME
+                # is the ancestor-qualified key path (built above) — byte-identical to
+                # the SUBTOTAL Execute axis, so a client joining DISCOVER to Execute
+                # sees ONE identity per member and month-4-of-2025 no longer collides
+                # with month-4-of-2026. PARENT_UNIQUE_NAME is the same grammar (the
+                # path minus the member's own key, at the parent level); MEMBER_CAPTION
+                # is the display caption (may differ from the key); MEMBER_KEY is the
+                # member's own deepest key. The dual-grammar matcher (Phase 1) still
+                # accepts the legacy caption form a saved workbook may echo back.
+                if is_multi_level:
+                    parent_idx = len(mem_key_path) - 2
+                    if 0 <= parent_idx < len(level_names):
+                        parent_uname = qualify_member_uname(
+                            hier, level_names[parent_idx], mem_key_path[:-1]
+                        )
+                    else:
+                        parent_uname = all_member_uname
+                else:
+                    # Flat dimension: caption-form parent (original behaviour).
+                    if level_idx == 0 or not parent_name:
+                        parent_uname = all_member_uname
+                    else:
+                        parent_uname = f"{hier}.[{parent_name}]"
+                rows.append({
+                    "CATALOG_NAME": name,
+                    "CUBE_NAME": name,
+                    "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+                    "HIERARCHY_UNIQUE_NAME": hier,
+                    "LEVEL_UNIQUE_NAME": level_uname,
+                    "LEVEL_NUMBER": str(level_idx + 1),
+                    "MEMBER_ORDINAL": str(mem.get("ordinal", 0)),
+                    "MEMBER_NAME": mname,
+                    "MEMBER_UNIQUE_NAME": mem_uname,
+                    "MEMBER_TYPE": "1",  # MDMEMBER_TYPE_REGULAR
+                    "MEMBER_CAPTION": mem_caption,
+                    "CHILDREN_CARDINALITY": str(child_count),
+                    "PARENT_LEVEL": "0" if level_idx == 0 else str(level_idx),
+                    "PARENT_UNIQUE_NAME": parent_uname,
+                    "PARENT_COUNT": "0" if level_idx == 0 else "1",
+                    "MEMBER_KEY": mem_key_path[-1] if mem_key_path else mname,
+                    "IS_PLACEHOLDERMEMBER": "false",
+                    "IS_DATAMEMBER": "false",
+                })
+
+    return rows
+
+
+def _level_for_member(
+    member_name: str,
+    members: list[dict],
+    levels: list[str],
+    hier: str,
+) -> str:
+    """Return the level name for a given member from member data."""
+    for mem in members:
+        if mem["name"] == member_name:
+            return mem.get("level", levels[0] if levels else "")
+    return levels[0] if levels else ""
+
+
+def _rows_measuregroups(catalog: str, measures: list[dict]) -> list[dict]:
+    """MDSCHEMA_MEASUREGROUPS — all measures belong to the "default" group."""
+    return [
+        {
+            "CATALOG_NAME": catalog,
+            "CUBE_NAME": catalog,
+            "MEASUREGROUP_NAME": "default",
+            "DESCRIPTION": "-",
+            "IS_WRITE_ENABLED": "true",
+            "MEASUREGROUP_CAPTION": "default",
+        }
+    ]
+
+
+def _rows_measuregroup_dimensions(
+    catalog: str,
+    dimensions: list[dict],
+    measures: list[dict],
+) -> list[dict]:
+    """MDSCHEMA_MEASUREGROUP_DIMENSIONS — every dimension belongs to "default"."""
+    rows: list[dict] = []
+    for d in dimensions:
+        dname = d.get("name", "")
+
+        for gn in ["default"]:
+            rows.append({
+                "CATALOG_NAME": catalog,
+                "CUBE_NAME": catalog,
+                "MEASUREGROUP_NAME": gn,
+                "MEASUREGROUP_CARDINALITY": "ONE",
+                "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+                "DIMENSION_CARDINALITY": "MANY",
+                "DIMENSION_IS_VISIBLE": "true",
+                "DIMENSION_IS_FACT_DIMENSION": "false",
+                "DIMENSION_GRANULARITY": f"[{dname}].[{dname}]",
+            })
+    return rows
+
+
+def _xe(t): return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+def _rows_md_properties(
+    catalog: str,
+    dimensions: list[dict],
+    measures: list[dict],
+    restrictions: dict[str, list[str]],
+) -> list[dict]:
+    """
+    MDSCHEMA_PROPERTIES — cell and member properties.
+    PROPERTY_TYPE values:
+      1 = MDPROP_MEMBER (intrinsic member properties like KEY, ID)
+      2 = MDPROP_CELL (cell properties like VALUE, FORMAT_STRING)
+    Excel queries both types — we must return the correct type for each query.
+    """
+    name = catalog
+
+    prop_type_filter = (restrictions.get("PROPERTY_TYPE") or [None])[0]
+    hier_filter = (restrictions.get("HIERARCHY_UNIQUE_NAME") or [None])[0]
+    prop_name_filter_vals = restrictions.get("PROPERTY_NAME") or restrictions.get("PropertyName") or []
+    prop_name_filter = {v.strip().upper() for v in prop_name_filter_vals if v and v.strip()}
+
+    member_props = [
+        ("MEMBER_KEY", 130),
+        ("MEMBER_VALUE", 130),
+        ("MEMBER_NAME", 130),
+        ("MEMBER_UNIQUE_NAME", 130),
+        ("MEMBER_CAPTION", 130),
+        ("LEVEL_UNIQUE_NAME", 130),
+        ("LEVEL_NUMBER", 3),
+        ("PARENT_UNIQUE_NAME", 130),
+        ("HIERARCHY_UNIQUE_NAME", 130),
+        ("MEMBER_TYPE", 3),
+        ("MEMBER_ORDINAL", 19),
+        ("CHILDREN_CARDINALITY", 19),
+        ("DISPLAY_INFO", 19),
+    ]
+    cell_props = [
+        ("VALUE", 130), ("FORMAT_STRING", 130), ("LANGUAGE", 19),
+        ("BACK_COLOR", 19), ("FORE_COLOR", 19), ("FONT_FLAGS", 3),
+        ("FONT_SIZE", 5), ("FONT_NAME", 130), ("FORMATTED_VALUE", 130),
+        ("ACTION_TYPE", 3), ("CELL_ORDINAL", 19), ("UPDATEABLE", 11),
+        ("STYLE", 130), ("className", 130),
+    ]
+
+    def _matches_name_filter(prop_name: str) -> bool:
+        if not prop_name_filter:
+            return True
+        return prop_name.upper() in prop_name_filter
+
+    def _member_property_rows() -> list[dict]:
+        rows: list[dict] = []
+        target_dimensions = []
+        for d in dimensions:
+            dname = d.get("name", "")
+            hier = f"[{dname}].[{dname}]"
+            if hier_filter and hier_filter != hier:
+                continue
+            target_dimensions.append((dname, hier, _dimension_level_names(d)))
+
+        if hier_filter and not target_dimensions:
+            dim_match = re.match(r"\[([^\]]+)\]\.\[([^\]]+)\]", hier_filter)
+            if dim_match:
+                dname = dim_match.group(1)
+                target_dimensions.append((dname, hier_filter, [dname]))
+
+        for dname, hier, level_names in target_dimensions:
+            level_unames = [f"{hier}.[(All)]"]
+            level_unames.extend(f"{hier}.[{level_name}]" for level_name in level_names)
+            for level_uname in level_unames:
+                for prop_name, data_type in member_props:
+                    if not _matches_name_filter(prop_name):
+                        continue
+                    rows.append({
+                        "CATALOG_NAME": name,
+                        "CUBE_NAME": name,
+                        "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+                        "HIERARCHY_UNIQUE_NAME": hier,
+                        "LEVEL_UNIQUE_NAME": level_uname,
+                        "MEMBER_UNIQUE_NAME": "",
+                        "PROPERTY_TYPE": "1",
+                        "PROPERTY_NAME": prop_name,
+                        "PROPERTY_CAPTION": prop_name,
+                        "DATA_TYPE": str(data_type),
+                        "DESCRIPTION": "",
+                        "PROPERTY_CONTENT_TYPE": "0",
+                        "PROPERTY_ORIGIN": "1",
+                        "PROPERTY_IS_VISIBLE": "true",
+                    })
+        return rows
+
+    def _cell_property_rows() -> list[dict]:
+        rows: list[dict] = []
+        for prop_name, data_type in cell_props:
+            if not _matches_name_filter(prop_name):
+                continue
+            rows.append({
+                "CATALOG_NAME": name,
+                "CUBE_NAME": name,
+                "DIMENSION_UNIQUE_NAME": "",
+                "HIERARCHY_UNIQUE_NAME": "",
+                "LEVEL_UNIQUE_NAME": "",
+                "MEMBER_UNIQUE_NAME": "",
+                "PROPERTY_TYPE": "2",
+                "PROPERTY_NAME": prop_name,
+                "PROPERTY_CAPTION": prop_name,
+                "DATA_TYPE": str(data_type),
+                "DESCRIPTION": "",
+                "PROPERTY_CONTENT_TYPE": "0",
+                "PROPERTY_ORIGIN": "1",
+                "PROPERTY_IS_VISIBLE": "true",
+            })
+        return rows
+
+    if prop_type_filter == "1":
+        return _member_property_rows()
+    if prop_type_filter == "2":
+        return _cell_property_rows()
+    return _member_property_rows() + _cell_property_rows()
+
+def build_execute_response(catalog_name: str, columns: list[dict[str, Any]], rows: list[list[Any]]) -> str:
+    col_defs = []
+    for i, c in enumerate(columns):
+        cname = c.get("name", f"Col{i}") if isinstance(c, dict) else str(c)
+        col_defs.append({"name": cname, "type": "string", "required": False})
+
+    dict_rows = []
+    for r in rows:
+        row_dict = {}
+        for i, cdef in enumerate(col_defs):
+            val = r[i] if i < len(r) else ""
+            row_dict[cdef["name"]] = str(val) if val is not None else ""
+        dict_rows.append(row_dict)
+
+    return _build_rowset_xml(col_defs, dict_rows)
+
+
+def _rows_sets(catalog: str, named_sets: list[dict[str, Any]]) -> list[dict[str, str]]:
+    rows = []
+    for ns in named_sets:
+        # F-018-13: deprecated sets are already filtered out at the gateway
+        # client (router_client.get_model_named_sets). Surface the governance
+        # state for the rest so BI users can tell a certified set from a draft:
+        # certified/shared sets carry a "[Certified]" marker in the description.
+        description = ns.get("description", "") or ""
+        status = ns.get("certification_status")
+        if status in ("certified", "shared"):
+            marker = "[Certified] "
+            description = (marker + description).strip()
+        rows.append({
+            "CATALOG_NAME": catalog,
+            "SCHEMA_NAME": "",
+            "CUBE_NAME": catalog,
+            "SET_NAME": ns.get("name", ""),
+            "SET_CAPTION": ns.get("display_name") or ns.get("name", ""),
+            "SET_DESCRIPTION": description,
+            "SET_DISPLAY_FOLDER": ns.get("display_folder", ""),
+            "SCOPE": str(ns.get("scope", 1)),
+            "EXPRESSION": ns.get("expression", ""),
+            "DIMENSIONS": ns.get("dimensions", ""),
+            "SET_EVALUATION_CONTEXT": "0",
+        })
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# KPI status expression builder (Bug-5254)
+# ---------------------------------------------------------------------------
+
+# Known RAG colours — kept in sync with model-service kpi_threshold.py.
+_BAD_BAND_COLORS = {"#d32f2f", "#757575"}
+_WARN_BAND_COLORS = {"#f57c00", "#e65100", "#9e9e9e"}
+_GOOD_BAND_COLORS = {"#388e3c", "#1565c0", "#0d47a1"}
+
+
+def _band_status_from_color(color: str) -> int | None:
+    """Map a band colour to RAG status (1 / 0 / -1), or None."""
+    c = (color or "").strip().lower()
+    if c in _BAD_BAND_COLORS:
+        return -1
+    if c in _WARN_BAND_COLORS:
+        return 0
+    if c in _GOOD_BAND_COLORS:
+        return 1
+    return None
+
+
+def _band_status_from_position(index: int, total: int) -> int:
+    """Positional convention: first = worst (-1), last = best (1)."""
+    if total <= 1:
+        return 0
+    if index == 0:
+        return -1
+    if index == total - 1:
+        return 1
+    return 0
+
+
+def _build_kpi_status_expression(
+    kpi_value: str,
+    kpi_goal: str,
+    bands: list[dict[str, Any]] | None,
+    *,
+    direction: str = "higher_is_better",
+    evaluation_type: str = "percentage_of_target",
+) -> str:
+    """Build an MDX CASE expression that maps a KPI value to -1/0/1.
+
+    Bug-5254: when ``presentation_meta.bands`` are present, the
+    expression uses the band boundaries and colours to derive the
+    correct status rather than hard-coding 90 %/110 % thresholds.
+    When bands are absent, a direction-based heuristic is used as
+    the fallback.
+    """
+    if not bands or len(bands) < 2:
+        # Fallback: direction-based heuristic (pre-Bug-5254 behaviour
+        # but still correct for KPIs that lack explicit bands).
+        if direction == "lower_is_better":
+            return (
+                f"CASE WHEN {kpi_value} <= {kpi_goal} THEN 1 "
+                f"WHEN {kpi_value} <= {kpi_goal} * 1.1 THEN 0 ELSE -1 END"
+            )
+        return (
+            f"CASE WHEN {kpi_value} >= {kpi_goal} THEN 1 "
+            f"WHEN {kpi_value} >= {kpi_goal} * 0.9 THEN 0 ELSE -1 END"
+        )
+
+    # Derive status per band: for absolute_value / absolute_variance /
+    # percentage_variance, colour carries intent; for ratio-based types,
+    # position carries intent (first = worst, last = best).
+    use_color = evaluation_type in (
+        "absolute_value", "absolute_variance", "percentage_variance",
+    )
+    statuses: list[int] = []
+    for i, b in enumerate(bands):
+        if use_color:
+            s = _band_status_from_color(b.get("color", ""))
+            if s is None:
+                s = _band_status_from_position(i, len(bands))
+            statuses.append(s)
+        else:
+            statuses.append(_band_status_from_position(i, len(bands)))
+
+    # For absolute_value evaluation, the MDX expression compares the KPI
+    # value directly against band boundaries. For ratio-based evaluation,
+    # it compares value/goal (as a percentage of target).
+    if evaluation_type == "absolute_value":
+        val_expr = kpi_value
+    else:
+        # percentage_of_target: ratio = value / goal * 100
+        val_expr = f"({kpi_value} / {kpi_goal} * 100)"
+
+    # Build a CASE WHEN chain from the bands. Bands are ordered by
+    # ascending min so we test them in order, matching [min, max).
+    clauses: list[str] = []
+    for i, b in enumerate(bands):
+        b_min = b.get("min")
+        b_max = b.get("max")
+        status = statuses[i]
+        if b_min is None and b_max is None:
+            # Catch-all band — will be the ELSE
+            continue
+        if b_min is None:
+            clauses.append(f"WHEN {val_expr} < {b_max} THEN {status}")
+        elif b_max is None:
+            clauses.append(f"WHEN {val_expr} >= {b_min} THEN {status}")
+        else:
+            clauses.append(
+                f"WHEN {val_expr} >= {b_min} AND {val_expr} < {b_max} "
+                f"THEN {status}"
+            )
+
+    # Find the catch-all (open-ended) band for the ELSE clause, or
+    # default to 0 (warning).
+    catch_all_status = 0
+    for i, b in enumerate(bands):
+        if b.get("min") is None and b.get("max") is None:
+            catch_all_status = statuses[i]
+            break
+
+    if not clauses:
+        # Degenerate: all bands are catch-all. Return a constant.
+        return str(catch_all_status)
+
+    return f"CASE {' '.join(clauses)} ELSE {catch_all_status} END"
+
+
+def _rows_kpis(
+    catalog: str, kpis: list[dict[str, Any]], measures: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """MDSCHEMA_KPIS — one row per KPI.
+
+    Supports both v2 expression-based KPIs and legacy measure-reference KPIs.
+    For v2 KPIs the expression is emitted directly as KPI_VALUE. For legacy
+    KPIs the value/goal measure names are wrapped in [Measures].[...] syntax.
+    Composite KPIs populate KPI_PARENT_KPI_NAME for child KPIs.
+    """
+    measure_map = {str(m.get("id", "")): m for m in measures}
+    # Build KPI name lookup for parent references
+    kpi_name_map = {str(k.get("id", "")): k.get("name", "") for k in kpis}
+    rows = []
+    for kpi in kpis:
+        kpi_name = kpi.get("name", "")
+        # v2 expression path
+        expression = kpi.get("expression") or ""
+        if expression:
+            # F-017-23: emit a real MDX member reference, not the Tessallite DSL
+            # string. Tessallite exposes each KPI as a queryable measure column
+            # named "[KPI] <name>" (inline KPI columns / $KPIs), so the member
+            # path is [Measures].[[KPI] <name>]. Excel KPI consumers can resolve
+            # this; the raw DSL string was non-executable decorative metadata.
+            kpi_value = f"[Measures].[[KPI] {kpi_name}]" if kpi_name else ""
+        else:
+            # Legacy path: reference value measure
+            value_m = measure_map.get(str(kpi.get("value_measure_id", "")), {})
+            kpi_value = f"[Measures].[{value_m.get('name', '')}]" if value_m else ""
+
+        # Goal / target
+        target_type = kpi.get("target_type") or ""
+        target_value = kpi.get("target_value")
+        if target_type == "static" and target_value is not None:
+            kpi_goal = str(target_value)
+        elif target_type in ("measure", "expression"):
+            target_expr = kpi.get("target_expression") or ""
+            kpi_goal = target_expr if target_expr else ""
+        else:
+            # Legacy path: reference goal measure
+            goal_m = measure_map.get(str(kpi.get("goal_measure_id", "")), {})
+            kpi_goal = f"[Measures].[{goal_m.get('name', '')}]" if goal_m else ""
+
+        # Composite parent reference
+        parent_id = kpi.get("parent_kpi_id")
+        parent_name = kpi_name_map.get(str(parent_id), "") if parent_id else ""
+
+        # Presentation type for status/trend graphics. Map each Tessallite
+        # presentation type to the closest standard Excel KPI status graphic so
+        # the metadata BI clients read agrees with what the UI renders
+        # (Bug-5343: previously every non-gauge/bullet type defaulted to
+        # "Traffic Light", advertising a graphic the UI did not draw).
+        ptype = kpi.get("presentation_type") or ""
+        status_graphic_map = {
+            "traffic_light": "Traffic Light",
+            "gauge": "Gauge",
+            "reverse_gauge": "Gauge",
+            "speedometer": "Gauge",
+            "progress_ring": "Cylinder",
+            "thermometer": "Thermometer",
+            "bullet_chart": "Gauge",
+            "rag_bar": "Shapes",
+        }
+        status_graphic = status_graphic_map.get(ptype, "Traffic Light")
+        trend_graphic = "Standard Arrow"
+
+        # F-017-23 + Bug-5254: build a direction-aware MDX status CASE
+        # expression from the KPI's v2 threshold bands (stored in
+        # ``presentation_meta.bands``). Falls back to the stored legacy
+        # expression when present, or to a direction-based heuristic when
+        # no bands are defined.
+        legacy_status = kpi.get("status_expression") or ""
+        legacy_trend = kpi.get("trend_expression") or ""
+        kpi_status = legacy_status
+        kpi_trend = legacy_trend
+        if not legacy_status and kpi_value and kpi_goal:
+            pmeta = kpi.get("presentation_meta") or {}
+            bands = pmeta.get("bands")
+            kpi_status = _build_kpi_status_expression(
+                kpi_value, kpi_goal, bands,
+                direction=kpi.get("direction") or "higher_is_better",
+                evaluation_type=pmeta.get("evaluation_type") or "percentage_of_target",
+            )
+
+        rows.append({
+            "CATALOG_NAME": catalog,
+            "SCHEMA_NAME": "",
+            "CUBE_NAME": catalog,
+            "MEASUREGROUP_NAME": "default",
+            "KPI_NAME": kpi.get("name", ""),
+            "KPI_CAPTION": kpi.get("display_name") or kpi.get("name", ""),
+            "KPI_DESCRIPTION": kpi.get("description", ""),
+            "KPI_DISPLAY_FOLDER": kpi.get("display_folder", ""),
+            "KPI_VALUE": kpi_value,
+            "KPI_GOAL": kpi_goal,
+            "KPI_STATUS": kpi_status,
+            "KPI_TREND": kpi_trend,
+            "KPI_STATUS_GRAPHIC": status_graphic,
+            "KPI_TREND_GRAPHIC": trend_graphic,
+            "KPI_WEIGHT": str(kpi.get("weight", "")) if kpi.get("weight") is not None else "",
+            "KPI_CURRENT_TIME_MEMBER": "",
+            "KPI_PARENT_KPI_NAME": parent_name,
+            "ANNOTATIONS": "",
+            "UNARY_OPERATOR": "",
+            "ASSOCIATE_MEASURE_GROUP_NAME": "default",
+        })
+    return rows

@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tessallite Help</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="index.html" class="logo">Tessallite Help</a>
+  </header>
+
+  <main class="article">
+    <div class="article-meta">
+      <span class="audience-badge">All users</span>
+      <span class="updated">Updated 2026-05-15</span>
+    </div>
+
+    <h1>Tessallite Help</h1>
+    <p>This library documents Tessallite: what it is, how to connect BI tools, how to build models, how the conversational agent works, and how to administer the platform. It covers the full product surface, from the Workspace Explorer and Model Builder to system configuration, BI integrations, and troubleshooting.</p>
+    <h2>Who this library is for</h2>
+
+    <div class="audience-grid">
+      <div class="audience-card">
+        <h3>Analyst</h3>
+        <p>Connects BI tools to Tessallite and queries deployed models. Start with <a href="getting-started/what-is-tessallite.html">What is Tessallite</a>, <a href="getting-started/workspace-explorer.html">Workspace Explorer</a>, and <a href="getting-started/connect-a-bi-tool.html">Connect a BI tool</a>.</p>
+      </div>
+      <div class="audience-card">
+        <h3>Modeller</h3>
+        <p>Builds and maintains semantic models: sources, joins, measures, dimensions, calendars, aggregates, security, lineage, and diagnostics. Start with <a href="concepts/projects-and-models.html">Projects and models</a>.</p>
+      </div>
+      <div class="audience-card">
+        <h3>Tenant Admin</h3>
+        <p>Manages users, roles, SSO, webhooks, audit views, project settings, and agent configuration for one workspace. Start with <a href="admin/manage-users.html">Manage users</a>.</p>
+      </div>
+      <div class="audience-card">
+        <h3>System Admin</h3>
+        <p>Deploys and operates the Tessallite platform. Start with <a href="system-admin/architecture-overview.html">Architecture overview</a>, <a href="system-admin/deploy-local.html">Deploy locally</a>, or <a href="system-admin/system-configuration.html">System configuration</a>.</p>
+      </div>
+    </div>
+    <h2>Getting Started</h2>
+    <p>Start here. These articles take a new user from first sign-in to an understood workspace and connected BI tool.</p>
+    <div class="section-nav">
+      <a href="getting-started/what-is-tessallite.html" class="nav-card">
+        <h3>What is Tessallite</h3>
+        <p>What the platform does and what problem it solves.</p>
+      </a>
+      <a href="getting-started/how-tessallite-works.html" class="nav-card">
+        <h3>How Tessallite Works</h3>
+        <p>The query path from BI tool to result, and how aggregates are built.</p>
+      </a>
+      <a href="getting-started/first-time-setup.html" class="nav-card">
+        <h3>First-Time Setup</h3>
+        <p>Sign in, create a workspace, and prepare the first tenant user.</p>
+      </a>
+      <a href="getting-started/welcome-wizard.html" class="nav-card">
+        <h3>Welcome Wizard</h3>
+        <p>Understand the guided onboarding flow and when to relaunch it.</p>
+      </a>
+      <a href="getting-started/workspace-explorer.html" class="nav-card">
+        <h3>Workspace Explorer</h3>
+        <p>Navigate projects, model cards, project settings, imports, exports, and agent entry points.</p>
+      </a>
+      <a href="getting-started/acme-demo-tenant.html" class="nav-card">
+        <h3>Demo tenant: acme-demo</h3>
+        <p>Explore the seeded workspace used by the screenshots and examples.</p>
+      </a>
+      <a href="getting-started/install-local.html" class="nav-card">
+        <h3>Install Tessallite Locally</h3>
+        <p>Deploy Tessallite on your machine using Docker Compose.</p>
+      </a>
+      <a href="getting-started/install-gcp.html" class="nav-card">
+        <h3>Deploy Tessallite to Google Cloud Platform</h3>
+        <p>Deploy Tessallite to Google Cloud Platform using Cloud Run.</p>
+      </a>
+      <a href="getting-started/connect-a-bi-tool.html" class="nav-card">
+        <h3>Connect a BI Tool via JDBC</h3>
+        <p>Connect DBeaver, Tableau, Power BI, or any PostgreSQL-compatible client.</p>
+      </a>
+      <a href="getting-started/connect-excel.html" class="nav-card">
+        <h3>Connect Excel via XMLA</h3>
+        <p>Connect Microsoft Excel via XMLA and build a pivot table.</p>
+      </a>
+      <a href="getting-started/tessallite-features.html" class="nav-card">
+        <h3>Tessallite Features</h3>
+        <p>Complete reference of every feature with descriptions and where to find it.</p>
+      </a>
+    </div>
+    <h2>Core Concepts</h2>
+    <p>Core ideas behind Tessallite. Read this section before building or governing models.</p>
+    <ul>
+      <li><a href="concepts/workspaces-and-tenants.html">Workspaces and Tenants</a></li>
+      <li><a href="concepts/projects-and-models.html">Projects and Models</a></li>
+      <li><a href="concepts/sources-tables-and-joins.html">Sources, Tables, and Joins</a></li>
+      <li><a href="concepts/dimensions-and-measures.html">Dimensions and Measures</a></li>
+      <li><a href="concepts/aggregates.html">Aggregates</a></li>
+      <li><a href="concepts/query-routing.html">Query Routing</a></li>
+      <li><a href="concepts/model-health.html">Model Health</a></li>
+      <li><a href="concepts/roles-and-permissions.html">Roles and Permissions</a></li>
+      <li><a href="concepts/calendar-types.html">Calendar Types</a></li>
+      <li><a href="concepts/kpis.html">KPIs (Key Performance Indicators)</a></li>
+    </ul>
+    <h2>Modelling</h2>
+    <p>Step-by-step walkthroughs for every major task in Model Builder.</p>
+    <ul>
+      <li><a href="modelling/create-a-project.html">Create a Project</a></li>
+      <li><a href="modelling/manage-connections.html">Manage Connections</a></li>
+      <li><a href="modelling/add-a-data-source.html">Add a Data Source</a></li>
+      <li><a href="modelling/add-tables-to-a-model.html">Add Tables to a Model</a></li>
+      <li><a href="modelling/source-statistics.html">Source Statistics</a></li>
+      <li><a href="modelling/table-auto-analysis.html">Table Auto-Analysis</a></li>
+      <li><a href="modelling/model-canvas-tour.html">Model Canvas Tour</a></li>
+      <li><a href="modelling/canvas-undo-redo.html">Canvas Undo/Redo</a></li>
+      <li><a href="modelling/define-joins.html">Define Joins</a></li>
+      <li><a href="modelling/define-hierarchies.html">Define Hierarchies</a></li>
+      <li><a href="modelling/define-dimensions.html">Define Dimensions</a></li>
+      <li><a href="modelling/dimension-aliases.html">Dimension Aliases</a></li>
+      <li><a href="modelling/business-glossary.html">Business Glossary</a></li>
+      <li><a href="modelling/define-measures.html">Define Measures</a></li>
+      <li><a href="modelling/semi-additive-measures.html">Semi-Additive Measures</a></li>
+      <li><a href="modelling/calculated-measures.html">Calculated Measures</a></li>
+      <li><a href="modelling/configure-time-variants.html">Configure Time Variants</a></li>
+      <li><a href="modelling/configure-calendar-table.html">Configure Calendar Table</a></li>
+      <li><a href="modelling/associate-calendar-with-dimensions.html">Associate Calendar with Dimensions</a></li>
+      <li><a href="modelling/multi-calendar-best-practices.html">Multi-Calendar Best Practices</a></li>
+      <li><a href="modelling/measure-query-panel.html">Measure Query Panel</a></li>
+      <li><a href="modelling/pivot-conditional-formatting.html">Pivot Conditional Formatting</a></li>
+      <li><a href="modelling/query-panel.html">Query Panel</a></li>
+      <li><a href="querying/live-vs-aggregate.html">Live vs Aggregate</a></li>
+      <li><a href="modelling/drill-through.html">Drill-through</a></li>
+      <li><a href="modelling/curate-drill-through.html">Curate drill-through</a></li>
+      <li><a href="modelling/set-a-query-target.html">Set a Query Target</a></li>
+      <li><a href="modelling/configure-aggregates.html">Configure Aggregates</a></li>
+      <li><a href="modelling/predictive-aggregates.html">Predictive Aggregates</a></li>
+      <li><a href="modelling/aggregate-lifecycle.html">Aggregate Lifecycle</a></li>
+      <li><a href="modelling/cold-start-latency.html">Cold-start Latency</a></li>
+      <li><a href="modelling/configure-pocket-tables.html">Configure Pocket Tables</a></li>
+      <li><a href="modelling/run-a-refresh.html">Run a Refresh</a></li>
+      <li><a href="modelling/manage-aggregate-schedules.html">Manage Aggregate Schedules</a></li>
+      <li><a href="modelling/scheduler-dependencies.html">Scheduler Dependencies</a></li>
+      <li><a href="modelling/use-the-ai-optimiser.html">Use the AI Optimiser</a></li>
+      <li><a href="modelling/usage-analytics.html">Usage Analytics</a></li>
+      <li><a href="modelling/configure-row-security.html">Configure Row Security</a></li>
+      <li><a href="modelling/data-tags.html">Data Tags</a></li>
+      <li><a href="modelling/column-level-security.html">Column-Level Security</a></li>
+      <li><a href="modelling/configure-personas.html">Configure Personas</a></li>
+      <li><a href="modelling/parameterized-filters.html">Parameterized Filters</a></li>
+      <li><a href="modelling/data-quality-rules.html">Data Quality Rules</a></li>
+      <li><a href="modelling/impact-analysis.html">Impact Analysis</a></li>
+      <li><a href="modelling/named-sets.html">Named Lists (Named Sets)</a></li>
+      <li><a href="modelling/kpis.html">KPIs</a></li>
+      <li><a href="modelling/data-preview.html">Data Preview</a></li>
+      <li><a href="modelling/schema-changes.html">Schema Changes</a></li>
+      <li><a href="modelling/view-model-lineage.html">View Model Lineage</a></li>
+      <li><a href="modelling/view-diagnostics.html">View Diagnostics</a></li>
+      <li><a href="modelling/save-and-version-a-model.html">Save and Version a Model</a></li>
+      <li><a href="modelling/deploy-a-model.html">Deploy a Model</a></li>
+      <li><a href="modelling/export-and-import-a-model.html">Export and Import a Model</a></li>
+      <li><a href="modelling/export-and-import-a-project.html">Export and Import a Project</a></li>
+      <li><a href="modelling/import-from-dbt.html">Import from dbt</a></li>
+      <li><a href="modelling/import-from-semantic-layer.html">Import from a Semantic Layer Tool</a></li>
+      <li><a href="modelling/model-templates.html">Model Templates</a></li>
+      <li><a href="modelling/model-translations.html">Model Translations (i18n)</a></li>
+      <li><a href="modelling/model-details.html">Model Details</a></li>
+    </ul>
+    <h2>Conversational Agent</h2>
+    <p>Project-level conversational agent setup, scoping, quality control, recipes, and logs.</p>
+    <ul>
+      <li><a href="agent/agent-chat.html">Agent Chat</a></li>
+      <li><a href="agent/configure-agent.html">Configure your project agent</a></li>
+      <li><a href="agent/project-personas.html">Project-Level Personas</a></li>
+      <li><a href="agent/glossary-alias-map.html">Author the glossary alias map</a></li>
+      <li><a href="agent/write-a-judge-rubric.html">Write a judge rubric</a></li>
+      <li><a href="agent/cross-model-recipes.html">Cross-model calculation recipes</a></li>
+      <li><a href="agent/agent-log-screen.html">Agent log screen</a></li>
+      <li><a href="agent/session-memory.html">Agent Session Memory</a></li>
+      <li><a href="agent/agent-export.html">Agent Conversation Export</a></li>
+      <li><a href="agent/agent-stop-button.html">Agent Stop Button</a></li>
+    </ul>
+    <h2>Admin</h2>
+    <p>Workspace administration: users, roles, settings, SSO, webhooks, audit trails, and operational policies.</p>
+    <ul>
+      <li><a href="admin/create-a-workspace.html">Create a Workspace</a></li>
+      <li><a href="admin/manage-users.html">Manage Users</a></li>
+      <li><a href="admin/manage-roles.html">Manage Roles</a></li>
+      <li><a href="admin/rbac-model-scoped.html">Model-Scoped RBAC</a></li>
+      <li><a href="admin/workspace-settings.html">Workspace Settings</a></li>
+      <li><a href="admin/project-settings.html">Project Settings</a></li>
+      <li><a href="admin/model-configuration.html">Model Configuration</a></li>
+      <li><a href="admin/audit-log.html">Audit Log</a></li>
+      <li><a href="admin/query-log.html">Query Log</a></li>
+      <li><a href="admin/alert-configuration.html">Alert Configuration</a></li>
+      <li><a href="admin/sso-configuration.html">SSO Configuration</a></li>
+      <li><a href="admin/group-mappings.html">SSO Group Mappings</a></li>
+      <li><a href="admin/webhooks.html">Webhooks</a></li>
+      <li><a href="admin/security-audit-trail.html">Security Audit Trail</a></li>
+      <li><a href="admin/scheduler-sla.html">Refresh SLA Declarations</a></li>
+    </ul>
+    <h2>System Admin</h2>
+    <p>Platform deployment, configuration, service operation, credentials, and upgrade procedures.</p>
+    <ul>
+      <li><a href="system-admin/architecture-overview.html">Architecture Overview</a></li>
+      <li><a href="system-admin/deploy-local.html">Deploy Locally</a></li>
+      <li><a href="system-admin/deploy-gcp.html">Deploy on GCP</a></li>
+      <li><a href="system-admin/configure-environment-variables.html">Configure Environment Variables</a></li>
+      <li><a href="system-admin/system-configuration.html">System Configuration</a></li>
+      <li><a href="system-admin/credentials-and-env.html">Credentials and the .env File</a></li>
+      <li><a href="system-admin/service-reference.html">Service Reference</a></li>
+      <li><a href="system-admin/teardown.html">Teardown</a></li>
+      <li><a href="system-admin/upgrade.html">Upgrade</a></li>
+      <li><a href="system-admin/monitoring-stack.html">Monitoring Stack (Prometheus &amp; Grafana)</a></li>
+    </ul>
+    <h2>Integrations</h2>
+    <p>Connection guides and API references for BI tools and programmatic clients.</p>
+    <ul>
+      <li><a href="integrations/jdbc-connection-guide.html">JDBC Connection Guide</a></li>
+      <li><a href="integrations/looker-studio-connection-guide.html">Looker Studio Direct Connection</a></li>
+      <li><a href="integrations/looker-studio-via-looker-guide.html">Optional Looker-hosted LookML Workflow</a></li>
+      <li><a href="integrations/lookml-emitter-guide.html">LookML Emitter</a></li>
+      <li><a href="integrations/excel-xmla-connection-guide.html">Excel XMLA Connection Guide</a></li>
+      <li><a href="integrations/excel-pivottable-features.html">Excel PivotTable Features</a></li>
+      <li><a href="integrations/excel-add-in.html">Tessallite Excel Add-in</a></li>
+      <li><a href="integrations/named-list-mdx-composition.html">Named List MDX Composition</a></li>
+      <li><a href="integrations/named-list-parameterisation.html">Named List Parameterisation</a></li>
+      <li><a href="integrations/powerbi-connection-guide.html">Power BI Connection Guide</a></li>
+      <li><a href="integrations/bi-compatibility.html">BI Tool Compatibility Matrix</a></li>
+      <li><a href="integrations/supported-data-sources.html">Supported Data Sources</a></li>
+      <li><a href="integrations/api-authentication.html">API Authentication</a></li>
+      <li><a href="integrations/api-reference.html">API Reference</a></li>
+      <li><a href="integrations/headless-api.html">Headless API</a></li>
+      <li><a href="integrations/embed-api.html">Embed API</a></li>
+      <li><a href="integrations/embed-agent-chat.html">Embed Agent Chat</a></li>
+      <li><a href="integrations/mcp-server.html">MCP Server (Model Context Protocol)</a></li>
+      <li><a href="integrations/solidatus-integration.html">Solidatus Integration</a></li>
+      <li><a href="integrations/collibra-integration.html">Collibra Integration</a></li>
+    </ul>
+    <h2>Troubleshooting</h2>
+    <p>Diagnostic guidance for common connection, query, refresh, and service problems.</p>
+    <ul>
+      <li><a href="troubleshooting/excel-connection-problems.html">Excel Connection Problems</a></li>
+      <li><a href="troubleshooting/query-returns-wrong-results.html">Query Returns Wrong Results</a></li>
+      <li><a href="troubleshooting/field-compatibility-warnings.html">Field Compatibility Warnings</a></li>
+      <li><a href="troubleshooting/aggregates-not-building.html">Aggregates Not Building</a></li>
+      <li><a href="troubleshooting/service-not-starting.html">Service Not Starting</a></li>
+      <li><a href="troubleshooting/common-errors.html">Common Errors</a></li>
+    </ul>
+  </main>
+
+  <nav class="page-nav">
+    <span class="page-nav-btn prev disabled"></span>
+    <span class="page-nav-btn home disabled">Home</span>
+    <a href="getting-started/what-is-tessallite.html" class="page-nav-btn next">What is Tessallite &rarr;</a>
+  </nav>
+
+  <footer class="site-footer">
+    <p>Tessallite Help — <a href="index.html">Back to contents</a></p>
+  </footer>
+</body>
+</html>

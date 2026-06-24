@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<OfficeApp
+  xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+  xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
+  xsi:type="TaskPaneApp">
+
+  <Id>e3ae536b-1d2f-44fd-bdc4-e01b5a7597d2</Id>
+  <Version>1.0.0.1</Version>
+  <ProviderName>Tessallite</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="Tessallite"/>
+  <Description DefaultValue="Governed semantic layer insights inside Excel."/>
+
+  <IconUrl DefaultValue="https://cloud.tessallite.io/excel-plugin/assets/icon-32.png"/>
+  <HighResolutionIconUrl DefaultValue="https://cloud.tessallite.io/excel-plugin/assets/icon-80.png"/>
+
+  <SupportUrl DefaultValue="https://cloud.tessallite.io/help/excel-plugin.html"/>
+
+  <AppDomains>
+    <AppDomain>https://cloud.tessallite.io</AppDomain>
+  </AppDomains>
+
+  <Hosts>
+    <Host Name="Workbook"/>
+  </Hosts>
+
+  <DefaultSettings>
+    <SourceLocation DefaultValue="https://cloud.tessallite.io/excel-plugin/index.html"/>
+  </DefaultSettings>
+
+  <Permissions>ReadWriteDocument</Permissions>
+
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Hosts>
+      <Host xsi:type="Workbook">
+        <AllFormFactors>
+          <ExtensionPoint xsi:type="CustomFunctions">
+            <CustomFunctions>
+              <Page>
+                <SourceLocation resid="Functions.Page.Url"/>
+              </Page>
+              <Metadata>
+                <SourceLocation resid="Functions.Metadata.Url"/>
+              </Metadata>
+              <Namespace resid="Functions.Namespace"/>
+            </CustomFunctions>
+          </ExtensionPoint>
+        </AllFormFactors>
+        <DesktopFormFactor>
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="Tessallite.Group">
+                <Label resid="GroupLabel"/>
+                <Icon>
+                  <bt:Image size="16" resid="Icon16"/>
+                  <bt:Image size="32" resid="Icon32"/>
+                  <bt:Image size="80" resid="Icon80"/>
+                </Icon>
+                <Control xsi:type="Button" id="Tessallite.OpenPane">
+                  <Label resid="OpenPane.Label"/>
+                  <Supertip>
+                    <Title resid="OpenPane.Label"/>
+                    <Description resid="OpenPane.Tooltip"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Icon16"/>
+                    <bt:Image size="32" resid="Icon32"/>
+                    <bt:Image size="80" resid="Icon80"/>
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>TessallitePane</TaskpaneId>
+                    <SourceLocation resid="Taskpane.Url"/>
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+
+    <Resources>
+      <bt:Images>
+        <bt:Image id="Icon16" DefaultValue="https://cloud.tessallite.io/excel-plugin/assets/icon-16.png"/>
+        <bt:Image id="Icon32" DefaultValue="https://cloud.tessallite.io/excel-plugin/assets/icon-32.png"/>
+        <bt:Image id="Icon80" DefaultValue="https://cloud.tessallite.io/excel-plugin/assets/icon-80.png"/>
+      </bt:Images>
+      <bt:Urls>
+        <bt:Url id="Taskpane.Url" DefaultValue="https://cloud.tessallite.io/excel-plugin/index.html"/>
+        <bt:Url id="Functions.Page.Url" DefaultValue="https://cloud.tessallite.io/excel-plugin/functions.html"/>
+        <bt:Url id="Functions.Metadata.Url" DefaultValue="https://cloud.tessallite.io/excel-plugin/functions.json"/>
+      </bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="GroupLabel" DefaultValue="Tessallite"/>
+        <bt:String id="OpenPane.Label" DefaultValue="Tessallite"/>
+        <bt:String id="Functions.Namespace" DefaultValue="TESS"/>
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="OpenPane.Tooltip" DefaultValue="Open Tessallite panel."/>
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>

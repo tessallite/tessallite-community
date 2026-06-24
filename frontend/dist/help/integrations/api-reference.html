@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API Reference — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>API Reference</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-04</span></div>
+    <h1>API Reference</h1>
+<h2>What this covers</h2>
+<p>REST API endpoint reference for Tessallite. All endpoints require HTTP Basic authentication unless stated otherwise. See <a href="api-authentication.html">API Authentication</a> for credential and role details.</p>
+<p><strong>Base URL</strong>: <code>http://HOST:3000/api/v1</code></p>
+<blockquote>REST API endpoint paths are subject to change between major versions. Check release notes when upgrading across major versions.</blockquote>
+<h2>Health</h2>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Path</th><th>Auth required</th><th>Description</th></tr></thead><tbody><tr><td><code>GET</code></td><td><code>/health</code></td><td>No</td><td>Returns <code>{&quot;status&quot;:&quot;ok&quot;,&quot;db_migration&quot;:&quot;N&quot;}</code>. Use to verify the Frontend service is reachable.</td></tr></tbody></table></div>
+<h2>Workspaces</h2>
+<p>System Admin only.</p>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Path</th><th>Auth required</th><th>Description</th></tr></thead><tbody><tr><td><code>GET</code></td><td><code>/workspaces</code></td><td>System Admin</td><td>List all workspaces</td></tr><tr><td><code>POST</code></td><td><code>/workspaces</code></td><td>System Admin</td><td>Create a workspace. Body: <code>{&quot;slug&quot;:&quot;acme&quot;,&quot;display_name&quot;:&quot;Acme Corp&quot;,&quot;admin_email&quot;:&quot;admin@acme.com&quot;}</code></td></tr><tr><td><code>GET</code></td><td><code>/workspaces/{slug}</code></td><td>System Admin</td><td>Get workspace details</td></tr><tr><td><code>DELETE</code></td><td><code>/workspaces/{slug}</code></td><td>System Admin</td><td>Delete workspace (irreversible — removes all projects, models, and aggregates)</td></tr></tbody></table></div>
+<h2>Projects</h2>
+<p>Tenant Admin or Modeller.</p>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Path</th><th>Auth required</th><th>Description</th></tr></thead><tbody><tr><td><code>GET</code></td><td><code>/workspaces/{slug}/projects</code></td><td>Tenant Admin or Modeller</td><td>List all projects in the workspace</td></tr><tr><td><code>POST</code></td><td><code>/workspaces/{slug}/projects</code></td><td>Tenant Admin</td><td>Create a new project</td></tr><tr><td><code>GET</code></td><td><code>/workspaces/{slug}/projects/{id}</code></td><td>Tenant Admin or Modeller</td><td>Get project details</td></tr><tr><td><code>DELETE</code></td><td><code>/workspaces/{slug}/projects/{id}</code></td><td>Tenant Admin</td><td>Delete project and all its models and aggregates</td></tr></tbody></table></div>
+<h2>Aggregates and diagnostics</h2>
+<p>Modeller or higher.</p>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Path</th><th>Auth required</th><th>Description</th></tr></thead><tbody><tr><td><code>GET</code></td><td><code>/workspaces/{slug}/projects/{id}/aggregates</code></td><td>Modeller</td><td>List aggregates with status (Ready, Building, Stale, Error)</td></tr><tr><td><code>POST</code></td><td><code>/workspaces/{slug}/projects/{id}/aggregates/{agg_id}/refresh</code></td><td>Modeller</td><td>Trigger immediate aggregate refresh (async; poll GET aggregates to check status)</td></tr><tr><td><code>GET</code></td><td><code>/workspaces/{slug}/projects/{id}/diagnostics</code></td><td>Modeller</td><td>Get model health diagnostics (schema drift, permission errors, build failures)</td></tr></tbody></table></div>
+<h2>Model definition</h2>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Path</th><th>Auth required</th><th>Description</th></tr></thead><tbody><tr><td><code>GET</code></td><td><code>/workspaces/{slug}/projects/{id}/model</code></td><td>Modeller</td><td>Get model definition: tables, joins, dimensions, measures</td></tr></tbody></table></div>
+<h2>Headless API (query-router)</h2>
+<p>JSON-in, JSON-out query interface for non-SQL clients. Base URL for headless: <code>http://HOST:3000/query-router/api/v1/headless</code>.</p>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Path</th><th>Auth required</th><th>Description</th></tr></thead><tbody><tr><td><code>POST</code></td><td><code>/query</code></td><td>JWT</td><td>Execute a semantic query. Body: <code>{project_id, model_id, measures, dimensions, filters, limit, offset, order_by}</code>. Returns <code>{columns, rows, total_rows, query_id}</code>.</td></tr><tr><td><code>GET</code></td><td><code>/models</code></td><td>JWT</td><td>List all models accessible to the caller&#x27;s tenant.</td></tr><tr><td><code>GET</code></td><td><code>/models/{model_id}/measures</code></td><td>JWT</td><td>List measures in a model with name, display_name, format, aggregation_type, variant_kind.</td></tr><tr><td><code>GET</code></td><td><code>/models/{model_id}/dimensions</code></td><td>JWT</td><td>List dimensions in a model with name, display_name, is_time_dim.</td></tr></tbody></table></div>
+<p>Rate limit: 100 requests/minute per tenant (configurable via <code>HEADLESS_RATE_LIMIT</code> env var). Returns <code>429 Too Many Requests</code> when exceeded. All responses include the <code>X-RateLimit-Remaining</code> header.</p>
+<p>See <a href="headless-api.html">Headless API</a> for full documentation with worked examples.</p>
+<h2>Related</h2>
+<ul><li><a href="api-authentication.html">API Authentication</a></li><li><a href="headless-api.html">Headless API</a></li><li><a href="supported-data-sources.html">Supported Data Sources</a></li><li><a href="../troubleshooting/common-errors.html">Common Errors</a></li></ul>
+<nav class="page-nav"><a href="api-authentication.html" class="page-nav-btn prev">&larr; API Authentication</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="headless-api.html" class="page-nav-btn next">Headless API &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

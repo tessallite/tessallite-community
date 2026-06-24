@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Welcome Wizard — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Getting Started</span> / <span>Welcome Wizard</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">all</span><span class="updated">Updated 2026-05-04</span></div>
+    <h1>Welcome Wizard</h1>
+<h2>What this covers</h2>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/welcome-wizard-live.png" alt="Live Welcome route as rendered in the deployed acme-demo application."></figure>
+<p>The welcome wizard is a guided first-time setup flow that walks new users through the core steps of using Tessallite: connecting a data source, building a model, running a query, and connecting a BI tool. This article explains what each step covers, when to skip, and how to relaunch the wizard later.</p>
+<h2>When it appears</h2>
+<p>The wizard appears automatically the first time a user logs in. After completing or skipping it, it does not appear again on login. You can relaunch it at any time from the user menu.</p>
+<h2>The five steps</h2>
+<h3>1. Welcome</h3>
+<p>An overview of Tessallite&#x27;s core concepts: projects, models, connections, measures, and dimensions. Provides context for the steps that follow.</p>
+<h3>2. Add Sources</h3>
+<p>Guidance on adding data source connections to a project. Covers where to find the connection dialog, what credentials are needed, and how to verify the connection.</p>
+<h3>3. Build Model</h3>
+<p>Guidance on creating a semantic model: adding tables, defining measures and dimensions, setting up joins. Introduces the Model Builder canvas.</p>
+<h3>4. Run Query</h3>
+<p>Guidance on running a query using the Measure Query Panel or by connecting a BI tool. Explains how to verify that the model returns correct results.</p>
+<h3>5. Connect BI Tool</h3>
+<p>Guidance on connecting external BI tools (Excel, Power BI, DBeaver, Tableau) to Tessallite via JDBC or XMLA. Shows the connection strings for the current environment.</p>
+<h2>Skipping steps</h2>
+<p>Each step has a <strong>Skip</strong> button that advances to the next step without performing any action. There is also a <strong>Skip All</strong> link that completes the wizard immediately.</p>
+<p><strong>When it is OK to skip:</strong></p>
+<ul><li>Experienced users who already understand the platform and want to get started immediately.</li><li>Users who have already set up their environment and just need to clear the first-login prompt.</li></ul>
+<p><strong>When skipping may cause confusion:</strong></p>
+<ul><li>First-time users who skip and then don&#x27;t know where to find the data source dialog or model builder. The wizard provides context for navigating the platform — skipping loses that context.</li></ul>
+<h2>Relaunching the wizard</h2>
+<p>To relaunch the wizard after it has been completed:</p>
+<ol><li>Click the <strong>user icon</strong> in the top-right corner of the app bar.</li><li>Select <strong>Welcome Tour</strong> from the dropdown menu.</li><li>The wizard opens. Navigate through the steps again as needed.</li></ol>
+<p>Relaunching does not reset your onboarding status — it simply shows the wizard again for reference.</p>
+<h2>Related</h2>
+<ul><li><a href="what-is-tessallite.html">What is Tessallite</a></li><li><a href="first-time-setup.html">First-Time Setup</a></li><li><a href="connect-a-bi-tool.html">Connect a BI Tool</a></li><li><a href="acme-demo-tenant.html">Demo Tenant: acme-demo</a></li></ul>
+<nav class="page-nav"><a href="first-time-setup.html" class="page-nav-btn prev">&larr; First-Time Setup</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="workspace-explorer.html" class="page-nav-btn next">Workspace Explorer &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

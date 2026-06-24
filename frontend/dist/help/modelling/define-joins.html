@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Define Joins — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Define Joins</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-25</span></div>
+    <h1>Define Joins</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/model-builder-join-drawer.png" alt="Model Builder — Join configuration drawer."></figure>
+<h2>What this covers</h2>
+<p>Joins tell Tessallite how tables relate to one another. Without joins, the query router cannot construct the SQL needed to pull dimension attributes into aggregate GROUP BY queries. This article covers the join creation flow, join properties, when to choose INNER vs LEFT, structural constraints, and how to edit or delete a join.</p>
+<h2>Before you start</h2>
+<ul><li>All tables involved in a join must already be added to the model. See <a href="add-tables-to-a-model.html">Add Tables to a Model</a>.</li><li>You must know the foreign key relationship: which column in one table corresponds to the primary key in the other.</li></ul>
+<h2>Steps</h2>
+<ol><li>Open the Model Builder for the project.</li><li>In the Toolbelt, click <strong>Add Join</strong>. Alternatively, drag from one table card to another in the Canvas.</li><li>In the Drawer, set the <strong>Left table</strong> and <strong>Left column</strong> (the many-side, typically the fact table).</li><li>Set the <strong>Right table</strong> and <strong>Right column</strong> (the one-side, typically a dimension table).</li><li>Choose the <strong>Join type</strong>: LEFT or INNER.</li><li>Click <strong>Save Join</strong>. A line appears in the Canvas connecting the two table cards, labeled with the join type.</li></ol>
+<h2>Join properties</h2>
+<div class="table-wrapper"><table><thead><tr><th>Property</th><th>Description</th></tr></thead><tbody><tr><td>Left table</td><td>The table on the left side of the ON clause.</td></tr><tr><td>Left column</td><td>The foreign key column in the left table.</td></tr><tr><td>Right table</td><td>The table being joined to. Typically a dimension table.</td></tr><tr><td>Right column</td><td>The primary key or join key column in the right table.</td></tr><tr><td>Join type</td><td>LEFT or INNER. Controls how unmatched rows are handled.</td></tr></tbody></table></div>
+<h2>INNER vs LEFT</h2>
+<p>Use <strong>LEFT</strong> in almost all cases. A LEFT join preserves every row from the fact table even when the dimension table has no matching row, preventing silent data loss if a dimension record is missing or the foreign key is null.</p>
+<p>Use <strong>INNER</strong> only when you are certain every fact row has a matching dimension row. A misapplied INNER join produces totals lower than expected with no error message.</p>
+<blockquote>Every dimension table must be reachable from the fact table through a join path. A dimension table with no join connection will trigger a warning in the Health tab and cannot be used in aggregate queries.</blockquote>
+<h2>Structural constraints</h2>
+<ul><li><strong>Star or snowflake only.</strong> Joins radiate outward from the fact table. Cycles are not allowed.</li><li><strong>No fact-to-fact joins.</strong> Joins between two <code>fact</code> tables are not supported. Use two separate projects or pre-join the tables in the source.</li><li><strong>One join per table pair.</strong> Only one join can exist between any two tables.</li></ul>
+<p>The Health tab shows errors for constraint violations. The model cannot be published while errors are present.</p>
+<h2>Editing a join</h2>
+<p>Click the join line in the Canvas to open it in the Drawer. Edit any property and click <strong>Save Join</strong>.</p>
+<h2>Deleting a join</h2>
+<p>Click the join line in the Canvas, then click <strong>Delete Join</strong> in the Drawer. Dimensions or measures relying on columns in the disconnected table will produce Health tab errors until the join is restored or those objects are removed.</p>
+<h2>Auto-hide of dimension join keys</h2>
+<p>When a join is created between a fact table and a dimension table, Tessallite automatically hides the dimension-side join key column. This prevents the same attribute from appearing twice in the virtual schema (once from the fact table's foreign key and once from the dimension table's primary/join key).</p>
+<p><strong>How it works:</strong></p>
+<div class="table-wrapper"><table><thead><tr><th>Event</th><th>What happens</th></tr></thead><tbody><tr><td>Join created (fact to dimension)</td><td>The dimension table's join key column is hidden. Any dimension or measure referencing that column is also hidden.</td></tr><tr><td>Join deleted</td><td>If the column was auto-hidden (not manually set by the user), it becomes visible again. If other joins still reference the column, it stays hidden.</td></tr><tr><td>Join columns changed</td><td>The old dimension-side column is restored to visible; the new dimension-side column is hidden.</td></tr></tbody></table></div>
+<p><strong>Manual override.</strong> You can always change the visibility of any column manually. Open the table card in the Canvas, click the column, and toggle the <strong>Hidden</strong> checkbox.</p>
+<ul><li>If you manually show an auto-hidden column, the system records your choice. Deleting the join later will not re-hide it.</li><li>If you manually hide a column, creating a join through that column will not change your setting.</li></ul>
+<p>The auto-hide rule only applies to fact-to-dimension joins. Joins between two dimension tables (snowflake joins) do not trigger auto-hide.</p>
+<h2>Related</h2>
+<ul><li><a href="add-tables-to-a-model.html">Add Tables to a Model</a></li><li><a href="define-dimensions.html">Define Dimensions</a></li><li><a href="../concepts/sources-tables-and-joins.html">Sources, Tables, and Joins</a></li></ul>
+<nav class="page-nav"><a href="canvas-undo-redo.html" class="page-nav-btn prev">&larr; Canvas Undo/Redo</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="define-hierarchies.html" class="page-nav-btn next">Define Hierarchies &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

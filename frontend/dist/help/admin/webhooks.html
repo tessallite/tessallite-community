@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Webhooks — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Webhooks</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-05-01</span></div>
+    <h1>Webhooks</h1>
+<h2>What this covers</h2>
+<p>Tessallite can push notifications to external systems when significant events occur — a model is deployed, a user is created, or a setting changes. This page explains the webhook system: which events are available, how to create and manage endpoints, how to verify payload signatures, and how to handle delivery failures.</p>
+<h2>When to use webhooks</h2>
+<p>Webhooks are the right tool when an external system needs to react to something that happened inside Tessallite:</p>
+<ul><li><strong>CI/CD pipelines</strong> that trigger downstream processing when a model is published.</li><li><strong>Audit systems</strong> that ingest structured events from all platforms.</li><li><strong>Notification channels</strong> (Slack, Teams, PagerDuty) that alert on destructive actions.</li><li><strong>Data catalogs</strong> that sync model metadata when it changes.</li></ul>
+<p>Webhooks are not the right tool for polling or querying state. Use the REST API for that.</p>
+<h2>Event types</h2>
+<div class="table-wrapper"><table><thead><tr><th>Event</th><th>Fired when</th></tr></thead><tbody><tr><td><code>model.published</code></td><td>A model is deployed to a version.</td></tr><tr><td><code>model.undeployed</code></td><td>A model&#x27;s deploy pointer is cleared.</td></tr><tr><td><code>model.reverted</code></td><td>A model is reverted to an earlier version.</td></tr><tr><td><code>model.deleted</code></td><td>A model is permanently deleted.</td></tr><tr><td><code>user.created</code></td><td>A new user account is created (local, JIT, or SSO).</td></tr><tr><td><code>user.deleted</code></td><td>A user account is deleted.</td></tr><tr><td><code>settings.changed</code></td><td>A tenant, project, or model setting is saved.</td></tr><tr><td><code>schema_drift.detected</code></td><td>The scheduler detects that a source's schema has drifted from the model.</td></tr><tr><td><code>refresh.completed</code></td><td>An aggregate refresh (scheduled or manual) finishes successfully.</td></tr><tr><td><code>refresh.failed</code></td><td>An aggregate refresh ends in error.</td></tr><tr><td><code>refresh.sla_breach</code></td><td>An aggregate's freshness exceeds its configured SLA threshold.</td></tr><tr><td><code>refresh.sla_recovered</code></td><td>An aggregate that had breached its SLA returns to freshness.</td></tr></tbody></table></div>
+<p>The <code>refresh.*</code> family is the most useful for orchestration: subscribe to <code>refresh.completed</code> to trigger a downstream job only after data is fresh, and to <code>refresh.failed</code> / <code>refresh.sla_breach</code> to alert when it is not. The authoritative list of event names lives in <code>shared/webhooks/event_types.py</code>; a subscription can name specific events or use the wildcard <code>*</code> to receive all of them.</p>
+<p>There is also a <code>test.ping</code> event. It is <strong>not</strong> a real platform event — it is sent only when you click <strong>Send test</strong> on an endpoint, so you can confirm connectivity and signature verification without waiting for something to happen.</p>
+<p>Each event type sends a JSON payload with the event type, a timestamp, the actor&#x27;s identity, and an event-specific detail object.</p>
+<h2>Creating an endpoint</h2>
+<ol><li>Navigate to <em>Admin &gt; Webhooks</em>.</li><li>Click <strong>New Endpoint</strong>.</li><li>Fill in:</li></ol>
+<ul><li><strong>Name</strong> — a descriptive label (e.g., &quot;Slack model alerts&quot;).</li><li><strong>URL</strong> — the HTTPS endpoint that will receive POST requests.</li><li><strong>Event filters</strong> — tick the event types this endpoint should receive, or select all.</li></ul>
+<ol><li>Click <strong>Save</strong>.</li></ol>
+<p>Tessallite generates an HMAC-SHA256 signing secret for the endpoint. The secret is shown once on creation and can be rotated later.</p>
+<h2>Payload format and signature verification</h2>
+<p>Each delivery is a <code>POST</code> request with a JSON body:</p>
+<pre><code>{
+  &quot;event_type&quot;: &quot;model.published&quot;,
+  &quot;timestamp&quot;: &quot;2026-05-01T14:30:00Z&quot;,
+  &quot;actor&quot;: &quot;admin@acme.com&quot;,
+  &quot;detail&quot;: {
+    &quot;model_id&quot;: &quot;...&quot;,
+    &quot;model_slug&quot;: &quot;sales&quot;,
+    &quot;version&quot;: 3
+  }
+}</code></pre>
+<p>The request includes an <code>X-Tessallite-Signature</code> header:</p>
+<pre><code>t=1746105000,v1=5d41402abc4b2a76b9719d911017c592...</code></pre>
+<p>To verify:</p>
+<ol><li>Extract the <code>t</code> (timestamp) and <code>v1</code> (signature) values from the header.</li><li>Compute <code>HMAC-SHA256(signing_secret, t + &quot;.&quot; + raw_request_body)</code>.</li><li>Compare the hex digest to <code>v1</code>. If they match, the payload is authentic and untampered.</li></ol>
+<p>Maximum payload size is 64 KB. Payloads exceeding this limit are truncated.</p>
+<h2>Delivery and retry</h2>
+<p>Tessallite delivers each event as a fire-and-forget async task. Delivery attempts follow this pattern:</p>
+<div class="table-wrapper"><table><thead><tr><th>Attempt</th><th>Delay after failure</th></tr></thead><tbody><tr><td>1st</td><td>immediate</td></tr><tr><td>2nd</td><td>10 seconds</td></tr><tr><td>3rd</td><td>60 seconds</td></tr><tr><td>4th (final)</td><td>300 seconds</td></tr></tbody></table></div>
+<p>A delivery is considered successful when the endpoint returns an HTTP 2xx status code. Any other response (including timeouts) counts as a failure.</p>
+<p>After all retries are exhausted, the delivery moves to the <strong>dead-letter queue</strong> (DLQ).</p>
+<h2>Managing endpoints</h2>
+<p>The <em>Admin &gt; Webhooks</em> page provides:</p>
+<ul><li><strong>Endpoint list</strong> — name, URL (domain only, path masked), subscribed event types, active/inactive toggle, and last delivery status.</li><li><strong>Active toggle</strong> — disable an endpoint without deleting it. Disabled endpoints stop receiving deliveries immediately.</li><li><strong>Edit</strong> — change the name, URL, or event filters.</li><li><strong>Delete</strong> — permanently remove the endpoint and all its delivery history.</li><li><strong>Test delivery</strong> — send a synthetic <code>webhook.test</code> event to verify connectivity and signature handling.</li><li><strong>Rotate secret</strong> — generate a new signing secret. The old secret stops working immediately. Requires confirmation.</li></ul>
+<h3>Delivery history</h3>
+<p>Click an endpoint row to open its delivery history drawer. Each entry shows:</p>
+<ul><li>Timestamp, event type, HTTP status code, and delivery status (<code>delivered</code>, <code>failed</code>, <code>pending</code>, <code>dlq</code>).</li><li>For failed deliveries, the error message (timeout, connection refused, non-2xx status).</li></ul>
+<h3>Dead-letter queue</h3>
+<p>The <strong>DLQ</strong> tab lists all deliveries that exhausted their retries. For each entry you can:</p>
+<ul><li><strong>Retry</strong> — re-enqueue the delivery for one more attempt.</li><li><strong>Delete</strong> — permanently discard the failed delivery.</li></ul>
+<h2>Best practices</h2>
+<ul><li><strong>Always verify signatures.</strong> Without verification, any system that discovers your endpoint URL can send fake events.</li><li><strong>Respond quickly.</strong> Return a 2xx within 5 seconds. Do heavy processing asynchronously after acknowledging receipt.</li><li><strong>Use event filters.</strong> Subscribe only to the events you need. A catch-all endpoint that ignores most events wastes delivery capacity.</li><li><strong>Monitor the DLQ.</strong> A growing DLQ means your endpoint is failing. Investigate and fix before retrying.</li><li><strong>Rotate secrets on team changes.</strong> When someone who knew the signing secret leaves the team, rotate it.</li></ul>
+<h2>API reference</h2>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Endpoint</th><th>Purpose</th></tr></thead><tbody><tr><td>GET</td><td><code>/api/v1/admin/webhooks</code></td><td>List all endpoints</td></tr><tr><td>POST</td><td><code>/api/v1/admin/webhooks</code></td><td>Create an endpoint</td></tr><tr><td>PUT</td><td><code>/api/v1/admin/webhooks/{id}</code></td><td>Update an endpoint</td></tr><tr><td>DELETE</td><td><code>/api/v1/admin/webhooks/{id}</code></td><td>Delete an endpoint</td></tr><tr><td>POST</td><td><code>/api/v1/admin/webhooks/{id}/test</code></td><td>Send a test event</td></tr><tr><td>POST</td><td><code>/api/v1/admin/webhooks/{id}/rotate-secret</code></td><td>Regenerate signing secret</td></tr><tr><td>GET</td><td><code>/api/v1/admin/webhooks/{id}/deliveries</code></td><td>Delivery history (paginated)</td></tr><tr><td>GET</td><td><code>/api/v1/admin/webhooks/dlq</code></td><td>Dead-letter queue entries</td></tr><tr><td>POST</td><td><code>/api/v1/admin/webhooks/dlq/{id}/retry</code></td><td>Retry a DLQ entry</td></tr><tr><td>DELETE</td><td><code>/api/v1/admin/webhooks/dlq/{id}</code></td><td>Delete a DLQ entry</td></tr></tbody></table></div>
+<p>All endpoints require <code>tenant_admin</code> role.</p>
+<h2>Related</h2>
+<ul><li><a href="audit-log.html">Audit Log</a></li><li><a href="workspace-settings.html">Workspace Settings</a></li></ul>
+<nav class="page-nav"><a href="group-mappings.html" class="page-nav-btn prev">&larr; SSO Group Mappings</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="security-audit-trail.html" class="page-nav-btn next">Security Audit Trail &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

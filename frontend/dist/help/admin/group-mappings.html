@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SSO Group Mappings — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>SSO Group Mappings</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-05-15</span></div>
+    <h1>SSO Group Mappings</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/group-mappings.png" alt="Live SSO Group Mappings administration screen."></figure>
+<h2>What this covers</h2>
+<p>SSO group mappings translate identity-provider groups into Tessallite workspace and project roles. They are evaluated when a user signs in through SAML or OIDC, allowing access to follow the user&#x27;s IdP group membership instead of being managed only by local Tessallite user records.</p>
+<h2>What a mapping contains</h2>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody><tr><td>Provider group</td><td>Group name or claim value received from the identity provider.</td></tr><tr><td>Workspace</td><td>Tenant workspace where the mapping applies.</td></tr><tr><td>Project</td><td>Optional project scope. If omitted, the mapping applies at workspace level where supported.</td></tr><tr><td>Role</td><td>Tessallite role granted by the mapping: <code>viewer</code>, <code>modeler</code>, <code>admin</code>, or the audience role <code>model_technical</code>.</td></tr><tr><td>Status</td><td>Whether the mapping is active.</td></tr></tbody></table></div>
+<h3>Mapping a group to <code>model_technical</code></h3>
+<p>Besides the three access roles, you can map an IdP group to <code>model_technical</code>. This is an <em>audience</em> role: it does not grant project permissions, it pins everyone in that group to the <strong>technical persona</strong>, so column-level security and data tags show them the technical view of the data. Use it for an "engineers" or "data platform" IdP group that should always see technical column detail. Because <code>model_technical</code> confers no access by itself, those users still need a <code>viewer</code>/<code>modeler</code>/<code>admin</code> mapping (or a local project binding) to actually reach a project. See <a href="manage-roles.html">Manage roles</a> and <a href="../modelling/configure-personas.html">Configure personas</a>.</p>
+<h2>How mappings are applied</h2>
+<p>On SSO login, Tessallite reads the configured group claim, finds matching mappings, and applies the corresponding roles. If a user is removed from an IdP group, the mapped access is removed on the next sign-in. Local emergency admin access should be kept separate so administrators are not locked out by an IdP outage.</p>
+<h2>Good practice</h2>
+<p>Use narrow IdP groups that match business responsibilities. Avoid mapping broad groups such as &quot;all employees&quot; to modeler or admin roles. Review mappings alongside <a href="project-settings.html">Project Settings</a>, <a href="manage-users.html">Manage Users</a>, and <a href="audit-log.html">Audit Log</a> when investigating access issues.</p>
+<h2>Related</h2>
+<ul><li><a href="sso-configuration.html">SSO Configuration</a></li><li><a href="manage-roles.html">Manage Roles</a></li><li><a href="rbac-model-scoped.html">Model-Scoped RBAC</a></li><li><a href="security-audit-trail.html">Security Audit Trail</a></li></ul>
+<nav class="page-nav"><a href="sso-configuration.html" class="page-nav-btn prev">&larr; SSO Configuration</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="webhooks.html" class="page-nav-btn next">Webhooks &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

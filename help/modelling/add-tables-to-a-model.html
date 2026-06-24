@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Add Tables to a Model — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Add Tables to a Model</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-26</span></div>
+    <h1>Add Tables to a Model</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/model-builder-add-table.png" alt="Model Builder — Add table from source schema browser."></figure>
+<h2>What this covers</h2>
+<p>Before you can define dimensions, measures, or aggregates, you must add the source tables you intend to use into the model. This article explains how to navigate to the Model Builder, browse the schema, add tables, and choose the correct table type for each one.</p>
+<h2>Before you start</h2>
+<ul><li>A project must exist and its data source connection must be working. See <a href="create-a-project.html">Create a Project</a> and <a href="add-a-data-source.html">Add a Data Source</a>.</li><li>You must be signed in as a Modeller or Tenant Admin on the project.</li></ul>
+<h2>Steps</h2>
+<ol><li>Open the project from the workspace dashboard.</li><li>Click <strong>Model Builder</strong> in the project navigation. The Model Builder opens with the Canvas (center), Toolbelt (left), Drawer (right), and Summary Bar (bottom).</li><li>In the Toolbelt, click <strong>Add Table</strong>. The Drawer opens showing the schema browser.</li><li>Expand a schema in the browser to see its tables.</li><li>Click a table name to select it. The Drawer shows the table&#x27;s columns and a <strong>Table type</strong> selector.</li><li>Choose the correct table type (see the reference below).</li><li>Click <strong>Add to Model</strong>. The table appears as a node in the Canvas.</li><li>Repeat for each table you need.</li></ol>
+<h2>Table type reference</h2>
+<p>Choosing the right type determines how Tessallite constructs the aggregate grain — the combination of columns used when building pre-aggregated summary tables.</p>
+<div class="table-wrapper"><table><thead><tr><th>Table type</th><th>When to use</th><th>Example</th><th>Included in aggregate grain?</th></tr></thead><tbody><tr><td><code>fact</code></td><td>The central transaction or event table. Every model must have exactly one. Contains numeric measures and foreign keys to dimension tables.</td><td><code>orders</code>, <code>page_views</code>, <code>sensor_readings</code></td><td>Yes</td></tr><tr><td><code>dim_aggregate</code></td><td>A dimension table that participates in the aggregate grain. Use when you want pre-aggregation to group by columns in this table.</td><td><code>dim_date</code>, <code>dim_product</code></td><td>Yes</td></tr><tr><td><code>dim_detail</code></td><td>A dimension table used only for filtering or labeling. Its columns are not included in aggregate grain.</td><td><code>dim_customer</code>, <code>dim_employee</code></td><td>No</td></tr></tbody></table></div>
+<blockquote>A model must have exactly one <code>fact</code> table. If you mark a second table as <code>fact</code>, the Health tab shows a validation error and the model cannot be published.</blockquote>
+<h2>What the Canvas shows</h2>
+<p>Each table appears as a card showing the table name and type badge. Tables with no join are shown with a dashed border and flagged as a warning in the Health tab until all tables are joined.</p>
+<p>Click a table-node header to focus the matching row in the <strong>Sources</strong> panel — the source expands and the row is briefly highlighted. From there, the <strong>Edit</strong> pencil opens the unified table editor (General · Columns · Attributes) where you can change the type, rename the alias, edit columns, and manage user-defined attributes. See <a href="dimension-aliases.html">Dimension Aliases</a> for the full editor walkthrough.</p>
+<h2>Removing a table</h2>
+<p>Select the table in the Canvas, then click <strong>Remove from Model</strong> in the Drawer. All joins, dimensions, and measures referencing that table are also removed. This action cannot be undone.</p>
+<h2>Related</h2>
+<ul><li><a href="../concepts/sources-tables-and-joins.html">Sources, Tables, and Joins</a></li><li><a href="define-joins.html">Define Joins</a></li><li><a href="create-a-project.html">Create a Project</a></li></ul>
+<nav class="page-nav"><a href="add-a-data-source.html" class="page-nav-btn prev">&larr; Add a Data Source</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="source-statistics.html" class="page-nav-btn next">Source Statistics &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

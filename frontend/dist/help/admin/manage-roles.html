@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Manage Roles — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Manage Roles</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-06-12</span></div>
+    <h1>Manage Roles</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/admin-role-dropdown.png" alt="Admin panel — user detail with the Role dropdown open."></figure>
+<h2>What this covers</h2>
+<p>This article explains the Tessallite roles, how to change a user&#x27;s workspace role, the difference between workspace-level and project-level access, and how to assign project-level permissions. There are four standard roles (below) plus one special <strong>audience</strong> role, <code>model_technical</code>, described after the capabilities table.</p>
+<h2>Role overview</h2>
+<div class="table-wrapper"><table><thead><tr><th>Role</th><th>Scope</th><th>Who assigns it</th><th>What they can do</th></tr></thead><tbody><tr><td>System Admin</td><td>Installation-wide</td><td>Defined by environment variables at deployment; not assignable via UI.</td><td>Create workspaces, manage all workspace users, access the System Administration screen.</td></tr><tr><td>Tenant Admin</td><td>Workspace-wide</td><td>System Admin (initial); Tenant Admin (additional)</td><td>Invite and remove users, assign roles, configure workspace settings.</td></tr><tr><td>Modeller</td><td>Workspace-wide (with per-project access)</td><td>Tenant Admin</td><td>Create and edit models, define dimensions and measures, configure aggregates and schedules, view diagnostics.</td></tr><tr><td>Analyst / Viewer</td><td>Per project</td><td>Tenant Admin or Modeller (via project settings)</td><td>Connect BI tools via JDBC or XMLA, run queries, view query results.</td></tr><tr><td><code>model_technical</code> (audience)</td><td>Per user</td><td>Tenant Admin (User management) or via SSO Group Mappings</td><td>A special <em>audience</em> role, not a permission tier. It pins the user to the <strong>technical persona</strong> so column-level security and data-tag rules show them the technical (unmasked-where-permitted) view. It grants <strong>no</strong> project permissions on its own.</td></tr></tbody></table></div>
+<h2>The <code>model_technical</code> audience role</h2>
+<p><code>model_technical</code> is different from the four roles above. The four standard roles control <strong>what a user can do</strong>; <code>model_technical</code> controls <strong>which persona's view a user sees</strong> when column-level security and data tags are in play. Assigning it does not let someone edit models or run privileged actions — it only selects the technical persona for that user.</p>
+<p>Use it for engineers and data stewards who need to see technical column detail that business personas hide. You set it two ways:</p>
+<ul><li><strong>Per user</strong> — in Tenant Admin → Users, set the user's role to <code>model_technical</code>.</li><li><strong>By SSO group</strong> — map an identity-provider group to <code>model_technical</code> in Group Mappings, so members of that group inherit the technical persona automatically.</li></ul>
+<p>Because it confers no project access by itself, a <code>model_technical</code> user still needs the usual project-level Viewer/Modeller binding to reach a project at all. See <a href="../modelling/configure-personas.html">Configure personas</a> for how the technical persona is defined and <a href="group-mappings.html">Group mappings</a> for the SSO route.</p>
+<h2>Role capabilities reference</h2>
+<div class="table-wrapper"><table><thead><tr><th>Action</th><th>System Admin</th><th>Tenant Admin</th><th>Modeller</th><th>Analyst</th></tr></thead><tbody><tr><td>Create workspaces</td><td>Yes</td><td>No</td><td>No</td><td>No</td></tr><tr><td>Manage workspace users</td><td>No</td><td>Yes</td><td>No</td><td>No</td></tr><tr><td>Configure workspace settings</td><td>No</td><td>Yes</td><td>No</td><td>No</td></tr><tr><td>Create / edit models</td><td>No</td><td>No</td><td>Yes</td><td>No</td></tr><tr><td>Configure aggregates</td><td>No</td><td>No</td><td>Yes</td><td>No</td></tr><tr><td>Connect BI tools</td><td>No</td><td>No</td><td>Yes</td><td>Yes</td></tr><tr><td>Run queries</td><td>No</td><td>No</td><td>Yes</td><td>Yes</td></tr></tbody></table></div>
+<h2>Changing a user&#x27;s workspace role</h2>
+<ol><li>In the workspace sidebar, click <strong>Admin</strong>.</li><li>Click the <strong>Users</strong> tab.</li><li>Click the user&#x27;s name to open their detail panel.</li><li>In the <strong>Role</strong> dropdown, select the new role.</li><li>Click <strong>Save</strong>.</li></ol>
+<p>The change takes effect on the user&#x27;s next sign-in. Existing sessions continue with the old role until the user signs out and signs back in.</p>
+<h2>Workspace-level vs. project-level access</h2>
+<p>Tenant Admin and Modeller are workspace-wide roles. An Analyst role at the workspace level provides no project access by default — users must be explicitly added to each project.</p>
+<h2>Assigning project-level access</h2>
+<ol><li>Open the project in Model Builder.</li><li>Click <strong>Settings</strong> in the project toolbar.</li><li>Click the <strong>Access</strong> tab.</li><li>Click <strong>Add User</strong>, enter the user&#x27;s email, and select their project-level permission: <strong>Viewer</strong> or <strong>Modeller</strong>.</li><li>Click <strong>Save</strong>.</li></ol>
+<p>A user&#x27;s workspace role is the ceiling for their effective permissions. A Modeller cannot be granted Tenant Admin access at the project level. Change the workspace role first if a higher level is needed.</p>
+<p><strong>Project roles and model versions.</strong> The project-level role also decides what a user may do with a model's version history, because reverting is destructive:</p>
+<ul><li>A <strong>Viewer</strong> can open the version history and compare past versions.</li><li>A <strong>Modeller</strong> can additionally save a new version and deploy or undeploy.</li><li><strong>Reverting</strong> to an earlier version (which deletes every newer version) requires the project <strong>Admin</strong> role.</li></ul>
+<p>See <a href="../modelling/save-and-version-a-model.html">Save and version a model</a> for the full version workflow.</p>
+<h2>Open project access before the first binding (the bootstrap rule)</h2>
+<p>When a project has <strong>no project-level access entries at all</strong>, Tessallite treats every signed-in user of the workspace as that project&#x27;s administrator. This is called the <em>bootstrap rule</em>, and it exists so the person who creates a project can set it up — add connections, build a model, grant access — without being locked out of their own brand-new project.</p>
+<p>Think of it like a new office room before the locks are fitted: anyone with a badge for the building can walk in and arrange the furniture. The moment the first lock is fitted (the first access entry is saved), only people named on the door get in.</p>
+<p><strong>What this means in practice:</strong></p>
+<ul><li>A freshly created project is open to <em>everyone in the workspace</em> — including users who normally only view things — until someone saves the first access entry.</li><li>The very first access entry you add closes the door: from then on, only listed users (and workspace admins) can touch the project.</li></ul>
+<p><strong>This behaviour is deliberate.</strong> It was reviewed and kept as an accepted trade-off: convenience for small teams over strictness for large ones. Two safeguards apply:</p>
+<ol><li><strong>Audit trail.</strong> Every time a user without any access entry is let in by the bootstrap rule, an audit event named <code>rbac.bootstrap_admin_grant</code> is written (severity <em>warn</em>). It records who used the open door and on which project. To avoid flooding the log, repeat visits by the same user to the same project are recorded at most once per hour per service instance. Review these events in <em>Admin &gt; Audit Log</em>.</li><li><strong>You can close the door early.</strong> Right after creating a project, add yourself (or your team) on the <strong>Access</strong> tab. One entry is enough to end the open period.</li></ol>
+<p><strong>Best practice for multi-team workspaces:</strong> make &quot;add the first access entry&quot; part of your project-creation checklist. Until that entry exists, treat the project as visible to the whole workspace and keep sensitive connection credentials out of it.</p>
+<h2>Related</h2>
+<ul><li><a href="manage-users.html">Manage Users</a></li><li><a href="workspace-settings.html">Workspace Settings</a></li><li><a href="../concepts/roles-and-permissions.html">Roles and Permissions (concepts)</a></li></ul>
+<nav class="page-nav"><a href="manage-users.html" class="page-nav-btn prev">&larr; Manage Users</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="rbac-model-scoped.html" class="page-nav-btn next">Model-Scoped RBAC &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

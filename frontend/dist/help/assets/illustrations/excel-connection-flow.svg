@@ -1,0 +1,57 @@
+<svg viewBox="0 0 800 400" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif" role="img" aria-labelledby="svg-title">
+  <title id="svg-title">Excel XMLA connection sequence: four steps from opening the wizard to a populated pivot table</title>
+
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#006C35"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="400" fill="#FFFFFF"/>
+
+  <!-- Title -->
+  <text x="400" y="24" text-anchor="middle" fill="#006C35" font-size="14" font-weight="700">Excel XMLA Connection</text>
+
+  <!-- Step 1 box -->
+  <rect x="250" y="40" width="300" height="44" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5" rx="8"/>
+  <text x="400" y="58" text-anchor="middle" fill="#333333" font-size="13" font-weight="600">Excel: Data</text>
+  <text x="400" y="74" text-anchor="middle" fill="#6B7280" font-size="11">Get Data → From Database → From Analysis Services</text>
+
+  <!-- Arrow 1 → 2 -->
+  <line x1="400" y1="84" x2="400" y2="126" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Step 2 box -->
+  <rect x="250" y="130" width="300" height="44" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5" rx="8"/>
+  <text x="400" y="150" text-anchor="middle" fill="#333333" font-size="13" font-weight="600">Enter URL + credentials</text>
+  <text x="400" y="166" text-anchor="middle" fill="#6B7280" font-size="11">http://localhost:8080/api/v1/xmla/ · email · password</text>
+
+  <!-- Arrow 2 → 3 -->
+  <line x1="400" y1="174" x2="400" y2="216" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Step 3 box -->
+  <rect x="250" y="220" width="300" height="44" fill="#EFF7F3" stroke="#006C35" stroke-width="2" rx="8"/>
+  <text x="400" y="240" text-anchor="middle" fill="#333333" font-size="13" font-weight="600">Select catalogue (model name)</text>
+  <text x="400" y="256" text-anchor="middle" fill="#6B7280" font-size="11">Business view · or · _technical variant</text>
+
+  <!-- Arrow 3 → 4 -->
+  <line x1="400" y1="264" x2="400" y2="306" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Step 4 box -->
+  <rect x="250" y="310" width="300" height="44" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5" rx="8"/>
+  <text x="400" y="330" text-anchor="middle" fill="#333333" font-size="13" font-weight="600">Build pivot table</text>
+  <text x="400" y="346" text-anchor="middle" fill="#6B7280" font-size="11">Drag dimensions to Rows/Columns · measures to Values</text>
+
+  <!-- Step number badges -->
+  <circle cx="250" cy="62" r="11" fill="#006C35"/>
+  <text x="250" y="67" text-anchor="middle" fill="#FFFFFF" font-size="11" font-weight="600">1</text>
+
+  <circle cx="250" cy="152" r="11" fill="#006C35"/>
+  <text x="250" y="157" text-anchor="middle" fill="#FFFFFF" font-size="11" font-weight="600">2</text>
+
+  <circle cx="250" cy="242" r="11" fill="#006C35"/>
+  <text x="250" y="247" text-anchor="middle" fill="#FFFFFF" font-size="11" font-weight="600">3</text>
+
+  <circle cx="250" cy="332" r="11" fill="#006C35"/>
+  <text x="250" y="337" text-anchor="middle" fill="#FFFFFF" font-size="11" font-weight="600">4</text>
+</svg>

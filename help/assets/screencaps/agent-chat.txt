@@ -1,0 +1,1 @@
+Live Agent Chat route for Project 1 showing the conversation workspace, project-scoped data assistant controls, and the prompt area available to the demo admin.

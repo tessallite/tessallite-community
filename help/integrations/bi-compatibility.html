@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BI Tool Compatibility Matrix — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>BI Compatibility</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-05-25</span></div>
+    <h1>BI Tool Compatibility Matrix</h1>
+
+<h2>Overview</h2>
+<p>Tessallite exposes two connection protocols: a <strong>PostgreSQL wire protocol</strong> gateway (JDBC, port 5433) and an <strong>XMLA/DAX</strong> endpoint (HTTP, port 8080). Most BI tools connect through one of these two protocols. This page lists supported tools, the protocol each uses, and the feature coverage for each.</p>
+
+<h2>Protocol summary</h2>
+<div class="table-wrapper">
+<table>
+  <thead><tr><th>Protocol</th><th>Port</th><th>Query language</th><th>Best for</th></tr></thead>
+  <tbody>
+    <tr><td><strong>JDBC (PostgreSQL wire)</strong></td><td>5433</td><td>SQL</td><td>DBeaver, Tableau, Superset, pgAdmin, Python (psycopg2), any JDBC/ODBC client</td></tr>
+    <tr><td><strong>XMLA/DAX</strong></td><td>8080</td><td>DAX, MDX</td><td>Excel PivotTable, Power BI</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Compatibility matrix</h2>
+<div class="table-wrapper">
+<table>
+  <thead>
+    <tr>
+      <th>Tool</th>
+      <th>Protocol</th>
+      <th>Connect</th>
+      <th>Browse schema</th>
+      <th>Query</th>
+      <th>Aggregates</th>
+      <th>Personas</th>
+      <th>Row security</th>
+      <th>Drill-through</th>
+      <th>Guide</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Microsoft Excel</strong></td><td>XMLA</td>
+      <td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td>
+      <td><a href="excel-xmla-connection-guide.html">Guide</a></td>
+    </tr>
+    <tr>
+      <td><strong>Power BI Desktop</strong></td><td>XMLA</td>
+      <td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>N/A</td>
+      <td><a href="powerbi-connection-guide.html">Guide</a></td>
+    </tr>
+    <tr>
+      <td><strong>DBeaver</strong></td><td>JDBC</td>
+      <td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>N/A</td><td>N/A</td><td>N/A</td>
+      <td><a href="jdbc-connection-guide.html">Guide</a></td>
+    </tr>
+    <tr>
+      <td><strong>Tableau Desktop</strong></td><td>JDBC</td>
+      <td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>N/A</td><td>N/A</td><td>N/A</td>
+      <td><a href="jdbc-connection-guide.html">Guide</a></td>
+    </tr>
+    <tr>
+      <td><strong>Apache Superset</strong></td><td>JDBC</td>
+      <td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>N/A</td><td>N/A</td><td>N/A</td>
+      <td><a href="jdbc-connection-guide.html">Guide</a></td>
+    </tr>
+    <tr>
+      <td><strong>pgAdmin / psql</strong></td><td>JDBC</td>
+      <td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>N/A</td><td>N/A</td><td>N/A</td>
+      <td><a href="jdbc-connection-guide.html">Guide</a></td>
+    </tr>
+    <tr>
+      <td><strong>Python (psycopg2)</strong></td><td>JDBC</td>
+      <td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>N/A</td><td>N/A</td><td>N/A</td>
+      <td><a href="jdbc-connection-guide.html">Guide</a></td>
+    </tr>
+    <tr>
+      <td><strong>Headless REST API</strong></td><td>HTTP</td>
+      <td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>N/A</td>
+      <td><a href="headless-api.html">Guide</a></td>
+    </tr>
+    <tr>
+      <td><strong>Looker Studio / Data Studio (direct)</strong></td><td>JDBC</td>
+      <td>Ready for live validation</td><td>Ready for live validation</td><td>Ready for live validation</td><td>Internal</td><td>Pending live</td><td>Pending live</td><td>N/A</td>
+      <td><a href="looker-studio-connection-guide.html">Guide</a></td>
+    </tr>
+    <tr>
+      <td><strong>Optional Looker-hosted workflow</strong></td><td>JDBC + LookML</td>
+      <td>Deferred</td><td>Internal</td><td>Internal</td><td>Internal</td><td>Deferred</td><td>Deferred</td><td>Internal</td>
+      <td><a href="looker-studio-via-looker-guide.html">Guide</a></td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Feature notes</h2>
+<h3>Aggregates</h3>
+<p>Aggregate routing is transparent. When a query matches a pre-built aggregate, the gateway rewrites the query to read from the aggregate table instead of the source. The BI tool does not need to be aware of aggregates.</p>
+
+<h3>Personas</h3>
+<p>Persona catalogues are available over XMLA and JDBC as <code>&lt;model_slug&gt;_&lt;persona_slug&gt;</code> relations, and the Headless API accepts its governed persona context. A client must select the intended persona catalogue or use the API context; a plain base JDBC relation is not implicitly scoped to a persona.</p>
+
+<h3>Row security</h3>
+<p>Row-level security is enforced server-side when a query is bound to its applicable rule or persona context, including persona-catalogue JDBC queries. Clients cannot bypass an applied rule by changing BI tools.</p>
+
+<h3>Drill-through</h3>
+<p>Drill-through (clicking a PivotTable cell to see the underlying detail rows) is supported in Excel via the XMLA endpoint. Power BI does not support XMLA drill-through natively. JDBC clients can achieve the same result by querying with the appropriate WHERE clause.</p>
+
+<h2>Choosing a protocol</h2>
+<ul>
+  <li><strong>Excel users</strong> should connect via XMLA. This gives full PivotTable functionality, persona support, row security, and drill-through.</li>
+  <li><strong>Power BI users</strong> should connect via XMLA for the richest experience (measures, hierarchies, formatted values).</li>
+  <li><strong>Tableau, Superset, DBeaver</strong> and other SQL-based tools should connect via JDBC. They get SQL access to all published models with transparent aggregate routing.</li>
+  <li><strong>Looker Studio / Data Studio</strong> uses its direct PostgreSQL route for relational reports and does not consume LookML. This route does not require <code>LOOKER_GATEWAY_ENABLED</code>.</li>
+  <li><strong>Optional Looker-hosted execution</strong> uses generated LookML and the TLS JDBC gateway; enable <code>LOOKER_GATEWAY_ENABLED</code> only when an eligible instance is available for validation.</li>
+  <li><strong>Programmatic access</strong> (scripts, pipelines) should use the Headless REST API for the most control, or JDBC for standard SQL integration.</li>
+</ul>
+
+<h2>Limitations</h2>
+<ul>
+  <li>JDBC clients see a flat relational view. Hierarchies and measure formatting defined in the semantic model are not exposed over the PostgreSQL wire protocol.</li>
+  <li>XMLA connections require models to be deployed (published). JDBC connections also require deployment.</li>
+  <li>Concurrent connection limits depend on the gateway configuration and deployment scale.</li>
+  <li>Direct Data Studio live-product validation is still pending recorded evidence. The optional generated-LookML relation surface is default-off and rejects unsupported symmetric-aggregate window shapes instead of executing uncertain results.</li>
+</ul>
+
+  </main>
+  <footer class="site-footer"><p>Tessallite Documentation</p></footer>
+<nav class="page-nav"><a href="powerbi-connection-guide.html" class="page-nav-btn prev">&larr; Power BI Connection Guide</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="headless-api.html" class="page-nav-btn next">Headless API &rarr;</a></nav>
+</body>
+</html>

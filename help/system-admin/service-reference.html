@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Service Reference — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>Service Reference</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Service Reference</h1>
+<h2>What this covers</h2>
+<p>Per-service details for all six Tessallite services: default ports, health endpoints, inter-service dependencies, restart behavior, and log format. Includes a service summary table and dependency graph.</p>
+<h2>gateway</h2>
+<p><strong>Purpose:</strong> Public entry point for BI tool query traffic. Translates JDBC and XMLA queries into an internal format and forwards them to query-router.</p>
+<ul><li><strong>Ports:</strong> 5433 (JDBC, PostgreSQL wire protocol), 8080 (XMLA/HTTP)</li><li><strong>Health endpoint:</strong> <code>GET /api/health</code> on port 8080. Returns <code>{&quot;status&quot;:&quot;ok&quot;}</code> when ready.</li><li><strong>Depends on:</strong> query-router</li><li><strong>Restart behavior:</strong> Stateless. Safe to restart at any time. Active JDBC connections will drop and must reconnect.</li><li><strong>Log format:</strong> Structured JSON lines on stdout.</li></ul>
+<h2>query-router</h2>
+<p><strong>Purpose:</strong> Routes translated queries to a pre-built aggregate or to the raw data source. Records query misses.</p>
+<ul><li><strong>Port:</strong> Internal HTTP only. Not exposed to the host network.</li><li><strong>Health endpoint:</strong> <code>GET /api/health</code>. Returns <code>{&quot;status&quot;:&quot;ok&quot;}</code> when ready.</li><li><strong>Depends on:</strong> model-service</li><li><strong>Restart behavior:</strong> Stateless. Safe to restart at any time.</li><li><strong>Log format:</strong> Structured JSON lines on stdout.</li></ul>
+<h2>model-service</h2>
+<p><strong>Purpose:</strong> Serves model definitions to query-router and the frontend. Writes query misses to the internal database.</p>
+<ul><li><strong>Port:</strong> Internal HTTP only. Not exposed to the host network.</li><li><strong>Health endpoint:</strong> <code>GET /api/health</code>. Returns <code>{&quot;status&quot;:&quot;ok&quot;,&quot;db_migration&quot;:&quot;VERSION&quot;}</code> when ready.</li><li><strong>Depends on:</strong> internal PostgreSQL (postgres)</li><li><strong>Restart behavior:</strong> Stateless. All model data persisted in PostgreSQL. Safe to restart at any time.</li><li><strong>Log format:</strong> Structured JSON lines on stdout.</li></ul>
+<h2>optimizer</h2>
+<p><strong>Purpose:</strong> Reads the query miss log, scores aggregate candidates by ROI, and creates build recommendations.</p>
+<ul><li><strong>Port:</strong> Internal HTTP only. Not exposed to the host network.</li><li><strong>Health endpoint:</strong> <code>GET /api/health</code>. Returns <code>{&quot;status&quot;:&quot;ok&quot;}</code> when ready.</li><li><strong>Depends on:</strong> model-service</li><li><strong>Restart behavior:</strong> Stateless. Recommendations recalculated from miss log on each run.</li><li><strong>Log format:</strong> Structured JSON lines on stdout.</li></ul>
+<h2>scheduler</h2>
+<p><strong>Purpose:</strong> Builds and refreshes aggregate tables in the user&#x27;s target schema. Executes on a cron schedule and on demand.</p>
+<ul><li><strong>Port:</strong> Internal HTTP only. Not exposed to the host network.</li><li><strong>Health endpoint:</strong> <code>GET /api/health</code>. Returns <code>{&quot;status&quot;:&quot;ok&quot;}</code> when ready.</li><li><strong>Depends on:</strong> model-service</li><li><strong>Restart behavior:</strong> Stateless. In-progress builds may be interrupted on restart; scheduler will re-queue them on the next run.</li><li><strong>Log format:</strong> Structured JSON lines on stdout.</li></ul>
+<h2>frontend</h2>
+<p><strong>Purpose:</strong> Web management interface for model building, aggregate management, connection setup, and platform monitoring.</p>
+<ul><li><strong>Port:</strong> 3000 (HTTP). Exposed to the host network.</li><li><strong>Health endpoint:</strong> <code>GET /api/health</code> on port 3000. Returns <code>{&quot;status&quot;:&quot;ok&quot;}</code> when ready.</li><li><strong>Depends on:</strong> model-service</li><li><strong>Restart behavior:</strong> Stateless. Active user sessions may need to re-authenticate after restart.</li><li><strong>Log format:</strong> Structured JSON lines on stdout.</li></ul>
+<h2>Service dependency graph</h2>
+<ul><li><strong>gateway</strong> depends on query-router</li><li><strong>query-router</strong> depends on model-service</li><li><strong>model-service</strong> depends on internal PostgreSQL</li><li><strong>optimizer</strong> depends on model-service</li><li><strong>scheduler</strong> depends on model-service</li><li><strong>frontend</strong> depends on model-service</li></ul>
+<p>Start order from scratch: postgres → model-service → (query-router, optimizer, scheduler, frontend) → gateway.</p>
+<h2>Service summary</h2>
+<div class="table-wrapper"><table><thead><tr><th>Service</th><th>Port</th><th>Health endpoint</th><th>Depends on</th><th>Stateless</th></tr></thead><tbody><tr><td>gateway</td><td>5433, 8080</td><td><code>GET :8080/api/health</code></td><td>query-router</td><td>Yes</td></tr><tr><td>query-router</td><td>Internal</td><td><code>GET /api/health</code></td><td>model-service</td><td>Yes</td></tr><tr><td>model-service</td><td>Internal</td><td><code>GET /api/health</code></td><td>postgres</td><td>Yes</td></tr><tr><td>optimizer</td><td>Internal</td><td><code>GET /api/health</code></td><td>model-service</td><td>Yes</td></tr><tr><td>scheduler</td><td>Internal</td><td><code>GET /api/health</code></td><td>model-service</td><td>Yes</td></tr><tr><td>frontend</td><td>3000</td><td><code>GET :3000/api/health</code></td><td>model-service</td><td>Yes</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="configure-environment-variables.html">Configure Environment Variables</a></li><li><a href="architecture-overview.html">Architecture Overview</a></li><li><a href="teardown.html">Teardown</a></li></ul>
+<nav class="page-nav"><a href="credentials-and-env.html" class="page-nav-btn prev">&larr; Credentials and the .env File</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="teardown.html" class="page-nav-btn next">Teardown &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

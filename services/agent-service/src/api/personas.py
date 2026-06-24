@@ -1,0 +1,243 @@
+"""Project persona CRUD endpoints.
+
+Personas scope the conversational agent's view of models and attributes.
+A persona is defined at the project level and can have per-model attribute
+restrictions via model scopes.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from typing import Optional
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
+from shared.db.models import (
+    ProjectPersona,
+    ProjectPersonaModelScope,
+)
+from shared.db.session import get_tenant_db
+from src.auth.middleware import CurrentUser, forbid_embed_user
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/projects/{project_id}/agent/personas",
+    tags=["agent-personas"],
+)
+
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+
+def _make_slug(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:63]
+    return slug or "persona"
+
+
+class ModelScopeBody(BaseModel):
+    model_id: UUID
+    included_measure_ids: list[UUID] = Field(default_factory=list)
+    included_dimension_ids: list[UUID] = Field(default_factory=list)
+
+
+class PersonaCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    slug: Optional[str] = Field(default=None, max_length=64)
+    description: Optional[str] = None
+    model_scopes: list[ModelScopeBody] = Field(default_factory=list)
+
+
+class PersonaUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=255)
+    description: Optional[str] = None
+    model_scopes: Optional[list[ModelScopeBody]] = None
+
+
+class ModelScopeResponse(BaseModel):
+    model_config = {"from_attributes": True}
+
+    model_id: UUID
+    included_measure_ids: list
+    included_dimension_ids: list
+
+
+class PersonaResponse(BaseModel):
+    model_config = {"from_attributes": True}
+
+    id: UUID
+    project_id: UUID
+    name: str
+    slug: str
+    description: Optional[str] = None
+    model_scopes: list[ModelScopeResponse] = Field(default_factory=list)
+
+
+@router.get("", response_model=list[PersonaResponse])
+async def list_personas(
+    project_id: UUID,
+    current_user: CurrentUser = Depends(forbid_embed_user),
+) -> list[PersonaResponse]:
+    async for db in get_tenant_db(current_user.tenant_id):
+        q = await db.execute(
+            select(ProjectPersona)
+            .options(selectinload(ProjectPersona.model_scopes))
+            .where(ProjectPersona.project_id == project_id)
+            .order_by(ProjectPersona.name)
+        )
+        personas = q.scalars().all()
+        return [_to_response(p) for p in personas]
+    raise HTTPException(status_code=500, detail="DB session exhausted")
+
+
+@router.post("", response_model=PersonaResponse, status_code=201)
+async def create_persona(
+    project_id: UUID,
+    body: PersonaCreate,
+    current_user: CurrentUser = Depends(forbid_embed_user),
+) -> PersonaResponse:
+    async for db in get_tenant_db(current_user.tenant_id):
+        slug = body.slug or _make_slug(body.name)
+        if not _SLUG_RE.match(slug):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid slug: '{slug}'. Must be lowercase alphanumeric with hyphens/underscores.",
+            )
+
+        persona = ProjectPersona(
+            project_id=project_id,
+            name=body.name,
+            slug=slug,
+            description=body.description,
+        )
+        db.add(persona)
+        await db.flush()
+
+        for scope in body.model_scopes:
+            db.add(ProjectPersonaModelScope(
+                project_persona_id=persona.id,
+                model_id=scope.model_id,
+                included_measure_ids=[str(mid) for mid in scope.included_measure_ids],
+                included_dimension_ids=[str(did) for did in scope.included_dimension_ids],
+            ))
+
+        await db.commit()
+        await db.refresh(persona)
+
+        q = await db.execute(
+            select(ProjectPersona)
+            .options(selectinload(ProjectPersona.model_scopes))
+            .where(ProjectPersona.id == persona.id)
+        )
+        persona = q.scalar_one()
+        return _to_response(persona)
+    raise HTTPException(status_code=500, detail="DB session exhausted")
+
+
+@router.get("/{persona_id}", response_model=PersonaResponse)
+async def get_persona(
+    project_id: UUID,
+    persona_id: UUID,
+    current_user: CurrentUser = Depends(forbid_embed_user),
+) -> PersonaResponse:
+    async for db in get_tenant_db(current_user.tenant_id):
+        q = await db.execute(
+            select(ProjectPersona)
+            .options(selectinload(ProjectPersona.model_scopes))
+            .where(
+                ProjectPersona.id == persona_id,
+                ProjectPersona.project_id == project_id,
+            )
+        )
+        persona = q.scalar_one_or_none()
+        if persona is None:
+            raise HTTPException(status_code=404, detail="Persona not found")
+        return _to_response(persona)
+    raise HTTPException(status_code=500, detail="DB session exhausted")
+
+
+@router.patch("/{persona_id}", response_model=PersonaResponse)
+async def update_persona(
+    project_id: UUID,
+    persona_id: UUID,
+    body: PersonaUpdate,
+    current_user: CurrentUser = Depends(forbid_embed_user),
+) -> PersonaResponse:
+    async for db in get_tenant_db(current_user.tenant_id):
+        q = await db.execute(
+            select(ProjectPersona)
+            .options(selectinload(ProjectPersona.model_scopes))
+            .where(
+                ProjectPersona.id == persona_id,
+                ProjectPersona.project_id == project_id,
+            )
+        )
+        persona = q.scalar_one_or_none()
+        if persona is None:
+            raise HTTPException(status_code=404, detail="Persona not found")
+
+        if body.name is not None:
+            persona.name = body.name
+        if body.description is not None:
+            persona.description = body.description
+
+        if body.model_scopes is not None:
+            for scope in list(persona.model_scopes):
+                await db.delete(scope)
+            await db.flush()
+
+            for scope in body.model_scopes:
+                db.add(ProjectPersonaModelScope(
+                    project_persona_id=persona.id,
+                    model_id=scope.model_id,
+                    included_measure_ids=[str(mid) for mid in scope.included_measure_ids],
+                    included_dimension_ids=[str(did) for did in scope.included_dimension_ids],
+                ))
+
+        await db.commit()
+
+        q2 = await db.execute(
+            select(ProjectPersona)
+            .options(selectinload(ProjectPersona.model_scopes))
+            .where(ProjectPersona.id == persona.id)
+        )
+        persona = q2.scalar_one()
+        return _to_response(persona)
+    raise HTTPException(status_code=500, detail="DB session exhausted")
+
+
+@router.delete("/{persona_id}", status_code=204)
+async def delete_persona(
+    project_id: UUID,
+    persona_id: UUID,
+    current_user: CurrentUser = Depends(forbid_embed_user),
+) -> None:
+    async for db in get_tenant_db(current_user.tenant_id):
+        persona = await db.get(ProjectPersona, persona_id)
+        if persona is None or persona.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Persona not found")
+        await db.delete(persona)
+        await db.commit()
+        return
+    raise HTTPException(status_code=500, detail="DB session exhausted")
+
+
+def _to_response(persona: ProjectPersona) -> PersonaResponse:
+    return PersonaResponse(
+        id=persona.id,
+        project_id=persona.project_id,
+        name=persona.name,
+        slug=persona.slug,
+        description=persona.description,
+        model_scopes=[
+            ModelScopeResponse(
+                model_id=s.model_id,
+                included_measure_ids=s.included_measure_ids,
+                included_dimension_ids=s.included_dimension_ids,
+            )
+            for s in persona.model_scopes
+        ],
+    )

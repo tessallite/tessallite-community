@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Workspace Explorer — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Getting Started</span> / <span>Workspace Explorer</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">all</span><span class="updated">Updated 2026-05-15</span></div>
+    <h1>Workspace Explorer</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/explorer-workspace.png" alt="Live Explorer workspace showing the acme-demo project list, agent card, and deployed model cards."></figure>
+<h2>What this covers</h2>
+<p>The Workspace Explorer is the first operational screen for tenant users. It is where you choose a project, create or import models, open the conversational agent, manage project settings, and see which models are deployed. Treat it as the project control room rather than a landing page.</p>
+<h2>What you see</h2>
+<p>The left side is the project list for the current workspace. The tenant card shows the workspace you are signed into, and the project list lets you switch between business domains. Use <strong>Import project</strong> when you have a project export bundle from another tenant or environment.</p>
+<p>The main area shows the selected project. At the top are project-level controls: enable/disable, add model, import model, export project, agent chat, agent log, and project settings. Below that, each model appears as a card with its display name, slug, deployed state, and quick actions.</p>
+<h2>Model card states</h2>
+<div class="table-wrapper"><table><thead><tr><th>State</th><th>Meaning</th><th>What to do</th></tr></thead><tbody><tr><td><code>Deployed</code></td><td>A saved model version is active for JDBC, XMLA, the query router, scheduler, and optimizer.</td><td>Open it to inspect or edit; deploy again after saving a new version.</td></tr><tr><td><code>Ready</code></td><td>The model has saved metadata but no active deployed version. BI tools cannot query it yet.</td><td>Open the model, validate it, then deploy.</td></tr><tr><td><code>Invalid</code> or warning indicators</td><td>One or more objects, schema bindings, joins, or aggregates require attention.</td><td>Open Model Builder and check Model Health, Diagnostics, or Schema Changes.</td></tr></tbody></table></div>
+<h2>Main actions</h2>
+<ul><li><strong>Open a model</strong> to enter Model Builder.</li><li><strong>Deploy/undeploy</strong> from the model card when you need to publish or withdraw the latest saved version.</li><li><strong>Import model</strong> to bring in a JSON model bundle. Credentials are not imported; source and target connections must be rebound.</li><li><strong>Export project</strong> to move a whole project between tenants or environments.</li><li><strong>Project settings</strong> opens the drawer for agent configuration, LLM providers, users, audit settings, webhooks, and SSO mappings.</li><li><strong>Start a conversation</strong> opens the project agent, scoped to models enabled for the agent.</li></ul>
+<h2>How to use it well</h2>
+<p>Create one project per business domain, not one project per table. A project can contain multiple one-fact models, such as payments, settlements, and chargebacks. Keep model display names business-readable because they surface in the Explorer, BI catalogues, and agent context.</p>
+<p>Before deleting or renaming a model, check whether it is deployed and whether downstream assets reference it. Use <a href="../modelling/impact-analysis.html">Impact Analysis</a> for column-level dependencies and <a href="../admin/audit-log.html">Audit Log</a> for recent administrative changes.</p>
+<h2>Related</h2>
+<ul><li><a href="../modelling/create-a-project.html">Create a project</a></li><li><a href="../modelling/add-tables-to-a-model.html">Create and build a model</a></li><li><a href="../modelling/deploy-a-model.html">Deploy a model</a></li><li><a href="../agent/configure-agent.html">Configure your project agent</a></li></ul>
+<nav class="page-nav"><a href="welcome-wizard.html" class="page-nav-btn prev">&larr; Welcome Wizard</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="acme-demo-tenant.html" class="page-nav-btn next">Demo tenant: acme-demo &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

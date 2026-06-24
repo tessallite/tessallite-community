@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Create a Project — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Create a Project</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Create a Project</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/create-project-dialog.png" alt="Tenant Admin — Create new project dialog."></figure>
+<h2>What this covers</h2>
+<p>A project is the top-level container within a workspace. It connects a workspace to exactly one data source and holds exactly one model. This article explains what a project is, who can create one, the creation flow, and what you can configure after creation.</p>
+<h2>Before you start</h2>
+<ul><li>You must be signed in as a <strong>Tenant Admin</strong> or a <strong>Modeller</strong> with project-creation permission granted by a Tenant Admin.</li><li>You need the connection details for the data source the project will use. You can enter these during creation or update them later in project settings.</li></ul>
+<h2>What a project contains</h2>
+<p>Within the multi-tenant hierarchy — Platform, Workspace, Project, Model — a project sits below the workspace. Each project:</p>
+<ul><li>Connects to exactly one data source (PostgreSQL, BigQuery, or Hadoop/Spark).</li><li>Contains exactly one model, built in the Model Builder.</li><li>Has its own access control: team members can be granted Modeller or Analyst roles scoped to that project.</li></ul>
+<p>Multiple projects can exist within the same workspace, each pointing to a different (or the same) data source.</p>
+<h2>Steps</h2>
+<ol><li>Sign in at port 3000 as a Tenant Admin or Modeller.</li><li>From the workspace dashboard, click <strong>New Project</strong>.</li><li>Enter a <strong>Project name</strong>. Use a name that identifies the data domain (for example, <code>Sales Analytics</code> or <code>Logistics 2026</code>).</li><li>Enter an optional <strong>Description</strong>. This is visible to all workspace members in the project list.</li><li>Select the <strong>Data source type</strong>: PostgreSQL, BigQuery, or Hadoop/Spark Thrift Server.</li><li>Enter the connection parameters for the selected source type. See <a href="add-a-data-source.html">Add a Data Source</a> for the full parameter reference.</li><li>Click <strong>Test Connection</strong> to verify. A success message confirms the gateway can reach the source.</li><li>Click <strong>Create Project</strong>. The project appears in the workspace project list and the Model Builder opens with an empty model.</li></ol>
+<blockquote>The Test Connection step does not save the project. If you close the browser before clicking Create Project, no project is created.</blockquote>
+<h2>Project settings after creation</h2>
+<p>Open the project and click the <strong>Settings</strong> tab to edit the following:</p>
+<div class="table-wrapper"><table><thead><tr><th>Setting</th><th>What it controls</th><th>Who can change it</th></tr></thead><tbody><tr><td>Name</td><td>Display name shown in project lists and BI tool schema listings.</td><td>Tenant Admin, Modeller</td></tr><tr><td>Description</td><td>Free-text description shown in the project list.</td><td>Tenant Admin, Modeller</td></tr><tr><td>Data source</td><td>Connection parameters and source type. Changing source type after tables have been added invalidates the model.</td><td>Tenant Admin</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="../concepts/projects-and-models.html">Projects and Models</a></li><li><a href="add-a-data-source.html">Add a Data Source</a></li><li><a href="../concepts/workspaces-and-tenants.html">Workspaces and Tenants</a></li></ul>
+<nav class="page-nav"><a href="../concepts/kpis.html" class="page-nav-btn prev">&larr; KPIs</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="manage-connections.html" class="page-nav-btn next">Manage Connections &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

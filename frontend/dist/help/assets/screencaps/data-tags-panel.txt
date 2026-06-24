@@ -1,0 +1,1 @@
+Live Data Tags drawer for modely, opened from the Model Builder toolbelt, showing model-scoped tag management for column-level governance.

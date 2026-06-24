@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Live vs Aggregate — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Querying</span> / <span>Live vs Aggregate</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-24</span></div>
+    <h1>Live vs Aggregate</h1>
+<h2>Why this matters</h2>
+<p>Every query a business asks has two ways to be answered: scan the source fact table and compute the answer from scratch, or read a pre-computed summary and save the scan. On a 50-million-row fact the first path takes 3 seconds; the second takes 40 milliseconds. The user does not care which path — they just want the right number, quickly.</p>
+<p>Tessallite&#x27;s Query Router makes the choice on every query. Most of the time it picks correctly and invisibly, and the analyst never thinks about it. But there are three moments every modeller hits:</p>
+<ol><li><strong>The number looks wrong.</strong> Is it wrong at the source, or is a stale aggregate lying to everyone?</li><li><strong>A new aggregate was just built.</strong> Is the router actually using it?</li><li><strong>A number on Tuesday disagreed with the same number on Thursday.</strong> Did the aggregate refresh in between?</li></ol>
+<p>The <strong>Route badge</strong> and the <strong>Force Live</strong> toggle exist so the analyst can answer all three in under a minute without a SQL console. This page covers what the three routes are, how the badge names the one that ran, when to reach for Force Live, and how row security interacts with the routing choice.</p>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/route-badge-three-paths.png" alt="A three-path diagram showing a query entering the Query Router and leaving via aggregate (41 ms), pocket (62 ms), or live-source (1 840 ms), each with its colour-coded Route badge."></figure>
+<p><em>Figure 1 — The three routing paths. The Route badge on the result identifies which ran and its tooltip explains why. Full description: <a href="../assets/screencaps/route-badge-three-paths.txt">route-badge-three-paths.txt</a>.</em></p>
+<h2>The three routes</h2>
+<h3>aggregate</h3>
+<p>A pre-computed roll-up of the model at a specific grain over selected measures. The Query Router matches the query&#x27;s grain and measure set against every registered aggregate; if one covers the request, the router rewrites the query to read from the aggregate instead of the source.</p>
+<ul><li><strong>When it fires.</strong> The query&#x27;s grain is a subset of the aggregate&#x27;s grain, and every measure asked for is present in the aggregate.</li><li><strong>Latency.</strong> 10-100 ms typical; depends on aggregate size, not source size.</li><li><strong>Freshness.</strong> As fresh as the last build. If the source advances, the aggregate is stale until refreshed.</li></ul>
+<h3>pocket</h3>
+<p>A curator-registered derived table — a small, opinionated materialisation shaped for a specific query pattern. Think &quot;a pre-filtered view of the fact table scoped to Q1 2024&quot; or &quot;a pre-joined revenue-by-region table used by three dashboards&quot;.</p>
+<ul><li><strong>When it fires.</strong> The query&#x27;s shape (filters, grain, measures) matches a known pocket.</li><li><strong>Latency.</strong> Comparable to aggregate; pockets are usually smaller than aggregates and often narrower.</li><li><strong>Freshness.</strong> Depends on the pocket&#x27;s refresh schedule, which is curator-owned.</li></ul>
+<h3>live (source)</h3>
+<p>The query runs directly against the source fact table. No pre-computation, no rewriting — SQL that any database admin would recognise.</p>
+<ul><li><strong>When it fires.</strong> No aggregate and no pocket covers the query, or Force Live is on.</li><li><strong>Latency.</strong> Depends on the source. A warehouse indexed for BI will be fast; a raw OLTP source will not.</li><li><strong>Freshness.</strong> Real-time — reads exactly what&#x27;s in the source right now.</li></ul>
+<h2>The Route badge</h2>
+<p>Every executed query shows a Route badge above the result grid. The badge text is the name of the route (<code>aggregate</code>, <code>pocket</code>, or <code>live</code>). Hover it and a tooltip reveals the <strong>routing reason</strong> — the same explanation the <code>/explain</code> endpoint returns — so you do not need a second request to see why a particular path was chosen.</p>
+<p>Three numeric chips sit next to the badge:</p>
+<ul><li><strong>rows</strong> — the number of rows returned.</li><li><strong>ms</strong> — end-to-end execution time, including router, connector, and network.</li><li><strong>bytes</strong> — bytes scanned at the executor level (when the connector reports it; some do not).</li></ul>
+<p>The badge, its tooltip, and the three chips appear identically on the Query Panel and the Measure Query Panel. The same information is surfaced in the REST <code>/query</code> response body under <code>routing</code>, so a notebook or an agent sees the same explanation.</p>
+<p><strong>Reading the badge.</strong> When the badge reads <code>aggregate</code>, the number you are looking at is as fresh as the last aggregate build. When it reads <code>pocket</code>, similar — as fresh as the pocket&#x27;s refresh schedule. When it reads <code>live</code>, the number is the source&#x27;s current truth.</p>
+<h2>The Force Live toggle</h2>
+<p>The <strong>Force Live</strong> toggle sits next to the Execute button. Switching it on forces the next query to skip aggregate and pocket matching and run directly against the source. Use it when you need to:</p>
+<ul><li><strong>Verify that the source agrees with a pre-computed aggregate.</strong> Run normally (badge: <code>aggregate</code>). Switch Force Live on. Re-run. If the two numbers disagree, the aggregate is stale or the aggregate&#x27;s build logic is wrong.</li><li><strong>Compare a recent source change against an aggregate that has not yet been refreshed.</strong> Force Live reads post-change data; the aggregate route reads the pre-refresh snapshot.</li><li><strong>Reproduce a reported discrepancy.</strong> A finance analyst says Q2 revenue should be €5.2M and the dashboard says €4.8M. Run the same query both ways; if Force Live matches the analyst&#x27;s number, the aggregate is the culprit.</li></ul>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/force-live-toggle.png" alt="The top-right control cluster of the Measure Query Panel with the Force Live toggle half-animated into the on position, the tooltip visible, and the Route badge above the grid updating from aggregate (green) to live (red)."></figure>
+<p><em>Figure 2 — The Force Live toggle. One query, not a default setting. Full description: <a href="../assets/screencaps/force-live-toggle.txt">force-live-toggle.txt</a>.</em></p>
+<p><strong>Force Live is a per-query flag.</strong> It resets to off on panel reload. It never becomes a default for a model. This is deliberate: forcing live on every query would defeat the purpose of aggregates. Force Live is an investigative tool.</p>
+<p><strong>Row security is always enforced.</strong> Force Live changes which table the query reads from, not which rows the caller is allowed to see. Every live query is still wrapped with the same row-security predicate that applies to aggregate and pocket routes. See <a href="../modelling/configure-row-security.html">Configure Row Security</a>.</p>
+<h2>When to use which</h2>
+<div class="table-wrapper"><table><thead><tr><th>Goal</th><th>Use</th></tr></thead><tbody><tr><td>Build a dashboard that reads a known slice</td><td>Let the router pick; aggregate is preferred</td></tr><tr><td>Investigate a single value that looks wrong</td><td>Run the query with Force Live; compare the Route badge reason against the aggregate route</td></tr><tr><td>Confirm a pocket table is doing its job</td><td>Run the query normally; check the badge reads <code>pocket</code></td></tr><tr><td>Test a query before aggregates exist</td><td>Force Live; the miss will be logged and the Optimizer may propose an aggregate</td></tr><tr><td>Run the same query every 10 seconds</td><td><strong>Don&#x27;t.</strong> Let the router pick and let the aggregate serve it</td></tr><tr><td>Export every row behind a dashboard cell</td><td>Click the cell → <a href="../modelling/drill-through.html">Drill-through</a>; Force Live changes aggregation, not export</td></tr></tbody></table></div>
+<h2>Worked example — chase down a stale number</h2>
+<p><strong>Context.</strong> A finance analyst reports that the &quot;Gross margin %&quot; figure on the executive dashboard disagrees with the value they computed by hand from the source fact.</p>
+<p><strong>Steps.</strong></p>
+<ol><li>Open the <a href="../modelling/measure-query-panel.html">Measure Query Panel</a>. Replicate the dashboard&#x27;s query: <code>Gross margin %</code> by region.</li><li>Click <strong>Run</strong>. Route badge reads <code>aggregate</code>. Value for EMEA: 28.4%.</li><li>Hover the badge. Tooltip reads &quot;Served by aggregate <code>margin_by_region</code> (last built 2026-04-20, 4 days ago).&quot;</li><li>Switch <strong>Force Live</strong> on. Click <strong>Run</strong> again. Route badge reads <code>live</code>. Value for EMEA: 31.2%.</li><li>The aggregate is four days stale. The source has moved. Refresh the aggregate (see <a href="../modelling/run-a-refresh.html">Run a Refresh</a>) or accept the staleness and reschedule the build.</li><li>After refresh, run the query normally (Force Live off). Route badge reads <code>aggregate</code>, value reads 31.2%. Dashboard matches the analyst&#x27;s hand-computed number.</li></ol>
+<p>The whole investigation took two Route-badge hovers and a toggle click. No SQL session. No IT ticket.</p>
+<h2>The Optimizer link</h2>
+<p>Queries that fall to the live path log a <strong>miss</strong> — a structured record that says &quot;this query was served live and would have matched an aggregate if one existed at grain X with measures Y&quot;. The Optimizer consumes these misses and proposes aggregates. See <a href="../modelling/use-the-ai-optimiser.html">Use the AI Optimiser</a>.</p>
+<p>This is why &quot;test a query with Force Live&quot; is a constructive action even when the number comes back correct — the miss record tells the Optimizer what aggregate would have been useful.</p>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr></thead><tbody><tr><td>Badge always reads <code>live</code></td><td>No aggregate or pocket covers the query grain</td><td>Define one (see <a href="../modelling/configure-aggregates.html">Configure Aggregates</a>) or accept the live cost</td></tr><tr><td>Badge reads <code>aggregate</code> but the number is stale</td><td>Aggregate refresh is behind its schedule</td><td>Refresh manually, or tighten the schedule</td></tr><tr><td>Force Live on but badge reads <code>aggregate</code></td><td>Very rare — a caching layer in front of the Router returned a cached response</td><td>Clear the frontend cache or re-run from a fresh tab</td></tr><tr><td>Query works for one user and not another, both with Force Live on</td><td>Row security rule fires for one user and not the other</td><td>See <a href="../modelling/configure-row-security.html">Configure Row Security</a></td></tr><tr><td>&quot;bytes&quot; chip always reads 0</td><td>Connector does not report scanned bytes</td><td>Not a bug — PostgreSQL does not report this; BigQuery does</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="../concepts/query-routing.html">Query Routing</a></li><li><a href="../modelling/measure-query-panel.html">Measure Query Panel</a></li><li><a href="../modelling/drill-through.html">Drill-through</a></li><li><a href="../modelling/configure-row-security.html">Configure Row Security</a></li></ul>
+<nav class="page-nav"><a href="../modelling/query-panel.html" class="page-nav-btn prev">&larr; Query Panel</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="../modelling/drill-through.html" class="page-nav-btn next">Drill-through &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

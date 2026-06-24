@@ -1,0 +1,1 @@
+Screenshot of the Excel Data Connection Wizard, step 2 — catalogue selection. A dropdown shows a list of available catalogues. Two entries are visible: 'orders' (the business view) and 'orders_technical' (the technical view). The user has selected 'orders'. Dimensions: 800x600px.

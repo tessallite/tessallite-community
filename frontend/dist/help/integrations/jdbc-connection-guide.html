@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JDBC Connection Guide — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>JDBC Connection Guide</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-05-25</span></div>
+    <h1>JDBC Connection Guide</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/connect-jdbc-dbeaver.png" alt="DBeaver New Database Connection dialog (PostgreSQL)."></figure>
+<h2>What this covers</h2>
+<p>Tessallite exposes a PostgreSQL wire-protocol endpoint on port 5433. Any JDBC client that supports the standard PostgreSQL driver can connect — including DBeaver, Tableau, and any tool using psycopg2 or the JDBC PostgreSQL driver. No Tessallite-specific driver is required.</p>
+<p>This article is a detailed connection reference. For a shorter walkthrough, see <a href="../getting-started/connect-a-bi-tool.html">Connect a BI Tool via JDBC</a>.</p>
+<h2>Connection parameters</h2>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Value</th><th>Notes</th></tr></thead><tbody><tr><td>Host</td><td>Hostname or IP of the Tessallite Gateway</td><td>Use <code>localhost</code> for local installs. Obtain from your System Admin for cloud deployments.</td></tr><tr><td>Port</td><td><code>5433</code></td><td>Fixed. Not the standard PostgreSQL port (5432).</td></tr><tr><td>Database</td><td>Workspace slug (e.g., <code>acme</code>)</td><td>Case-sensitive. This is not a real database name — it routes to the correct workspace.</td></tr><tr><td>Username</td><td>Your Tessallite email address</td><td></td></tr><tr><td>Password</td><td>Your Tessallite password</td><td></td></tr><tr><td>SSL</td><td>Optional for generic JDBC clients; required for the supported Looker path</td><td>Add <code>?sslmode=require</code> for Looker or whenever the server requires SSL.</td></tr><tr><td>Driver class</td><td><code>org.postgresql.Driver</code></td><td>Standard PostgreSQL JDBC driver. No Tessallite-specific driver needed.</td></tr></tbody></table></div>
+<h2>JDBC URL format</h2>
+<pre><code>jdbc:postgresql://HOST:5433/WORKSPACE_SLUG</code></pre>
+<p>Example:</p>
+<pre><code>jdbc:postgresql://analytics.example.com:5433/acme</code></pre>
+<p>With SSL:</p>
+<pre><code>jdbc:postgresql://analytics.example.com:5433/acme?sslmode=require</code></pre>
+<blockquote>The &quot;database&quot; field must contain the workspace slug, not a real database name. Entering anything else returns <code>FATAL: database &quot;X&quot; does not exist</code>.</blockquote>
+<blockquote>Looker Studio/Data Studio direct uses this standard PostgreSQL wire path and does not require generated LookML or <code>LOOKER_GATEWAY_ENABLED</code>. That flag controls only the optional generated relation surface for Looker-hosted use.</blockquote>
+<h2>Connect with DBeaver</h2>
+<ol><li>Open DBeaver.</li><li>Click <strong>New Database Connection</strong> (plug icon in toolbar).</li><li>Select <strong>PostgreSQL</strong> and click <strong>Next</strong>.</li><li>Fill in Host, Port (<code>5433</code>), Database (workspace slug), Username, and Password.</li><li>Click <strong>Test Connection</strong>. A &quot;Connected&quot; dialog confirms success.</li><li>Click <strong>Finish</strong>.</li><li>Expand the connection in the left panel to see schemas and columns.</li></ol>
+<h2>Connect with Tableau</h2>
+<ol><li>Open Tableau Desktop.</li><li>In the <strong>Connect</strong> pane, under <strong>To a Server</strong>, select <strong>PostgreSQL</strong>.</li><li>Enter the Gateway hostname in <strong>Server</strong>.</li><li>Enter <code>5433</code> in <strong>Port</strong>.</li><li>Enter the workspace slug in <strong>Database</strong>.</li><li>Enter your credentials and click <strong>Sign In</strong>.</li></ol>
+<h2>Connect with Apache Superset</h2>
+<ol><li>Log in to Superset.</li><li>Go to <strong>Data</strong> &gt; <strong>Databases</strong> &gt; <strong>+ Database</strong>.</li><li>Select <strong>PostgreSQL</strong> as the database type.</li><li>In the <strong>SQLAlchemy URI</strong> field, enter: <code>postgresql://USER:PASSWORD@HOST:5433/WORKSPACE_SLUG</code> — replace with your Tessallite credentials and gateway address.</li><li>Click <strong>Test Connection</strong> to verify.</li><li>Click <strong>Connect</strong>.</li><li>Navigate to <strong>SQL Lab</strong> to run queries against Tessallite models, or create datasets from the connection for use in charts and dashboards.</li></ol>
+<p>Superset connects via the standard PostgreSQL driver (psycopg2). No additional driver installation is needed.</p>
+<h2>Driver note</h2>
+<p>Tessallite uses the PostgreSQL wire protocol. Use the standard <code>org.postgresql.Driver</code> (JDBC) or <code>psycopg2</code> (Python). No special driver is required.</p>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>Resolution</th></tr></thead><tbody><tr><td>Connection refused on port 5433</td><td>Gateway not running or wrong host</td><td>Verify Gateway service is up with your System Admin</td></tr><tr><td><code>FATAL: database &quot;X&quot; does not exist</code></td><td>Wrong workspace slug</td><td>Verify slug with Tenant Admin (case-sensitive)</td></tr><tr><td>Authentication failed</td><td>Wrong username or password</td><td>Use Tessallite email and password, not source DB credentials</td></tr><tr><td>SSL error</td><td>Server requires SSL</td><td>Append <code>?sslmode=require</code> to the JDBC URL</td></tr><tr><td>No tables visible</td><td>No published models</td><td>A Modeller must publish at least one model</td></tr><tr><td>New columns or tables missing after a model was just published</td><td>Your tool read the catalogue once when it connected, so a mid-session publish is not visible yet</td><td>Disconnect and reconnect the connection in your BI tool; the refreshed catalogue then shows the new model</td></tr><tr><td>A generated LookML relation reports support disabled</td><td>Optional Looker adapter is default-off</td><td>Enable <code>LOOKER_GATEWAY_ENABLED=true</code> only when validating a Looker-hosted project</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="../getting-started/connect-a-bi-tool.html">Connect a BI Tool via JDBC</a></li><li><a href="excel-xmla-connection-guide.html">Excel XMLA Connection Guide</a></li><li><a href="powerbi-connection-guide.html">Power BI Connection Guide</a></li><li><a href="looker-studio-connection-guide.html">Looker Studio Direct Connection</a></li><li><a href="looker-studio-via-looker-guide.html">Optional Looker-hosted LookML Workflow</a></li><li><a href="../troubleshooting/common-errors.html">Common Errors</a></li></ul>
+<nav class="page-nav"><a href="../system-admin/upgrade.html" class="page-nav-btn prev">&larr; Upgrade</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="excel-xmla-connection-guide.html" class="page-nav-btn next">Excel XMLA Connection Guide &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

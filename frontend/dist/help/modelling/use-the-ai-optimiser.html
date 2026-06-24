@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Use the AI Optimiser — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Use the AI Optimiser</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Use the AI Optimiser</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/ai-optimiser-recommendations.png" alt="AI optimiser recommendations panel."></figure>
+<h2>What this covers</h2>
+<p>The AI Optimiser analyzes query miss patterns against your model, scores potential aggregate configurations by estimated return on investment, and surfaces ranked recommendations. This article explains how to open the Optimiser, how to read the recommendation list, and how to act on each recommendation.</p>
+<h2>How the Optimiser works</h2>
+<p>Every time a query reaches the Query Router and no suitable aggregate exists to answer it, the miss is recorded in the query miss log. The Optimiser reads this log, groups misses by grain (the combination of dimensions and measures requested), and scores each group by the estimated query time that could be saved if an aggregate existed for that grain. The result is a ranked list of candidates ordered from highest to lowest ROI.</p>
+<p>The Optimiser requires data in the query miss log before it can make recommendations. At least some queries must have run against the model after it was published. If no queries have run yet, the recommendation list will be empty.</p>
+<h2>Opening the AI Optimiser</h2>
+<ol><li>Open your project in Model Builder.</li><li>In the Toolbelt on the right side of the screen, click <strong>Optimiser</strong>.</li><li>The AI Optimiser panel opens and displays the current recommendation list.</li></ol>
+<h2>Reading the recommendation list</h2>
+<div class="table-wrapper"><table><thead><tr><th>Column</th><th>Description</th></tr></thead><tbody><tr><td>Grain / Dimensions</td><td>The set of dimension columns defining this aggregate&#x27;s level of detail.</td></tr><tr><td>Measures</td><td>The numeric columns the Optimiser recommends pre-aggregating for this grain.</td></tr><tr><td>Query hits</td><td>The number of times this pattern was missed. Higher values = more frequent.</td></tr><tr><td>ROI score</td><td>Combines query frequency and estimated time saved per query.</td></tr><tr><td>Action</td><td>Build, Schedule, or Dismiss.</td></tr></tbody></table></div>
+<h2>Actions</h2>
+<p><strong>Build</strong> — Queues the aggregate for immediate construction. The aggregate appears in Canvas as Building, then transitions to Ready when complete.</p>
+<p><strong>Schedule</strong> — Adds the aggregate to the regular build cycle without an immediate build. The workspace default refresh schedule is applied. Adjust it in the aggregate Drawer or Scheduler panel.</p>
+<p><strong>Dismiss</strong> — Removes the recommendation without creating an aggregate. If the same miss pattern recurs, the recommendation may reappear.</p>
+<h2>Re-scoring after acting on a recommendation</h2>
+<p>After you Build, Schedule, or Dismiss, the Optimiser re-scores remaining candidates and updates the list. Aggregates already built or scheduled are excluded from future recommendations.</p>
+<h2>Optimiser vs. manual configuration</h2>
+<p>Use the Optimiser when you do not know which queries are slow or which aggregates would have the most impact.</p>
+<p>Use manual aggregate configuration when you know the exact grain you need and want direct control over the definition, refresh schedule, and partitioning.</p>
+<p>Both approaches can be combined. The Optimiser handles opportunistic coverage; manual configuration handles known, critical queries.</p>
+<h2>Running the AI advisor (Smart Builder)</h2>
+<p>The AI advisor studies how the model is actually queried and uses an LLM to propose aggregates, scoring each suggestion. Two settings shape how it behaves, and one rule governs when you can run it.</p>
+<h3>Save before you run</h3>
+<p>The advisor reads the model exactly as it is <strong>saved on the server</strong>, not the draft you are editing. If you have unsaved changes in the Builder, the <strong>Run AI now</strong> button stays disabled until you Save. This is deliberate: it stops the advisor from analysing a shape that no longer matches what you see, and saves you from a confusing "version conflict" afterwards. Save first, then run.</p>
+<h3>Minimum confidence</h3>
+<p>Each recommendation carries a <strong>confidence</strong> score between 0 and 1. The <strong>minimum confidence</strong> setting (default 0.5) filters out anything the advisor is unsure about — low-confidence suggestions are still written to the run's decision log for transparency, but they are not offered as actions. Raise the threshold to see only the advisor's strongest calls; lower it to see more, including speculative, suggestions. Start near the default and adjust once you see how the advisor behaves on your model.</p>
+<h3>Require review before applying</h3>
+<p>By default, an approved AI suggestion is built and routed straight away. If you would rather check every change first, turn on <strong>Require review before applying</strong>. With it on, the advisor still studies the data and still proposes aggregates — but instead of building them it registers each one as a <strong>disabled</strong> aggregate. Nothing is built and no query is sped up until you open the aggregate and enable it yourself. This is the safe choice while you are learning how the advisor behaves on a model; turn it off once you trust the suggestions and want them applied automatically.</p>
+<h3>Only one run at a time</h3>
+<p>An AI run holds a per-model lock while it works, and it runs in the background — you get an immediate acknowledgement and a visible "running" row rather than a frozen screen. If a run is already in progress — whether you started it or a schedule did — starting another is rejected with an "AI run in progress" message instead of running two at once. Wait for the current run to finish, then try again.</p>
+<h2>Related</h2>
+<ul><li><a href="view-diagnostics.html">View Diagnostics</a></li><li><a href="manage-aggregate-schedules.html">Manage Aggregate Schedules</a></li><li><a href="configure-aggregates.html">Configure Aggregates</a></li><li><a href="../concepts/aggregates.html">Aggregates (concepts)</a></li></ul>
+<nav class="page-nav"><a href="scheduler-dependencies.html" class="page-nav-btn prev">&larr; Scheduler Dependencies</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="usage-analytics.html" class="page-nav-btn next">Usage Analytics &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

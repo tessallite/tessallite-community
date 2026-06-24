@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Security Audit Trail — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Security Audit Trail</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant_admin</span><span class="updated">Updated 2026-05-02</span></div>
+    <h1>Security Audit Trail</h1>
+<h2>What this covers</h2>
+<p>The security audit trail records every row-security rule evaluation that fires during query execution. This page explains what is logged, how to read the audit log, how to filter it, and what access controls apply.</p>
+<h2>Why the security audit trail matters</h2>
+<p>Row security enforces data access by filtering query results at runtime. For compliance purposes you need to prove that:</p>
+<ul><li>The correct rule fired for the correct user on the correct query.</li><li>No rule was bypassed or skipped for a privileged query.</li><li>You can reconstruct which rows a specific user could have seen at a point in time.</li></ul>
+<p>The security audit trail provides this evidence. Each log entry links the rule, the principal, the persona (where applicable), and the timestamp of the query.</p>
+<h2>What is logged</h2>
+<p>Every time the query router applies a row-security rule, it writes an audit event containing:</p>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Contents</th></tr></thead><tbody><tr><td><code>rule_id</code></td><td>UUID of the <code>RowSecurityRule</code> that fired</td></tr><tr><td><code>rule_name</code></td><td>Display name of the rule</td></tr><tr><td><code>principal_id</code></td><td>User ID from the JWT</td></tr><tr><td><code>principal_email</code></td><td>Email address of the caller</td></tr><tr><td><code>persona_id</code></td><td>UUID of the persona, if the query was routed through one</td></tr><tr><td><code>applied_at</code></td><td>UTC timestamp of the query</td></tr><tr><td><code>query_fingerprint</code></td><td>Normalized query fingerprint</td></tr><tr><td><code>predicate_applied</code></td><td>The SQL predicate injected by the rule</td></tr><tr><td><code>attribute_source</code></td><td>The attribute source used (<code>jwt_role</code>, <code>idp_group</code>, <code>saml_claim</code>, <code>oidc_scope</code>)</td></tr></tbody></table></div>
+<h2>Accessing the audit log</h2>
+<p>The security audit log is accessible from <strong>Tenant Administration → Security → Audit Log</strong>.</p>
+<p>The same data is available via API:</p>
+<pre><code>GET /api/v1/security-audit</code></pre>
+<p>Query parameters:</p>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>from_date</code></td><td>ISO date string</td><td>Include events on or after this date</td></tr><tr><td><code>to_date</code></td><td>ISO date string</td><td>Include events on or before this date</td></tr><tr><td><code>rule_id</code></td><td>UUID</td><td>Filter to a specific rule</td></tr><tr><td><code>principal_id</code></td><td>UUID</td><td>Filter to a specific user</td></tr><tr><td><code>limit</code></td><td>integer</td><td>Maximum records per page (default 100, max 1000)</td></tr><tr><td><code>offset</code></td><td>integer</td><td>Records to skip for pagination</td></tr></tbody></table></div>
+<h2>Access control</h2>
+<p>Only users with the <code>tenant_admin</code> role can read the security audit log. Modellers and viewers receive HTTP 403. The purpose is to protect the log from being used to infer which data other users can see.</p>
+<h2>Attribute source values</h2>
+<p>Row-security rules can derive the filter value from four sources. The audit log records which source was used:</p>
+<div class="table-wrapper"><table><thead><tr><th><code>attribute_source</code></th><th>Where the value comes from</th></tr></thead><tbody><tr><td><code>jwt_role</code></td><td>The <code>role</code> claim in the caller&#x27;s JWT</td></tr><tr><td><code>idp_group</code></td><td>The group membership claim from the identity provider</td></tr><tr><td><code>saml_claim</code></td><td>A named claim in a SAML assertion</td></tr><tr><td><code>oidc_scope</code></td><td>A named scope in an OIDC token</td></tr></tbody></table></div>
+<p>If the attribute source is absent from the token, the rule logs the evaluation but may produce an empty result set (the query runs but returns no rows) rather than a 403.</p>
+<h2>Retention</h2>
+<p>Audit events are kept for 90 days by default. The retention period can be adjusted in Workspace Settings.</p>
+<h2>Related</h2>
+<ul><li><a href="../modelling/configure-row-security.html">Configure Row Security</a></li><li><a href="manage-roles.html">Manage Roles</a></li></ul>
+<nav class="page-nav"><a href="webhooks.html" class="page-nav-btn prev">&larr; Webhooks</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="scheduler-sla.html" class="page-nav-btn next">Refresh SLA Declarations &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,1 @@
+Screenshot of the DBeaver New Database Connection dialog with PostgreSQL selected. The form shows fields: Host (filled with 'localhost'), Port (filled with '5433'), Database (filled with the workspace slug), Username (filled with the user's email), Password (filled). The 'Test Connection' button is visible. Dimensions: 800x600px.

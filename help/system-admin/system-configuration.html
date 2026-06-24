@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>System Configuration — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>System Configuration</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-05-28</span></div>
+    <h1>System Configuration</h1>
+<figure class="illustration"><img class="illustration" src="../assets/illustrations/settings-precedence-chain.svg" alt="Settings precedence chain"></figure>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/system-configuration-tab.png" alt="System Admin — Configuration tab with sectioned settings accordions."></figure>
+<h2>What this covers</h2>
+<p>The Configuration tab in System Admin lets you tune platform-wide settings across five sections: authentication, daily maintenance schedule, query timeouts, result limits and rate limiting, and a read-only view of the environment variables from the <code>.env</code> file.</p>
+<h2>Tabs</h2>
+<div class="table-wrapper"><table><thead><tr><th>Tab</th><th>Purpose</th></tr></thead><tbody><tr><td><strong>Auth</strong></td><td>Session lifetime and security settings.</td></tr><tr><td><strong>Daily schedule</strong></td><td>What time each daily maintenance task runs (aggregate cleanup, source schema check, AI advisor, predictive aggregate check, pocket table cleanup). Each shows a time picker in UTC.</td></tr><tr><td><strong>Timeouts</strong></td><td>Source database connect timeout and query timeout.</td></tr><tr><td><strong>Ceilings</strong></td><td>Maximum result rows, chunk size, tenant query rate limiting.</td></tr><tr><td><strong>Environment</strong></td><td>Read-only view of values from the host <code>.env</code> file (database DSN, JWT key, ports, CORS).</td></tr></tbody></table></div>
+<h2>Rate limiting and the per-replica ceiling</h2>
+<p>The <strong>Ceilings</strong> section sets two rate limits: the number of requests each tenant may make per minute (<code>rate_limit.per_minute</code>), and a stricter ceiling on login attempts per client address per minute (<code>rate_limit.login_per_minute</code>, which slows password guessing). When a caller exceeds either limit, the platform returns HTTP 429 with a <code>Retry-After</code> header and stops serving them until the minute rolls over. The master switch <code>rate_limit.enabled</code> turns enforcement on or off, and changes take effect immediately — no restart.</p>
+<p>There is one thing to understand before you rely on these ceilings in production. <strong>The limit is counted per replica.</strong> Each running copy of a service (each worker process, or each instance when the platform scales out — for example on Cloud Run) keeps its own private tally in memory. If you run three replicas, a tenant can make up to three times the configured number of requests per minute, because each replica only sees a third of the traffic and none of them share a running total. The counters also reset to zero whenever a replica restarts or a new one starts up.</p>
+<p>This is fine for a single-instance deployment (the usual local or small setup), where there is exactly one replica and the configured number is the real ceiling. It matters once you scale horizontally and want a single, shared ceiling across every replica. To get that, point the <code>RATE_LIMIT_STORAGE_URI</code> environment variable (in the host <code>.env</code>, shown read-only on the <strong>Environment</strong> tab) at a shared store such as a Redis or Memcached server — for example <code>redis://my-redis-host:6379/0</code>. With a shared store configured, all replicas count against the same buckets and the configured number becomes the true platform-wide ceiling. Leaving <code>RATE_LIMIT_STORAGE_URI</code> empty keeps the default per-replica in-memory behaviour.</p>
+<p><strong>Tip:</strong> if you are seeing more requests get through than the number you set, count your replicas first — the most common cause is the per-replica tally, not a broken limit. Either set <code>RATE_LIMIT_STORAGE_URI</code> to a shared store, or pin the replica count, or simply divide your intended ceiling by the number of replicas.</p>
+<p>Internal service-to-service traffic (for example the gateway relaying a BI query to the model service) is intentionally exempt from these limits, so throttling never breaks the query pipeline for connected BI tools.</p>
+<h2>Who can edit it</h2>
+<p>Only the <strong>system_admin</strong> role can read or write here. Tenant admins, modelers, and viewers do not see the tab. Backend endpoints (<code>GET /api/v1/system/settings</code>, <code>PUT /api/v1/system/settings/{key}</code>) reject any other role.</p>
+<h2>How values resolve</h2>
+<p>Every setting on this page is the platform default. A tenant admin can override individual keys at the tenant level; a project admin can further override at the project level; modelers can override at the model level. When a query, scheduler job, or API handler asks for a setting, the resolver walks <strong>model &rarr; project &rarr; tenant &rarr; system &rarr; registry default</strong> and returns the first non-null value. A <code>null</code> stored at any level means &quot;explicitly unset, fall through&quot;.</p>
+<h2>Editing a setting</h2>
+<ol><li>Sign in as a system administrator and open System Admin &rarr; Configuration.</li><li>Use the search box at the top to filter by key, section, or description.</li><li>Find the setting you want to change. The default and the current value are displayed inline.</li><li>Edit the value, then click <strong>Save</strong>. <strong>Reset</strong> restores the registry default for that key.</li></ol>
+<h2>Restart-required settings</h2>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/system-restart-banner.png" alt="Yellow restart-required banner with the How to restart link."></figure>
+<p>Some settings &mdash; daily schedule times &mdash; can only take effect when the scheduler service restarts. Saving any of these shows a yellow banner at the top of the page listing the recently-changed keys.</p>
+<p>The <strong>How to restart</strong> button on that banner opens a dialog with the docker-compose / systemd procedure. After restarting, return to the Configuration tab and click <strong>Mark all as applied</strong> to clear the banner.</p>
+<h2>Environment tab</h2>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/bootstrap-env-panel.png" alt="System Configuration — read-only Environment panel."></figure>
+<p>The Environment tab shows read-only values from the host&#x27;s <code>.env</code> file: the system DB DSN, the Fernet credential-encryption key, the JWT signing key, the system administrator&#x27;s email and password, the gateway&#x27;s JDBC and XMLA ports, the internal service URLs, and the CORS allow-list. Secrets are masked (<code>***** (32 chars)</code>) and the DSN&#x27;s password is redacted, so an operator can verify what is in effect without exposing credentials.</p>
+<p>To change any of these values, edit <code>.env</code> on the host and restart the affected service (or the whole stack with <code>docker compose restart</code>). See <a href="credentials-and-env.html">Credentials and the .env file</a> for the full procedure.</p>
+<h2>Per-key reference</h2>
+<p>The complete catalog of every system-level key, its type, default, restart flag, and description is generated from the registry at <code>docs/guides/guides_configuration-reference.md</code>. Regenerate after any registry change with:</p>
+<pre><code>python tessallite/scripts/gen_config_reference.py</code></pre>
+<h2>Related</h2>
+<ul><li><a href="configure-environment-variables.html">Configure Environment Variables</a></li><li><a href="credentials-and-env.html">Credentials and the .env file</a></li><li><a href="../admin/workspace-settings.html">Workspace settings (tenant level)</a></li><li><a href="../admin/project-settings.html">Project settings</a></li><li><a href="../admin/model-configuration.html">Model configuration</a></li></ul>
+<nav class="page-nav"><a href="configure-environment-variables.html" class="page-nav-btn prev">&larr; Configure Environment Variables</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="credentials-and-env.html" class="page-nav-btn next">Credentials and the .env File &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

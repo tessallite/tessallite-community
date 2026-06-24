@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 200" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="arrow" refX="8" refY="3" markerWidth="8" markerHeight="6" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#006C35"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="400" y="20" font-size="14" font-weight="700" fill="#006C35" text-anchor="middle">First-Time Setup</text>
+
+  <!-- Block 1: Sign in as System Admin -->
+  <rect x="20" y="60" width="160" height="100" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5" rx="10"/>
+  <circle cx="100" cy="85" r="16" fill="#006C35"/>
+  <text x="100" y="90" font-size="13" font-weight="700" fill="white" text-anchor="middle">1</text>
+  <text x="100" y="118" font-size="12" font-weight="600" fill="#333333" text-anchor="middle">Sign in as</text>
+  <text x="100" y="134" font-size="12" font-weight="600" fill="#333333" text-anchor="middle">System Admin</text>
+
+  <!-- Arrow 1 → 2 -->
+  <line x1="180" y1="110" x2="205" y2="110" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Block 2: Create Workspace -->
+  <rect x="210" y="60" width="160" height="100" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5" rx="10"/>
+  <circle cx="290" cy="85" r="16" fill="#006C35"/>
+  <text x="290" y="90" font-size="13" font-weight="700" fill="white" text-anchor="middle">2</text>
+  <text x="290" y="118" font-size="12" font-weight="600" fill="#333333" text-anchor="middle">Create</text>
+  <text x="290" y="134" font-size="12" font-weight="600" fill="#333333" text-anchor="middle">Workspace</text>
+
+  <!-- Arrow 2 → 3 -->
+  <line x1="370" y1="110" x2="395" y2="110" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Block 3: Create Tenant User -->
+  <rect x="400" y="60" width="160" height="100" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5" rx="10"/>
+  <circle cx="480" cy="85" r="16" fill="#006C35"/>
+  <text x="480" y="90" font-size="13" font-weight="700" fill="white" text-anchor="middle">3</text>
+  <text x="480" y="118" font-size="12" font-weight="600" fill="#333333" text-anchor="middle">Create</text>
+  <text x="480" y="134" font-size="12" font-weight="600" fill="#333333" text-anchor="middle">Tenant User</text>
+
+  <!-- Arrow 3 → 4 -->
+  <line x1="560" y1="110" x2="585" y2="110" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Block 4: Sign in as Tenant User -->
+  <rect x="590" y="60" width="160" height="100" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5" rx="10"/>
+  <circle cx="670" cy="85" r="16" fill="#006C35"/>
+  <text x="670" y="90" font-size="13" font-weight="700" fill="white" text-anchor="middle">4</text>
+  <text x="670" y="118" font-size="12" font-weight="600" fill="#333333" text-anchor="middle">Sign in as</text>
+  <text x="670" y="134" font-size="12" font-weight="600" fill="#333333" text-anchor="middle">Tenant User</text>
+</svg>

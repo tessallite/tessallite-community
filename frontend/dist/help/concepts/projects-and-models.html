@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Projects and Models — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Concepts</span> / <span>Projects and Models</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Projects and Models</h1>
+<h2>What this covers</h2>
+<p>This article explains what projects and models are, how they differ, and how the Model Builder is organised.</p>
+<h2>Projects</h2>
+<p>A project is a container for one or more models. Projects exist within a workspace and group related models — for example, all models related to sales in one project, all models related to inventory in another.</p>
+<p>A project has a name, a creation date, and a list of members. Each member has a role within the project: Modeller or Viewer.</p>
+<p>Projects are created by Modellers or Tenant Admins.</p>
+<h2>Models</h2>
+<p>A model is the core object in Tessallite. It defines a single business fact — the central event or transaction being analysed. A model is built by a Modeller using the Model Builder.</p>
+<p>A model contains:</p>
+<ul><li><strong>Tables</strong> — the source data tables drawn from a connected data source. One table must be of type <code>fact</code>. Additional tables of type <code>dim_aggregate</code> or <code>dim_detail</code> may be added.</li><li><strong>Joins</strong> — the relationships between tables. A join connects the fact table to a dimension table, or connects dimension tables to each other.</li><li><strong>Dimensions</strong> — the attributes by which the fact can be sliced and filtered. Each dimension maps to a column in one of the model&#x27;s tables.</li><li><strong>Measures</strong> — the numeric values computed from the fact. Each measure defines an aggregation function (SUM, COUNT, AVG, and others) applied to a column.</li><li><strong>Aggregates</strong> — pre-computed summaries. Tessallite builds these automatically and uses them to answer recurring queries without scanning raw data.</li><li><strong>Targets</strong> — the data destination where aggregates are stored.</li></ul>
+<h2>The one-fact rule</h2>
+<p>Each model must have exactly one fact table. Multi-fact analysis is handled by creating one model per fact within the same project.</p>
+<h2>The Model Builder</h2>
+<p>Selecting a model opens the Model Builder. It has five distinct areas.</p>
+<p><strong>Canvas</strong> — a visual diagram of the tables and joins in the model. Nodes are colour-coded: blue for fact tables, green for aggregate dimensions, yellow for detail dimensions. Drawing a line between two nodes creates a join.</p>
+<p><strong>Toolbelt</strong> — a vertical icon strip on the left side of the screen. Each icon opens a panel in the Drawer for managing one aspect of the model: Sources, Joins, Dimensions, Measures, Targets, Aggregates, Refresh, Lineage, Diagnostics.</p>
+<p><strong>Drawer</strong> — the detail panel on the right, showing the content of whichever Toolbelt panel is currently open.</p>
+<p><strong>Summary Bar</strong> — a bar below the page header showing the current count of tables, joins, dimensions, measures, and aggregates, and the target status. The Summary Bar is always visible.</p>
+<p><strong>Model Health tab</strong> — a dedicated view showing structural alerts, recent aggregate refresh runs, recent Optimiser runs, and any invalid objects.</p>
+<h2>Table types</h2>
+<p>Tessallite classifies each table in a model into one of three types.</p>
+<div class="table-wrapper"><table><thead><tr><th>Type</th><th>Description</th><th>When to use</th></tr></thead><tbody><tr><td><code>fact</code></td><td>The central event or transaction table</td><td>One per model — the primary data being analysed</td></tr><tr><td><code>dim_aggregate</code></td><td>A dimension with low to moderate cardinality</td><td>Country, category, status — data that groups well</td></tr><tr><td><code>dim_detail</code></td><td>A high-cardinality dimension</td><td>Customer, product catalogue, address — data for lookup and filtering</td></tr></tbody></table></div>
+<p>The table type affects how Tessallite builds aggregates and how the query router selects pre-computed summaries.</p>
+<h2>Related</h2>
+<ul><li><a href="workspaces-and-tenants.html">Workspaces and tenants</a></li><li><a href="../modelling/add-a-data-source.html">Add a data source</a></li><li><a href="../modelling/define-dimensions.html">Define dimensions</a></li><li><a href="../modelling/define-measures.html">Define measures</a></li><li><a href="../modelling/create-a-project.html">Create a project</a></li></ul>
+<nav class="page-nav"><a href="workspaces-and-tenants.html" class="page-nav-btn prev">&larr; Workspaces and Tenants</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="sources-tables-and-joins.html" class="page-nav-btn next">Sources, Tables, and Joins &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

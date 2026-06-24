@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Project-Level Personas — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Agent</span> / <span>Project-Level Personas</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-05-15</span></div>
+    <h1>Project-Level Personas</h1>
+<h2>What this covers</h2>
+<p>Project-level personas restrict what the conversational agent can see across a project. They are different from model-level personas, which publish scoped catalogues for JDBC/XMLA and in-app querying. Use project-level personas when the agent serves several audiences from the same project and each audience should see a different subset of models, measures, or dimensions.</p>
+<h2>How they differ from model personas</h2>
+<div class="table-wrapper"><table><thead><tr><th>Aspect</th><th>Project-level persona</th><th>Model-level persona</th></tr></thead><tbody><tr><td>Primary consumer</td><td>Conversational agent</td><td>Query router, JDBC, XMLA, Measure Query Panel</td></tr><tr><td>Scope</td><td>One project, many models</td><td>One model</td></tr><tr><td>Restricts</td><td>Models, measures, dimensions exposed to the agent context</td><td>Measures, dimensions, hierarchies, filters, row-security bypass, tag restrictions</td></tr><tr><td>Enforcement point</td><td>Agent context assembly and query validation</td><td>Gateway/query-router persona gate</td></tr><tr><td>Typical user</td><td>Tenant admin or data steward configuring agent audiences</td><td>Modeller publishing audience-specific catalogues</td></tr></tbody></table></div>
+<h2>How the agent uses a project persona</h2>
+<p>When a persona is selected in Agent Chat, the prompt builder filters model profiles before the LLM sees them. Excluded models and attributes are not described to the model. If a later query plan references excluded objects, validation rejects it before execution.</p>
+<p>A persona contains one or more model scopes. If a model scope is absent, that model is hidden from the persona. If a model scope exists with empty measure or dimension lists, that axis is unrestricted for that model. Non-empty lists act as allow lists.</p>
+<h2>Recommended design</h2>
+<p>Create personas for audiences, not individuals: Finance, Operations, Partner Support, Executive Review. Start broad enough for the audience to answer its real questions, then narrow only where governance requires it. Keep descriptions explicit because the persona name becomes part of the user-facing chat context.</p>
+<h2>Example</h2>
+<p>A Finance persona can include the payments and settlements models, allow revenue/cost/margin measures, and include fiscal calendar dimensions. A Partner persona can include only shipment count and SLA measures while excluding customer identity dimensions and cost measures.</p>
+<h2>Related</h2>
+<ul><li><a href="agent-chat.html">Agent Chat</a></li><li><a href="configure-agent.html">Configure your project agent</a></li><li><a href="../modelling/configure-personas.html">Configure model-level personas</a></li><li><a href="../modelling/column-level-security.html">Column-Level Security</a></li></ul>
+<nav class="page-nav"><a href="configure-agent.html" class="page-nav-btn prev">&larr; Configure your project agent</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="glossary-alias-map.html" class="page-nav-btn next">Author the glossary alias map &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>
