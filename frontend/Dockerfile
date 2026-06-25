@@ -62,7 +62,14 @@ RUN npm run build
 # Stage 2: serve with nginx (same-origin API proxy)
 FROM nginx:1.25-alpine
 
-RUN mkdir -p /etc/nginx/certs
+RUN mkdir -p /etc/nginx/certs && apk add --no-cache openssl
+
+# Self-heal TLS: nginx.conf.template requires a cert unconditionally. This
+# entrypoint hook (run before nginx by the base image) generates a self-signed
+# default when none is mounted, so a fresh community compose / Helm install does
+# not crashloop. A bind-mounted or Secret-mounted cert overrides it.
+COPY frontend/docker-entrypoint.d/05-ensure-cert.sh /docker-entrypoint.d/05-ensure-cert.sh
+RUN chmod +x /docker-entrypoint.d/05-ensure-cert.sh
 
 COPY --from=builder /app/frontend/dist /usr/share/nginx/html
 COPY excel-plugin/dist /usr/share/nginx/html/excel-plugin
@@ -95,7 +102,7 @@ ENV GATEWAY_HOST=gateway
 ENV AGENT_SERVICE_URL=http://agent-service:8000
 ENV AGENT_SERVICE_HOST=agent-service
 
-RUN chown -R nginx:nginx /usr/share/nginx/html /var/cache/nginx /var/log/nginx /etc/nginx/conf.d && \
+RUN chown -R nginx:nginx /usr/share/nginx/html /var/cache/nginx /var/log/nginx /etc/nginx/conf.d /etc/nginx/certs && \
     chmod -R 755 /usr/share/nginx/html && \
     touch /var/run/nginx.pid && chown nginx:nginx /var/run/nginx.pid
 USER nginx

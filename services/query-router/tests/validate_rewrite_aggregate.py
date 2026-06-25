@@ -83,6 +83,9 @@ PG_PASSWORD = os.environ.get("PG_PASSWORD", os.environ.get("POSTGRES_PASSWORD", 
 TENANT_SLUG = os.environ.get("BATCH_TENANT_SLUG", "acme-demo")
 TENANT_EMAIL = os.environ.get("BATCH_TENANT_EMAIL", "admin@acme-demo.com")
 TENANT_PASSWORD = os.environ.get("BATCH_TENANT_PASSWORD", "acme-demo")
+# Project slug to run against. Dev acme-demo uses "project1"; the Community demo
+# tenant uses "project-demo" — set BATCH_PROJECT_SLUG to retarget (Bug-5453).
+PROJECT_SLUG = os.environ.get("BATCH_PROJECT_SLUG", "project1")
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
 PHYSICAL_TABLE = os.environ.get("PHYSICAL_TABLE", "demo_data.payment_transaction")
 
@@ -414,11 +417,21 @@ def _normalize_value(v):
                 return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             except ValueError:
                 continue
+    # Numeric canonicalization (Bug-5454): compare numbers by VALUE, not string
+    # representation. An aggregate SUM cache column is unconstrained `numeric` so a
+    # 0 sum renders "0", while the source numeric(_,2) renders "0.00" — same value,
+    # different scale. Canonicalize via Decimal so "0"=="0.00", "5.0"=="5", and
+    # "5.10"=="5.1"; genuinely different values stay different. Use Decimal (not
+    # float) to avoid binary rounding on long decimals.
     try:
-        f = float(s)
-        if f == int(f) and "." not in s and "e" not in s.lower():
-            return str(int(f))
-        return s
+        from decimal import Decimal, InvalidOperation
+        try:
+            d = Decimal(s)
+        except InvalidOperation:
+            return s
+        if d == d.to_integral_value():
+            return str(d.to_integral_value())          # 0.00 -> 0, 5.0 -> 5, 100 -> 100
+        return format(d.normalize(), "f")              # 5.10 -> 5.1, 0.50 -> 0.5
     except (ValueError, OverflowError):
         pass
     return s
@@ -603,9 +616,9 @@ def setup(ctx: TestModelContext) -> bool:
     # 2. Discover project and source model
     try:
         projects = _api("GET", f"{MODEL_SERVICE_URL}/api/v1/projects", token=ctx.token)
-        project = next((p for p in projects if p.get("slug") == "project1"), None)
+        project = next((p for p in projects if p.get("slug") == PROJECT_SLUG), None)
         if not project:
-            print("  ABORT: project1 not found")
+            print(f"  ABORT: project {PROJECT_SLUG!r} not found")
             return False
         ctx.project_id = project["id"]
 
@@ -617,7 +630,7 @@ def setup(ctx: TestModelContext) -> bool:
             print(f"  ABORT: {SOURCE_MODEL_SLUG} not found")
             return False
         ctx.source_model_id = source["id"]
-        print(f"  Found project1 ({ctx.project_id}) and {SOURCE_MODEL_SLUG} ({ctx.source_model_id})")
+        print(f"  Found {PROJECT_SLUG} ({ctx.project_id}) and {SOURCE_MODEL_SLUG} ({ctx.source_model_id})")
     except Exception as e:
         print(f"  ABORT: Discovery failed: {e}")
         return False

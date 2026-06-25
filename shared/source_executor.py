@@ -189,7 +189,11 @@ async def _execute_bq(conn_obj: Any, sql: str) -> tuple[list[dict], list[str]]:
             or creds.get("project_id")
             or sa_info.get("project_id")
         )
-        client = bigquery.Client(credentials=gc, project=project_id)
+        client = bigquery.Client(
+            credentials=gc,
+            project=project_id,
+            location=(conn_obj.config or {}).get("location") or creds.get("location") or None,
+        )
         try:
             job = client.query(sql)
             result = job.result(timeout=timeout_s)
@@ -398,7 +402,11 @@ async def _execute_ddl_bq(conn_obj: Any, statements: list[str]) -> None:
             or creds.get("project_id")
             or sa_info.get("project_id")
         )
-        client = bigquery.Client(credentials=gc, project=project_id)
+        client = bigquery.Client(
+            credentials=gc,
+            project=project_id,
+            location=(conn_obj.config or {}).get("location") or creds.get("location") or None,
+        )
         try:
             for stmt in statements:
                 job = client.query(stmt)
@@ -691,7 +699,11 @@ async def _bulk_insert_bq(
             or creds.get("project_id")
             or sa_info.get("project_id")
         )
-        client = bigquery.Client(credentials=gc, project=project_id)
+        client = bigquery.Client(
+            credentials=gc,
+            project=project_id,
+            location=(conn_obj.config or {}).get("location") or creds.get("location") or None,
+        )
         try:
             table_ref = f"{project_id}.{schema}.{table}" if project_id else f"{schema}.{table}"
             total = 0
@@ -1452,7 +1464,11 @@ async def open_source_connection(
             or creds.get("project_id")
             or sa_info.get("project_id")
         )
-        client = bigquery.Client(credentials=gc, project=project_id)
+        client = bigquery.Client(
+            credentials=gc,
+            project=project_id,
+            location=(conn_obj.config or {}).get("location") or creds.get("location") or None,
+        )
         try:
             yield SourceConnection(client, "bigquery")
         finally:

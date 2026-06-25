@@ -255,6 +255,45 @@ Example H — case-insensitive grouping with a scalar function attribute:
   Why: a registered scalar function (lower) normalises the grouping key; the \
 "field" must be a real dimension from AVAILABLE MODELS.
 
+Example I — function-on-column WHERE filter:
+  Question: "Total value for transactions that happened in June, any year"
+  Output: {"query": {"model_id": "...", "measures": ["<amount_measure>"], \
+"dimensions": [], "where": [{"left": {"fn": "extract", "args": \
+[{"literal": "month"}, {"field": "<date_dimension>"}]}, "op": "eq", \
+"right": {"literal": 6}}], "having": [], "sort": [], "limit": 100, \
+"chart_type": "kpi"}}
+  Why: the filter is a function of a column (EXTRACT(MONTH FROM d) = 6), so use \
+the structured {"left","op","right"} predicate form, not a bare-column filter.
+
+Example J — column-to-column WHERE filter:
+  Question: "How many records settled after the transaction date?"
+  Output: {"query": {"model_id": "...", "measures": ["<count_measure>"], \
+"dimensions": [], "where": [{"left": {"field": "<settlement_date>"}, "op": "gt", \
+"right": {"field": "<transaction_date>"}}], "having": [], "sort": [], \
+"limit": 100, "chart_type": "kpi"}}
+  Why: both sides are columns compared on the same row, so the right side is a \
+{"field": ...} node, not a literal value.
+
+Example K — ratio-of-aggregates HAVING:
+  Question: "Categories where fees are more than half of the transaction value"
+  Output: {"query": {"model_id": "...", "measures": ["<fees>", "<amount>"], \
+"dimensions": ["<category>"], "where": [], "having": [{"left": {"arith": "div", \
+"left": {"fn": "sum", "args": [{"field": "<fees>"}]}, "right": {"fn": "sum", \
+"args": [{"field": "<amount>"}]}}, "op": "gt", "right": {"literal": 0.5}}], \
+"sort": [], "limit": 100}}
+  Why: the threshold is a ratio of two aggregates, expressed as a structured \
+HAVING predicate whose left side contains the aggregates.
+
+Example L — CASE bucket projection:
+  Question: "Bucket each category's value into high/low at 1000"
+  Output: {"query": {"model_id": "...", "measures": [], \
+"dimensions": ["<category>"], "projections": [{"expr": {"case": [{"when": \
+{"left": {"field": "<amount_measure>"}, "op": "gt", "right": {"literal": 1000}}, \
+"then": {"literal": "high"}}], "else": {"literal": "low"}}, "alias": \
+"value_band"}], "where": [], "having": [], "sort": []}}
+  Why: a derived/computed output column uses the "projections" list with a \
+structured CASE node; the "field" must be a real measure or dimension.
+
 SHAPE CONTRACT EXAMPLES (generic; choose real fields only from AVAILABLE MODELS):
 1. Multi-series trend contract: choose one temporal dimension, one categorical \
 dimension, and one numeric model measure from Measures available. UDA-backed \

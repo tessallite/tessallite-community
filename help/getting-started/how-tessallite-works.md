@@ -15,7 +15,7 @@ This article describes what Tessallite does with a query from the moment the BI 
 
 Tessallite sits between a BI tool and one or more data sources. It receives SQL or DAX queries, decides how to answer them, and returns results. To the BI tool, Tessallite looks like a single database. The BI tool does not need to know where the data came from.
 
-When Tessallite can answer a query from a pre-computed summary table, it does. When no suitable summary exists, it runs the query against the raw source. In both cases the result is identical.
+When Tessallite can answer a query from a pre-computed summary table, it does. When no suitable summary exists, it runs the query through the governed source path. In both cases the result is identical.
 
 ---
 
@@ -26,7 +26,7 @@ When Tessallite can answer a query from a pre-computed summary table, it does. W
 3. The Query Router parses the query and maps its columns to the semantic model. The semantic model contains the definitions of dimensions, measures, and joins set up by the modeller. This step confirms that every column referenced in the query has a known meaning.
 4. The aggregate matcher checks whether a pre-computed summary exists that can answer the query. It checks three conditions: the summary's grain covers the query's grain, all requested measures are present in the summary, and any column used to filter is part of the summary's grain.
 5. If a match is found — a hit — the Query Router rewrites the query to run against the summary table. The rewritten query executes and the result is returned to the BI tool.
-6. If no match is found — a miss — the query runs against the raw source table. The miss is recorded with the query's grain and measure pattern.
+6. If no match is found — a miss — the query runs through the governed source path. The miss is recorded with the query's grain and measure pattern.
 
 ![Query routing flow.](../assets/illustrations/query-routing-flow.svg)
 
@@ -40,7 +40,7 @@ The Optimizer reads the miss log. When the same query pattern appears frequently
 
 ## What the analyst sees
 
-The analyst's query always returns the same numbers. Whether the result came from a summary table or the raw source makes no difference to the values returned. The BI tool does not change. The query does not change.
+The analyst's query always returns the same numbers. Whether the result came from a summary table or the source path makes no difference to the values returned. The BI tool does not change. The query does not change.
 
 ---
 

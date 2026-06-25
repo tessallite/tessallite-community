@@ -47,10 +47,10 @@ Use the pagination controls to navigate through the data. The preview fetches ea
 
 ## Limitations
 
-- **Queries the source directly.** Each page load issues a query against the live source database. This is not cached and not aggregate-routed.
+- **Reads source rows for modelling checks.** Each page load issues a limited preview query through Tessallite's source preview path. This is not cached and not aggregate-routed.
 - **Large tables may be slow.** On BigQuery or Spark sources, even a `LIMIT 100` query has a minimum latency due to job startup overhead.
 - **No filtering or sorting.** The preview shows raw data in source order. For filtered or sorted views, use the Measure Query Panel.
-- **Row security not applied.** The preview shows raw source data regardless of persona or row security rules. It is a modeller tool, not an end-user view.
+- **Row security not applied.** The preview shows source rows regardless of persona or row security rules. It is a modeller tool, not an end-user view.
 
 ---
 

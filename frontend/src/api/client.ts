@@ -156,6 +156,7 @@ import type {
 // ---------------------------------------------------------------------------
 
 import {
+  issuerBaseUrl,
   modelServiceBaseUrl,
   optimizerBaseUrl,
   queryRouterBaseUrl,
@@ -342,9 +343,24 @@ export const authApi = {
     api.post<User>("/api/v1/auth/users/me/complete-onboarding").then((r) => r.data),
 };
 
+export type LicenseManagerStatus = {
+  edition: string | null;
+  status: Record<string, unknown>;
+  entitlements: Record<string, unknown>;
+  enforcement_enabled: boolean;
+  has_license: boolean;
+};
+
 export const adminApi = {
   migrateTenant: (tenantId: string) =>
     api.post(`/api/v1/admin/migrate/tenant/${encodeURIComponent(tenantId)}`).then((r) => r.data),
+  // License manager (system-admin only).
+  licenseStatus: () =>
+    api.get<LicenseManagerStatus>("/api/v1/admin/license").then((r) => r.data),
+  installLicense: (doc: unknown) =>
+    api
+      .post<{ status: string; license: LicenseManagerStatus }>("/api/v1/admin/license", doc)
+      .then((r) => r.data),
 };
 
 // ---------------------------------------------------------------------------
@@ -423,7 +439,12 @@ export type EditionStatus = {
 export type EditionLimits = {
   edition?: string;
   entitlements: Record<string, unknown>;
-  usage?: { models?: number | null; users?: number | null };
+  usage?: {
+    models?: number | null;
+    users?: number | null;
+    tenants?: number | null;
+    projects?: number | null;
+  };
 };
 
 export const editionApi = {
@@ -431,6 +452,35 @@ export const editionApi = {
     api.get<EditionStatus>("/api/v1/edition").then((r) => r.data),
   getLimits: () =>
     api.get<EditionLimits>("/api/v1/limits").then((r) => r.data),
+};
+
+// ---------------------------------------------------------------------------
+// Advisory / update feed (read-only; served by the public issuer service)
+// ---------------------------------------------------------------------------
+
+export type Advisory = {
+  id: string;
+  published?: string;
+  severity?: string; // "info" | "low" | "medium" | "high" | "critical"
+  title: string;
+  summary?: string;
+  fixed_in?: string;
+  link?: string;
+};
+
+type AdvisoryFeed = { advisories?: Advisory[] };
+
+// The issuer is external and unauthenticated: use a bare axios call (no
+// credentials, no CSRF) with a short timeout so an unreachable feed degrades
+// gracefully instead of hanging the UI.
+export const advisoriesApi = {
+  list: (): Promise<Advisory[]> =>
+    axios
+      .get<AdvisoryFeed>(`${issuerBaseUrl()}/advisories`, {
+        withCredentials: false,
+        timeout: 8000,
+      })
+      .then((r) => r.data?.advisories ?? []),
 };
 
 // ---------------------------------------------------------------------------

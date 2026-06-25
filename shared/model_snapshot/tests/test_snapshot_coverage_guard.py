@@ -139,6 +139,17 @@ EXCLUDED: dict[str, str] = {
     "solidatus_connections": "external-integration connection config + secrets; not portable",
     "solidatus_object_mappings": "runtime governance-sync mapping, not model config",
     "solidatus_sync_runs": "runtime integration sync telemetry",
+    # Conversational-agent runtime data. These are per-tenant chat/cost/webhook
+    # records keyed on project_id; they only chain to models via an OPTIONAL
+    # pinned_model_id (conversations) / its child FKs (turns, cost ledger,
+    # webhook DLQ). They are not model-definition config — the model-snapshot
+    # serialiser (which "excludes runtime logs and anything at project scope")
+    # never emits them, and only project_rehydrator handles them at project
+    # scope. So all four are excluded from the model snapshot.
+    "agent_conversations": "runtime agent conversation log (project-scoped, optional model pin)",
+    "agent_turns": "runtime agent turn log (child of agent_conversations)",
+    "agent_cost_ledger": "runtime per-turn LLM cost telemetry",
+    "agent_webhook_dlq": "runtime webhook dead-letter queue (operator-managed)",
 }
 
 

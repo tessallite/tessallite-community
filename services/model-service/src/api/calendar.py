@@ -38,10 +38,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from shared.config.settings import get_settings
-from shared.connector_qualify import qualify_table_name as _shared_qualify
 from shared.db.models import (
     CalendarTable,
     DataSource,
+    Model,
     ModelColumn,
     ModelTable,
     ProjectConnection,
@@ -56,6 +56,8 @@ from shared.semantic.calendar_dialects import (
 )
 from shared.semantic.calendar_types import CALENDAR_TYPES, normalize_calendar_type
 from shared.source_executor import DDL_CAPABLE_CONNECTORS
+from src.api._scope import resolve_source_connection
+from src.api._table_qualify import qualify_physical_name
 from src.api.hierarchies import (
     _auto_create_date_hierarchies_for_model,
     _ensure_model_in_project,
@@ -141,9 +143,16 @@ async def auto_register_calendar_from_classification(
     source = await db.get(DataSource, table.source_id)
     if source is None:
         return None
-    connection = await db.get(ProjectConnection, source.project_connection_id)
-    if connection is None:
+    # Bug-5325: resolve the connection fail-closed — a legacy/imported source
+    # whose connection points at another project must NOT be used to classify
+    # a calendar against the wrong project's dialect. Derive the source's
+    # owning project from the table's model.
+    model = await db.get(Model, table.model_id)
+    if model is None:
         return None
+    connection = await resolve_source_connection(
+        db, source, expected_project_id=model.project_id
+    )
 
     conn_type = (connection.connection_type or "").lower()
     if conn_type in CALENDAR_DIALECTS:
@@ -275,13 +284,18 @@ class CalendarCoverageResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def _load_source_with_connection(db, source_id: UUID, model_id: UUID) -> tuple[DataSource, ProjectConnection]:
+async def _load_source_with_connection(
+    db, source_id: UUID, model_id: UUID, *, project_id: UUID
+) -> tuple[DataSource, ProjectConnection]:
     source = await db.get(DataSource, source_id)
     if source is None or source.model_id != model_id:
         raise HTTPException(status_code=404, detail="DataSource not found")
-    connection = await db.get(ProjectConnection, source.project_connection_id)
-    if connection is None:
-        raise HTTPException(status_code=500, detail="Source has no project connection")
+    # Bug-5325: fail closed when the source's connection belongs to another
+    # project (legacy/imported malformed row). project_id is the source's
+    # owning project — every caller runs _ensure_model_in_project first.
+    connection = await resolve_source_connection(
+        db, source, expected_project_id=project_id
+    )
     return source, connection
 
 
@@ -293,54 +307,6 @@ def _normalise_dialect(connection_type: str) -> str:
     raise HTTPException(
         status_code=400,
         detail=f"Connection type {connection_type!r} has no calendar dialect",
-    )
-
-
-def _decrypt_credentials(enc: bytes) -> dict:
-    # Rotation-aware decrypt: current key first, then any previous key.
-    from shared.security.credential_crypto import decrypt_json
-    return decrypt_json(enc)
-
-
-def _qualify_table_name(
-    table_name: str,
-    connection: "ProjectConnection",
-    source: "DataSource | None" = None,
-) -> str:
-    conn_cfg = connection.config or {}
-    src_cfg = (source.config if source else None) or {}
-    conn_type = (connection.connection_type or "").lower()
-
-    parts = table_name.split(".")
-
-    if conn_type != "bigquery" and len(parts) > 1:
-        return table_name
-
-    schema = (
-        src_cfg.get("dataset")
-        or src_cfg.get("schema")
-        or conn_cfg.get("dataset")
-        or conn_cfg.get("schema")
-        or (source.default_schema if source else None)
-    )
-
-    project_id: str | None = None
-    if conn_type == "bigquery":
-        creds = {}
-        if connection.encrypted_credentials:
-            try:
-                creds = _decrypt_credentials(bytes(connection.encrypted_credentials))
-            except Exception:
-                pass
-        project_id = creds.get("project_id") or conn_cfg.get("project_id")
-
-        if len(parts) >= 3:
-            return table_name
-        if len(parts) == 2:
-            return f"{project_id}.{table_name}" if project_id else table_name
-
-    return _shared_qualify(
-        conn_type, table_name, schema=schema, project_id=project_id,
     )
 
 
@@ -630,10 +596,10 @@ async def emit_calendar_script(
 ) -> CalendarScriptResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
-        source, connection = await _load_source_with_connection(db, source_id, model_id)
+        source, connection = await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
         dialect = _normalise_dialect(connection.connection_type)
         calendar_type = _validate_calendar_type(body.calendar_type) or "standard"
-        qualified_name = _qualify_table_name(body.table_name, connection, source)
+        qualified_name = qualify_physical_name(body.table_name, connection, source)
         try:
             ddl = emit_calendar_ddl(
                 dialect, qualified_name, body.start_date, body.end_date,
@@ -670,10 +636,10 @@ async def auto_create_calendar(
 ) -> CalendarTableResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
-        source, connection = await _load_source_with_connection(db, source_id, model_id)
+        source, connection = await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
         dialect = _normalise_dialect(connection.connection_type)
         calendar_type = _validate_calendar_type(body.calendar_type) or "standard"
-        qualified_name = _qualify_table_name(body.table_name, connection, source)
+        qualified_name = qualify_physical_name(body.table_name, connection, source)
         columns = CALENDAR_COLUMN_SETS.get(calendar_type, STANDARD_COLUMNS)
         try:
             ddl = emit_calendar_ddl(
@@ -847,7 +813,7 @@ async def bind_calendar(
 
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
-        source, connection = await _load_source_with_connection(db, source_id, model_id)
+        source, connection = await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
         dialect = body.dialect or _normalise_dialect(connection.connection_type)
         if dialect not in CALENDAR_DIALECTS:
             raise HTTPException(status_code=400, detail=f"Unsupported dialect {dialect!r}")
@@ -858,7 +824,7 @@ async def bind_calendar(
                 detail="At least one of date_column or year_column must be provided",
             )
 
-        qualified_name = _qualify_table_name(body.table_name, connection, source)
+        qualified_name = qualify_physical_name(body.table_name, connection, source)
         await _verify_table_exists(
             qualified_name, connection,
             model_id=model_id, source_id=source.id, bearer=bearer,
@@ -1017,7 +983,7 @@ async def check_calendar_coverage(
     bearer = _extract_bearer(request)
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
-        source, connection = await _load_source_with_connection(db, source_id, model_id)
+        source, connection = await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
         cal = await db.get(CalendarTable, calendar_id)
         if cal is None or cal.data_source_id != source_id:
             raise HTTPException(status_code=404, detail="Calendar not found")
@@ -1032,7 +998,7 @@ async def check_calendar_coverage(
 
         connector = normalize_connection_type((connection.connection_type or "").lower())
         cal_qualified = cal.table_name  # already source-qualified at bind time
-        fact_qualified = _qualify_table_name(fact_table, connection, source)
+        fact_qualified = qualify_physical_name(fact_table, connection, source)
 
         queries = [
             ("cal", _build_minmax_sql(connector, table_name=cal_qualified, date_col=cal.date_column)),
@@ -1130,7 +1096,7 @@ async def update_calendar(
         cal = await db.get(CalendarTable, calendar_id)
         if cal is None or cal.data_source_id != source_id:
             raise HTTPException(status_code=404, detail="CalendarTable not found")
-        await _load_source_with_connection(db, source_id, model_id)
+        await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
 
         updates = body.model_dump(exclude_unset=True)
 
@@ -1183,7 +1149,7 @@ async def delete_calendar(
     async for db in get_tenant_db(current_user.tenant_id):
         # F-016-12: verify source-to-model/project chain before deleting.
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
-        await _load_source_with_connection(db, source_id, model_id)
+        await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
         cal = await db.get(CalendarTable, calendar_id)
         if cal is None or cal.data_source_id != source_id:
             return

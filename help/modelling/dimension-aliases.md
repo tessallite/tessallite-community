@@ -7,7 +7,7 @@ updated: 2026-04-26
 
 ## What this covers
 
-Dimension aliases are how Tessallite handles the modelling pattern known in dimensional design as a *role-playing dimension*: one physical dimension table that participates in the same fact under more than one role. This article explains the concept, the trade-offs, and the practical mechanics — when to use aliases, when not to, how the unified table editor works, and how aliases interact with the calendar and time-variant measures.
+Dimension aliases are how Tessallite handles one physical dimension table that participates in the same fact under more than one business role. This article explains the concept, the trade-offs, and the practical mechanics — when to use aliases, when not to, how the unified table editor works, and how aliases interact with the calendar and time-variant measures.
 
 ---
 
@@ -20,7 +20,7 @@ A row in the fact table often references the same dimension table multiple times
 
 A dimension alias gives the modeller a third option: register the same physical table multiple times under distinct logical roles. Each alias carries its own joins, dimensions, and display name. Queries can group on each role independently. The physical table is unchanged — only the model's view of it is.
 
-In Kimball-style terms, aliasing is the canonical way to model a role-playing dimension. In Tessallite specifically, every `ModelTable` row carries an `alias` field; when you have a single role, the alias is just an identifier; when you need multiple roles, the alias becomes the natural key the catalog, joins, and dimensions all key off.
+In dimensional modelling, this is the standard way to show that one lookup table is being used in several roles. In Tessallite specifically, every `ModelTable` row carries an `alias` field; when you have a single role, the alias is just an identifier; when you need multiple roles, the alias becomes the natural key the catalog, joins, and dimensions all key off.
 
 ---
 

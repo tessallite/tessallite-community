@@ -32,6 +32,13 @@ from shared.config.bootstrap import system_snapshot_get
 from shared.config.settings import get_settings
 from shared.db.models import LLMProviderConfig, Project
 from shared.db.session import get_tenant_db
+# Shared service-account-auth policy (single source of truth across the CRUD
+# guard, the import neutraliser, and the Google adapter). Aliased to the
+# historical private name used across this module + its tests.
+from shared.llm.sa_auth import (
+    service_account_auth_allowed,
+    uses_service_account_auth as _uses_service_account_auth,
+)
 from shared.schemas.pydantic_models import (
     LLMConnectionTestRequest,
     LLMConnectionTestResponse,
@@ -68,6 +75,23 @@ def _decrypt_api_key(encrypted: bytes | None) -> str | None:
     # Rotation-aware decrypt: current key first, then any previous key.
     from shared.security.credential_crypto import decrypt_str
     return decrypt_str(encrypted)
+
+
+def _guard_service_account_auth(provider: str | None, config: dict | None) -> None:
+    """Reject non-API-key (service-account/OAuth) LLM auth unless an operator has
+    explicitly enabled it via ``LLM_ALLOW_SERVICE_ACCOUNT_AUTH``. Keeps spend on a
+    bring-your-own API key by default so a project admin cannot point the agent at
+    the deployment's cloud credentials (cost-leak hardening)."""
+    if _uses_service_account_auth(provider, config) and not service_account_auth_allowed():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Service-account / OAuth LLM auth (e.g. google_mode='vertex_ai') is "
+                "disabled on this deployment. Use a bring-your-own API key instead, "
+                "or set LLM_ALLOW_SERVICE_ACCOUNT_AUTH=true to allow cloud-credential "
+                "billing."
+            ),
+        )
 
 
 async def _ensure_project(db, project_id: UUID) -> Project:
@@ -121,6 +145,7 @@ async def create_llm_config(
     body: LLMProviderConfigCreate,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> LLMProviderConfigResponse:
+    _guard_service_account_auth(body.provider, body.config)
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_project(db, project_id)
         record = LLMProviderConfig(
@@ -159,6 +184,12 @@ async def update_llm_config(
         if record is None or record.project_id != project_id:
             raise HTTPException(status_code=404, detail="LLM config not found")
         updates = body.model_dump(exclude_unset=True)
+        # Guard on the EFFECTIVE post-update provider/config so an update can't
+        # switch an existing row to service-account/OAuth auth either.
+        _guard_service_account_auth(
+            updates.get("provider", record.provider),
+            updates.get("config", record.config),
+        )
         if "api_key" in updates:
             record.encrypted_api_key = _encrypt_api_key(updates.pop("api_key"))
         for k, v in updates.items():

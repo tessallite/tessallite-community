@@ -12,29 +12,62 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Embed Agent Chat</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">developer</span><span class="updated">Updated 2026-05-19</span></div>
+    <div class="article-meta"><span class="audience-badge">developer</span><span class="updated">Updated 2026-06-21</span></div>
 <h1>Embed Agent Chat</h1>
 <h2>What this covers</h2>
 <p>This article explains how to embed Tessallite's conversational agent inside a third-party web application. The embedded chat lets end users ask questions about semantic models without leaving the host application. It builds on the <a href="embed-api.html">Embed API</a>, which handles token minting and scope control.</p>
-<p>Embedding uses a lightweight iframe that loads the Tessallite conversational client at <code>/embed/chat</code>. The host application mints a scoped embed token server-side, passes it to the iframe via a URL parameter, and handles token refresh when the token nears expiry.</p>
+<p>Embedding uses a lightweight iframe that loads the Tessallite conversational client at <code>/embed/chat</code>. The host application mints a scoped embed token server-side, delivers it to the iframe via the postMessage handshake, and handles token refresh when the token nears expiry.</p>
 <h2>Architecture</h2>
 <p>The embed flow involves three participants:</p>
 <ol>
-<li><strong>ISV backend</strong> — authenticates to Tessallite as a tenant admin, mints an embed token via <code>POST /api/v1/auth/embed-token</code>, and passes it to the browser.</li>
-<li><strong>Host page</strong> — renders an iframe pointing at the Tessallite conversational client's <code>/embed/chat</code> route with the token as a URL parameter.</li>
-<li><strong>Embedded chat</strong> — authenticates using the embed token, loads the scoped project, and renders a full-screen chat interface with no login page, navigation bar, or sidebar.</li>
+<li><strong>ISV backend</strong> &mdash; authenticates to Tessallite as a tenant admin, mints an embed token via <code>POST /api/v1/auth/embed-token</code>, and passes it to the browser.</li>
+<li><strong>Host page</strong> &mdash; renders an iframe pointing at the Tessallite conversational client's <code>/embed/chat</code> route, waits for the iframe to signal readiness, then sends the token to the iframe via <code>postMessage</code>.</li>
+<li><strong>Embedded chat</strong> &mdash; receives the token via <code>postMessage</code>, authenticates, loads the scoped project, and renders a full-screen chat interface with no login page, navigation bar, or sidebar.</li>
 </ol>
-<p>The embedded chat communicates with the host page using <code>postMessage</code> for token refresh. No Tessallite credentials are exposed to the end user.</p>
-<h2>Embedding with an iframe</h2>
-<p>The simplest integration is a single iframe element:</p>
+<p>The embedded chat communicates with the host page using <code>postMessage</code> for both initial token delivery and token refresh. No Tessallite credentials are exposed to the end user. The token never appears in the URL.</p>
+<h2>Bootstrap: the postMessage handshake</h2>
+<p>The recommended way to deliver the embed token to the iframe is the <strong>postMessage handshake</strong>. This avoids placing the token in the URL, where it would be visible in browser history, server logs, referrer headers, and proxy caches.</p>
+<p>The handshake works as follows:</p>
+<ol>
+<li>The host page creates an iframe pointing at <code>/embed/chat</code> with no token parameter.</li>
+<li>As soon as the iframe loads, the embedded chat posts a <strong>ready</strong> message to the parent frame: <code>{ "type": "tessallite:ready" }</code>.</li>
+<li>The host page listens for the ready message, then sends the token: <code>{ "type": "tessallite:bootstrap-token", "token": "&lt;JWT&gt;" }</code>.</li>
+<li>The embedded chat validates the token, authenticates, and renders the chat interface.</li>
+</ol>
+<p>The host page must be listed in the <code>ALLOWED_EMBED_ORIGINS</code> environment variable on the Tessallite backend, and the origin used in <code>postMessage</code> must match the conversational client's actual origin. The embedded chat ignores messages from origins that are not in the allowed list.</p>
+<h3>Host page code</h3>
 <pre><code>&lt;iframe
   id="tessallite-chat"
-  src="https://chat.tessallite.example.com/embed/chat?token=eyJhbGci..."
+  src="https://chat.tessallite.example.com/embed/chat"
   style="width: 100%; height: 600px; border: none; border-radius: 8px;"
   allow="clipboard-write"
-&gt;&lt;/iframe&gt;</code></pre>
-<p>The <code>?token=...</code> parameter is the embed JWT returned by the embed token endpoint. The iframe renders the chat interface immediately — no login page is shown.</p>
-<h3>Sizing</h3>
+&gt;&lt;/iframe&gt;
+
+&lt;script&gt;
+  const TESSALLITE_ORIGIN = "https://chat.tessallite.example.com";
+
+  window.addEventListener("message", (event) =&gt; {
+    if (event.origin !== TESSALLITE_ORIGIN) return;
+
+    if (event.data?.type === "tessallite:ready") {
+      // The iframe is loaded and waiting for its token.
+      // embedToken should have been fetched from your own backend.
+      const iframe = document.getElementById("tessallite-chat");
+      iframe.contentWindow.postMessage(
+        { type: "tessallite:bootstrap-token", token: embedToken },
+        TESSALLITE_ORIGIN
+      );
+    }
+  });
+&lt;/script&gt;</code></pre>
+<p>The iframe renders a loading spinner until it receives the bootstrap token. Once authenticated, the chat interface appears immediately with no login page.</p>
+<h2>Deprecated: token via URL parameter</h2>
+<p>An older integration method passes the token as a <code>?token=</code> URL parameter:</p>
+<pre><code>/embed/chat?token=eyJhbGci...</code></pre>
+<p><strong>This method is deprecated.</strong> It continues to work, but the embedded chat logs a deprecation warning to the browser console on every use. It will be removed in a future release.</p>
+<p><strong>Security caution.</strong> Placing a bearer token in the URL exposes it in browser history, HTTP referrer headers, server access logs, and proxy caches. Any of these can leak the token to unintended parties. Use the postMessage handshake instead.</p>
+<p>If you are currently using the URL parameter method, migrate to the postMessage handshake described above. The only change required on the host page is: remove the <code>?token=</code> from the iframe <code>src</code>, add a listener for the <code>tessallite:ready</code> message, and post the token via <code>postMessage</code>.</p>
+<h2>Sizing</h2>
 <p>The embedded chat is responsive and fills its container. Set the iframe dimensions to fit the host layout. A minimum height of 400px is recommended; 600-800px provides a comfortable experience.</p>
 <h3>Sandbox attributes</h3>
 <p>If your content security policy requires <code>sandbox</code> on iframes, include at minimum:</p>
@@ -43,14 +76,16 @@
 <h2>Token refresh</h2>
 <p>Embed tokens expire after the configured <code>expiry_minutes</code> (default 3 hours). When the token is within 10 minutes of expiry, the embedded chat posts a message to the parent frame:</p>
 <pre><code>{ "type": "tessallite:token-expiring" }</code></pre>
-<p>The host page should listen for this message, mint a fresh token from its backend, and send it back:</p>
+<p>The host page should listen for this message, mint a fresh token from its backend, and send it back using the <code>tessallite:token</code> message type:</p>
 <pre><code>window.addEventListener("message", async (event) =&gt; {
+  if (event.origin !== TESSALLITE_ORIGIN) return;
+
   if (event.data?.type === "tessallite:token-expiring") {
     const freshToken = await fetchFreshEmbedToken();
     const iframe = document.getElementById("tessallite-chat");
     iframe.contentWindow.postMessage(
       { type: "tessallite:token", token: freshToken },
-      "https://chat.tessallite.example.com"
+      TESSALLITE_ORIGIN
     );
   }
 });</code></pre>
@@ -58,7 +93,7 @@
 <h3>Refresh best practices</h3>
 <ul>
 <li>Set <code>expiry_minutes</code> to 30-60 minutes in production.</li>
-<li>Always specify the target origin in <code>postMessage</code> — never use <code>"*"</code> in production.</li>
+<li>Always specify the target origin in <code>postMessage</code> &mdash; never use <code>"*"</code> in production.</li>
 <li>The <code>fetchFreshEmbedToken()</code> function should call your own backend, which in turn calls Tessallite's embed token endpoint. Never expose admin credentials in client-side code.</li>
 </ul>
 <h2>Scope and capabilities</h2>
@@ -71,9 +106,9 @@
 <tr><td><code>explore</code></td><td>Allows the agent to browse model metadata for context.</td></tr>
 </tbody>
 </table>
-<p>The <code>persona_id</code> field locks the session to a specific persona's row-level security filters and column restrictions. The <code>model_ids</code> field restricts which models the agent can query.</p>
+<p>The <code>persona_id</code> field locks the session to a specific persona's row-level security filters and column restrictions. The <code>model_ids</code> field restricts which models the agent can query. The <code>project_ids</code> field restricts which projects the embedded session can access; the chat loads only projects in this list.</p>
 <h2>Choosing a model</h2>
-<p>A project agent can be configured with several semantic models. By default a conversation can draw on every model the agent allows. The <strong>model picker</strong> — the dataset icon in the strip at the top of the embedded chat — lets the end user restrict a single conversation to one model.</p>
+<p>A project agent can be configured with several semantic models. By default a conversation can draw on every model the agent allows. The <strong>model picker</strong> &mdash; the dataset icon in the strip at the top of the embedded chat &mdash; lets the end user restrict a single conversation to one model.</p>
 <ul>
 <li>Picking a model restricts the agent to that model alone for every turn in the conversation, overriding both the project allow-list and the project's primary model. The restriction applies to prompt context and to query execution.</li>
 <li>Picking <strong>Project default</strong> clears the restriction and returns the conversation to the project's normal set of models.</li>
@@ -81,15 +116,16 @@
 </ul>
 <p>The picker only ever lists models the session is already entitled to: the project allow-list, further narrowed by the embed token's <code>persona_id</code> and <code>model_ids</code> scope. It can only narrow access, never widen it. If a chosen model later leaves that scope, the conversation silently reverts to the project default. This makes the picker a convenience for focusing an answer on one subject area, not a way to reach data the token does not already permit.</p>
 <h2>Theming</h2>
-<p>The conversational client supports light and dark mode. By default it follows the user's system preference. You can override by appending <code>&amp;theme=light</code> or <code>&amp;theme=dark</code> to the embed URL:</p>
-<pre><code>/embed/chat?token=eyJ...&amp;theme=dark</code></pre>
+<p>The conversational client supports light and dark mode. By default it follows the user's system preference. You can override by appending <code>?theme=light</code> or <code>?theme=dark</code> to the embed URL:</p>
+<pre><code>/embed/chat?theme=dark</code></pre>
 <p>For deeper customisation (brand colours, typography), deploy the conversational client with a custom theme configuration file. See the conversational client's <code>tessallite-theme.json</code> for the available theme tokens.</p>
 <h2>Security considerations</h2>
 <ul>
-<li><strong>Token storage.</strong> Embed tokens are bearer tokens. Anyone with the token can use it until it expires. Never store embed tokens in localStorage or expose them in URLs that might be logged or cached by proxies.</li>
+<li><strong>Token delivery.</strong> Always use the postMessage handshake to deliver the token. Placing the token in the URL exposes it in browser history, referrer headers, and server logs.</li>
+<li><strong>Token storage.</strong> Embed tokens are bearer tokens. Anyone with the token can use it until it expires. Never store embed tokens in localStorage.</li>
 <li><strong>CORS.</strong> Configure <code>ALLOWED_EMBED_ORIGINS</code> on the Tessallite backend to include only the specific domains that will embed the chat. Do not use <code>*</code> in production.</li>
 <li><strong>HTTPS.</strong> Always use HTTPS in production. Embed tokens transmitted over plain HTTP can be intercepted.</li>
-<li><strong>Target origin.</strong> Always specify the exact origin when calling <code>postMessage</code> for token refresh. Using <code>"*"</code> allows any page to intercept the token.</li>
+<li><strong>Target origin.</strong> Always specify the exact origin when calling <code>postMessage</code>. Using <code>"*"</code> allows any page to intercept the token.</li>
 <li><strong>Audit trail.</strong> The <code>user_identity</code> field in the embed token appears in Tessallite's audit log. Use a meaningful identifier (email, employee ID) so administrators can trace embedded usage.</li>
 </ul>
 <h2>Complete example</h2>
@@ -128,19 +164,36 @@ embed_token = resp.json()["token"]
   &lt;h1&gt;Ask our data&lt;/h1&gt;
   &lt;iframe
     id="tessallite-chat"
-    src="http://localhost:3001/embed/chat?token=TOKEN_FROM_SERVER"
+    src="http://localhost:3333/embed/chat"
     style="width: 100%; height: 700px; border: 1px solid #ddd; border-radius: 8px;"
   &gt;&lt;/iframe&gt;
 
   &lt;script&gt;
+    const TESSALLITE_ORIGIN = "http://localhost:3333";
+
+    // embedToken is injected by the server-side template
+    const embedToken = "TOKEN_FROM_SERVER";
+
     window.addEventListener("message", async (event) =&gt; {
+      if (event.origin !== TESSALLITE_ORIGIN) return;
+
+      if (event.data?.type === "tessallite:ready") {
+        // Iframe is loaded -- send the bootstrap token
+        document.getElementById("tessallite-chat")
+          .contentWindow.postMessage(
+            { type: "tessallite:bootstrap-token", token: embedToken },
+            TESSALLITE_ORIGIN
+          );
+      }
+
       if (event.data?.type === "tessallite:token-expiring") {
+        // Token is about to expire -- fetch a fresh one
         const resp = await fetch("/api/refresh-embed-token");
         const { token } = await resp.json();
         document.getElementById("tessallite-chat")
           .contentWindow.postMessage(
             { type: "tessallite:token", token },
-            "http://localhost:3001"
+            TESSALLITE_ORIGIN
           );
       }
     });
@@ -149,15 +202,16 @@ embed_token = resp.json()["token"]
 &lt;/html&gt;</code></pre>
 <h2>Troubleshooting</h2>
 <ul>
-<li><strong>"No embed token provided" error.</strong> The <code>?token=</code> parameter is missing from the iframe URL. Check that your server is injecting the token into the src attribute.</li>
+<li><strong>"No embed token provided" error.</strong> The iframe did not receive a bootstrap token. Check that your host page is listening for the <code>tessallite:ready</code> message and posting back a <code>tessallite:bootstrap-token</code> message with the token. If you are using the deprecated URL parameter method, check that <code>?token=</code> is present in the iframe src.</li>
 <li><strong>"This embed token does not include the 'chat' capability" error.</strong> The token was minted without the <code>chat</code> capability. Re-mint with <code>"capabilities": ["chat"]</code> or omit the field to get all capabilities.</li>
 <li><strong>CORS errors in browser console.</strong> The Tessallite backend's <code>ALLOWED_EMBED_ORIGINS</code> does not include the host page's origin. Add it to the environment variable.</li>
 <li><strong>Token refresh not working.</strong> Check that the <code>postMessage</code> target origin matches the conversational client's actual origin. Check the browser console for message delivery issues.</li>
+<li><strong>Deprecation warning in console.</strong> If you see a warning about <code>?token=</code> being deprecated, migrate to the postMessage handshake. See the <em>Deprecated: token via URL parameter</em> section above.</li>
 </ul>
 <h2>Related</h2>
 <ul><li><a href="embed-api.html">Embed API</a></li><li><a href="api-authentication.html">API Authentication</a></li><li><a href="../agent/agent-chat.html">Agent Chat</a></li></ul>
 <nav class="page-nav"><a href="embed-api.html" class="page-nav-btn prev">&larr; Embed API</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="mcp-server.html" class="page-nav-btn next">MCP Server &rarr;</a></nav>
   </main>
-  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
 </body>
 </html>

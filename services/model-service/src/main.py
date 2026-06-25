@@ -101,8 +101,33 @@ settings = get_settings()
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # startup
     await refresh_system_snapshot()
+    # Build the license manager from the persisted (UI-fed) license in the system
+    # DB so the edition/limits + any enforcement reflect it without a restart.
+    try:
+        from src.licensing_guard import reload_license_manager
+        await reload_license_manager()
+    except Exception:  # noqa: BLE001 — never block startup on license load
+        import logging
+        logging.getLogger(__name__).warning("license manager load failed", exc_info=True)
+    # Product-side licence beacon emitter (Bug-5459). Default-OFF: no-op unless
+    # LICENSE_BEACON_URL is configured. license_id-only, offline-tolerant.
+    beacon = None
+    try:
+        from src.beacon_runtime import build_beacon_emitter
+        beacon = build_beacon_emitter()
+        if beacon is not None:
+            beacon.start()
+    except Exception:  # noqa: BLE001 — beacon must never block startup
+        import logging
+        logging.getLogger(__name__).debug("beacon emitter start skipped", exc_info=True)
     yield
-    # shutdown: nothing needed — asyncpg connection pools close on GC
+    # shutdown
+    if beacon is not None:
+        try:
+            await beacon.stop()
+        except Exception:  # noqa: BLE001
+            pass
+    # asyncpg connection pools close on GC
 
 
 app = FastAPI(

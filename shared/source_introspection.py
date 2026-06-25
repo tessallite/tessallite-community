@@ -93,7 +93,10 @@ async def _test_bq(creds, config):
         sa_info = creds.get("service_account_json", creds)
         if isinstance(sa_info, str):
             sa_info = json.loads(sa_info)
-        client = bigquery.Client.from_service_account_info(sa_info)
+        client = bigquery.Client.from_service_account_info(
+            sa_info,
+            location=(config or {}).get("location") or (creds or {}).get("location") or None,
+        )
         list(client.list_datasets(max_results=1))
         client.close()
     _audit_log("introspect.test", "bigquery SELECT datasets[1]")
@@ -261,7 +264,10 @@ async def _discover_tables_bq(creds, config, *, schema=None, **_kw):
         sa_info = creds.get("service_account_json", creds)
         if isinstance(sa_info, str):
             sa_info = json.loads(sa_info)
-        client = bigquery.Client.from_service_account_info(sa_info)
+        client = bigquery.Client.from_service_account_info(
+            sa_info,
+            location=(config or {}).get("location") or (creds or {}).get("location") or None,
+        )
         project = creds.get("project_id", config.get("project_id"))
         tables = []
         if schema:
@@ -459,7 +465,10 @@ async def _discover_columns_bq(creds, config, *, schema, table, **_kw):
         sa_info = creds.get("service_account_json", creds)
         if isinstance(sa_info, str):
             sa_info = json.loads(sa_info)
-        client = bigquery.Client.from_service_account_info(sa_info)
+        client = bigquery.Client.from_service_account_info(
+            sa_info,
+            location=(config or {}).get("location") or (creds or {}).get("location") or None,
+        )
         project = creds.get("project_id", config.get("project_id"))
         table_ref = qualify_table_name("bigquery", table, schema=schema, project_id=project)
         bq_table = client.get_table(table_ref)
@@ -714,7 +723,10 @@ async def _profile_bq(creds, config, *, schema, table, **_kw):
         sa_info = creds.get("service_account_json", creds)
         if isinstance(sa_info, str):
             sa_info = json.loads(sa_info)
-        client = bigquery.Client.from_service_account_info(sa_info)
+        client = bigquery.Client.from_service_account_info(
+            sa_info,
+            location=(config or {}).get("location") or (creds or {}).get("location") or None,
+        )
         project = creds.get("project_id", config.get("project_id"))
         if "." in table:
             table_ref = f"{schema}.{table}"

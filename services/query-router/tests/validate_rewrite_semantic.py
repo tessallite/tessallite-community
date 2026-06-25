@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -328,6 +329,26 @@ def main():
     # Filter out skip labels
     queries = [q for q in queries if q.label not in SKIP_LABELS]
     print(f"Loaded {len(queries)} queries (skipped {len(SKIP_LABELS)} xfail)")
+
+    # Claude-CLI optionality (Bug-5453). The semantic verdict (PASS/FAIL) comes
+    # ENTIRELY from the `claude` CLI; the deterministic pass only logs DIVERGE
+    # status. In headless/non-auth contexts (e.g. the live-community gate) the CLI
+    # may be ABSENT or PRESENT-BUT-NON-INTERACTIVE (it then hangs to the 120s
+    # timeout per batch and the old code silently reported ALL_PASS over an empty
+    # comparison). So unless explicitly required, skip the whole validator upfront
+    # with a clear notice rather than depend on an unreliable CLI. Default
+    # REQUIRE=1 keeps the dev run strict (and fails loudly if the CLI is missing).
+    require_claude = os.environ.get("BATCH_REQUIRE_CLAUDE", "1") == "1"
+    if not require_claude:
+        print("SKIP: semantic comparison needs the `claude` CLI; BATCH_REQUIRE_CLAUDE=0 "
+              "so it is skipped (set =1 to enforce).")
+        print("RESULT: SKIPPED")
+        sys.exit(0)
+    if shutil.which("claude") is None:
+        print("ERROR: 'claude' CLI not found in PATH and BATCH_REQUIRE_CLAUDE=1 "
+              "(semantic comparison cannot run).")
+        print("RESULT: HAS_FAILURES")
+        sys.exit(1)
 
     # Connect to source DB
     print(f"Connecting to source PostgreSQL at {PG_HOST}:{PG_PORT}...")

@@ -29,6 +29,7 @@ from uuid import UUID
 
 from shared.aggregate_quantiles import is_quantile_stat_type
 from shared.aggregate_stats import is_stat_type
+from shared.semantic.numeric_scale import cast_for_agg
 from shared.semantic.grain_resolver import (
     AGG_TEMPLATES,
     ResolvedAggregateLayout,
@@ -127,13 +128,28 @@ def measure_agg_expr(
     measure: ResolvedMeasureCol,
     alias_by_table_id: Mapping[UUID, str],
     dialect: SelectListDialect,
+    source_numeric_types: Optional[Mapping[UUID, str]] = None,
 ) -> str:
     """The plain aggregation expression for a non-variant, non-calculated,
-    non-quantile, non-stat measure column (the AGG-template path)."""
+    non-quantile, non-stat measure column (the AGG-template path).
+
+    Bug-5454 durability: when ``source_numeric_types`` maps this measure to a
+    constrained ``numeric(p,s)`` and the aggregation is scale-preserving
+    (sum/min/max), the expression is wrapped in ``ROUND(<agg>, s)`` so a
+    same-engine refresh CTAS keeps the source scale ("0.00", not "0") instead
+    of recomputing an unconstrained numeric that undoes the optimizer's typed
+    create. The map is supplied ONLY by the same-engine PostgreSQL/Redshift
+    refresh path; BigQuery/Spark and cross-DB callers pass ``None`` and are
+    byte-identical to before. ROUND (not CAST to numeric(p,s)) keeps a large
+    SUM from overflowing the source precision.
+    """
     agg = (measure.aggregation_function or measure.stat_type or "sum").lower()
     template = dialect.agg_templates.get(agg, "SUM({ref})")
     source_ref = measure_source_ref(measure, alias_by_table_id, dialect)
-    return template.format(ref=source_ref)
+    expr = template.format(ref=source_ref)
+    if source_numeric_types:
+        expr = cast_for_agg(expr, agg, source_numeric_types.get(measure.measure_id))
+    return expr
 
 
 def is_skippable_stat_column(measure: ResolvedMeasureCol) -> bool:
@@ -154,6 +170,7 @@ def build_select_parts(
     include_calculated_via_stat_type: bool = True,
     on_measure_emitted: Optional[Callable[[ResolvedMeasureCol, str, bool], None]] = None,
     on_grain_emitted: Optional[Callable[[ResolvedGrainCol], None]] = None,
+    source_numeric_types: Optional[Mapping[UUID, str]] = None,
 ) -> list[str]:
     """Assemble the grain + measure + row-count SELECT parts.
 
@@ -181,6 +198,13 @@ def build_select_parts(
       only for the AGG-template branch (so the caller can pick the right
       result type).
     - ``on_grain_emitted(grain)``: optional hook for grain column_defs.
+    - ``source_numeric_types``: optional ``measure_id -> "numeric(p,s)"`` map
+      (Bug-5454). When supplied (same-engine PG/Redshift refresh only), a
+      scale-preserving plain AGG over a constrained-numeric source column is
+      wrapped in ``ROUND(<agg>, s)`` so the refresh CTAS keeps the source
+      scale and does not undo the optimizer's typed create. ``None`` (the
+      default for BigQuery/Spark and cross-DB callers) leaves every expression
+      byte-identical to before.
 
     Returns the ordered list of formatted SELECT parts (grain, then
     measures, then the row count).
@@ -219,7 +243,9 @@ def build_select_parts(
         # loop does not re-emit them as SUM (corruption: every pNN/stat == SUM).
         if is_skippable_stat_column(measure):
             continue
-        expr = measure_agg_expr(measure, alias_by_table_id, dialect)
+        expr = measure_agg_expr(
+            measure, alias_by_table_id, dialect, source_numeric_types
+        )
         parts.append(emit(expr, measure.physical_col_name))
         if on_measure_emitted is not None:
             on_measure_emitted(measure, expr, True)

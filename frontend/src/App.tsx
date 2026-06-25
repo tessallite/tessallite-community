@@ -27,6 +27,7 @@ const SystemAdmin = lazy(() => import("./pages/SystemAdmin"));
 const SystemConfiguration = lazy(
   () => import("./pages/SystemConfiguration"),
 );
+const LicenseEdition = lazy(() => import("./pages/LicenseEdition"));
 const AgentChat = lazy(() => import("./pages/AgentChat"));
 const AgentLog = lazy(() => import("./pages/AgentLog"));
 const AuditLog = lazy(() => import("./pages/AuditLog"));
@@ -123,6 +124,7 @@ const router = createBrowserRouter([
           { path: "welcome", element: <WelcomeWizard /> },
           { path: "system", element: <SystemAdmin /> },
           { path: "system/configuration", element: <SystemConfiguration /> },
+          { path: "system/license", element: <LicenseEdition /> },
           { path: "admin", element: <Navigate to="/" replace /> },
           { path: "admin/audit-log", element: <AuditLog /> },
           { path: "admin/group-mappings", element: <GroupMappings /> },

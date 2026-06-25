@@ -154,7 +154,7 @@ def build_drillthrough_rowset(
         safe = _xml_safe_name(col)
         col_elements += (
             f'<xs:element minOccurs="0" name="{_xe(safe)}" '
-            f'sql:field="{_xe(safe)}" type="string"/>'
+            f'sql:field="{_xe(safe)}" type="xs:string"/>'
         )
 
     schema = (

@@ -2,7 +2,7 @@
 title: "Demo tenant: acme-demo"
 audience: all
 area: getting-started
-updated: 2026-04-25
+updated: 2026-06-24
 ---
 
 ## What this covers
@@ -24,14 +24,14 @@ It supersedes the legacy `acme-test` fixture. `acme-test` scripts remain in `tes
 
 ---
 
-## How it gets seeded
+## How it gets seeded in the Community bundle
 
-The deploy step seeds it automatically. On `tessallite/deploy/local/steps/06_sample_data.sh` (and the GCP equivalent in `09_sample_data.sh`), after the legacy `demo_data` load:
+The signed Community bundle seeds it during `./install.sh`. After the system schema is ready, the installer loads the demo source data and imports the project bundle so a new user has a working tenant immediately.
 
 1. Source and target schemas are loaded from `deploy/Sample-db/acme-demo/*.sql`.
 2. The acme-demo tenant is reset, the project + four connections are created, then all five models are re-imported from the seed bundle `tessallite/seeds/acme-demo/project.json` (a single project export containing every model; older builds used separate per-model JSON files).
 
-The seed is conditional on `SYSTEM_DATABASE_URL` and `CREDENTIAL_ENCRYPTION_KEY` being set. If the seed assets are missing, the deploy step prints a notice and continues.
+The seed is conditional on `SYSTEM_DATABASE_URL` and `CREDENTIAL_ENCRYPTION_KEY` being present in the generated `.env`. If the seed assets are missing, the installer prints a notice and continues so the platform still starts.
 
 ---
 

@@ -33,7 +33,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # image's build context (tessallite/).
 RUN pip install --no-cache-dir cython && \
     cd /app/shared/licensing/closed && \
-    cython -3 manager_impl.py -o manager_impl.c && \
+    cython -3 -X annotation_typing=False manager_impl.py -o manager_impl.c && \
     gcc -shared -fPIC \
         -I"$(python3 -c 'import sysconfig; print(sysconfig.get_path("include"))')" \
         manager_impl.c -o manager_impl.so && \

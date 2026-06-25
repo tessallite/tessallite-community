@@ -16,7 +16,7 @@ A complete reference of every Tessallite feature, what it does, and where to fin
 | Feature | Description | Where to use it |
 |---|---|---|
 | Multi-source connections | Connect PostgreSQL, BigQuery, Spark/Hive, SQL Server, Snowflake, and Redshift as data sources | Model Builder > Connections panel |
-| Tables and aliases | Add source tables to a model; create role-playing aliases of the same table for different join roles | Model Builder > Sources panel |
+| Tables and aliases | Add source tables to a model; create dimension aliases when the same table needs different business roles | Model Builder > Sources panel |
 | Joins | Define relationships between fact and dimension tables; one-fact-per-model rule enforced | Model Builder > Canvas (drag to connect) or Joins panel |
 | Dimensions | Column-based attributes with display name, data type, folder, and hidden flag | Model Builder > Dimensions panel |
 | Calculated dimensions | Expression-based dimensions computed at query time from SQL (CASE, COALESCE, UPPER, etc.) | Dimensions panel > Create > Expression tab |
@@ -61,7 +61,7 @@ A complete reference of every Tessallite feature, what it does, and where to fin
 | Parameterized filters | Named parameters (@region, @date_range) with five types: string, number, multi_value, date_range, boolean | Measures drawer > Parameters section |
 | Multi-dialect transpilation | Canonical PostgreSQL SQL transpiled to BigQuery, Spark, SQL Server, Snowflake, and Redshift via sqlglot | Automatic (transparent to user) |
 | Query result caching | Semantic-aware cache with per-model eviction; avoids re-executing identical queries | Automatic |
-| Headless REST API | JSON-in, JSON-out query interface for programmatic access without a BI tool | `POST /api/v1/plugin/execute` |
+| Headless REST API | JSON-in, JSON-out query interface for apps and services that need governed metrics without writing SQL | `POST /query-router/api/v1/headless/query` |
 
 ## Aggregates and Optimisation
 
@@ -185,9 +185,9 @@ must be recorded before those integrations are described as validated.
 
 | Feature | Description | Where to use it |
 |---|---|---|
-| Local deployment | Guided interactive script with prerequisites check, env generation, migrations, and first user | `deploy/local/deploy.bat` or `deploy.sh` |
-| GCP Cloud Run deployment | Scripted Cloud Run + Cloud SQL setup with domain mapping and budget alerts | `deploy/gcp/deploy.bat` or `deploy.sh` |
-| Docker Compose | Multi-service local stack with isolated `tessallite_net` network and easy teardown | `tessallite/infra/docker-compose.yml` |
+| Community local deployment | Signed website bundle with licence file, `.env` generation, migrations, demo seed, and Docker Compose startup | Download page > `install.sh` |
+| GCP Cloud Run deployment | Scripted Cloud Run + Cloud SQL setup with domain mapping and budget alerts for managed/operator deployments | `deploy/gcp/deploy.bat` or `deploy.sh` |
+| Docker Compose | Multi-service local stack with isolated network and easy teardown | Community bundle `docker-compose.yml` |
 | Monitoring stack | Optional standalone Prometheus + Grafana in `monitoring/`; no impact on platform when stopped | `monitoring/deploy.sh` |
 | Service proxy | All backend ports hidden behind nginx reverse proxy; only 3000, 3443, 5433, 8080 exposed | Frontend nginx |
 | Connection pooling | Lazy asyncpg pool per (host, port, database, user) for source database queries | Automatic |

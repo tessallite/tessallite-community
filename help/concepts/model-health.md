@@ -37,7 +37,7 @@ An issue in the Health tab means something in the model configuration is inconsi
 
 **Severity: Error**
 
-A column referenced in a join definition no longer exists in the source schema. This happens when the source data warehouse has been modified since the model was last synced.
+A column referenced in a join definition no longer exists in the source schema. This happens when the source has been modified since the model was last synced.
 
 To resolve: open the join in the Model Builder Drawer, update the left or right column to a column that currently exists in the source, and save. If the join is no longer valid, remove it entirely. Then run a schema sync to confirm the model is consistent with the current source.
 

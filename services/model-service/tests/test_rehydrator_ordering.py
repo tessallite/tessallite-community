@@ -329,6 +329,13 @@ async def test_full_insert_ordering_respects_fk_dependencies():
         "_insert_source_join_statistics": "join_stats",
         "_insert_ai_scheduler": "ai_scheduler",
         "_insert_lineage": "lineage",
+        # v3 model-scoped config families (F-013-06 / Bug-3578). They run last
+        # in rehydrate_into_live, after _insert_lineage, in this source order.
+        "_insert_model_parameters": "model_parameters",
+        "_insert_model_alias_map": "model_alias_map",
+        "_insert_refresh_sla_config": "refresh_sla_config",
+        "_insert_data_quality_rules": "data_quality_rules",
+        "_insert_entity_translations": "entity_translations",
     }
 
     with contextlib.ExitStack() as stack:
@@ -345,6 +352,19 @@ async def test_full_insert_ordering_respects_fk_dependencies():
         ("tables", "udas"),
         ("tables", "joins"),
         ("measures", "drill_through"),
+        # Bug-3578: the v3 model-scoped config families run last, after the
+        # core graph and after _insert_lineage, in this source order. Asserting
+        # them here pins their full-cycle invocation by rehydrate_into_live to
+        # the ordering test (not only the isolated mock-capture tests). Their
+        # FK shape does not force this order among themselves — e.g.
+        # EntityTranslation.entity_id is a soft reference with no DB FK
+        # (rehydrator.py:416-419) — so this asserts their ACTUAL invocation
+        # order, which is the contract the rehydrator must keep stable.
+        ("lineage", "model_parameters"),
+        ("model_parameters", "model_alias_map"),
+        ("model_alias_map", "refresh_sla_config"),
+        ("refresh_sla_config", "data_quality_rules"),
+        ("data_quality_rules", "entity_translations"),
     ]
     for before, after in required_orderings:
         if before in call_order and after in call_order:
@@ -352,6 +372,21 @@ async def test_full_insert_ordering_respects_fk_dependencies():
                 f"{before} must precede {after} in insert order; "
                 f"got: {call_order}"
             )
+
+    # All five v3 inserters must actually be invoked in the full cycle — the
+    # `if before in call_order` guard above silently skips a pair when an
+    # inserter is missing, so assert their presence explicitly here.
+    for v3_tag in (
+        "model_parameters",
+        "model_alias_map",
+        "refresh_sla_config",
+        "data_quality_rules",
+        "entity_translations",
+    ):
+        assert v3_tag in call_order, (
+            f"v3 inserter '{v3_tag}' was not invoked by rehydrate_into_live; "
+            f"got: {call_order}"
+        )
 
 
 # ---------------------------------------------------------------------------

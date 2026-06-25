@@ -2,7 +2,7 @@
 title: "Embed API"
 audience: developer
 area: Integrations
-updated: 2026-05-19
+updated: 2026-06-21
 ---
 
 ## What this covers
@@ -38,6 +38,7 @@ No Tessallite login page is shown. The end user's identity comes from the `user_
 | `tenant_id` | string | yes | - | Target tenant slug |
 | `user_identity` | string | yes | - | Display name for audit trail |
 | `persona_id` | string | no | null | Lock to this persona's permissions |
+| `project_ids` | string[] | no | null | Restrict access to these project IDs only |
 | `model_ids` | string[] | no | null | Restrict visible models |
 | `capabilities` | string[] | no | all | Allowed features: `query`, `chat`, `explore` |
 | `expiry_minutes` | integer | no | 180 | Token lifetime (min 5, max 1440) |
@@ -52,6 +53,7 @@ No Tessallite login page is shown. The end user's identity comes from the `user_
     "tenant_id": "acme-demo",
     "user_identity": "viewer@customer.com",
     "persona_id": null,
+    "project_ids": null,
     "model_ids": null,
     "capabilities": ["query", "chat", "explore"],
     "expiry_minutes": 180
@@ -64,6 +66,8 @@ No Tessallite login page is shown. The end user's identity comes from the `user_
 ## Scope fields
 
 **`persona_id`** locks the session to a specific persona. All row-level security filters and measure/dimension access rules for that persona apply. If omitted, the embedded user sees the default (unfiltered) view.
+
+**`project_ids`** restricts which projects the embedded session can access. API calls targeting a project not in the list return 403. The embedded chat only loads and displays projects that appear in this list. If omitted, all projects in the tenant are accessible (subject to normal RBAC).
 
 **`model_ids`** restricts which models the token can access. Any query or chat request targeting a model not in the list returns 403. If omitted, all models in the tenant are accessible.
 

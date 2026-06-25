@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { useModelEditorStore, useIsModelDirty } from "./useModelEditorStore";
+import {
+  useModelEditorStore,
+  useIsModelDirty,
+  useModelNeedsSaveOrDeploy,
+  modelNeedsSaveOrDeploy,
+} from "./useModelEditorStore";
 import { act, renderHook } from "@testing-library/react";
 
 describe("useModelEditorStore", () => {
@@ -179,6 +184,67 @@ describe("useModelEditorStore", () => {
       expect(result.current).toBe(false);
       act(() => useModelEditorStore.getState().markDirty());
       expect(result.current).toBe(true);
+    });
+  });
+
+  describe("modelNeedsSaveOrDeploy (Bug-5515)", () => {
+    it("is true when the model has unsaved edits, regardless of versions", () => {
+      expect(
+        modelNeedsSaveOrDeploy({ isDirty: true, lastSavedVersion: 2, deployedVersion: 2 }),
+      ).toBe(true);
+    });
+
+    it("is true when the saved version differs from the deployed version", () => {
+      expect(
+        modelNeedsSaveOrDeploy({ isDirty: false, lastSavedVersion: 3, deployedVersion: 2 }),
+      ).toBe(true);
+    });
+
+    it("is true when nothing is deployed yet", () => {
+      expect(
+        modelNeedsSaveOrDeploy({ isDirty: false, lastSavedVersion: 1, deployedVersion: null }),
+      ).toBe(true);
+    });
+
+    it("is true for a brand-new model with no saved version", () => {
+      expect(
+        modelNeedsSaveOrDeploy({ isDirty: false, lastSavedVersion: null, deployedVersion: null }),
+      ).toBe(true);
+    });
+
+    it("is false only when clean AND the saved version equals the deployed version", () => {
+      expect(
+        modelNeedsSaveOrDeploy({ isDirty: false, lastSavedVersion: 4, deployedVersion: 4 }),
+      ).toBe(false);
+    });
+  });
+
+  describe("useModelNeedsSaveOrDeploy selector", () => {
+    it("returns true when dirty and false only when saved AND deployed in sync", () => {
+      const { result } = renderHook(() => useModelNeedsSaveOrDeploy());
+      // initial: nothing saved/deployed -> needs work
+      expect(result.current).toBe(true);
+
+      act(() =>
+        useModelEditorStore.getState().setModel({
+          modelId: "m",
+          lastSavedVersion: 5,
+          deployedVersion: 5,
+          lastDeployedAt: "t",
+        }),
+      );
+      expect(result.current).toBe(false);
+
+      act(() => useModelEditorStore.getState().markDirty());
+      expect(result.current).toBe(true);
+
+      // Save bumps the saved version ahead of the deployed one -> still needs deploy.
+      act(() => useModelEditorStore.getState().markClean({ lastSavedVersion: 6 }));
+      expect(result.current).toBe(true);
+
+      // Deploy catches up.
+      act(() => useModelEditorStore.getState().markClean({ deployedVersion: 6 }));
+      expect(result.current).toBe(false);
     });
   });
 });

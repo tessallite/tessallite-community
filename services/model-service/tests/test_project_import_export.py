@@ -817,3 +817,83 @@ class TestProjectImportDryRun:
 
         with pytest.raises(ProjectImportError):
             await plan_project_import(bundle, db, mode="replace")
+
+
+# ---------------------------------------------------------------------------
+# Bug-4263 — replace-plan cascade volume (aggregates/pockets/logs)
+# ---------------------------------------------------------------------------
+
+class TestReplacePlanCascadeCounts:
+    """The dry-run plan must report the true cascade row volume a replace
+    deletes (Bug-4263), not just the model count. ``delete_model_cascade``
+    removes each model's aggregates, pockets and query/route logs — so the
+    plan exposes a ``model_cascade_counts`` breakdown computed on the preview
+    path only."""
+
+    @pytest.mark.asyncio
+    async def test_replace_plan_reports_per_model_cascade_volume(self):
+        project_id = uuid.uuid4()
+        model_id = uuid.uuid4()
+        bundle = _bundle(models=[_model_snap(slug="orders")])
+
+        db = _import_db_mock()
+
+        project_row = MagicMock()
+        project_row.scalar_one_or_none.return_value = SimpleNamespace(
+            id=project_id, slug="imported"
+        )
+        model_list_row = MagicMock()
+        model_list_row.all.return_value = [(model_id, "orders", "Orders")]
+        route_count_row = MagicMock()
+        route_count_row.scalar_one.return_value = 7
+
+        # execute() sequence: project lookup → model list (cascade) →
+        # route_logs count. _count_rows / _count_rows_by_model are patched, so
+        # they do not consume an execute() call.
+        db.execute = AsyncMock(
+            side_effect=[project_row, model_list_row, route_count_row]
+        )
+
+        # delete_counts path: models=2, orphan_connections=0 (no conn section).
+        with patch(
+            "shared.model_snapshot.project_rehydrator._count_rows",
+            AsyncMock(side_effect=[2, 0]),
+        ), patch(
+            "shared.model_snapshot.project_rehydrator._count_rows_by_model",
+            # aggregates, pockets, query_logs, query_miss_logs for the one model
+            AsyncMock(side_effect=[4, 3, 120, 9]),
+        ):
+            plan = await plan_project_import(bundle, db, mode="replace")
+
+        assert plan["will_replace_project"] is True
+        cascade = plan["model_cascade_counts"]
+        assert cascade["totals"] == {
+            "aggregates": 4,
+            "pockets": 3,
+            "query_logs": 120,
+            "query_miss_logs": 9,
+            "route_logs": 7,
+        }
+        assert len(cascade["per_model"]) == 1
+        entry = cascade["per_model"][0]
+        assert entry["slug"] == "orders"
+        assert entry["display_name"] == "Orders"
+        assert entry["model_id"] == str(model_id)
+        assert entry["counts"] == {
+            "aggregates": 4,
+            "pockets": 3,
+            "query_logs": 120,
+            "query_miss_logs": 9,
+            "route_logs": 7,
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_plan_has_empty_cascade_counts(self):
+        """Create mode deletes nothing, so the cascade breakdown is empty and
+        no counting queries run on the create path."""
+        bundle = _bundle(models=[_model_snap(slug="orders")])
+        db = _import_db_mock()  # project lookup returns None → create path
+
+        plan = await plan_project_import(bundle, db, mode="create")
+
+        assert plan["model_cascade_counts"] == {"per_model": [], "totals": {}}

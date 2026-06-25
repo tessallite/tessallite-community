@@ -2,12 +2,14 @@
 title: "Configure Environment Variables"
 audience: system-admin
 area: system-admin
-updated: 2026-06-14
+updated: 2026-06-24
 ---
 
 ## What this covers
 
-The variables you set in `.env` (local) or Secret Manager (GCP) to start Tessallite. These are the **bootstrap** variables — the bare minimum the services need before they can read anything from the database. Operational tuning knobs (rate limits, optimizer thresholds, scheduler cadences) are set in the System Admin UI and are not covered here.
+The variables you set in `.env` (Community/local) or Secret Manager (GCP) to start Tessallite. These are the **bootstrap** variables — the bare minimum the services need before they can read anything from the database. Operational tuning knobs (rate limits, optimizer thresholds, scheduler cadences) are set in the System Admin UI and are not covered here.
+
+For Community Edition, `.env` is created by `install.sh` inside the signed release bundle. You normally do not copy it by hand. Review it when you need to change ports, public URLs, or operator-owned secrets. Licence upload and replacement happen later in **System Admin → License & edition** and are stored in the platform database.
 
 The **complete, always-current list** of every configurable value is in the [Configuration Reference](../../../docs/guides/guides_configuration-reference.md). When this page and the reference disagree, the reference is authoritative.
 
@@ -15,7 +17,7 @@ The **complete, always-current list** of every configurable value is in the [Con
 
 ## Required bootstrap variables
 
-These must be set in `.env` (local) or stored as Secret Manager secrets (GCP). The services will refuse to start if any of the credential fields are left at their placeholder values.
+These must be set in `.env` (Community/local) or stored as Secret Manager secrets (GCP). The services will refuse to start if any credential fields are left at placeholder values. In the Community bundle, `install.sh` generates missing secrets and preserves values already present.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -24,6 +26,9 @@ These must be set in `.env` (local) or stored as Secret Manager secrets (GCP). T
 | `JWT_SECRET_KEY` | Yes | — | Secret used to sign user session tokens. Minimum 32 characters. |
 | `SYSTEM_ADMIN_EMAIL` | No | `admin@tessallite.local` | Email address of the system-level administrator. |
 | `SYSTEM_ADMIN_PASSWORD` | Yes | — | Password for the system administrator. |
+| `LICENSE_FILE_HOST` | No | `./license.json` | Legacy/bootstrap host path to a signed local licence file. The License Manager upload stores the active licence in the platform database. |
+| `LICENSE_PUBLIC_KEYS` | No | built-in key | Optional public verification key override. Normal installs use the built-in Tessallite public key. |
+| `LICENSE_ENFORCEMENT_ENABLED` | No | `true` | Requires a valid signed licence at startup. Leave enabled for normal Community installs. |
 
 ---
 
@@ -53,16 +58,20 @@ The scripted GCP deploy (`deploy/gcp/`) sets this automatically using the Comput
 
 ## Setting variables in Docker Compose
 
-Copy `.env.example` to `.env` (in the same directory as `docker-compose.yml`) and fill in the required values:
+For the signed Community bundle, run `./install.sh`. It creates `.env` from `.env.example` if missing and fills empty secret values:
 
 ```
 POSTGRES_PASSWORD=your-strong-password
 CREDENTIAL_ENCRYPTION_KEY=your-fernet-key-here
 JWT_SECRET_KEY=your-jwt-secret-min-32-chars
 SYSTEM_ADMIN_PASSWORD=your-admin-password
+LICENSE_FILE_HOST=./license.json
+LICENSE_PUBLIC_KEYS=tessallite-prod-2026:<public-key>
 ```
 
-Docker Compose reads this file automatically. Never commit `.env` to source control — it is listed in `.gitignore`.
+Docker Compose reads this file automatically. Never commit `.env` or `license.json` to source control. A developer source checkout may still create `.env` manually from `.env.example`, but that is not the public install path.
+
+After the stack is running, system administrators replace a signed licence from **System Admin → License & edition**. Tessallite verifies the uploaded `license.json`, stores it in the platform database, and applies it immediately. `LICENSE_PUBLIC_KEYS` is only needed when you must override the built-in Tessallite public key.
 
 ---
 
@@ -84,7 +93,7 @@ gcloud run services update SERVICE_NAME \
 
 ## Security
 
-Never commit credential values to source control. On GCP, all three secrets (`SYSTEM_DATABASE_URL`, `CREDENTIAL_ENCRYPTION_KEY`, `JWT_SECRET_KEY`) are stored in Secret Manager and mounted into Cloud Run at deploy time — they never appear in the service YAML. For key rotation, see `CREDENTIAL_ENCRYPTION_KEY_PREVIOUS` in the [Configuration Reference](../../../docs/guides/guides_configuration-reference.md).
+Never commit credential values to source control. In Community installs, keep `.env` with your installation backup, but outside git. Keep downloaded `license.json` files somewhere secure as records, but the active uploaded licence lives in the platform database. On GCP, secrets (`SYSTEM_DATABASE_URL`, `CREDENTIAL_ENCRYPTION_KEY`, `JWT_SECRET_KEY`, and other secret values) are stored in Secret Manager and mounted into Cloud Run at deploy time — they never appear in the service YAML. For key rotation, see `CREDENTIAL_ENCRYPTION_KEY_PREVIOUS` in the [Configuration Reference](../../../docs/guides/guides_configuration-reference.md).
 
 ---
 
@@ -96,4 +105,4 @@ Never commit credential values to source control. On GCP, all three secrets (`SY
 
 ---
 
-← [Deploy on GCP](deploy-gcp.md) | [Home](../index.md) | [System Configuration →](system-configuration.md)
+← [Deploy on Kubernetes](deploy-kubernetes.md) | [Home](../index.md) | [System Configuration →](system-configuration.md)

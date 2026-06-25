@@ -13,12 +13,15 @@ import httpx
 import pytest
 
 API_BASE = os.environ.get("INTEGRATION_TEST_API_BASE", "http://localhost:8001/api/v1")
-TENANT_ID = "acme-demo"
-EMAIL = "admin@acme-demo.com"
-PASSWORD = "acme-demo"
+# Profile-aware: defaults target the dev acme-demo stack; override via env to run
+# against the Community demo bundle (tenant=demo / admin@demo.com / demo /
+# project-demo / modely) — see agentic-testing/config/profiles/*.env.
+TENANT_ID = os.environ.get("INTEGRATION_TEST_TENANT", "acme-demo")
+EMAIL = os.environ.get("INTEGRATION_TEST_EMAIL", "admin@acme-demo.com")
+PASSWORD = os.environ.get("INTEGRATION_TEST_PASSWORD", "acme-demo")
 
-PROJECT_SLUG = "project1"
-MODEL_SLUG = "modelx"
+PROJECT_SLUG = os.environ.get("INTEGRATION_TEST_PROJECT", "project1")
+MODEL_SLUG = os.environ.get("INTEGRATION_TEST_MODEL", "modelx")
 
 
 def _api_up() -> bool:
@@ -123,8 +126,26 @@ def _dimensions(headers, project_id, model_id):
 
 
 def _measure_id(measures: list[dict], name: str) -> str:
-    return _find_by_name(measures, name)["id"]
+    # Profile-portable: skip (not error) when the active model lacks this
+    # measure — the KPI integration tests assume the dev acme-demo `modelx`
+    # measures (Revenue/net_sales/gross_margin_pct/...); on the demo bundle's
+    # `modely` they are absent, so the test skips cleanly instead of erroring.
+    try:
+        return _find_by_name(measures, name)["id"]
+    except LookupError:
+        pytest.skip(
+            f"measure {name!r} not on the active model "
+            f"({[m.get('name') for m in measures]}) — needs the dev acme-demo "
+            f"modelx profile (see Bug-5453/5498 for demo-bundle portability)"
+        )
 
 
 def _dimension_id(dimensions: list[dict], name: str) -> str:
-    return _find_by_name(dimensions, name)["id"]
+    try:
+        return _find_by_name(dimensions, name)["id"]
+    except LookupError:
+        pytest.skip(
+            f"dimension {name!r} not on the active model "
+            f"({[d.get('name') for d in dimensions]}) — needs the dev acme-demo "
+            f"modelx profile (Bug-5453/5498)"
+        )

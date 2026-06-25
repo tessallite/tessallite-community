@@ -30,8 +30,14 @@ from shared.db.models import (
 )
 from shared.schemas.connection_type import normalize_connection_type
 from shared.db.session import get_tenant_db
+from shared.aggregate_connection import is_same_database, resolve_source_connection
 from shared.pocket.fingerprint import predicate_set_hash
-from shared.pocket.refresh import drop_pocket_storage, refresh_pocket_definition
+from shared.pocket.refresh import (
+    unsupported_pocket_combo_reason,
+    drop_pocket_storage,
+    refresh_pocket_definition,
+)
+from shared.source_executor import resolve_connector_type
 from shared.pocket.structure import collect_pocket_structure_violations
 from shared.schemas.pydantic_models import (
     PocketDefinitionCreate,
@@ -433,27 +439,28 @@ async def create_pocket(
         if target is None or target.model_id != model_id:
             raise HTTPException(status_code=400, detail="Invalid target_id for model")
 
-        # Bug-5200: pocket refresh (CTAS materialisation) is currently
-        # implemented for postgresql and redshift only (see
-        # shared/pocket/refresh.py). Reject unsupported targets at
-        # creation rather than letting the pocket persist and fail
-        # silently on every refresh attempt.
-        _POCKET_REFRESH_CONNECTORS = frozenset({"postgresql", "redshift"})
+        # Bug-5200 / Bug-5475: reject an unsupported source/target connector
+        # combination at creation rather than letting the pocket persist and
+        # fail (or hang) on every refresh. Pocket materialisation supports a
+        # postgresql/redshift/bigquery target, but only same-connector
+        # combinations: a BigQuery target requires a BigQuery source (atomic
+        # CREATE OR REPLACE), and cross-database streaming is PG-family only.
+        # The authoritative validation lives in shared/pocket/refresh.py
+        # (unsupported_pocket_combo_reason); this is the create-time mirror.
         target_conn_id = getattr(target, "project_connection_id", None)
         target_conn = await db.get(ProjectConnection, target_conn_id) if target_conn_id else None
         if target_conn is not None:
             target_connector = normalize_connection_type(
                 (target_conn.connection_type or "").lower()
             )
-            if target_connector not in _POCKET_REFRESH_CONNECTORS:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Pocket tables require a PostgreSQL or Redshift target "
-                        f"for materialisation. The selected target uses "
-                        f"{target_conn.connection_type!r}, which is not supported."
-                    ),
-                )
+            source_conn = await resolve_source_connection(model_id, db)
+            source_connector = await resolve_connector_type(source_conn)
+            cross_db = not is_same_database(source_conn, target_conn)
+            combo_error = unsupported_pocket_combo_reason(
+                source_connector, target_connector, cross_db
+            )
+            if combo_error is not None:
+                raise HTTPException(status_code=400, detail=combo_error)
 
         allowed = await get_setting("pocket.allowed_refresh_policies", tenant_session=db)
         if body.refresh_policy not in set(allowed or []):

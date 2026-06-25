@@ -554,9 +554,17 @@ async def _resolve_model_source_connection(db, model_id: UUID) -> tuple[ProjectC
     ).scalar_one_or_none()
     if source is None:
         return None, "No data source configured for this model."
-    conn = await db.get(ProjectConnection, source.project_connection_id)
-    if conn is None:
-        return None, "Project connection for model source was not found."
+    # Bug-5325: fail closed if a legacy/imported source points its connection at
+    # a different project. Derive the source's owning project from its model and
+    # reject a cross-project connection (via the shared fail-closed resolver)
+    # rather than previewing the wrong project's source data.
+    from src.api._scope import resolve_source_connection
+    model = await db.get(Model, model_id)
+    if model is None:
+        return None, "Model not found for source connection resolution."
+    conn = await resolve_source_connection(
+        db, source, expected_project_id=model.project_id
+    )
     return conn, None
 
 

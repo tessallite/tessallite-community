@@ -1,11 +1,10 @@
 # Tessallite Community Edition License Terms
 
-Version: draft 0.1
-Last updated: 2026-06-23
+Version: 1.0
+Effective date: 2026-06-23
 
-These terms are a draft for review. They are intended to describe the free,
-self-hosted Tessallite Community Edition under the source-available Community
-model.
+These terms describe the free, self-hosted Tessallite Community Edition under
+the source-available Community model.
 
 ## 1. Definitions
 
@@ -25,10 +24,10 @@ Community license file.
 **Community Source** means source code intentionally published under the
 source-available root `LICENSE` in the Tessallite Community repository.
 
-**Closed Components** means proprietary Tessallite components, including the
-license manager, gateway guard, license issuer, closed model-service policy
-modules or compiled model-service builds, private release/signing automation,
-and optional closed optimizer/acceleration modules.
+**Proprietary Components** means Tessallite components licensed as part of the
+Community runtime but not published as Community Source, including the license
+manager, gateway guard, license issuer, proprietary policy modules, release
+signing automation, and optional proprietary optimizer or acceleration modules.
 
 **Built-in demo tenant** means the seeded demonstration tenant and its hosted or
 packaged demo source data.
@@ -42,42 +41,36 @@ verified locally by the product.
 ## 2. Grant
 
 Subject to these terms and your signed license, Tessallite grants you a
-non-exclusive, non-transferable, revocable license to install and run Community
-Edition for internal evaluation, proof-of-value, development, training, and
-small-team internal business use.
+non-exclusive, non-transferable license to install and run Community Edition for
+internal evaluation, proof-of-value, development, training, and small-team
+internal business use.
 
 Community Source remains available under the source-available root `LICENSE`.
-Closed Components are licensed only under these Community terms and are not
-open-source software.
+Proprietary Components are licensed under these Community terms.
 
 ## 3. Community Limits
 
-Unless your signed license says otherwise, Community Edition permits:
+Unless your signed license or release notes state otherwise, Community Edition
+is generally configured to permit:
 
 - one built-in demo tenant;
 - one own tenant;
-- unlimited own projects;
+- own projects within the practical limits of the installed release;
 - two own models total across the own tenant;
 - two users.
 
 The built-in demo tenant does not count as your own tenant. Projects are not
-currently capped in Community Edition; the practical control-plane cap is the
-number of own models.
+currently the primary entitlement boundary; the practical control-plane cap is
+normally the number of own models, users, and own tenants permitted by the signed
+license.
 
-Community limits are control-plane limits only. Community Edition does not cap:
+Community limits are primarily control-plane limits. The signed license, release
+notes, or installed configuration may include reasonable technical, operational,
+or edition limits that are appropriate for the Community Edition.
 
-- query volume;
-- row count;
-- data volume;
-- source data size;
-- credits;
-- acceleration use;
-- optimizer use;
-- session count, unless a later signed license explicitly adds such a limit.
-
-All product capabilities may be available in Community Edition, subject to the
-installed components, your own configuration, normal authentication and
-authorization, and the limits above.
+Product capabilities available in Community Edition depend on the installed
+components, signed license, release configuration, your own configuration,
+normal authentication and authorization, and the limits above.
 
 ## 4. Signed Local License
 
@@ -88,34 +81,36 @@ offline using public verification keys.
 The product may refuse to create or activate additional users, projects, models,
 or tenants when the signed license limits are reached.
 
-License verification is local. Loss of internet access must not disable an
-already-installed Community Edition solely because Tessallite's website or
-license registry is unreachable.
+License verification is designed to run locally for Community installations.
+Some optional services, updates, registry access, advisory feeds, support
+features, or future entitlements may still depend on network availability or
+release-specific configuration.
 
 ## 5. Demo Tenant And Demo Data
 
 The built-in demo tenant and demo source are provided for demonstration and
 evaluation. Demo source credentials, if shipped or configured, may be read-only.
-You must not attempt to bypass demo source protections, scrape hosted demo data
-at scale, or use demo data as a production dataset.
+The demo tenant is intended for evaluation use, not as a production dataset or
+bulk data extraction source.
 
-## 6. Restrictions
+## 6. Commercial Boundaries
 
-You must not:
+A separate written agreement with Tessallite is required to:
 
-- sell, sublicense, rent, lease, or transfer Community Edition or Closed
+- sell, sublicense, rent, lease, or transfer Community Edition or Proprietary
   Components to a third party;
 - provide Tessallite as a hosted, managed, bureau, resale, OEM, white-label, or
-  service-provider offering to third parties without a separate written
-  agreement;
-- remove copyright, trademark, proprietary, or license notices;
-- reverse engineer, decompile, disassemble, or attempt to extract source code
-  from Closed Components except to the extent mandatory law permits it;
-- bypass or disable the license manager, gateway guard, internal request-token
-  controls, or signed-license checks;
-- use Community Edition in a way that exceeds the signed license limits;
-- use Tessallite names, logos, or marks except as allowed by written brand
-  guidance.
+  service-provider offering to third parties;
+- use Tessallite names, logos, or marks outside written brand guidance.
+
+You agree to:
+
+- keep copyright, trademark, proprietary, and license notices in place;
+- use Community Edition within the signed license limits;
+- use signed-license and entitlement controls as provided;
+- not reverse engineer, decompile, disassemble, or attempt to extract source
+  code from Proprietary Components except to the extent mandatory law permits
+  it.
 
 ## 7. Community Source
 
@@ -124,22 +119,21 @@ Community Source. If you modify Community Source, your rights and obligations fo
 those files are governed by the root `LICENSE` and
 `LICENSE-SOURCE-AVAILABLE.md`.
 
-These Community terms govern Closed Components, signed bundles, runtime
+These Community terms govern Proprietary Components, signed bundles, runtime
 activation, and edition limits.
 
 ## 8. Optional Beacon
 
 Community Edition may include an optional adoption beacon. The beacon is for
-awareness and advisory delivery only. It must not act as a remote kill switch or
-remote control plane.
+awareness and advisory delivery only.
 
 Allowed beacon payloads should be limited to license ID, product version,
-edition, and anonymous high-level activity counters. Beacon payloads must not
-include query text, row data, schemas, credentials, or personal data beyond the
-license ID.
+edition, and anonymous high-level activity counters. Beacon payloads are not
+intended to include query text, row data, schemas, credentials, or personal data
+beyond the license ID.
 
-If the beacon is unavailable or disabled, the product must continue to operate
-subject to its local signed license.
+If the beacon is unavailable or turned off, the product is designed to continue
+operating subject to its local signed license.
 
 ## 9. Enterprise Upgrade
 
@@ -153,17 +147,15 @@ security assurance material, SSO, onboarding, and commercial terms.
 Tessallite and its licensors retain all rights not expressly granted. Community
 Edition is licensed, not sold.
 
-## 11. No Warranty
+## 11. Warranty Disclaimer
 
-Community Edition is provided "as is" and "as available", without warranty of
-any kind to the maximum extent permitted by law.
+Community Edition is provided without a commercial warranty unless Tessallite
+agrees otherwise in writing.
 
-Tessallite does not guarantee that Community Edition, Community Source,
-documentation, examples, demo data, container images, installation scripts,
-connectors, integrations, migration scripts, updates, or related materials will
-be secure, accurate, complete, uninterrupted, error-free, fit for a particular
-purpose, compatible with your environment, or available for any particular
-period.
+To the maximum extent permitted by law, Tessallite does not provide implied
+warranties for Community Edition, Community Source, documentation, examples,
+demo data, container images, installation scripts, connectors, integrations,
+migration scripts, updates, or related materials.
 
 ## 12. Limitation Of Liability
 
@@ -173,9 +165,9 @@ Edition in the twelve months before the claim or GBP 100.
 
 ## 13. Termination
 
-Tessallite may terminate your Community license if you materially breach these
-terms and fail to cure the breach after written notice. On termination, you must
-stop using Closed Components and destroy copies of them, except where retention
+Tessallite may end your Community license if you materially breach these terms
+and do not cure the breach after written notice. If that happens, you must stop
+using Proprietary Components and destroy copies of them, except where retention
 is required by law.
 
 Community Source rights continue only as permitted by the root source-available
@@ -183,9 +175,9 @@ Community Source rights continue only as permitted by the root source-available
 
 ## 14. Governing Law
 
-These draft terms are intended to use the laws of England and Wales, with courts
-of England and Wales having exclusive jurisdiction, unless a final signed
-agreement states otherwise.
+These terms are governed by the laws of England and Wales. The courts of England
+and Wales have exclusive jurisdiction, unless a separate written agreement signed
+by Tessallite states otherwise.
 
 ## 15. Contact
 

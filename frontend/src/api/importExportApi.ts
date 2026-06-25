@@ -129,6 +129,26 @@ export type ProjectImportConnectionAction = {
   target_connection_id: string | null;
 };
 
+export type ProjectImportModelCascadeCounts = {
+  aggregates: number;
+  pockets: number;
+  query_logs: number;
+  query_miss_logs: number;
+  route_logs: number;
+};
+
+export type ProjectImportModelCascade = {
+  model_id: string;
+  slug: string;
+  display_name: string;
+  counts: ProjectImportModelCascadeCounts;
+};
+
+export type ProjectImportCascadeCounts = {
+  per_model: ProjectImportModelCascade[];
+  totals: Partial<ProjectImportModelCascadeCounts>;
+};
+
 export type ProjectImportPlan = {
   mode: string;
   target_project_id: string | null;
@@ -138,6 +158,7 @@ export type ProjectImportPlan = {
   will_create_project: boolean;
   will_replace_project: boolean;
   delete_counts: Record<string, number>;
+  model_cascade_counts: ProjectImportCascadeCounts;
   incoming_counts: Record<string, number>;
   connection_actions: ProjectImportConnectionAction[];
   model_slugs: string[];

@@ -277,6 +277,340 @@ def _get_axis_expr(mdx: str, axis_name: str) -> str:
     return ""
 
 
+# A single measure reference: `[Measures].[m]` or `[Measures].m`.
+_MEASURE_REF = r'\[Measures\]\.(?:\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)'
+
+_CMP_OP = r'(?:>=|<=|<>|>|<|=)'
+
+# (1) Comparison-operand measures — a condition inside a Filter() predicate.
+# A measure is a predicate operand when a comparison operator sits on EITHER
+# side of it: `[Measures].[m] > 5`, `5 < [Measures].[m]`, or both sides in a
+# measure-vs-measure compare `[Measures].[a] > [Measures].[b]`. The operator is
+# captured (group `op`) and re-emitted by the replacement so the *other* operand
+# can also strip on the same pass; the leading-measure form uses a lookahead so
+# the operator is never consumed there either.
+#
+# Bug-5495: a paren-wrapped or function-wrapped operand — `([Measures].[m]) > 5`
+# or `CoalesceEmpty([Measures].[m], 0) > 5` — also places the measure in a
+# predicate context, not on the axis. The regex now also matches:
+#   - `( [Measures].[m] )` adjacent to a comparison operator (paren-wrapped),
+#   - a measure reference that appears inside a function call (word + `(`)
+#     followed by `)` and then a comparison operator.
+# A genuine wrapped axis measure is always set-wrapped (`{[Measures].[m]}`)
+# and never adjacent to a comparison operator, so it is never stripped.
+
+# Paren-wrapped measure: `( [Measures].[m] )` — the outer parens plus the
+# measure reference.  Must match when a comparison sits on either side.
+# Also handles double-paren wrapping `(( [Measures].[m] ))` (Bug-5495).
+_PAREN_MEASURE = rf'\(+\s*{_MEASURE_REF}\s*\)+'
+
+_PREDICATE_MEASURE_RE = re.compile(
+    # bare leading measure before a comparison operator
+    rf'(?P<lead>{_MEASURE_REF})(?=\s*{_CMP_OP})'
+    rf'|'
+    # bare trailing measure after a comparison operator
+    rf'(?P<op>{_CMP_OP})\s*{_MEASURE_REF}'
+    rf'|'
+    # paren-wrapped leading measure before a comparison operator (Bug-5495)
+    rf'(?P<pwlead>{_PAREN_MEASURE})(?=\s*{_CMP_OP})'
+    rf'|'
+    # paren-wrapped trailing measure after a comparison operator (Bug-5495)
+    rf'(?P<pwop>{_CMP_OP})\s*{_PAREN_MEASURE}',
+    re.IGNORECASE,
+)
+
+
+def _blank_predicate_measure(match: "re.Match") -> str:
+    """Replace a matched comparison-operand measure with a space, preserving any
+    comparison operator captured on the trailing-measure branch so the other
+    operand of a measure-vs-measure compare still strips on the same pass.
+
+    Bug-5495: also handles paren-wrapped measure operands via the ``pwlead``
+    and ``pwop`` groups added to ``_PREDICATE_MEASURE_RE``."""
+    # Bare trailing: `op [Measures].[m]`
+    op = match.group("op")
+    if op:
+        return f"{op} "
+    # Paren-wrapped trailing: `op ([Measures].[m])`
+    pwop = match.group("pwop")
+    if pwop:
+        return f"{pwop} "
+    # Paren-wrapped leading: `([Measures].[m]) <op>`
+    if match.group("pwlead"):
+        return " "
+    # Bare leading: `[Measures].[m] <op>`
+    return " "
+
+# (2) Sort-key / rank measures — the scalar measure argument of an ordering or
+# ranking function: `Order(set, [Measures].[m], BDESC)`,
+# `TopCount(set, 10, [Measures].[m])`, `BottomCount(...)`, `TopPercent(...)`.
+# Unlike CrossJoin (whose bare measure argument is a genuine axis member), the
+# measure here is a numeric sort key. The argument span of these calls is found
+# by balanced-paren scan (depth-independent), then any bare scalar measure
+# argument that is NOT wrapped in a `{}` set is blanked.
+_RANK_FUNCS = frozenset({
+    "order", "topcount", "bottomcount", "toppercent",
+    "bottompercent", "topsum", "bottomsum",
+})
+_RANK_CALL_RE = re.compile(
+    rf'\b({"|".join(_RANK_FUNCS)})\s*\(', re.IGNORECASE,
+)
+# A measure reference anchored for replacement inside an argument scan.
+_ANCHORED_MEASURE_RE = re.compile(rf'^\s*{_MEASURE_REF}\s*$')
+
+# Set-valued functions whose result is an axis SET, never a scalar sort key. A
+# rank-call argument headed by one of these is the ranked SET (or a nested set),
+# so its measures are axis members and must be preserved. Used to distinguish a
+# scalar function-wrapped sort key (Bug-5495 — strip) from a set argument (keep).
+_SET_FUNCS = frozenset({
+    "crossjoin", "filter", "union", "intersect", "except", "descendants",
+    "children", "members", "addcalculatedmembers", "topcount", "bottomcount",
+    "toppercent", "bottompercent", "topsum", "bottomsum", "order", "hierarchize",
+    "distinct", "generate", "extract", "subset", "head", "tail", "drilldownlevel",
+    "drilldownmember", "drilluplevel", "drillupmember", "namedset", "set",
+})
+# A scalar function-wrapped sort key: `Name( ... [Measures]... )` whose head NAME
+# is NOT a set function and whose body has no set-brace `{` and no `.Members` set
+# expansion — i.e. a numeric expression over measures (`CoalesceEmpty([m],0)`,
+# `Abs([m])`, `IIF(cond,[m],0)`), used as the rank sort key (Bug-5495).
+_SCALAR_FUNC_HEAD_RE = re.compile(r'^\s*([A-Za-z_]\w*)\s*\(', re.IGNORECASE)
+
+
+def _is_scalar_func_sort_key(seg: str) -> bool:
+    """True when *seg* is a scalar FUNCTION call wrapping measure(s) that is a
+    rank sort key (Bug-5495), not a set argument. Conservative: requires a
+    non-set head function, at least one measure, and no set-brace / `.Members`."""
+    s = seg.strip()
+    head = _SCALAR_FUNC_HEAD_RE.match(s)
+    if not head:
+        return False
+    if head.group(1).lower() in _SET_FUNCS:
+        return False
+    if "[Measures]" not in s or "{" in s:
+        return False
+    if re.search(r'\.\s*Members\b', s, re.IGNORECASE):
+        return False
+    return True
+
+
+def _blank_top_level_measure_args(arg_list: str) -> str:
+    """Within a rank call's argument list (the text BETWEEN the outer parens),
+    blank any argument that is a sort-key measure expression. An argument is a
+    sort key when it is *exactly* a bare measure reference, OR (Bug-5495) a scalar
+    FUNCTION call wrapping measures that is not a set argument
+    (`CoalesceEmpty([Measures].[m], 0)`). Arguments are split on top-level commas —
+    commas at paren-depth 0, brace-depth 0 AND bracket-depth 0 — so a comma inside
+    a `[Member, Name]` identifier, a `{}` set, or a nested call is never treated as
+    an argument separator. A `{}`-set argument or a set-function argument (the
+    ranked SET) is preserved so genuine axis measures survive."""
+    out: list[str] = []
+    depth_paren = 0
+    depth_brace = 0
+    depth_bracket = 0
+    start = 0
+    i = 0
+    n = len(arg_list)
+
+    def emit(seg: str) -> str:
+        if _ANCHORED_MEASURE_RE.match(seg) or _is_scalar_func_sort_key(seg):
+            return " "
+        return seg
+
+    while i < n:
+        c = arg_list[i]
+        if c == '[':
+            depth_bracket += 1
+        elif c == ']':
+            if depth_bracket > 0:
+                depth_bracket -= 1
+        elif depth_bracket == 0:
+            # Paren/brace/comma structure is only significant outside a
+            # bracketed identifier (member names may contain (){}, commas).
+            if c == '(':
+                depth_paren += 1
+            elif c == ')':
+                depth_paren -= 1
+            elif c == '{':
+                depth_brace += 1
+            elif c == '}':
+                depth_brace -= 1
+            elif c == ',' and depth_paren == 0 and depth_brace == 0:
+                out.append(emit(arg_list[start:i]))
+                out.append(',')
+                start = i + 1
+        i += 1
+    out.append(emit(arg_list[start:n]))
+    return "".join(out)
+
+
+def _strip_rank_key_measures(expr: str) -> str:
+    """Blank bare scalar measure arguments of ranking/order calls, at any paren
+    nesting depth. Walks each rank call's balanced-paren argument span and
+    removes only measures that stand alone as a top-level argument (a sort key),
+    leaving set-wrapped axis measures (`{[Measures].[m]}`) and measures inside
+    nested set expressions untouched."""
+    out = expr
+    pos = 0
+    while True:
+        m = _RANK_CALL_RE.search(out, pos)
+        if not m:
+            break
+        open_idx = m.end() - 1  # index of the '('
+        depth = 0
+        bracket = 0
+        close_idx = -1
+        for i in range(open_idx, len(out)):
+            c = out[i]
+            if c == '[':
+                bracket += 1
+            elif c == ']':
+                if bracket > 0:
+                    bracket -= 1
+            elif bracket == 0:
+                # Parens inside a bracketed member name (e.g. `[Sales (Net)]`)
+                # are literal text, not call structure.
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                    if depth == 0:
+                        close_idx = i
+                        break
+        if close_idx == -1:
+            break  # unbalanced — leave the rest untouched
+        inner = out[open_idx + 1:close_idx]
+        new_inner = _blank_top_level_measure_args(inner)
+        out = out[:open_idx + 1] + new_inner + out[close_idx:]
+        # Advance past this call's name; nested rank calls inside the (rewritten)
+        # span are still reachable on the next iteration.
+        pos = m.end()
+    return out
+
+
+# (3) Function-wrapped comparison operand (Bug-5495): a function call like
+# `CoalesceEmpty([Measures].[m], 0)` or `IIF(cond, [Measures].[m], 0)` that is
+# itself a comparison operand — `CoalesceEmpty([Measures].[m], 0) > 5`. The
+# function name precedes an opening paren; we scan to the balanced close, then
+# check whether a comparison operator follows. If so, any [Measures] ref inside
+# the function call is a predicate operand and is blanked.
+_FUNC_CALL_CMP_RE = re.compile(
+    r'\b[A-Za-z_]\w*\s*\(',
+    re.IGNORECASE,
+)
+_BARE_MEASURE_RE = re.compile(
+    rf'{_MEASURE_REF}',
+    re.IGNORECASE,
+)
+
+
+_TRAILING_CMP_RE = re.compile(rf'{_CMP_OP}\s*$')
+
+
+def _strip_func_wrapped_comparison_measures(expr: str) -> str:
+    """Blank measure references inside function calls that are comparison operands.
+
+    Scans for `FuncName(...)` patterns and blanks any `[Measures].[x]` reference
+    inside the call when a comparison operator sits immediately AFTER the closing
+    paren (`FuncName(...) > value`) OR immediately BEFORE the function name
+    (`value < FuncName(...)`) -- in either orientation the call is a predicate
+    operand, so the measures inside it are conditions, not axis members.
+
+    Does NOT touch function calls that are not adjacent to a comparison operator --
+    those may be genuine axis expressions like `AddCalculatedMembers({[Measures].[m]})`
+    or a set-function whose result is never compared (`CrossJoin(...)`, `Filter(...)`).
+    A set-wrapped axis measure `{[Measures].[m]}` is never inside a comparison-operand
+    call, so it survives.
+
+    The scan advances past the function NAME (not the entire call) on non-match
+    so that nested function calls (e.g. `CoalesceEmpty(...)` inside `Filter(...)`)
+    are still reached.
+    """
+    out = expr
+    pos = 0
+    while pos < len(out):
+        m = _FUNC_CALL_CMP_RE.search(out, pos)
+        if not m:
+            break
+        name_start = m.start()
+        open_idx = m.end() - 1  # the '('
+        # balanced-paren scan (bracket-aware)
+        depth = 0
+        bracket = 0
+        close_idx = -1
+        for i in range(open_idx, len(out)):
+            c = out[i]
+            if c == '[':
+                bracket += 1
+            elif c == ']':
+                if bracket > 0:
+                    bracket -= 1
+            elif bracket == 0:
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                    if depth == 0:
+                        close_idx = i
+                        break
+        if close_idx == -1:
+            break  # unbalanced
+        # The call is a comparison operand iff a comparison operator follows its
+        # closing paren (skipping wrapper parens) OR precedes its function NAME
+        # (skipping wrapper parens).  Bug-5495: `(CoalesceEmpty(...)) > 5`
+        # wraps the function call in extra parens before the comparison operator.
+        after = out[close_idx + 1:].lstrip()
+        # Skip trailing wrapper parens: `) > 5` -> skip `)` to find `> 5`
+        after = after.lstrip(")")
+        after = after.lstrip()
+        followed_by_cmp = bool(re.match(_CMP_OP, after))
+        # Skip leading wrapper parens before the function name
+        before_text = out[:name_start].rstrip()
+        preceded_by_cmp = bool(_TRAILING_CMP_RE.search(before_text.rstrip("(").rstrip()))
+        if not (followed_by_cmp or preceded_by_cmp):
+            # Advance past the function name only (not the entire call) so
+            # nested function calls inside the argument list are still found.
+            pos = m.end()
+            continue
+        # The function call is a comparison operand -- blank any measure ref
+        # inside it. Only blank inside the function call span, not outside.
+        inner = out[open_idx + 1:close_idx]
+        if "[Measures]" in inner:
+            new_inner = _BARE_MEASURE_RE.sub(" ", inner)
+            delta = len(new_inner) - len(inner)
+            out = out[:open_idx + 1] + new_inner + out[close_idx:]
+            pos = close_idx + 1 + delta
+        else:
+            pos = close_idx + 1
+    return out
+
+
+def _strip_predicate_measures(axis_expr: str) -> str:
+    """Blank out measure references that are *operands* of a set-function
+    predicate or ranking key rather than axis members (Bug-5492).
+
+    `Filter([Dim].Members, [Measures].[m] > N)`, `Order(set, [Measures].[m], …)`
+    and `TopCount(set, n, [Measures].[m])` use the measure as a *condition* or
+    *sort key*, not as an axis member. Counting it as a row/column hierarchy
+    pollutes the axis layout (the measure leaks onto ROWS, flips
+    has_measures_axis, and the member tuples get dropped).
+
+    A measure placed directly on an axis is wrapped in a set (`{[Measures].[m]}`)
+    or stands alone — it is never adjacent to a comparison operator, and never a
+    bare comma-delimited scalar argument of a ranking call — so removing only
+    comparison operands and bare scalar rank-key arguments leaves genuine axis
+    measures untouched.
+
+    Bug-5495: also handles paren-wrapped and function-wrapped comparison operands
+    like `([Measures].[m]) > 5` and `CoalesceEmpty([Measures].[m], 0) > 5`.
+    """
+    if not axis_expr or "[Measures]" not in axis_expr:
+        return axis_expr
+    stripped = _PREDICATE_MEASURE_RE.sub(_blank_predicate_measure, axis_expr)
+    stripped = _strip_rank_key_measures(stripped)
+    stripped = _strip_func_wrapped_comparison_measures(stripped)
+    return stripped
+
+
 def _extract_hierarchies(axis_expr: str) -> list[str]:
     """
     Extract unique hierarchy names from an axis expression.
@@ -288,9 +622,17 @@ def _extract_hierarchies(axis_expr: str) -> list[str]:
 
     This prevents treating each measure member or level name as a separate hierarchy,
     which would produce wrong cross-product tuples.
+
+    Bug-5492: a measure used as a comparison operand inside a set-function
+    predicate (e.g. `Filter([Dim].Members, [Measures].[m] > N)`) is a condition,
+    not an axis member, so it is excluded from the hierarchy collection.
     """
     if not axis_expr:
         return []
+
+    # Drop predicate-operand measures (Filter/Order/TopCount conditions) so they
+    # do not leak onto the axis hierarchy list.
+    axis_expr = _strip_predicate_measures(axis_expr)
 
     # Inner capture pattern for bracket contents like [(All)], [Continent], etc.
     _BC = r'([^\]]+)'

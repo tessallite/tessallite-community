@@ -12,19 +12,23 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>Configure Environment Variables</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-06-14</span></div>
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-06-24</span></div>
     <h1>Configure Environment Variables</h1>
 <h2>What this covers</h2>
-<p>The variables you set in <code>.env</code> (local) or Secret Manager (GCP) to start Tessallite. These are the <strong>bootstrap</strong> variables — the bare minimum the services need before they can read anything from the database. Operational tuning knobs (rate limits, optimizer thresholds, scheduler cadences) are set in the System Admin UI and are not covered here.</p>
+<p>The variables you set in <code>.env</code> (Community/local) or Secret Manager (GCP) to start Tessallite. These are the <strong>bootstrap</strong> variables — the bare minimum the services need before they can read anything from the database. Operational tuning knobs (rate limits, optimizer thresholds, scheduler cadences) are set in the System Admin UI and are not covered here.</p>
+<p>For Community Edition, <code>.env</code> is created by <code>install.sh</code> inside the signed release bundle. You normally do not copy it by hand. Review it when you need to change ports, public URLs, or operator-owned secrets. Licence upload and replacement happen later in <strong>System Admin &rarr; License &amp; edition</strong> and are stored in the platform database.</p>
 <p>The <strong>complete, always-current list</strong> of every configurable value is in the <a href="../../../docs/guides/guides_configuration-reference.md">Configuration Reference</a>. When this page and the reference disagree, the reference is authoritative.</p>
 <h2>Required bootstrap variables</h2>
-<p>These must be set in <code>.env</code> (local) or stored as Secret Manager secrets (GCP). The services will refuse to start if any of the credential fields are left at their placeholder values.</p>
+<p>These must be set in <code>.env</code> (Community/local) or stored as Secret Manager secrets (GCP). The services will refuse to start if any credential fields are left at placeholder values. In the Community bundle, <code>install.sh</code> generates missing secrets and preserves values already present.</p>
 <div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Required</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>POSTGRES_PASSWORD</code></td><td>Yes</td><td>—</td><td>Password for the internal PostgreSQL user. Used by Docker Compose to construct the connection URL automatically. On GCP the full URL (<code>SYSTEM_DATABASE_URL</code>) is stored in Secret Manager instead.</td></tr>
 <tr><td><code>CREDENTIAL_ENCRYPTION_KEY</code></td><td>Yes</td><td>—</td><td>Fernet key (base64, 32 bytes) used to encrypt source database credentials at rest. Generate with: <code>python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"</code></td></tr>
 <tr><td><code>JWT_SECRET_KEY</code></td><td>Yes</td><td>—</td><td>Secret used to sign user session tokens. Minimum 32 characters.</td></tr>
 <tr><td><code>SYSTEM_ADMIN_EMAIL</code></td><td>No</td><td><code>admin@tessallite.local</code></td><td>Email address of the system-level administrator.</td></tr>
 <tr><td><code>SYSTEM_ADMIN_PASSWORD</code></td><td>Yes</td><td>—</td><td>Password for the system administrator.</td></tr>
+<tr><td><code>LICENSE_FILE_HOST</code></td><td>No</td><td><code>./license.json</code></td><td>Legacy/bootstrap host path to a signed local licence file. The License Manager upload stores the active licence in the platform database.</td></tr>
+<tr><td><code>LICENSE_PUBLIC_KEYS</code></td><td>No</td><td>built-in key</td><td>Optional public verification key override. Normal installs use the built-in Tessallite public key.</td></tr>
+<tr><td><code>LICENSE_ENFORCEMENT_ENABLED</code></td><td>No</td><td><code>true</code></td><td>Requires a valid signed licence at startup. Leave enabled for normal Community installs.</td></tr>
 </tbody></table></div>
 <h2>GCP-specific: SYSTEM_DATABASE_URL</h2>
 <p>On GCP the Cloud Run services cannot reach the local Docker network. Instead of <code>POSTGRES_PASSWORD</code>, store the full connection URL as a Secret Manager secret:</p>
@@ -41,12 +45,15 @@
 <tr><td><code>LOG_LEVEL</code></td><td><code>info</code></td><td>Log verbosity: <code>debug</code>, <code>info</code>, <code>warn</code>, or <code>error</code>.</td></tr>
 </tbody></table></div>
 <h2>Setting variables in Docker Compose</h2>
-<p>Copy <code>.env.example</code> to <code>.env</code> (in the same directory as <code>docker-compose.yml</code>) and fill in the required values:</p>
+<p>For the signed Community bundle, run <code>./install.sh</code>. It creates <code>.env</code> from <code>.env.example</code> if missing and fills empty secret values:</p>
 <pre><code>POSTGRES_PASSWORD=your-strong-password
 CREDENTIAL_ENCRYPTION_KEY=your-fernet-key-here
 JWT_SECRET_KEY=your-jwt-secret-min-32-chars
-SYSTEM_ADMIN_PASSWORD=your-admin-password</code></pre>
-<p>Docker Compose reads this file automatically. Never commit <code>.env</code> to source control — it is listed in <code>.gitignore</code>.</p>
+SYSTEM_ADMIN_PASSWORD=your-admin-password
+LICENSE_FILE_HOST=./license.json
+LICENSE_PUBLIC_KEYS=tessallite-prod-2026:&lt;public-key&gt;</code></pre>
+<p>Docker Compose reads this file automatically. Never commit <code>.env</code> or <code>license.json</code> to source control. A developer source checkout may still create <code>.env</code> manually from <code>.env.example</code>, but that is not the public install path.</p>
+<p>After the stack is running, system administrators replace a signed licence from <strong>System Admin &rarr; License &amp; edition</strong>. Tessallite verifies the uploaded <code>license.json</code>, stores it in the platform database, and applies it immediately. <code>LICENSE_PUBLIC_KEYS</code> is only needed when you must override the built-in Tessallite public key.</p>
 <h2>Setting variables in Cloud Run</h2>
 <p>The scripted GCP deploy handles secrets automatically. If you need to update a secret manually:</p>
 <pre><code># Update a secret value
@@ -57,10 +64,10 @@ gcloud run services update SERVICE_NAME \
   --region REGION \
   --set-env-vars LOG_LEVEL=debug</code></pre>
 <h2>Security</h2>
-<p>Never commit credential values to source control. On GCP, all three secrets (<code>SYSTEM_DATABASE_URL</code>, <code>CREDENTIAL_ENCRYPTION_KEY</code>, <code>JWT_SECRET_KEY</code>) are stored in Secret Manager and mounted into Cloud Run at deploy time — they never appear in the service YAML. For key rotation, see <code>CREDENTIAL_ENCRYPTION_KEY_PREVIOUS</code> in the <a href="../../../docs/guides/guides_configuration-reference.md">Configuration Reference</a>.</p>
+<p>Never commit credential values to source control. In Community installs, keep <code>.env</code> with your installation backup, but outside git. Keep downloaded <code>license.json</code> files somewhere secure as records, but the active uploaded licence lives in the platform database. On GCP, secrets (<code>SYSTEM_DATABASE_URL</code>, <code>CREDENTIAL_ENCRYPTION_KEY</code>, <code>JWT_SECRET_KEY</code>, and other secret values) are stored in Secret Manager and mounted into Cloud Run at deploy time — they never appear in the service YAML. For key rotation, see <code>CREDENTIAL_ENCRYPTION_KEY_PREVIOUS</code> in the <a href="../../../docs/guides/guides_configuration-reference.md">Configuration Reference</a>.</p>
 <h2>Related</h2>
 <ul><li><a href="deploy-local.html">Deploy Locally</a></li><li><a href="deploy-gcp.html">Deploy on GCP</a></li><li><a href="service-reference.html">Service Reference</a></li></ul>
-<nav class="page-nav"><a href="deploy-gcp.html" class="page-nav-btn prev">&larr; Deploy on GCP</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="system-configuration.html" class="page-nav-btn next">System Configuration &rarr;</a></nav>
+<nav class="page-nav"><a href="deploy-kubernetes.html" class="page-nav-btn prev">&larr; Deploy on Kubernetes</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="system-configuration.html" class="page-nav-btn next">System Configuration &rarr;</a></nav>
   </main>
   <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
 </body>

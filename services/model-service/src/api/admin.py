@@ -11,7 +11,7 @@ import logging
 import os
 import subprocess
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,8 +24,17 @@ from shared.db.models import (
     WebhookEndpoint,
 )
 from shared.db.session import get_system_db, get_tenant_db, normalize_tenant_db_url
+from shared.licensing.errors import LicenseError
+from shared.licensing.loader import build_registry
+from shared.licensing.verify import verify_license
 from shared.security.credential_crypto import decrypt_str, re_encrypt_blob
-from src.auth.middleware import require_system_admin
+from src.auth.middleware import CurrentUser, require_system_admin
+from src.licensing_guard import (
+    get_license_manager,
+    has_installed_license,
+    license_public_keys,
+    store_license_doc,
+)
 
 settings = get_settings()
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_system_admin)])
@@ -172,3 +181,58 @@ async def rotate_credentials(
         )
 
     return {"status": "ok", "rotated": rotated}
+
+
+# ---------------------------------------------------------------------------
+# License manager (system-admin). Upload / replace the signed license from the
+# UI (Bug-5466). The license is fed from the frontend and persisted in the
+# SYSTEM DB (not a file/env), so it survives restart and works on read-only
+# hosts (e.g. Cloud Run). Verified with the built-in public key before it is
+# stored; applied immediately via a manager reload. Closed engine untouched.
+# ---------------------------------------------------------------------------
+
+async def _license_status() -> dict:
+    """Non-secret license/edition status for the admin UI."""
+    s = get_settings()
+    mgr = get_license_manager()
+    return {
+        "edition": mgr.status().get("edition"),
+        "status": mgr.status(),
+        "entitlements": mgr.entitlements(),
+        "enforcement_enabled": bool(s.LICENSE_ENFORCEMENT_ENABLED),
+        "has_license": await has_installed_license(),
+    }
+
+
+@router.get("/license")
+async def get_license_status() -> dict:
+    """Current edition/entitlements + whether a license is installed."""
+    return await _license_status()
+
+
+@router.post("/license")
+async def install_license(
+    body: dict = Body(..., description="The signed license JSON document"),
+    current_user: CurrentUser = Depends(require_system_admin),
+) -> dict:
+    """Verify the uploaded license and persist it to the system DB, applying it
+    immediately (no restart, no file, works on read-only hosts)."""
+    # Verify signature + expiry BEFORE persisting (offline, pure). The built-in
+    # public key is used unless LICENSE_PUBLIC_KEYS overrides it.
+    try:
+        lic = verify_license(body, build_registry(license_public_keys()))
+    except LicenseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"License rejected: {exc}",
+        )
+
+    await store_license_doc(body, installed_by=getattr(current_user, "email", None))
+
+    logger.warning(
+        "[LICENSE] installed license_id=%s edition=%s by=%s",
+        getattr(lic, "license_id", "?"),
+        get_license_manager().status().get("edition"),
+        getattr(current_user, "email", "?"),
+    )
+    return {"status": "installed", "license": await _license_status()}

@@ -29,10 +29,13 @@ For tenant endpoint (/xmla/{tenant}):
 """
 from __future__ import annotations
 
+import contextvars
+import gzip
 import logging
 import os
 import re
 import uuid
+import zlib
 from typing import Any, Callable, Optional
 from defusedxml import DefusedXmlException, ElementTree as ET
 
@@ -72,6 +75,7 @@ from src.router_client import (
     get_model_measures,
     get_model_named_sets,
     get_model_personas,
+    get_model_snapshot,
     get_dimension_members,
     list_all_models_for_tenant,
     list_models_for_tenant,
@@ -83,6 +87,34 @@ router = APIRouter()
 _SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 _XMLA_NS = "urn:schemas-microsoft-com:xml-analysis"
 _CONTENT_TYPE = "text/xml; charset=utf-8"
+
+# Bug-5436b: per-request client Accept-Encoding. Set once at the HTTP entry
+# point and read inside ``_soap_response`` so every XMLA response is compressed
+# without threading a parameter through ~8 call sites. A ContextVar is the
+# correct primitive here: each ASGI request runs in its own context, so there
+# is no cross-request bleed even under concurrency.
+_accept_encoding: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "xmla_accept_encoding", default=""
+)
+
+# Responses smaller than this (bytes) are not worth compressing — the gzip
+# header overhead can make tiny payloads larger, and the CPU is wasted.
+_COMPRESS_MIN_BYTES = 512
+
+
+def _pick_content_encoding(accept_encoding: str) -> str:
+    """Return the response Content-Encoding to use for a client Accept-Encoding.
+
+    Honors gzip and deflate (the two encodings MSOLAP/Power BI advertise);
+    prefers gzip. Returns "" when the client advertised neither (identity).
+    A bare ``identity`` or empty header yields no compression.
+    """
+    ae = (accept_encoding or "").lower()
+    if "gzip" in ae:
+        return "gzip"
+    if "deflate" in ae:
+        return "deflate"
+    return ""
 
 
 def _tenant_from_jwt(jwt_token: str) -> str:
@@ -134,6 +166,10 @@ async def xmla_server_endpoint(request: Request) -> Response:
     if request.method == "GET":
         # GET probe required by MSOLAP. Middleware already verified auth.
         return Response(status_code=200, media_type="text/plain")
+
+    # Bug-5436b: record the client's Accept-Encoding for this request so
+    # ``_soap_response`` can gzip/deflate the response body.
+    _accept_encoding.set(request.headers.get("accept-encoding", ""))
 
     # Access authenticated user and JWT token set by BasicAuthMiddleware
     username = getattr(request.state, "username", "")
@@ -435,6 +471,8 @@ async def xmla_tenant_endpoint(tenant_slug: str, request: Request) -> Response:
     """
     username = getattr(request.state, "username", "")
     jwt_token = getattr(request.state, "jwt_token", "")
+    # Bug-5436b: record the client's Accept-Encoding for response compression.
+    _accept_encoding.set(request.headers.get("accept-encoding", ""))
     body_bytes = await request.body()
     body_bytes = XmlaAdapter.normalize_inbound(body_bytes)
 
@@ -1111,12 +1149,141 @@ async def _handle_discover(
 # EXECUTE handler
 # ---------------------------------------------------------------------------
 
+async def _handle_tmschema_dmv(
+    statement: str,
+    catalog: str,
+    tenant_slug: str,
+    jwt_token: str,
+    session_id: str,
+) -> Response:
+    """Answer a ``$SYSTEM.TMSCHEMA_*`` DMV Execute from model metadata (Bug-5430).
+
+    Power BI / "Analyze in Excel" read the Tabular metadata surface via these
+    DMVs. We resolve the catalog's model, fetch its measures / dimensions /
+    hierarchies, and project the requested TMSCHEMA table as a flat XMLA Rowset
+    (the same response shape DRILLTHROUGH uses). An unresolved catalog or an
+    unknown TMSCHEMA table yields a conformant empty rowset rather than a fault,
+    so the discovery sequence proceeds.
+    """
+    from src.dax.mdschema import _build_rowset_xml, build_tmschema_rowset
+
+    table = _tmschema_table_name(statement)
+    measures: list[dict[str, Any]] = []
+    dimensions: list[dict[str, Any]] = []
+    hierarchy_defs: list[dict[str, Any]] = []
+
+    model_id, project_id, persona = await _resolve_model_id(
+        catalog, tenant_slug, jwt_token,
+    )
+    if model_id:
+        try:
+            measures = await get_model_measures(
+                model_id, tenant_slug, jwt_token, project_id=project_id,
+            )
+            dimensions = await get_model_dimensions(
+                model_id, tenant_slug, jwt_token, project_id=project_id,
+            )
+            hierarchy_defs = await get_model_hierarchies(
+                model_id, tenant_slug, jwt_token, project_id=project_id,
+                include_details=True,
+            )
+        except Exception as exc:
+            logger.warning("TMSCHEMA DMV metadata fetch failed: %s", exc)
+
+    # Persona / hidden scoping for the TMSCHEMA DMV (Bug-5493).
+    #
+    # Two distinct restriction kinds must be handled differently because they
+    # mean different things:
+    #
+    #   ACCESS  (persona allow lists + CLS restricted columns) — the requesting
+    #           persona is NOT permitted to see the object at all. Such measures
+    #           must be EXCLUDED so neither their name nor their DAX expression
+    #           leaks. This mirrors the persona-as-catalog isolation the discovery
+    #           path enforces.
+    #
+    #   CURATION (the hidden/visible flag) — the object exists for this persona
+    #           but the modeller has hidden it from default field lists. The real
+    #           SSAS Tabular contract still LISTS hidden measures in
+    #           TMSCHEMA_MEASURES with IsHidden=true, so we include them with their
+    #           expression and carry the IsHidden flag through. Hidden is curation,
+    #           not an access boundary, and must not blank the DAX.
+    #
+    # A technical persona (includes_hidden_columns) sees every object as visible,
+    # so its hidden flag is cleared; otherwise the original is_hidden is preserved
+    # (NOT dropped) and surfaced via the IsHidden column.
+    is_technical_view = _persona_includes_hidden(persona)
+    if is_technical_view:
+        def _unhide(item: dict[str, Any]) -> dict[str, Any]:
+            return {**item, "is_hidden": False}
+
+        measures = [_unhide(m) for m in measures]
+        dimensions = [_unhide(d) for d in dimensions]
+
+    if persona:
+        # ACCESS boundary 1 — persona allow lists exclude non-permitted objects.
+        measures, dimensions, hierarchy_defs = _apply_persona_allow_lists(
+            persona,
+            measures=measures,
+            dimensions=dimensions,
+            hierarchies=hierarchy_defs,
+        )
+        # ACCESS boundary 2 — CLS / persona-restricted source columns. A measure
+        # or dimension bound to a restricted source column is excluded entirely
+        # (name + DAX). Additionally, an INCLUDED measure whose DAX expression
+        # references a restricted column NAME has its expression blanked so the
+        # restricted column name cannot leak through the exposed DAX (covers
+        # calculated measures, which reference columns only inside free-text DSL).
+        restricted_column_names: set[str] = set()
+        names_resolved = True
+        if persona.get("restricted_column_ids") and model_id:
+            restricted_column_names, names_resolved = (
+                await _resolve_restricted_column_names(
+                    persona, model_id, tenant_slug, jwt_token, project_id,
+                )
+            )
+        measures, dimensions = _apply_cls_column_guard(
+            persona,
+            measures=measures,
+            dimensions=dimensions,
+            restricted_column_names=restricted_column_names,
+            names_resolved=names_resolved,
+        )
+
+    col_defs, rows = build_tmschema_rowset(
+        table, catalog, measures, dimensions, hierarchy_defs,
+    )
+    xml_body = _build_rowset_xml(col_defs, rows)
+    return _soap_response(
+        f'<tns:ExecuteResponse>{xml_body}</tns:ExecuteResponse>',
+        session_id=session_id,
+    )
+
+
 async def _handle_execute(
     method_el: ET.Element,
     tenant_slug: str,
     jwt_token: str,
     session_id: str = "",
 ) -> Response:
+    # Bug-5436b: an XMLA Execute whose Command is <Cancel> asks the server to
+    # abort an in-flight command on a connection/session/SPID. Tessallite holds
+    # no long-running cancellable server-side cursor — every Execute runs to
+    # completion synchronously through the query-router — so the conformant
+    # response is an empty-success ExecuteResponse acknowledging the request.
+    # This must run BEFORE statement extraction: a Cancel command carries no
+    # <Statement>, so it would otherwise fall into the empty-handshake path and
+    # (harmlessly but incorrectly) be treated as a connection probe.
+    if _is_cancel_command(method_el):
+        logger.debug("xmla cancel command acknowledged (session=%r)", session_id)
+        return _soap_response(
+            '<tns:ExecuteResponse>'
+            '<return>'
+            '<root xmlns="urn:schemas-microsoft-com:xml-analysis:empty"/>'
+            '</return>'
+            '</tns:ExecuteResponse>',
+            session_id=session_id,
+        )
+
     # Extract the DAX statement first — MSOLAP sends an empty Execute as a
     # connection handshake before any catalog is selected. Return an empty
     # success response so MSOLAP treats the connection as established.
@@ -1139,6 +1306,16 @@ async def _handle_execute(
 
     properties = _parse_properties(method_el)
     catalog = properties.get("Catalog", "")
+
+    # Bug-5430: Power BI / Tabular clients issue DMV-style Execute statements
+    # (``SELECT ... FROM $SYSTEM.TMSCHEMA_*``) to read the Tabular metadata
+    # surface. Intercept before MDX translation — the parser does not
+    # understand DMV SELECTs and would fault — and answer from model metadata.
+    if _is_tmschema_dmv(dax_statement):
+        return await _handle_tmschema_dmv(
+            dax_statement, catalog, tenant_slug, jwt_token, session_id,
+        )
+
     model_id, _project_id, persona = await _resolve_model_id(
         catalog, tenant_slug, jwt_token,
     )
@@ -1168,6 +1345,26 @@ async def _handle_execute(
         )
     except Exception as exc:
         logger.warning("Failed to fetch model metadata for Execute: %s", exc)
+
+    # Bug-5499: fetch saved named sets and inline their expressions into the
+    # MDX statement BEFORE any axis extraction, SQL translation, or response
+    # building. When a BI tool places a saved named set onto an axis, the MDX
+    # references the set by name (e.g. `{[Top Customers]} ON ROWS`). Without
+    # inlining, the axis extractors see a bare name — not a dimension or
+    # measure reference — so the axis renders empty.
+    execute_named_sets: list[dict[str, Any]] = []
+    try:
+        execute_named_sets = await get_model_named_sets(
+            model_id, tenant_slug, jwt_token, project_id=_project_id,
+        )
+    except Exception as exc:
+        logger.debug("Named sets not available for Execute inlining: %s", exc)
+    if execute_named_sets:
+        dax_statement = _inline_named_sets(dax_statement, execute_named_sets)
+        logger.debug(
+            "[XMLA-EXEC] inlined %d named set(s) into MDX",
+            len(execute_named_sets),
+        )
 
     (
         dim_names,
@@ -1883,6 +2080,150 @@ def _apply_persona_allow_lists(
         hierarchies = [h for h in hierarchies if str(h.get("id", "")) in allow_h]
 
     return measures, dimensions, hierarchies
+
+
+async def _resolve_restricted_column_names(
+    persona: dict[str, Any],
+    model_id: str,
+    tenant_slug: str,
+    jwt_token: str,
+    project_id: str,
+) -> tuple[set[str], bool]:
+    """Resolve a persona's ``restricted_column_ids`` to the corresponding source
+    column NAMES via the model snapshot (Bug-5493). Names feed the CLS column-
+    disclosure guard so a restricted column name referenced inside a measure's
+    DAX expression can be detected and blanked.
+
+    Returns ``(names, resolved)``. ``resolved`` is False whenever resolution is
+    not provably complete, so the caller can FAIL CLOSED (blank all expressions)
+    rather than skip the expression scan and risk leaking a restricted column name
+    through an unscanned expression. ``resolved`` is False when:
+      - the snapshot fetch fails; or
+      - any restricted column id is absent from the snapshot columns; or
+      - any restricted column resolves to a blank/empty name.
+    Only when EVERY restricted id maps to a non-blank name do we have the full set
+    of names to scan for, and ``resolved`` is True. When there are no restricted
+    columns, returns ``(set(), True)`` — nothing to resolve.
+    """
+    restricted_ids = {str(x) for x in (persona.get("restricted_column_ids") or [])}
+    if not restricted_ids:
+        return set(), True
+    try:
+        snapshot = await get_model_snapshot(
+            model_id, tenant_slug, jwt_token, project_id=project_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "TMSCHEMA CLS column-name resolution failed (snapshot fetch): %s", exc,
+        )
+        return set(), False
+    names: set[str] = set()
+    resolved_ids: set[str] = set()
+    for col in snapshot.get("columns") or []:
+        col_id = str(col.get("id", ""))
+        if col_id in restricted_ids:
+            # Snapshot columns are serialised from ModelColumn (ORM), whose name
+            # field is `column_name` (see shared/db/models.py:ModelColumn and the
+            # router_client snapshot consumers). Read that canonical key.
+            name = str(col.get("column_name") or "").strip()
+            if name:
+                names.add(name)
+                resolved_ids.add(col_id)
+    # If any restricted id did not resolve to a non-blank name, the name set is
+    # incomplete — fail closed so the caller blanks every surviving expression.
+    resolved = resolved_ids >= restricted_ids
+    return names, resolved
+
+
+def _expression_references_name(expression: str, name: str) -> bool:
+    """True when *name* appears in *expression* as a whole token (case-
+    insensitive). Used by the CLS column-disclosure guard so a restricted source
+    column name embedded inside a larger identifier (e.g. ``salary_band`` vs
+    ``salary``) does not over-match, while a real reference does.
+    """
+    if not expression or not name:
+        return False
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])",
+                     expression, flags=re.IGNORECASE) is not None
+
+
+def _apply_cls_column_guard(
+    persona: Optional[dict[str, Any]],
+    *,
+    measures: list[dict[str, Any]],
+    dimensions: list[dict[str, Any]],
+    restricted_column_names: set[str] | None = None,
+    names_resolved: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Enforce CLS / persona column restrictions on the TMSCHEMA projection
+    (Bug-5493). ``restricted_column_ids`` is the same persona allow-list machinery
+    the catalogue-metadata path uses (router_client._fetch_model_metadata).
+
+    Two ACCESS rules, both honouring the persona's restricted source columns:
+
+      1. EXCLUSION — a measure or dimension whose own ``source_column_id`` is a
+         restricted source column is dropped entirely so neither its name nor its
+         DAX expression reaches the client. Mirrors the catalogue-metadata path.
+
+      2. EXPRESSION BLANKING (column-disclosure guard) — for an INCLUDED measure
+         whose DAX ``expression`` text references a restricted column NAME, the
+         expression is blanked (the row + measure name remain, the DAX text is
+         dropped). A restricted column name can only be disclosed if it literally
+         appears in the exposed expression text, so scanning the expression for
+         restricted column names is an exact guard against name disclosure — not a
+         heuristic. This covers *calculated* measures, which carry no
+         ``source_column_id`` and reference columns only inside free-text DSL.
+
+    ``restricted_column_names`` is the set of source column NAMES corresponding to
+    the persona's ``restricted_column_ids`` (resolved by the caller from the model
+    snapshot). ``names_resolved`` reports whether that resolution succeeded.
+
+    FAIL CLOSED: when the persona HAS restricted columns but their names could not
+    be resolved (``names_resolved is False`` — e.g. the snapshot fetch failed),
+    we cannot scan expressions for the restricted names, so we blank the
+    expression of EVERY surviving included measure rather than risk leaking a
+    restricted column name through an unscanned expression. Rule 1 (exclusion by
+    bound column) still applies in that case.
+
+    Returns the narrowed ``(measures, dimensions)`` (measure dicts are shallow-
+    copied before blanking so the caller's source lists are not mutated).
+    """
+    if not persona:
+        return list(measures), list(dimensions)
+
+    restricted_column_ids = {
+        str(x) for x in (persona.get("restricted_column_ids") or [])
+    }
+    if not restricted_column_ids:
+        return list(measures), list(dimensions)
+
+    names = {n for n in (restricted_column_names or set()) if n}
+    # Fail-closed trigger: restricted columns exist but their names are unknown.
+    blank_all = not names_resolved
+
+    def _is_restricted(obj: dict[str, Any]) -> bool:
+        col_id = obj.get("source_column_id")
+        return col_id is not None and str(col_id) in restricted_column_ids
+
+    kept_measures: list[dict[str, Any]] = []
+    for m in measures:
+        if _is_restricted(m):
+            # Rule 1 — bound to a restricted column: drop row (name + DAX).
+            continue
+        # Rule 2 — included measure whose expression names a restricted column:
+        # blank the expression so the restricted column NAME cannot leak. When
+        # the restricted names are unresolved, blank every expression (fail
+        # closed) since any of them could reference a restricted column.
+        expr = str(m.get("expression") or "")
+        if expr and (blank_all or any(
+            _expression_references_name(expr, n) for n in names
+        )):
+            m = {**m, "expression": ""}
+        kept_measures.append(m)
+
+    kept_dimensions = [d for d in dimensions if not _is_restricted(d)]
+
+    return kept_measures, kept_dimensions
 
 
 _INFO_MEASURES = {
@@ -2632,13 +2973,42 @@ class _TopNSpec:
         self.descending = descending
 
 
-class _FilterSpec:
-    __slots__ = ("measure", "operator", "value")
+class _FilterCond:
+    __slots__ = ("measure", "operator", "value", "coalesce_default")
 
-    def __init__(self, measure: str, operator: str, value: str) -> None:
+    def __init__(
+        self,
+        measure: str,
+        operator: str,
+        value: str,
+        coalesce_default: str | None = None,
+    ) -> None:
         self.measure = measure
         self.operator = operator
         self.value = value
+        # Bug-5523: when the MDX operand was `CoalesceEmpty([Measures].[m], d)`,
+        # `coalesce_default` carries `d` so the HAVING can render
+        # `COALESCE(AGG(m), d) op value` and reproduce MDX's treatment of empty/
+        # null measure cells (which evaluate against `d`, not as unknown).
+        self.coalesce_default = coalesce_default
+
+
+class _FilterSpec:
+    """A value filter over one or more measure-threshold predicates.
+
+    The named-list compiler (`shared.named_list_compiler._compile_filter`) joins
+    every condition with a single AND/OR inside one MDX `Filter(...)` call, e.g.
+    ``Filter([cat].Members, [Measures].[a] > 1 AND [Measures].[b] < 2)``. The
+    gateway must translate *all* predicates and the joining logic — dropping any
+    of them would silently contradict the deployed named set and the model-
+    service preview (`_build_filter_having`), which renders every condition.
+    """
+
+    __slots__ = ("conditions", "logic")
+
+    def __init__(self, conditions: list[_FilterCond], logic: str) -> None:
+        self.conditions = conditions
+        self.logic = logic
 
 
 def _extract_topn_spec(axis_text: str) -> _TopNSpec | None:
@@ -2657,21 +3027,247 @@ def _extract_topn_spec(axis_text: str) -> _TopNSpec | None:
     return None
 
 
+_FILTER_PREDICATE = re.compile(
+    r'\[Measures\]\.\[([^\]]+)\]\s*(>=|<=|<>|>|<|=)\s*([0-9.]+)',
+    re.IGNORECASE,
+)
+
+# Bug-5505: comparison operators and a bare-measure reference shape, mirrored from
+# mdx_execute's `_CMP_OP` / `_MEASURE_REF` (Bug-5495) so the two layers agree on
+# which wrapped Filter() operands collapse to a bare measure predicate.
+_FILTER_CMP_OP = r'(?:>=|<=|<>|>|<|=)'
+_FILTER_BRACKET_MEASURE = r'\[Measures\]\.\[[^\]]+\]'
+# A measure operand wrapped only in balanced parentheses: `([Measures].[m])` or
+# `(( [Measures].[m] ))`. Collapsed to the bare reference before predicate
+# extraction so a paren-wrapped operand reads as the bare form.
+_FILTER_PAREN_WRAPPED_MEASURE = re.compile(
+    rf'\(+\s*({_FILTER_BRACKET_MEASURE})\s*\)+',
+    re.IGNORECASE,
+)
+
+
+def _normalize_wrapped_filter_operands(cond_text: str) -> str:
+    """Collapse *paren*-wrapped measure operands to the bare form.
+
+    Bug-5505 / Bug-5523: Excel and the model-service preview emit Filter()
+    conditions whose measure operand is wrapped in balanced parentheses —
+    `([Measures].[net_sales]) > 5` or `(( [Measures].[m] )) >= 10`. A
+    parenthesis group is *semantically identical* to its inner reference, so the
+    bare predicate `[Measures].[m] > 5` produces an identical filter and these
+    are collapsed here before predicate extraction. This keeps the numeric
+    matcher and the fail-loud count guard (both written for the bare shape)
+    working unchanged, and never touches a set-wrapped axis measure
+    (`{[Measures].[m]}`) since that is never adjacent to a comparison operator.
+
+    Scalar *function*-wrapped operands (`CoalesceEmpty([Measures].[m], 0) > 5`)
+    are NOT collapsed here. A function such as ``CoalesceEmpty`` changes the
+    measure's empty/null semantics, so stripping it to a bare reference would
+    silently produce a different-cardinality result for some operators (Bug-5523:
+    `= 0`, `<= 0`, `< d`). Those operands are matched by
+    ``_FILTER_COALESCE_PREDICATE`` in ``_extract_filter_spec``, which preserves
+    the coalesce default for the HAVING render. This function only normalizes the
+    neutral paren form.
+    """
+    if not cond_text or "[Measures]" not in cond_text:
+        return cond_text
+
+    out = cond_text
+
+    # Paren-wrapped operand: `([Measures].[m])` -> `[Measures].[m]`. Only when
+    # adjacent to a comparison operator, so a slicer tuple `([Dim].[m])` that
+    # happens to hold a measure is not disturbed — but in a Filter condition a
+    # paren-wrapped measure beside a comparison is always a predicate operand.
+    def _unwrap_paren(match: "re.Match") -> str:
+        span_start, span_end = match.span()
+        after = out[span_end:].lstrip()
+        before = out[:span_start].rstrip()
+        if re.match(_FILTER_CMP_OP, after) or re.search(_FILTER_CMP_OP + r'\s*$', before):
+            return match.group(1)
+        return match.group(0)
+
+    out = _FILTER_PAREN_WRAPPED_MEASURE.sub(_unwrap_paren, out)
+    return out
+
+
+# Bug-5523: a `CoalesceEmpty([Measures].[m], <numeric default>) <op> <value>`
+# predicate. The measure, default, comparison operator and threshold are all
+# captured so the HAVING can render `COALESCE(AGG(m), default) op value` and
+# faithfully reproduce MDX's empty/null handling (an empty measure cell is
+# treated as the default, not as SQL NULL). The default is restricted to a
+# numeric literal — the only form the aggregate HAVING can express — so a
+# non-numeric default (`CoalesceEmpty([m], "x")`) falls through and defers to the
+# fail-loud guard rather than being mistranslated.
+_FILTER_COALESCE_PREDICATE = re.compile(
+    r'CoalesceEmpty\s*\(\s*\[Measures\]\.\[([^\]]+)\]\s*,\s*(-?[0-9.]+)\s*\)'
+    r'\s*(>=|<=|<>|>|<|=)\s*(-?[0-9.]+)',
+    re.IGNORECASE,
+)
+
+def _filter_condition_text(axis_text: str) -> str | None:
+    """Return the condition argument of the first ``Filter(set, <cond>)`` call.
+
+    The body is bounded by matching the parenthesis depth from the ``Filter(``
+    opener — NOT by ``rfind(')')`` — so an outer wrapper that carries its own
+    later argument (e.g. ``OuterFn(Filter(set, p1), p2)``) cannot leak ``p2``
+    into the captured condition text, and a trailing `` ) ON ROWS FROM [cube]``
+    is excluded.
+    """
+    fm = re.search(r'\bFilter\s*\(', axis_text, re.IGNORECASE)
+    if not fm:
+        return None
+    # Walk from the Filter's opening paren to its matching close.
+    i = fm.end() - 1  # index of the '('
+    depth = 0
+    end = -1
+    for j in range(i, len(axis_text)):
+        ch = axis_text[j]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                end = j
+                break
+    if end == -1:
+        return None
+    inner = axis_text[i + 1:end]
+    # Drop the set argument (everything up to the first top-level comma) so only
+    # the condition text remains.
+    depth = 0
+    for k, ch in enumerate(inner):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            return inner[k + 1:].strip()
+    return None
+
+
 def _extract_filter_spec(
     axis_text: str, measure_names: set[str],
 ) -> _FilterSpec | None:
-    """Extract Filter(set, [Measures].[M] op value) from MDX axis text."""
-    m = re.search(
-        r'\bFilter\s*\([^,]+,\s*\[Measures\]\.\[([^\]]+)\]\s*(>=|<=|<>|>|<|=)\s*([0-9.]+)',
-        axis_text, re.IGNORECASE,
-    )
-    if m:
-        meas = m.group(1).strip()
-        if meas in measure_names or meas.lower() in {n.lower() for n in measure_names}:
-            return _FilterSpec(
-                measure=meas, operator=m.group(2), value=m.group(3),
-            )
-    return None
+    """Extract ``Filter(set, [Measures].[M] op value [AND|OR ...])``.
+
+    Captures *every* measure-threshold predicate inside the first `Filter(...)`
+    condition argument and the single AND/OR that joins them, mirroring the
+    compiler's output. Bare and paren-wrapped operands render as
+    ``AGG(m) op value``; a ``CoalesceEmpty([Measures].[m], d) op value`` operand
+    is captured with its default so the HAVING renders ``COALESCE(AGG(m), d) op
+    value`` and preserves MDX's empty/null semantics (Bug-5523). Returns ``None``
+    (deferring to the fail-loud guard in ``_mdx_to_sql``) whenever the whole
+    condition cannot be translated faithfully — unknown measure, a mixed AND/OR
+    body, or any measure / coalesce operand the numeric matcher could not consume
+    (e.g. a string-valued comparison or a non-numeric coalesce default) — so no
+    condition is ever silently dropped or mistranslated.
+    """
+    cond_text = _filter_condition_text(axis_text)
+    if not cond_text:
+        return None
+
+    # Bug-5505/Bug-5523: collapse only the neutral *paren*-wrapped operand
+    # (`([Measures].[m]) > 5`) to the bare `[Measures].[m] > 5` form. Scalar
+    # function-wrapped operands such as `CoalesceEmpty([m], 0) > 5` are NOT
+    # collapsed (that would drop the coalesce default and change empty/null
+    # semantics) — they are captured separately below with the default preserved.
+    cond_text = _normalize_wrapped_filter_operands(cond_text)
+
+    known = {n.lower() for n in measure_names}
+    conditions: list[_FilterCond] = []
+    # Bug-5523 (Codex round 3): the character spans of every recognised predicate,
+    # so the WHOLE-CONDITION CONSUMED-SPAN CHECK below can verify nothing in the
+    # Filter body is left unconsumed. Each recognised predicate contributes its
+    # `(start, end)` here; the residual (cond_text minus these spans) must collapse
+    # to only the supported boolean structure (AND/OR + parens/whitespace), or the
+    # whole Filter() fails loud. This replaces the earlier per-shape occurrence
+    # count guards, which only counted coalesce/bare comparisons *on a measure* and
+    # therefore let a coalesce on a NON-measure attribute, an unhandled scalar
+    # function, or any other sub-condition slip through under AND/OR.
+    consumed_spans: list[tuple[int, int]] = []
+
+    # 1) CoalesceEmpty operands first, so their inner measure is not also seen by
+    #    the bare-predicate scan and so the coalesce default reaches the HAVING.
+    for cm in _FILTER_COALESCE_PREDICATE.finditer(cond_text):
+        meas = cm.group(1).strip()
+        if meas.lower() not in known and meas not in measure_names:
+            return None
+        conditions.append(
+            _FilterCond(meas, cm.group(3), cm.group(4), coalesce_default=cm.group(2))
+        )
+        consumed_spans.append(cm.span())
+
+    # 2) Bare / paren-collapsed measure-threshold predicates. The bare-predicate
+    #    regex requires an operator immediately after `[Measures].[m]`, so the
+    #    `[Measures].[m], d` inside a CoalesceEmpty call is never matched here.
+    #    Skip any match that overlaps an already-consumed coalesce span (the
+    #    coalesce default `, 0) > 5` cannot match the bare shape, but guard anyway
+    #    so an inner reference is never double-counted).
+    for pm in _FILTER_PREDICATE.finditer(cond_text):
+        if _span_overlaps(pm.span(), consumed_spans):
+            continue
+        meas = pm.group(1).strip()
+        if meas.lower() not in known and meas not in measure_names:
+            # An unknown measure predicate — let the fail-loud guard reject the
+            # whole Filter rather than translate a partial condition set.
+            return None
+        conditions.append(_FilterCond(meas, pm.group(2), pm.group(3)))
+        consumed_spans.append(pm.span())
+    if not conditions:
+        return None
+
+    # WHOLE-CONDITION CONSUMED-SPAN CHECK (Bug-5523, Codex round 3). Blank out the
+    # character spans of every recognised predicate, then strip the only structure
+    # this translator can faithfully express around them — boolean joiners
+    # (AND/OR), parentheses, and whitespace. If ANY residual character remains the
+    # Filter body carries a sub-condition the translator did NOT consume (a
+    # coalesce on a non-measure attribute, an unhandled scalar function, an extra
+    # comparison, a string-valued measure predicate, a stray member reference),
+    # so we return None and let `_mdx_to_sql` raise the existing "Unsupported
+    # Filter() usage" SOAP fault instead of running a PARTIAL filter that silently
+    # drops the unrecognised clause. This is the general close of the leak class
+    # the earlier per-shape count guards missed.
+    residual_chars = list(cond_text)
+    for start, end in consumed_spans:
+        for idx in range(start, end):
+            residual_chars[idx] = " "
+    # The condition with every recognised predicate blanked out: now only the
+    # joining boolean structure (and any UNCONSUMED content) survives. Both the
+    # residual check below and the AND/OR joiner detection read from THIS string —
+    # never raw `cond_text` — so a measure name that literally contains a
+    # standalone `AND`/`OR` word (`[Net AND Gross]`) cannot leak a spurious joiner
+    # token: it lives inside a consumed predicate span and is already blanked here.
+    blanked = "".join(residual_chars)
+
+    # Remove the supported boolean structure: whole-word AND/OR, parentheses, and
+    # whitespace. `\bAND\b`/`\bOR\b` only strips standalone joiner words; any
+    # surviving `AND`/`OR`-spelled text would have to sit OUTSIDE a consumed span,
+    # which by construction means it is part of an unconsumed sub-condition and
+    # should fail loud — but member references only appear inside consumed
+    # (blanked) predicates, so no genuine residual is masked.
+    residual = re.sub(r'\b(?:AND|OR)\b', " ", blanked, flags=re.IGNORECASE)
+    residual = re.sub(r'[()\s]+', "", residual)
+    if residual:
+        return None
+
+    # The compiler uses a single joiner for the whole filter. Reject a body that
+    # mixes AND and OR (operator precedence cannot be expressed by one flat
+    # HAVING) so the translation never changes the set's membership semantics.
+    # Read from `blanked`, not `cond_text`, so a bracket-embedded AND/OR inside a
+    # consumed predicate cannot poison the joiner set (span-consistent detection).
+    logic_tokens = {t.upper() for t in re.findall(r'\b(AND|OR)\b', blanked, re.IGNORECASE)}
+    if logic_tokens == {"AND", "OR"}:
+        return None
+    logic = "OR" if logic_tokens == {"OR"} else "AND"
+    return _FilterSpec(conditions=conditions, logic=logic)
+
+
+def _span_overlaps(span: tuple[int, int], spans: list[tuple[int, int]]) -> bool:
+    """True when ``span`` intersects any ``(start, end)`` in ``spans``."""
+    s, e = span
+    for os_, oe in spans:
+        if s < oe and os_ < e:
+            return True
+    return False
 
 
 def _count_mdx_function_calls(axis_text: str, func_names: tuple[str, ...]) -> int:
@@ -3217,8 +3813,41 @@ def _mdx_to_sql(
         if group_cols:
             sql += f' GROUP BY {", ".join(group_cols)}'
     if filter_spec:
-        canon = measure_canonical.get(filter_spec.measure.lower(), filter_spec.measure)
-        sql += f' HAVING {_q(canon)} {filter_spec.operator} {filter_spec.value}'
+        # The MDX `Filter(set, [Measures].[m] op value ...)` tests *aggregated*
+        # measures per member, so every predicate belongs in HAVING over the
+        # GROUP BY entity AND must wrap its measure in the measure's aggregate.
+        # A bare column reference (`HAVING "m" op value`) is rejected by
+        # PostgreSQL (column neither grouped nor aggregated) and mis-resolves on
+        # other engines, so each clause mirrors the SELECT-list aggregate and
+        # the model-service preview's `_build_filter_having`. All conditions and
+        # the compiler's single AND/OR joiner are rendered so the gateway result
+        # never silently contradicts the deployed named set.
+        having_clauses: list[str] = []
+        for cond in filter_spec.conditions:
+            canon = measure_canonical.get(cond.measure.lower(), cond.measure)
+            agg = measure_agg.get(canon, "SUM")
+            qc = _q(canon)
+            if agg == "COUNT_DISTINCT":
+                agg_expr = f"COUNT(DISTINCT {qc})"
+            elif agg == "COUNT":
+                agg_expr = f"COUNT({qc})"
+            elif agg == "LAST_NON_EMPTY":
+                agg_expr = f"SUM({qc})"
+            else:
+                agg_expr = f"{agg}({qc})"
+            # Bug-5523: a `CoalesceEmpty([m], d)` operand replaced an empty/null
+            # measure cell with `d` in MDX BEFORE the comparison, so a group whose
+            # aggregate is NULL/empty is tested as `d op value` and may be
+            # INCLUDED. Plain `AGG(m) op value` yields NULL (unknown -> excluded)
+            # for those groups, dropping rows MDX keeps. Wrapping the aggregate in
+            # `COALESCE(AGG(m), d)` reproduces the MDX semantics exactly for every
+            # operator (`= 0`, `<= 0`, `> 5`, ...). COALESCE is ANSI SQL; the
+            # router transpiles to the source dialect downstream.
+            if cond.coalesce_default is not None:
+                agg_expr = f"COALESCE({agg_expr}, {cond.coalesce_default})"
+            having_clauses.append(f"{agg_expr} {cond.operator} {cond.value}")
+        joiner = f" {filter_spec.logic} "
+        sql += f' HAVING {joiner.join(having_clauses)}'
     if topn_spec:
         canon = measure_canonical.get(topn_spec.measure.lower(), topn_spec.measure)
         direction = "DESC" if topn_spec.descending else "ASC"
@@ -3247,6 +3876,20 @@ def _resolve_hierarchy_dimension_name(
         resolved = by_level.get(level_key)
         if resolved:
             return resolved
+
+    # Bug-5514: two-bracket level reference [Hierarchy].[Level].Members.
+    # MDSCHEMA emits levels as [Dim].[Dim].[Level], but Excel/Power BI abbreviate
+    # to [Dim].[Level] when the dimension and hierarchy share a name. In that form
+    # the parser hands us dim_name=<hierarchy> and hierarchy_name=<level> with no
+    # explicit level_name. If dim_name is itself a known multi-level hierarchy and
+    # the second segment names one of its levels, resolve to THAT level's grain
+    # dimension instead of falling through to the hierarchy's leaf default below.
+    if not level_key and hierarchy_name:
+        dim_as_hier = hierarchy_level_dim_map.get((dim_name or "").strip().lower())
+        if dim_as_hier:
+            level_as_second = dim_as_hier.get((hierarchy_name or "").strip().lower())
+            if level_as_second:
+                return level_as_second
 
     if hkey in hierarchy_default_dim_map:
         return hierarchy_default_dim_map[hkey]
@@ -3352,6 +3995,83 @@ def _alias_result_dimensions_for_hierarchy_axes(
         existing_names.add(alias)
 
     return new_columns, new_rows, out_dimensions
+
+
+# ---------------------------------------------------------------------------
+# Named-set inlining (Bug-5499)
+# ---------------------------------------------------------------------------
+
+def _inline_named_sets(
+    mdx: str,
+    named_sets: list[dict[str, Any]],
+) -> str:
+    """Replace named-set references in MDX with their compiled expressions.
+
+    When a BI tool (Excel / Power BI) places a saved named set on an axis, it
+    emits the set NAME as a bare reference:
+
+      ``SELECT {[Measures].[Revenue]} ON COLUMNS, {[Top Customers]} ON ROWS ...``
+
+    or without braces:
+
+      ``SELECT {[Measures].[Revenue]} ON COLUMNS, [Top Customers] ON ROWS ...``
+
+    The gateway's axis/dimension extractors do not recognise the bare set name
+    (it is not a ``[Dim].[Hier]`` bracket or a ``[Measures].[m]`` reference), so
+    no dimensions are detected on the axis and the row axis renders empty.
+
+    This function replaces every named-set reference with the set's stored MDX
+    expression (e.g. ``TopCount([customer].[customer].Members, 5, [Measures].[Revenue])``).
+    The replacement makes the expression visible to the existing axis/dimension
+    extractors and the SQL translator.
+
+    Replacement targets (case-insensitive, whole-word):
+      - ``[SetName]`` — bracket-quoted bare name
+      - ``SetName``   — unquoted bare name (only when it is not a substring of
+                        a longer ``[X].[Y]`` hierarchy path)
+
+    Sets whose expression is empty or whitespace-only are skipped.
+    """
+    if not named_sets or not mdx:
+        return mdx
+
+    result = mdx
+    for ns in named_sets:
+        name = ns.get("name", "")
+        expression = (ns.get("expression") or "").strip()
+        if not name or not expression:
+            continue
+
+        # (1) Bracket-quoted form: `[SetName]` not preceded by `.` or `&`
+        #     (which would indicate a terminal member like `[Dim].[Hier].[SetName]`
+        #     or a key member like `[Dim].[Hier].&[SetName]`) and not followed
+        #     by `.[` (which would indicate a hierarchy start like `[SetName].[Hier]`).
+        #     Also skip `FROM [SetName]` (cube name) via the callback.
+        pattern_bracket = re.compile(
+            r'(?<![.&])(\[' + re.escape(name) + r'\])(?!\s*\.)',
+            re.IGNORECASE,
+        )
+
+        def _bracket_replace(m: re.Match) -> str:
+            # Check whether this match is preceded by FROM + whitespace.
+            start = m.start()
+            prefix = result[:start].rstrip()
+            if prefix.upper().endswith("FROM"):
+                return m.group(0)  # keep the cube name intact
+            return expression
+
+        result = pattern_bracket.sub(_bracket_replace, result)
+
+        # (2) Bare unquoted form: `SetName` as a whole word, not inside brackets,
+        #     not preceded by `[` or `.`, not followed by `]` or `.`.
+        #     This catches `{SetName}` and `SetName ON ROWS`.
+        pattern_bare = re.compile(
+            r'(?<![.\[\w])' + re.escape(name) + r'(?![.\]\w])',
+            re.IGNORECASE,
+        )
+        result = pattern_bare.sub(expression, result)
+
+    return result
 
 
 def _mdx_axis_expr(mdx: str, axis_num: int) -> str:
@@ -3891,6 +4611,42 @@ def _find_command_statement(method_el: ET.Element) -> Optional[str]:
     return None
 
 
+def _is_cancel_command(method_el: ET.Element) -> bool:
+    """True when the Execute Command is an XMLA <Cancel> (Bug-5436b).
+
+    The Cancel command lives under ``Command`` and carries ConnectionID /
+    SessionID / SPID children. We only need to recognise the element name to
+    acknowledge it; we do not act on a specific connection because no
+    cancellable server-side state exists.
+    """
+    for el in method_el.iter():
+        if _tag_matches(el.tag, "Cancel"):
+            return True
+    return False
+
+
+# Bug-5430: matches a DMV ``SELECT ... FROM $SYSTEM.TMSCHEMA_<table>`` and
+# captures the table name. ``$SYSTEM`` may be bracket-quoted; whitespace is
+# flexible. Case-insensitive.
+_TMSCHEMA_DMV_RE = re.compile(
+    r"\bfrom\s+\[?\$system\]?\s*\.\s*\[?\s*(tmschema_[a-z_]+)\s*\]?",
+    re.IGNORECASE,
+)
+
+
+def _is_tmschema_dmv(statement: str | None) -> bool:
+    """True when the Execute statement is a ``$SYSTEM.TMSCHEMA_*`` DMV query."""
+    if not statement:
+        return False
+    return bool(_TMSCHEMA_DMV_RE.search(statement))
+
+
+def _tmschema_table_name(statement: str) -> str:
+    """Extract the TMSCHEMA table name from a DMV statement (uppercased)."""
+    m = _TMSCHEMA_DMV_RE.search(statement)
+    return m.group(1).upper() if m else ""
+
+
 def _local_name(tag: str) -> str:
     """Strip XML namespace from a tag string."""
     if tag.startswith("{"):
@@ -3932,14 +4688,31 @@ def _soap_response(inner_xml: str, session_id: str = "") -> Response:
     )
 
     body_bytes = envelope.encode("utf-8")
+    headers = {
+        "Content-Type": _CONTENT_TYPE,
+        "Connection": "keep-alive",
+    }
+
+    # Bug-5436b: gzip/deflate the response when the client advertised support
+    # via Accept-Encoding and the payload is large enough to benefit. MSOLAP and
+    # Power BI both send ``Accept-Encoding: gzip, deflate`` and transparently
+    # decode the body. Identity (no/unknown encoding) is left untouched so the
+    # plain-XML contract every existing client relies on is preserved.
+    encoding = _pick_content_encoding(_accept_encoding.get())
+    if encoding and len(body_bytes) >= _COMPRESS_MIN_BYTES:
+        if encoding == "gzip":
+            body_bytes = gzip.compress(body_bytes)
+        else:  # deflate
+            body_bytes = zlib.compress(body_bytes)
+        headers["Content-Encoding"] = encoding
+        # Caches/proxies must not serve a gzip body to an identity-only client.
+        headers["Vary"] = "Accept-Encoding"
+
+    headers["Content-Length"] = str(len(body_bytes))
     return Response(
         content=body_bytes,
         status_code=200,
-        headers={
-            "Content-Type": _CONTENT_TYPE,
-            "Content-Length": str(len(body_bytes)),
-            "Connection": "keep-alive",
-        }
+        headers=headers,
     )
 
 

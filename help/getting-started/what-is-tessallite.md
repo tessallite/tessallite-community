@@ -2,46 +2,46 @@
 title: "What is Tessallite"
 audience: all
 area: getting-started
-updated: 2026-04-17
+updated: 2026-06-24
 ---
 
 ## What this covers
 
-This article explains what Tessallite does, what problem it addresses, and what the analyst sees when using it. It also lists the supported BI tools and data sources.
+This article explains Tessallite in plain language: what it does, why a team would put it between BI tools and data, and what changes for analysts, modellers, and platform owners.
 
 ---
 
 ## What Tessallite does
 
-Tessallite sits between BI tools and the data warehouse.
+Tessallite sits between BI tools and governed data sources.
 
-When a BI tool sends a SQL or DAX query, Tessallite intercepts it. Tessallite checks whether a pre-aggregated summary table exists that can answer the query. If one exists, Tessallite rewrites the query to run against the summary. If no suitable summary exists, Tessallite forwards the query to the raw data source.
+When a BI tool sends a SQL, DAX, or MDX query, Tessallite checks the request against the semantic model: the approved definitions of measures, dimensions, joins, calendars, personas, and security rules. If a pre-aggregated summary can answer the question, Tessallite routes the query to that faster table. If not, it runs the query against the source through the same governed gateway.
 
-The BI tool requires no changes. The query results are identical regardless of which path was taken.
+The analyst does not need a new reporting tool or a new query language. The important contract is that the answer means the same thing whichever route Tessallite chooses.
 
-![Tessallite sits between BI tools and the data warehouse.](../assets/illustrations/system-overview.svg)
+![Tessallite sits between BI tools and governed data sources.](../assets/illustrations/system-overview.svg)
 
 ---
 
 ## What problem it solves
 
-Large fact tables accumulate rows over time. Queries that aggregate millions of rows are slow. Running the same aggregation query repeatedly against the same raw data produces the same result each time, at full cost each time.
+Most reporting teams carry two kinds of waste. The first is compute waste: the same totals, counts, and period comparisons are recalculated from detailed rows again and again. The second is trust waste: different tools grow different definitions of the same metric, so people spend time reconciling reports instead of using them.
 
-Tessallite observes which queries recur. It builds pre-aggregated summary tables for those queries automatically. When an identical or compatible query arrives, Tessallite routes it to the summary. The summary contains far fewer rows than the raw table. The query returns faster and consumes fewer warehouse resources.
+Tessallite attacks both problems together. The semantic model gives the business one place to define "Revenue", "Active Customer", "Fiscal Month", or "PII". The optimizer watches repeated query patterns and builds summaries where they will save time and cost. A compatible future query can then use the smaller summary instead of scanning the detailed source rows.
 
-This happens without analyst involvement. The analyst continues to write queries as normal.
+The result is not magic caching. It is governed acceleration: faster answers that still obey the model, security rules, personas, and source permissions.
 
 ---
 
 ## What the analyst sees
 
-To the analyst, Tessallite appears as a database.
+To the analyst, Tessallite appears as a familiar database or XMLA endpoint.
 
-The analyst connects using the same credentials and client they use for any other database. They write queries in SQL or DAX. Tessallite returns results.
+They connect from Excel, Power BI, Tableau, DBeaver, or another supported client. They browse friendly measures and dimensions, build a pivot or query, and receive rows back.
 
-There is no indicator in the query result that shows whether the result came from a summary or the raw source. The values are the same either way.
+In most tools the result looks ordinary, because it should. Modellers and admins can inspect route badges, query logs, and usage analytics to see whether a query used an aggregate, a pocket table, or the source path.
 
-If a query returns faster than expected, it likely hit a pre-aggregated summary. If a query takes longer than expected, it likely fell back to the raw source because no suitable summary existed yet.
+If a report is unexpectedly slow, that is a modelling signal rather than a mystery. It may need a better grain, a missing aggregate, a source statistic refresh, or a security rule that requires the source path.
 
 ---
 
@@ -67,7 +67,7 @@ Excel and Power BI can connect to port 8080 using the XMLA protocol. This endpoi
 
 ## Supported data sources
 
-Tessallite can connect to the following data warehouses and query engines as its backend source:
+Tessallite can connect to the following data sources:
 
 - **PostgreSQL** — any version supported by the JDBC PostgreSQL driver
 - **BigQuery** — via the BigQuery JDBC driver

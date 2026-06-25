@@ -14,7 +14,7 @@ from shared.config.settings import get_settings
 from shared.db.models import DataSource, ProjectConnection
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import DataSourceCreate, DataSourceResponse, DataSourceUpdate
-from src.api._scope import ensure_model_in_project
+from src.api._scope import ensure_model_in_project, resolve_source_connection
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 
@@ -156,9 +156,13 @@ async def list_schemas(
         source = await db.get(DataSource, source_id)
         if source is None or source.model_id != model_id:
             raise HTTPException(status_code=404, detail="DataSource not found")
-        connection = await db.get(ProjectConnection, source.project_connection_id)
-        if connection is None:
-            raise HTTPException(status_code=404, detail="Connection not found")
+        # Bug-5325: fail closed if this source's connection belongs to another
+        # project (legacy/imported malformed row). project_id is the source's
+        # owning project — ensure_model_in_project confirmed the model lives in
+        # it and the source belongs to that model.
+        await resolve_source_connection(
+            db, source, expected_project_id=project_id
+        )
         try:
             return await _fetch_schemas(
                 str(model_id), current_user.raw_token,

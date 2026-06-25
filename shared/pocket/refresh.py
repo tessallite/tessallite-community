@@ -11,7 +11,15 @@ from jose import jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.aggregate_connection import is_same_database, resolve_source_connection
+from shared.connection_scope import (
+    CrossProjectConnectionError,
+    resolve_endpoint_connection_for_model,
+)
 from shared.config.settings import get_settings
+from shared.config.source_db import (
+    resolve_aggregate_target_defaults,
+    resolve_target_schema,
+)
 from shared.connector_qualify import quote_identifier, quote_table_ref
 from shared.db.models import DataTarget, Model, PocketDefinition, PocketRefreshRun, ProjectConnection
 from shared.pocket_refresh_lock import (
@@ -23,9 +31,25 @@ from shared.schemas.connection_type import normalize_connection_type
 from shared.source_executor import (
     ensure_target_schema,
     execute_source_ddl,
+    execute_source_sql_scalar,
     open_source_connection,
+    resolve_connector_type,
     stream_to_staging_table,
+    table_storage_bytes,
 )
+
+# Connectors whose pocket cache table can be materialised same-connector.
+# - postgresql / redshift: DROP + CTAS (or incremental delta) via a live
+#   connection (the original path).
+# - bigquery: atomic CREATE OR REPLACE TABLE, mirroring the aggregate BigQuery
+#   CTAS path (shared/aggregate_table_ops + scheduler full_refresh).
+_POCKET_TARGET_CONNECTORS = frozenset({"postgresql", "redshift", "bigquery"})
+
+# Same-connector cross-database streaming (different connections, same engine
+# family) is only implemented for the PostgreSQL family. Streaming from a
+# BigQuery source into a PostgreSQL target (or any other connector mismatch)
+# is NOT supported and must fail fast with a surfaced error instead of hanging.
+_POCKET_CROSS_DB_CONNECTORS = frozenset({"postgresql", "redshift"})
 
 logger = logging.getLogger(__name__)
 
@@ -384,18 +408,53 @@ async def refresh_pocket_definition(
     if target is None:
         raise ValueError(f"DataTarget {pocket.target_id} not found")
 
-    target_conn = await db.get(ProjectConnection, target.project_connection_id)
-    if target_conn is None:
-        raise ValueError(f"ProjectConnection {target.project_connection_id} not found")
-
-    target_connector = normalize_connection_type(target_conn.connection_type)
-    if target_connector not in ("postgresql", "redshift"):
-        raise ValueError(
-            f"Pocket refresh currently supports postgresql and redshift only (got {target_conn.connection_type!r})"
-        )
+    # Bug-5500 fail-closed: a legacy/imported DataTarget can carry a
+    # project_connection_id pointing at a ProjectConnection in a DIFFERENT
+    # project than the model that owns the pocket. Resolve the target
+    # connection through the shared scope guard (the owning model's project is
+    # the project the connection must belong to) so pocket materialisation
+    # DDL/streaming never targets another project's database. Mirrors the
+    # gateway pocket-target execution path.
+    target_conn = await resolve_endpoint_connection_for_model(
+        db, target, model_id=pocket.model_id
+    )
 
     source_conn = await resolve_source_connection(pocket.model_id, db)
     cross_db = not is_same_database(source_conn, target_conn)
+
+    # Bug-5475: validate the source/target connector combination BEFORE any
+    # state transition or remote work, and fail fast with a surfaced error.
+    # Previously only postgresql/redshift targets were allowed; a BigQuery
+    # target was rejected outright, and a cross-connector combo (e.g. BigQuery
+    # source -> PostgreSQL target) was never reached here but, when it was,
+    # hung indefinitely in the cross-DB streaming path with no error_message.
+    target_connector = normalize_connection_type(target_conn.connection_type)
+    source_connector = await resolve_connector_type(source_conn)
+    combo_error = unsupported_pocket_combo_reason(
+        source_connector, target_connector, cross_db
+    )
+    if combo_error is not None:
+        now = datetime.now(timezone.utc)
+        if existing_run is not None:
+            failed_run = existing_run
+            failed_run.status = "failed"
+            failed_run.error_message = combo_error[:1000]
+            failed_run.completed_at = now
+        else:
+            failed_run = PocketRefreshRun(
+                pocket_definition_id=pocket.id,
+                refresh_mode=refresh_mode,
+                status="failed",
+                triggered_by=triggered_by,
+                error_message=combo_error[:1000],
+                completed_at=now,
+            )
+            db.add(failed_run)
+        pocket.status = "failed"
+        pocket.failure_reason = combo_error[:1000]
+        await db.commit()
+        await db.refresh(failed_run)
+        return failed_run
 
     if existing_run is not None:
         run = existing_run
@@ -415,7 +474,7 @@ async def refresh_pocket_definition(
     await db.refresh(pocket)
 
     target_schema, target_table = _resolve_target_location(pocket, target)
-    table_ref = _quoted_table_ref(target_schema, target_table)
+    table_ref = _quoted_table_ref(target_schema, target_table, target_connector)
 
     try:
         # F-005-06: always the service token here — never the caller's token —
@@ -428,6 +487,25 @@ async def refresh_pocket_definition(
             row_count, storage_bytes = await _refresh_cross_db(
                 pocket, target_conn, target_schema, target_table, table_ref,
                 token, refresh_mode, db,
+            )
+        elif target_connector == "bigquery" and source_connector == "bigquery":
+            # Bug-5475: take the same-DB BigQuery CREATE OR REPLACE path only when
+            # BOTH source and target are BigQuery. ``cross_db`` (is_same_database)
+            # already screens connection identity, but we assert the connector
+            # pair explicitly so a future change to is_same_database semantics
+            # cannot route a non-BigQuery source's rewrite (wrong dialect) into
+            # the BigQuery CTAS. A BigQuery target with a non-BigQuery source on
+            # the same connection is an unsupported combo that is already rejected
+            # up front by ``unsupported_pocket_combo_reason``.
+            # The BigQuery dataset is resolved via the shared target resolver
+            # (config.dataset priority), which can differ from the value
+            # _resolve_target_location derived. Re-bind target_schema to the
+            # dataset the table was ACTUALLY created in so the stamp below (and
+            # therefore the pocket matcher's table reference) points at the
+            # right dataset.
+            target_schema, row_count, storage_bytes = await _refresh_same_db_bigquery(
+                pocket, target_conn, target, target_schema, target_table,
+                token, db,
             )
         else:
             row_count, storage_bytes = await _refresh_same_db(
@@ -462,6 +540,112 @@ async def refresh_pocket_definition(
     await db.commit()
     await db.refresh(run)
     return run
+
+
+def unsupported_pocket_combo_reason(
+    source_connector: str,
+    target_connector: str,
+    cross_db: bool,
+) -> str | None:
+    """Return a human-readable reason when this source/target connector pair
+    cannot be materialised, or ``None`` when it is supported.
+
+    Bug-5475: fail fast (so the caller marks the run ``failed`` with a surfaced
+    message) instead of attempting a path that hangs indefinitely.
+
+    Supported:
+      - same-connection (``cross_db`` False): postgresql, redshift, bigquery.
+      - cross-database (``cross_db`` True, different connections): only the
+        PostgreSQL family AND only when source and target share that family
+        (PG/Redshift stream-and-stage). Any connector mismatch — notably a
+        BigQuery source with a PostgreSQL target — is rejected.
+    """
+    if target_connector not in _POCKET_TARGET_CONNECTORS:
+        return (
+            f"Pocket tables require a PostgreSQL, Redshift, or BigQuery target "
+            f"for materialisation; the selected target uses "
+            f"{target_connector!r}, which is not supported."
+        )
+    if not cross_db:
+        return None
+    # Cross-database: only the PG family, and only PG-family source.
+    if (
+        source_connector not in _POCKET_CROSS_DB_CONNECTORS
+        or target_connector not in _POCKET_CROSS_DB_CONNECTORS
+    ):
+        return (
+            f"Cross-connector pocket materialisation is not supported "
+            f"(source={source_connector!r}, target={target_connector!r}). "
+            f"Materialise the pocket to a target on the same source engine — "
+            f"for a BigQuery source, use a BigQuery target."
+        )
+    return None
+
+
+async def _refresh_same_db_bigquery(
+    pocket: PocketDefinition,
+    target_conn: ProjectConnection,
+    target: DataTarget,
+    target_schema: str,
+    target_table: str,
+    token: str,
+    db: AsyncSession,
+) -> tuple[str, int | None, int | None]:
+    """Materialise a pocket into a BigQuery target via atomic CREATE OR REPLACE.
+
+    Bug-5475: mirrors the aggregate BigQuery CTAS path. Source and target are
+    the same BigQuery connection (gated by ``unsupported_pocket_combo_reason``), so
+    the router-rewritten SELECT is already BigQuery dialect and executes
+    in-place — no buffering of the full result in model-service, no streaming.
+    ``CREATE OR REPLACE TABLE`` is atomic, so there is no destructive DROP gap.
+
+    Returns ``(resolved_schema, row_count, storage_bytes)``. The resolved schema
+    is the BigQuery dataset the table was actually created in (via the shared
+    target resolver), which the caller stamps onto ``pocket.target_schema`` so
+    the matcher's table reference points at the same dataset.
+    """
+    select_sql = await _get_rewritten_sql(pocket.model_id, pocket.defining_sql, token)
+
+    defaults = await resolve_aggregate_target_defaults(
+        tenant_session=db, project_id=target_conn.project_id,
+    )
+    # NOTE on resolution priority (BigQuery): inside resolve_target_schema the
+    # BigQuery branch is config-dataset-first, so when target.config carries a
+    # "dataset" it WINS over this ``schema_override``. In other words, on a
+    # configured BigQuery target ``pocket.target_schema`` has no effect on which
+    # dataset the table lands in — it is NOT a routing knob here. The override
+    # only takes effect when the target config has no dataset (then it falls
+    # back through schema_override -> config.schema -> default dataset). The
+    # resolved dataset is returned to the caller and stamped back onto
+    # pocket.target_schema so the matcher points at the dataset actually written.
+    tgt_ref = resolve_target_schema(
+        "bigquery", target.config or {}, defaults,
+        schema_override=pocket.target_schema,
+    )
+    schema = tgt_ref.schema or target_schema
+    dotted = tgt_ref.qualified_table(target_table)
+    bq_table_ref = quote_table_ref("bigquery", dotted)
+
+    await ensure_target_schema(target_conn, schema, tenant_session=db)
+    await execute_source_ddl(
+        target_conn,
+        f"CREATE OR REPLACE TABLE {bq_table_ref} AS {select_sql}",
+        tenant_session=db,
+    )
+
+    count_row = await execute_source_sql_scalar(
+        target_conn,
+        f"SELECT COUNT(*) AS c FROM {bq_table_ref}",
+        tenant_session=db,
+    )
+    row_count = int(count_row) if count_row is not None else None
+
+    storage_bytes = await table_storage_bytes(
+        target_conn, schema, target_table,
+        bq_project=tgt_ref.bq_project or None,
+        tenant_session=db,
+    )
+    return schema, row_count, storage_bytes
 
 
 async def _refresh_same_db(
@@ -555,14 +739,46 @@ async def drop_pocket_storage(
     if target is None:
         return
 
-    conn = await db.get(ProjectConnection, target.project_connection_id)
-    if conn is None:
+    # Bug-5500 fail-closed: never issue DROP TABLE against a target connection
+    # in a different project than the pocket's owning model. A cross-project
+    # row here would drop a table on another project's database. Resolve through
+    # the shared scope guard and refuse (skip the drop) on mismatch rather than
+    # execute destructive DDL elsewhere; missing connection/model is treated the
+    # same as the existing best-effort no-op cleanup.
+    try:
+        conn = await resolve_endpoint_connection_for_model(
+            db, target, model_id=pocket.model_id
+        )
+    except CrossProjectConnectionError:
+        logger.error(
+            "drop_pocket_storage: refusing to drop pocket %s storage — its "
+            "target connection belongs to a different project than model %s "
+            "(cross-project row rejected fail-closed)",
+            pocket.id, pocket.model_id,
+        )
+        return
+    except ValueError:
         return
 
-    if normalize_connection_type(conn.connection_type) not in ("postgresql", "redshift"):
+    connector = normalize_connection_type(conn.connection_type)
+    if connector not in _POCKET_TARGET_CONNECTORS:
         return
 
     target_schema, target_table = _resolve_target_location(pocket, target)
-    table_ref = _quoted_table_ref(target_schema, target_table)
+
+    if connector == "bigquery":
+        # Bug-5475: BigQuery targets qualify the dataset/project via the shared
+        # target resolver, then quote with backticks (never double quotes).
+        defaults = await resolve_aggregate_target_defaults(
+            tenant_session=db, project_id=conn.project_id,
+        )
+        tgt_ref = resolve_target_schema(
+            "bigquery", target.config or {}, defaults,
+            schema_override=pocket.target_schema,
+        )
+        dotted = tgt_ref.qualified_table(target_table)
+        table_ref = quote_table_ref("bigquery", dotted)
+    else:
+        table_ref = _quoted_table_ref(target_schema, target_table, connector)
 
     await execute_source_ddl(conn, f"DROP TABLE IF EXISTS {table_ref}", tenant_session=db)

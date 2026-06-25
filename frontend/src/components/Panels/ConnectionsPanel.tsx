@@ -32,6 +32,7 @@ import {
   isFieldVisible,
 } from "../connectionFields";
 import { useConfirm } from "../Confirm";
+import { canPerform } from "../../auth/explorerPrivileges";
 
 export default function ConnectionsPanel({
   projectId: propProjectId,
@@ -41,6 +42,12 @@ export default function ConnectionsPanel({
   const qc = useQueryClient();
   const connections = useConnections(projectId!);
   const t = useT();
+  // Bug-5445: connection create/test/edit/delete write credentials and are
+  // admin-only on the backend (api/connections.py require_role("admin")). Gate
+  // the management controls to admin, mirroring the project-setup-drawer's
+  // admin-only Connections section. The list/get view stays visible to modeller
+  // (require_role("modeler")) so they can still pick a connection for a source.
+  const canManageConnections = canPerform("connection.manage");
 
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -301,17 +308,19 @@ export default function ConnectionsPanel({
         <Typography variant="subtitle2" fontWeight={700} flexGrow={1}>
           {t("connections.title")}
         </Typography>
-        <Button
-          size="small"
-          variant="contained"
-          startIcon={<AddIcon />}
-          onClick={() => {
-            resetForm("postgresql");
-            setOpen(true);
-          }}
-        >
-          {t("connections.add")}
-        </Button>
+        {canManageConnections && (
+          <Button
+            size="small"
+            variant="contained"
+            startIcon={<AddIcon />}
+            onClick={() => {
+              resetForm("postgresql");
+              setOpen(true);
+            }}
+          >
+            {t("connections.add")}
+          </Button>
+        )}
       </Box>
 
       {connections.isLoading ? (
@@ -323,23 +332,25 @@ export default function ConnectionsPanel({
               key={c.id}
               sx={{ py: 0.5 }}
               secondaryAction={
-                <Box>
-                  <Tooltip title={t("connections.edit")}>
-                    <IconButton size="small" onClick={() => openEdit(c)}>
-                      <EditIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
-                  <Tooltip title={t("connections.test")}>
-                    <IconButton size="small" onClick={() => testSaved.mutate(c.id)}>
-                      <PlayArrowIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
-                  <Tooltip title={t("common.delete")}>
-                    <IconButton size="small" onClick={() => handleDeleteConn(c)}>
-                      <DeleteIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
-                </Box>
+                canManageConnections ? (
+                  <Box>
+                    <Tooltip title={t("connections.edit")}>
+                      <IconButton size="small" onClick={() => openEdit(c)}>
+                        <EditIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                    <Tooltip title={t("connections.test")}>
+                      <IconButton size="small" onClick={() => testSaved.mutate(c.id)}>
+                        <PlayArrowIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                    <Tooltip title={t("common.delete")}>
+                      <IconButton size="small" onClick={() => handleDeleteConn(c)}>
+                        <DeleteIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  </Box>
+                ) : null
               }
             >
               <CableIcon fontSize="small" sx={{ mr: 0.5, color: "text.secondary" }} />
@@ -371,6 +382,8 @@ export default function ConnectionsPanel({
         </List>
       )}
 
+      {canManageConnections && (
+        <>
       <ConnectionDialog
         open={open}
         mode="create"
@@ -407,6 +420,8 @@ export default function ConnectionsPanel({
         onClose={() => setEditingId(null)}
         passwordHint
       />
+        </>
+      )}
 
     </Box>
   );

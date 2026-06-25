@@ -209,3 +209,157 @@ async def test_known_from_table_slug_accepted():
     with _patches([_dim("city_name")], [_meas("revenue")]):
         bound = await bind_query_to_model(q, AsyncMock())
     assert bound is not None
+
+
+# ---------------------------------------------------------------------------
+# Bug-5488: dimensions referenced ONLY inside a function-wrapped / OR-compound
+# WHERE predicate must be collected so the source rewriter loads their physical
+# columns and joins their tables (otherwise the bare semantic name leaks to the
+# source DB and it raises "column does not exist").
+# ---------------------------------------------------------------------------
+
+def _where_query(raw_sql: str) -> LogicalQuery:
+    """A LogicalQuery carrying a real raw WHERE clause and the unresolvable
+    flag, but NO extracted LogicalFilters (mirrors what the parser produces for
+    a function-wrapped or OR-compound predicate)."""
+    lq = LogicalQuery(
+        model_id="model-1",
+        protocol="jdbc",
+        raw_query=raw_sql,
+        requested_measures=[],
+        requested_dimensions=["payment_reference"],
+        filters=[],
+        grain=["payment_reference"],
+        order_by=[],
+        limit=None,
+        offset=None,
+        query_fingerprint="fp",
+    )
+    lq.has_unresolvable_where = True
+    lq.from_tables = ["testmodel"]
+    return lq
+
+
+async def test_function_wrapped_where_dim_collected():
+    """A dimension referenced only inside ``UPPER(TRIM(col))`` in an unresolvable
+    WHERE is collected into ``where_referenced_dimensions`` even though it
+    produces no LogicalFilter and is absent from SELECT/ORDER BY."""
+    raw = (
+        "SELECT payment_reference FROM modely "
+        "WHERE UPPER(TRIM(payment_method)) <> UPPER(TRIM(payment_method_code)) "
+        "LIMIT 1"
+    )
+    dims = [_dim("payment_reference"), _dim("payment_method"), _dim("payment_method_code")]
+    with _patches(dims, [_meas("revenue")]):
+        bound = await bind_query_to_model(_where_query(raw), AsyncMock())
+    # Both function-wrapped columns are collected; the SELECT column is not the
+    # concern of this set but is harmless if present.
+    assert "payment_method" in bound.where_referenced_dimensions
+    assert "payment_method_code" in bound.where_referenced_dimensions
+
+
+async def test_or_compound_where_dim_collected():
+    """Both branches of an OR-compound predicate are walked, so a dimension that
+    appears only inside the function-wrapped branch is still collected."""
+    raw = (
+        "SELECT payment_reference FROM modely "
+        "WHERE payment_method = 'CARD' "
+        "OR UPPER(TRIM(payment_method)) <> UPPER(TRIM(payment_method_code)) "
+        "LIMIT 1"
+    )
+    dims = [_dim("payment_reference"), _dim("payment_method"), _dim("payment_method_code")]
+    with _patches(dims, [_meas("revenue")]):
+        bound = await bind_query_to_model(_where_query(raw), AsyncMock())
+    assert "payment_method_code" in bound.where_referenced_dimensions
+
+
+async def test_where_collection_canonicalises_case():
+    """A WHERE column typed in a different case resolves to the canonical model
+    dimension name (case-insensitive), not the raw typed token."""
+    raw = (
+        "SELECT payment_reference FROM modely "
+        "WHERE UPPER(PAYMENT_METHOD_CODE) = 'CARD' LIMIT 1"
+    )
+    dims = [_dim("payment_reference"), _dim("payment_method_code")]
+    with _patches(dims, [_meas("revenue")]):
+        bound = await bind_query_to_model(_where_query(raw), AsyncMock())
+    assert "payment_method_code" in bound.where_referenced_dimensions
+    assert "PAYMENT_METHOD_CODE" not in bound.where_referenced_dimensions
+
+
+async def test_where_collection_ignores_non_model_tokens():
+    """Literals, aliases, and unknown identifiers inside the WHERE are NOT
+    captured — only names present in the model maps are collected."""
+    raw = (
+        "SELECT payment_reference FROM modely "
+        "WHERE UPPER(payment_method_code) = 'CARD' "
+        "AND LENGTH(not_a_model_column) > 0 LIMIT 1"
+    )
+    dims = [_dim("payment_reference"), _dim("payment_method_code")]
+    with _patches(dims, [_meas("revenue")]):
+        bound = await bind_query_to_model(_where_query(raw), AsyncMock())
+    assert bound.where_referenced_dimensions == {"payment_method_code"}
+
+
+async def test_where_collection_empty_for_resolvable_where():
+    """When the WHERE is fully representable (no unresolvable flag), the set
+    stays empty — the resolvable path already covers it via resolved_filters,
+    so this fix is a strict no-op there."""
+    filters = [LogicalFilter("payment_method_code", "eq", "CARD")]
+    q = _query(
+        dims=["payment_reference"], measures=["revenue"],
+        filters=filters, has_unresolvable_where=False,
+    )
+    dims = [_dim("payment_reference"), _dim("payment_method_code")]
+    with _patches(dims, [_meas("revenue")]):
+        bound = await bind_query_to_model(q, AsyncMock())
+    assert bound.where_referenced_dimensions == set()
+
+
+async def test_subquery_wrapper_where_dim_collected():
+    """Bug-457 / Codex-finding shape: when the unresolvable WHERE lives inside a
+    subquery wrapper (``SELECT col FROM (SELECT * FROM model WHERE ...) q``), the
+    collector must unwrap the wrapper using sqlglot's ``from_`` key (NOT
+    ``from``) and walk the inner SELECT's WHERE, mirroring the rewriter's own
+    subquery-WHERE extraction in source_sql. Otherwise the fallback is dead and
+    a WHERE-only dimension still leaks."""
+    raw = (
+        "SELECT payment_reference FROM "
+        "(SELECT * FROM modely "
+        " WHERE UPPER(TRIM(payment_method)) <> UPPER(TRIM(payment_method_code))) q "
+        "LIMIT 1"
+    )
+    dims = [_dim("payment_reference"), _dim("payment_method"), _dim("payment_method_code")]
+    with _patches(dims, [_meas("revenue")]):
+        bound = await bind_query_to_model(_where_query(raw), AsyncMock())
+    assert "payment_method" in bound.where_referenced_dimensions
+    assert "payment_method_code" in bound.where_referenced_dimensions
+
+
+async def test_where_collection_excludes_measure_only_in_where():
+    """Deep-review scope guard (Bug-5488): a MEASURE referenced only inside the
+    WHERE is deliberately NOT collected — the source rewriter's filter backfill
+    loads dimensions only and ``_get_phys_expr`` resolves a measure only when it
+    is in resolved/order measures, so adding a filter-only measure name to
+    ``filter_dim_names`` could not be satisfied. Only dimensions are collected."""
+    raw = (
+        "SELECT payment_reference FROM modely "
+        "WHERE UPPER(payment_method_code) = 'CARD' AND revenue > 0 LIMIT 1"
+    )
+    dims = [_dim("payment_reference"), _dim("payment_method_code")]
+    with _patches(dims, [_meas("revenue")]):
+        bound = await bind_query_to_model(_where_query(raw), AsyncMock())
+    assert bound.where_referenced_dimensions == {"payment_method_code"}
+    assert "revenue" not in bound.where_referenced_dimensions
+
+
+async def test_where_collection_empty_for_complex_passthrough():
+    """Complex passthrough queries skip semantic resolution and go to source
+    raw, so no WHERE column collection happens for them."""
+    raw = "SELECT payment_reference FROM modely WHERE UPPER(payment_method_code) = 'CARD'"
+    q = _where_query(raw)
+    q.has_complex_sql = True
+    dims = [_dim("payment_reference"), _dim("payment_method_code")]
+    with _patches(dims, [_meas("revenue")]):
+        bound = await bind_query_to_model(q, AsyncMock())
+    assert bound.where_referenced_dimensions == set()

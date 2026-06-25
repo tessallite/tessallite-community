@@ -745,6 +745,114 @@ def _pocket_response_stub(predicate_rows):
 
 
 @pytest.mark.asyncio
+async def test_create_pocket_rejects_cross_connector_target(client):
+    """Bug-5475: a pocket whose source connector differs from its target
+    connector (e.g. BigQuery source -> PostgreSQL target) is rejected at
+    creation (HTTP 400) with a clear message — never persisted to fail or hang
+    on refresh."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+        display_name="Model Y", seed="deadbeef",
+    )
+    target_id = uuid.uuid4()
+    target = types.SimpleNamespace(
+        id=target_id, model_id=TEST_MODEL_ID, project_connection_id="conn-pg",
+    )
+    pg_conn = types.SimpleNamespace(
+        id="conn-pg", connection_type="postgresql", project_id=TEST_PROJECT_ID,
+    )
+    bq_source = types.SimpleNamespace(id="conn-bq", connection_type="bigquery")
+
+    async def _get(cls, obj_id):
+        from shared.db.models import DataTarget, ProjectConnection
+        if cls is Model:
+            return scoped_model
+        if cls is DataTarget:
+            return target
+        if cls is ProjectConnection:
+            return pg_conn
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets._validate_via_router", AsyncMock(return_value=_router_response())), \
+         patch("src.api.pockets.resolve_source_connection", AsyncMock(return_value=bq_source)), \
+         patch("src.api.pockets.is_same_database", return_value=False), \
+         patch("src.api.pockets.get_setting", AsyncMock(side_effect=lambda key, **kw: ["manual"] if "allowed" in key else 14)):
+        resp = await client.post(
+            PREFIX,
+            json={
+                "target_id": str(target_id),
+                "defining_sql": "SELECT * FROM modely",
+                "refresh_policy": "manual",
+                "ttl_days": 14,
+            },
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 400, resp.text
+    assert "Cross-connector pocket materialisation is not supported" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_create_pocket_allows_bigquery_same_connector_target(client):
+    """Bug-5475: a BigQuery source + BigQuery target (same connection) is now a
+    supported pocket combination and must persist (HTTP 201)."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+        display_name="Model Y", seed="deadbeef",
+    )
+    target_id = uuid.uuid4()
+    target = types.SimpleNamespace(
+        id=target_id, model_id=TEST_MODEL_ID, project_connection_id="conn-bq",
+    )
+    bq_conn = types.SimpleNamespace(
+        id="conn-bq", connection_type="bigquery", project_id=TEST_PROJECT_ID,
+    )
+
+    async def _get(cls, obj_id):
+        from shared.db.models import DataTarget, ProjectConnection
+        if cls is Model:
+            return scoped_model
+        if cls is DataTarget:
+            return target
+        if cls is ProjectConnection:
+            return bq_conn
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    def _execute(*args, **kwargs):
+        result = MagicMock()
+        result.scalar_one.return_value = _pocket_response_stub([])
+        return result
+
+    db.execute = AsyncMock(side_effect=_execute)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets._validate_via_router", AsyncMock(return_value=_router_response())), \
+         patch("src.api.pockets.resolve_source_connection", AsyncMock(return_value=bq_conn)), \
+         patch("src.api.pockets.is_same_database", return_value=True), \
+         patch("src.api.pockets.get_setting", AsyncMock(side_effect=lambda key, **kw: ["manual"] if "allowed" in key else 14)):
+        resp = await client.post(
+            PREFIX,
+            json={
+                "target_id": str(target_id),
+                "defining_sql": "SELECT * FROM modely",
+                "refresh_policy": "manual",
+                "ttl_days": 14,
+            },
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 201, resp.text
+    db.commit.assert_called()
+
+
+@pytest.mark.asyncio
 async def test_create_pocket_ignores_weaker_client_predicates(client):
     """Bug-1096 (F-005): a create whose client `predicates` payload is WEAKER
     than the actual SQL filters must persist the SQL-derived predicates, never

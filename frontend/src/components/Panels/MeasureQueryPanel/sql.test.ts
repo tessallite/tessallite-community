@@ -274,6 +274,53 @@ describe("buildPivotSql — measure aggregation (Bug-150)", () => {
   });
 });
 
+describe("buildPivotSql — measure aliases preserved for all dialects (Bug-5174)", () => {
+  // The pivot builder emits dialect-neutral ANSI SQL with dialect "postgresql"
+  // (Bug-907 note in sql.ts); the query-router translates to the target source
+  // dialect (BigQuery, SQL Server, etc.). Regardless of the eventual target,
+  // every measure column must keep its `AS "<alias>"` clause so the exported /
+  // routed pivot SQL never loses its measure column names.
+  it("keeps AS alias on a plain aggregate measure (BigQuery target)", () => {
+    const sql = buildPivotSql(model, [col("revenue", "SUM")], [], [], [], []);
+    expect(sql).toContain('SUM("revenue") AS "revenue__sum__0"');
+  });
+
+  it("keeps AS alias on the record-count column", () => {
+    const rc = col("__record_count__", "COUNT", 0, { _recordCount: true });
+    const sql = buildPivotSql(model, [rc], [], [], [], []);
+    expect(sql).toContain('COUNT(*) AS "__record_count____count__0"');
+  });
+
+  it("keeps AS alias on a scratchpad expression measure", () => {
+    const sp = col("margin_ratio", "SUM", 0, {
+      _scratchpad: true,
+      expression: "SUM(margin) / NULLIF(SUM(revenue), 0)",
+    });
+    const sql = buildPivotSql(model, [sp], [], [], [], []);
+    expect(sql).toContain('AS "margin_ratio__sum__0"');
+  });
+
+  it("keeps a distinct AS alias on every column when several measures coexist", () => {
+    const cols = [
+      col("revenue", "SUM", 0),
+      col("__record_count__", "COUNT", 1, { _recordCount: true }),
+      col("orders", "COUNT_DISTINCT", 2),
+    ];
+    const sql = buildPivotSql(model, cols, [dim("region")], [], [], []);
+    // One AS clause per measure column (dimensions carry no alias).
+    const aliasClauses = sql.match(/ AS "/g) ?? [];
+    expect(aliasClauses).toHaveLength(3);
+    expect(sql).toContain('SUM("revenue") AS "revenue__sum__0"');
+    expect(sql).toContain('COUNT(*) AS "__record_count____count__1"');
+    expect(sql).toContain('COUNT(DISTINCT "orders") AS "orders__count_distinct__2"');
+  });
+
+  it("emits no dialect-specific (BigQuery backtick) quoting (Bug-907 / Bug-5174)", () => {
+    const sql = buildPivotSql(model, [col("revenue", "SUM")], [dim("region")], [], [], []);
+    expect(sql).not.toContain("`");
+  });
+});
+
 describe("validateScratchpadExpression (Bug-5315)", () => {
   it("allows a valid arithmetic expression", () => {
     expect(validateScratchpadExpression("SUM(a) / COUNT(b)")).toBeNull();

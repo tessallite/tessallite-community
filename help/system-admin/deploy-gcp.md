@@ -125,4 +125,4 @@ For light usage (development or small team): an `e2-medium` Compute Engine VM fo
 
 ---
 
-← [Deploy Locally](deploy-local.md) | [Home](../index.md) | [Configure Environment Variables →](configure-environment-variables.md)
+← [Deploy Locally](deploy-local.md) | [Home](../index.md) | [Deploy on Kubernetes →](deploy-kubernetes.md)

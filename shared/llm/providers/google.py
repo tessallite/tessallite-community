@@ -14,17 +14,44 @@ Supports two modes selected via ``config.google_mode`` on the
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncGenerator
-
-from google import genai
-from google.genai import types
+from typing import TYPE_CHECKING, AsyncGenerator
 
 from shared.llm.adapter import LLMAdapter, ThinkingCallback
 
+if TYPE_CHECKING:  # import only for type checkers; the SDK is an optional dep
+    pass
 
-def _client(config) -> genai.Client:
+
+def _genai():
+    """Lazy-import the optional google-genai SDK.
+
+    The import is deferred so this module loads without the dep installed:
+    the Vertex/ADC refusal path (LLM_ALLOW_SERVICE_ACCOUNT_AUTH=false) raises
+    before any client is constructed, so callers must be able to reach that
+    guard without the SDK present.
+    """
+    from google import genai as _g
+    from google.genai import types as _t
+
+    return _g, _t
+
+
+def _client(config):
     mode = (config.config or {}).get("google_mode")
     if mode == "vertex_ai":
+        # Defense in depth (cost-leak hardening): Vertex AI mode authenticates via
+        # cloud service-account / OAuth (ADC), billing the deployment's GCP project
+        # rather than a bring-your-own API key. Refuse it unless an operator opted
+        # in, so a pre-existing/imported row can't be exploited even if the CRUD
+        # guard was bypassed (model-service llm_config blocks creation/update).
+        from shared.llm.sa_auth import service_account_auth_allowed
+        if not service_account_auth_allowed():
+            raise ValueError(
+                "Vertex AI (service-account/OAuth) LLM auth is disabled on this "
+                "deployment (LLM_ALLOW_SERVICE_ACCOUNT_AUTH=false). Use a "
+                "bring-your-own API key instead."
+            )
+        genai, _ = _genai()
         # Bug-5282 — fail clearly when Vertex AI config is incomplete.
         # The previous hard-coded defaults ("tessallite-io" / "global") were
         # internal dev values that would silently fail on any other deployment.
@@ -50,6 +77,7 @@ def _client(config) -> genai.Client:
             location=location,
         )
     # default / api_key / missing
+    genai, _ = _genai()
     return genai.Client(api_key=config.api_key)
 
 
@@ -66,6 +94,7 @@ class GoogleAdapter(LLMAdapter):
 
     def _complete_sync(self, system: str, user: str, include_thoughts: bool = False) -> tuple[str, str]:
         client = _client(self.config)
+        _, types = _genai()
         config_kwargs: dict = {
             "system_instruction": system,
             "max_output_tokens": self.config.max_tokens,
@@ -109,6 +138,7 @@ class GoogleAdapter(LLMAdapter):
 
     async def stream_complete(self, system: str, user: str, on_thinking: ThinkingCallback = None) -> AsyncGenerator[str, None]:
         client = _client(self.config)
+        _, types = _genai()
         config_kwargs: dict = {
             "system_instruction": system,
             "max_output_tokens": self.config.max_tokens,

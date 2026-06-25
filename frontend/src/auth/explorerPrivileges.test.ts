@@ -15,6 +15,7 @@ const TENANT_ADMIN_ACTIONS: ExplorerAction[] = [
   "project.importExport",
   "project.toggleActive",
   "project.delete",
+  "connection.manage",
 ];
 
 const MODELLER_ACTIONS: ExplorerAction[] = [

@@ -164,6 +164,31 @@ def _validate_query_like(
                 repairable=True,
             ))
 
+    # Bug-5349 Phase 2/3 — walk every base field of every STRUCTURED expression
+    # (computed projection, structured WHERE/HAVING predicate). A base field is
+    # valid when it is a known measure OR dimension; an unknown one is an
+    # invented field that must be caught pre-execution, exactly as for bare
+    # dimensions above. Bare measures/dimensions/flat filters are validated by
+    # the blocks above; this only adds coverage for the expression forms.
+    known_fields = index.measures | index.dimensions
+    _expr_specs: list[tuple[str, Any]] = []
+    for pos, proj in enumerate(getattr(call, "projection_refs", None) or []):
+        _expr_specs.append((f"{path}.projections[{pos}]", proj))
+    for pos, pref in enumerate(getattr(call, "where_refs", None) or []):
+        _expr_specs.append((f"{path}.where[{pos}]", pref))
+    for pos, href in enumerate(getattr(call, "having_refs", None) or []):
+        _expr_specs.append((f"{path}.having[{pos}]", href))
+    for item_path, ref in _expr_specs:
+        for field_name in ref.base_fields:
+            if field_name not in known_fields:
+                issues.append(PlanValidationIssue(
+                    path=item_path,
+                    reason="unknown_field",
+                    field_name=field_name,
+                    model_id=call.model_id,
+                    repairable=True,
+                ))
+
     selected = set(call.measures) | selected_dimension_aliases | result_labels
     for pos, item in enumerate(call.sort):
         name = item.get("name") if isinstance(item, dict) else None
@@ -212,6 +237,13 @@ def validate_tool_call_against_bundle(call: ToolCall, bundle: Any) -> list[PlanV
                 limit=step.limit,
                 limit_explicit=step.limit_explicit,
                 dimension_refs=step.dimension_refs,
+                # Bug-5349 Phase 2/3 — carry the structured refs so the
+                # pre-execution bundle validator walks their base fields too
+                # (an invented field hidden in a structured predicate /
+                # projection must be caught here, not only downstream).
+                projection_refs=step.projection_refs,
+                where_refs=step.where_refs,
+                having_refs=step.having_refs,
             )
             issues.extend(_validate_query_like(
                 call=step_call,

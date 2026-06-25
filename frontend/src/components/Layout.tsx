@@ -23,6 +23,7 @@ import {
 import AdminPanelSettingsIcon from "@mui/icons-material/AdminPanelSettings";
 import AccountCircleIcon from "@mui/icons-material/AccountCircle";
 import SettingsIcon from "@mui/icons-material/Settings";
+import WorkspacePremiumIcon from "@mui/icons-material/WorkspacePremium";
 import LocaleSelector from "./LocaleSelector";
 import EditionBadge from "./EditionBadge";
 
@@ -85,6 +86,7 @@ export default function Layout() {
   }
 
   const onConfigRoute = location.pathname === "/system/configuration";
+  const onLicenseRoute = location.pathname === "/system/license";
 
   return (
     <Box sx={{ display: "flex" }}>
@@ -108,6 +110,20 @@ export default function Layout() {
             <Typography variant="body2" sx={{ opacity: 0.7, mr: 2 }}>
               {t("nav.systemAdmin")}
             </Typography>
+          )}
+
+          {isSystemAdmin && (
+            <Tooltip title={t("nav.licenseEdition")}>
+              <IconButton
+                size="large"
+                aria-label={t("nav.aria.openLicense")}
+                onClick={() => navigate("/system/license")}
+                color="inherit"
+                sx={{ opacity: onLicenseRoute ? 1 : 0.85, mr: 0.5 }}
+              >
+                <WorkspacePremiumIcon />
+              </IconButton>
+            </Tooltip>
           )}
 
           {canOpenConfig && (
@@ -187,6 +203,18 @@ export default function Layout() {
                     <AdminPanelSettingsIcon />
                   </ListItemIcon>
                   <ListItemText primary={t("nav.tenants")} />
+                </ListItemButton>
+              )}
+              {isSystemAdmin && (
+                <ListItemButton
+                  selected={onLicenseRoute}
+                  onClick={() => navigate("/system/license")}
+                  sx={{ borderRadius: 1, mx: 0.5 }}
+                >
+                  <ListItemIcon sx={{ minWidth: 36 }}>
+                    <WorkspacePremiumIcon />
+                  </ListItemIcon>
+                  <ListItemText primary={t("nav.licenseEdition")} />
                 </ListItemButton>
               )}
             </List>

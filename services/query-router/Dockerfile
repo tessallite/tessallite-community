@@ -36,7 +36,7 @@ RUN pip install --no-cache-dir cython && \
              /app/src/routing/exactness_validator \
              /app/src/rewrite/aggregate \
              /app/src/rewrite/pocket; do \
-        cython -3 "$m.py" -o "$m.c" && \
+        cython -3 -X annotation_typing=False "$m.py" -o "$m.c" && \
         gcc -shared -fPIC -I"$inc" "$m.c" -o "$m.so" && \
         rm -f "$m.py" "$m.c"; \
     done

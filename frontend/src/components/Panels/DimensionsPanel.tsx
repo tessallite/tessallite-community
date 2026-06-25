@@ -62,6 +62,10 @@ export default function DimensionsPanel() {
   const [dimTableId, setDimTableId] = useState("");
   const [dimAttrId, setDimAttrId] = useState("");
   const [pendingDimAttrName, setPendingDimAttrName] = useState<string | null>(null);
+  // Bug-5502: optional DISPLAY column (caption source) for a flat dimension.
+  // Holds the source column NAME ("" = none) to match the create/update payload
+  // field `display_column_name`.
+  const [dimDisplayColumnName, setDimDisplayColumnName] = useState("");
   const [dimIsTime, setDimIsTime] = useState(false);
   const [dimTimeGrain, setDimTimeGrain] = useState("");
   const [dimCalcExpression, setDimCalcExpression] = useState("");
@@ -82,6 +86,14 @@ export default function DimensionsPanel() {
   const isDateAttribute = selectedAttribute
     ? /date|timestamp|datetime/i.test(selectedAttribute.data_type)
     : false;
+  // Bug-5502: the display-column picker only applies to a flat (single-level)
+  // dimension backed by a real source column — not time dims, calc expressions
+  // or user-defined attributes (those have no distinct caption column to pick).
+  const isFlatSourceDimension =
+    !!selectedAttribute &&
+    !selectedAttribute.is_user_defined &&
+    !dimIsTime &&
+    !dimCalcExpression.trim();
 
   useEffect(() => {
     if (!pendingDimAttrName || !tableAttributes.data) return;
@@ -112,6 +124,11 @@ export default function DimensionsPanel() {
         selectedAttribute && selectedAttribute.is_user_defined
           ? dimAttrId
           : undefined,
+      // Bug-5502: send the display column only for an eligible flat dimension.
+      // `null` clears it back to none; an unset/non-flat dim omits the field.
+      display_column_name: isFlatSourceDimension
+        ? dimDisplayColumnName || null
+        : undefined,
       is_time_dim: dimIsTime,
       time_grain: dimIsTime && dimTimeGrain ? dimTimeGrain : undefined,
       calc_expression: dimCalcExpression.trim() || null,
@@ -198,6 +215,7 @@ export default function DimensionsPanel() {
     setDimTableId("");
     setDimAttrId("");
     setPendingDimAttrName(null);
+    setDimDisplayColumnName("");
     setDimIsTime(false);
     setDimTimeGrain("");
     setDimCalcExpression("");
@@ -223,6 +241,9 @@ export default function DimensionsPanel() {
       setDimAttrId("");
       setPendingDimAttrName(dim.source_column_name ?? null);
     }
+    // Bug-5502: restore the saved display column (by name) so the picker shows
+    // the current caption source on edit, clearable back to none.
+    setDimDisplayColumnName(dim.display_column_name ?? "");
     setDimIsTime(dim.is_time_dim);
     setDimTimeGrain(dim.time_grain ?? "");
     setDimCalcExpression(dim.calc_expression ?? "");
@@ -454,6 +475,32 @@ export default function DimensionsPanel() {
               )}
             </Select>
           </FormControl>
+
+          {/* Bug-5502: optional display-column picker for flat dimensions. The
+              key column above stays the identity; this picks a distinct caption
+              column rendered to users. Clearable (a flat dim need not have one). */}
+          {isFlatSourceDimension && (
+            <FormControl fullWidth margin="dense" disabled={!dimTableId}>
+              <InputLabel>{t("dimensions.displayColumnLabel")}</InputLabel>
+              <Select
+                value={dimDisplayColumnName}
+                label={t("dimensions.displayColumnLabel")}
+                onChange={(e) => setDimDisplayColumnName(e.target.value)}
+              >
+                <MenuItem value="">{t("common.none")}</MenuItem>
+                {tableAttributes.data
+                  ?.filter((attr) => !attr.is_user_defined)
+                  .map((attr) => (
+                    <MenuItem key={attr.id} value={attr.name}>
+                      {attr.name}
+                    </MenuItem>
+                  ))}
+              </Select>
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5 }}>
+                {t("dimensions.displayColumnHelp")}
+              </Typography>
+            </FormControl>
+          )}
 
           <Typography variant="subtitle2" sx={{ mt: 2, mb: 0.5 }}>
             {t("dimensions.formulaExpression")}

@@ -108,7 +108,7 @@ Optional (standalone Docker Compose in monitoring/):
 <li>Query-router checks for aggregate/pocket matches:
   <ul>
     <li><strong>Match found:</strong> rewrites query to target the pre-built table.</li>
-    <li><strong>No match:</strong> routes to raw source tables and records a miss.</li>
+    <li><strong>No match:</strong> routes through the governed source path and records a miss.</li>
   </ul>
 </li>
 <li>Query-router executes and returns results through gateway to the BI tool.</li>

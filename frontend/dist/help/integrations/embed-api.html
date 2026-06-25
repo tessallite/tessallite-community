@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Embed API</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">developer</span><span class="updated">Updated 2026-05-19</span></div>
+    <div class="article-meta"><span class="audience-badge">developer</span><span class="updated">Updated 2026-06-21</span></div>
 <h1>Embed API</h1>
 <h2>What this covers</h2>
 <p>The Embed API lets third-party applications embed Tessallite's conversational agent or query capabilities inside their own products. Instead of requiring users to log in to Tessallite directly, the host application requests a scoped, time-limited token from its backend, then passes it to the embedded component. The end user never sees Tessallite credentials.</p>
@@ -34,13 +34,29 @@
 <tr><td><code>tenant_id</code></td><td>string</td><td>yes</td><td>-</td><td>Target tenant slug</td></tr>
 <tr><td><code>user_identity</code></td><td>string</td><td>yes</td><td>-</td><td>Display name for audit trail</td></tr>
 <tr><td><code>persona_id</code></td><td>string</td><td>no</td><td>null</td><td>Lock to this persona's permissions</td></tr>
+<tr><td><code>project_ids</code></td><td>string[]</td><td>no</td><td>null</td><td>Restrict access to these project IDs only</td></tr>
 <tr><td><code>model_ids</code></td><td>string[]</td><td>no</td><td>null</td><td>Restrict visible models</td></tr>
 <tr><td><code>capabilities</code></td><td>string[]</td><td>no</td><td>all</td><td>Allowed features: query, chat, explore</td></tr>
 <tr><td><code>expiry_minutes</code></td><td>integer</td><td>no</td><td>180</td><td>Token lifetime (min 5, max 1440)</td></tr>
 </tbody>
 </table>
+<p><strong>Response:</strong></p>
+<pre><code>{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "expires_at": "2026-05-19T15:30:00+00:00",
+  "scope": {
+    "tenant_id": "acme-demo",
+    "user_identity": "viewer@customer.com",
+    "persona_id": null,
+    "project_ids": null,
+    "model_ids": null,
+    "capabilities": ["query", "chat", "explore"],
+    "expiry_minutes": 180
+  }
+}</code></pre>
 <h2>Scope fields</h2>
 <p><strong>persona_id</strong> locks the session to a specific persona. All row-level security filters and measure/dimension access rules for that persona apply. If omitted, the embedded user sees the default (unfiltered) view.</p>
+<p><strong>project_ids</strong> restricts which projects the embedded session can access. API calls targeting a project not in the list return 403. The embedded chat only loads and displays projects that appear in this list. If omitted, all projects in the tenant are accessible (subject to normal RBAC).</p>
 <p><strong>model_ids</strong> restricts which models the token can access. Any query or chat request targeting a model not in the list returns 403. If omitted, all models in the tenant are accessible.</p>
 <p><strong>capabilities</strong> controls which features the embed can use:</p>
 <ul>

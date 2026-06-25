@@ -9,6 +9,8 @@ export interface DimensionCreate {
   display_folder?: string | null;
   source_table_id?: string;
   source_column_name?: string;
+  /** Bug-5434: optional distinct DISPLAY column (caption source) for a flat dim. */
+  display_column_name?: string | null;
   data_type?: string;
   user_defined_attribute_id?: string;
   is_time_dim?: boolean;
@@ -62,6 +64,9 @@ export interface Dimension {
   is_hidden?: boolean;
   source_column_id: string | null;
   source_column_name: string | null;
+  /** Bug-5434: distinct DISPLAY column (caption source) for a flat dimension. */
+  display_column_id?: string | null;
+  display_column_name?: string | null;
   data_type?: string | null;
   source_table_id: string | null;
   source_table_alias: string | null;

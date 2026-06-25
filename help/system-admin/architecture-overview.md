@@ -92,7 +92,7 @@ Receives queries from gateway, the frontend's Query panel, the Excel add-in, and
 3. Applies persona gates and row-security filters.
 4. Checks for matching aggregates or pocket tables.
 5. If a match exists, rewrites the query to target that pre-built table.
-6. If no match, routes to the raw source tables and records a miss.
+6. If no match, routes through the governed source path and records a miss.
 7. Executes the query and returns results with a route trace.
 
 Supports three route types: `aggregate`, `pocket`, and `source`. Every response includes `route_type` and a human-readable `reason` so the caller knows which path served the query.
@@ -166,7 +166,7 @@ Each tenant gets its own PostgreSQL schemas (`<slug>_meta` for model metadata an
 4. Query-router parses the query, binds it to the semantic model stored by **model-service**, and applies persona gates and row-security filters.
 5. Query-router checks for matching aggregates or pocket tables:
    - **If a match exists:** rewrites the query to target the pre-built table for faster execution.
-   - **If no match:** routes the query to the raw source tables and records a miss in the miss log.
+   - **If no match:** routes the query through the governed source path and records a miss in the miss log.
 6. Query-router executes the query against the data source and returns results.
 7. Results travel back through gateway to the BI tool.
 

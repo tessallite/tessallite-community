@@ -1,16 +1,13 @@
 Tessallite Community Source Available License
-Version: draft 0.1
-Last updated: 2026-06-23
+Version: 1.0
+Effective date: 2026-06-23
 
 Copyright (c) 2026 Tessallite Ltd.
 
-This license is not an open-source license. It is a source-available license for
-Tessallite Community source code that Tessallite Ltd intentionally publishes to
-the public Tessallite Community repository. It does not grant Apache-2.0, MIT,
-GPL, AGPL, BSD, or other OSI-style open-source rights.
-
-These terms are drafts for review and should be reviewed by qualified counsel
-before public release or customer signature.
+This is a source-available license for Tessallite Community source code that
+Tessallite Ltd intentionally publishes to the public Tessallite Community
+repository. The permitted source review, internal evaluation, development, and
+self-hosted Community use rights are set out below.
 
 ## 1. Licensor
 
@@ -27,16 +24,17 @@ Tessallite Community repository and that do not carry a separate license notice.
 
 Covered Source does not include:
 
-- closed license manager implementations;
+- proprietary license manager implementations;
 - gateway guard or admission-control modules;
-- internal request-token issuer or verifier modules when shipped closed;
-- model-service policy-enforcement modules or compiled model-service builds when
-  shipped as closed artifacts;
+- internal request-token issuer or verifier modules when shipped as proprietary
+  runtime components;
+- model-service policy modules or compiled model-service builds when shipped as
+  proprietary runtime components;
 - license issuer, signing, release, registry, website, or customer-provisioning
   systems;
 - private release or signing automation;
 - optional optimizer, acceleration planner, aggregate/pocket matcher, exactness
-  validator, aggregate/pocket rewrite, and related private IP modules;
+  validator, aggregate/pocket rewrite, and related proprietary modules;
 - compiled object code, container image layers, appliance images, VM images,
   hosted services, release bundles, or enterprise artifacts unless expressly
   identified as Covered Source;
@@ -46,7 +44,7 @@ Covered Source does not include:
 ## 3. Permitted Use
 
 Subject to these terms, Tessallite grants you a limited, non-exclusive,
-non-transferable, revocable, royalty-free license to:
+non-transferable, royalty-free license to:
 
 - view, clone, and study the Covered Source;
 - modify the Covered Source for your own internal evaluation, development,
@@ -58,9 +56,11 @@ non-transferable, revocable, royalty-free license to:
   and security review;
 - submit issues, patches, or pull requests to Tessallite.
 
-## 4. Restricted Use
+## 4. Commercial Boundaries
 
-You must not, without a separate written agreement with Tessallite:
+The source-available grant is intended for internal review, evaluation,
+development, testing, training, and self-hosted Community use. A separate
+written agreement with Tessallite is required to:
 
 - sell, sublicense, rent, lease, distribute, or transfer the Covered Source or
   modified versions to a third party;
@@ -70,29 +70,27 @@ You must not, without a separate written agreement with Tessallite:
 - use the Covered Source to build or offer a competing commercial semantic
   layer, BI gateway, analytics platform, managed service, or substantially
   similar product;
-- remove, obscure, or alter copyright, trademark, proprietary, or license
-  notices;
-- bypass, disable, or remove license checks, signed-license verification,
-  gateway guards, internal request-token controls, or Community/Enterprise
-  entitlement checks;
-- reverse engineer, decompile, disassemble, or attempt to extract source code
-  from Closed Components except to the extent mandatory law permits it;
 - publish, share, or distribute patches, forks, builds, images, or packages that
-  include Closed Components or Tessallite proprietary material;
-- use Tessallite names, logos, domains, marks, or brand assets except as allowed
-  by written brand guidance.
+  include Proprietary Components or Tessallite proprietary material.
+
+You agree to keep copyright, trademark, proprietary, and license notices in
+place; use Tessallite names, logos, domains, marks, and brand assets only as
+allowed by written brand guidance; use signed-license and entitlement controls
+as provided; and not reverse engineer, decompile, disassemble, or attempt to
+extract source code from Proprietary Components except to the extent mandatory
+law permits it.
 
 ## 5. Community Edition Runtime Terms
 
 Running Tessallite Community Edition may require a signed local license file and
 is also governed by `LICENSE-COMMUNITY.md`. If these source-available terms
-conflict with `LICENSE-COMMUNITY.md` for Community runtime use, the more
-restrictive term applies unless Tessallite signs a written exception.
+conflict with `LICENSE-COMMUNITY.md` for Community runtime use, the Community
+runtime terms control unless Tessallite signs a written exception.
 
 ## 6. Enterprise Terms
 
 Enterprise Edition, production rights beyond Community Edition, support,
-customer-specific entitlements, closed components, private bundles, and
+customer-specific entitlements, proprietary components, private bundles, and
 commercial artifacts are governed by `LICENSE-ENTERPRISE.md` and the applicable
 written order or agreement.
 
@@ -106,7 +104,7 @@ commercial terms. Do not submit material you do not have the right to contribute
 ## 8. Ownership
 
 Tessallite and its licensors retain all rights not expressly granted. The Covered
-Source and Closed Components are licensed, not sold. No rights are granted by
+Source and Proprietary Components are licensed, not sold. No rights are granted by
 implication, exhaustion, waiver, estoppel, or otherwise.
 
 ## 9. Third-Party Components
@@ -117,20 +115,19 @@ only.
 
 ## 10. Termination
 
-This license terminates automatically if you materially breach these terms. On
-termination, you must stop using the Covered Source and destroy copies in your
-possession or control, except where retention is required by law. Tessallite may
-also terminate this license by written notice if your use creates legal,
-security, or commercial risk for Tessallite.
+If you materially breach these terms, your rights under this license end unless
+Tessallite agrees otherwise in writing. You must then stop using the Covered
+Source and destroy copies in your possession or control, except where retention
+is required by law.
 
-## 11. No Warranty
+## 11. Warranty Disclaimer
 
-The Covered Source is provided "as is" and "as available", without warranty of
-any kind to the maximum extent permitted by law. Tessallite does not guarantee
-that the Covered Source, Community Edition, documentation, examples, demo data,
-container images, installation scripts, or related materials will be secure,
-accurate, complete, uninterrupted, error-free, fit for a particular purpose,
-compatible with your environment, or available for any particular period.
+The Covered Source is provided without a commercial warranty unless Tessallite
+agrees otherwise in writing.
+
+To the maximum extent permitted by law, Tessallite does not provide implied
+warranties for the Covered Source, Community Edition, documentation, examples,
+demo data, container images, installation scripts, or related materials.
 
 ## 12. Limitation Of Liability
 
@@ -141,9 +138,9 @@ aggregate liability under these terms is limited to GBP 100.
 
 ## 13. Governing Law
 
-These draft terms are intended to use the laws of England and Wales, with courts
-of England and Wales having exclusive jurisdiction, unless a final signed
-agreement states otherwise.
+These terms are governed by the laws of England and Wales. The courts of England
+and Wales have exclusive jurisdiction, unless a separate written agreement signed
+by Tessallite states otherwise.
 
 ## 14. Contact
 

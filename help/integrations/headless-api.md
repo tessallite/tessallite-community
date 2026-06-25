@@ -2,12 +2,14 @@
 title: "Headless API"
 audience: developer
 area: integrations
-updated: 2026-05-04
+updated: 2026-06-24
 ---
 
 ## What this covers
 
-The headless API is a JSON-in, JSON-out query interface for non-SQL clients. It lets mobile apps, microservices, embedded analytics widgets, and custom integrations query the Tessallite semantic layer without writing SQL. Queries are expressed as lists of measure and dimension names with optional filters, and results come back as JSON arrays. This article covers authentication, the query and metadata endpoints, rate limiting, and worked examples.
+The headless API is for applications that need governed metrics but should not have to generate SQL. A mobile app can ask for `revenue` by `region`; an embedded dashboard can request a persona-safe KPI table; a backend service can fetch the same metric definition that Excel users see. Tessallite still applies the model, aggregate routing, personas, row security, and column restrictions.
+
+Use this API when you are building a product integration. Do not use it to bypass BI tools for ordinary analysis, and do not connect your app directly to the source just because JSON feels easier. The business value is that every surface asks Tessallite the same governed question.
 
 ---
 
@@ -23,6 +25,8 @@ The headless API is a JSON-in, JSON-out query interface for non-SQL clients. It 
 | Automated reporting scripts | Either (headless is simpler if you don't need SQL) |
 
 The headless API and JDBC/XMLA share the same semantic layer, the same aggregate routing, and the same security model. The difference is the query language: headless uses JSON measure/dimension names; JDBC/XMLA use SQL or DAX.
+
+Headless is deliberately narrower than SQL. It is excellent for stable app screens, scorecards, scheduled snapshots, and embedded tables. Use JDBC or the Query Panel when a human needs ad-hoc exploration with joins, expressions, or SQL-specific debugging.
 
 ---
 

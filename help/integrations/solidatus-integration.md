@@ -126,11 +126,11 @@ This means the first sync sends everything, but subsequent syncs only send what 
 
 ## Related
 
-- [Collibra Integration](collibra-integration.html) — The equivalent integration for Collibra governance platform
-- [Model Configuration](../modelling/model-settings.html) — All model-level settings
-- [Lineage Panel](../modelling/lineage.html) — View lineage within Tessallite
-- [API Reference](api-reference.html) — REST API documentation
+- [Collibra Integration](collibra-integration.md) — The equivalent integration for Collibra governance platform
+- [Model Configuration](../admin/model-configuration.md) — All model-level settings
+- [View Model Lineage](../modelling/view-model-lineage.md) — View lineage within Tessallite
+- [API Reference](api-reference.md) — REST API documentation
 
 ---
 
-← [Embed Agent Chat](embed-agent-chat.md) | [Home](../index.md) | [Collibra Integration →](collibra-integration.md)
+← [MCP Server](mcp-server.md) | [Home](../index.md) | [Collibra Integration →](collibra-integration.md)

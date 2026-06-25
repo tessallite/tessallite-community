@@ -17,8 +17,14 @@ from src.recipes.eval import check_node_shape
 from src.tools.expressions import (
     DimRef,
     ExpressionError,
+    PredRef,
+    ProjRef,
+    is_structured_predicate,
     normalize_dimension,
     normalize_dimensions,
+    normalize_filter,
+    normalize_projection,
+    predicate_has_aggregate,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,15 +57,23 @@ _QUERY_SCHEMA = """\
       {"name": "<date dimension>", "grain": "year|quarter|month|week|day"},
       {"expr": <expression node>, "alias": "<output column name>"}
     ],
+    "projections": [
+      {"expr": <expression node>, "alias": "<output column name>"}
+    ],
     "where": [
       {"name": "<dimension_or_filterable_measure>",
        "op": "eq|in|between|like|is_null|is_not_null|gt|gte|lt|lte",
-       "value": <scalar | list | [lo, hi]>}
+       "value": <scalar | list | [lo, hi]>},
+      {"left": <expression node>, "op": "eq|neq|gt|gte|lt|lte|like|in|between|is_null|is_not_null",
+       "right": <expression node | [node, ...] | [lo, hi] | omitted>},
+      {"and": [<predicate>, ...]}, {"or": [<predicate>, ...]}, {"not": <predicate>}
     ],
     "having": [
       {"name": "<measure name>",
        "op": "eq|in|between|gt|gte|lt|lte",
-       "value": <scalar | list | [lo, hi]>}
+       "value": <scalar | list | [lo, hi]>},
+      {"left": <aggregate expression node>, "op": "gt|gte|lt|lte|eq|neq",
+       "right": <expression node>}
     ],
     "sort": [
       {"name": "<measure_or_dimension>", "direction": "asc|desc"}
@@ -83,15 +97,23 @@ _QUERY_SCHEMA_WITH_CHART = """\
       {"name": "<date dimension>", "grain": "year|quarter|month|week|day"},
       {"expr": <expression node>, "alias": "<output column name>"}
     ],
+    "projections": [
+      {"expr": <expression node>, "alias": "<output column name>"}
+    ],
     "where": [
       {"name": "<dimension_or_filterable_measure>",
        "op": "eq|in|between|like|is_null|is_not_null|gt|gte|lt|lte",
-       "value": <scalar | list | [lo, hi]>}
+       "value": <scalar | list | [lo, hi]>},
+      {"left": <expression node>, "op": "eq|neq|gt|gte|lt|lte|like|in|between|is_null|is_not_null",
+       "right": <expression node | [node, ...] | [lo, hi] | omitted>},
+      {"and": [<predicate>, ...]}, {"or": [<predicate>, ...]}, {"not": <predicate>}
     ],
     "having": [
       {"name": "<measure name>",
        "op": "eq|in|between|gt|gte|lt|lte",
-       "value": <scalar | list | [lo, hi]>}
+       "value": <scalar | list | [lo, hi]>},
+      {"left": <aggregate expression node>, "op": "gt|gte|lt|lte|eq|neq",
+       "right": <expression node>}
     ],
     "sort": [
       {"name": "<measure_or_dimension>", "direction": "asc|desc"}
@@ -549,6 +571,54 @@ function is genuinely required):
 - compound_query steps accept the same structured dimensions as query steps.
   Row alignment uses deterministic semantic alignment keys derived from the
   normalized dimension refs, not display aliases alone.
+
+EXPRESSION WHERE FILTERS (Bug-5349 — prefer the plain {"name","op","value"}
+filter whenever a bare column answers the question; use the structured forms
+below only when a function, a column-to-column comparison, or OR/NOT is
+genuinely required):
+- Function on a column: compare a registered scalar function of a column.
+    {"left": {"fn": "extract", "args": [{"literal": "month"}, {"field": "<date>"}]},
+     "op": "eq", "right": {"literal": 6}}                  -> EXTRACT(MONTH FROM d) = 6
+    {"left": {"fn": "lower", "args": [{"field": "<city>"}]},
+     "op": "eq", "right": {"literal": "cairo"}}            -> LOWER(city) = 'cairo'
+- Column-to-column (same-row comparison):
+    {"left": {"field": "<settlement_date>"}, "op": "gt",
+     "right": {"field": "<transaction_date>"}}
+- Boolean composition: {"and": [<pred>, ...]}, {"or": [<pred>, ...]},
+  {"not": <pred>}. Use these only when the plain AND-of-filters list cannot
+  express the request (an OR, a negation, or a grouped predicate).
+- Allowed predicate ops: eq, neq, gt, gte, lt, lte, like, in, between, is_null,
+  is_not_null. For "in" the right side is a list of nodes; for "between" it is a
+  two-element list [lo, hi]; for is_null / is_not_null omit the right side.
+
+EXPRESSION PROJECTIONS (Bug-5349 — derived/computed SELECT columns):
+- Use "projections" for a computed output column that is neither a bare measure
+  nor a grouping dimension: arithmetic, ROUND, CONCAT, SUBSTRING, a date part,
+  or a CASE bucket. Each entry is {"expr": <node>, "alias": "<column name>"}.
+- Inline arithmetic node: {"arith": "add|sub|mul|div", "left": <node>,
+  "right": <node>}.
+- CASE node (searched form): {"case": [{"when": <predicate>, "then": <node>},
+  ...], "else": <node | omitted>}.  Example bucket:
+    {"expr": {"case": [{"when": {"left": {"field": "<amount>"}, "op": "gt",
+      "right": {"literal": 1000}}, "then": {"literal": "high"}}],
+      "else": {"literal": "low"}}, "alias": "amount_band"}
+- Aggregate functions (sum, avg, min, max, count, count_distinct) ARE allowed in
+  a projection and in HAVING (e.g. ROUND(SUM(amount), 2)); they are NOT allowed
+  in a grouping dimension.
+
+EXPRESSION HAVING (Bug-5349 — computed aggregate thresholds):
+- For a ratio of aggregates or any computed aggregate threshold, use the
+  structured HAVING form. The left side MUST contain an aggregate.
+    {"left": {"arith": "div", "left": {"fn": "sum", "args": [{"field": "<fees>"}]},
+      "right": {"fn": "sum", "args": [{"field": "<amount>"}]}},
+     "op": "gt", "right": {"literal": 0.5}}        -> HAVING SUM(fees)/SUM(amount) > 0.5
+- A structured HAVING predicate that references no aggregate is rejected; use
+  "where" for row-level filters instead.
+
+Every "field" in any expression (filter, projection, having) must be a real
+measure or dimension from AVAILABLE MODELS for the selected model. Expressions
+in EVERY clause are subject to the same field validation and persona scope as
+bare names — a function cannot hide a hidden column.
 """
 
 TOOL_SPEC_TEXT = _SPEC_PREAMBLE + "\n" + _QUERY_SCHEMA + "\n" + _COMPOUND_QUERY_SCHEMA + "\n" + _OTHER_SCHEMAS + "\n" + _SPEC_RULES + "\n" + _EXPRESSION_DIMENSION_RULES + "\n" + _COMPOUND_QUERY_RULES
@@ -575,10 +645,26 @@ class QueryToolCall:
     # derived from `dimensions` so direct constructors (and existing tests)
     # keep working without supplying refs.
     dimension_refs: Optional[list[DimRef]] = None
+    # Bug-5349 Phase 3 — computed SELECT projection columns
+    # ({"expr": <node>, "alias": ..}). Bare measures/dimensions stay in their
+    # own lists (byte-for-byte legacy SQL); these add derived columns.
+    projection_refs: list[ProjRef] = None  # type: ignore[assignment]
+    # Bug-5349 Phase 2/3 — typed companions to `where`/`having` carrying the
+    # STRUCTURED predicate entries only (function-on-column, column-to-column,
+    # OR/NOT, ratio-of-aggregates). Legacy flat {name/op/value} entries stay in
+    # `where`/`having` and render through the legacy path unchanged.
+    where_refs: list[PredRef] = None  # type: ignore[assignment]
+    having_refs: list[PredRef] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.dimension_refs is None:
             self.dimension_refs = normalize_dimensions(list(self.dimensions))
+        if self.projection_refs is None:
+            self.projection_refs = []
+        if self.where_refs is None:
+            self.where_refs = []
+        if self.having_refs is None:
+            self.having_refs = []
 
 
 @dataclass
@@ -613,10 +699,21 @@ class CompoundStep:
     # preserve structured dimension refs. The branch executor derives semantic
     # alignment aliases from these refs before row-aligned expression evaluation.
     dimension_refs: Optional[list[DimRef]] = None
+    # Bug-5349 Phase 3 / D5 — shape parity for computed projection columns and
+    # structured predicates inside a compound step.
+    projection_refs: list[ProjRef] = None  # type: ignore[assignment]
+    where_refs: list[PredRef] = None  # type: ignore[assignment]
+    having_refs: list[PredRef] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.dimension_refs is None:
             self.dimension_refs = normalize_dimensions(list(self.dimensions))
+        if self.projection_refs is None:
+            self.projection_refs = []
+        if self.where_refs is None:
+            self.where_refs = []
+        if self.having_refs is None:
+            self.having_refs = []
 
 
 @dataclass
@@ -726,14 +823,39 @@ _VALID_FILTER_OPS = frozenset({
 })
 
 
-def _parse_filter_list(body: dict[str, Any], key: str) -> list[dict[str, Any]]:
+def _parse_filter_list(
+    body: dict[str, Any], key: str, *, ctx: str = "query"
+) -> tuple[list[dict[str, Any]], list[PredRef]]:
+    """Split a where/having list into (legacy flat entries, structured refs).
+
+    Legacy ``{name, op, value}`` entries render through the unchanged flat path
+    (byte-for-byte back-compat). Structured entries — boolean composition
+    (``and``/``or``/``not``) or comparisons (``{left, op, right}``) — are
+    normalized into the typed predicate AST (Bug-5349 Phase 2/3). A malformed
+    structured predicate RAISES (fail-closed, R3) — it is never silently
+    dropped, which would loosen a filter or leak a HAVING gate."""
     raw = body.get(key) or []
     if not isinstance(raw, list):
-        raise ToolCallParseError(f"query.{key} must be a list.")
-    result: list[dict[str, Any]] = []
+        raise ToolCallParseError(f"{ctx}.{key} must be a list.")
+    clause = "where" if key == "where" else "having"
+    flat: list[dict[str, Any]] = []
+    refs: list[PredRef] = []
     for f in raw:
         if not isinstance(f, dict):
             raise ToolCallParseError(f"Each {key} entry must be an object.")
+        if is_structured_predicate(f):
+            try:
+                ref = normalize_filter(f, clause=clause)
+            except ExpressionError as exc:
+                raise ToolCallParseError(f"{ctx}.{key} invalid: {exc}")
+            if key == "having" and not predicate_has_aggregate(ref.node):
+                raise ToolCallParseError(
+                    f"{ctx}.having predicate must reference an aggregate "
+                    f"(e.g. SUM/AVG/COUNT); use 'where' for row-level filters."
+                )
+            refs.append(ref)
+            continue
+        # legacy flat filter
         if "name" not in f or "op" not in f:
             raise ToolCallParseError(f"{key} entry requires 'name' and 'op'.")
         op = f["op"]
@@ -744,8 +866,23 @@ def _parse_filter_list(body: dict[str, Any], key: str) -> list[dict[str, Any]]:
             )
         if op in ("is_null", "is_not_null"):
             f.setdefault("value", None)
-        result.append(f)
-    return result
+        flat.append(f)
+    return flat, refs
+
+
+def _parse_projections(raw: Any, *, ctx: str, taken: set[str]) -> list[ProjRef]:
+    """Normalize the optional ``projections`` list (computed SELECT columns)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ToolCallParseError(f"{ctx}.projections must be a list.")
+    refs: list[ProjRef] = []
+    for p in raw:
+        try:
+            refs.append(normalize_projection(p, taken))
+        except ExpressionError as exc:
+            raise ToolCallParseError(f"{ctx}.projections invalid: {exc}")
+    return refs
 
 
 def _parse_limit(raw: Any, field: str) -> tuple[int, bool]:
@@ -782,15 +919,20 @@ def _parse_sort_list(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _parse_dimensions(
-    raw: Any, *, ctx: str, allow_expr: bool
+    raw: Any, *, ctx: str, allow_expr: bool, taken: set[str] | None = None
 ) -> tuple[list[str], list[DimRef]]:
     """Normalize a dimensions list into (aliases, typed refs). Accepts bare
     name strings always; grain shorthand and expression objects only when
     ``allow_expr`` (the single ``query`` path, decision D4/D5). Returns aliases
-    for the legacy ``dimensions`` field and typed refs for SQL composition."""
+    for the legacy ``dimensions`` field and typed refs for SQL composition.
+    ``taken`` (when given) shares the alias-collision namespace with computed
+    projections so a derived column cannot reuse a dimension alias OR a selected
+    measure's output alias (R4); the caller seeds the measure names into
+    ``taken`` before parsing projections."""
     if not isinstance(raw, list):
         raise ToolCallParseError(f"{ctx}.dimensions must be a list.")
-    taken: set[str] = set()
+    if taken is None:
+        taken = set()
     refs: list[DimRef] = []
     for d in raw:
         if not allow_expr and not isinstance(d, str):
@@ -820,16 +962,25 @@ def _parse_query(body: dict[str, Any]) -> QueryToolCall:
     raw_dims = body.get("dimension_exprs")
     if not isinstance(raw_dims, list):
         raw_dims = body.get("dimensions") or []
+    taken: set[str] = set()
     dim_aliases, dim_refs = _parse_dimensions(
-        raw_dims, ctx="query", allow_expr=True
+        raw_dims, ctx="query", allow_expr=True, taken=taken
     )
-    if not measures and not dim_aliases:
-        raise ToolCallParseError("query needs at least one measure or dimension.")
+    # Bug-5349 Phase 3 / R4 — computed projection columns share the dimension AND
+    # measure alias namespace so a derived column can never collide with a
+    # grouping alias OR a selected measure's output column (a duplicate output
+    # alias would silently drop one column in the name-keyed result rows).
+    taken |= {str(m) for m in measures}
+    projection_refs = _parse_projections(
+        body.get("projections"), ctx="query", taken=taken
+    )
+    if not measures and not dim_aliases and not projection_refs:
+        raise ToolCallParseError("query needs at least one measure, dimension, or projection.")
     # Backward compat: accept old "filters" as "where" if "where" is absent.
     if "where" not in body and "filters" in body:
         body["where"] = body.pop("filters")
-    where = _parse_filter_list(body, "where")
-    having = _parse_filter_list(body, "having")
+    where, where_refs = _parse_filter_list(body, "where")
+    having, having_refs = _parse_filter_list(body, "having")
     sort = _parse_sort_list(body)
     limit, limit_explicit = _parse_limit(body.get("limit"), "query.limit")
     chart_type = body.get("chart_type")
@@ -846,6 +997,9 @@ def _parse_query(body: dict[str, Any]) -> QueryToolCall:
         limit_explicit=limit_explicit,
         chart_type=chart_type,
         dimension_refs=dim_refs,
+        projection_refs=projection_refs,
+        where_refs=where_refs,
+        having_refs=having_refs,
     )
 
 
@@ -914,21 +1068,30 @@ def _parse_compound_query(body: dict[str, Any]) -> CompoundQueryToolCall:
         raw_dims = s.get("dimension_exprs")
         if not isinstance(raw_dims, list):
             raw_dims = s.get("dimensions") or []
+        step_ctx = f"compound_query.steps[{i}]"
+        taken: set[str] = set()
         dim_aliases, dim_refs = _parse_dimensions(
-            raw_dims, ctx=f"compound_query.steps[{i}]", allow_expr=True
+            raw_dims, ctx=step_ctx, allow_expr=True, taken=taken
         )
-        if not measures and not dim_aliases:
+        # D5 — expression projection columns and structured predicates inside a
+        # compound step (shape parity with the single-query path). Seed the alias
+        # namespace with measure names (R4 — no duplicate output column).
+        taken |= {str(m) for m in measures}
+        projection_refs = _parse_projections(
+            s.get("projections"), ctx=step_ctx, taken=taken
+        )
+        if not measures and not dim_aliases and not projection_refs:
             raise ToolCallParseError(
-                f"compound_query.steps[{i}] needs at least one measure or dimension."
+                f"{step_ctx} needs at least one measure, dimension, or projection."
             )
 
         if "where" not in s and "filters" in s:
             s["where"] = s.pop("filters")
-        where = _parse_filter_list(s, "where")
-        having = _parse_filter_list(s, "having")
+        where, where_refs = _parse_filter_list(s, "where", ctx=step_ctx)
+        having, having_refs = _parse_filter_list(s, "having", ctx=step_ctx)
         sort = _parse_sort_list(s)
         limit, limit_explicit = _parse_limit(
-            s.get("limit"), f"compound_query.steps[{i}].limit"
+            s.get("limit"), f"{step_ctx}.limit"
         )
 
         steps.append(CompoundStep(
@@ -942,6 +1105,9 @@ def _parse_compound_query(body: dict[str, Any]) -> CompoundQueryToolCall:
             limit=limit,
             limit_explicit=limit_explicit,
             dimension_refs=dim_refs,
+            projection_refs=projection_refs,
+            where_refs=where_refs,
+            having_refs=having_refs,
         ))
 
     expression = body.get("expression")

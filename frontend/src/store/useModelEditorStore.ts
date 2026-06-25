@@ -92,3 +92,48 @@ export const useModelEditorStore = create<ModelEditorState & Actions>(
  */
 export const useIsModelDirty = () =>
   useModelEditorStore((s) => s.isDirty);
+
+/**
+ * Pure derivation of the "model is in sync with what queries actually run
+ * against" rule, exported separately so it can be unit-tested without a React
+ * render and reused by any non-hook caller.
+ *
+ * The query-router executes every query against the DEPLOYED snapshot, but the
+ * builder panels render the current/draft model. The two only agree when the
+ * model has NO unsaved edits AND the currently-saved version is the one that is
+ * deployed. Anything else (unsaved edits, nothing deployed yet, or a deployment
+ * lagging behind the latest save) means the panels show fields that the engine
+ * will not honour — so we surface a warning (Bug-5515).
+ *
+ * Returns `true` when the model needs a save and/or deploy before the panels
+ * match the engine, `false` only when it is BOTH saved AND deployed in sync.
+ */
+export function modelNeedsSaveOrDeploy(state: {
+  isDirty: boolean;
+  lastSavedVersion: number | null;
+  deployedVersion: number | null;
+}): boolean {
+  if (state.isDirty) return true;
+  // No deployed snapshot at all, or no saved version to compare against:
+  // queries cannot reflect the draft the user is editing.
+  if (state.deployedVersion === null || state.lastSavedVersion === null) {
+    return true;
+  }
+  // Saved but the deployment lags behind the latest saved version.
+  return state.lastSavedVersion !== state.deployedVersion;
+}
+
+/**
+ * Single source of truth for the "unsaved or undeployed" warning state shared
+ * by the status bar and every query-generating panel (Bug-5515). No panel
+ * should re-derive this from raw dirty/version fields — consume this hook so
+ * the rule stays in one place.
+ */
+export const useModelNeedsSaveOrDeploy = () =>
+  useModelEditorStore((s) =>
+    modelNeedsSaveOrDeploy({
+      isDirty: s.isDirty,
+      lastSavedVersion: s.lastSavedVersion,
+      deployedVersion: s.deployedVersion,
+    }),
+  );

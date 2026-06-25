@@ -173,3 +173,7 @@ Use a service account with appropriate permissions rather than a personal admin 
 **Empty model list** — The authenticated user may not have access to any projects. Check user access bindings in the admin panel.
 
 **Queries return no results** — The user's persona may restrict visible measures or apply row-level filters that exclude all data. Try with a user that has broader access.
+
+---
+
+← [Embed Agent Chat](embed-agent-chat.md) | [Home](../index.md) | [Solidatus Integration →](solidatus-integration.md)

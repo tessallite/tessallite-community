@@ -12,15 +12,18 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>Deploy Locally</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-06-14</span></div>
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-06-24</span></div>
     <h1>Deploy Locally</h1>
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/deploy-local-docker-ps.png" alt="Terminal — `docker compose ps` showing all services healthy."></figure>
 <h2>What this covers</h2>
-<p>Detailed configuration reference for a local Docker Compose deployment. This complements the guided install article in Getting Started. It covers environment variable configuration, volume management, resource requirements, and debug logging.</p>
+<p>Detailed operations reference for a local Docker Compose deployment. For Community Edition, start from the signed release bundle and <code>install.sh</code>; this page explains what to do after the bundle is installed, how to manage the Compose stack, and how <code>.env</code> is used. A source checkout is a developer workflow, not the normal install path.</p>
 <h2>Requirements</h2>
-<ul><li>Docker Desktop 24 or later with Compose v2.</li><li>Minimum 2 CPUs and 4 GB RAM for a development deployment. 4 CPUs and 8 GB RAM recommended for sustained use.</li><li>Ports 5433, 8080, 3000, and 3443 free on the host. (3000 serves the web UI over plain HTTP; 3443 serves it over HTTPS — see below.)</li></ul>
+<ul><li>Docker Desktop 24 or later with Compose v2.</li><li>Minimum 2 CPUs and 4 GB RAM for a development deployment. 4 CPUs and 8 GB RAM recommended for sustained use.</li><li>Ports 3000, 8001, 8080, and 5433 free on the host. If you use the developer Excel add-in path, port 3443 must also be free for HTTPS.</li><li>A signed Community licence at <code>./license.json</code> when licence enforcement is enabled.</li></ul>
 <h2>Starting and stopping</h2>
-<pre><code># Start all services in the background
+<pre><code># In the signed Community bundle directory
+./install.sh
+
+# Start all services in the background
 docker compose up -d
 
 # Check service status
@@ -32,19 +35,24 @@ docker compose logs -f query-router
 # Stop all services (data volumes preserved)
 docker compose down</code></pre>
 <h2>Accessing the web UI (HTTP and HTTPS)</h2>
-<p>A local deployment serves the web UI two ways:</p>
-<ul><li><strong><code>http://localhost:3000</code></strong> — plain HTTP. Fine for everyday browser use on your own machine.</li><li><strong><code>https://localhost:3443</code></strong> — HTTPS, using a locally-generated certificate. This is the address you use for the <strong>Excel add-in</strong>: Microsoft Office only loads add-ins served over HTTPS, so the add-in's manifest points at <code>https://localhost:3443</code>, not the HTTP port.</li></ul>
+<p>A Community bundle deployment serves the web UI at:</p>
+<ul><li><strong><code>http://localhost:3000</code></strong> — the main local UI.</li></ul>
+<p>A developer source checkout may also serve HTTPS for the Excel add-in:</p>
+<ul><li><strong><code>https://localhost:3443</code></strong> — HTTPS, using a locally-generated certificate. This is the address you use for the <strong>Excel add-in</strong>: Microsoft Office only loads add-ins served over HTTPS, so the add-in's manifest points at <code>https://localhost:3443</code>, not the HTTP port.</li></ul>
 <p>The HTTPS certificate for <code>localhost:3443</code> is created during deployment (the certificate step, <code>03b_certs</code>). It is a self-signed development certificate, so a browser may warn you the first time — that warning is expected for local development and does not apply to a real deployment, which serves over a trusted certificate. If the Excel add-in cannot connect, confirm port 3443 is free and that the certificate step ran successfully.</p>
 <h2>Persistent data</h2>
 <p>Tessallite uses one named volume: <code>tessallite_pgdata</code> — stores workspace metadata, model definitions, aggregate build history, and the query miss log.</p>
 <p>This volume persists across <code>docker compose down</code> and <code>docker compose up</code> cycles. To delete it and all Tessallite data, use <code>docker compose down -v</code>. See the Teardown article for details.</p>
 <h2>Environment variable configuration</h2>
-<p>Copy <code>.env.example</code> to <code>.env</code> in the same directory as <code>docker-compose.yml</code>. Docker Compose reads this file automatically. The minimum required values are:</p>
+<p>For Community, <code>install.sh</code> creates <code>.env</code> from <code>.env.example</code> if needed, generates missing secrets, and preserves values already present. Review <code>.env</code> before first use if you need to change ports, public URLs, or licence paths. The minimum important values are:</p>
 <pre><code>POSTGRES_PASSWORD=your-strong-password
 CREDENTIAL_ENCRYPTION_KEY=your-fernet-key-here
 JWT_SECRET_KEY=your-jwt-secret-minimum-32-characters
-SYSTEM_ADMIN_PASSWORD=your-admin-password</code></pre>
-<p>Never commit <code>.env</code> to source control — it is listed in <code>.gitignore</code>. Change all four values from their placeholder defaults before running in any shared environment. See <a href="configure-environment-variables.html">Configure Environment Variables</a> for the full variable list and how to generate the Fernet key.</p>
+SYSTEM_ADMIN_PASSWORD=your-admin-password
+LICENSE_FILE_HOST=./license.json
+LICENSE_PUBLIC_KEYS=tessallite-prod-2026:&lt;public-key&gt;</code></pre>
+<p>Never commit <code>.env</code> or <code>license.json</code> to source control. In the release bundle, <code>.env</code> is runtime state; in a source checkout, <code>.env</code> is still local-only and ignored by git. See <a href="configure-environment-variables.html">Configure Environment Variables</a> for the full variable list and ownership rules.</p>
+<p>To replace a licence after the stack is running, open <strong>System Admin &rarr; License &amp; edition</strong> and click <strong>Upload license file</strong>. Tessallite verifies the signed <code>license.json</code>, stores it in the platform database, and applies it immediately without restarting the stack.</p>
 <h2>Environment variable reference</h2>
 <div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Required</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>POSTGRES_PASSWORD</code></td><td>Yes</td><td>—</td><td>Password for the internal PostgreSQL user. Docker Compose uses this to build the connection URL for every service.</td></tr>
@@ -52,13 +60,15 @@ SYSTEM_ADMIN_PASSWORD=your-admin-password</code></pre>
 <tr><td><code>JWT_SECRET_KEY</code></td><td>Yes</td><td>—</td><td>Signs user session tokens. Minimum 32 characters.</td></tr>
 <tr><td><code>SYSTEM_ADMIN_EMAIL</code></td><td>No</td><td><code>admin@tessallite.local</code></td><td>System admin login email.</td></tr>
 <tr><td><code>SYSTEM_ADMIN_PASSWORD</code></td><td>Yes</td><td>—</td><td>System admin password.</td></tr>
+<tr><td><code>LICENSE_FILE_HOST</code></td><td>No</td><td><code>./license.json</code></td><td>Legacy/bootstrap host path to a signed local licence file. The License Manager upload stores the active licence in the platform database.</td></tr>
+<tr><td><code>LICENSE_PUBLIC_KEYS</code></td><td>No</td><td>built-in key</td><td>Optional public verification key override. Normal installs use the built-in Tessallite public key.</td></tr>
 <tr><td><code>JDBC_PORT</code></td><td>No</td><td><code>5433</code></td><td>Host port for the JDBC listener.</td></tr>
 <tr><td><code>XMLA_PORT</code></td><td>No</td><td><code>8080</code></td><td>Host port for the XMLA listener.</td></tr>
 <tr><td><code>LOG_LEVEL</code></td><td>No</td><td><code>info</code></td><td>One of: <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>.</td></tr>
 </tbody></table></div>
 <h2>Enabling debug logging</h2>
 <pre><code>LOG_LEVEL=debug</code></pre>
-<p>Add this to your <code>.env</code> file. Debug output is high volume — use it for short-duration troubleshooting only.</p>
+<p>Add this to your <code>.env</code> file and restart the relevant service. Debug output is high volume — use it for short-duration troubleshooting only.</p>
 <h2>Related</h2>
 <ul><li><a href="architecture-overview.html">Architecture Overview</a></li><li><a href="configure-environment-variables.html">Configure Environment Variables</a></li><li><a href="../getting-started/install-local.html">Install Tessallite Locally</a></li></ul>
 <nav class="page-nav"><a href="architecture-overview.html" class="page-nav-btn prev">&larr; Architecture Overview</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="deploy-gcp.html" class="page-nav-btn next">Deploy on GCP &rarr;</a></nav>

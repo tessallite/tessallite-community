@@ -8,17 +8,74 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from sqlalchemy import delete, select
 
+from shared.connection_scope import (
+    CrossProjectConnectionError,
+    resolve_endpoint_connection,
+)
 from shared.db.models import (
+    DataSource,
     EntityTranslation,
     GlossaryAttachment,
     GlossaryEntry,
     Model,
+    ProjectConnection,
     UserEntityPreference,
 )
 
 
 def model_not_found() -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
+
+
+def cross_project_connection() -> HTTPException:
+    """Bug-5325: a DataSource/DataTarget row points its connection at a
+    different project than the one that owns the source. Refuse to use it."""
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail=(
+            "Source connection belongs to a different project. This source is "
+            "misconfigured; re-point it at a connection in the correct project."
+        ),
+    )
+
+
+async def resolve_source_connection(
+    db,
+    source: DataSource,
+    *,
+    expected_project_id: UUID,
+) -> ProjectConnection:
+    """Read-time, fail-closed resolution of a DataSource's ProjectConnection.
+
+    Bug-5325: create/update guards stop NEW cross-project writes, but legacy or
+    imported ``DataSource.project_connection_id`` rows could already point at a
+    ProjectConnection that belongs to a DIFFERENT project (and therefore a
+    different tenant's source credentials). Every read site that turns a source
+    into a live connection must funnel through here so such a row is REJECTED
+    rather than silently used.
+
+    ``expected_project_id`` is the project that owns the source — i.e. the
+    project_id of the source's model, already validated by
+    ``ensure_model_in_project``. The connection is accepted only when its
+    ``project_id`` matches; this mirrors the create/update validators' notion of
+    "belongs to this project".
+
+    Delegates the actual project-scope check to the shared fail-closed resolver
+    (``shared.connection_scope``) so there is a single source of truth shared
+    with the query-router execution sites; this handler only maps the shared
+    errors onto the model-service's HTTP error shapes.
+    """
+    try:
+        return await resolve_endpoint_connection(
+            db, source, expected_project_id=expected_project_id
+        )
+    except CrossProjectConnectionError:
+        raise cross_project_connection()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project connection not found",
+        )
 
 
 async def purge_entity_soft_references(db, *, model_id: UUID, entity_id: UUID) -> None:

@@ -1,9 +1,10 @@
 # Tessallite Source Available Scope Notes
 
-Last updated: 2026-06-23
+Version: 1.0
+Effective date: 2026-06-23
 
-Tessallite Community source is source-available, not open-source. The governing
-source license is the root `LICENSE` file.
+Tessallite Community source is source-available under the governing source
+license in the root `LICENSE` file.
 
 ## Scope
 
@@ -12,15 +13,16 @@ the public Tessallite Community repository and not marked with another license.
 
 It does not apply to:
 
-- closed license manager implementations;
+- proprietary license manager implementations;
 - gateway guard/admission modules;
-- internal request-token issuer/verifier modules when shipped closed;
-- model-service policy-enforcement modules or compiled model-service builds when
-  shipped as closed artifacts;
+- internal request-token issuer/verifier modules when shipped as proprietary
+  runtime components;
+- model-service policy modules or compiled model-service builds when shipped as
+  proprietary runtime components;
 - license issuer/signing systems;
 - private release/signing automation;
 - optional optimizer, acceleration planner, aggregate/pocket matcher, exactness
-  validator, aggregate/pocket rewrite, and related private IP modules;
+  validator, aggregate/pocket rewrite, and related proprietary modules;
 - customer-specific Enterprise artifacts;
 - container images, VM images, appliance images, or release bundles except to
   the extent they expressly include source-available files;

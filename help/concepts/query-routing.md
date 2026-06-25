@@ -7,7 +7,7 @@ updated: 2026-04-23
 
 ## What this covers
 
-This article explains how Tessallite decides whether a query is answered from a pre-computed summary or from the raw source table. It covers the routing conditions, the behaviour of non-additive measures, and what happens when no summary matches.
+This article explains how Tessallite decides whether a query is answered from a pre-computed summary or from the governed source path. It covers the routing conditions, the behaviour of non-additive measures, and what happens when no summary matches.
 
 ---
 
@@ -21,7 +21,7 @@ Tessallite routes a query to a pre-computed aggregate when all three of the foll
 
 **Any column the query uses to filter is part of the aggregate's grain.** If a query filters by product category, the aggregate must have been computed with product category as a dimension.
 
-If any one of these conditions is not met, the query runs against the raw source table.
+If any one of these conditions is not met, the query runs through the governed source path.
 
 ![Query routing flow.](../assets/illustrations/query-routing-flow.svg)
 
@@ -29,19 +29,19 @@ If any one of these conditions is not met, the query runs against the raw source
 
 ## Non-additive measures
 
-COUNT DISTINCT and other non-additive operations require an exact grain match. A coarser aggregate cannot be used even if it covers all the requested dimensions. Distinct counts cannot be re-aggregated from a summary computed at a coarser grain: summing the distinct counts from two regions does not yield the correct distinct count for the combined total. The query falls through to the raw source unless the aggregate was computed at exactly the same grain.
+COUNT DISTINCT and other non-additive operations require an exact grain match. A coarser aggregate cannot be used even if it covers all the requested dimensions. Distinct counts cannot be re-aggregated from a summary computed at a coarser grain: summing the distinct counts from two regions does not yield the correct distinct count for the combined total. The query falls through to the source path unless the aggregate was computed at exactly the same grain.
 
 ---
 
 ## What happens on a miss
 
-When no suitable aggregate exists, the query runs against the raw source table. The miss is logged with the query's grain and measure pattern. The Optimizer reads the miss log. When the same pattern appears frequently enough, the Optimizer creates a new aggregate. Future queries matching that pattern are routed to the new aggregate.
+When no suitable aggregate exists, the query runs through the governed source path. The miss is logged with the query's grain and measure pattern. The Optimizer reads the miss log. When the same pattern appears frequently enough, the Optimizer creates a new aggregate. Future queries matching that pattern are routed to the new aggregate.
 
 ---
 
 ## Hit rate
 
-The hit rate is the proportion of queries that were served from an aggregate rather than the raw source. A higher hit rate indicates that more queries are being answered without scanning raw data. The hit rate metric is visible in the Diagnostics panel of the Model Builder.
+The hit rate is the proportion of queries that were served from an aggregate rather than the source path. A higher hit rate indicates that more queries are being answered without scanning detailed source rows. The hit rate metric is visible in the Diagnostics panel of the Model Builder.
 
 ---
 

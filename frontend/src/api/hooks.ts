@@ -34,6 +34,7 @@ import {
   savedQueriesApi,
   userDefinedAttributesApi,
   editionApi,
+  advisoriesApi,
 } from "./client";
 
 // ---------------------------------------------------------------------------
@@ -55,6 +56,19 @@ export function useLimits() {
     queryKey: ["edition", "limits"],
     queryFn: () => editionApi.getLimits(),
     staleTime: EDITION_STALE_MS,
+  });
+}
+
+const ADVISORIES_STALE_MS = 15 * 60 * 1000;
+
+export function useAdvisories() {
+  return useQuery({
+    queryKey: ["advisories"],
+    queryFn: () => advisoriesApi.list(),
+    staleTime: ADVISORIES_STALE_MS,
+    // The issuer is external; one quick retry, then fall through to the
+    // unreachable state rather than spinning.
+    retry: 1,
   });
 }
 

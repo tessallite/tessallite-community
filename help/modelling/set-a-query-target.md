@@ -55,7 +55,7 @@ The query target must be:
 5. Enter the **Schema / dataset name**. This is the schema (PostgreSQL, Snowflake, Redshift) or dataset (BigQuery) inside the selected connection where summary tables will be created. The schema must already exist; Tessallite does not create it.
 6. Click **Save**. Tessallite validates that the Scheduler service can reach the target with the expected permissions. If validation fails, an error message describes which permission or connection step failed.
 
-> **Note:** If validation passes but an aggregate build later fails with a permission error, the most likely cause is that the schema-level grant was applied but the connection's service account has a table-level override blocking it. Review the grants on the target schema directly in the data warehouse.
+> **Note:** If validation passes but an aggregate build later fails with a permission error, the most likely cause is that the schema-level grant was applied but the connection's service account has a table-level override blocking it. Review the grants on the target schema directly in the target source.
 
 ---
 

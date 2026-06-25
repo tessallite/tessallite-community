@@ -79,9 +79,9 @@ SHAPE_OWNERS: dict[int, str] = {
     68: "suite:test_demo_data_integration.py + suite:test_expression_routing.py (qualified table)",
     69: "suite:test_binder_filter_validation.py::test_known_from_table_slug_accepted",
     70: "suite:test_binder_filter_validation.py::test_unknown_from_table_raises",
-    71: "tracked-gap:G-2 (multi-source SELECT; e2e, two source DBs)",
-    72: "tracked-gap:G-2 (multi-source filter-only; e2e, two source DBs)",
-    73: "tracked-gap:G-2 (multi-source order-only; e2e, two source DBs)",
+    71: "suite:test_multi_source_reject.py::test_cross_source_reject_71_72_73 (multi-source SELECT; CROSS_SOURCE_UNSUPPORTED 400)",
+    72: "suite:test_multi_source_reject.py::test_cross_source_reject_71_72_73 (multi-source filter-only; CROSS_SOURCE_UNSUPPORTED 400)",
+    73: "suite:test_multi_source_reject.py::test_cross_source_reject_71_72_73 (multi-source order-only; CROSS_SOURCE_UNSUPPORTED 400)",
     # --- Input dialect quoting #74-#76 ---------------------------------------
     74: "suite:test_input_dialect_contract.py (BigQuery backticks)",
     75: "suite:test_input_dialect_contract.py (SQL Server brackets)",

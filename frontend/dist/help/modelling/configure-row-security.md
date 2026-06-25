@@ -69,9 +69,9 @@ Anything outside this grammar is rejected at save time with a structured validat
 
 String literals are single-quoted. Escape a single quote by doubling it (`'O''Brien'`).
 
-![The Row Security Rule dialog in create mode, showing the shape-adaptive form with free-text dimension path, the DSL editor, and the applies-to-roles text input.](../assets/screencaps/row-security-rule-drawer.png)
+![The Row Security Rule dialog in create mode, showing the shape-adaptive form with a dimension dropdown selector, the DSL editor, and the applies-to-roles text input.](../assets/screencaps/row-security-rule-drawer.png)
 
-*Figure 2 — Authoring a role predicate. The dimension path field is a plain free-text input where you type the path manually (for example `region.region_code`). The predicate expression field is a multi-line text area where you write the DSL expression; a helper hint below the field reminds you of the supported forms. The applies-to-roles field accepts a comma-separated list of role names. When the rule type is changed to `user_mapping`, the form adapts to show mapping-table fields instead. Full description: [row-security-rule-drawer.txt](../assets/screencaps/row-security-rule-drawer.txt).*
+*Figure 2 — Authoring a role predicate. The dimension path field is a dropdown selector populated from the model's defined dimensions; select the dimension the rule filters on (for example `region_code`). The predicate expression field is a multi-line text area where you write the DSL expression; a helper hint below the field reminds you of the supported forms. The applies-to-roles field accepts a comma-separated list of role names. When the rule type is changed to `user_mapping`, the form adapts to show a mapping-table dropdown (populated from the model's tables) and column-name fields instead. Full description: [row-security-rule-drawer.txt](../assets/screencaps/row-security-rule-drawer.txt).*
 
 ### 2. User mapping
 
@@ -158,7 +158,7 @@ Phase 12 will extend this to a **workspace-wide simulate mode** that re-runs the
 | **Roles are strings carried on the JWT.** No central role registry in v1. | Typos in `applies_to_roles` silently match nothing. | Keep a canonical list of role strings in the team's runbook; Phase 12's rule-coverage audit will highlight orphaned roles. |
 | **One security dimension per rule.** A rule filters on exactly one `dimension_path`. | Compound rules require multiple rules. | Author multiple rules — they AND together. |
 | **Embed sessions are persona-filtered, not RLS-rule-filtered.** An embedded view runs under its embed persona's default filters; it carries no role, group, or claim, so `role_predicate` / `idp_group` / `saml_claim` / `oidc_scope` rules never match it. | A `role_predicate` rule you expect to filter an embedded view will not apply. | Express the embedded audience's scope as the embed persona's default filters, not as an RLS rule. |
-| **Visual rule builder (predicate tree, simulate-principal canvas overlay, coverage audit) is split to Phase 12.** | Current authoring is a free-text DSL editor. | The DSL is small; the form validates as you type; Simulate gives the round-trip check. |
+| **Visual rule builder (predicate tree, simulate-principal canvas overlay, coverage audit) is split to Phase 12.** | Current authoring uses model-aware dropdown selectors for dimension and mapping table, but the predicate expression is a free-text DSL editor. | The DSL is small; the form validates as you type; Simulate gives the round-trip check. |
 
 ---
 

@@ -76,6 +76,40 @@ def build_discover_response(
     col_defs = _ROWSETS[rtype]["columns"] if rtype in _ROWSETS else [{"name": k, "type": "string"} for k in (rows[0].keys() if rows else [])]
     return _build_rowset_xml(col_defs, rows)
 
+# XSD built-in types must be referenced with the ``xs:`` prefix. The inline rowset
+# schema is nested under a ``<root xmlns="...rowset">`` element, so an UNPREFIXED
+# ``type="string"`` resolves (via the inherited default namespace) to the rowset
+# target namespace — where ``string`` is undefined — making the schema invalid.
+# Lenient clients (curl, our XMLA probes) ignore it, but Excel's MSOLAP validates
+# the schema strictly and rejects the rowset ("cannot retrieve list of databases").
+# Custom types declared IN the target namespace (uuid, row, xmlDocument) must stay
+# unprefixed so they resolve to the rowset namespace.
+_XSD_BUILTIN_TYPES = frozenset({
+    "string", "int", "integer", "long", "short", "decimal", "double", "float",
+    "boolean", "dateTime", "date", "time", "base64Binary",
+    "unsignedInt", "unsignedShort", "unsignedLong", "unsignedByte", "byte",
+})
+_ROWSET_CUSTOM_TYPES = frozenset({"uuid", "row", "xmlDocument"})
+
+
+def _qualify_xsd_type(xsd_type: str) -> str:
+    """Return the schema type reference, prefixing XSD built-ins with ``xs:``.
+
+    Custom rowset-namespace types (uuid/row/xmlDocument) are returned unchanged.
+    An unrecognised type (neither a known built-in nor a custom type) is returned
+    as-is but LOGGED — a typo'd or newly-added config type emitted bare would
+    silently re-introduce the invalid-schema condition (Bug-5518).
+    """
+    if xsd_type in _XSD_BUILTIN_TYPES:
+        return f"xs:{xsd_type}"
+    if xsd_type not in _ROWSET_CUSTOM_TYPES:
+        logger.warning(
+            "mdschema: unrecognised XSD type %r emitted unprefixed; if it is an "
+            "XSD built-in, add it to _XSD_BUILTIN_TYPES (Bug-5518)", xsd_type,
+        )
+    return xsd_type
+
+
 def _build_rowset_xml(col_defs: list[dict], rows: list[dict[str, str]]) -> str:
     """
     Render a MSOLAP-compatible rowset string with proper XSD types.
@@ -93,16 +127,16 @@ def _build_rowset_xml(col_defs: list[dict], rows: list[dict[str, str]]) -> str:
             attrs += f' maxOccurs="{max_occurs}"'
         if not required:
             attrs += ' minOccurs="0"'
-        col_elements += f'<xs:element{attrs} name="{name}" sql:field="{name}" type="{xsd_type}"/>'
+        col_elements += f'<xs:element{attrs} name="{name}" sql:field="{name}" type="{_qualify_xsd_type(xsd_type)}"/>'
 
     schema = (
-        f'<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:sql="{_SQL_NS}" elementFormDefault="qualified" '
+        f'<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:sql="{_SQL_NS}" xmlns="{_ROWSET_NS}" elementFormDefault="qualified" '
         f'targetNamespace="{_ROWSET_NS}">'
         f'<xs:element name="root"><xs:complexType>'
         f'<xs:sequence maxOccurs="unbounded" minOccurs="0">'
         f'<xs:element name="row" type="row"/>'
         f'</xs:sequence></xs:complexType></xs:element>'
-        f'<xs:simpleType name="uuid"><xs:restriction base="string">'
+        f'<xs:simpleType name="uuid"><xs:restriction base="xs:string">'
         f'<xs:pattern value="[0-9a-zA-Z]{{8}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{12}}"/>'
         f'</xs:restriction></xs:simpleType>'
         f'<xs:complexType name="xmlDocument"><xs:sequence><xs:any/></xs:sequence></xs:complexType>'
@@ -273,9 +307,20 @@ def _build_schema_rowsets_xml() -> str:
             ("CUBE_NAME", "string"), ("SET_NAME", "string"),
             ("SCOPE", "int"),
         ],
+        # Bug-5430: Power BI / Tabular discovery rowsets advertised so a
+        # discovering client knows the gateway dispatches them.
+        "DISCOVER_CSDL_METADATA": [
+            ("CATALOG_NAME", "string"), ("VERSION", "string"),
+            ("PERSPECTIVE_NAME", "string"),
+        ],
+        "DISCOVER_CALC_DEPENDENCY": [
+            ("DATABASE_NAME", "string"), ("OBJECT_TYPE", "string"),
+            ("TABLE", "string"), ("OBJECT", "string"),
+        ],
     }
 
-    # Schema order matching OlaPy exactly (OlaPy starts with DBSCHEMA_TABLES)
+    # Schema order matching OlaPy exactly (OlaPy starts with DBSCHEMA_TABLES).
+    # The two Tabular rowsets (Bug-5430) are appended after the SSAS roster.
     _OLAPY_ORDER = [
         "DBSCHEMA_TABLES", "DISCOVER_DATASOURCES", "DISCOVER_INSTANCES",
         "DISCOVER_KEYWORDS", "DBSCHEMA_CATALOGS", "DISCOVER_LITERALS",
@@ -286,6 +331,7 @@ def _build_schema_rowsets_xml() -> str:
         "MDSCHEMA_MEASUREGROUPS", "MDSCHEMA_MEASUREGROUP_DIMENSIONS",
         "MDSCHEMA_MEASURES", "MDSCHEMA_MEMBERS", "MDSCHEMA_PROPERTIES",
         "MDSCHEMA_SETS",
+        "DISCOVER_CSDL_METADATA", "DISCOVER_CALC_DEPENDENCY",
     ]
 
     rows_xml = ""
@@ -317,26 +363,26 @@ def _build_schema_rowsets_xml() -> str:
     # XSD matching OlaPy format: uuid simpleType, xmlDocument complexType,
     # maxOccurs/minOccurs on sequence, SchemaGuid type=uuid, RestrictionsMask type=unsignedLong
     schema = (
-        f'<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:sql="{_SQL_NS}" elementFormDefault="qualified" '
+        f'<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:sql="{_SQL_NS}" xmlns="{_ROWSET_NS}" elementFormDefault="qualified" '
         f'targetNamespace="{_ROWSET_NS}">'
         f'<xs:element name="root"><xs:complexType>'
         f'<xs:sequence maxOccurs="unbounded" minOccurs="0">'
         f'<xs:element name="row" type="row"/>'
         f'</xs:sequence></xs:complexType></xs:element>'
-        f'<xs:simpleType name="uuid"><xs:restriction base="string">'
+        f'<xs:simpleType name="uuid"><xs:restriction base="xs:string">'
         f'<xs:pattern value="[0-9a-zA-Z]{{8}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{4}}-[0-9a-zA-Z]{{12}}"/>'
         f'</xs:restriction></xs:simpleType>'
         f'<xs:complexType name="xmlDocument"><xs:sequence><xs:any/></xs:sequence></xs:complexType>'
         f'<xs:complexType name="row"><xs:sequence>'
-        f'<xs:element minOccurs="0" name="SchemaName" sql:field="SchemaName" type="string"/>'
+        f'<xs:element minOccurs="0" name="SchemaName" sql:field="SchemaName" type="xs:string"/>'
         f'<xs:element minOccurs="0" name="SchemaGuid" sql:field="SchemaGuid" type="uuid"/>'
         f'<xs:element maxOccurs="unbounded" minOccurs="0" name="Restrictions" sql:field="Restrictions">'
         f'<xs:complexType><xs:sequence>'
-        f'<xs:element minOccurs="0" name="Name" sql:field="Name" type="string"/>'
-        f'<xs:element minOccurs="0" name="Type" sql:field="Type" type="string"/>'
+        f'<xs:element minOccurs="0" name="Name" sql:field="Name" type="xs:string"/>'
+        f'<xs:element minOccurs="0" name="Type" sql:field="Type" type="xs:string"/>'
         f'</xs:sequence></xs:complexType></xs:element>'
-        f'<xs:element minOccurs="0" name="Description" sql:field="Description" type="string"/>'
-        f'<xs:element minOccurs="0" name="RestrictionsMask" sql:field="RestrictionsMask" type="unsignedLong"/>'
+        f'<xs:element minOccurs="0" name="Description" sql:field="Description" type="xs:string"/>'
+        f'<xs:element minOccurs="0" name="RestrictionsMask" sql:field="RestrictionsMask" type="xs:unsignedLong"/>'
         f'</xs:sequence></xs:complexType>'
         f'</xs:schema>'
     )
@@ -398,6 +444,9 @@ def _get_rows(rtype, catalog, model_id, measures, dimensions, url, properties, r
     if rtype == "MDSCHEMA_PROPERTIES": return _rows_md_properties(catalog, dimensions, measures, restrictions)
     if rtype == "MDSCHEMA_SETS": return _rows_sets(catalog, named_sets)
     if rtype == "MDSCHEMA_KPIS": return _rows_kpis(catalog, kpis, measures)
+    # Bug-5430: Power BI / Tabular discovery rowsets.
+    if rtype == "DISCOVER_CSDL_METADATA": return _rows_csdl_metadata(catalog, measures, dimensions)
+    if rtype == "DISCOVER_CALC_DEPENDENCY": return _rows_calc_dependency(catalog)
     return []
 
 def _row(name: str, value: Any, access: str = "Read", ptype: str = "string") -> dict[str, str]:
@@ -1325,6 +1374,20 @@ def _rows_members(
                 next_level_members = members_by_level.get(level_idx + 1, [])
                 child_count = sum(1 for m in next_level_members if str(m.get("parent") or "") == mname)
 
+                # Bug-5434: flat (single-level) dimension with a distinct display
+                # attribute. SSAS surfaces the display name as MEMBER_NAME /
+                # MEMBER_CAPTION and the key separately as MEMBER_KEY; the member
+                # is still identified by its KEY in MEMBER_UNIQUE_NAME. Previously
+                # the flat branch emitted MEMBER_NAME = key, so a flat dim whose
+                # member_data carried a separate caption surfaced
+                # MEMBER_KEY == MEMBER_NAME == the raw key (caption lost on the
+                # NAME axis). Multi-level hierarchies keep the Bug-3617 key-form
+                # MEMBER_NAME the dual-grammar matcher depends on (unchanged).
+                if is_multi_level:
+                    member_name_out = mname
+                else:
+                    member_name_out = mem_caption
+
                 # Bug-3617 (Phase 2): canonical SSAS member identity. MEMBER_UNIQUE_NAME
                 # is the ancestor-qualified key path (built above) — byte-identical to
                 # the SUBTOTAL Execute axis, so a client joining DISCOVER to Execute
@@ -1356,7 +1419,7 @@ def _rows_members(
                     "LEVEL_UNIQUE_NAME": level_uname,
                     "LEVEL_NUMBER": str(level_idx + 1),
                     "MEMBER_ORDINAL": str(mem.get("ordinal", 0)),
-                    "MEMBER_NAME": mname,
+                    "MEMBER_NAME": member_name_out,
                     "MEMBER_UNIQUE_NAME": mem_uname,
                     "MEMBER_TYPE": "1",  # MDMEMBER_TYPE_REGULAR
                     "MEMBER_CAPTION": mem_caption,
@@ -1818,3 +1881,209 @@ def _rows_kpis(
             "ASSOCIATE_MEASURE_GROUP_NAME": "default",
         })
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Bug-5430: Power BI / Tabular (Analysis Services Tabular) discovery rowsets
+# ---------------------------------------------------------------------------
+
+def _rows_csdl_metadata(
+    catalog: str,
+    measures: list[dict[str, Any]],
+    dimensions: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """DISCOVER_CSDL_METADATA — a single-row rowset whose ``Metadata`` cell
+    carries a minimal CSDL (Conceptual Schema Definition Language) document
+    describing the catalog as a Tabular model.
+
+    Power BI Desktop and "Analyze in Excel" issue this against an XMLA endpoint
+    to learn the Tabular shape (entity container, entity sets for each table,
+    measure members). We are a semantic-aggregation layer, not a full Tabular
+    server, so we emit a minimally-conformant CSDL envelope: one EntityType per
+    dimension-bearing table plus the measure properties. This lets a Power BI
+    discovery succeed (it gets a well-formed schema) instead of hard-failing on
+    an unrecognised request type.
+
+    The CSDL is embedded as an escaped XML string in the ``Metadata`` cell —
+    this matches the SSAS contract, where the row column carries the document
+    text rather than nested elements.
+    """
+    cube = catalog or "Model"
+    props: list[str] = []
+    for d in dimensions:
+        dname = str(d.get("name", "")).strip()
+        if not dname:
+            continue
+        props.append(
+            f'<Property Name="{_xe(dname)}" Type="Edm.String" Nullable="true"/>'
+        )
+    for m in measures:
+        mname = str(m.get("name", "")).strip()
+        if not mname:
+            continue
+        props.append(
+            f'<Property Name="{_xe(mname)}" Type="Edm.Double" Nullable="true"/>'
+        )
+    csdl = (
+        '<edmx:Edmx Version="1.0" '
+        'xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx">'
+        '<edmx:DataServices>'
+        '<Schema xmlns="http://schemas.microsoft.com/ado/2008/09/edm" '
+        f'Namespace="{_xe(cube)}">'
+        f'<EntityType Name="{_xe(cube)}">'
+        '<Key><PropertyRef Name="RowNumber"/></Key>'
+        '<Property Name="RowNumber" Type="Edm.Int64" Nullable="false"/>'
+        + "".join(props)
+        + '</EntityType>'
+        f'<EntityContainer Name="{_xe(cube)}">'
+        f'<EntitySet Name="{_xe(cube)}" EntityType="{_xe(cube)}.{_xe(cube)}"/>'
+        '</EntityContainer>'
+        '</Schema>'
+        '</edmx:DataServices>'
+        '</edmx:Edmx>'
+    )
+    return [{"Metadata": csdl}]
+
+
+def _rows_calc_dependency(catalog: str) -> list[dict[str, str]]:
+    """DISCOVER_CALC_DEPENDENCY — calculation dependency graph for a Tabular
+    model. Tessallite measures/dimensions are not Tabular calculation objects
+    with a DAX dependency graph, so this rowset is legitimately EMPTY (the same
+    way a Tabular model with no calculated columns/measures returns no rows).
+    Returning the conformant empty rowset lets the discovery succeed rather than
+    faulting on an unrecognised request type.
+    """
+    return []
+
+
+# TMSCHEMA tables we surface from model metadata. A DMV referencing any other
+# TMSCHEMA table gets the conformant empty-rowset answer.
+TMSCHEMA_TABLES = {
+    "TMSCHEMA_MODEL",
+    "TMSCHEMA_TABLES",
+    "TMSCHEMA_COLUMNS",
+    "TMSCHEMA_MEASURES",
+    "TMSCHEMA_HIERARCHIES",
+    "TMSCHEMA_LEVELS",
+    "TMSCHEMA_PARTITIONS",
+    "TMSCHEMA_RELATIONSHIPS",
+}
+
+
+def build_tmschema_rowset(
+    table: str,
+    catalog: str,
+    measures: list[dict[str, Any]],
+    dimensions: list[dict[str, Any]],
+    hierarchy_defs: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Build (col_defs, rows) for a ``$SYSTEM.TMSCHEMA_*`` DMV (Bug-5430).
+
+    Returns a minimally-conformant Tabular-metadata projection built from the
+    model's measures / dimensions / hierarchies. Unknown TMSCHEMA tables return
+    an empty rowset with a single ``ID`` column so the response is well-formed.
+    ``ID`` values are synthetic stable ordinals (1-based) — we have no Tabular
+    object IDs, but Power BI only needs referential consistency within one DMV
+    response, which the ordinals provide.
+    """
+    tbl = (table or "").upper()
+    hierarchy_defs = hierarchy_defs or []
+    cube = catalog or "Model"
+
+    if tbl == "TMSCHEMA_MODEL":
+        cols = [{"name": "ID", "type": "long"}, {"name": "Name", "type": "string"}]
+        return cols, [{"ID": "1", "Name": cube}]
+
+    if tbl == "TMSCHEMA_TABLES":
+        cols = [
+            {"name": "ID", "type": "long"}, {"name": "ModelID", "type": "long"},
+            {"name": "Name", "type": "string"}, {"name": "IsHidden", "type": "boolean"},
+        ]
+        return cols, [{"ID": "1", "ModelID": "1", "Name": cube, "IsHidden": "false"}]
+
+    if tbl == "TMSCHEMA_COLUMNS":
+        cols = [
+            {"name": "ID", "type": "long"}, {"name": "TableID", "type": "long"},
+            {"name": "ExplicitName", "type": "string"},
+            {"name": "DataType", "type": "int"}, {"name": "IsHidden", "type": "boolean"},
+        ]
+        rows: list[dict[str, str]] = []
+        idx = 1
+        for d in dimensions:
+            dname = str(d.get("name", "")).strip()
+            if not dname:
+                continue
+            rows.append({
+                "ID": str(idx), "TableID": "1", "ExplicitName": dname,
+                # DataType 2 = String in the TOM DataType enum.
+                "DataType": "2",
+                "IsHidden": "true" if d.get("is_hidden") else "false",
+            })
+            idx += 1
+        return cols, rows
+
+    if tbl == "TMSCHEMA_MEASURES":
+        cols = [
+            {"name": "ID", "type": "long"}, {"name": "TableID", "type": "long"},
+            {"name": "Name", "type": "string"}, {"name": "Expression", "type": "string"},
+            {"name": "IsHidden", "type": "boolean"},
+        ]
+        rows = []
+        for idx, m in enumerate(measures, start=1):
+            mname = str(m.get("name", "")).strip()
+            if not mname:
+                continue
+            rows.append({
+                "ID": str(idx), "TableID": "1", "Name": mname,
+                "Expression": str(m.get("expression") or ""),
+                "IsHidden": "true" if m.get("is_hidden") else "false",
+            })
+        return cols, rows
+
+    if tbl == "TMSCHEMA_HIERARCHIES":
+        cols = [
+            {"name": "ID", "type": "long"}, {"name": "TableID", "type": "long"},
+            {"name": "Name", "type": "string"}, {"name": "IsHidden", "type": "boolean"},
+        ]
+        rows = []
+        for idx, h in enumerate(hierarchy_defs, start=1):
+            hname = str(h.get("name", "")).strip()
+            if not hname:
+                continue
+            rows.append({
+                "ID": str(idx), "TableID": "1", "Name": hname, "IsHidden": "false",
+            })
+        return cols, rows
+
+    if tbl == "TMSCHEMA_LEVELS":
+        cols = [
+            {"name": "ID", "type": "long"}, {"name": "HierarchyID", "type": "long"},
+            {"name": "Ordinal", "type": "int"}, {"name": "Name", "type": "string"},
+        ]
+        rows = []
+        lid = 1
+        for hidx, h in enumerate(hierarchy_defs, start=1):
+            levels = h.get("levels") or []
+            for ordinal, lvl in enumerate(levels):
+                lname = (
+                    str(lvl.get("name", "")).strip()
+                    if isinstance(lvl, dict) else str(lvl).strip()
+                )
+                if not lname:
+                    continue
+                rows.append({
+                    "ID": str(lid), "HierarchyID": str(hidx),
+                    "Ordinal": str(ordinal), "Name": lname,
+                })
+                lid += 1
+        return cols, rows
+
+    if tbl == "TMSCHEMA_PARTITIONS":
+        cols = [
+            {"name": "ID", "type": "long"}, {"name": "TableID", "type": "long"},
+            {"name": "Name", "type": "string"},
+        ]
+        return cols, [{"ID": "1", "TableID": "1", "Name": f"{cube}-partition"}]
+
+    # TMSCHEMA_RELATIONSHIPS and any other table: conformant empty rowset.
+    return [{"name": "ID", "type": "long"}], []

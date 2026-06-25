@@ -8,12 +8,29 @@ from __future__ import annotations
 import base64
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
 
 from src import licensing_guard
 from shared.licensing.issuer.sign import generate_ed25519_keypair, sign_license
+
+
+async def _load_license_from_file(monkeypatch, lf):
+    """Populate the license manager from a signed license FILE.
+
+    After the License-Manager refactor, ``get_license_manager()`` no longer auto-loads;
+    the manager is (re)built by ``reload_license_manager()``, which reads
+    ``load_license_doc_from_db()`` (system DB first, file fallback). Unit tests have no
+    system DB, so mock that loader to return the file's doc and trigger the reload.
+    Pass ``lf=None`` for the no-license case.
+    """
+    doc = json.loads(open(lf, encoding="utf-8").read()) if lf else None
+    monkeypatch.setattr(
+        licensing_guard, "load_license_doc_from_db", AsyncMock(return_value=doc)
+    )
+    await licensing_guard.reload_license_manager()
 
 
 def _settings(**kw):
@@ -53,9 +70,12 @@ def _community_license_file(tmp_path, models=2, demo_tenant_id=None):
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
-    licensing_guard.get_license_manager.cache_clear()
+    # licensing_guard caches the manager in a module global (_MANAGER) with an async
+    # reload_license_manager(); reset that singleton between tests. (Was .cache_clear()
+    # from the old @lru_cache impl, which broke after the License-Manager refactor.)
+    licensing_guard._MANAGER = None
     yield
-    licensing_guard.get_license_manager.cache_clear()
+    licensing_guard._MANAGER = None
 
 
 async def _count(n: int) -> int:
@@ -84,6 +104,7 @@ async def test_enforcement_on_allows_under_cap(tmp_path, monkeypatch):
         "get_settings",
         lambda: _settings(LICENSE_ENFORCEMENT_ENABLED=True, LICENSE_FILE=lf, LICENSE_PUBLIC_KEYS=pk),
     )
+    await _load_license_from_file(monkeypatch, lf)
     # 0 and 1 existing models -> allowed (cap 2)
     await licensing_guard.enforce_create_cap("model", lambda: _count(0))
     await licensing_guard.enforce_create_cap("model", lambda: _count(1))
@@ -96,6 +117,7 @@ async def test_enforcement_on_blocks_at_cap(tmp_path, monkeypatch):
         "get_settings",
         lambda: _settings(LICENSE_ENFORCEMENT_ENABLED=True, LICENSE_FILE=lf, LICENSE_PUBLIC_KEYS=pk),
     )
+    await _load_license_from_file(monkeypatch, lf)
     with pytest.raises(HTTPException) as exc:
         await licensing_guard.enforce_create_cap("model", lambda: _count(2))
     assert exc.value.status_code == 403
@@ -103,24 +125,77 @@ async def test_enforcement_on_blocks_at_cap(tmp_path, monkeypatch):
 
 
 async def test_unactivated_when_enabled_without_license(monkeypatch):
-    # enforcement on but no license configured -> stub denies (Community unactivated)
+    # enforcement ON but no license -> fail-CLOSED: the unactivated manager DENIES creates
+    # (Bug-5496 fix). Not installing a licence must never grant the full product.
     monkeypatch.setattr(
         licensing_guard,
         "get_settings",
         lambda: _settings(LICENSE_ENFORCEMENT_ENABLED=True),
     )
+    await _load_license_from_file(monkeypatch, None)
     with pytest.raises(HTTPException) as exc:
         await licensing_guard.enforce_create_cap("project", lambda: _count(0))
     assert exc.value.status_code == 403
 
 
-def test_demo_source_locked_blocks_demo_tenant(tmp_path, monkeypatch):
+async def test_no_license_enforcement_on_is_unactivated_not_unlimited(monkeypatch):
+    # Regression for Bug-5496 (the breach): enforcement ON + no licence must NOT fall back
+    # to the full product. The manager is the fail-closed unactivated stub that denies every
+    # create — so caps can't be bypassed by simply never installing a licence.
+    monkeypatch.setattr(
+        licensing_guard,
+        "get_settings",
+        lambda: _settings(LICENSE_ENFORCEMENT_ENABLED=True),
+    )
+    await _load_license_from_file(monkeypatch, None)
+    mgr = licensing_guard.get_license_manager()
+    assert mgr.status()["activated"] is False
+    assert mgr.can_create("model", 0).allowed is False
+    assert mgr.can_create("user", 0).allowed is False
+    assert mgr.can_create("project", 0).allowed is False
+
+
+def test_no_license_enforcement_off_is_full_product(monkeypatch):
+    # Counterpart: enforcement OFF + no licence stays the full product (dev/internal).
+    monkeypatch.setattr(licensing_guard, "get_settings", lambda: _settings())
+    mgr = licensing_guard.get_license_manager()
+    assert mgr.can_create("model", 999).allowed is True
+
+
+async def test_db_lookup_error_falls_back_to_file(tmp_path, monkeypatch):
+    # Regression for Bug-5485: if the system-DB licence lookup raises (e.g. the schema
+    # is not migrated yet — on K8s the migration runs as a post-install Job AFTER the
+    # pods start), load_license_doc_from_db must SWALLOW it and fall through to the
+    # file. Otherwise a file-mounted Community licence never loads and the manager is
+    # stuck unactivated, denying every create even with a valid licence installed.
+    lf, pk = _community_license_file(tmp_path, models=2)
+    monkeypatch.setattr(
+        licensing_guard,
+        "get_settings",
+        lambda: _settings(LICENSE_ENFORCEMENT_ENABLED=True, LICENSE_FILE=lf, LICENSE_PUBLIC_KEYS=pk),
+    )
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("relation \"system_settings\" does not exist")
+        yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(licensing_guard, "get_system_db", _boom)
+    doc = await licensing_guard.load_license_doc_from_db()
+    assert doc is not None and doc.get("license_id"), "file licence must load when the DB errors"
+
+    # end to end: reload from that file -> activated manager that enforces (not unactivated)
+    await licensing_guard.reload_license_manager()
+    assert licensing_guard.get_license_manager().status().get("activated") is True
+
+
+async def test_demo_source_locked_blocks_demo_tenant(tmp_path, monkeypatch):
     lf, pk = _community_license_file(tmp_path, demo_tenant_id="demo-123")
     monkeypatch.setattr(
         licensing_guard,
         "get_settings",
         lambda: _settings(LICENSE_ENFORCEMENT_ENABLED=True, LICENSE_FILE=lf, LICENSE_PUBLIC_KEYS=pk),
     )
+    await _load_license_from_file(monkeypatch, lf)
     with pytest.raises(HTTPException) as exc:
         licensing_guard.enforce_demo_source_locked("demo-123")
     assert exc.value.status_code == 403

@@ -71,3 +71,17 @@ export function agentServiceBaseUrl(): string {
     "/agent",
   );
 }
+
+/**
+ * Public issuer service base URL — serves the curated security/update advisory
+ * feed (`/advisories`). This is an external, unauthenticated service operated by
+ * Tessallite; it is NOT proxied through the gateway. The build-time
+ * `VITE_ISSUER_URL` override lets air-gapped operators point at a mirror; the
+ * default is the live issuer.
+ */
+const DEFAULT_ISSUER_URL = "https://issuer-6pjlis7ega-uc.a.run.app";
+
+export function issuerBaseUrl(): string {
+  const override = (import.meta.env.VITE_ISSUER_URL as string | undefined)?.trim();
+  return override || DEFAULT_ISSUER_URL;
+}

@@ -495,3 +495,73 @@ class TestNoDoubleCount:
 
         # Exactly one credit, with the correct aggregate
         mock_credit.assert_awaited_once_with(agg, db)
+
+
+# ---------------------------------------------------------------------------
+# 5. Bug-5325 — cross-project connection error maps to a clean 422 at the
+#    execute_with_observation wrapper, NOT the generic 502 execution path, and
+#    issues no hit credit. This pins the route-level error translation that the
+#    /execute, /headless/query and /plugin/execute seams all share.
+# ---------------------------------------------------------------------------
+
+class TestCrossProjectConnectionMapping:
+    """A CrossProjectConnectionError raised by execute_routed_query (the guard
+    fired before any SQL ran) must surface as HTTP 422 — fail closed, not a
+    masked 502 — and must never credit an aggregate hit."""
+
+    async def test_cross_project_error_maps_to_422_no_credit(self):
+        from fastapi import HTTPException
+
+        from shared.connection_scope import CrossProjectConnectionError
+        from src.api.routes import execute_with_observation
+
+        m = make_measure("revenue")
+        agg = make_aggregate(["country"], [make_agg_col(m)])
+        bq = make_bound_query([make_dimension("country")], [m])
+
+        decision = RouteDecision(
+            route_type="aggregate",
+            rewritten_query="SELECT SUM(revenue__sum) FROM agg_table",
+            reason="Matched aggregate agg-1",
+            aggregate_id="agg-1",
+            pending_hit_credit=agg,
+        )
+
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=None)
+        db.get = AsyncMock(return_value=None)
+        db.commit = AsyncMock()
+
+        with (
+            patch(
+                "src.api.routes.resolve_filter_anchors",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch("src.api.routes.audit_filters_present"),
+            patch(
+                "src.api.routes.execute_routed_query",
+                new_callable=AsyncMock,
+                side_effect=CrossProjectConnectionError("different project"),
+            ),
+            patch(
+                "src.api.routes._log_query_failure",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "src.api.routes.record_aggregate_hit",
+                new_callable=AsyncMock,
+            ) as mock_credit,
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await execute_with_observation(
+                    bound=bq,
+                    decision=decision,
+                    db=db,
+                    user_identity="user@test.com",
+                    tenant_id="test-tenant",
+                )
+
+        assert exc.value.status_code == 422
+        assert "different project" in exc.value.detail
+        mock_credit.assert_not_awaited()
