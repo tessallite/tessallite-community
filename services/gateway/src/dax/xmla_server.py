@@ -1930,6 +1930,7 @@ async def _handle_execute(
             subtotal_hierarchy=subtotal_info,
             requery_results=requery_results,
             subtotal_hierarchies=subtotal_hierarchies if subtotal_hierarchies and len(subtotal_hierarchies) > 1 else None,
+            hierarchy_defs=hierarchy_defs,
         )
     except ValueError as exc:
         logger.warning("Execute response build failed: %s", exc)

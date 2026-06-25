@@ -9,6 +9,7 @@ Covers:
 from __future__ import annotations
 
 import gzip
+import re
 import zlib
 
 import pytest
@@ -105,7 +106,12 @@ def test_calc_dependency_rowset_is_conformant_empty():
 
 def test_schema_rowsets_advertise_tabular_surfaces():
     """A discovering client must see the new Tabular rowsets advertised in
-    DISCOVER_SCHEMA_ROWSETS so it knows the gateway dispatches them."""
+    DISCOVER_SCHEMA_ROWSETS so it knows the gateway dispatches them.
+
+    MSOLAP validates the advertised schema-rowset metadata strictly; an empty
+    SchemaGuid element violates the inline uuid pattern and makes Excel stop
+    before it asks for DBSCHEMA_CATALOGS.
+    """
     xml = build_discover_response(
         request_type="DISCOVER_SCHEMA_ROWSETS",
         catalog_name="",
@@ -115,6 +121,18 @@ def test_schema_rowsets_advertise_tabular_surfaces():
     )
     assert "DISCOVER_CSDL_METADATA" in xml
     assert "DISCOVER_CALC_DEPENDENCY" in xml
+    uuid_pattern = re.compile(
+        r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+        r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+    )
+    for row_xml in re.findall(r"<row>(.*?)</row>", xml, flags=re.S):
+        name = re.search(r"<SchemaName>(.*?)</SchemaName>", row_xml)
+        guid = re.search(r"<SchemaGuid>(.*?)</SchemaGuid>", row_xml)
+        assert name is not None
+        assert guid is not None, f"{name.group(1)} missing SchemaGuid"
+        assert uuid_pattern.match(guid.group(1)), (
+            f"{name.group(1)} has invalid SchemaGuid {guid.group(1)!r}"
+        )
 
 
 def test_tmschema_measures_rowset_from_metadata():

@@ -911,6 +911,41 @@ class RawSQL(str):
     pass
 
 
+class NumericLiteral(float):
+    """A numeric filter value that REMEMBERS its original SQL spelling.
+
+    Bug-5539 (Codex round-3 finding 3): the extracted-filter path coerces a
+    numeric SQL literal to a Python ``float`` via ``float(text)``. Once the
+    spelling is gone, ``value_is_numeric_literal`` accepts ANY finite float, so a
+    scientific/signed source token (``int_dim = 1e9``) silently launders into a
+    bare ``1000000000.0`` token against a numeric DIMENSION filter — the exact
+    shape the strict grammar exists to reject on the quoted-string path.
+
+    The fix preserves the ORIGINAL text alongside the float value:
+      - It IS a ``float`` (``isinstance(value, float)`` and ``value == 1e5`` both
+        hold), so F-003-10's scientific-literal parse round-trip is NOT regressed
+        — ``WHERE b > 1e5`` still yields a numeric float filter value, and a
+        ``>`` comparison against a measure transpiles to a bare numeric for
+        strict-typed targets exactly as before.
+      - It carries ``.original_text`` so the SAME strict grammar
+        (``value_is_numeric_literal``) can validate the original spelling at
+        render time. A scientific/leading-plus form is then rejected before it
+        can emit a bare token against a numeric column — closing the laundering
+        gap without losing the spelling to ``float()``.
+
+    Plain integers keep returning a bare ``int`` (no spelling ambiguity: the
+    canonical ``str(int)`` always passes the strict grammar), so only the
+    decimal/scientific branch needs this wrapper.
+    """
+
+    original_text: str
+
+    def __new__(cls, value: float, original_text: str) -> "NumericLiteral":
+        obj = super().__new__(cls, value)
+        obj.original_text = original_text
+        return obj
+
+
 def _literal_value(lit: Any) -> Any:
     if lit is None:
         return None
@@ -926,7 +961,16 @@ def _literal_value(lit: Any) -> Any:
                 # string was returned, so strict-typed targets (BigQuery)
                 # got a quoted string for a numeric comparison. Parse the
                 # full float grammar — Python's float() handles exponents.
-                return float(text)
+                #
+                # Bug-5539 (Codex round-3 finding 3): wrap the float in a
+                # ``NumericLiteral`` that remembers ``text`` so the original
+                # spelling survives parsing. ``value_is_numeric_literal`` then
+                # validates the ORIGINAL token at render time — a scientific /
+                # leading-plus form (``1e9``) is rejected as a bare token
+                # against a numeric column instead of being laundered to
+                # ``1000000000.0``. The value still IS a float, so F-003-10's
+                # parse round-trip (``b > 1e5`` -> finite float) is unchanged.
+                return NumericLiteral(float(text), text)
             except ValueError:
                 return text
         return lit.this

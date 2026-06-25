@@ -8,11 +8,12 @@ Extracted from query_rewriter.py (Phase 3 decomposition); behaviour-identical.
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
 from shared.connector_qualify import quote_identifier
-from src.ir.logical_query import LogicalFilter
+from src.ir.logical_query import LogicalFilter, SemanticBindingError
 
 # Column-type sets used by value coercion (and by joins.py for date/timestamp
 # join-key alignment). Kept here as the canonical home; joins.py imports them.
@@ -49,8 +50,7 @@ def _coerce_value(col_expr: str, rendered: str, col_type: str | None = None) -> 
     Skips coercion when the column's declared output type is numeric
     (e.g. INTEGER from ``EXTRACT(YEAR FROM CAST(ts AS DATE))``).
     """
-    normalized_col_type = (col_type or "").upper().split("(")[0].strip()
-    if normalized_col_type in _NUMERIC_TYPES:
+    if is_numeric_col_type(col_type):
         return rendered
     m = _CAST_TYPE_RE.search(col_expr)
     if not m:
@@ -146,8 +146,41 @@ _TEXT_TYPES = frozenset({
 def _render_value(value: Any, col_type: str | None = None) -> str:
     if value is None:
         return "NULL"
-    # RawSQL marker: emit as-is (SQL expression like CAST('2024-01-01' AS DATE)).
     from src.parsing.sql_parser import RawSQL
+    # Bug-5462 / Bug-5538 (Codex round-2 finding 1): the numeric-column guard runs
+    # BEFORE the RawSQL short-circuit so it is UNBYPASSABLE. A ``LogicalFilter``
+    # value wrapped as ``RawSQL`` must clear the SAME strict
+    # ``value_is_numeric_literal`` validator as any other value before it may emit
+    # a bare token against an INT/NUMERIC column — otherwise an arbitrary raw
+    # token (``1e9``, ``+1``, ``1 OR 1=1``) would slip past the gate. For every
+    # value type the value has to be a finite numeric literal to render unquoted;
+    # anything else (``"abc"``/``""``/``"1_000"``/``inf``/``nan``/``True``/a
+    # non-numeric ``RawSQL``) fails loud instead of silently emitting ``'abc'``
+    # (string vs INT64) or a bare token (invalid SQL / injection surface).
+    if is_numeric_col_type(col_type):
+        candidate = str(value) if isinstance(value, RawSQL) else value
+        if value_is_numeric_literal(candidate):
+            # Bug-5539 (review finding 1): emit the literal's PRESERVED original
+            # spelling when present. ``str(float)`` switches to scientific form
+            # for very large/small magnitudes (``0.0000001`` -> ``1e-07``,
+            # ``1e19`` -> ``1e+19``), which would launder a grammar-conformant
+            # plain decimal into a bare scientific token against a numeric column
+            # — the exact precision gap this fix closes. ``original_text`` is the
+            # token the strict grammar just validated, so it is guaranteed
+            # non-scientific and safe to emit bare. Falls back to ``str`` for
+            # plain int/float/str values that carry no preserved spelling.
+            original = getattr(candidate, "original_text", None)
+            if isinstance(original, str):
+                return original
+            return str(candidate)
+        raise SemanticBindingError(
+            f"Non-numeric value {value!r} for numeric column "
+            f"(type {col_type!r}); refusing to render a string literal or bare "
+            f"token for a numeric comparison"
+        )
+    # RawSQL marker: emit as-is (SQL expression like CAST('2024-01-01' AS DATE)).
+    # Reached only for non-numeric columns — the numeric gate above already
+    # validated/short-circuited every RawSQL bound for a numeric column.
     if isinstance(value, RawSQL):
         return str(value)
     normalized = (col_type or "").upper().split("(")[0].strip()
@@ -155,12 +188,6 @@ def _render_value(value: Any, col_type: str | None = None) -> str:
         escaped = str(value).replace("'", "''")
         return f"'{escaped}'"
     if isinstance(value, str):
-        if normalized in _NUMERIC_TYPES:
-            try:
-                float(value)
-                return value
-            except ValueError:
-                pass
         if normalized in _TIMESTAMP_TYPES:
             escaped = value.replace("'", "''")
             # Architectural note (Bug-906): ``TIMESTAMP 'xxx'`` is PostgreSQL
@@ -177,6 +204,62 @@ def _render_value(value: Any, col_type: str | None = None) -> str:
         return "TRUE" if value else "FALSE"
     return str(value)
 
+
+
+def is_numeric_col_type(col_type: str | None) -> bool:
+    """True when ``col_type`` names a numeric source type (INT64, INTEGER,
+    DECIMAL, FLOAT, …). Normalises case and strips any ``(precision)`` suffix
+    so e.g. ``NUMERIC(10,2)`` is recognised. Shared by every WHERE renderer so
+    the numeric-type decision lives in exactly one place."""
+    normalized = (col_type or "").upper().split("(")[0].strip()
+    return normalized in _NUMERIC_TYPES
+
+
+# A finite, *safe* integer/decimal literal: an optional leading MINUS sign, ASCII
+# digits, and an optional single ``.`` fraction. Deliberately tight (Bug-5538,
+# Codex round-2 finding 3):
+#   - NO exponent (``1e9`` is rejected — a slicer member key is never written in
+#     scientific form, and a bare ``1e9`` is an injection/precision surface).
+#   - NO leading ``+`` (``+1`` is rejected — a member key never carries a unary
+#     plus; accepting it widens the bare-token grammar for no real input).
+#   - NO surrounding whitespace (``' 1 '`` is rejected — matched WITHOUT a strip,
+#     so a padded token can never reach ``exp.Literal.number`` as a bare token).
+#     The tail is anchored with ``\Z`` (not ``$``): ``$`` also matches just before
+#     a single trailing newline, so ``$`` would let ``"12\n"`` slip through as a
+#     bare ``= 12\n`` token. ``\Z`` matches only the true end of string.
+# Still rejects ``inf``/``nan`` and Python's underscore grouping (``1_000``),
+# both of which ``float()`` accepts but which are NOT safe bare SQL. ``re.ASCII``
+# keeps ``\d`` to 0-9 so non-ASCII decimal digits (e.g. Arabic-Indic ``١٩٩٩``)
+# fail loud rather than emitting an unparseable bare token to the source DB.
+_NUMERIC_LITERAL_RE = re.compile(r"^-?(\d+(\.\d+)?|\.\d+)\Z", re.ASCII)
+
+
+def value_is_numeric_literal(value: Any) -> bool:
+    """True when ``value`` is a finite numeric literal safe to emit bare.
+
+    Accepts a real int/float (finite only) or a string that matches a plain
+    integer/decimal form (optional leading ``-``, digits, optional single ``.``
+    fraction). Rejects scientific notation (``1e9``), a leading ``+`` (``+1``),
+    surrounding whitespace (``' 1 '``), ``inf``/``nan``/``1_000`` and anything
+    else ``float()`` would over-accept — those must never reach
+    ``exp.Literal.number`` as a bare token. The match is performed WITHOUT
+    trimming, so a padded token can never slip through."""
+    if isinstance(value, bool):
+        return False
+    # Bug-5539 (Codex round-3 finding 3): a numeric literal extracted from raw
+    # SQL carries its ORIGINAL spelling on ``.original_text`` (a NumericLiteral
+    # from the parser). Validate that original token through the SAME strict
+    # grammar rather than the lenient "any finite float" check below — otherwise
+    # a scientific/leading-plus source token (``1e9`` -> ``float`` ``1e9``) would
+    # launder into a bare ``1000000000.0`` token against a numeric column.
+    original = getattr(value, "original_text", None)
+    if isinstance(original, str):
+        return bool(_NUMERIC_LITERAL_RE.match(original))
+    if isinstance(value, (int, float)):
+        return math.isfinite(value)
+    if isinstance(value, str):
+        return bool(_NUMERIC_LITERAL_RE.match(value))
+    return False
 
 
 def _quote(name: str) -> str:

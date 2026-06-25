@@ -531,6 +531,269 @@ def test_render_condition_extract_year_integer_col_type():
 
 
 # ---------------------------------------------------------------------------
+# Bug-5462: integer-keyed dimension filters must render NUMERIC literals.
+# A BI client (Excel/Power BI/XMLA) sends a slicer member key as a quoted
+# string ('1999'); when the column is INTEGER/NUMERIC, BigQuery rejects the
+# INT64-vs-STRING comparison. The extracted-filter path (_render_value /
+# _render_condition) must emit a bare numeric literal for numeric col_type and
+# keep a string literal for text col_type.
+# ---------------------------------------------------------------------------
+
+import sqlglot
+from src.rewrite.conditions import (
+    _render_value,
+    _render_where,
+    is_numeric_col_type,
+    value_is_numeric_literal,
+)
+
+
+@pytest.mark.parametrize("col_type", ["INT64", "INTEGER", "integer", "BIGINT", "NUMERIC", "DECIMAL(10,2)", "FLOAT64"])
+def test_render_value_numeric_col_type_emits_bare_number(col_type):
+    """A string member key against a numeric column renders unquoted."""
+    assert _render_value("1999", col_type=col_type) == "1999"
+
+
+def test_render_condition_eq_integer_dim_is_numeric():
+    """d_year = 1999 (not '1999') for an INT64 column."""
+    result = _render_condition('"dt"."d_year"', "eq", "1999", col_type="INT64")
+    assert result == '"dt"."d_year" = 1999'
+    assert "'1999'" not in result
+
+
+def test_render_condition_eq_integer_dim_transpiles_for_bigquery():
+    """The numeric predicate transpiles to a bare BigQuery numeric literal."""
+    result = _render_condition('"dt"."d_year"', "eq", "1999", col_type="INT64")
+    bq = sqlglot.transpile(result, read="postgres", write="bigquery")[0]
+    assert bq == "`dt`.`d_year` = 1999"
+
+
+def test_render_condition_quarter_month_numeric():
+    """d_qoy = 2 and d_moy = 6 render as integers (slicer scenario)."""
+    assert _render_condition('"d_qoy"', "eq", "2", col_type="INT64") == '"d_qoy" = 2'
+    assert _render_condition('"d_moy"', "eq", "6", col_type="INTEGER") == '"d_moy" = 6'
+
+
+def test_render_condition_in_integer_dim_numeric():
+    """IN list against an integer column renders numeric members."""
+    result = _render_condition('"d_year"', "in", ["1999", "2000"], col_type="INT64")
+    assert result == '"d_year" IN (1999, 2000)'
+
+
+def test_render_condition_string_dim_unchanged():
+    """A string dimension keeps its quoted literal (must not regress)."""
+    result = _render_condition('"it"."i_category"', "eq", "Shoes", col_type="STRING")
+    assert result == "\"it\".\"i_category\" = 'Shoes'"
+
+
+def test_render_condition_string_dim_no_col_type_unchanged():
+    """No col_type → string literal default preserved for text values."""
+    result = _render_condition('"region"', "eq", "Unknown")
+    assert result == "\"region\" = 'Unknown'"
+
+
+def test_render_value_date_col_type_unchanged():
+    """DATE / TIMESTAMP handling is unchanged by the numeric fix."""
+    out = _render_value("2025-01-01", col_type="TIMESTAMP")
+    assert out == "TIMESTAMP '2025-01-01'"
+
+
+def test_is_numeric_col_type_helper():
+    assert is_numeric_col_type("INT64")
+    assert is_numeric_col_type("numeric(10,2)")
+    assert not is_numeric_col_type("STRING")
+    assert not is_numeric_col_type(None)
+
+
+def test_value_is_numeric_literal_helper():
+    assert value_is_numeric_literal("1999")
+    assert value_is_numeric_literal("-3.14")
+    # Bug-5538 (Codex round-2 finding 3): scientific notation is no longer a
+    # valid bare member-key literal — a slicer member key is never written as
+    # ``1e3`` and a bare exponent token is an injection/precision surface.
+    assert not value_is_numeric_literal("1e3")
+    assert value_is_numeric_literal(2000)
+    assert not value_is_numeric_literal("Shoes")
+
+
+def test_value_is_numeric_literal_tightened_grammar():
+    """Bug-5538 (Codex round-2 finding 3): the safe grammar is optional leading
+    ``-``, digits, optional single ``.`` fraction — NO exponent, NO leading
+    ``+``, NO surrounding whitespace. Genuine integers/decimals still pass."""
+    # Accepted — genuine integer / decimal forms.
+    for good in ("1999", "-5", "19.99", "0", "-0.5", ".5", "-.5"):
+        assert value_is_numeric_literal(good), good
+    # Rejected — scientific notation, leading +, surrounding whitespace, and a
+    # trailing newline (``$`` would have matched just before a single ``\n``;
+    # the regex anchors with ``\Z`` so ``"12\n"`` cannot slip through as a bare
+    # ``= 12\n`` token).
+    for bad in ("1e9", "1E9", "-1e3", "+1", "+19.99", " 1", "1 ", " 1 ", "1.",
+                "12\n", "1\n", "\n1", "1\n2"):
+        assert not value_is_numeric_literal(bad), bad
+
+
+def test_render_value_numeric_col_rejects_scientific_and_signed():
+    """A scientific / leading-+ / padded token against a numeric column must FAIL
+    LOUD — never emit a bare ``1e9`` / ``+1`` / ``' 1 '`` token."""
+    from src.ir.logical_query import SemanticBindingError
+    for bad in ("1e9", "+1", " 1 ", "0x1F"):
+        with pytest.raises(SemanticBindingError):
+            _render_value(bad, col_type="INT64")
+
+
+def test_render_value_rawsql_non_numeric_against_numeric_col_fails_loud():
+    """Bug-5538 (Codex round-2 finding 1): a ``RawSQL``-wrapped value must clear
+    the SAME strict validator before rendering bare against a numeric column —
+    the numeric gate is UNBYPASSABLE. A non-numeric raw token fails loud."""
+    from src.ir.logical_query import SemanticBindingError
+    from src.parsing.sql_parser import RawSQL
+    with pytest.raises(SemanticBindingError):
+        _render_value(RawSQL("1 OR 1=1"), col_type="INT64")
+    with pytest.raises(SemanticBindingError):
+        _render_value(RawSQL("d_year"), col_type="INTEGER")
+    with pytest.raises(SemanticBindingError):
+        _render_value(RawSQL("1e9"), col_type="INT64")
+
+
+def test_render_value_rawsql_numeric_against_numeric_col_renders_bare():
+    """A genuine numeric ``RawSQL`` against a numeric column still renders bare."""
+    from src.parsing.sql_parser import RawSQL
+    assert _render_value(RawSQL("1999"), col_type="INT64") == "1999"
+
+
+def test_render_value_rawsql_non_numeric_col_unchanged():
+    """For a NON-numeric column, ``RawSQL`` still emits as-is (e.g. a CAST date
+    expression) — the guard only applies to numeric columns."""
+    from src.parsing.sql_parser import RawSQL
+    out = _render_value(RawSQL("CAST('2024-01-01' AS DATE)"), col_type="DATE")
+    assert out == "CAST('2024-01-01' AS DATE)"
+
+
+def test_value_is_numeric_literal_rejects_non_finite_and_grouped():
+    """float() over-accepts these, but they must NOT become bare SQL numbers."""
+    for bad in ("inf", "-inf", "nan", "infinity", "1_000", "", " "):
+        assert not value_is_numeric_literal(bad), bad
+    assert not value_is_numeric_literal(True)  # bool is not a numeric literal
+
+
+def test_value_is_numeric_literal_rejects_unicode_digits():
+    """Bug-5538: non-ASCII decimal digits (Arabic-Indic) must be rejected — a
+    bare token like ``١٩٩٩`` is unparseable by Postgres/BigQuery, so it must
+    fail loud, not slip through ``\\d``."""
+    assert not value_is_numeric_literal("١٩٩٩")  # ١٩٩٩
+    # And it fails loud through _render_value for a numeric column.
+    from src.ir.logical_query import SemanticBindingError
+    with pytest.raises(SemanticBindingError):
+        _render_value("١٩٩٩", col_type="INT64")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["abc", "", " ", "1_000", "inf", "-inf", "nan", "infinity", "1; DROP TABLE t"],
+)
+def test_render_value_numeric_col_invalid_string_fails_loud(bad):
+    """Bug-5538 (Codex finding 1): a non-numeric string against a numeric column
+    must FAIL LOUD, never emit a string literal (``'abc'`` is STRING vs INT64)
+    nor a bare non-numeric token. The DB-rejects-it-loudly fallback was
+    incomplete: a string literal silently changes the comparison type."""
+    from src.ir.logical_query import SemanticBindingError
+    with pytest.raises(SemanticBindingError):
+        _render_value(bad, col_type="INT64")
+
+
+@pytest.mark.parametrize("bad", [True, False, float("inf"), float("nan"), float("-inf")])
+def test_render_value_numeric_col_invalid_nonstring_fails_loud(bad):
+    """Bug-5538 (Codex finding 1): bool / non-finite float against a numeric
+    column must FAIL LOUD, never fall through to bare ``TRUE``/``inf``/``nan``."""
+    from src.ir.logical_query import SemanticBindingError
+    with pytest.raises(SemanticBindingError):
+        _render_value(bad, col_type="INT64")
+
+
+def test_render_value_numeric_col_accepts_real_int_and_float():
+    """A finite real int/float against a numeric column still renders bare."""
+    assert _render_value(2000, col_type="INT64") == "2000"
+    assert _render_value(3.14, col_type="NUMERIC") == "3.14"
+
+
+# ---------------------------------------------------------------------------
+# Bug-5539 (Codex round-3 finding 3): the extracted-filter path must not launder
+# a scientific/signed source token into a bare numeric. ``_literal_value`` now
+# preserves the ORIGINAL spelling on a ``NumericLiteral`` so the SAME strict
+# grammar validates the original token at render time — F-003-10's float
+# round-trip stays intact.
+# ---------------------------------------------------------------------------
+
+
+def _parsed_literal(sql_value: str):
+    """Return the ``_literal_value`` result for a SQL literal token, exactly as
+    the extracted-filter path would produce it from a parsed comparison."""
+    from src.parsing.sql_parser import _literal_value
+    node = sqlglot.parse_one(
+        "SELECT 1 FROM t WHERE x = " + sql_value, read="postgres"
+    ).args["where"].this.expression
+    return _literal_value(node)
+
+
+def test_numeric_literal_preserves_scientific_spelling_and_is_rejected():
+    """A scientific source token is parsed to a finite float (F-003-10) BUT
+    carries its original ``1e9`` spelling, which the strict grammar rejects — so
+    it can never render as a bare token against a numeric column."""
+    from src.parsing.sql_parser import NumericLiteral
+    v = _parsed_literal("1e9")
+    assert isinstance(v, NumericLiteral) and isinstance(v, float)
+    assert v == 1e9
+    assert v.original_text == "1e9"
+    assert not value_is_numeric_literal(v)
+
+
+def test_extracted_scientific_literal_against_numeric_fails_loud():
+    """The end-to-end extracted-path defence: a ``NumericLiteral`` from ``1e9``
+    rendered against a numeric column must FAIL LOUD (no ``1000000000.0``)."""
+    from src.ir.logical_query import SemanticBindingError
+    v = _parsed_literal("1e9")
+    with pytest.raises(SemanticBindingError):
+        _render_value(v, col_type="INT64")
+
+
+def test_extracted_decimal_literal_against_numeric_renders_bare():
+    """A genuine decimal source token (``19.99``) keeps rendering bare — its
+    preserved spelling passes the strict grammar (no regression)."""
+    v = _parsed_literal("19.99")
+    assert value_is_numeric_literal(v)
+    assert _render_value(v, col_type="NUMERIC") == "19.99"
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "0.0000001",                  # str(float) -> '1e-07'
+        "10000000000000000000.0",     # str(float) -> '1e+19'
+        ".5",                         # sqlglot normalises to '0.5'
+    ],
+)
+def test_extracted_decimal_magnitude_renders_non_scientific(token):
+    """A grammar-conformant plain decimal whose ``str(float)`` would switch to
+    SCIENTIFIC form must STILL render as a non-scientific bare token against a
+    numeric column — the preserved original spelling is emitted, never the float
+    repr. Otherwise a valid plain decimal would launder into a bare ``1e-07`` /
+    ``1e+19`` token, re-opening the same precision gap Bug-5539 closes."""
+    v = _parsed_literal(token)
+    assert value_is_numeric_literal(v)
+    rendered = _render_value(v, col_type="NUMERIC")
+    assert "e" not in rendered.lower(), rendered
+    # The emitted token must itself pass the strict grammar (no scientific form).
+    assert value_is_numeric_literal(rendered), rendered
+
+
+def test_extracted_plain_int_literal_stays_int_and_renders_bare():
+    """Plain integers still parse to a bare ``int`` and render bare."""
+    v = _parsed_literal("1999")
+    assert type(v) is int and v == 1999
+    assert _render_value(v, col_type="INT64") == "1999"
+
+
+# ---------------------------------------------------------------------------
 # Bug-894 / LOW: empty IN / NOT IN filters must not emit invalid SQL
 # ---------------------------------------------------------------------------
 
