@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API Authentication — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>API Authentication</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>API Authentication</h1>
+<h2>What this covers</h2>
+<p>The Tessallite REST API uses HTTP Basic authentication on every request. There are no session tokens, API keys, or OAuth flows.</p>
+<h2>How authentication works</h2>
+<p>Each request must include an <code>Authorization</code> header with HTTP Basic credentials: a Tessallite username (email address) and password, base64-encoded.</p>
+<p><strong>Base URL</strong>: <code>http://HOST:3000/api/v1</code></p>
+<p>Most HTTP clients (curl, Python requests, Postman) handle the encoding automatically.</p>
+<blockquote>HTTP Basic auth transmits credentials as base64, not encrypted. Use HTTPS in all production environments.</blockquote>
+<h2>Permissions</h2>
+<div class="table-wrapper"><table><thead><tr><th>Role</th><th>API access</th></tr></thead><tbody><tr><td>System Admin</td><td>Full access to all endpoints, including workspace management</td></tr><tr><td>Tenant Admin</td><td>Project and workspace-level endpoints within their tenant</td></tr><tr><td>Modeller</td><td>Project, model, and aggregate endpoints</td></tr><tr><td>Analyst / Viewer</td><td>Read-only access; no administrative endpoints</td></tr></tbody></table></div>
+<p>The <code>ADMIN_USER</code> / <code>ADMIN_PASS</code> credentials have full access to all endpoints.</p>
+<h2>Example: curl</h2>
+<pre><code>curl -u username:password http://HOST:3000/api/v1/health</code></pre>
+<h2>Example: Python requests</h2>
+<pre><code>import requests
+
+response = requests.get(
+    &quot;http://HOST:3000/api/v1/health&quot;,
+    auth=(&quot;user@example.com&quot;, &quot;yourpassword&quot;)
+)
+print(response.json())</code></pre>
+<h2>Common authentication errors</h2>
+<div class="table-wrapper"><table><thead><tr><th>HTTP status</th><th>Meaning</th><th>Resolution</th></tr></thead><tbody><tr><td><code>401 Unauthorized</code></td><td>No credentials or wrong credentials</td><td>Verify email and password; confirm Authorization header is sent</td></tr><tr><td><code>403 Forbidden</code></td><td>Credentials correct but role insufficient</td><td>Use an account with the required role</td></tr></tbody></table></div>
+<h2>Security recommendations</h2>
+<ul><li>Always use HTTPS in production.</li><li>Do not store credentials in source code. Use environment variables or a secrets manager.</li><li>Use a dedicated service account with the minimum required role for API automation.</li><li>Rotate the service account password if it may have been exposed.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="api-reference.html">API Reference</a></li><li><a href="supported-data-sources.html">Supported Data Sources</a></li><li><a href="../troubleshooting/common-errors.html">Common Errors</a></li></ul>
+<nav class="page-nav"><a href="supported-data-sources.html" class="page-nav-btn prev">&larr; Supported Data Sources</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="api-reference.html" class="page-nav-btn next">API Reference &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

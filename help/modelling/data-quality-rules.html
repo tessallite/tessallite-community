@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Data Quality Rules — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Data Quality Rules</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-02</span></div>
+    <h1>Data Quality Rules</h1>
+<h2>What this covers</h2>
+<p>Data quality rules let you declare constraints on physical source columns and automatically detect violations after each aggregate refresh. This page explains the five rule types, when to use them, how violations are recorded, and the <code>block_on_failure</code> option.</p>
+<h2>Why data quality rules matter</h2>
+<p>Aggregates are only useful if the underlying source data is clean. A fact table with NULL transaction amounts produces misleading subtotals. Duplicate keys on a dimension corrupt join cardinalities. A date column accepting free text silently breaks time-variant measure calculations. By the time a data analyst notices that &quot;March revenue&quot; doubled overnight, the corrupt aggregate has already been served to a dashboard.</p>
+<p>Data quality rules close this loop. They run automatically after each refresh and write violation counts back to the aggregate metadata. When violations breach a threshold, a model alert is raised. If <code>block_on_failure</code> is enabled, the alert is escalated to error severity and clearly signals that downstream data should not be trusted.</p>
+<h2>Rule types</h2>
+<div class="table-wrapper"><table><thead><tr><th>Rule type</th><th>What it checks</th><th>Configured by</th></tr></thead><tbody><tr><td><code>not_null</code></td><td>Count of NULL values in the column</td><td>No extra config needed</td></tr><tr><td><code>unique</code></td><td>Count of duplicate values in the column</td><td>No extra config needed</td></tr><tr><td><code>range</code></td><td>Rows where the value falls outside <code>[min, max]</code></td><td><code>rule_config: { &quot;min&quot;: 0, &quot;max&quot;: 100 }</code></td></tr><tr><td><code>regex</code></td><td>Rows where the column does not match a regular expression</td><td><code>rule_config: { &quot;pattern&quot;: &quot;^\\d{4}-\\d{2}-\\d{2}$&quot; }</code></td></tr><tr><td><code>custom_sql</code></td><td>A hand-written SQL query that must return the violation count as its first column</td><td><code>rule_config: { &quot;sql&quot;: &quot;SELECT COUNT(*) FROM my_table WHERE status NOT IN (&#x27;active&#x27;,&#x27;closed&#x27;)&quot; }</code></td></tr></tbody></table></div>
+<h3><code>custom_sql</code> considerations</h3>
+<ul><li>The SQL runs against the source database, not against the aggregate.</li><li>The query must return a single value in the first column of the first row.</li><li>Use parameterless SQL only. Session state, temp tables, and DDL are not supported.</li><li>Return <code>0</code> for &quot;no violations&quot;, any positive integer for &quot;N violations found&quot;.</li></ul>
+<h2>Targets</h2>
+<p>A rule targets a specific object within the model:</p>
+<div class="table-wrapper"><table><thead><tr><th><code>target_type</code></th><th>Meaning</th></tr></thead><tbody><tr><td><code>column</code></td><td>A specific <code>ModelColumn</code> row; the rule&#x27;s <code>target_id</code> is the column UUID</td></tr><tr><td><code>dimension</code></td><td>The source column of a dimension; <code>target_id</code> is the dimension UUID</td></tr><tr><td><code>measure</code></td><td>The source column of a standard measure; <code>target_id</code> is the measure UUID</td></tr></tbody></table></div>
+<h2>Severity levels</h2>
+<div class="table-wrapper"><table><thead><tr><th>Severity</th><th>Effect on model alerts</th></tr></thead><tbody><tr><td><code>info</code></td><td>No model alert raised</td></tr><tr><td><code>warn</code></td><td>Warning alert raised</td></tr><tr><td><code>error</code></td><td>Error alert raised</td></tr></tbody></table></div>
+<p>When <code>block_on_failure</code> is enabled, any violation produces an error-severity alert regardless of the rule&#x27;s <code>severity</code> setting.</p>
+<h2>block_on_failure</h2>
+<p>When <code>block_on_failure</code> is set to <code>true</code> on a rule:</p>
+<ul><li>Violations of any count produce an error-severity model alert.</li><li>The alert detail includes the message &quot;Queries blocked until resolved.&quot;</li><li>The aggregate&#x27;s violations chip in the Aggregates panel shows an error badge.</li></ul>
+<p>Use <code>block_on_failure</code> for rules where a single violation means the data is definitively wrong and the aggregate should not be served. Examples: a primary key column on the fact table that must be unique, a date column that must never be NULL.</p>
+<h2>Automatic validation</h2>
+<p>Rules run automatically after each full aggregate refresh. You can also trigger validation manually using the <strong>Run Checks</strong> button in the Data Quality panel.</p>
+<p>After validation completes:</p>
+<ul><li><code>last_violation_count</code> on each rule is updated.</li><li>New <code>DataQualityViolation</code> rows are written with the violation count, a sample of failing values (where available), and the aggregate ID for which violations were found.</li><li>Model alerts are raised for <code>warn</code>/<code>error</code>/<code>block_on_failure</code> rules that have violations.</li></ul>
+<h2>Violation history</h2>
+<p>Each rule keeps a violation history. Click the expand button on a rule row to see past violation events with timestamps and sample values. To clear stale violation history, use the <strong>Clear</strong> button on the rule row.</p>
+<h2>Common patterns</h2>
+<p><strong>Fact table NOT NULL guard.</strong> Create a <code>not_null</code> rule targeting the fact table&#x27;s primary key column with <code>severity=error</code> and <code>block_on_failure=true</code>. Any NULL in that column means the CTAS joined incorrectly and the aggregate should not be trusted.</p>
+<p><strong>Dimension code uniqueness.</strong> Create a <code>unique</code> rule targeting the natural key of a dimension table. A duplicate key means two rows will join to the same fact record, inflating measures.</p>
+<p><strong>Date format guard.</strong> For a string-typed date column, create a <code>regex</code> rule with a date pattern. Out-of-format values will cause time-variant measure calculations to fail silently.</p>
+<p><strong>Business range check.</strong> For a <code>unit_price</code> column, create a <code>range</code> rule with <code>min=0</code> and <code>max=99999</code>. Negative or absurdly large prices indicate upstream ETL issues.</p>
+<h2>Limits</h2>
+<ul><li>Rules run synchronously after each refresh. Many rules on a large fact table will extend refresh time.</li><li><code>custom_sql</code> rules run against the source database using the model&#x27;s source connection. They cannot reference the aggregate schema.</li><li>There is no version history for rule definitions. Deleting a rule also deletes its violation history.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="configure-aggregates.html">Configure aggregates</a></li><li><a href="run-a-refresh.html">Run a refresh</a></li><li><a href="view-diagnostics.html">View diagnostics</a></li></ul>
+<nav class="page-nav"><a href="parameterized-filters.html" class="page-nav-btn prev">&larr; Parameterized Filters</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="impact-analysis.html" class="page-nav-btn next">Impact Analysis &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

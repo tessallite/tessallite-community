@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Pixodesk SVG (https://pixodesk.com) -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 480" text-rendering="geometricPrecision" shape-rendering="geometricPrecision">
+  <defs>
+    <marker id="arrowhead" refX="10" refY="3.5" markerHeight="7" markerWidth="10" orient="auto">
+      <path fill="#b8860b" d="M0,0L10,3.5L0,7"/>
+    </marker>
+  </defs>
+  <rect fill="#ffffff" width="800" height="480"/>
+  <rect fill="#f2f7f4" stroke="#006c35" stroke-width="2" rx="6" ry="0" x="300" y="180" width="200" height="120"/>
+  <rect fill="#006c35" rx="6" ry="0" x="300" y="180" width="200" height="32"/>
+  <rect fill="#006c35" x="300" y="204" width="200" height="8"/>
+  <text fill="#ffffff" text-anchor="middle" font-family="Inter, sans-serif" font-size="13" font-weight="600" xml:space="preserve" x="400" y="202" data-gn-el-type="text" style="white-space:pre"><tspan>fact</tspan></text>
+  <text fill="#333333" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" xml:space="preserve" x="400" y="232" data-gn-el-type="text" style="white-space:pre"><tspan>orders</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" xml:space="preserve" x="400" y="252" data-gn-el-type="text" style="white-space:pre"><tspan>order_id PK</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" xml:space="preserve" x="400" y="270" data-gn-el-type="text" style="white-space:pre"><tspan>product_id FK</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" xml:space="preserve" x="400" y="288" data-gn-el-type="text" style="white-space:pre"><tspan>revenue</tspan></text>
+  <rect fill="#f2f7f4" stroke="#2e8b57" stroke-width="2" rx="6" ry="0" x="60" y="60" width="180" height="110"/>
+  <rect fill="#2e8b57" rx="6" ry="0" x="60" y="60" width="180" height="32"/>
+  <rect fill="#2e8b57" x="60" y="84" width="180" height="8"/>
+  <text fill="#ffffff" text-anchor="middle" font-family="Inter, sans-serif" font-size="12" font-weight="600" xml:space="preserve" x="150" y="82" data-gn-el-type="text" style="white-space:pre"><tspan>dim_aggregate</tspan></text>
+  <text fill="#333333" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" xml:space="preserve" x="150" y="112" data-gn-el-type="text" style="white-space:pre"><tspan>dim_product</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" xml:space="preserve" x="150" y="132" data-gn-el-type="text" style="white-space:pre"><tspan>product_id PK</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" xml:space="preserve" x="150" y="150" data-gn-el-type="text" style="white-space:pre"><tspan>category</tspan></text>
+  <path stroke="#006c35" stroke-width="1.5" marker-end="url(#arrowhead)" d="M240,115L298,215"/>
+  <text fill="#006c35" text-anchor="middle" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" transform="translate(52, -12)" x="248" y="165" data-gn-el-type="text" style="white-space:pre"><tspan>extends grain</tspan></text>
+  <rect fill="#f2f7f4" stroke="#2e8b57" stroke-width="2" rx="6" ry="0" x="60" y="310" width="180" height="110"/>
+  <rect fill="#2e8b57" rx="6" ry="0" x="60" y="310" width="180" height="32"/>
+  <rect fill="#2e8b57" x="60" y="334" width="180" height="8"/>
+  <text fill="#ffffff" text-anchor="middle" font-family="Inter, sans-serif" font-size="12" font-weight="600" xml:space="preserve" x="150" y="332" data-gn-el-type="text" style="white-space:pre"><tspan>dim_aggregate</tspan></text>
+  <text fill="#333333" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" xml:space="preserve" x="150" y="362" data-gn-el-type="text" style="white-space:pre"><tspan>dim_date</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" xml:space="preserve" x="150" y="382" data-gn-el-type="text" style="white-space:pre"><tspan>date_id PK</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" xml:space="preserve" x="150" y="400" data-gn-el-type="text" style="white-space:pre"><tspan>month, year</tspan></text>
+  <path stroke="#006c35" stroke-width="1.5" marker-end="url(#arrowhead)" d="M240,365L298,285"/>
+  <text fill="#006c35" text-anchor="middle" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" transform="translate(42, 37)" x="248" y="315" data-gn-el-type="text" style="white-space:pre"><tspan>extends grain</tspan></text>
+  <rect fill="#fffbf0" stroke="#b8860b" stroke-width="2" stroke-dasharray="6 3" rx="6" ry="0" x="560" y="185" width="200" height="110"/>
+  <rect fill="#b8860b" rx="6" ry="0" x="560" y="185" width="200" height="32"/>
+  <rect fill="#b8860b" x="560" y="209" width="200" height="8"/>
+  <text fill="#ffffff" text-anchor="middle" font-family="Inter, sans-serif" font-size="12" font-weight="600" xml:space="preserve" x="660" y="207" data-gn-el-type="text" style="white-space:pre"><tspan>dim_detail</tspan></text>
+  <text fill="#333333" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" xml:space="preserve" x="660" y="237" data-gn-el-type="text" style="white-space:pre"><tspan>dim_customer</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" xml:space="preserve" x="660" y="257" data-gn-el-type="text" style="white-space:pre"><tspan>customer_id PK</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" xml:space="preserve" x="660" y="277" data-gn-el-type="text" style="white-space:pre"><tspan>email, address</tspan></text>
+  <path fill="#2e8b57" stroke="#b8860b" stroke-width="1.5" stroke-dasharray="5 3" transform="translate(1.8553, 1.5327)" marker-end="url(#arrowhead)" d="M500,240L558,240"/>
+  <text fill="#b8860b" text-anchor="middle" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" transform="translate(0, -8)" x="529" y="228" data-gn-el-type="text" style="white-space:pre"><tspan>filter only</tspan></text>
+  <text fill="#b8860b" text-anchor="middle" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" transform="translate(0, -7)" x="529" y="240" data-gn-el-type="text" style="white-space:pre"><tspan>no grain</tspan></text>
+  <rect fill="#006c35" rx="2" ry="0" x="30" y="430" width="14" height="14"/>
+  <text fill="#333333" font-family="Inter, sans-serif" font-size="11" xml:space="preserve" x="50" y="442" data-gn-el-type="text" style="white-space:pre"><tspan>fact — one per model, drives aggregation</tspan></text>
+  <rect fill="#2e8b57" rx="2" ry="0" x="270" y="430" width="14" height="14"/>
+  <text fill="#333333" font-family="Inter, sans-serif" font-size="11" xml:space="preserve" x="290" y="442" data-gn-el-type="text" style="white-space:pre"><tspan>dim_aggregate — participates in grain</tspan></text>
+  <rect fill="#b8860b" rx="2" ry="0" x="510" y="430" width="14" height="14"/>
+  <text fill="#333333" font-family="Inter, sans-serif" font-size="11" xml:space="preserve" x="530" y="442" data-gn-el-type="text" style="white-space:pre"><tspan>dim_detail — filter/label only</tspan></text>
+</svg>

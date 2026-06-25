@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Pixodesk SVG (https://pixodesk.com) -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 480" text-rendering="geometricPrecision" shape-rendering="geometricPrecision">
+  <defs>
+    <marker id="arrow" refX="8" refY="3" markerHeight="6" markerWidth="8" orient="auto">
+      <path fill="#006c35" d="M0,0L8,3L0,6L0,0z"/>
+    </marker>
+  </defs>
+  <rect fill="#ffffff" width="800" height="480"/>
+  <text fill="#6b7280" text-anchor="middle" letter-spacing="0.05em" font-size="12" font-weight="600" xml:space="preserve" x="100" y="48" data-gn-el-type="text" style="white-space:pre"><tspan>BI TOOLS</tspan></text>
+  <rect fill="#f2f7f4" stroke="#006c35" stroke-width="1.5" rx="8" ry="0" x="20" y="60" width="160" height="50"/>
+  <text fill="#333333" text-anchor="middle" font-size="14" font-weight="600" xml:space="preserve" x="100" y="80" data-gn-el-type="text" style="white-space:pre"><tspan>Excel / Power BI</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" font-size="11" xml:space="preserve" x="100" y="98" data-gn-el-type="text" style="white-space:pre"><tspan>XMLA</tspan></text>
+  <rect fill="#f2f7f4" stroke="#006c35" stroke-width="1.5" rx="8" ry="0" x="20" y="215" width="160" height="50"/>
+  <text fill="#333333" text-anchor="middle" font-size="14" font-weight="600" xml:space="preserve" x="100" y="235" data-gn-el-type="text" style="white-space:pre"><tspan>Tableau / DBeaver</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" font-size="11" xml:space="preserve" x="100" y="253" data-gn-el-type="text" style="white-space:pre"><tspan>JDBC</tspan></text>
+  <rect fill="#f2f7f4" stroke="#006c35" stroke-width="1.5" rx="8" ry="0" x="20" y="370" width="160" height="50"/>
+  <text fill="#333333" text-anchor="middle" font-size="14" font-weight="600" xml:space="preserve" x="100" y="390" data-gn-el-type="text" style="white-space:pre"><tspan>Custom apps</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" font-size="11" xml:space="preserve" x="100" y="408" data-gn-el-type="text" style="white-space:pre"><tspan>JDBC</tspan></text>
+  <rect fill="#eff7f3" stroke="#006c35" stroke-width="2" rx="12" ry="0" x="310" y="90" width="180" height="300"/>
+  <text fill="#006c35" text-anchor="middle" font-size="16" font-weight="700" xml:space="preserve" x="400" y="118" data-gn-el-type="text" style="white-space:pre"><tspan>Tessallite</tspan></text>
+  <rect fill="#ffffff" stroke="#cbd5e1" rx="6" ry="0" x="330" y="130" width="140" height="32"/>
+  <text fill="#333333" text-anchor="middle" font-size="13" font-weight="500" xml:space="preserve" x="400" y="151" data-gn-el-type="text" style="white-space:pre"><tspan>Gateway</tspan></text>
+  <rect fill="#ffffff" stroke="#cbd5e1" rx="6" ry="0" x="330" y="174" width="140" height="32"/>
+  <text fill="#333333" text-anchor="middle" font-size="13" font-weight="500" xml:space="preserve" x="400" y="195" data-gn-el-type="text" style="white-space:pre"><tspan>Query Router</tspan></text>
+  <rect fill="#ffffff" stroke="#cbd5e1" rx="6" ry="0" x="330" y="218" width="140" height="32"/>
+  <text fill="#333333" text-anchor="middle" font-size="13" font-weight="500" xml:space="preserve" x="400" y="239" data-gn-el-type="text" style="white-space:pre"><tspan>Semantic Layer</tspan></text>
+  <rect fill="#ffffff" stroke="#cbd5e1" rx="6" ry="0" x="330" y="262" width="140" height="44"/>
+  <text fill="#333333" text-anchor="middle" font-size="13" font-weight="500" xml:space="preserve" x="400" y="281" data-gn-el-type="text" style="white-space:pre"><tspan>Optimizer +</tspan></text>
+  <text fill="#333333" text-anchor="middle" font-size="13" font-weight="500" xml:space="preserve" x="400" y="298" data-gn-el-type="text" style="white-space:pre"><tspan>Scheduler</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" letter-spacing="0.05em" font-size="12" font-weight="600" xml:space="preserve" x="700" y="48" data-gn-el-type="text" style="white-space:pre"><tspan>DATA SOURCES</tspan></text>
+  <rect fill="#f2f7f4" stroke="#006c35" stroke-width="1.5" rx="8" ry="0" x="620" y="60" width="160" height="50"/>
+  <text fill="#333333" text-anchor="middle" font-size="14" font-weight="600" xml:space="preserve" x="700" y="80" data-gn-el-type="text" style="white-space:pre"><tspan>PostgreSQL</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" font-size="11" xml:space="preserve" x="700" y="98" data-gn-el-type="text" style="white-space:pre"><tspan>SQL</tspan></text>
+  <rect fill="#f2f7f4" stroke="#006c35" stroke-width="1.5" rx="8" ry="0" x="620" y="215" width="160" height="50"/>
+  <text fill="#333333" text-anchor="middle" font-size="14" font-weight="600" xml:space="preserve" x="700" y="235" data-gn-el-type="text" style="white-space:pre"><tspan>BigQuery</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" font-size="11" xml:space="preserve" x="700" y="253" data-gn-el-type="text" style="white-space:pre"><tspan>SQL</tspan></text>
+  <rect fill="#f2f7f4" stroke="#006c35" stroke-width="1.5" rx="8" ry="0" x="620" y="370" width="160" height="50"/>
+  <text fill="#333333" text-anchor="middle" font-size="14" font-weight="600" xml:space="preserve" x="700" y="390" data-gn-el-type="text" style="white-space:pre"><tspan>Hadoop / Spark</tspan></text>
+  <text fill="#6b7280" text-anchor="middle" font-size="11" xml:space="preserve" x="700" y="408" data-gn-el-type="text" style="white-space:pre"><tspan>SQL</tspan></text>
+  <path fill="none" stroke="#006c35" stroke-width="2" marker-end="url(#arrow)" d="M182,85L308,146"/>
+  <text fill="#6b7280" text-anchor="middle" font-size="11" xml:space="preserve" transform="translate(7, -13)" x="230" y="104" data-gn-el-type="text" style="white-space:pre"><tspan>XMLA port 8080</tspan></text>
+  <path fill="none" stroke="#006c35" stroke-width="2" marker-end="url(#arrow)" d="M181.0379,239.417L308,200"/>
+  <path fill="none" stroke="#006c35" stroke-width="2" marker-end="url(#arrow)" d="M182,395L308,220"/>
+  <text fill="#6b7280" text-anchor="middle" font-size="11" xml:space="preserve" transform="translate(12.4465, -62.0978)" x="230" y="310" data-gn-el-type="text" style="white-space:pre"><tspan>JDBC port 5433</tspan></text>
+  <path fill="none" stroke="#006c35" stroke-width="2" marker-end="url(#arrow)" d="M492,170L618,88"/>
+  <text fill="#6b7280" text-anchor="middle" font-size="11" xml:space="preserve" x="560" y="115" data-gn-el-type="text" style="white-space:pre"><tspan>SQL</tspan></text>
+  <path fill="none" stroke="#006c35" stroke-width="2" marker-end="url(#arrow)" d="M492,240L618,240"/>
+  <text fill="#6b7280" text-anchor="middle" font-size="11" xml:space="preserve" x="560" y="233" data-gn-el-type="text" style="white-space:pre"><tspan>SQL</tspan></text>
+  <path fill="none" stroke="#006c35" stroke-width="2" marker-end="url(#arrow)" d="M492,310L618,392"/>
+  <text fill="#6b7280" text-anchor="middle" font-size="11" xml:space="preserve" transform="translate(-6.3844, 8.9382)" x="570" y="370" data-gn-el-type="text" style="white-space:pre"><tspan>SQL</tspan></text>
+</svg>

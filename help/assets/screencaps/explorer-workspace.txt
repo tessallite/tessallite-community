@@ -1,0 +1,1 @@
+Live Explorer workspace for acme-demo showing the tenant card, Project 1, the conversational agent card, and deployed ModelX/modely model cards with project actions.

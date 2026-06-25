@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Field Compatibility Warnings — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Troubleshooting</span> / <span>Field Compatibility Warnings</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-06-14</span></div>
+    <h1>Field Compatibility Warnings</h1>
+<h2>What this covers</h2>
+<p>Tessallite warns or blocks a query when a selected measure cannot be grouped by a selected dimension. The common message is:</p>
+<pre><code>There is no aggregation path between &lt;Measure&gt; and &lt;Dimension&gt;.
+&lt;Measure&gt; can be used with: &lt;Dimension A&gt;, &lt;Dimension B&gt;, &lt;Dimension C&gt;.
+</code></pre>
+<p>An aggregation path means the model has a valid semantic relationship from the data behind the measure to the dimension you want to group by. This protects you from invalid pivots and misleading totals.</p>
+<h2>Example</h2>
+<p><code>Average Student Age</code> may be valid by <code>Student Grade</code> and <code>School</code>, but not by <code>Teacher Name</code> unless the model defines a valid relationship between those business areas.</p>
+<p>Use one of the suggested compatible dimensions, remove the incompatible dimension, or ask a model owner to add the relationship if the business relationship is real.</p>
+<h2>Where you see it</h2>
+<div class="table-wrapper"><table><thead><tr><th>Surface</th><th>Behavior</th></tr></thead><tbody><tr><td>Web pivot table</td><td>Incompatible dimensions are disabled where possible. Saved layouts that already contain incompatible fields show a warning and Execute is blocked.</td></tr><tr><td>Query validation and dry run</td><td>Validation returns the same message before execution. Freeform SQL is not blocked while typing, but validation can block execution once the fields are resolved.</td></tr><tr><td>Excel Report Builder</td><td>Incompatible dimensions are disabled after measures are placed in Values. Run, Insert Table, and Pivot are blocked while incompatible fields remain.</td></tr><tr><td>Excel CUBE Formula Wizard</td><td>Optional dimension filters are limited to compatible dimensions. Unavailable fields may appear disabled when the workflow offers a show-unavailable option.</td></tr><tr><td>Native Excel pivots over inserted tables</td><td>Existing local worksheet pivots are not dynamically restricted. Compatibility is checked before Tessallite generates or refreshes the source table.</td></tr><tr><td>XMLA and JDBC clients</td><td>The query fails during validation or execution with the aggregation-path message.</td></tr><tr><td>Conversational agent</td><td>The agent may try the requested analysis, then explain the structured compatibility failure and suggest valid dimensions.</td></tr></tbody></table></div>
+<h2>Multiple measures</h2>
+<p>When a pivot contains multiple measures, a dimension must be compatible with every selected measure. Tessallite uses the common compatible dimensions across the selected measures.</p>
+<p>If no common dimensions exist, split the analysis into separate pivots or choose measures from the same business area.</p>
+<h2>Security-filtered suggestions</h2>
+<p>Suggested dimensions are filtered by your current persona and column-level-security rules. You may see fewer options than a model owner sees.</p>
+<p>Tessallite does not reveal hidden or unauthorized dimensions as alternatives. If your access level restricts a measure to aggregated use only, the warning uses security-aware language and suggests only dimensions available to your persona.</p>
+<h2>What to do</h2>
+<ol><li>Choose one of the suggested compatible dimensions.</li><li>Remove the incompatible dimension or slicer.</li><li>Split multi-measure pivots into separate analyses when the measures do not share dimensions.</li><li>Ask a model owner to add or correct relationships if the business relationship should be valid.</li><li>Switch persona only when you are authorized to do so and need a different access scope.</li></ol>
+<h2>Related</h2>
+<ul><li><a href="../modelling/measure-query-panel.html">Measure Query Panel</a></li><li><a href="../modelling/query-panel.html">Query Panel</a></li><li><a href="../integrations/excel-add-in.html">Tessallite Excel Add-in</a></li><li><a href="../integrations/excel-xmla-connection-guide.html">Excel XMLA Connection Guide</a></li><li><a href="../integrations/jdbc-connection-guide.html">JDBC Connection Guide</a></li><li><a href="../agent/agent-chat.html">Agent Chat</a></li><li><a href="../modelling/column-level-security.html">Column-Level Security</a></li></ul>
+<nav class="page-nav"><a href="query-returns-wrong-results.html" class="page-nav-btn prev">&larr; Query Returns Wrong Results</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="aggregates-not-building.html" class="page-nav-btn next">Aggregates Not Building &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

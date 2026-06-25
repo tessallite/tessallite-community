@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Query Log — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Query Log</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-05-18</span></div>
+    <h1>Query Log</h1>
+<h2>What this covers</h2>
+<p>The query log records every SQL, DAX, and MDX query that flows through the Tessallite gateway and query-router. This page explains what information is captured, how to filter and search the log, how to export it as CSV, and how to configure retention.</p>
+<h2>Why query logging matters</h2>
+<p>The query log serves three audiences:</p>
+<ul><li><strong>Administrators</strong> need to know which users are running queries, how often, and whether those queries are hitting aggregates or falling through to the source database.</li><li><strong>Modellers</strong> use query logs to identify slow queries, missing aggregates, and patterns that the optimizer has not yet addressed.</li><li><strong>Security teams</strong> need a record of which data was accessed, by whom, and whether row-level security rules were applied.</li></ul>
+<p>Without a query log, diagnosing a slow PivotTable refresh or an unexpected data access means searching raw service logs. The query log gives every stakeholder a single, filterable, exportable view.</p>
+<h2>What is captured</h2>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Description</th></tr></thead><tbody><tr><td>Timestamp</td><td>When the query was received.</td></tr><tr><td>User identity</td><td>The authenticated user or JDBC/XMLA session identity.</td></tr><tr><td>Protocol</td><td><code>jdbc</code>, <code>xmla</code>, <code>rest</code>, or <code>internal</code>.</td></tr><tr><td>Raw query</td><td>The original SQL, DAX, or MDX text.</td></tr><tr><td>Route type</td><td>How the query was served: <code>source</code> (direct to database), <code>aggregate</code> (hit a pre-built aggregate), or <code>pocket</code> (hit a pocket table).</td></tr><tr><td>Status</td><td><code>success</code> or <code>error</code>.</td></tr><tr><td>Error type</td><td>If the query failed: <code>timeout</code>, <code>result_too_large</code>, <code>parse_error</code>, <code>auth_error</code>, etc.</td></tr><tr><td>Execution time</td><td>Wall-clock milliseconds from receive to response.</td></tr><tr><td>Rows returned</td><td>Number of result rows.</td></tr><tr><td>Rewritten query</td><td>If the query-router rewrote the SQL (e.g., to target an aggregate), the rewritten version.</td></tr><tr><td>Query fingerprint</td><td>A normalised hash of the query structure, used to group similar queries.</td></tr></tbody></table></div>
+<h2>Accessing the query log</h2>
+<p>Open any model in the Explorer. The Diagnostics panel appears in the lower section. Select the <strong>Query Log</strong> tab.</p>
+<p>The query log is scoped to the current project. All models in the project share a single log view.</p>
+<h2>Filtering</h2>
+<p>Six filters narrow the results. All filters combine with AND logic.</p>
+<div class="table-wrapper"><table><thead><tr><th>Filter</th><th>Behaviour</th></tr></thead><tbody><tr><td><strong>From / To</strong></td><td>Date-time range. Only queries within this window are shown.</td></tr><tr><td><strong>User</strong></td><td>Partial text match against the user identity field.</td></tr><tr><td><strong>Status</strong></td><td>Dropdown: All, Success, Error.</td></tr><tr><td><strong>Route</strong></td><td>Dropdown: All, Source, Aggregate, Pocket.</td></tr><tr><td><strong>Error type</strong></td><td>Available via the API: exact match against the error type field.</td></tr><tr><td><strong>Model</strong></td><td>Available via the API: filter to a single model within the project.</td></tr></tbody></table></div>
+<p>Type a date range and press Enter or click away to apply. Text filters apply as you type with a short debounce.</p>
+<h2>Viewing query details</h2>
+<p>Click any row to open the detail dialog. The dialog shows:</p>
+<ul><li>Status, route type, protocol, execution time, and rows returned as badges.</li><li>The user identity (if present).</li><li>The full original query text.</li><li>The rewritten query (if the query-router rewrote it).</li><li>Error type and error detail (for failed queries).</li><li>Aggregate or pocket ID (if the query hit a cached result).</li><li>The query fingerprint.</li></ul>
+<h2>CSV export</h2>
+<p>Click the download icon in the toolbar to export the current filtered view as a CSV file. The export includes all matching rows (not just the current page) with these columns:</p>
+<p><code>created_at</code>, <code>user_identity</code>, <code>protocol</code>, <code>raw_query</code>, <code>route_type</code>, <code>status</code>, <code>error_type</code>, <code>execution_ms</code>, <code>rows_returned</code>, <code>query_fingerprint</code></p>
+<p>Use the filters to narrow the export before downloading. For large tenants with millions of queries, apply a date range to keep the export manageable.</p>
+<h2>Retention</h2>
+<p>The <code>query_log.retention_days</code> tenant setting controls how long query logs are kept:</p>
+<ul><li>Default: <strong>90 days</strong>.</li><li>Set to <strong>0</strong> for indefinite retention (logs are never auto-deleted).</li></ul>
+<p>A daily scheduler job (<code>query_log_purge</code>) deletes query log entries and their associated route log entries older than the retention threshold. The job runs once per day per tenant at 05:30 UTC.</p>
+<p>Configure retention in <em>Admin &gt; Settings</em> by adding or updating the <code>query_log.retention_days</code> key.</p>
+<h2>API reference</h2>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Endpoint</th><th>Purpose</th></tr></thead><tbody><tr><td>GET</td><td><code>/api/v1/projects/{project_id}/logs/queries</code></td><td>List query logs (paginated). Params: <code>model_id</code>, <code>status</code>, <code>error_type</code>, <code>route_type</code>, <code>user_identity</code>, <code>date_from</code>, <code>date_to</code>, <code>page</code>, <code>page_size</code>.</td></tr><tr><td>GET</td><td><code>/api/v1/projects/{project_id}/logs/queries/export</code></td><td>CSV download with the same filter parameters.</td></tr><tr><td>GET</td><td><code>/api/v1/projects/{project_id}/logs/misses</code></td><td>List query miss logs (cache misses tracked by the optimizer).</td></tr></tbody></table></div>
+<p>All endpoints require authentication and project membership.</p>
+<h2>Best practices</h2>
+<ul><li><strong>Review the hit/miss ratio regularly.</strong> A high miss rate means queries are bypassing aggregates and hitting the source database directly. Use the route filter to isolate misses and check whether the optimizer has candidates queued.</li><li><strong>Export before retention purges.</strong> If you need query logs for capacity planning or billing, schedule a periodic CSV export. The query log is not a permanent archive.</li><li><strong>Use the user filter for access reviews.</strong> Filter by a specific user to see what data they queried and when.</li><li><strong>Set retention to match your needs.</strong> 90 days is sufficient for most operational use. Extend to 365 for compliance-heavy environments.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="audit-log.html">Audit Log</a> — platform action audit trail (separate from query execution logs)</li><li><a href="workspace-settings.html">Workspace Settings</a></li></ul>
+<nav class="page-nav"><a href="audit-log.html" class="page-nav-btn prev">&larr; Audit Log</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="alert-configuration.html" class="page-nav-btn next">Alert Configuration &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

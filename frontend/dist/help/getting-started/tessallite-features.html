@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tessallite Features — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Getting Started</span> / <span>Tessallite Features</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">all</span><span class="updated">Updated 2026-05-25</span></div>
+    <h1>Tessallite Features</h1>
+
+<h2>What this covers</h2>
+<p>A complete reference of every Tessallite feature, what it does, and where to find it in the product. Use this page to discover capabilities you may not know about, or as a checklist when evaluating the platform.</p>
+
+<h2>Semantic Modelling</h2>
+<table>
+<thead><tr><th>Feature</th><th>Description</th><th>Where to use it</th></tr></thead>
+<tbody>
+<tr><td>Multi-source connections</td><td>Connect PostgreSQL, BigQuery, Spark/Hive, SQL Server, Snowflake, and Redshift</td><td>Model Builder &gt; Connections panel</td></tr>
+<tr><td>Tables and aliases</td><td>Add source tables; create role-playing aliases for different join roles</td><td>Model Builder &gt; Sources panel</td></tr>
+<tr><td>Joins</td><td>Fact-dimension relationships; one-fact-per-model rule enforced</td><td>Model Builder &gt; Canvas or Joins panel</td></tr>
+<tr><td>Dimensions</td><td>Column-based attributes with display name, type, folder, hidden flag</td><td>Model Builder &gt; Dimensions panel</td></tr>
+<tr><td>Calculated dimensions</td><td>Expression-based dimensions from SQL (CASE, COALESCE, etc.)</td><td>Dimensions panel &gt; Expression tab</td></tr>
+<tr><td>Measures</td><td>Aggregations (SUM, COUNT, AVG, MIN, MAX, DISTINCT COUNT) with format tokens</td><td>Model Builder &gt; Measures panel</td></tr>
+<tr><td>Calculated measures</td><td>Expressions over other measures using measure(), safe_div, arithmetic</td><td>Measures panel &gt; Create calculated</td></tr>
+<tr><td>Semi-additive measures</td><td>Time-aware aggregation: LAST_NON_EMPTY, FIRST_NON_EMPTY, AVG_OF_CHILDREN, etc.</td><td>Measures drawer &gt; semi_additive_behavior</td></tr>
+<tr><td>Time intelligence variants</td><td>14 canonical time calculations: lag, YTD, YoY growth, trailing N, moving avg</td><td>Measures drawer &gt; Variants (fx+)</td></tr>
+<tr><td>Hierarchies (4 types)</td><td>Explicit, date_embedded, segment, inferred with time units</td><td>Model Builder &gt; Hierarchies panel</td></tr>
+<tr><td>Calendar tables</td><td>6 types: Standard, Fiscal, ISO Week, Retail 4-4-5, Hijri, Thai Buddhist</td><td>Model Builder &gt; Calendar setup</td></tr>
+<tr><td>Business glossary</td><td>Propose, approve, publish business term definitions</td><td>Model Builder &gt; Glossary panel</td></tr>
+<tr><td>Named Lists (Named Sets)</td><td>Reusable dimension member selections: fixed members, Top N, filtered, or Advanced MDX</td><td>Model Builder &gt; Named Lists panel</td></tr>
+<tr><td>KPIs</td><td>Value vs goal comparison with status (good/warning/poor) and trend (improving/flat/declining)</td><td>Model Builder &gt; KPIs panel</td></tr>
+<tr><td>KPI Scorecard</td><td>Live traffic-light dashboard of all KPIs with grouping by display folder</td><td>Model Builder &gt; KPIs tab (bottom bar)</td></tr>
+<tr><td>KPI Template Gallery</td><td>Pre-built KPI definitions across Financial, Customer, Operations, HR, Sales categories</td><td>KPIs panel &gt; Templates button</td></tr>
+<tr><td>Data tags</td><td>Sensitivity labels (PII, Financial) for governance</td><td>Model Builder &gt; Data Tags panel</td></tr>
+<tr><td>Model versioning</td><td>Immutable snapshots; compare, restore, revert</td><td>Model Builder &gt; Save and Version</td></tr>
+<tr><td>Multi-language metadata (i18n)</td><td>Translate dimension, measure, and hierarchy display names into multiple locales; locale selector in Explorer</td><td>Translations API; Explorer &gt; Locale selector</td></tr>
+<tr><td>Model templates</td><td>Pre-built starter kits (E-Commerce, SaaS, Financial) auto-imported on model creation</td><td>Explorer &gt; Create Model &gt; Template picker</td></tr>
+<tr><td>Deploy and undeploy</td><td>Publish model to BI tools; undeploy to remove</td><td>Model Builder &gt; Deploy button</td></tr>
+<tr><td>Export/Import (JSON)</td><td>Portable project bundles with connection rebinding</td><td>Project menu &gt; Export / Import</td></tr>
+<tr><td>Export/Import (YAML)</td><td>Git-friendly YAML format with clean diffs</td><td>Project menu &gt; Export YAML</td></tr>
+<tr><td>dbt importer</td><td>Import dbt semantic_models and metrics (v1.7+)</td><td>Project menu &gt; Import from dbt</td></tr>
+<tr><td>AtScale importer</td><td>Import AtScale SML projects (10 object types: models, datasets, dimensions, metrics, calculations)</td><td>Project menu &gt; Import from AtScale</td></tr>
+<tr><td>Cube importer</td><td>Import Cube.dev YAML projects (cubes, measures, dimensions, joins)</td><td>Project menu &gt; Import from Cube</td></tr>
+</tbody>
+</table>
+
+<h2>Query Execution</h2>
+<table>
+<thead><tr><th>Feature</th><th>Description</th><th>Where to use it</th></tr></thead>
+<tbody>
+<tr><td>Transparent query routing</td><td>Auto-route to fastest path: aggregate, pocket, or live source</td><td>Automatic (route badge)</td></tr>
+<tr><td>Route visibility</td><td>Every response shows which path served it and why</td><td>Query panel &gt; Route badge</td></tr>
+<tr><td>Force Live toggle</td><td>Bypass aggregates to query source directly</td><td>Query panel &gt; Force Live</td></tr>
+<tr><td>Canvas undo/redo</td><td>Ctrl+Z / Ctrl+Y to undo and redo node position changes on the model canvas</td><td>Canvas toolbar Undo/Redo buttons</td></tr>
+<tr><td>Measure Query Panel</td><td>Multi-dim pivot: 3 row x 3 col dims, subtotals, slicers, drill</td><td>Model Builder &gt; Pivot tab</td></tr>
+<tr><td>Pivot conditional formatting</td><td>Color-scale, data-bars, and threshold-based cell formatting in the pivot grid</td><td>Pivot tab &gt; Conditional Format controls</td></tr>
+<tr><td>Drill-through</td><td>Contributing fact rows with pagination and column selection</td><td>Pivot &gt; Click cell &gt; Drill drawer</td></tr>
+<tr><td>Parameterized filters</td><td>Named parameters (@region, @date_range) with 5 types</td><td>Measures drawer &gt; Parameters</td></tr>
+<tr><td>Multi-dialect transpilation</td><td>PostgreSQL SQL transpiled to BigQuery, Spark, SQL Server, Snowflake, Redshift</td><td>Automatic</td></tr>
+<tr><td>Headless REST API</td><td>JSON query interface for programmatic access</td><td>POST /api/v1/plugin/execute</td></tr>
+</tbody>
+</table>
+
+<h2>Aggregates and Optimisation</h2>
+<table>
+<thead><tr><th>Feature</th><th>Description</th><th>Where to use it</th></tr></thead>
+<tbody>
+<tr><td>Aggregate creation</td><td>Pre-computed tables with selected grain and measures</td><td>Aggregates panel &gt; Create</td></tr>
+<tr><td>Exact and partial grain routing</td><td>Exact match or re-aggregate from finer-grained table</td><td>Automatic</td></tr>
+<tr><td>Full and incremental refresh</td><td>DROP+CTAS or watermark-based partial update; multi-dialect via sqlglot</td><td>Run a Refresh</td></tr>
+<tr><td>Scheduler dependency chains</td><td>Define refresh ordering (B after A) with topological sorting and cycle detection</td><td>Aggregates panel &gt; Dependencies</td></tr>
+<tr><td>Predictive aggregates</td><td>Auto-probe sources, score by ROI, top-K build</td><td>Aggregates panel &gt; Predictive tab</td></tr>
+<tr><td>AI optimiser</td><td>LLM analysis of miss patterns for suggestions</td><td>Aggregates panel &gt; AI Optimiser</td></tr>
+<tr><td>Aggregate lifecycle</td><td>Auto events: created, validated, retired, evicted</td><td>Model Health &gt; Lifecycle</td></tr>
+<tr><td>Pocket tables</td><td>Materialised filtered slices with incremental refresh</td><td>Pocket Tables panel</td></tr>
+<tr><td>Pocket auto-suggestion</td><td>Analyse repeated WHERE predicates within size budget</td><td>Pocket Tables &gt; Suggestions</td></tr>
+</tbody>
+</table>
+
+<h2>Security and Access Control</h2>
+<table>
+<thead><tr><th>Feature</th><th>Description</th><th>Where to use it</th></tr></thead>
+<tbody>
+<tr><td>Project-scoped RBAC</td><td>admin/modeler/viewer roles per project</td><td>Admin &gt; Project Settings &gt; Access</td></tr>
+<tr><td>Model-scoped RBAC</td><td>Per-model access bindings</td><td>Admin &gt; Model-level access</td></tr>
+<tr><td>Row-level security</td><td>Restrict rows by JWT role or user-mapping table</td><td>Row Security panel</td></tr>
+<tr><td>Column-level security</td><td>Tag-based column restrictions via personas</td><td>Personas &gt; Tag restrictions</td></tr>
+<tr><td>Personas</td><td>Named audience subsets with allow lists and default filters</td><td>Personas panel</td></tr>
+<tr><td>Persona row-security bypass</td><td>Elevated audiences bypass RLS</td><td>Personas &gt; Bypass toggle</td></tr>
+<tr><td>Embed tokens</td><td>Signed JWTs for iframe embedding with scope control</td><td>API: POST /auth/embed-token</td></tr>
+</tbody>
+</table>
+
+<h2>Authentication</h2>
+<table>
+<thead><tr><th>Feature</th><th>Description</th><th>Where to use it</th></tr></thead>
+<tbody>
+<tr><td>Local auth</td><td>Email/password with httpOnly cookie JWT and CSRF protection</td><td>Login page</td></tr>
+<tr><td>SSO: SAML 2.0</td><td>SP-initiated SSO for Auth0, Google Workspace, generic SAML</td><td>Admin &gt; SSO Configuration</td></tr>
+<tr><td>SSO: OIDC</td><td>Authorization-code flow for generic OIDC providers</td><td>Admin &gt; SSO Configuration</td></tr>
+<tr><td>SSO group mappings</td><td>Map IdP groups to project/model roles</td><td>Admin &gt; SSO Group Mappings</td></tr>
+<tr><td>LDAP authentication</td><td>Bind-and-search with configurable DN and filter</td><td>Admin &gt; Workspace Settings</td></tr>
+<tr><td>User management</td><td>Create, edit, delete, reset password, role assignment</td><td>Admin &gt; Users tab</td></tr>
+</tbody>
+</table>
+
+<h2>BI Tool Integrations</h2>
+<table>
+<thead><tr><th>Feature</th><th>Description</th><th>Where to use it</th></tr></thead>
+<tbody>
+<tr><td>JDBC gateway</td><td>PostgreSQL wire protocol for DBeaver, Tableau, Superset</td><td>Port 5433</td></tr>
+<tr><td>XMLA gateway</td><td>DAX/MDX for Excel PivotTables and Power BI</td><td>Port 8080</td></tr>
+<tr><td>Excel PivotTables</td><td>Totals, subtotals, drill-down, Show Values As, Timelines</td><td>Excel &gt; PivotTable</td></tr>
+<tr><td>Excel Add-in</td><td>Report Builder, chat, CUBE/KPI/Named List formulas, drill-through, stale detection, personas</td><td>Excel &gt; Add-ins &gt; Tessallite</td></tr>
+<tr><td>Power BI</td><td>DirectQuery/Import with aggregates and personas</td><td>Power BI &gt; Analysis Services</td></tr>
+<tr><td>Looker Studio / Data Studio direct</td><td>PostgreSQL connector path through the JDBC gateway; no LookML or Looker license required; live validation ready to execute</td><td><a href="../integrations/looker-studio-connection-guide.html">Looker Studio guide</a></td></tr>
+<tr><td>Optional Looker-hosted workflow</td><td>Generated LookML views and explores backed by governed gateway relations; deferred until a compatible Looker instance exists</td><td><a href="../integrations/looker-studio-via-looker-guide.html">Looker-hosted guide</a></td></tr>
+<tr><td>LookML emitter</td><td>Export-dialog ZIP download and offline CLI with model-hash drift detection; artifact generation requires no Looker access</td><td><a href="../integrations/lookml-emitter-guide.html">Emitter guide</a></td></tr>
+<tr><td>Multi-catalogue</td><td>Business, Technical, Persona catalogues via JDBC/XMLA</td><td>BI tool &gt; Schema browser</td></tr>
+</tbody>
+</table>
+<p>Looker version 1 limitations: no persistent derived tables against Tessallite, no bidirectional LookML import, no Looker Action API integration, and no certification of optional Looker-hosted execution. Live Data Studio evidence must be recorded before the direct integration is described as validated.</p>
+
+<h2>Conversational Agent</h2>
+<table>
+<thead><tr><th>Feature</th><th>Description</th><th>Where to use it</th></tr></thead>
+<tbody>
+<tr><td>Agent Chat</td><td>Multi-turn conversation with streaming, citations, charts</td><td>Frontend &gt; Agent Chat</td></tr>
+<tr><td>Agent conversation export</td><td>Export chat conversations as Markdown or PDF with full turn history</td><td>Agent Chat &gt; Export button</td></tr>
+<tr><td>Agent stop button</td><td>Abort in-progress SSE streaming response; Stop replaces Send during streaming</td><td>Agent Chat &gt; Stop button</td></tr>
+<tr><td>Multi-LLM support</td><td>Claude, GPT, or Gemini per project</td><td>Admin &gt; LLM Configuration</td></tr>
+<tr><td>Session memory</td><td>Configurable history depth with token-aware truncation</td><td>Admin &gt; Agent &gt; Advanced</td></tr>
+<tr><td>Guardrails</td><td>Token/cost budgets and complexity limits</td><td>Admin &gt; Agent &gt; Budget</td></tr>
+<tr><td>Judge rubric</td><td>Answer quality scoring with eval runs</td><td>Admin &gt; Agent &gt; Judge rubrics</td></tr>
+<tr><td>Glossary alias map</td><td>Business synonyms for entity resolution</td><td>Admin &gt; Agent &gt; Glossary</td></tr>
+<tr><td>Conversational Client</td><td>Standalone chat app (React/Flask) with ECharts</td><td>conversational-client/ (port 3333)</td></tr>
+<tr><td>Embed agent chat</td><td>Iframe-embeddable chat via signed embed tokens</td><td>Embed API &gt; /embed/chat</td></tr>
+</tbody>
+</table>
+
+<h2>Monitoring and Observability</h2>
+<table>
+<thead><tr><th>Feature</th><th>Description</th><th>Where to use it</th></tr></thead>
+<tbody>
+<tr><td>Query log</td><td>Execution history with filters and CSV export</td><td>Admin &gt; Query Log</td></tr>
+<tr><td>Usage analytics</td><td>Volume, top measures, hit rate, latency</td><td>Model Builder &gt; Usage Analytics</td></tr>
+<tr><td>Model Health</td><td>Alerts, invalids, refreshes, cold-start metrics</td><td>Model Builder &gt; Model Health</td></tr>
+<tr><td>Data quality rules</td><td>not_null, unique, range, regex, custom_sql</td><td>Model Health &gt; Data Quality</td></tr>
+<tr><td>Schema drift detection</td><td>Auto-detect source schema changes</td><td>Model Health &gt; Schema Changes</td></tr>
+<tr><td>Lineage</td><td>Dependency graph: source &gt; joins &gt; dims &gt; measures &gt; aggs</td><td>Model Builder &gt; Lineage</td></tr>
+<tr><td>Email and Slack alerts</td><td>Notifications for failures, drift, SLA breach, spike</td><td>Admin &gt; Alert Configuration</td></tr>
+<tr><td>Prometheus + Grafana</td><td>Optional monitoring stack with 21-panel dashboard</td><td>monitoring/ (ports 9090, 3001)</td></tr>
+</tbody>
+</table>
+
+<h2>Administration</h2>
+<table>
+<thead><tr><th>Feature</th><th>Description</th><th>Where to use it</th></tr></thead>
+<tbody>
+<tr><td>Workspace creation</td><td>Tenant provisioning with isolated schemas</td><td>System Admin</td></tr>
+<tr><td>Project/Workspace settings</td><td>Limits, budgets, agent config, alert routes</td><td>Admin &gt; Settings</td></tr>
+<tr><td>Audit logging</td><td>Model CRUD, auth, security events with levels</td><td>Admin &gt; Audit Log</td></tr>
+<tr><td>Webhooks</td><td>HMAC-signed outbound events with DLQ and retries</td><td>Admin &gt; Webhooks</td></tr>
+<tr><td>Scheduler SLA</td><td>Refresh time and latency SLA with breach alerts</td><td>Admin &gt; SLA</td></tr>
+<tr><td>System configuration</td><td>Database-backed settings editable from UI</td><td>System Admin &gt; Configuration</td></tr>
+</tbody>
+</table>
+
+<h2>Infrastructure</h2>
+<table>
+<thead><tr><th>Feature</th><th>Description</th><th>Where to use it</th></tr></thead>
+<tbody>
+<tr><td>Local deployment</td><td>Guided script with prereqs, env, migrations</td><td>deploy/local/</td></tr>
+<tr><td>GCP deployment</td><td>Cloud Run + Cloud SQL scripted setup</td><td>deploy/gcp/</td></tr>
+<tr><td>Docker Compose</td><td>Multi-service stack with tessallite_net network</td><td>tessallite/infra/</td></tr>
+<tr><td>Monitoring stack</td><td>Optional Prometheus + Grafana in separate compose</td><td>monitoring/</td></tr>
+<tr><td>HTTPS with HSTS</td><td>nginx redirect with Strict-Transport-Security</td><td>Frontend nginx</td></tr>
+<tr><td>Rate limiting</td><td>Per-tenant throttling (60 req/min default)</td><td>Automatic</td></tr>
+<tr><td>MCP server</td><td>Model Context Protocol for AI assistants</td><td>tessallite/mcp-server/</td></tr>
+</tbody>
+</table>
+
+<h2>Related</h2>
+<ul>
+<li><a href="what-is-tessallite.html">What is Tessallite</a></li>
+<li><a href="how-tessallite-works.html">How Tessallite Works</a></li>
+<li><a href="../system-admin/architecture-overview.html">Architecture Overview</a></li>
+<li><a href="../integrations/bi-compatibility.html">BI Tool Compatibility Matrix</a></li>
+</ul>
+
+  </main>
+  <footer class="page-nav">
+    <a href="connect-excel.html">&larr; Connect Excel via XMLA</a> |
+    <a href="../index.html">Home</a> |
+    <a href="../concepts/workspaces-and-tenants.html">Workspaces and Tenants &rarr;</a>
+  </footer>
+</body>
+</html>

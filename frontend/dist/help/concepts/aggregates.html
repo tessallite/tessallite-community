@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aggregates — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Concepts</span> / <span>Aggregates</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Aggregates</h1>
+<figure class="illustration"><img class="illustration" src="../assets/illustrations/aggregate-lifecycle.svg" alt="Aggregate lifecycle state diagram: query miss leads to Optimizer scoring, then Building, Ready, Stale, Refreshing back to Ready, and Retired for unused aggregates."></figure>
+<h2>What this covers</h2>
+<p>This article explains what aggregate tables are, how they are created and maintained, when the Query Router uses them, and how the Optimizer and Scheduler manage their lifecycle.</p>
+<h2>What an aggregate is</h2>
+<p>An aggregate is a pre-computed summary table stored in a target schema. Where the fact table might contain hundreds of millions of individual transaction rows, an aggregate compresses that data into thousands of summary rows — one per unique combination of grouped dimensions. A query that previously required a full scan of the fact table can instead read a small number of aggregate rows.</p>
+<p>Aggregates are physical tables, not views. They exist in the target schema until the Optimizer retires them. Tessallite manages their creation, refresh, and deletion through the Scheduler and Optimizer services.</p>
+<h2>Grain and measures</h2>
+<p>Each aggregate is defined by two things:</p>
+<ul><li><strong>Grain</strong> — the set of dimensions at which the data was grouped. Example: {Region, Product Category, Month}.</li><li><strong>Measures</strong> — the aggregated values stored at that grain. Example: SUM(order_total), COUNT(order_id).</li></ul>
+<p>The aggregate table has one column per grain dimension and multiple columns per measure &mdash; one for each type-compatible aggregation. For example, a SUM-default measure also stores COUNT, MIN, and MAX so that queries requesting any of those stat types can route to the aggregate instead of falling back to the source. The example above would produce columns like: <code>region</code>, <code>product_category</code>, <code>month</code>, <code>order_total__sum</code>, <code>order_total__count</code>, <code>order_total__min</code>, <code>order_total__max</code>, <code>order_id__count</code>, <code>order_id__min</code>, <code>order_id__max</code>.</p>
+<h2>The aggregate lifecycle</h2>
+<p>Aggregates move through a defined set of states from creation to retirement:</p>
+<ol><li><strong>Miss detection</strong> — the Query Router logs each query that cannot be served by an existing aggregate. These misses are the raw input for the Optimizer.</li><li><strong>Optimizer scoring</strong> — the Optimizer periodically reviews the miss log and scores candidate aggregates by estimated query acceleration gain versus storage cost. High-scoring candidates are submitted to the Scheduler as build jobs.</li><li><strong>Build</strong> — the Scheduler executes a <code>CREATE TABLE AS SELECT ... GROUP BY ...</code> against the source. The aggregate is in the <strong>Building</strong> state.</li><li><strong>Ready</strong> — the build completes successfully. The aggregate is registered with the Query Router.</li><li><strong>Stale</strong> — source data has changed. The Scheduler queues a refresh.</li><li><strong>Refreshing</strong> — the Scheduler is rebuilding the aggregate. Queries continue to be routed to the previous version during this window.</li><li><strong>Retired</strong> — the Optimizer determined the aggregate has not been used within the configured usage window. The Scheduler drops the table.</li></ol>
+<div class="table-wrapper"><table><thead><tr><th>State</th><th>Queries routed to it</th><th>Description</th></tr></thead><tbody><tr><td>Building</td><td>No</td><td>Initial build in progress. Not yet registered with the router.</td></tr><tr><td>Ready</td><td>Yes</td><td>Build complete and data is current.</td></tr><tr><td>Stale</td><td>Yes (by default)</td><td>Source data has changed. Refresh is queued.</td></tr><tr><td>Refreshing</td><td>Yes — previous version</td><td>Refresh build is running. Previous version serves queries.</td></tr><tr><td>Retired</td><td>No</td><td>Optimizer determined the aggregate is unused. Table has been dropped.</td></tr></tbody></table></div>
+<h2>Manual vs automated aggregates</h2>
+<p><strong>Manual aggregates</strong> are defined in the Model Builder. You select the grain dimensions and the measures, then save. The Scheduler picks up the definition and builds the table on its next run. Manual aggregates give you precise control and are appropriate for known high-frequency query patterns.</p>
+<p><strong>Automated aggregates</strong> are created by the Optimizer. You enable the AI Optimizer from the Model Builder and configure thresholds for miss frequency and storage budget. The Optimizer monitors query misses and creates, adjusts, and retires aggregates without manual intervention.</p>
+<p>Manual and automated aggregates coexist in the same model. The Optimizer will not create a duplicate of a manually defined aggregate, but it may create additional aggregates at different grains.</p>
+<h2>Refresh policy</h2>
+<p>An aggregate becomes stale when data in its source tables changes. The Scheduler detects staleness by comparing the source table&#x27;s last-modified timestamp against the aggregate&#x27;s last-build timestamp. You configure the refresh schedule per model: either on a fixed interval (e.g., every hour) or triggered after a source ETL completes via the Scheduler API.</p>
+<p>If an aggregate has not been refreshed within its expected window, the Health tab raises an &quot;Aggregate refresh overdue&quot; warning. Check the Scheduler job log for build errors.</p>
+<h2>Related</h2>
+<ul><li><a href="dimensions-and-measures.html">Dimensions and measures</a></li><li><a href="query-routing.html">Query routing</a></li><li><a href="../modelling/configure-aggregates.html">Configure aggregates</a></li><li><a href="../modelling/run-a-refresh.html">Run a refresh</a></li><li><a href="../modelling/use-the-ai-optimiser.html">Use the AI Optimizer</a></li></ul>
+<nav class="page-nav"><a href="dimensions-and-measures.html" class="page-nav-btn prev">&larr; Dimensions and Measures</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="query-routing.html" class="page-nav-btn next">Query Routing &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

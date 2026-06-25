@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Connect Excel via XMLA — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Getting Started</span> / <span>Connect Excel via XMLA</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Connect Excel via XMLA</h1>
+<h2>What this covers</h2>
+<p>Connecting Microsoft Excel to a Tessallite workspace via the XMLA endpoint, selecting a model catalogue, and building a pivot table from the model&#x27;s dimensions and measures.</p>
+<h2>Before you start</h2>
+<ul><li>Role required: Analyst (Viewer) or higher.</li><li>You will need: Microsoft Excel for Windows with the <strong>Data</strong> tab available, your email address, and your Tessallite password.</li><li>You will also need: the XMLA endpoint URL. For a local install, this is <code>http://localhost:8080/api/v1/xmla/</code>. For a cloud install, your system administrator provides the URL.</li><li>The trailing slash in the URL is required. The connection wizard does not accept the URL without it.</li><li>Windows Authentication is not supported. You must enter your email address and password manually.</li></ul>
+<h2>Step 1: Open the connection wizard</h2>
+<ol><li>Open Excel.</li><li>Click the <strong>Data</strong> tab in the ribbon.</li><li>Click <strong>Get Data</strong>.</li><li>From the menu, select <strong>From Database</strong>.</li><li>From the submenu, select <strong>From Analysis Services</strong>.</li><li>The Data Connection Wizard opens.</li></ol>
+<h2>Step 2: Enter the server address</h2>
+<ol><li>In the <strong>Server name</strong> field, enter the XMLA endpoint URL: <code>http://localhost:8080/api/v1/xmla/</code></li><li>Under <strong>Log on credentials</strong>, select <strong>Use the following User Name and Password</strong>.</li><li>In the <strong>User Name</strong> field, enter your email address.</li><li>In the <strong>Password</strong> field, enter your Tessallite password.</li><li>Click <strong>Next</strong>.</li></ol>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/connect-excel-wizard.png" alt="Excel Data Connection Wizard — server name and credentials fields."></figure>
+<h2>Step 3: Select a catalogue</h2>
+<ol><li>Excel connects to the gateway and retrieves a list of available catalogues.</li><li>Each model appears twice in the list:</li></ol>
+<ul><li>The plain model name (e.g. <code>orders</code>) — this is the business view, with curated fields and calculated measures.</li><li>The model name with <code>_technical</code> appended (e.g. <code>orders_technical</code>) — this is the unfiltered view, intended for modellers and power users.</li></ul>
+<ol><li>Select the catalogue you want to connect to. For most purposes, select the plain name.</li><li>Click <strong>Next</strong>, then click <strong>Finish</strong>.</li></ol>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/connect-excel-catalogue.png" alt="Excel Data Connection Wizard — catalogue selection showing model and persona catalogues."></figure>
+<h2>Step 4: Build a pivot table</h2>
+<ol><li>Excel asks where to place the data. Select a cell in your worksheet and click <strong>OK</strong>.</li><li>The PivotTable Field List opens on the right side. It shows the dimensions and measures from the selected model.</li><li>Drag dimension fields to the <strong>Rows</strong> or <strong>Columns</strong> area.</li><li>Drag measure fields to the <strong>Values</strong> area.</li><li>Excel queries Tessallite and populates the pivot table with results.</li></ol>
+<figure class="illustration"><img class="illustration" src="../assets/illustrations/excel-connection-flow.svg" alt="Excel XMLA connection sequence."></figure>
+<h2>Refreshing the data</h2>
+<p>Right-click anywhere in the pivot table and select <strong>Refresh</strong> to retrieve the latest data from Tessallite.</p>
+<h2>Tenant-specific URL</h2>
+<p>If your system administrator has set up per-tenant XMLA endpoints, the URL format is:</p>
+<p><code>http://&lt;hostname&gt;:8080/api/v1/xmla/&lt;workspace-slug&gt;</code></p>
+<p>Replace <code>&lt;hostname&gt;</code> with the gateway host and <code>&lt;workspace-slug&gt;</code> with your workspace identifier. This form does not require a trailing slash.</p>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr></thead><tbody><tr><td>&quot;Unable to connect to data source&quot;</td><td>Wrong URL format or gateway not running</td><td>Confirm the URL includes the trailing slash. Confirm the gateway service is running.</td></tr><tr><td>No catalogues appear after entering credentials</td><td>Authentication failed</td><td>Re-enter your email address and password. Do not select Windows Authentication.</td></tr><tr><td>Pivot table shows no data</td><td>No data in the model&#x27;s source</td><td>Verify with the modeller that the source connection is active and data is present.</td></tr><tr><td>Pivot table figures appear incorrect</td><td>Wrong catalogue selected</td><td>Disconnect and reconnect using the plain catalogue name (business view), not the <code>_technical</code> variant.</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="../integrations/excel-xmla-connection-guide.html">Excel XMLA connection guide</a></li><li><a href="../troubleshooting/excel-connection-problems.html">Excel connection problems</a></li><li><a href="connect-a-bi-tool.html">Connect a BI tool via JDBC</a></li></ul>
+<nav class="page-nav"><a href="connect-a-bi-tool.html" class="page-nav-btn prev">&larr; Connect a BI Tool via JDBC</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="../concepts/workspaces-and-tenants.html" class="page-nav-btn next">Workspaces and Tenants &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

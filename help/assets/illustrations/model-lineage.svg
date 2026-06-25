@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Pixodesk SVG (https://pixodesk.com) -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 420" text-rendering="geometricPrecision" shape-rendering="geometricPrecision">
+  <defs>
+    <marker id="arr" refX="10" refY="3.5" markerHeight="7" markerWidth="10" orient="auto">
+      <path fill="#006c35" d="M0,0L10,3.5L0,7"/>
+    </marker>
+  </defs>
+  <rect fill="#ffffff" width="800" height="420"/>
+  <rect fill="#f2f7f4" stroke="#2e8b57" stroke-width="1.5" rx="4" ry="0" x="30" y="60" width="160" height="52"/>
+  <text fill="#2e8b57" font-family="Inter, sans-serif" font-size="11" font-weight="600" xml:space="preserve" x="50" y="82" data-gn-el-type="text" style="white-space:pre"><tspan>dim_product</tspan></text>
+  <text fill="#555555" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="50" y="100" data-gn-el-type="text" style="white-space:pre"><tspan>schema: public</tspan></text>
+  <rect fill="#f2f7f4" stroke="#2e8b57" stroke-width="1.5" rx="4" ry="0" x="30" y="184" width="160" height="52"/>
+  <text fill="#2e8b57" font-family="Inter, sans-serif" font-size="11" font-weight="600" xml:space="preserve" x="50" y="206" data-gn-el-type="text" style="white-space:pre"><tspan>dim_date</tspan></text>
+  <text fill="#555555" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="50" y="224" data-gn-el-type="text" style="white-space:pre"><tspan>schema: public</tspan></text>
+  <rect fill="#fffbf0" stroke="#b8860b" stroke-width="1.5" rx="4" ry="0" x="30" y="308" width="160" height="52"/>
+  <text fill="#b8860b" font-family="Inter, sans-serif" font-size="11" font-weight="600" xml:space="preserve" x="50" y="330" data-gn-el-type="text" style="white-space:pre"><tspan>dim_customer</tspan></text>
+  <text fill="#b8860b" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="50" y="348" data-gn-el-type="text" style="white-space:pre"><tspan>dim_detail</tspan></text>
+  <rect fill="#006c35" stroke="#006c35" stroke-width="2" rx="6" ry="0" x="300" y="152" width="170" height="96"/>
+  <text fill="#ffffff" text-anchor="middle" font-family="Inter, sans-serif" font-size="14" font-weight="700" xml:space="preserve" x="385" y="188" data-gn-el-type="text" style="white-space:pre"><tspan>orders</tspan></text>
+  <text fill="#cce5d8" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" xml:space="preserve" x="385" y="208" data-gn-el-type="text" style="white-space:pre"><tspan>fact table</tspan></text>
+  <text fill="#9dd4b4" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="385" y="228" data-gn-el-type="text" style="white-space:pre"><tspan>public.orders</tspan></text>
+  <path stroke="#006c35" stroke-width="1.5" marker-end="url(#arr)" d="M190,90L298,186"/>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" xml:space="preserve" transform="translate(45, -11)" x="228" y="128" data-gn-el-type="text" style="white-space:pre"><tspan>orders.product_id</tspan></text>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" xml:space="preserve" transform="translate(45, -11)" x="228" y="140" data-gn-el-type="text" style="white-space:pre"><tspan>= dim_product.id</tspan></text>
+  <path stroke="#006c35" stroke-width="1.5" marker-end="url(#arr)" d="M190,210L298,210"/>
+  <text fill="#555555" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" xml:space="preserve" transform="translate(7, -4)" x="244" y="204" data-gn-el-type="text" style="white-space:pre"><tspan>date_id = dim_date.id</tspan></text>
+  <path stroke="#b8860b" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr)" d="M190,334L298,234"/>
+  <text fill="#b8860b" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" xml:space="preserve" transform="translate(35, 0)" x="228" y="302" data-gn-el-type="text" style="white-space:pre"><tspan>filter only</tspan></text>
+  <rect fill="#f2f7f4" stroke="#006c35" stroke-width="1.5" stroke-dasharray="6 3" rx="6" ry="0" x="560" y="60" width="210" height="72"/>
+  <text fill="#006c35" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" font-weight="600" xml:space="preserve" x="665" y="86" data-gn-el-type="text" style="white-space:pre"><tspan>daily_revenue_by_country</tspan></text>
+  <text fill="#555555" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="575" y="106" data-gn-el-type="text" style="white-space:pre"><tspan>Grain: Sale Date, Region</tspan></text>
+  <text fill="#555555" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="575" y="122" data-gn-el-type="text" style="white-space:pre"><tspan>Measures: Total Revenue, Orders</tspan></text>
+  <rect fill="#f2f7f4" stroke="#006c35" stroke-width="1.5" stroke-dasharray="6 3" rx="6" ry="0" x="560" y="184" width="210" height="72"/>
+  <text fill="#006c35" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" font-weight="600" xml:space="preserve" x="665" y="210" data-gn-el-type="text" style="white-space:pre"><tspan>monthly_by_category</tspan></text>
+  <text fill="#555555" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="575" y="230" data-gn-el-type="text" style="white-space:pre"><tspan>Grain: Month, Product Category</tspan></text>
+  <text fill="#555555" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="575" y="246" data-gn-el-type="text" style="white-space:pre"><tspan>Measures: Total Revenue</tspan></text>
+  <rect fill="#f2f7f4" stroke="#2e8b57" stroke-width="1.5" stroke-dasharray="6 3" rx="6" ry="0" x="560" y="308" width="210" height="72"/>
+  <text fill="#2e8b57" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" font-weight="600" xml:space="preserve" x="665" y="334" data-gn-el-type="text" style="white-space:pre"><tspan>unique_customers_daily</tspan></text>
+  <text fill="#555555" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="575" y="354" data-gn-el-type="text" style="white-space:pre"><tspan>Grain: Sale Date</tspan></text>
+  <text fill="#555555" font-family="JetBrains Mono, monospace" font-size="10" xml:space="preserve" x="575" y="370" data-gn-el-type="text" style="white-space:pre"><tspan>Measures: Unique Customers</tspan></text>
+  <text fill="#2e8b57" text-anchor="middle" font-family="Inter, sans-serif" font-size="9" xml:space="preserve" transform="translate(62, 2)" x="665" y="386" data-gn-el-type="text" style="white-space:pre"><tspan>Auto — AI Optimizer</tspan></text>
+  <path stroke="#006c35" stroke-width="1.5" marker-end="url(#arr)" d="M470,186L558,108"/>
+  <path stroke="#006c35" stroke-width="1.5" marker-end="url(#arr)" d="M470,210L558,218"/>
+  <path stroke="#006c35" stroke-width="1.5" marker-end="url(#arr)" d="M470,230L558,332"/>
+  <rect fill="#2e8b57" rx="2" ry="0" x="30" y="384" width="12" height="12"/>
+  <text fill="#333333" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" x="48" y="395" data-gn-el-type="text" style="white-space:pre"><tspan>Source table (dim_aggregate)</tspan></text>
+  <rect fill="#b8860b" rx="2" ry="0" x="210" y="384" width="12" height="12"/>
+  <text fill="#333333" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" x="228" y="395" data-gn-el-type="text" style="white-space:pre"><tspan>Source table (dim_detail)</tspan></text>
+  <rect fill="#006c35" rx="2" ry="0" x="380" y="384" width="12" height="12"/>
+  <text fill="#333333" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" x="398" y="395" data-gn-el-type="text" style="white-space:pre"><tspan>Fact table</tspan></text>
+  <rect fill="#f2f7f4" stroke="#006c35" rx="2" ry="0" x="460" y="384" width="12" height="12"/>
+  <text fill="#333333" font-family="Inter, sans-serif" font-size="10" xml:space="preserve" x="478" y="395" data-gn-el-type="text" style="white-space:pre"><tspan>Aggregate (dashed = pre-computed summary)</tspan></text>
+</svg>

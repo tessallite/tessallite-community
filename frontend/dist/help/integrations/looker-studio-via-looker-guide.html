@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Optional Looker-hosted LookML Workflow - Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header"><a href="../index.html" class="logo">Tessallite Help</a><nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Optional Looker-hosted LookML Workflow</span></nav></header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-25</span></div>
+    <h1>Optional Looker-hosted LookML Workflow</h1>
+    <h2>What this covers</h2>
+    <p>This optional path connects Looker Studio to a Looker project generated from a Tessallite model. Choose it only when a compatible Looker instance already exists and reports need LookML modelling hints.</p>
+    <pre><code>Looker Studio -&gt; Looker connector -&gt; Looker instance
+  -&gt; generated LookML -&gt; TLS PostgreSQL gateway :5433 -&gt; Tessallite router</code></pre>
+    <p>This is not required for Data Studio direct reporting. Generated files and the export workflow are internally tested; execution remains deferred because no licensed Looker instance is available for validation.</p>
+    <h2>Setup</h2>
+    <ol><li>Enable <code>LOOKER_GATEWAY_ENABLED=true</code> and gateway TLS in a controlled validation environment.</li><li>In Tessallite select <strong>Export</strong> then <strong>LookML (.zip)</strong> for a deployed model.</li><li>Commit generated files to a private repository accessible to Looker.</li><li>Configure the Looker PostgreSQL-dialect connection to the gateway with SSL required.</li><li>Validate in Looker and connect Studio through its Looker connector.</li></ol>
+    <h2>Capture checks</h2>
+    <div class="table-wrapper"><table><thead><tr><th>Emitted hint</th><th>Validation required</th></tr></thead><tbody><tr><td><code>drill_fields</code></td><td>Drill action returns correct rows.</td></tr><tr><td><code>always_filter</code></td><td>Required filter reaches the gateway query.</td></tr><tr><td><code>conditionally_filter</code></td><td>Conditional requirement renders as observed.</td></tr><tr><td><code>suggest_dimension</code></td><td>Suggestions render from the declared source.</td></tr><tr><td><code>access_filter</code></td><td>Scoped results are enforced without leakage.</td></tr></tbody></table></div>
+    <h2>Limits</h2>
+    <p>No persistent derived tables against Tessallite, bidirectional LookML import, Looker Action API integration, or certification of Looker-hosted execution is included in version 1. Unsupported symmetric-aggregate window shapes fail rather than executing uncertain results.</p>
+    <nav class="page-nav"><a href="looker-studio-connection-guide.html" class="page-nav-btn prev">&larr; Looker Studio Direct</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="lookml-emitter-guide.html" class="page-nav-btn next">LookML Emitter &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help - <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

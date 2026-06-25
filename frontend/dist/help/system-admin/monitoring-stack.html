@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Monitoring Stack (Prometheus &amp; Grafana) — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>Monitoring Stack</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-05-23</span></div>
+    <h1>Monitoring Stack (Prometheus &amp; Grafana)</h1>
+
+<h2>What this covers</h2>
+<p>How to deploy, configure, and extend the optional Prometheus + Grafana monitoring stack that provides real-time observability into every Tessallite service. This page explains the architecture, what data is collected, how the dashboard is organised, and how to add your own metrics and panels.</p>
+
+<h2>Overview</h2>
+<p>Tessallite ships with an optional monitoring stack that runs as a completely separate Docker Compose project. It is not required to run the platform and can be started or stopped independently without affecting any Tessallite service.</p>
+<p>The stack consists of three containers:</p>
+<table>
+<thead><tr><th>Container</th><th>Image</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><strong>prometheus</strong></td><td><code>prom/prometheus:v2.51.0</code></td><td>Scrapes <code>/metrics</code> from every service every 15 seconds, stores time-series data for up to 15 days</td></tr>
+<tr><td><strong>grafana</strong></td><td><code>grafana/grafana:10.4.0</code></td><td>Visualises metrics through a pre-built dashboard with 21 panels across three sections</td></tr>
+<tr><td><strong>nginx-exporter</strong></td><td><code>nginx/nginx-prometheus-exporter:1.1</code></td><td>Translates the frontend's nginx <code>stub_status</code> into Prometheus-format metrics</td></tr>
+</tbody>
+</table>
+<p>All three containers live in the <code>monitoring/</code> directory at the workspace root, separate from the main <code>tessallite/infra/</code> Docker Compose stack.</p>
+
+<h2>How it connects to Tessallite</h2>
+<p>Both stacks share a Docker network called <code>tessallite_net</code>. This allows Prometheus (running in the monitoring stack) to reach every Tessallite service by container name, even though they are managed by different Docker Compose projects.</p>
+<p>The main stack creates the network automatically on <code>docker compose up</code>. The monitoring stack's deploy script also creates it if it does not exist, so either stack can be started first.</p>
+
+<h2>Deploying the monitoring stack</h2>
+<h3>Prerequisites</h3>
+<ul>
+<li>Docker and Docker Compose v2 installed</li>
+<li>The main Tessallite stack running (or at least one <code>docker compose up</code> to create the shared network)</li>
+</ul>
+
+<h3>Steps</h3>
+<ol>
+<li>Navigate to the monitoring directory: <code>cd monitoring/</code></li>
+<li>Create the environment file: <code>cp .env.example .env</code></li>
+<li>Set <code>GRAFANA_ADMIN_PASSWORD</code> in <code>.env</code></li>
+<li>Deploy: <code>bash deploy.sh</code> (Linux/macOS/Git Bash) or <code>deploy.bat</code> (Windows)</li>
+<li>Open the dashboards:
+  <ul>
+    <li><strong>Prometheus:</strong> <code>http://127.0.0.1:9090</code></li>
+    <li><strong>Grafana:</strong> <code>http://127.0.0.1:3001</code> (username: <code>admin</code>, password: your <code>.env</code> value)</li>
+  </ul>
+</li>
+</ol>
+
+<h3>Teardown</h3>
+<pre><code>bash teardown.sh              # stop and remove data
+bash teardown.sh --keep-data  # stop but preserve volumes</code></pre>
+
+<h2>What data is collected</h2>
+
+<h3>Scraped services</h3>
+<p>Prometheus scrapes metrics from all seven Tessallite services:</p>
+<table>
+<thead><tr><th>Service</th><th>Port</th><th>Metrics source</th></tr></thead>
+<tbody>
+<tr><td>model-service</td><td>8001</td><td><code>prometheus-client</code> via FastAPI middleware</td></tr>
+<tr><td>query-router</td><td>8000</td><td><code>prometheus-client</code> via FastAPI middleware</td></tr>
+<tr><td>optimizer</td><td>8000</td><td><code>prometheus-client</code> via FastAPI middleware</td></tr>
+<tr><td>scheduler</td><td>8000</td><td><code>prometheus-client</code> via FastAPI middleware</td></tr>
+<tr><td>agent-service</td><td>8000</td><td><code>prometheus-client</code> via FastAPI middleware</td></tr>
+<tr><td>gateway</td><td>8080</td><td><code>prometheus-client</code> via FastAPI middleware</td></tr>
+<tr><td>frontend</td><td>nginx-exporter (9113)</td><td>nginx <code>stub_status</code> translated by exporter sidecar</td></tr>
+</tbody>
+</table>
+
+<h3>Platform metrics</h3>
+<table>
+<thead><tr><th>Metric</th><th>Type</th><th>Labels</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>tessallite_http_requests_total</code></td><td>Counter</td><td>service, method, path, status</td><td>Total HTTP requests handled</td></tr>
+<tr><td><code>tessallite_http_request_duration_seconds</code></td><td>Histogram</td><td>service, method, path</td><td>Request latency in seconds</td></tr>
+</tbody>
+</table>
+
+<h3>Model-level usage metrics</h3>
+<table>
+<thead><tr><th>Metric</th><th>Type</th><th>Labels</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>tessallite_model_queries_total</code></td><td>Counter</td><td>tenant, project, model_name, protocol, route_type</td><td>Query volume per model</td></tr>
+<tr><td><code>tessallite_model_query_errors_total</code></td><td>Counter</td><td>tenant, project, model_name, error_type</td><td>Failed queries per model</td></tr>
+<tr><td><code>tessallite_model_query_duration_seconds</code></td><td>Histogram</td><td>tenant, project, model_name</td><td>Query execution time per model</td></tr>
+<tr><td><code>tessallite_model_bytes_processed_total</code></td><td>Counter</td><td>tenant, project, model_name</td><td>Bytes scanned per model</td></tr>
+<tr><td><code>tessallite_model_rows_returned_total</code></td><td>Counter</td><td>tenant, project, model_name</td><td>Rows returned per model</td></tr>
+</tbody>
+</table>
+
+<h3>Aggregate refresh metrics</h3>
+<table>
+<thead><tr><th>Metric</th><th>Type</th><th>Labels</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>tessallite_refresh_runs_total</code></td><td>Counter</td><td>status</td><td>Completed vs failed refreshes</td></tr>
+<tr><td><code>tessallite_refresh_run_duration_seconds</code></td><td>Histogram</td><td>mode</td><td>Refresh duration (full or incremental)</td></tr>
+</tbody>
+</table>
+
+<h2>Dashboard sections</h2>
+<p>The Grafana dashboard is organised into three collapsible sections with four filter variables at the top: <strong>Service</strong>, <strong>Tenant</strong>, <strong>Project</strong>, and <strong>Model</strong>.</p>
+
+<h3>Service Health (7 panels)</h3>
+<p>Live service status tiles, uptime over time, scrape duration, per-service request rate, error rate (5xx), and latency percentiles (p95 and p50).</p>
+
+<h3>Query Routing and Aggregates (4 panels)</h3>
+<p>Query routing distribution (source/aggregate/pocket), HTTP error rate by service, refresh run duration, and refresh completion rate.</p>
+
+<h3>Model Health and Usage (7 panels)</h3>
+<p>Per-model query throughput, latency p95, protocol distribution (SQL vs DAX), route distribution, query errors by type, bytes processed, and rows returned.</p>
+
+<h2>Adding custom metrics</h2>
+<p>All Tessallite metrics are defined in <code>tessallite/shared/metrics.py</code> using the Python <code>prometheus-client</code> library.</p>
+<ol>
+<li><strong>Define the metric</strong> in <code>shared/metrics.py</code> using <code>Counter</code>, <code>Histogram</code>, or <code>Gauge</code>.</li>
+<li><strong>Import and instrument</strong> in the relevant service code (e.g., <code>from shared.metrics import MY_COUNTER</code>).</li>
+<li><strong>Rebuild the service</strong>: <code>docker compose build &lt;service&gt; &amp;&amp; docker compose up -d &lt;service&gt;</code></li>
+</ol>
+<p>The new metric appears automatically on <code>/metrics</code>. Prometheus begins scraping it on the next 15-second cycle. No Prometheus configuration changes are needed.</p>
+
+<h2>Adding a Grafana panel</h2>
+<ol>
+<li>Open Grafana and navigate to the Tessallite Platform Overview dashboard.</li>
+<li>Click <strong>Edit</strong>, then <strong>Add panel</strong>.</li>
+<li>Write a PromQL query referencing your metric.</li>
+<li>Save the dashboard.</li>
+</ol>
+<p>To make the panel permanent, export the dashboard JSON and save it to <code>monitoring/grafana/tessallite-dashboard.json</code>.</p>
+
+<h2>Adding a new scrape target</h2>
+<ol>
+<li>Add <code>PrometheusMiddleware</code> and a <code>/metrics</code> endpoint to the new service.</li>
+<li>Add a scrape job to <code>monitoring/prometheus.yml</code>.</li>
+<li>Restart Prometheus: <code>cd monitoring/ &amp;&amp; docker compose restart prometheus</code></li>
+</ol>
+
+<h2>Data retention</h2>
+<p>Prometheus retains time-series data for <strong>15 days</strong> by default. To change this, edit the <code>--storage.tsdb.retention.time</code> argument in <code>monitoring/docker-compose.yml</code> and restart.</p>
+
+<h2>Frequently asked questions</h2>
+<p><strong>Do I need the monitoring stack to run Tessallite?</strong><br>No. It is entirely optional. Tessallite operates normally without it.</p>
+<p><strong>Will stopping the monitoring stack affect Tessallite?</strong><br>No. The monitoring containers are independent. Stopping them has zero impact on the platform.</p>
+<p><strong>Where is monitoring data stored?</strong><br>In Docker volumes: <code>monitoring_prometheus_data</code> and <code>monitoring_grafana_data</code>. Use <code>teardown.sh --keep-data</code> to preserve them.</p>
+<p><strong>Can I use this in production?</strong><br>Yes, for small to medium deployments. For high availability, consider a managed Prometheus service and point it at the same <code>/metrics</code> endpoints.</p>
+
+<h2>Related</h2>
+<ul>
+<li><a href="architecture-overview.html">Architecture Overview</a></li>
+<li><a href="service-reference.html">Service Reference</a></li>
+<li><a href="deploy-local.html">Deploy Locally</a></li>
+<li><a href="system-configuration.html">System Configuration</a></li>
+</ul>
+
+  </main>
+  <footer class="page-nav">
+    <a href="upgrade.html">&larr; Upgrade</a> |
+    <a href="../index.html">Home</a>
+  </footer>
+</body>
+</html>

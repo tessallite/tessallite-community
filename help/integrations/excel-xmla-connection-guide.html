@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Excel XMLA Connection Guide — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Excel XMLA Connection Guide</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>Excel XMLA Connection Guide</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/connect-excel-wizard.png" alt="Excel Data Connection Wizard — server credentials step."></figure>
+<h2>What this covers</h2>
+<p>Detailed connection reference for Microsoft Excel connecting to Tessallite via the XMLA endpoint on port 8080. For a shorter introduction, see <a href="../getting-started/connect-excel.html">Connect Excel via XMLA</a>.</p>
+<h2>XMLA endpoint details</h2>
+<div class="table-wrapper"><table><thead><tr><th>Parameter</th><th>Value</th><th>Notes</th></tr></thead><tbody><tr><td>URL</td><td><code>http://HOST:8080/xmla</code></td><td>Must include the <code>/xmla</code> path segment.</td></tr><tr><td>Authentication</td><td>HTTP Basic</td><td>Tessallite username and password.</td></tr><tr><td>Catalog</td><td>Workspace slug (e.g., <code>acme</code>)</td><td>Case-sensitive. Obtain from your Tenant Admin.</td></tr><tr><td>Protocol</td><td>XMLA 1.1</td><td>Standard Analysis Services protocol.</td></tr><tr><td>Cube / Persona</td><td>Model name</td><td>Selected from the catalog browser after connecting.</td></tr></tbody></table></div>
+<h2>Connect Excel to Tessallite</h2>
+<ol><li>Open Excel.</li><li>Go to <strong>Data</strong> → <strong>Get Data</strong> → <strong>From Other Sources</strong> → <strong>From Analysis Services</strong>.</li><li>In <strong>Server name</strong>, enter: <code>http://HOST:8080/xmla</code></li><li>Under <strong>Log on credentials</strong>, select <strong>Use the following User Name and Password</strong>.</li><li>Enter your Tessallite username (email) and password.</li><li>Click <strong>Next</strong>.</li><li>Select your workspace slug from the <strong>database</strong> dropdown.</li><li>Select the model name from the cube list.</li><li>Click <strong>Next</strong>, then <strong>Finish</strong>.</li><li>In <strong>Import Data</strong>, select <strong>PivotTable Report</strong> and click <strong>OK</strong>.</li></ol>
+<p>A PivotTable is inserted. The field list on the right shows the model&#x27;s dimensions and measures.</p>
+<h2>Create a PivotTable</h2>
+<p>Drag dimensions to Rows or Columns and measures to Values. Excel sends MDX queries to Tessallite, which routes them to the fastest available source.</p>
+<h2>Supported PivotTable features</h2>
+<div class="table-wrapper"><table><thead><tr><th>Feature</th><th>Status</th><th>Notes</th></tr></thead><tbody><tr><td>Expand / collapse hierarchies</td><td>Supported</td><td>Click +/- on row/column headers. Works with all hierarchy types.</td></tr><tr><td>Subtotals and grand totals</td><td>Supported</td><td>SUM, COUNT, DISTINCT COUNT, MIN, MAX, AVG aggregations all render correct subtotals.</td></tr><tr><td>Show Values As</td><td>Supported</td><td>% of Grand Total, % of Parent, Difference From, % Difference From, Running Total, Rank (Largest/Smallest), Index.</td></tr><tr><td>Calculated Fields</td><td>Supported</td><td>Insert Calculated Field for arithmetic expressions, ratios, and IIF conditionals.</td></tr><tr><td>Value Filters (Top 10, &gt;=, etc.)</td><td>Supported</td><td>Right-click a field &gt; Value Filters. Top N, Bottom N, and comparison operators.</td></tr><tr><td>Label Filters (Contains, etc.)</td><td>Supported</td><td>Subselect-based member filtering.</td></tr><tr><td>Date Grouping</td><td>Supported</td><td>Right-click a date field &gt; Group. Groups by Year, Quarter, Month via hierarchy levels.</td></tr><tr><td>GETPIVOTDATA</td><td>Supported</td><td>Cell formulas that reference specific PivotTable intersections.</td></tr><tr><td>Number Formatting</td><td>Supported</td><td>FORMAT_STRING from model definitions flows through to all cells including subtotals and calculated members.</td></tr><tr><td>Manual Member Selection</td><td>Supported</td><td>Filter dropdowns on row/column fields.</td></tr><tr><td>Custom Grouping</td><td>Not supported</td><td>Right-click &gt; Group on non-date members. Requires MDX Aggregate() over member sets.</td></tr><tr><td>Calculated Items</td><td>Not supported</td><td>Insert Calculated Item on a dimension. Requires dimension-level member aggregation.</td></tr></tbody></table></div>
+<h2>Refresh data</h2>
+<p>Right-click anywhere in the PivotTable and select <strong>Refresh</strong> to re-query Tessallite.</p>
+<p>To set automatic refresh: <strong>Data</strong> → <strong>Queries &amp; Connections</strong> → right-click the connection → <strong>Properties</strong> → <strong>Usage</strong> tab → enable <strong>Refresh every N minutes</strong>.</p>
+<h2>Manage connection properties</h2>
+<ol><li>Go to <strong>Data</strong> → <strong>Queries &amp; Connections</strong>.</li><li>Right-click the Tessallite connection → <strong>Properties</strong>.</li><li><strong>Definition</strong> tab: modify connection string and command text.</li><li><strong>Usage</strong> tab: set refresh intervals and open-file behavior.</li></ol>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Problem</th><th>Likely cause</th><th>Fix</th></tr></thead><tbody><tr><td>Cannot connect / &quot;Unable to connect&quot;</td><td>Wrong URL format or port blocked</td><td>Verify URL is exactly <code>http://HOST:8080/xmla</code>. Test with <code>curl -v http://HOST:8080/xmla</code>.</td></tr><tr><td>&quot;Catalog not found&quot;</td><td>Wrong workspace slug</td><td>Check slug with Tenant Admin (case-sensitive).</td></tr><tr><td>&quot;Authentication failed&quot;</td><td>Wrong credentials</td><td>Reset Tessallite password via Admin panel.</td></tr><tr><td>&quot;No cubes found&quot;</td><td>No published model</td><td>Ask Modeller to save and publish the model in Model Builder.</td></tr><tr><td>Excel cached a bad connection</td><td>Stale connection</td><td>Data → Queries &amp; Connections → Delete connection → reconnect from scratch.</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="../getting-started/connect-excel.html">Connect Excel via XMLA</a></li><li><a href="jdbc-connection-guide.html">JDBC Connection Guide</a></li><li><a href="powerbi-connection-guide.html">Power BI Connection Guide</a></li><li><a href="../troubleshooting/excel-connection-problems.html">Excel Connection Problems</a></li></ul>
+<nav class="page-nav"><a href="jdbc-connection-guide.html" class="page-nav-btn prev">&larr; JDBC Connection Guide</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="excel-pivottable-features.html" class="page-nav-btn next">Excel PivotTable Features &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

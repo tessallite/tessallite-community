@@ -1,0 +1,112 @@
+{
+  "model_id": "6096c0a1-2cdb-4262-a7b4-cc9e21b412b5",
+  "model_slug": "modely",
+  "model_display_name": "modely",
+  "project_brief": "Acme Corp payment processing. Users ask about transactions, revenue, merchant performance, and payment breakdowns.",
+  "measures": [
+    "base_amount", "chargeback_amount", "commission_amount", "fee_amount",
+    "max_base_amount", "net_amount", "refund_amount", "settlement_amount",
+    "tax_amount", "transaction_amount", "transaction_count"
+  ],
+  "dimensions": [
+    "business_date", "channel", "city", "country", "merchant_name",
+    "month_name", "payment_method", "payment_scheme", "quarter_name",
+    "region", "settlement_date", "year_name"
+  ],
+  "filterable_where": [
+    "base_amount", "business_date", "channel", "chargeback_amount", "city",
+    "commission_amount", "country", "fee_amount", "merchant_name",
+    "month_name", "net_amount", "payment_method", "payment_scheme",
+    "quarter_name", "refund_amount", "region", "settlement_amount",
+    "settlement_date", "tax_amount", "transaction_amount", "year_name"
+  ],
+  "valid_where_ops": ["eq", "in", "between", "like", "is_null", "is_not_null", "gt", "gte", "lt", "lte"],
+  "valid_having_ops": ["eq", "between", "gt", "gte", "lt", "lte"],
+  "valid_sort_directions": ["asc", "desc"],
+  "scenarios": {
+    "simple_kpi": {
+      "question": "What was total revenue last month?",
+      "expect_tool": "query",
+      "expect_measures_contain": ["base_amount"],
+      "expect_where_field": "business_date",
+      "expect_where_op": "between",
+      "expect_limit": 100
+    },
+    "breakdown": {
+      "question": "Show me revenue by payment method",
+      "expect_tool": "query",
+      "expect_measures_contain": ["base_amount"],
+      "expect_dimensions_contain": ["payment_method"]
+    },
+    "follow_up": {
+      "question": "Break that down by payment method",
+      "history": [
+        {
+          "user": "What was total revenue last month?",
+          "assistant": "USD 2,847,391 in base_amount for April 2026."
+        }
+      ],
+      "previous_plan": {
+        "query": {
+          "model_id": "{{model_id}}",
+          "measures": ["base_amount"],
+          "dimensions": [],
+          "where": [{"name": "business_date", "op": "between", "value": ["2026-04-01", "2026-04-30"]}],
+          "having": [],
+          "sort": [],
+          "limit": 100
+        }
+      },
+      "expect_tool": "query",
+      "expect_measures_contain": ["base_amount"],
+      "expect_dimensions_contain": ["payment_method"],
+      "expect_where_field": "business_date"
+    },
+    "row_level_where": {
+      "question": "How many payments over 1000?",
+      "expect_tool": "query",
+      "expect_measures_contain": ["transaction_count"],
+      "expect_where_field": "transaction_amount",
+      "expect_where_op_in": ["gt", "gte"]
+    },
+    "top_n_ranking": {
+      "question": "Top 10 merchants by revenue",
+      "expect_tool": "query",
+      "expect_measures_contain": ["base_amount"],
+      "expect_dimensions_contain": ["merchant_name"],
+      "expect_limit": 10,
+      "expect_sort_field": "base_amount",
+      "expect_sort_direction": "desc"
+    },
+    "having_threshold": {
+      "question": "Which merchants had more than 100 payments?",
+      "expect_tool": "query",
+      "expect_measures_contain": ["transaction_count"],
+      "expect_dimensions_contain": ["merchant_name"],
+      "expect_having_field": "transaction_count",
+      "expect_having_op_in": ["gt", "gte"]
+    },
+    "refuse_out_of_scope": {
+      "question": "What is the meaning of life?",
+      "expect_tool_in": ["refuse", "clarify"]
+    },
+    "trend_over_time": {
+      "question": "Show me revenue trend over time",
+      "expect_tool": "query",
+      "expect_measures_contain": ["base_amount"],
+      "expect_dimensions_contain_any": ["business_date", "month_name"]
+    },
+    "multi_measure_comparison": {
+      "question": "Compare refunds and chargebacks by region",
+      "expect_tool": "query",
+      "expect_measures_contain": ["refund_amount", "chargeback_amount"],
+      "expect_dimensions_contain": ["region"]
+    },
+    "json_shape_valid": {
+      "question": "What are the fees by channel?",
+      "expect_tool": "query",
+      "expect_measures_contain": ["fee_amount"],
+      "expect_dimensions_contain": ["channel"]
+    }
+  }
+}

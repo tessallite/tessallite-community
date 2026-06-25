@@ -1,0 +1,21 @@
+"""Row-security enforcement for the query router.
+
+Thin re-export of :mod:`shared.security` — the compiler now lives there
+because the model-service ``simulate-as-user`` preview needs the same
+logic. See ``work/phase-5-row-security-and-live-polish-action-plan.md``.
+"""
+from shared.security import (
+    CompiledPredicate,
+    Principal,
+    RowSecurityCompileError,
+    compile_row_security,
+    has_active_rules,
+)
+
+__all__ = [
+    "CompiledPredicate",
+    "Principal",
+    "RowSecurityCompileError",
+    "compile_row_security",
+    "has_active_rules",
+]

@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agent Conversation Export — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Agent</span> / <span>Agent Conversation Export</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">all</span><span class="updated">Updated 2026-05-24</span></div>
+<h1>Agent Conversation Export</h1>
+
+<h2>What this covers</h2>
+<p>You can export any agent conversation as <strong>Markdown</strong> or <strong>PDF</strong> for sharing, archiving, or compliance.</p>
+
+<h2>How to export</h2>
+<ol>
+<li>Open an <strong>Agent Chat</strong> conversation.</li>
+<li>Click the <strong>Export</strong> button in the conversation toolbar.</li>
+<li>Choose <strong>Markdown</strong> or <strong>PDF</strong>.</li>
+</ol>
+
+<h3>Markdown export</h3>
+<p>Downloads a <code>.md</code> file containing every turn in the conversation: user messages, assistant responses, embedded queries, result tables, and chart references.</p>
+
+<h3>PDF export</h3>
+<p>Opens a browser print dialog with a styled, print-ready version of the conversation. You can save as PDF or send to a printer. The PDF includes the same content as the Markdown export but with formatted tables and headings.</p>
+
+<h2>What is included</h2>
+<table>
+<thead><tr><th>Content</th><th>Included</th></tr></thead>
+<tbody>
+<tr><td>User messages</td><td>Yes</td></tr>
+<tr><td>Assistant responses</td><td>Yes</td></tr>
+<tr><td>SQL queries</td><td>Yes (fenced code blocks)</td></tr>
+<tr><td>Query results (tables)</td><td>Yes</td></tr>
+<tr><td>Chart references</td><td>Yes (type + data summary)</td></tr>
+<tr><td>Citations and sources</td><td>Yes</td></tr>
+<tr><td>Judge verdicts</td><td>Yes, if present</td></tr>
+<tr><td>Timestamps</td><td>Yes, per turn</td></tr>
+</tbody>
+</table>
+
+<h2>Notes</h2>
+<ul>
+<li>Export captures the conversation at the time you click Export. Subsequent turns are not retroactively added.</li>
+<li>Special characters are properly escaped in both formats.</li>
+<li>PDF rendering uses <code>window.onload</code> to ensure styles are fully applied before the print dialog opens.</li>
+</ul>
+
+<h2>Related</h2>
+<ul>
+<li><a href="agent-chat.html">Agent Chat</a></li>
+<li><a href="agent-log-screen.html">Agent Log Screen</a></li>
+<li><a href="session-memory.html">Agent Session Memory</a></li>
+</ul>
+<nav class="page-nav"><a href="session-memory.html" class="page-nav-btn prev">&larr; Agent Session Memory</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="agent-stop-button.html" class="page-nav-btn next">Agent Stop Button &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

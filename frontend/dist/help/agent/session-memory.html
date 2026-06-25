@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agent Session Memory — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Agent</span> / <span>Agent Session Memory</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-05-01</span></div>
+    <h1>Agent Session Memory</h1>
+<h2>What this covers</h2>
+<p>The conversational agent maintains a history of turns (question-answer pairs) within each conversation. This page explains how session memory works, how the history depth setting affects prompt construction, and how to manage conversation data through stats and purge controls.</p>
+<h2>How session memory works</h2>
+<p>Each conversation between a user and the agent is stored as a sequence of turns. A turn consists of the user&#x27;s question and the agent&#x27;s response (answer text, citations, thought process, and metadata).</p>
+<p>When a new question arrives, the agent includes prior turns in the LLM prompt so the model has conversational context. This allows the agent to handle follow-up questions (&quot;what about last quarter?&quot;), resolve pronouns (&quot;show me that by region&quot;), and maintain coherence across a multi-turn conversation.</p>
+<p>The trade-off is that more history means a larger prompt, which consumes more LLM tokens and increases latency. The session history depth setting controls this trade-off.</p>
+<h2>Session history depth</h2>
+<p>The <code>session_history_depth</code> setting (default: 20) controls how many recent turns include the full agent response in the prompt. Older turns are still included but in a compressed form: only the user&#x27;s question appears, prefixed with <code>[earlier question]</code>. The agent&#x27;s response is omitted.</p>
+<p>This design preserves the thread of the conversation (the user can still see what they asked earlier) while keeping the prompt size bounded.</p>
+<h3>How it works</h3>
+<p>For a conversation with 30 turns and a depth of 20:</p>
+<ul><li>Turns 1--10 appear as <code>[earlier question] (turn N): &lt;user&#x27;s question&gt;</code> — no agent response.</li><li>Turns 11--30 appear as <code>User (turn N): &lt;user&#x27;s question&gt;</code> followed by <code>Assistant: &lt;agent&#x27;s response&gt;</code>.</li></ul>
+<p>The boundary moves as the conversation grows. A conversation with fewer turns than the depth setting includes all turns in full.</p>
+<h3>Choosing a depth</h3>
+<div class="table-wrapper"><table><thead><tr><th>Scenario</th><th>Suggested depth</th></tr></thead><tbody><tr><td>Short, focused Q&amp;A sessions (most use cases)</td><td>10--20</td></tr><tr><td>Long analytical conversations with many follow-ups</td><td>30--50</td></tr><tr><td>High-throughput API usage where token cost matters</td><td>5--10</td></tr><tr><td>Models with very long agent responses</td><td>5--15</td></tr></tbody></table></div>
+<p>Configure the depth in the project agent settings:</p>
+<ol><li>Open <em>Tenant Administration &gt; Projects</em>.</li><li>Click the gear icon on the project row.</li><li>Navigate to the <strong>Advanced</strong> tab under the agent settings.</li><li>Set the <strong>Session history depth</strong> value (range: 1--100).</li><li>Click <strong>Save</strong>.</li></ol>
+<p>The change takes effect on the next agent turn — it does not retroactively alter stored turns.</p>
+<h2>Conversation stats</h2>
+<p>The Advanced tab displays two statistics for the project:</p>
+<ul><li><strong>Total conversations</strong> — the number of conversation threads stored for this project.</li><li><strong>Oldest conversation</strong> — the timestamp of the oldest conversation. Useful for understanding how much history has accumulated.</li></ul>
+<p>These statistics are fetched from <code>GET /api/v1/admin/agent/conversations/stats?project_id=&lt;id&gt;</code>.</p>
+<h2>Purging conversations</h2>
+<p>Conversation data accumulates over time. The Advanced tab provides two purge controls:</p>
+<h3>Purge by age</h3>
+<p>Enter a number of days and click <strong>Purge</strong>. Every conversation whose last activity is older than the specified number of days is permanently deleted, along with all its turns and trace data.</p>
+<h3>Delete all</h3>
+<p>Click <strong>Delete All Conversations</strong> and type <code>DELETE ALL</code> in the confirmation field. Every conversation for the project is permanently removed.</p>
+<p>Both actions are hard deletes — the data cannot be recovered. The purge operates at the conversation level: individual turns cannot be selectively deleted.</p>
+<h3>When to purge</h3>
+<ul><li><strong>Compliance windows.</strong> If your organisation requires conversation data to be retained for no more than N days, set the agent&#x27;s <code>conversation_retention_days</code> setting (which auto-purges via a scheduled job) OR use the manual purge for immediate cleanup.</li><li><strong>After testing.</strong> When the agent has been used for extensive testing during setup, purge the test conversations before going live.</li><li><strong>Storage management.</strong> Projects with high-volume agent usage accumulate significant conversation data. Periodic purges keep storage manageable.</li></ul>
+<h2>API reference</h2>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Endpoint</th><th>Purpose</th></tr></thead><tbody><tr><td>GET</td><td><code>/api/v1/admin/agent/conversations/stats</code></td><td>Conversation count and oldest date (requires <code>project_id</code> query param)</td></tr><tr><td>DELETE</td><td><code>/api/v1/admin/agent/conversations/purge</code></td><td>Delete conversations (requires <code>project_id</code> and <code>older_than_days</code> query params; <code>older_than_days=0</code> deletes all)</td></tr></tbody></table></div>
+<p>Both require <code>tenant_admin</code> role.</p>
+<h2>Relationship to retention</h2>
+<p>The <code>conversation_retention_days</code> setting on the Retention tab controls automatic cleanup via a scheduled job. The manual purge on the Advanced tab is an immediate, ad-hoc operation. They are independent — you can use one, both, or neither.</p>
+<div class="table-wrapper"><table><thead><tr><th>Mechanism</th><th>Trigger</th><th>Granularity</th></tr></thead><tbody><tr><td>Retention setting</td><td>Automatic (daily scheduler job)</td><td>Conversations older than the configured number of days</td></tr><tr><td>Manual purge</td><td>On-demand (admin clicks button)</td><td>By age threshold or all</td></tr></tbody></table></div>
+<h2>Best practices</h2>
+<ul><li><strong>Set retention for ongoing cleanup.</strong> Manual purges are for one-off situations. For steady-state operations, configure <code>conversation_retention_days</code> on the Retention tab.</li><li><strong>Start with default depth.</strong> 20 turns covers most conversational patterns. Adjust only after observing that conversations are either losing context (increase) or consuming excessive tokens (decrease).</li><li><strong>Purge test data before production launch.</strong> Test conversations contain synthetic or exploratory data that skews stats and wastes storage.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="configure-agent.html">Configure your project agent</a></li><li><a href="agent-log-screen.html">Agent log screen</a></li></ul>
+<nav class="page-nav"><a href="agent-log-screen.html" class="page-nav-btn prev">&larr; Agent log screen</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="agent-export.html" class="page-nav-btn next">Agent Conversation Export &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

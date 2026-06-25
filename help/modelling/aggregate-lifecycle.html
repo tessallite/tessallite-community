@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aggregate Lifecycle — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Aggregate Lifecycle</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-25</span></div>
+    <h1>Aggregate Lifecycle</h1>
+<h2>What this covers</h2>
+<p>The <strong>Aggregate Lifecycle</strong> panel is a chronological audit trail of every event that has happened to every aggregate in the current model. It answers questions like <em>&quot;why did this aggregate disappear?&quot;</em>, <em>&quot;when did the predictor validate that one?&quot;</em>, and <em>&quot;how often does this build fail?&quot;</em> without dropping into the database.</p>
+<h2>Opening the panel</h2>
+<p>Click the <strong>Aggregate Lifecycle</strong> icon (clock face) in the Toolbelt of Model Builder. The panel opens in the right drawer.</p>
+<p>The panel is read-only — it surfaces what happened, it does not change anything.</p>
+<h2>Event types</h2>
+<p>Every row carries a chip-coloured event type:</p>
+<div class="table-wrapper"><table><thead><tr><th>Event</th><th>Emitted by</th><th>Meaning</th></tr></thead><tbody><tr><td><code>created</code></td><td>Model service / optimiser / predictor</td><td>The aggregate definition was inserted. The <code>reason</code> field discriminates <code>manual</code> / <code>demand</code> / <code>predictive</code> / <code>workload</code>.</td></tr><tr><td><code>built</code></td><td>Scheduler</td><td>A successful CTAS build completed. Payload carries <code>rows_written</code> and <code>duration_ms</code>.</td></tr><tr><td><code>failed</code></td><td>Scheduler</td><td>A build failed. Payload carries the warehouse error message.</td></tr><tr><td><code>validated</code></td><td>Predictor feedback sweep</td><td>A predictive aggregate hit the threshold (<code>predictive.validation_min_hits</code> queries within <code>predictive.evaluation_window_days</code>) and is now considered useful. Payload carries <code>hit_count</code> and <code>window_start</code>.</td></tr><tr><td><code>retired_unused</code></td><td>Predictor feedback sweep</td><td>A predictive aggregate older than <code>predictive.unused_retire_days</code> with zero hits ever was flipped to <code>status=&#x27;retired&#x27;</code>.</td></tr><tr><td><code>evicted</code></td><td>Build orchestrator</td><td>The aggregate was dropped to make room for a higher-scoring predictive candidate. Payload carries the eviction policy that fired.</td></tr></tbody></table></div>
+<h2>Filtering</h2>
+<p>The <strong>Event</strong> dropdown above the table filters the list to a single event type. Default is &quot;All events&quot;.</p>
+<p>To filter by a specific aggregate, navigate to that aggregate&#x27;s card in the Aggregates panel and use the per-aggregate timeline view (separate from this model-wide log).</p>
+<h2>Columns</h2>
+<div class="table-wrapper"><table><thead><tr><th>Column</th><th>Source</th></tr></thead><tbody><tr><td><strong>When</strong></td><td>Event timestamp (UTC).</td></tr><tr><td><strong>Event</strong></td><td>Chip-coloured type — see table above.</td></tr><tr><td><strong>Aggregate</strong></td><td>Short form of the aggregate id (last 8 hex chars). Hover for the full UUID.</td></tr><tr><td><strong>Reason</strong></td><td>Free-form discriminator from the emitter — for example <code>feedback_sweep</code>, <code>predictive</code>, <code>lru</code>, <code>manual</code>.</td></tr><tr><td><strong>Detail</strong></td><td>Pretty-printed payload. For <code>built</code> / <code>failed</code> rows this is the row count or error; for <code>validated</code> it is the hit count + window; for <code>evicted</code> it is the policy + the displaced aggregate id.</td></tr></tbody></table></div>
+<h2>Risk-4 note (predictive validation)</h2>
+<p>When the feedback sweep validates a predictive aggregate, the panel shows two changes side by side:</p>
+<ul><li>A <code>validated</code> event row appears with <code>reason=feedback_sweep</code>.</li><li>The aggregate&#x27;s <code>creation_reason</code> stays as <code>predictive</code> — it does <strong>not</strong> flip to <code>workload</code> or <code>demand</code>.</li></ul>
+<p>This is intentional. The validation event records that the aggregate has earned its keep, but the <em>origin</em> (predictor) is preserved so eviction policies (<code>validated_survives</code>, <code>predicted_first</code>) can still distinguish predictive aggregates from demand-defined ones.</p>
+<h2>API</h2>
+<p>The panel reads from <code>GET /api/v1/models/{model_id}/aggregates/lifecycle</code>:</p>
+<div class="table-wrapper"><table><thead><tr><th>Query param</th><th>Meaning</th></tr></thead><tbody><tr><td><code>event_type</code></td><td>Filter to one event type.</td></tr><tr><td><code>aggregate_id</code></td><td>Filter to a single aggregate.</td></tr><tr><td><code>limit</code></td><td>Cap the number of rows returned (default 200).</td></tr></tbody></table></div>
+<p>Events are ordered newest-first by <code>occurred_at</code>.</p>
+<h2>Related</h2>
+<ul><li><a href="predictive-aggregates.html">Predictive Aggregates</a></li><li><a href="cold-start-latency.html">Cold-start Latency</a></li><li><a href="configure-aggregates.html">Configure Aggregates</a></li><li><a href="../concepts/aggregates.html">Aggregates (concept)</a></li></ul>
+<nav class="page-nav"><a href="predictive-aggregates.html" class="page-nav-btn prev">&larr; Predictive Aggregates</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="cold-start-latency.html" class="page-nav-btn next">Cold-start Latency &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Define Hierarchies — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Define Hierarchies</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-15</span></div>
+    <h1>Define Hierarchies</h1>
+    <h2>What this covers</h2>
+    <p>The <strong>Hierarchies</strong> panel defines ordered drill paths such as Year &gt; Quarter &gt; Month, Country &gt; Region &gt; Store, or Segment &gt; Category &gt; Product. Hierarchies give Tessallite enough structure to generate time variants, guide drill-through, and expose business navigation paths to downstream consumers.</p>
+    <p>This is different from the Dimensions panel. Dimensions expose individual attributes; hierarchies declare how attributes roll up.</p>
+    <h2>Hierarchy types</h2>
+    <div class="table-wrapper"><table><thead><tr><th>Type</th><th>Use it when</th></tr></thead><tbody><tr><td>Explicit</td><td>You already know each level and want to add them manually.</td></tr><tr><td>Date embedded</td><td>A date column can generate levels such as year, quarter, month, week, or day.</td></tr><tr><td>Segment</td><td>A code or text field contains multiple levels that can be split by delimiter or position.</td></tr></tbody></table></div>
+    <h2>Time hierarchy fields</h2>
+    <p>For time hierarchies, set the dimension kind to <strong>time</strong> and choose the calendar type when period calculations matter. Fiscal and ISO calendars change the meaning of year, week, quarter, and period-to-date variants.</p>
+    <p>Time units on levels are what let measures support variants such as YTD, prior year, moving windows, and period-to-date calculations.</p>
+    <h2>Generated attributes are managed for you</h2>
+    <p>When a date hierarchy generates levels such as year, quarter, month, or week, Tessallite also creates the matching attributes on the table for you. These are <strong>generated attributes</strong>: their formula is written and kept up to date by the hierarchy itself, so you do not edit it by hand.</p>
+    <p>If you open such an attribute in the table editor, the <strong>expression box is locked</strong> and the formula-building tools are hidden, with a note explaining that the attribute came from a date hierarchy. You can still rename it, change its description, or adjust its output type — only the <em>formula</em> is protected. This is deliberate: it stops a later change to the hierarchy from colliding with a hand edit, which would otherwise silently drift the two apart. To change what the formula does, edit the <strong>hierarchy</strong>, not the attribute, and the generated attributes update with it.</p>
+    <h2>Health checks</h2>
+    <p>The panel checks whether hierarchy levels still point to valid attributes, whether required time metadata is present, and whether generated levels can be interpreted by the query compiler. Resolve hierarchy warnings before relying on time variants or drill paths.</p>
+    <h2>Related</h2>
+    <ul><li><a href="define-dimensions.html">Define Dimensions</a></li><li><a href="configure-time-variants.html">Configure Time Variants</a></li><li><a href="../concepts/calendar-types.html">Calendar Types</a></li></ul>
+    <nav class="page-nav"><a href="define-joins.html" class="page-nav-btn prev">&larr; Define Joins</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="define-dimensions.html" class="page-nav-btn next">Define Dimensions &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

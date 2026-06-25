@@ -1,0 +1,1 @@
+SELECT "d"."fiscal_period" AS "fiscal_period", SUM("f"."amount") AS "amount" FROM "demo"."sales" AS "f" INNER JOIN "demo"."country" AS "d" ON CAST("f"."event_ts" AS DATE) = "d"."cal_date" GROUP BY "d"."fiscal_period"

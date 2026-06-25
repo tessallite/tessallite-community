@@ -1,0 +1,727 @@
+[
+  {
+    "type": "add_columns",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "agg_keyword",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "aggregate_func",
+    "named": true,
+    "fields": {
+      "func_name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "agg_keyword",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "all_func",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "allselected_func",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "argument",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "direction_keyword",
+          "named": true
+        },
+        {
+          "type": "expression",
+          "named": true
+        },
+        {
+          "type": "set_literal",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "bare_identifier",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "binary_expr",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "expression",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "calculate",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "calculate_table",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "column_ref",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "bracket_name",
+          "named": true
+        },
+        {
+          "type": "table_ref",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "dax_statement",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "expression",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "direction_keyword",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "distinct_func",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "divide_func",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "expression",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "add_columns",
+          "named": true
+        },
+        {
+          "type": "aggregate_func",
+          "named": true
+        },
+        {
+          "type": "all_func",
+          "named": true
+        },
+        {
+          "type": "allselected_func",
+          "named": true
+        },
+        {
+          "type": "bare_identifier",
+          "named": true
+        },
+        {
+          "type": "binary_expr",
+          "named": true
+        },
+        {
+          "type": "calculate",
+          "named": true
+        },
+        {
+          "type": "calculate_table",
+          "named": true
+        },
+        {
+          "type": "column_ref",
+          "named": true
+        },
+        {
+          "type": "distinct_func",
+          "named": true
+        },
+        {
+          "type": "divide_func",
+          "named": true
+        },
+        {
+          "type": "filter_func",
+          "named": true
+        },
+        {
+          "type": "if_func",
+          "named": true
+        },
+        {
+          "type": "number",
+          "named": true
+        },
+        {
+          "type": "paren_expr",
+          "named": true
+        },
+        {
+          "type": "removefilters_func",
+          "named": true
+        },
+        {
+          "type": "row_func",
+          "named": true
+        },
+        {
+          "type": "select_columns",
+          "named": true
+        },
+        {
+          "type": "string_literal",
+          "named": true
+        },
+        {
+          "type": "summarize",
+          "named": true
+        },
+        {
+          "type": "summarize_columns",
+          "named": true
+        },
+        {
+          "type": "time_intel_func",
+          "named": true
+        },
+        {
+          "type": "topn",
+          "named": true
+        },
+        {
+          "type": "treatas_func",
+          "named": true
+        },
+        {
+          "type": "values_func",
+          "named": true
+        },
+        {
+          "type": "var_block",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "filter_func",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "if_func",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "paren_expr",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "expression",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "removefilters_func",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "row_func",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "select_columns",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "set_literal",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "expression",
+          "named": true
+        },
+        {
+          "type": "set_literal",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "source_file",
+    "named": true,
+    "root": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "dax_statement",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "summarize",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "summarize_columns",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "table_ref",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "quoted_table_name",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "time_intel_func",
+    "named": true,
+    "fields": {
+      "func_name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "time_intel_keyword",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "time_intel_keyword",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "topn",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "treatas_func",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "values_func",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "argument",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "var_block",
+    "named": true,
+    "fields": {
+      "body": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "expression",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "var_decl",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "var_decl",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "expression",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "(",
+    "named": false
+  },
+  {
+    "type": ")",
+    "named": false
+  },
+  {
+    "type": "*",
+    "named": false
+  },
+  {
+    "type": "+",
+    "named": false
+  },
+  {
+    "type": ",",
+    "named": false
+  },
+  {
+    "type": "-",
+    "named": false
+  },
+  {
+    "type": "/",
+    "named": false
+  },
+  {
+    "type": "<",
+    "named": false
+  },
+  {
+    "type": "<=",
+    "named": false
+  },
+  {
+    "type": "<>",
+    "named": false
+  },
+  {
+    "type": "=",
+    "named": false
+  },
+  {
+    "type": ">",
+    "named": false
+  },
+  {
+    "type": ">=",
+    "named": false
+  },
+  {
+    "type": "bracket_name",
+    "named": true
+  },
+  {
+    "type": "identifier",
+    "named": true
+  },
+  {
+    "type": "number",
+    "named": true
+  },
+  {
+    "type": "quoted_table_name",
+    "named": true
+  },
+  {
+    "type": "string_literal",
+    "named": true
+  },
+  {
+    "type": "{",
+    "named": false
+  },
+  {
+    "type": "}",
+    "named": false
+  }
+]

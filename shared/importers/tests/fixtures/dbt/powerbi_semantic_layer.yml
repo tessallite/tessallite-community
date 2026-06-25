@@ -1,0 +1,167 @@
+# dbt 1.7+ semantic model — Power BI Semantic Layer Example
+# Source: Based on MrPowerBI/dbt_semantic_layer_example (GitHub)
+# Tests: sales domain, multi-entity, cumulative metrics, saved_queries with exports
+semantic_models:
+  - name: fct_sales
+    description: Sales transaction fact table, one row per line item.
+    model: ref('fct_sales')
+    label: Sales Transactions
+    defaults:
+      agg_time_dimension: sale_date
+    entities:
+      - name: sale_id
+        type: primary
+      - name: product
+        type: foreign
+        expr: product_id
+      - name: store
+        type: foreign
+        expr: store_id
+      - name: customer
+        type: foreign
+        expr: customer_id
+    dimensions:
+      - name: sale_date
+        type: time
+        label: Sale Date
+        type_params:
+          time_granularity: day
+      - name: payment_method
+        type: categorical
+        label: Payment Method
+        description: Card, cash, or digital wallet
+      - name: channel
+        type: categorical
+        label: Sales Channel
+        description: Online, in-store, or wholesale
+    measures:
+      - name: revenue
+        agg: sum
+        expr: line_total
+        label: Revenue
+        description: Sum of line item totals
+        create_metric: true
+      - name: quantity_sold
+        agg: sum
+        expr: quantity
+        label: Quantity Sold
+      - name: transaction_count
+        agg: count_distinct
+        expr: sale_id
+        label: Transaction Count
+      - name: cost_of_goods
+        agg: sum
+        expr: unit_cost * quantity
+        label: Cost of Goods Sold
+        description: Total COGS across all line items
+      - name: discount_amount
+        agg: sum
+        expr: discount
+        label: Total Discounts
+      - name: max_sale_amount
+        agg: max
+        expr: line_total
+        label: Largest Sale
+
+  - name: dim_products
+    description: Product dimension with category hierarchy.
+    model: ref('dim_products')
+    label: Products
+    entities:
+      - name: product
+        type: primary
+        expr: product_id
+    dimensions:
+      - name: product_name
+        type: categorical
+        label: Product Name
+      - name: category
+        type: categorical
+        label: Category
+      - name: subcategory
+        type: categorical
+        label: Subcategory
+      - name: brand
+        type: categorical
+        label: Brand
+      - name: is_active
+        type: categorical
+        description: Whether the product is currently sold
+    measures:
+      - name: product_count
+        agg: count_distinct
+        expr: product_id
+        label: Product Count
+
+metrics:
+  - name: total_revenue
+    type: simple
+    label: Total Revenue
+    description: Total revenue from all sales
+    type_params:
+      measure: revenue
+
+  - name: gross_profit
+    type: derived
+    label: Gross Profit
+    description: Revenue minus cost of goods sold
+    type_params:
+      expr: revenue - cost_of_goods
+      metrics:
+        - name: revenue
+        - name: cost_of_goods
+
+  - name: gross_margin_pct
+    type: ratio
+    label: Gross Margin %
+    description: Gross profit as a percentage of revenue
+    type_params:
+      numerator:
+        name: gross_profit
+        offset_window: null
+      denominator:
+        name: revenue
+
+  - name: cumulative_revenue
+    type: cumulative
+    label: Cumulative Revenue
+    description: Running total of revenue
+    type_params:
+      measure: revenue
+
+  - name: revenue_mtd
+    type: cumulative
+    label: Revenue MTD
+    description: Month-to-date revenue
+    type_params:
+      measure: revenue
+      grain_to_date: month
+
+  - name: avg_transaction_value
+    type: derived
+    label: Average Transaction Value
+    description: Revenue per transaction
+    type_params:
+      expr: revenue / transaction_count
+      metrics:
+        - name: revenue
+        - name: transaction_count
+
+saved_queries:
+  - name: daily_sales_summary
+    description: Daily revenue and transaction summary
+    label: Daily Sales Summary
+    query_params:
+      metrics:
+        - total_revenue
+        - transaction_count
+      group_by:
+        - TimeDimension('sale_date', 'day')
+        - Dimension('channel')
+      where:
+        - "{{ TimeDimension('sale_date', 'day') }} >= '2024-01-01'"
+    exports:
+      - name: daily_sales_export
+        config:
+          export_as: table
+          schema: analytics

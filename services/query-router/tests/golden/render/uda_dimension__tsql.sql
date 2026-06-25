@@ -1,0 +1,1 @@
+SELECT (CASE WHEN [f].[amount] > 100 THEN 'high' ELSE 'low' END) AS [cohort], SUM([f].[amount]) AS [amount] FROM [demo].[sales] AS [f] GROUP BY (CASE WHEN [f].[amount] > 100 THEN 'high' ELSE 'low' END)

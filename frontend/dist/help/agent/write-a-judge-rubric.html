@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Write a judge rubric — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Agent</span> / <span>Write a judge rubric</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-04-26</span></div>
+    <h1>Write a judge rubric</h1>
+<h2>What this covers</h2>
+<p>The judge is a second LLM that scores every answer the agent produces against a rubric. This article explains why the judge exists, how a rubric is shaped, how to write sections that the judge can act on consistently, and how to calibrate the rubric using the metrics the platform already records.</p>
+<h2>Why a judge</h2>
+<p>A grounded LLM still drifts. It can pick the wrong measure, misread a clarifying question as a refusal, or narrate a number with a confident phrasing that the data does not support. The judge runs after the answer has been formed and either signs it off (<em>pass</em>), flags a minor gap (<em>warn</em>), or blocks it (<em>fail</em>). In synchronous mode the user sees the verdict immediately; in asynchronous mode the verdict appears on the trace drawer once it lands.</p>
+<p>Two products fall out of running a judge:</p>
+<ul><li><strong>A real-time guardrail.</strong> A <code>fail</code> verdict in synchronous mode replaces the user-visible answer with a block message before it leaves the server.</li><li><strong>A continuously updating quality signal.</strong> Pass-rate, warn-rate, and per-section metrics are visible in <em>Metrics → Recent calibration</em>. A drop in pass-rate is a leading indicator that the model context, the safety policy, or the answer LLM has regressed.</li></ul>
+<h2>What a rubric is</h2>
+<p>A rubric is a JSON document with a name and a list of <em>sections</em>. Each section is a focused criterion the judge applies to the answer. The agent service ships with a default rubric so projects work out-of-the-box; you author a tenant-specific rubric when the defaults do not match your domain.</p>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/agent-judge-rubric.png" alt="Judge sub-tab — rubric editor with the section list and the per-section body / bullets fields."></figure>
+<p>Each section has three optional fields:</p>
+<ul><li><strong>title.</strong> Free text. Used as the metric key in the verdict&#x27;s <code>metrics</code> map.</li><li><strong>body.</strong> A paragraph the judge reads as guidance.</li><li><strong>bullets.</strong> A short list of pass/fail tests the judge can apply mechanically.</li></ul>
+<p>A good section names one concern. A rubric whose sections each cover six things produces noisy verdicts; a rubric whose sections each cover one produces verdicts you can act on.</p>
+<h2>What makes a section easy to judge</h2>
+<p>LLMs evaluate answers more consistently when the criterion is framed as a small number of binary tests. Three patterns work well:</p>
+<h3>1. The &quot;must contain&quot; pattern</h3>
+<blockquote><strong>Title:</strong> Currency present<br><strong>Body:</strong> Every numeric answer that quotes revenue must include the currency symbol or ISO code.<br><strong>Bullets:</strong><br>- The answer mentions a numeric value paired with the currency.<br>- If no currency is named, the section fails.</blockquote>
+<p>This sort of test is unambiguous: the judge either spots the currency or does not.</p>
+<h3>2. The &quot;must not contain&quot; pattern</h3>
+<blockquote><strong>Title:</strong> No personal speculation<br><strong>Body:</strong> The answer must report what the data shows, not the assistant&#x27;s opinion about why.<br><strong>Bullets:</strong><br>- Phrases like &quot;I think&quot;, &quot;this is probably&quot;, &quot;perhaps&quot; must not appear.<br>- Statements of cause that are not in the data fail this section.</blockquote>
+<h3>3. The &quot;must justify&quot; pattern</h3>
+<blockquote><strong>Title:</strong> Time window stated<br><strong>Body:</strong> Every aggregated number must be paired with the time window it was calculated over.<br><strong>Bullets:</strong><br>- The answer names a window (e.g. &quot;last 30 days&quot;, &quot;Q3 2025&quot;).<br>- If a number is given without a window, the section fails.</blockquote>
+<p>These three patterns cover most domains. Avoid sections that ask the judge to evaluate tone, novelty, or insight — they produce verdicts that drift across runs.</p>
+<h2>How the judge maps a rubric to a verdict</h2>
+<p>The judge LLM is told to read the answer plus the rubric and return one JSON object:</p>
+<pre><code>{
+  &quot;verdict&quot;: &quot;pass&quot; | &quot;warn&quot; | &quot;fail&quot;,
+  &quot;reasoning&quot;: &quot;&lt;one short paragraph&gt;&quot;,
+  &quot;metrics&quot;: { &quot;&lt;section title&gt;&quot;: &lt;0..1 score&gt;, ... }
+}</code></pre>
+<p>The verdict aggregates across sections: <em>pass</em> means every section is satisfied, <em>warn</em> means one section has a minor gap, <em>fail</em> means a section is materially violated. The reasoning paragraph explains the verdict in human terms — it is what users see when <em>Judge block visibility</em> is set to transparent.</p>
+<p>The <code>metrics</code> map is a per-section score. <em>Metrics → Recent calibration</em> charts these so you can see which section is failing most often.</p>
+<h2>A worked example: a rubric for an e-commerce dashboard</h2>
+<p>Assume the project answers questions about an Acme retail data model. A working rubric has four sections.</p>
+<ol><li><strong>Currency present.</strong> Pass when every numeric answer carries a currency.</li><li><strong>Time window stated.</strong> Pass when every aggregated number names a window.</li><li><strong>No personal speculation.</strong> Pass when no opinion-words (&quot;I think&quot;, &quot;probably&quot;) appear.</li><li><strong>Faithful to data.</strong> Pass when the numeric values quoted match the rows shown in the citations.</li></ol>
+<p>Each section gets a <code>title</code>, a one-sentence <code>body</code>, and three to five binary <code>bullets</code>. The whole rubric is fewer than 600 tokens, which keeps the judge call cheap and fast.</p>
+<h2>Calibrating the rubric</h2>
+<p>Calibration is the process of tightening sections until the verdicts match what an admin would say if they reviewed each answer by hand. The platform makes this concrete:</p>
+<ul><li>Open <em>Project Agent → Metrics</em>. The <em>Recent calibration</em> table lists the most recent judged turns with verdict, reasoning, and the original answer text.<p><strong>Who can see blocked originals.</strong> When the judge <em>blocks</em> an answer, the original text the user was prevented from seeing is sensitive — so the <em>Recent calibration</em> table, the judge trace, and the agent log reveal it only to people trusted to review it: a tenant administrator (or system administrator), or a user given an explicit <strong>Modeller</strong> or <strong>Admin</strong> binding on the project. Everyone else gets a 403 and sees the block message instead, never the original. This holds even on a brand-new project that has no access entries yet — unlike ordinary first-run setup, viewing blocked content is never opened up by default. It fails closed, because a project without bindings would otherwise expose every blocked answer to any signed-in user.</p></li><li>For each row, ask: would I have made the same call as the judge? If yes, the section is calibrated. If no, look at the reasoning column — it usually identifies which section was misapplied.</li><li>Edit the rubric. Tighten the body, add a bullet that names the missed case, or split an over-broad section into two.</li><li>Re-run <em>Run eval</em> (also under <em>Metrics</em>) — that re-runs the agent against every example question registered in the per-model glossaries and gives you a regression view.</li></ul>
+<p>In practice, three rounds of calibration are usually enough to get pass-rate above 80 % on a well-modelled project. After that, gains come from improving the project brief and the per-model glossary, not from more rubric edits.</p>
+<h2>Choosing async vs sync mode</h2>
+<p><em>Async mode</em> is the default. The answer streams to the user; the judge runs in the background; the verdict appears later in the trace drawer and on the dashboard. User-visible latency is unchanged. Use this for internal tooling where you want the quality signal but the user is trusted.</p>
+<p><em>Sync mode</em> runs the judge before the answer is delivered. If the verdict is <em>fail</em> and <em>Judge block visibility</em> is set, the user sees a block message instead of the answer. Latency goes up by the judge call&#x27;s wall time. Use this for external-facing surfaces or for regulated domains where an unreviewed answer cannot leave the service.</p>
+<p>Pick the cheapest, fastest LLM you can stomach for the judge — judging is a constrained task, and a 7B-class model is usually adequate.</p>
+<h2>Common pitfalls</h2>
+<ul><li><strong>Sections that overlap.</strong> Two sections that test the same thing produce double-counted verdicts. Each section should be one concern.</li><li><strong>Vague bullets.</strong> &quot;The answer should be useful.&quot; This is unjudgeable. Replace with binary tests.</li><li><strong>Long bodies, no bullets.</strong> A paragraph of guidance without bullets is hard to score consistently. The judge over-weights the closing sentence.</li><li><strong>Sync mode with a slow judge model.</strong> User latency suffers and the judge timeout will swallow some calls. Use a fast model or stay async.</li><li><strong>Skipping calibration.</strong> A rubric that has never been calibrated fails honest answers and passes wrong ones. Reserve an admin half-hour each week to walk <em>Recent calibration</em>.</li></ul>
+<h2>Related reading</h2>
+<ul><li><a href="configure-agent.html">Configure your project agent</a></li><li><a href="glossary-alias-map.html">Author the glossary alias map</a></li><li><a href="cross-model-recipes.html">Cross-model calculation recipes</a></li></ul>
+<nav class="page-nav"><a href="glossary-alias-map.html" class="page-nav-btn prev">&larr; Author the glossary alias map</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="cross-model-recipes.html" class="page-nav-btn next">Cross-model calculation recipes &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Demo tenant: acme-demo — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Getting Started</span> / <span>Demo tenant: acme-demo</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">all</span><span class="updated">Updated 2026-06-24</span></div>
+    <h1>Demo tenant: acme-demo</h1>
+<h2>What this covers</h2>
+<p><code>acme-demo</code> is the comprehensive demo workspace shipped with Tessallite. It exercises every modelling feature against a self-contained dataset so new operators can explore a working install without authoring anything from scratch.</p>
+<p>It supersedes the legacy <code>acme-test</code> fixture. <code>acme-test</code> scripts remain in <code>tessallite/scripts/</code> for backward compatibility, but new code should target <code>acme-demo</code>.</p>
+<h2>What it contains</h2>
+<ul><li>One project (<code>project1</code>).</li><li>Five models in that project. Two are the primary worked examples used throughout this help and the end-to-end test suite:<ul><li><code>ModelX</code> — small smoke model: one fact, a handful of measures, one persona, one row-security rule. The simplest model to read when you are learning the canvas.</li><li><code>modely</code> — comprehensive model: two facts, snowflake dimensions, time + geo hierarchies, many measures (sum / avg / calculated / currency + percent formats / time variants), three personas, two row-security rules (mapping + role predicate), pocket tables, predictive aggregates (including a demand-driven one), lifecycle events, drill-through sets, and glossary entries. This is the model that exercises nearly every feature.</li><li>The remaining three — <code>Model L</code>, <code>onboarding</code>, and <code>inventory</code> — are additional sample models added so the demo tenant shows a realistic multi-model workspace rather than just two. They are good for exploring the Explorer and model-switching, but <code>modely</code> remains the reference for feature walkthroughs.</li></ul></li><li>Source schema <code>acme_demo_src</code> and target schema <code>acme_demo_target</code> in <code>tessallite_system</code>. Both are recreated on every reseed.</li></ul>
+<h2>How it gets seeded in the Community bundle</h2>
+<p>The signed Community bundle seeds it during <code>./install.sh</code>. After the system schema is ready, the installer loads the demo source data and imports the project bundle so a new user has a working tenant immediately.</p>
+<ol><li>Source and target schemas are loaded from <code>deploy/Sample-db/acme-demo/*.sql</code>.</li><li>The acme-demo tenant is reset, the project + four connections are created, then all five models are re-imported from the seed bundle <code>tessallite/seeds/acme-demo/project.json</code> (a single project export containing every model; older builds used separate per-model JSON files).</li></ol>
+<p>The seed is conditional on <code>SYSTEM_DATABASE_URL</code> and <code>CREDENTIAL_ENCRYPTION_KEY</code> being present in the generated <code>.env</code>. If the seed assets are missing, the installer prints a notice and continues so the platform still starts.</p>
+<h2>Rebuilding the seed locally</h2>
+<p>To rebuild the JSON bundles from a clean state:</p>
+<pre><code>bash scripts/regenerate-acme-demo-seeds.sh</code></pre>
+<p>This script orchestrates:</p>
+<ol><li><code>tessallite/scripts/reset_acme_demo_tenant.py</code> — drops + recreates the tenant.</li><li><code>tessallite/scripts/load_acme_demo_schemas.sh</code> — recreates <code>acme_demo_src</code> + <code>acme_demo_target</code>.</li><li><code>tessallite/scripts/seed_acme_demo_project.py</code> — imports project + connection + models from the project export bundle.</li></ol>
+<p>Re-running against an unchanged codebase produces zero diff.</p>
+<h2>Adding a new feature to modely</h2>
+<ol><li>Modify <code>tessallite/scripts/bootstrap_acme_demo_models.py</code> to add the feature.</li><li>Run <code>bash scripts/regenerate-acme-demo-seeds.sh</code>.</li><li>Commit the changed <code>tessallite/seeds/acme-demo/project.json</code> and <code>MANIFEST.sha256</code>.</li></ol>
+<p>The committed <code>project.json</code> is the source of truth. Container deploys re-import from it; they do not re-run the bootstrap step.</p>
+<h2>Test fixture</h2>
+<p><code>tests/conftest.py</code> exposes the <code>acme_demo_seeded</code> session-scoped pytest fixture. It is opt-in: set <code>ACME_DEMO_FIXTURE_ENABLED=1</code> (and <code>SYSTEM_DATABASE_URL</code> + <code>CREDENTIAL_ENCRYPTION_KEY</code>) to enable. It is checksum-gated via <code>tessallite/seeds/acme-demo/.last_seeded_checksum</code> (gitignored), so unchanged seed inputs are a no-op (~0.01 s); a fresh reseed runs in roughly six seconds.</p>
+<p>The comprehensive coverage suite is <code>tests/e2e/test_acme_demo_modely.py</code> — one or more tests per feature row in the modely matrix. Run it with:</p>
+<pre><code>ACME_DEMO_FIXTURE_ENABLED=1 \
+SYSTEM_DATABASE_URL=postgresql+asyncpg://tessallite:&lt;pw&gt;@localhost:5432/tessallite_system \
+CREDENTIAL_ENCRYPTION_KEY=&lt;key&gt; \
+pytest tests/e2e/test_acme_demo_modely.py</code></pre>
+<h2>Related</h2>
+<ul><li><a href="install-local.html">Install Tessallite Locally</a></li><li><a href="first-time-setup.html">First-time setup</a></li><li><a href="../concepts/workspaces-and-tenants.html">Workspaces and tenants</a></li></ul>
+<nav class="page-nav"><a href="workspace-explorer.html" class="page-nav-btn prev">&larr; Workspace Explorer</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="install-local.html" class="page-nav-btn next">Install Tessallite Locally &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

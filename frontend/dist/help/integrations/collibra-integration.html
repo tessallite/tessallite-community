@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Collibra Integration — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Collibra Integration</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-06-13</span></div>
+    <h1>Collibra Integration</h1>
+
+    <h2>What it is</h2>
+    <p>The Collibra integration lets you push your Tessallite semantic model metadata into <strong>Collibra</strong>, the enterprise data governance and catalog platform. When connected, Collibra becomes the governed catalog for your metrics, dimensions, KPIs, glossary terms, and downstream reports — complete with ownership, classifications, and relationships.</p>
+
+    <h2>Who it is for</h2>
+    <ul>
+      <li><strong>Modellers</strong> who want their models governed in the enterprise data catalog</li>
+      <li><strong>Tenant Admins</strong> who configure the connection to the Collibra instance</li>
+      <li><strong>Data Stewards</strong> who manage ownership, classifications, and governance workflows in Collibra</li>
+    </ul>
+
+    <h2>What gets exported</h2>
+    <p>When you sync a model to Collibra, Tessallite exports these objects as governed assets with attributes, relations, and responsibilities:</p>
+    <div class="table-wrapper"><table>
+      <thead><tr><th>Tessallite object</th><th>Collibra asset type</th></tr></thead>
+      <tbody>
+        <tr><td>Project</td><td>Data Domain</td></tr>
+        <tr><td>Model</td><td>Semantic Model</td></tr>
+        <tr><td>Data Source</td><td>System</td></tr>
+        <tr><td>Tables + Columns</td><td>Table + Column assets</td></tr>
+        <tr><td>Dimensions</td><td>Data Attribute assets</td></tr>
+        <tr><td>Measures</td><td>Metric assets</td></tr>
+        <tr><td>KPIs</td><td>KPI assets</td></tr>
+        <tr><td>Glossary terms</td><td>Business Term assets</td></tr>
+        <tr><td>Downstream assets</td><td>Report / Dashboard assets</td></tr>
+        <tr><td>Aggregates</td><td>Table assets (materialized)</td></tr>
+        <tr><td>Data tags</td><td>Data Classification assets</td></tr>
+      </tbody>
+    </table></div>
+    <p>Each asset carries its Tessallite attributes (descriptions, types, formulas, visibility). Relationships link assets together. Ownership becomes Collibra responsibilities for objects that carry an explicit owner — <strong>KPIs</strong> and <strong>downstream assets</strong>. Measures and dimensions have no owner field, so they export without a responsibility.</p>
+    <p>Lifecycle statuses are mapped automatically: deployed → <strong>Accepted</strong>, draft → <strong>Candidate</strong>, hidden → <strong>Candidate</strong>, deprecated → <strong>Deprecated</strong>.</p>
+
+    <h2>Key difference from Solidatus</h2>
+    <p>Solidatus is a <strong>lineage graph</strong> — the main deliverable is a visual map of nodes and edges. Collibra is a <strong>governance operating system</strong> — the main deliverable is a governed catalog with assets, attributes, relations, responsibilities, statuses, and classifications. The Collibra integration exports richer governance metadata: ownership, stewardship, classifications, and lifecycle states.</p>
+
+    <h2>Step-by-step: Set up and sync</h2>
+
+    <h3>Step 1 — Get your Collibra details</h3>
+    <p>Before you start, ask your Collibra administrator for:</p>
+    <ul>
+      <li><strong>Base URL</strong> — the web address of your Collibra instance (e.g., <code>https://your-company.collibra.com</code>)</li>
+      <li><strong>API Token</strong> — a service account token with import permissions</li>
+      <li><strong>Community ID</strong> — the Collibra Community where assets will be placed</li>
+      <li><strong>Domain ID</strong> — the Collibra Domain within that Community</li>
+    </ul>
+
+    <h3>Step 2 — Open Model Settings</h3>
+    <ol>
+      <li>In Tessallite, open the project and model you want to sync.</li>
+      <li>Click the <strong>gear icon</strong> (⚙) in the top-right corner of the Model Builder.</li>
+      <li>The Model Configuration drawer opens.</li>
+    </ol>
+
+    <h3>Step 3 — Navigate to the Collibra tab</h3>
+    <ol>
+      <li>In the settings drawer, scroll the tabs until you see <strong>Collibra</strong>.</li>
+      <li>Click the Collibra tab.</li>
+    </ol>
+
+    <h3>Step 4 — Add a connection</h3>
+    <ol>
+      <li>Click the <strong>Add Connection</strong> button.</li>
+      <li>Fill in the dialog:
+        <ul>
+          <li><strong>Display Name</strong> — a friendly name like "Collibra Production"</li>
+          <li><strong>Base URL</strong> — the URL from Step 1</li>
+          <li><strong>API Token</strong> — the token from Step 1 (kept encrypted)</li>
+          <li><strong>Community ID</strong> — the Collibra Community ID from Step 1</li>
+          <li><strong>Domain ID</strong> — the Collibra Domain ID from Step 1</li>
+        </ul>
+      </li>
+      <li>Click <strong>Save</strong>.</li>
+    </ol>
+
+    <h3>Step 5 — Test the connection</h3>
+    <ol>
+      <li>Click the <strong>Test Connection</strong> button.</li>
+      <li>In this build the connection check is <strong>simulated</strong> — Tessallite does not yet contact your Collibra instance. Your configuration is saved, but it is not verified against a live Collibra API.</li>
+      <li>You will see an informational notice that the validation was simulated. This is not a green pass: a wrong URL or expired token will not be caught until live validation is available.</li>
+    </ol>
+
+    <h3>Step 6 — Preview what will be exported</h3>
+    <ol>
+      <li>Click the <strong>Preview Export</strong> button.</li>
+      <li>Tessallite builds the governance graph and shows you:
+        <ul>
+          <li>How many <strong>assets</strong> will be created (metrics, dimensions, tables, etc.)</li>
+          <li>How many <strong>relations</strong> will be created (relationships between them)</li>
+          <li>How many <strong>responsibilities</strong> will be assigned (ownership mappings)</li>
+        </ul>
+      </li>
+      <li>The preview breaks down counts by asset type so you can verify coverage.</li>
+    </ol>
+
+    <h3>Step 7 — Dry run</h3>
+    <ol>
+      <li>Click the <strong>Dry Run</strong> button.</li>
+      <li>Tessallite runs the full sync pipeline — builds the graph, maps to Collibra assets/relations/responsibilities, calculates what would change — but does NOT push to Collibra.</li>
+    </ol>
+
+    <h3>Step 8 — Live push (not yet available)</h3>
+    <p>Live push to Collibra is not implemented in this build, so the <strong>Sync</strong> button is disabled. The dry run in Step 7 lets you confirm exactly what would be created. When a live Collibra client is wired in, this button will push the previewed assets, relations, and responsibilities and record the result in run history.</p>
+
+    <h2>How sync works (under the hood)</h2>
+    <p>Same incremental sync engine as Solidatus:</p>
+    <ol>
+      <li><strong>Build governance graph</strong> — reads all model objects from the snapshot.</li>
+      <li><strong>Map to Collibra format</strong> — converts to assets (with attributes + status), relations, and responsibilities.</li>
+      <li><strong>Hash every object</strong> — SHA256 fingerprint for diffing.</li>
+      <li><strong>Compare with previous sync</strong> — identifies new, changed, and unchanged objects.</li>
+      <li><strong>Push only changes</strong> — sends only new and updated assets/relations to Collibra.</li>
+      <li><strong>Persist mappings</strong> — saves Tessallite→Collibra ID mappings for incremental sync.</li>
+    </ol>
+
+    <h2>Tips and best practices</h2>
+    <ul>
+      <li><strong>Sync after deploy</strong> — The sync exports the deployed model state. Draft changes won't appear until deployed.</li>
+      <li><strong>Community and Domain matter</strong> — Make sure the Community and Domain IDs are correct. If they don't exist in Collibra, the sync will fail.</li>
+      <li><strong>Ownership flows through</strong> — KPIs with an owner and downstream assets with an owner become Collibra responsibilities automatically. Measures and dimensions have no owner field, so they export without a responsibility.</li>
+      <li><strong>Deprecate, don't delete</strong> — Removed objects are marked Deprecated in Collibra, preserving audit history.</li>
+      <li><strong>Business vs Technical</strong> — The export supports separate business and technical views. Hidden columns are included in technical exports.</li>
+      <li><strong>Asset type mappings</strong> — The default asset type names work with standard Collibra installations. Custom setups can configure the mapping.</li>
+    </ul>
+
+    <h2>Troubleshooting</h2>
+    <div class="table-wrapper"><table>
+      <thead><tr><th>Problem</th><th>Likely cause</th><th>Solution</th></tr></thead>
+      <tbody>
+        <tr><td>"Connection not found"</td><td>No connection configured</td><td>Click Add Connection first</td></tr>
+        <tr><td>"Model not found"</td><td>Not inside a model</td><td>Open a model in Model Builder</td></tr>
+        <tr><td>Community/Domain not found</td><td>Wrong IDs</td><td>Verify with your Collibra admin</td></tr>
+        <tr><td>Sync fails with auth error</td><td>Invalid token</td><td>Edit connection and update the API token</td></tr>
+        <tr><td>Assets don't appear in Collibra</td><td>Wrong Community/Domain</td><td>Check the IDs in your connection settings</td></tr>
+        <tr><td>"Model not deployed" warning</td><td>Model has no deployed version</td><td>Deploy the model first</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2>Related</h2>
+    <ul>
+      <li><a href="solidatus-integration.html">Solidatus Integration</a> — The equivalent integration for Solidatus lineage platform</li>
+      <li><a href="../modelling/model-settings.html">Model Configuration</a> — All model-level settings</li>
+      <li><a href="../modelling/glossary.html">Glossary</a> — Manage business terms</li>
+      <li><a href="api-reference.html">API Reference</a> — REST API documentation</li>
+    </ul>
+
+    <nav class="page-nav">
+      <a href="solidatus-integration.html" class="page-nav-btn prev">&larr; Solidatus Integration</a>
+      <a href="../index.html" class="page-nav-btn home">Home</a>
+      <a href="../troubleshooting/excel-connection-problems.html" class="page-nav-btn next">Excel Connection Problems &rarr;</a>
+    </nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

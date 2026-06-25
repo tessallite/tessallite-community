@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Scheduler Dependencies — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Scheduler Dependencies</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-24</span></div>
+<h1>Scheduler Dependencies</h1>
+
+<h2>What this covers</h2>
+<p>When one aggregate depends on data produced by another, you need to ensure the upstream aggregate refreshes before the downstream one begins. Scheduler dependencies let you define these ordering constraints. This page explains how to create, view, and delete dependencies, and how topological sorting and cycle detection work.</p>
+
+<h2>Why dependencies matter</h2>
+<p>Without dependencies, all aggregates refresh independently according to their own cron schedules. If aggregate B reads from a table that aggregate A materialises, and A hasn&rsquo;t finished its refresh yet, B will see stale data. Dependencies guarantee that B&rsquo;s refresh job waits until A completes.</p>
+
+<h2>Creating a dependency</h2>
+<ol>
+<li>Open the <strong>Aggregates panel</strong> in the Model Builder.</li>
+<li>Select the downstream aggregate (the one that should wait).</li>
+<li>In the aggregate drawer, open the <strong>Dependencies</strong> section.</li>
+<li>Click <strong>Add dependency</strong> and select the upstream aggregate.</li>
+<li>Save. The scheduler will now ensure the upstream finishes before the downstream starts.</li>
+</ol>
+<p>Both aggregates must belong to the <strong>same model</strong>. Cross-model dependencies are not supported and the API will reject them with a 400 error.</p>
+
+<h2>Viewing dependencies</h2>
+<p>The <strong>Dependencies</strong> section in each aggregate drawer lists both:</p>
+<ul>
+<li><strong>Depends on</strong> (upstream) &mdash; aggregates that must complete before this one starts.</li>
+<li><strong>Required by</strong> (downstream) &mdash; aggregates that wait for this one to complete.</li>
+</ul>
+<p>The scheduler processes aggregates in topological order, so the refresh sequence always respects the dependency graph.</p>
+
+<h2>Cycle detection</h2>
+<p>If adding a dependency would create a circular chain (A depends on B, B depends on C, C depends on A), the API rejects the request with a <strong>400 Bad Request</strong> error and a message identifying the cycle. You must remove an existing dependency before the new one can be added.</p>
+
+<h2>Deleting a dependency</h2>
+<ol>
+<li>Open the downstream aggregate drawer.</li>
+<li>In the <strong>Dependencies</strong> section, click the delete icon next to the upstream entry.</li>
+<li>Confirm. The scheduler will no longer enforce ordering between the two.</li>
+</ol>
+
+<h2>API reference</h2>
+<table>
+<thead><tr><th>Endpoint</th><th>Method</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>/api/v1/models/{model_id}/dependencies</code></td><td>POST</td><td>Create a dependency (upstream_id, downstream_id)</td></tr>
+<tr><td><code>/api/v1/models/{model_id}/dependencies</code></td><td>GET</td><td>List all dependencies for the model</td></tr>
+<tr><td><code>/api/v1/models/{model_id}/dependencies/{id}</code></td><td>DELETE</td><td>Remove a dependency</td></tr>
+</tbody>
+</table>
+
+<h2>Related</h2>
+<ul>
+<li><a href="manage-aggregate-schedules.html">Manage Aggregate Schedules</a></li>
+<li><a href="configure-aggregates.html">Configure Aggregates</a></li>
+<li><a href="run-a-refresh.html">Run a Refresh</a></li>
+</ul>
+<nav class="page-nav"><a href="manage-aggregate-schedules.html" class="page-nav-btn prev">&larr; Manage Aggregate Schedules</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="use-the-ai-optimiser.html" class="page-nav-btn next">Use the AI Optimiser &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,445 @@
+{
+  "_comment": "MDSCHEMA rowset column definitions used by mdschema.py to build XMLA DISCOVER responses. Column schemas match OlaPy (confirmed working with Excel).",
+  "namespace": "urn:schemas-microsoft-com:xml-analysis:rowset",
+  "xsd_namespace": "http://www.w3.org/2001/XMLSchema",
+
+  "rowsets": {
+    "DBSCHEMA_CATALOGS": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "ROLES", "type": "string"},
+        {"name": "DATE_MODIFIED", "type": "dateTime"},
+        {"name": "COMPATIBILITY_LEVEL", "type": "int"},
+        {"name": "TYPE", "type": "int"}
+      ]
+    },
+    "MDSCHEMA_CUBES": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string", "required": true},
+        {"name": "SCHEMA_NAME", "type": "string"},
+        {"name": "CUBE_NAME", "type": "string"},
+        {"name": "CUBE_TYPE", "type": "string"},
+        {"name": "CUBE_GUID", "type": "uuid"},
+        {"name": "CREATED_ON", "type": "dateTime"},
+        {"name": "LAST_SCHEMA_UPDATE", "type": "dateTime"},
+        {"name": "SCHEMA_UPDATED_BY", "type": "string"},
+        {"name": "LAST_DATA_UPDATE", "type": "dateTime"},
+        {"name": "DATA_UPDATED_BY", "type": "string"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "IS_DRILLTHROUGH_ENABLED", "type": "boolean"},
+        {"name": "IS_LINKABLE", "type": "boolean"},
+        {"name": "IS_WRITE_ENABLED", "type": "boolean"},
+        {"name": "IS_SQL_ENABLED", "type": "boolean"},
+        {"name": "CUBE_CAPTION", "type": "string"},
+        {"name": "BASE_CUBE_NAME", "type": "string"},
+        {"name": "CUBE_SOURCE", "type": "unsignedShort"}
+      ]
+    },
+    "MDSCHEMA_DIMENSIONS": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "SCHEMA_NAME", "type": "string"},
+        {"name": "CUBE_NAME", "type": "string"},
+        {"name": "DIMENSION_NAME", "type": "string"},
+        {"name": "DIMENSION_UNIQUE_NAME", "type": "string"},
+        {"name": "DIMENSION_GUID", "type": "uuid"},
+        {"name": "DIMENSION_CAPTION", "type": "string"},
+        {"name": "DIMENSION_ORDINAL", "type": "unsignedInt"},
+        {"name": "DIMENSION_TYPE", "type": "short"},
+        {"name": "DIMENSION_CARDINALITY", "type": "unsignedInt"},
+        {"name": "DEFAULT_HIERARCHY", "type": "string"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "IS_VIRTUAL", "type": "boolean"},
+        {"name": "IS_READWRITE", "type": "boolean"},
+        {"name": "DIMENSION_UNIQUE_SETTINGS", "type": "int"},
+        {"name": "DIMENSION_MASTER_NAME", "type": "string"},
+        {"name": "DIMENSION_IS_VISIBLE", "type": "boolean"}
+      ]
+    },
+    "MDSCHEMA_HIERARCHIES": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "SCHEMA_NAME", "type": "string"},
+        {"name": "CUBE_NAME", "type": "string"},
+        {"name": "DIMENSION_UNIQUE_NAME", "type": "string"},
+        {"name": "HIERARCHY_NAME", "type": "string"},
+        {"name": "HIERARCHY_UNIQUE_NAME", "type": "string"},
+        {"name": "HIERARCHY_GUID", "type": "uuid"},
+        {"name": "HIERARCHY_CAPTION", "type": "string"},
+        {"name": "DIMENSION_TYPE", "type": "short"},
+        {"name": "HIERARCHY_CARDINALITY", "type": "unsignedInt"},
+        {"name": "DEFAULT_MEMBER", "type": "string"},
+        {"name": "ALL_MEMBER", "type": "string"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "STRUCTURE", "type": "short"},
+        {"name": "IS_VIRTUAL", "type": "boolean"},
+        {"name": "IS_READWRITE", "type": "boolean"},
+        {"name": "DIMENSION_UNIQUE_SETTINGS", "type": "int"},
+        {"name": "DIMENSION_MASTER_UNIQUE_NAME", "type": "string"},
+        {"name": "DIMENSION_IS_VISIBLE", "type": "boolean"},
+        {"name": "HIERARCHY_ORDINAL", "type": "unsignedInt"},
+        {"name": "DIMENSION_IS_SHARED", "type": "boolean"},
+        {"name": "HIERARCHY_IS_VISIBLE", "type": "boolean"},
+        {"name": "HIERARCHY_ORIGIN", "type": "unsignedShort"},
+        {"name": "HIERARCHY_DISPLAY_FOLDER", "type": "string"},
+        {"name": "INSTANCE_SELECTION", "type": "unsignedShort"},
+        {"name": "GROUPING_BEHAVIOR", "type": "unsignedShort"}
+      ]
+    },
+    "MDSCHEMA_LEVELS": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "SCHEMA_NAME", "type": "string"},
+        {"name": "CUBE_NAME", "type": "string"},
+        {"name": "DIMENSION_UNIQUE_NAME", "type": "string"},
+        {"name": "HIERARCHY_UNIQUE_NAME", "type": "string"},
+        {"name": "LEVEL_NAME", "type": "string"},
+        {"name": "LEVEL_UNIQUE_NAME", "type": "string"},
+        {"name": "LEVEL_GUID", "type": "uuid"},
+        {"name": "LEVEL_CAPTION", "type": "string"},
+        {"name": "LEVEL_NUMBER", "type": "unsignedInt"},
+        {"name": "LEVEL_CARDINALITY", "type": "unsignedInt"},
+        {"name": "LEVEL_TYPE", "type": "int"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "CUSTOM_ROLLUP_SETTINGS", "type": "int"},
+        {"name": "LEVEL_UNIQUE_SETTINGS", "type": "int"},
+        {"name": "LEVEL_IS_VISIBLE", "type": "boolean"},
+        {"name": "LEVEL_ORDERING_PROPERTY", "type": "string"},
+        {"name": "LEVEL_DBTYPE", "type": "int"},
+        {"name": "LEVEL_MASTER_UNIQUE_NAME", "type": "string"},
+        {"name": "LEVEL_NAME_SQL_COLUMN_NAME", "type": "string"},
+        {"name": "LEVEL_KEY_SQL_COLUMN_NAME", "type": "string"},
+        {"name": "LEVEL_UNIQUE_NAME_SQL_COLUMN_NAME", "type": "string"},
+        {"name": "LEVEL_ATTRIBUTE_HIERARCHY_NAME", "type": "string"},
+        {"name": "LEVEL_KEY_CARDINALITY", "type": "unsignedShort"},
+        {"name": "LEVEL_ORIGIN", "type": "unsignedShort"}
+      ]
+    },
+    "MDSCHEMA_MEASURES": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "SCHEMA_NAME", "type": "string"},
+        {"name": "CUBE_NAME", "type": "string"},
+        {"name": "MEASURE_NAME", "type": "string"},
+        {"name": "MEASURE_UNIQUE_NAME", "type": "string"},
+        {"name": "MEASURE_CAPTION", "type": "string"},
+        {"name": "MEASURE_GUID", "type": "uuid"},
+        {"name": "MEASURE_AGGREGATOR", "type": "int"},
+        {"name": "DATA_TYPE", "type": "unsignedShort"},
+        {"name": "NUMERIC_PRECISION", "type": "unsignedShort"},
+        {"name": "NUMERIC_SCALE", "type": "short"},
+        {"name": "MEASURE_UNITS", "type": "string"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "EXPRESSION", "type": "string"},
+        {"name": "MEASURE_IS_VISIBLE", "type": "boolean"},
+        {"name": "LEVELS_LIST", "type": "string"},
+        {"name": "MEASURE_NAME_SQL_COLUMN_NAME", "type": "string"},
+        {"name": "MEASURE_UNQUALIFIED_CAPTION", "type": "string"},
+        {"name": "MEASUREGROUP_NAME", "type": "string"},
+        {"name": "MEASURE_DISPLAY_FOLDER", "type": "string"},
+        {"name": "DEFAULT_FORMAT_STRING", "type": "string"}
+      ]
+    },
+    "MDSCHEMA_MEMBERS": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "SCHEMA_NAME", "type": "string"},
+        {"name": "CUBE_NAME", "type": "string"},
+        {"name": "DIMENSION_UNIQUE_NAME", "type": "string"},
+        {"name": "HIERARCHY_UNIQUE_NAME", "type": "string"},
+        {"name": "LEVEL_UNIQUE_NAME", "type": "string"},
+        {"name": "LEVEL_NUMBER", "type": "unsignedInt"},
+        {"name": "MEMBER_ORDINAL", "type": "unsignedInt"},
+        {"name": "MEMBER_NAME", "type": "string"},
+        {"name": "MEMBER_UNIQUE_NAME", "type": "string"},
+        {"name": "MEMBER_TYPE", "type": "int"},
+        {"name": "MEMBER_GUID", "type": "uuid"},
+        {"name": "MEMBER_CAPTION", "type": "string"},
+        {"name": "CHILDREN_CARDINALITY", "type": "unsignedInt"},
+        {"name": "PARENT_LEVEL", "type": "unsignedInt"},
+        {"name": "PARENT_UNIQUE_NAME", "type": "string"},
+        {"name": "PARENT_COUNT", "type": "unsignedInt"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "EXPRESSION", "type": "string"},
+        {"name": "MEMBER_KEY", "type": "string"},
+        {"name": "IS_PLACEHOLDERMEMBER", "type": "boolean"},
+        {"name": "IS_DATAMEMBER", "type": "boolean"},
+        {"name": "SCOPE", "type": "int"}
+      ]
+    },
+    "DBSCHEMA_TABLES": {
+      "columns": [
+        {"name": "TABLE_CATALOG", "type": "string"},
+        {"name": "TABLE_SCHEMA", "type": "string"},
+        {"name": "TABLE_NAME", "type": "string"},
+        {"name": "TABLE_TYPE", "type": "string"},
+        {"name": "TABLE_GUID", "type": "uuid"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "DATE_CREATED", "type": "dateTime"},
+        {"name": "DATE_MODIFIED", "type": "dateTime"}
+      ]
+    },
+    "DBSCHEMA_COLUMNS": {
+      "columns": [
+        {"name": "TABLE_CATALOG", "type": "string"},
+        {"name": "TABLE_SCHEMA", "type": "string"},
+        {"name": "TABLE_NAME", "type": "string"},
+        {"name": "COLUMN_NAME", "type": "string"},
+        {"name": "ORDINAL_POSITION", "type": "unsignedInt"},
+        {"name": "COLUMN_DEFAULT", "type": "string"},
+        {"name": "IS_NULLABLE", "type": "boolean"},
+        {"name": "DATA_TYPE", "type": "unsignedShort"},
+        {"name": "CHARACTER_MAXIMUM_LENGTH", "type": "unsignedInt"},
+        {"name": "NUMERIC_PRECISION", "type": "unsignedShort"},
+        {"name": "NUMERIC_SCALE", "type": "short"},
+        {"name": "DATETIME_PRECISION", "type": "unsignedInt"},
+        {"name": "CHARACTER_SET_NAME", "type": "string"},
+        {"name": "COLLATION_CATALOG", "type": "string"}
+      ]
+    },
+    "DISCOVER_SCHEMA_ROWSETS": {
+      "columns": [
+        {"name": "SchemaName", "type": "string"},
+        {"name": "SchemaGuid", "type": "uuid"},
+        {"name": "Restrictions", "type": "string"},
+        {"name": "SchemaDescription", "type": "string"},
+        {"name": "RestrictionsMask", "type": "unsignedLong"}
+      ]
+    },
+    "DISCOVER_ENUMERATORS": {
+      "columns": [
+        {"name": "ENUM_NAME", "type": "string"},
+        {"name": "ENUM_DESCRIPTION", "type": "string"},
+        {"name": "ENUM_TYPE", "type": "string"},
+        {"name": "ENUM_VALUE", "type": "string"},
+        {"name": "MEMBER_DESCRIPTION", "type": "string"}
+      ]
+    },
+    "DISCOVER_KEYWORDS": {
+      "columns": [
+        {"name": "KEYWORD", "type": "string"}
+      ]
+    },
+    "DISCOVER_LITERALS": {
+      "columns": [
+        {"name": "LiteralName", "type": "string"},
+        {"name": "LiteralValue", "type": "string"},
+        {"name": "LiteralInvalidChars", "type": "string"},
+        {"name": "LiteralInvalidStartingChars", "type": "string"},
+        {"name": "LiteralMaxLength", "type": "int"},
+        {"name": "LiteralNameEnumValue", "type": "int"}
+      ]
+    },
+    "MDSCHEMA_PROPERTIES": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "SCHEMA_NAME", "type": "string"},
+        {"name": "CUBE_NAME", "type": "string"},
+        {"name": "DIMENSION_UNIQUE_NAME", "type": "string"},
+        {"name": "HIERARCHY_UNIQUE_NAME", "type": "string"},
+        {"name": "LEVEL_UNIQUE_NAME", "type": "string"},
+        {"name": "MEMBER_UNIQUE_NAME", "type": "string"},
+        {"name": "PROPERTY_TYPE", "type": "short"},
+        {"name": "PROPERTY_NAME", "type": "string"},
+        {"name": "PROPERTY_CAPTION", "type": "string"},
+        {"name": "DATA_TYPE", "type": "unsignedShort"},
+        {"name": "CHARACTER_MAXIMUM_LENGTH", "type": "unsignedInt"},
+        {"name": "NUMERIC_PRECISION", "type": "unsignedShort"},
+        {"name": "NUMERIC_SCALE", "type": "short"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "PROPERTY_CONTENT_TYPE", "type": "short"},
+        {"name": "SQL_COLUMN_NAME", "type": "string"},
+        {"name": "LANGUAGE", "type": "unsignedShort"},
+        {"name": "PROPERTY_ORIGIN", "type": "unsignedShort"},
+        {"name": "PROPERTY_ATTRIBUTE_HIERARCHY_NAME", "type": "string"},
+        {"name": "PROPERTY_CARDINALITY", "type": "string"},
+        {"name": "MIME_TYPE", "type": "string"},
+        {"name": "PROPERTY_IS_VISIBLE", "type": "boolean"}
+      ]
+    },
+    "MDSCHEMA_KPIS": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "SCHEMA_NAME", "type": "string"},
+        {"name": "CUBE_NAME", "type": "string"},
+        {"name": "MEASUREGROUP_NAME", "type": "string"},
+        {"name": "KPI_NAME", "type": "string"},
+        {"name": "KPI_CAPTION", "type": "string"},
+        {"name": "KPI_DESCRIPTION", "type": "string"},
+        {"name": "KPI_DISPLAY_FOLDER", "type": "string"},
+        {"name": "KPI_VALUE", "type": "string"},
+        {"name": "KPI_GOAL", "type": "string"},
+        {"name": "KPI_STATUS", "type": "string"},
+        {"name": "KPI_TREND", "type": "string"},
+        {"name": "KPI_STATUS_GRAPHIC", "type": "string"},
+        {"name": "KPI_TREND_GRAPHIC", "type": "string"},
+        {"name": "KPI_WEIGHT", "type": "string"},
+        {"name": "KPI_CURRENT_TIME_MEMBER", "type": "string"},
+        {"name": "KPI_PARENT_KPI_NAME", "type": "string"},
+        {"name": "ANNOTATIONS", "type": "string"},
+        {"name": "UNARY_OPERATOR", "type": "string"},
+        {"name": "ASSOCIATE_MEASURE_GROUP_NAME", "type": "string"}
+      ]
+    },
+    "MDSCHEMA_SETS": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "SCHEMA_NAME", "type": "string"},
+        {"name": "CUBE_NAME", "type": "string"},
+        {"name": "SET_NAME", "type": "string"},
+        {"name": "SET_CAPTION", "type": "string"},
+        {"name": "SET_DESCRIPTION", "type": "string"},
+        {"name": "SET_DISPLAY_FOLDER", "type": "string"},
+        {"name": "SCOPE", "type": "int"},
+        {"name": "EXPRESSION", "type": "string"},
+        {"name": "DIMENSIONS", "type": "string"},
+        {"name": "SET_EVALUATION_CONTEXT", "type": "int"}
+      ]
+    },
+    "MDSCHEMA_FUNCTIONS": {
+      "columns": [
+        {"name": "FUNCTION_NAME", "type": "string"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "PARAMETER_LIST", "type": "string"},
+        {"name": "RETURN_TYPE", "type": "int"},
+        {"name": "ORIGIN", "type": "int"},
+        {"name": "INTERFACE_NAME", "type": "string"},
+        {"name": "LIBRARY_NAME", "type": "string"},
+        {"name": "CAPTION", "type": "string"}
+      ]
+    },
+    "DISCOVER_DATASOURCES": {
+      "columns": [
+        {"name": "DataSourceName", "type": "string", "required": true},
+        {"name": "DataSourceDescription", "type": "string"},
+        {"name": "URL", "type": "string"},
+        {"name": "DataSourceInfo", "type": "string"},
+        {"name": "ProviderName", "type": "string"},
+        {"name": "ProviderType", "type": "string", "required": true, "maxOccurs": "unbounded"},
+        {"name": "AuthenticationMode", "type": "string", "required": true}
+      ]
+    },
+    "DISCOVER_PROPERTIES": {
+      "columns": [
+        {"name": "PropertyName", "type": "string", "required": true},
+        {"name": "PropertyDescription", "type": "string"},
+        {"name": "PropertyType", "type": "string"},
+        {"name": "PropertyAccessType", "type": "string", "required": true},
+        {"name": "IsRequired", "type": "boolean"},
+        {"name": "Value", "type": "string"}
+      ]
+    },
+    "MDSCHEMA_CATALOGS": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "ROLES", "type": "string"},
+        {"name": "DATE_MODIFIED", "type": "dateTime"}
+      ]
+    },
+    "MDSCHEMA_MEASUREGROUPS": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "SCHEMA_NAME", "type": "string"},
+        {"name": "CUBE_NAME", "type": "string"},
+        {"name": "MEASUREGROUP_NAME", "type": "string"},
+        {"name": "DESCRIPTION", "type": "string"},
+        {"name": "IS_WRITE_ENABLED", "type": "boolean"},
+        {"name": "MEASUREGROUP_CAPTION", "type": "string"}
+      ]
+    },
+    "MDSCHEMA_MEASUREGROUP_DIMENSIONS": {
+      "columns": [
+        {"name": "CATALOG_NAME", "type": "string"},
+        {"name": "SCHEMA_NAME", "type": "string"},
+        {"name": "CUBE_NAME", "type": "string"},
+        {"name": "MEASUREGROUP_NAME", "type": "string"},
+        {"name": "MEASUREGROUP_CARDINALITY", "type": "string"},
+        {"name": "DIMENSION_UNIQUE_NAME", "type": "string"},
+        {"name": "DIMENSION_CARDINALITY", "type": "string"},
+        {"name": "DIMENSION_IS_VISIBLE", "type": "boolean"},
+        {"name": "DIMENSION_IS_FACT_DIMENSION", "type": "boolean"},
+        {"name": "DIMENSION_GRANULARITY", "type": "string"}
+      ]
+    },
+    "DISCOVER_CSDL_METADATA": {
+      "columns": [
+        {"name": "Metadata", "type": "string", "required": true}
+      ]
+    },
+    "DISCOVER_CALC_DEPENDENCY": {
+      "columns": [
+        {"name": "OBJECT_TYPE", "type": "string"},
+        {"name": "TABLE", "type": "string"},
+        {"name": "OBJECT", "type": "string"},
+        {"name": "EXPRESSION", "type": "string"},
+        {"name": "REFERENCED_OBJECT_TYPE", "type": "string"},
+        {"name": "REFERENCED_TABLE", "type": "string"},
+        {"name": "REFERENCED_OBJECT", "type": "string"},
+        {"name": "REFERENCED_EXPRESSION", "type": "string"},
+        {"name": "QUERY", "type": "string"}
+      ]
+    }
+  },
+
+  "schema_guids": {
+    "DBSCHEMA_TABLES":                  "C8B52229-5CF3-11CE-ADE5-00AA0044773D",
+    "DBSCHEMA_CATALOGS":                "C8B52211-5CF3-11CE-ADE5-00AA0044773D",
+    "DISCOVER_DATASOURCES":             "06C03D41-F66D-49F3-B1B8-987F7AF4CF18",
+    "DISCOVER_INSTANCES":               "20518699-2474-4C15-9885-0E947EC7A7E3",
+    "DISCOVER_KEYWORDS":                "1426C443-4CDD-4A40-8F45-572FAB9BBAA1",
+    "DISCOVER_LITERALS":                "C3EF5ECB-0A07-4665-A140-B075722DBDC2",
+    "DISCOVER_PROPERTIES":              "4B40ADFB-8B09-4758-97BB-636E8AE97BCF",
+    "DISCOVER_SCHEMA_ROWSETS":          "EEA0302B-7922-4992-8991-0E605D0E5593",
+    "DMSCHEMA_MINING_MODELS":           "3ADD8A77-D8B9-11D2-8D2A-00E029154FDE",
+    "MDSCHEMA_ACTIONS":                 "A07CCD08-8148-11D0-87BB-00C04FC33942",
+    "MDSCHEMA_CUBES":                   "C8B522D8-5CF3-11CE-ADE5-00AA0044773D",
+    "MDSCHEMA_DIMENSIONS":              "C8B522D9-5CF3-11CE-ADE5-00AA0044773D",
+    "MDSCHEMA_FUNCTIONS":               "A07CCD07-8148-11D0-87BB-00C04FC33942",
+    "MDSCHEMA_HIERARCHIES":             "C8B522DA-5CF3-11CE-ADE5-00AA0044773D",
+    "MDSCHEMA_INPUT_DATASOURCES":       "A07CCD32-8148-11D0-87BB-00C04FC33942",
+    "MDSCHEMA_KPIS":                    "2AE44109-ED3D-4842-B16F-B694D1CB0E3F",
+    "MDSCHEMA_LEVELS":                  "C8B522DB-5CF3-11CE-ADE5-00AA0044773D",
+    "MDSCHEMA_MEASUREGROUPS":           "E1625EBF-FA96-42FD-BEA6-DB90ADAFD96B",
+    "MDSCHEMA_MEASUREGROUP_DIMENSIONS": "A07CCD33-8148-11D0-87BB-00C04FC33942",
+    "MDSCHEMA_MEASURES":                "C8B522DC-5CF3-11CE-ADE5-00AA0044773D",
+    "MDSCHEMA_MEMBERS":                 "C8B522DE-5CF3-11CE-ADE5-00AA0044773D",
+    "MDSCHEMA_PROPERTIES":              "C8B522DD-5CF3-11CE-ADE5-00AA0044773D",
+    "MDSCHEMA_SETS":                    "A07CCD0B-8148-11D0-87BB-00C04FC33942"
+  },
+
+  "measure_aggregator_codes": {
+    "sum": 1,
+    "count": 2,
+    "min": 5,
+    "max": 6,
+    "avg": 9,
+    "count_distinct": 10,
+    "default": 0
+  },
+
+  "data_type_codes": {
+    "text": 130,
+    "varchar": 130,
+    "string": 130,
+    "integer": 3,
+    "bigint": 20,
+    "numeric": 5,
+    "decimal": 5,
+    "float": 5,
+    "double": 5,
+    "boolean": 11,
+    "date": 7,
+    "timestamp": 7,
+    "default": 130
+  },
+
+  "datasource_info": {
+    "DATASOURCE_NAME": "Tessallite",
+    "DATASOURCE_DESCRIPTION": "Tessallite Semantic Aggregation Layer",
+    "PROVIDER_NAME": "Tessallite XMLA Provider",
+    "PROVIDER_TYPE": "MDP",
+    "AUTHENTICATION_MODE": "Authenticated"
+  }
+}

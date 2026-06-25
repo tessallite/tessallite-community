@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deploy on Kubernetes — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>System Admin</span> / <span>Deploy on Kubernetes</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-06-24</span></div>
+    <h1>Deploy on Kubernetes (Helm)</h1>
+<p>Tessallite Community runs on any Kubernetes cluster through a Helm chart. This page explains what the chart deploys, what you must provide, and how to install, verify, and tear it down — including a zero-cost way to try it on your laptop first.</p>
+<h2>When to use this</h2>
+<p>Use Kubernetes when you want Tessallite to run as a managed, self-healing workload: rolling restarts, horizontal scaling of the stateless services, and a cloud load balancer in front of the gateway so BI tools get a stable address. If you just want a single host, the Docker Compose bundle is simpler — see <a href="deploy-local.html">Deploy Locally</a>.</p>
+<h2>What the chart deploys</h2>
+<p>The chart <code>tessallite-community</code> runs the pre-built Community images (it never builds from source). It creates seven service Deployments (model-service, query-router, optimizer, scheduler, agent-service, gateway, frontend); a Postgres StatefulSet with a PersistentVolumeClaim (data survives pod restarts; it uses the cluster's default StorageClass unless you set one); Services (most internal ClusterIP, with the gateway as a LoadBalancer because BI/SQL clients need raw TCP on 5433 for JDBC alongside HTTP/XMLA on 8080); an optional Ingress for the UI; and a default-deny NetworkPolicy.</p>
+<h2>What you must provide</h2>
+<p>The chart has no insecure defaults — it refuses to render if a required value is missing: <code>secrets.postgresPassword</code>, <code>secrets.credentialEncryptionKey</code> (a 44-character urlsafe-base64 Fernet key), <code>secrets.jwtSecretKey</code> (at least 32 characters), <code>secrets.systemAdminPassword</code>, <code>license.publicKeys</code> (<code>key_id:base64publickey</code>), and <code>license.signedDocument</code> (your signed Community licence JSON). You also need a registry your cluster can pull the images from; set <code>global.registry</code> and <code>global.tag</code> accordingly.</p>
+<h2>The deploy / teardown script</h2>
+<p>This single script handles every step and, critically, tears the cluster down so you do not leave cloud resources running. It ships in the product at <code>deploy/community/helm/deploy-kubernetes.sh</code>.</p>
+<pre><code>#!/usr/bin/env bash
+# =============================================================================
+# Tessallite Community — deploy on Kubernetes via Helm
+#
+# Subcommands:
+#   secrets       Generate the required secrets into k8s-secrets.env (edit after).
+#   gke-create    Create a small GKE cluster (COST-BEARING — tear down when done).
+#   install       Helm-install the chart (reads k8s-secrets.env + a license file).
+#   verify        Wait for pods Ready and print access info.
+#   teardown      helm uninstall + delete the namespace.
+#   gke-delete    Delete the GKE cluster (stops all cluster cost).
+#
+# Images: the chart pulls ghcr.io/tessallite/&lt;svc&gt;:&lt;tag&gt;. On a private/air-gapped
+# cluster, push the bundle images to a registry your nodes can pull, then set
+# REGISTRY/TAG below. For local testing, a `kind` cluster + `kind load` works with
+# global.imagePullPolicy=Never (see the &quot;Local test (kind)&quot; notes in the guide).
+#
+# Prerequisites: kubectl, helm (v3), and for GKE: gcloud with container API enabled.
+# =============================================================================
+set -euo pipefail
+
+HERE=&quot;$(cd &quot;$(dirname &quot;${BASH_SOURCE[0]}&quot;)&quot; &amp;&amp; pwd)&quot;
+CHART=&quot;$HERE/tessallite-community&quot;
+
+# ---- Config (override via environment) --------------------------------------
+NAMESPACE=&quot;${NAMESPACE:-tessallite}&quot;
+RELEASE=&quot;${RELEASE:-tessallite}&quot;
+REGISTRY=&quot;${REGISTRY:-ghcr.io/tessallite}&quot;
+TAG=&quot;${TAG:-0.1.0}&quot;                       # use an immutable digest in production
+LICENSE_FILE=&quot;${LICENSE_FILE:-license.json}&quot;   # signed Community license JSON
+SECRETS_ENV=&quot;${SECRETS_ENV:-$HERE/k8s-secrets.env}&quot;
+# Public verifier key shipped with the product (override only for a custom key).
+LICENSE_PUBLIC_KEYS=&quot;${LICENSE_PUBLIC_KEYS:-tessallite-prod-2026:/by3PGaeLD425bBkMrAbD2NeHROHyjLHVA37pS5w3+0=}&quot;
+# GKE
+GKE_CLUSTER=&quot;${GKE_CLUSTER:-tessallite-community}&quot;
+GKE_ZONE=&quot;${GKE_ZONE:-us-west1-a}&quot;
+GKE_PROJECT=&quot;${GKE_PROJECT:-$(gcloud config get-value project 2&gt;/dev/null || echo &#x27;&#x27;)}&quot;
+GKE_NODES=&quot;${GKE_NODES:-2}&quot;
+GKE_MACHINE=&quot;${GKE_MACHINE:-e2-standard-2}&quot;
+
+die() { echo &quot;ERROR: $*&quot; &gt;&amp;2; exit 1; }
+
+cmd_secrets() {
+  command -v openssl &gt;/dev/null || die &quot;openssl required.&quot;
+  command -v python3 &gt;/dev/null || die &quot;python3 required (Fernet key).&quot;
+  [ -f &quot;$SECRETS_ENV&quot; ] &amp;&amp; die &quot;$SECRETS_ENV exists — refusing to overwrite.&quot;
+  cat &gt; &quot;$SECRETS_ENV&quot; &lt;&lt;EOF
+# Tessallite Community Kubernetes secrets — generated $(date -u +%FT%TZ). KEEP PRIVATE.
+POSTGRES_PASSWORD=$(openssl rand -hex 24)
+CREDENTIAL_ENCRYPTION_KEY=$(python3 -c &quot;from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())&quot;)
+JWT_SECRET_KEY=$(python3 -c &quot;import secrets; print(secrets.token_urlsafe(48))&quot;)
+SYSTEM_ADMIN_EMAIL=admin@tessallite.local
+SYSTEM_ADMIN_PASSWORD=$(openssl rand -base64 18)
+EOF
+  chmod 600 &quot;$SECRETS_ENV&quot;
+  echo &quot;Wrote $SECRETS_ENV (chmod 600). Review it, then run: $0 install&quot;
+}
+
+cmd_gke_create() {
+  command -v gcloud &gt;/dev/null || die &quot;gcloud required.&quot;
+  [ -n &quot;$GKE_PROJECT&quot; ] || die &quot;set GKE_PROJECT or run &#x27;gcloud config set project ...&#x27;.&quot;
+  gcloud services enable container.googleapis.com --project &quot;$GKE_PROJECT&quot;
+  gcloud container clusters create &quot;$GKE_CLUSTER&quot; \
+    --project &quot;$GKE_PROJECT&quot; --zone &quot;$GKE_ZONE&quot; \
+    --num-nodes &quot;$GKE_NODES&quot; --machine-type &quot;$GKE_MACHINE&quot; \
+    --disk-size 50 --no-enable-master-authorized-networks
+  gcloud container clusters get-credentials &quot;$GKE_CLUSTER&quot; \
+    --project &quot;$GKE_PROJECT&quot; --zone &quot;$GKE_ZONE&quot;
+  echo &quot;GKE cluster &#x27;$GKE_CLUSTER&#x27; ready. COST IS NOW ACCRUING — run &#x27;$0 gke-delete&#x27; when done.&quot;
+}
+
+cmd_install() {
+  command -v helm &gt;/dev/null || die &quot;helm (v3) required.&quot;
+  [ -f &quot;$SECRETS_ENV&quot; ] || die &quot;no $SECRETS_ENV — run &#x27;$0 secrets&#x27; first.&quot;
+  [ -f &quot;$LICENSE_FILE&quot; ] || die &quot;no license file at $LICENSE_FILE (signed Community license).&quot;
+  # shellcheck disable=SC1090
+  set -a; . &quot;$SECRETS_ENV&quot;; set +a
+  helm upgrade --install &quot;$RELEASE&quot; &quot;$CHART&quot; -n &quot;$NAMESPACE&quot; --create-namespace \
+    --set global.registry=&quot;$REGISTRY&quot; --set global.tag=&quot;$TAG&quot; \
+    --set secrets.postgresPassword=&quot;$POSTGRES_PASSWORD&quot; \
+    --set secrets.credentialEncryptionKey=&quot;$CREDENTIAL_ENCRYPTION_KEY&quot; \
+    --set secrets.jwtSecretKey=&quot;$JWT_SECRET_KEY&quot; \
+    --set secrets.systemAdminEmail=&quot;$SYSTEM_ADMIN_EMAIL&quot; \
+    --set secrets.systemAdminPassword=&quot;$SYSTEM_ADMIN_PASSWORD&quot; \
+    --set license.publicKeys=&quot;$LICENSE_PUBLIC_KEYS&quot; \
+    --set-file license.signedDocument=&quot;$LICENSE_FILE&quot;
+  echo &quot;Installed. Run &#x27;$0 verify&#x27;.&quot;
+}
+
+cmd_verify() {
+  command -v kubectl &gt;/dev/null || die &quot;kubectl required.&quot;
+  echo &quot;Waiting for pods to become Ready (timeout 5m)...&quot;
+  kubectl -n &quot;$NAMESPACE&quot; wait --for=condition=ready pod --all --timeout=300s || true
+  kubectl -n &quot;$NAMESPACE&quot; get pods
+  echo
+  echo &quot;Gateway (BI/SQL clients) external address (LoadBalancer):&quot;
+  kubectl -n &quot;$NAMESPACE&quot; get svc &quot;${RELEASE}-gateway&quot;
+  echo &quot;UI: kubectl -n $NAMESPACE port-forward svc/${RELEASE}-frontend 3000  # then http://localhost:3000&quot;
+}
+
+cmd_teardown() {
+  helm uninstall &quot;$RELEASE&quot; -n &quot;$NAMESPACE&quot; || true
+  kubectl delete namespace &quot;$NAMESPACE&quot; --ignore-not-found
+  echo &quot;Workload removed. (If on GKE, also run &#x27;$0 gke-delete&#x27; to stop cluster cost.)&quot;
+}
+
+cmd_gke_delete() {
+  command -v gcloud &gt;/dev/null || die &quot;gcloud required.&quot;
+  gcloud container clusters delete &quot;$GKE_CLUSTER&quot; \
+    --project &quot;$GKE_PROJECT&quot; --zone &quot;$GKE_ZONE&quot; --quiet
+  echo &quot;GKE cluster &#x27;$GKE_CLUSTER&#x27; deleted — cluster cost stopped.&quot;
+}
+
+case &quot;${1:-}&quot; in
+  secrets)    cmd_secrets ;;
+  gke-create) cmd_gke_create ;;
+  install)    cmd_install ;;
+  verify)     cmd_verify ;;
+  teardown)   cmd_teardown ;;
+  gke-delete) cmd_gke_delete ;;
+  *) echo &quot;usage: $0 {secrets|gke-create|install|verify|teardown|gke-delete}&quot;; exit 2 ;;
+esac
+</code></pre>
+<h2>Step by step</h2>
+<pre><code>bash deploy-kubernetes.sh secrets        # 1. generate secrets (review k8s-secrets.env)
+GKE_PROJECT=my-project \
+  bash deploy-kubernetes.sh gke-create   # 2. optional: create a managed cluster
+bash deploy-kubernetes.sh install        # 3. put license.json in place, then install
+bash deploy-kubernetes.sh verify         # 4. wait for Ready, print gateway + UI access
+bash deploy-kubernetes.sh teardown       # 5. remove the workload when done
+bash deploy-kubernetes.sh gke-delete     #    and delete the cluster (stops all cost)
+</code></pre>
+<p>When <code>verify</code> finishes, all eight pods (the seven services plus <code>tess-postgres-0</code>) show <code>1/1 Running</code>. Open the UI with the printed <code>kubectl port-forward</code> command and point BI tools at the gateway Service's external address.</p>
+<h2>A note on TLS</h2>
+<p>The UI serves HTTPS. If you do not provide a certificate, the frontend container generates a self-signed one at start-up, so the install never stalls waiting for certificates. For a browser-trusted certificate, terminate TLS at your Ingress or load balancer, or mount your own certificate as a Secret over <code>/etc/nginx/certs/localhost.crt</code> and <code>/etc/nginx/certs/localhost.key</code>.</p>
+<h2>Try it free on your laptop (kind)</h2>
+<p>You can validate the chart on real Kubernetes with no cloud spend using <code>kind</code> (Kubernetes-in-Docker). Load the images straight into the node instead of pulling, and expose the gateway as a NodePort (a local cluster has no cloud load balancer):</p>
+<pre><code>kind create cluster --name tessallite-test
+kind load docker-image --name tessallite-test \
+  ghcr.io/tessallite/model-service:0.1.0 ghcr.io/tessallite/query-router:0.1.0 \
+  ghcr.io/tessallite/optimizer:0.1.0 ghcr.io/tessallite/scheduler:0.1.0 \
+  ghcr.io/tessallite/agent-service:0.1.0 ghcr.io/tessallite/gateway:0.1.0 \
+  ghcr.io/tessallite/frontend:0.1.0 postgres:15
+helm install tess deploy/community/helm/tessallite-community -n tessallite --create-namespace \
+  --set global.tag=0.1.0 --set global.imagePullPolicy=Never \
+  --set secrets.postgresPassword=... --set secrets.credentialEncryptionKey=&lt;fernet&gt; \
+  --set secrets.jwtSecretKey=&lt;32+ chars&gt; --set secrets.systemAdminPassword=... \
+  --set license.publicKeys=&quot;tessallite-prod-2026:/by3PGaeLD425bBkMrAbD2NeHROHyjLHVA37pS5w3+0=&quot; \
+  --set-file license.signedDocument=license.json \
+  --set ingress.enabled=false --set networkPolicy.enabled=false \
+  --set services.gateway.serviceType=NodePort
+kind delete cluster --name tessallite-test     # clean up
+</code></pre>
+<h2>Common issues</h2>
+<ul>
+<li><strong>A pod is <code>CrashLoopBackOff</code> right after install.</strong> Check its logs with <code>kubectl -n tessallite logs &lt;pod&gt;</code>. The most common cause is a too-short <code>jwtSecretKey</code> (it must be at least 32 characters) or a missing required value.</li>
+<li><strong>The gateway Service stays <code>Pending</code>.</strong> That is expected on a cluster with no load balancer (such as <code>kind</code>). Use a NodePort, or run on a managed cluster.</li>
+<li><strong>Pods can't pull images.</strong> Your cluster has no access to the registry. Push the images to a registry your nodes can reach and set <code>global.registry</code>/<code>global.tag</code>, or load them directly for local testing.</li>
+</ul>
+<h2>Related</h2>
+<ul><li><a href="deploy-gcp.html">Deploy on GCP</a></li><li><a href="deploy-local.html">Deploy Locally</a></li><li><a href="configure-environment-variables.html">Configure Environment Variables</a></li><li><a href="teardown.html">Teardown</a></li></ul>
+<nav class="page-nav"><a href="deploy-gcp.html" class="page-nav-btn prev">&larr; Deploy on GCP</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="configure-environment-variables.html" class="page-nav-btn next">Configure Environment Variables &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

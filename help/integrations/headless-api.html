@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Headless API — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Headless API</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">developer</span><span class="updated">Updated 2026-06-24</span></div>
+    <h1>Headless API</h1>
+<h2>What this covers</h2>
+<p>The headless API is for applications that need governed metrics but should not have to generate SQL. A mobile app can ask for <code>revenue</code> by <code>region</code>; an embedded dashboard can request a persona-safe KPI table; a backend service can fetch the same metric definition that Excel users see. Tessallite still applies the model, aggregate routing, personas, row security, and column restrictions.</p>
+<p>Use this API when you are building a product integration. Do not use it to bypass BI tools for ordinary analysis, and do not connect your app directly to the source just because JSON feels easier. The business value is that every surface asks Tessallite the same governed question.</p>
+<h2>When to use headless API vs JDBC/XMLA</h2>
+<div class="table-wrapper"><table><thead><tr><th>Use case</th><th>Recommended interface</th></tr></thead><tbody><tr><td>BI tools (Excel, Power BI, Tableau, DBeaver)</td><td>JDBC or XMLA</td></tr><tr><td>Mobile apps</td><td>Headless API</td></tr><tr><td>Microservice-to-microservice integration</td><td>Headless API</td></tr><tr><td>Embedded analytics in a web app</td><td>Headless API</td></tr><tr><td>Ad-hoc SQL exploration</td><td>JDBC</td></tr><tr><td>Automated reporting scripts</td><td>Either (headless is simpler if you don&#x27;t need SQL)</td></tr></tbody></table></div>
+<p>The headless API and JDBC/XMLA share the same semantic layer, the same aggregate routing, and the same security model. The difference is the query language: headless uses JSON measure/dimension names; JDBC/XMLA use SQL or DAX.</p>
+<p>Headless is deliberately narrower than SQL. It is excellent for stable app screens, scorecards, scheduled snapshots, and embedded tables. Use JDBC or the Query Panel when a human needs ad-hoc exploration with joins, expressions, or SQL-specific debugging.</p>
+<h2>Authentication</h2>
+<p>The headless API uses the same JWT tokens as the Tessallite SPA. Obtain a token via the login endpoint:</p>
+<pre><code>TOKEN=$(curl -s -X POST http://host:3000/api/v1/auth/login \
+  -H &#x27;Content-Type: application/json&#x27; \
+  -d &#x27;{&quot;tenant_id&quot;:&quot;acme-demo&quot;,&quot;email&quot;:&quot;admin@acme-demo.com&quot;,&quot;password&quot;:&quot;acme-demo&quot;}&#x27; \
+  | python3 -c &#x27;import sys,json; print(json.load(sys.stdin)[&quot;access_token&quot;])&#x27;)</code></pre>
+<p>Include the token in all subsequent requests:</p>
+<pre><code>Authorization: Bearer $TOKEN</code></pre>
+<h2>Query endpoint</h2>
+<h3>POST /query-router/api/v1/headless/query</h3>
+<p>Resolves measure and dimension names against the semantic model, builds SQL via the routing pipeline (aggregate/pocket/source), executes, and returns rows.</p>
+<p><strong>Request body:</strong></p>
+<pre><code>{
+  &quot;project_id&quot;: &quot;uuid&quot;,
+  &quot;model_id&quot;: &quot;uuid&quot;,
+  &quot;measures&quot;: [&quot;revenue&quot;, &quot;order_count&quot;],
+  &quot;dimensions&quot;: [&quot;region&quot;, &quot;order_date&quot;],
+  &quot;filters&quot;: [
+    {&quot;dimension&quot;: &quot;region&quot;, &quot;operator&quot;: &quot;eq&quot;, &quot;value&quot;: &quot;US&quot;},
+    {&quot;dimension&quot;: &quot;order_date&quot;, &quot;operator&quot;: &quot;between&quot;, &quot;values&quot;: [&quot;2025-01-01&quot;, &quot;2025-12-31&quot;]}
+  ],
+  &quot;limit&quot;: 100,
+  &quot;offset&quot;: 0,
+  &quot;order_by&quot;: [{&quot;field&quot;: &quot;revenue&quot;, &quot;direction&quot;: &quot;desc&quot;}]
+}</code></pre>
+<p><strong>Required fields:</strong> <code>project_id</code>, <code>model_id</code>, <code>measures</code> (at least one). The <code>project_id</code> must be the project the model belongs to — a mismatch returns 403.</p>
+<p><strong>Optional fields:</strong> <code>dimensions</code>, <code>filters</code>, <code>limit</code>, <code>offset</code>, <code>order_by</code>, <code>persona_id</code>.</p>
+<p><strong>Choosing a persona:</strong> if your user is assigned more than one persona on the model, pass <code>persona_id</code> to say which one the query should run as. Users with a single assigned persona are locked to it automatically, and embed tokens always use the persona baked into the token — in both cases you can leave the field out. The persona's column restrictions and default filters are applied to every query, exactly as they are in the Query Panel and through BI tools.</p>
+<p><strong>Filter operators:</strong></p>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Description</th><th>Value field</th></tr></thead><tbody><tr><td><code>eq</code></td><td>Equals</td><td><code>value</code></td></tr><tr><td><code>neq</code></td><td>Not equals</td><td><code>value</code></td></tr><tr><td><code>gt</code></td><td>Greater than</td><td><code>value</code></td></tr><tr><td><code>gte</code></td><td>Greater than or equal</td><td><code>value</code></td></tr><tr><td><code>lt</code></td><td>Less than</td><td><code>value</code></td></tr><tr><td><code>lte</code></td><td>Less than or equal</td><td><code>value</code></td></tr><tr><td><code>in</code></td><td>In list</td><td><code>values</code> (array)</td></tr><tr><td><code>not_in</code></td><td>Not in list</td><td><code>values</code> (array)</td></tr><tr><td><code>between</code></td><td>Between (inclusive)</td><td><code>values</code> (2-element array)</td></tr><tr><td><code>like</code></td><td>SQL LIKE pattern</td><td><code>value</code></td></tr><tr><td><code>is_null</code></td><td>Is NULL</td><td>(none)</td></tr><tr><td><code>is_not_null</code></td><td>Is not NULL</td><td>(none)</td></tr></tbody></table></div>
+<p><strong>Friendly aliases.</strong> If your client already speaks a Cube-style filter vocabulary, the API accepts these spellings and converts them for you: <code>ne</code> and <code>notEquals</code> mean <code>neq</code>, <code>equals</code> means <code>eq</code>, <code>set</code> means <code>in</code>, <code>inDateRange</code> means <code>between</code>, and <code>contains</code> becomes a <code>like</code> with the value wrapped in <code>%...%</code> (so <code>contains "VI"</code> matches "VISA"). For the scalar operators you may also put the value in <code>values[0]</code> instead of <code>value</code>.</p>
+<p><strong>Mistakes fail loudly.</strong> An unknown operator, a scalar operator without a value, an empty <code>in</code> list, or a <code>between</code> without exactly two values returns 422 with a message listing what is accepted — the API never guesses and never runs a weaker filter than you asked for.</p>
+<p><strong>Response:</strong></p>
+<pre><code>{
+  &quot;columns&quot;: [&quot;region&quot;, &quot;revenue&quot;, &quot;order_count&quot;],
+  &quot;rows&quot;: [
+    {&quot;region&quot;: &quot;US&quot;, &quot;revenue&quot;: 125000, &quot;order_count&quot;: 430},
+    {&quot;region&quot;: &quot;EU&quot;, &quot;revenue&quot;: 98000, &quot;order_count&quot;: 312}
+  ],
+  &quot;page_row_count&quot;: 2,
+  &quot;total_rows&quot;: 2,
+  &quot;query_id&quot;: &quot;a1b2c3d4e5f6g7h8&quot;
+}</code></pre>
+<p><strong>Reading the response fields.</strong></p>
+<ul><li><code>page_row_count</code> is the number of rows in <strong>this page</strong> of the result — the count of objects in <code>rows</code>. It is not a total-matching-row count; the API does not run a separate <code>COUNT(*)</code>. To know whether more pages exist, request <code>limit + 1</code> rows and check whether you got the extra one.</li><li><code>total_rows</code> carries the same value as <code>page_row_count</code>. It is kept only for wire back-compat with older clients and will be removed in a future version — prefer <code>page_row_count</code>.</li><li><code>query_id</code> identifies <strong>this exact page</strong> of this query: it folds in <code>limit</code>, <code>offset</code> and <code>order_by</code>, so two different pages of the same query get different ids. It is safe to use as a result-cache key. It is a stable hash, not a server-side handle — you cannot fetch a result by replaying the id.</li></ul>
+<h2>Metadata endpoints</h2>
+<h3>GET /query-router/api/v1/headless/models</h3>
+<p>Lists all models accessible to the authenticated user&#x27;s tenant.</p>
+<pre><code>[
+  {
+    &quot;id&quot;: &quot;uuid&quot;,
+    &quot;project_id&quot;: &quot;uuid&quot;,
+    &quot;slug&quot;: &quot;sales-model&quot;,
+    &quot;display_name&quot;: &quot;Sales Model&quot;,
+    &quot;description&quot;: &quot;Revenue and order metrics&quot;
+  }
+]</code></pre>
+<h3>GET /query-router/api/v1/headless/models/{model_id}/measures</h3>
+<p>Lists the measures in the specified model that your persona is allowed to see. If your user has more than one persona on the model, add <code>?persona_id=&lt;uuid&gt;</code> to pick one — the listing then matches exactly what that persona can query.</p>
+<pre><code>[
+  {
+    &quot;id&quot;: &quot;uuid&quot;,
+    &quot;name&quot;: &quot;revenue&quot;,
+    &quot;display_name&quot;: &quot;Revenue&quot;,
+    &quot;description&quot;: &quot;Total revenue&quot;,
+    &quot;format&quot;: &quot;$#,##0&quot;,
+    &quot;aggregation_type&quot;: &quot;sum&quot;,
+    &quot;variant_kind&quot;: null
+  }
+]</code></pre>
+<h3>GET /query-router/api/v1/headless/models/{model_id}/dimensions</h3>
+<p>Lists the dimensions in the specified model that your persona is allowed to see (same <code>?persona_id=</code> rule as measures). <code>data_type</code> is the source column's database type — useful for choosing sensible filter operators (for example, <code>between</code> for dates and numbers). Calculated dimensions without a source column report <code>null</code>.</p>
+<pre><code>[
+  {
+    &quot;id&quot;: &quot;uuid&quot;,
+    &quot;name&quot;: &quot;region&quot;,
+    &quot;display_name&quot;: &quot;Region&quot;,
+    &quot;description&quot;: &quot;Sales region&quot;,
+    &quot;is_time_dim&quot;: false,
+    &quot;data_type&quot;: &quot;character varying&quot;
+  }
+]</code></pre>
+<h2>Rate limiting</h2>
+<p>The headless API enforces a per-tenant rate limit (default: 100 requests per minute). When the limit is exceeded, the API returns:</p>
+<pre><code>HTTP 429 Too Many Requests</code></pre>
+<p>Every response includes the <code>X-RateLimit-Remaining</code> header showing how many requests remain in the current window. Monitor this header to implement client-side throttling. A <code>429</code> response carries a <code>Retry-After</code> header with the number of seconds to wait before retrying.</p>
+<p>The rate limit is configurable via the <code>HEADLESS_RATE_LIMIT</code> environment variable. The same per-tenant limit and headers apply to the plugin execution endpoint (<code>/query-router/api/v1/plugin/execute</code>); both surfaces draw from one shared per-tenant budget.</p>
+<p><strong>Multi-instance note.</strong> The limiter counts requests per server process. When the query-router runs as more than one instance (for example, several Cloud Run replicas), each instance keeps its own counter, so the effective per-tenant ceiling is the configured limit multiplied by the number of running instances, and counters reset when an instance is recycled. The limit therefore protects the source from sustained floods but is not an exact per-tenant quota across a horizontally scaled deployment.</p>
+<h2>Worked example: curl</h2>
+<pre><code># 1. Authenticate
+TOKEN=$(curl -s -X POST http://localhost:3000/api/v1/auth/login \
+  -H &#x27;Content-Type: application/json&#x27; \
+  -d &#x27;{&quot;tenant_id&quot;:&quot;acme-demo&quot;,&quot;email&quot;:&quot;admin@acme-demo.com&quot;,&quot;password&quot;:&quot;acme-demo&quot;}&#x27; \
+  | python3 -c &#x27;import sys,json; print(json.load(sys.stdin)[&quot;access_token&quot;])&#x27;)
+
+# 2. List models
+curl -s http://localhost:3000/query-router/api/v1/headless/models \
+  -H &quot;Authorization: Bearer $TOKEN&quot; | python3 -m json.tool
+
+# 3. List measures for a model
+MODEL_ID=&quot;&lt;model-uuid-from-step-2&gt;&quot;
+curl -s &quot;http://localhost:3000/query-router/api/v1/headless/models/$MODEL_ID/measures&quot; \
+  -H &quot;Authorization: Bearer $TOKEN&quot; | python3 -m json.tool
+
+# 4. Query
+curl -s -X POST http://localhost:3000/query-router/api/v1/headless/query \
+  -H &quot;Authorization: Bearer $TOKEN&quot; \
+  -H &quot;Content-Type: application/json&quot; \
+  -d &quot;{
+    \&quot;project_id\&quot;: \&quot;&lt;project-uuid&gt;\&quot;,
+    \&quot;model_id\&quot;: \&quot;$MODEL_ID\&quot;,
+    \&quot;measures\&quot;: [\&quot;revenue\&quot;],
+    \&quot;dimensions\&quot;: [\&quot;region\&quot;],
+    \&quot;limit\&quot;: 10
+  }&quot; | python3 -m json.tool</code></pre>
+<h2>Pitfalls</h2>
+<ul><li><strong>Forgetting pagination.</strong> Without <code>limit</code>, the API returns up to a hard cap of 100,000 rows — it does not stream an unbounded result set. For large datasets, always set an explicit <code>limit</code> and page with <code>offset</code>, and never assume a single response holds every matching row.</li><li><strong>Persona restrictions.</strong> If the authenticated user&#x27;s persona restricts certain columns, querying those measures or dimensions returns 403. Check the persona configuration if you get unexpected 403 errors.</li><li><strong>Measure names are semantic names, not display names.</strong> Use the metadata endpoint to discover the correct <code>name</code> field (e.g. <code>revenue</code>, not <code>Revenue</code>).</li></ul>
+<h2>Related</h2>
+<ul><li><a href="api-authentication.html">API Authentication</a></li><li><a href="api-reference.html">API Reference</a></li><li><a href="jdbc-connection-guide.html">JDBC Connection Guide</a></li></ul>
+<nav class="page-nav"><a href="api-reference.html" class="page-nav-btn prev">&larr; API Reference</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="embed-api.html" class="page-nav-btn next">Embed API &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Refresh SLA Declarations — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Refresh SLA Declarations</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">tenant_admin</span><span class="updated">Updated 2026-06-12</span></div>
+    <h1>Refresh SLA Declarations</h1>
+<h2>What this covers</h2>
+<p>A refresh SLA (Service Level Agreement) is a promise you write down for a model: &quot;the data in this model must be refreshed and ready by this time every day.&quot; The SLA monitor checks that promise for you. If the data is not ready on time, it can retry the refresh automatically and send you an alert. This page explains the idea, how to set one up, what the monitor actually checks, and how to read a breach alert.</p>
+<h2>Why SLA declarations matter</h2>
+<p>Refresh jobs run on a schedule and are mostly unattended. Without a declared SLA, a refresh that fails quietly at 3 a.m. surfaces only when someone opens a dashboard and notices yesterday's numbers. By then, decisions may already have been made on stale data.</p>
+<p>An SLA turns &quot;the data is usually ready in the morning&quot; into a checked rule: &quot;a successful refresh must have finished by 07:00 UTC; if not, retry it and tell the on-call channel.&quot; Think of it like a school bus schedule — the question is not &quot;did the bus drive around?&quot; but &quot;did it arrive at the stop by 8 o'clock?&quot; Only an on-time arrival counts.</p>
+<h2>Defining an SLA</h2>
+<p>SLAs are managed per model in the <strong>Refresh SLA</strong> section (available in the Scheduler panel and in the model's Settings panel).</p>
+<p>To create one:</p>
+<ol><li>Open the model and locate the <strong>Refresh SLA</strong> section.</li><li>Click <strong>Configure SLA</strong>.</li><li>Fill in:
+<ul><li><strong>Target completion time (HH:MM UTC)</strong> — the time of day by which a successful refresh must have finished. Note this is UTC, not your local time.</li><li><strong>Grace period (minutes)</strong> — extra slack added to the target before a breach is declared. Covers normal day-to-day jitter in refresh duration.</li><li><strong>Max retries per day</strong> — how many automatic retry attempts the monitor may make per day when a breach is detected.</li><li><strong>Send webhook alert on breach</strong> — whether to emit a <code>refresh.sla_breach</code> webhook event (and email/Slack notification, if notification routes are configured).</li></ul></li><li>Save.</li></ol>
+<p>Or via API:</p>
+<pre><code>POST /api/v1/projects/{project_id}/models/{model_id}/sla
+{
+  &quot;target_completion_time&quot;: &quot;07:00&quot;,
+  &quot;grace_period_minutes&quot;: 15,
+  &quot;max_retries&quot;: 1,
+  &quot;alert_on_breach&quot;: true
+}</code></pre>
+<p>One SLA exists per model. Creating a second returns a conflict — use PATCH on the same path to change an existing SLA, and DELETE to remove it.</p>
+<h2>How the monitor works</h2>
+<p>The SLA monitor runs as an hourly sweep job. For each model with an SLA it:</p>
+<ol><li>Works out today's deadline: target completion time plus the grace period (all in UTC).</li><li>Does nothing until the deadline has passed — no early alarms.</li><li>After the deadline, checks <strong>every active aggregate on the model</strong> one by one: did a refresh of that aggregate <strong>finish successfully</strong> between midnight UTC and the deadline? Only aggregates the scheduler actually keeps refreshed are checked — <strong>retired and invalid aggregates are not monitored</strong>. A retired aggregate is no longer kept fresh and nothing reads from it, so it can never breach the SLA. If every aggregate on a model has been retired, the model has nothing to monitor and is always reported as meeting its SLA.</li><li>The SLA is met only when <strong>all</strong> active aggregates pass that check. If even one active aggregate has no on-time success, the model is in breach — one slow table cannot hide behind six fast ones. A later refresh the same day does not undo an on-time success.</li><li>A refresh that <strong>failed</strong> before the deadline does not count as meeting the SLA — only a successful one does.</li></ol>
+<p>Each aggregate ends up in one of three buckets, and the alert reports all three:</p>
+<ul><li><strong>on time</strong> — refreshed successfully before the deadline.</li><li><strong>late</strong> — refreshed successfully today, but after the deadline. The data is fine now; the promise was still missed.</li><li><strong>stale</strong> — no successful refresh at all today. This is the data that is actually wrong.</li></ul>
+<h2>What happens on a breach</h2>
+<p>A breach opens a <strong>breach episode</strong> for that model and that day. Within one episode:</p>
+<ol><li><strong>Automatic retry — stale aggregates only.</strong> If the day's retry budget is not used up, the monitor immediately runs a real full refresh of every <strong>stale</strong> aggregate — the same refresh machinery the scheduler uses. Aggregates whose data already landed (on time or late) are never refreshed again: the monitor does not redo work that is already done. Each retry run appears in the refresh history (triggered by <code>sla_monitor</code>) and always finishes in a final state: completed or failed. If some other refresh of an aggregate is still running at that moment, the monitor does not start a second one on top of it — it skips that aggregate and reports the skip honestly. One retry attempt uses one unit of the daily budget.</li><li><strong>One alert.</strong> If &quot;Send webhook alert on breach&quot; is on, a single <code>refresh.sla_breach</code> webhook event is emitted — once per episode, on the first sweep that detects the breach. Later sweeps of the same day stay quiet, even if the breach persists: they may still retry stale data (budget permitting), but they will not re-alert. An email/Slack notification goes out with the alert if you have notification routes configured for the <code>sla_breach</code> event type.</li><li><strong>Recovery.</strong> When every aggregate finally has a successful refresh for the day, the episode is marked recovered and a single <code>refresh.sla_recovered</code> webhook event is emitted. After that the monitor is silent for the rest of the day. The next day is a fresh start — a new breach is a new episode and alerts again.</li></ol>
+<h2>Breach webhook payload</h2>
+<pre><code>{
+  &quot;model_id&quot;: &quot;&lt;uuid&gt;&quot;,
+  &quot;target_completion_time&quot;: &quot;07:00&quot;,
+  &quot;grace_period_minutes&quot;: 15,
+  &quot;last_completed_at&quot;: &quot;2026-06-12T08:24:59Z&quot;,
+  &quot;retried&quot;: true,
+  &quot;retries_today&quot;: 0,
+  &quot;retry_run_statuses&quot;: [&quot;completed&quot;, &quot;completed&quot;],
+  &quot;sla_scope&quot;: &quot;all_aggregates&quot;,
+  &quot;breach_kind&quot;: &quot;partial&quot;,
+  &quot;aggregates_total&quot;: 7,
+  &quot;aggregates_on_time&quot;: 5,
+  &quot;aggregates_late&quot;: 0,
+  &quot;aggregates_stale&quot;: 2
+}</code></pre>
+<p>How to read it:</p>
+<ul><li><strong>last_completed_at</strong> — when the latest <em>successful</em> refresh finished today, or <code>null</code> if none succeeded yet. In a breach this is always either missing or later than the deadline.</li><li><strong>retried</strong> — <code>true</code> only when the monitor actually executed a retry refresh and it ran to a final state. If the retry could not run at all, this is <code>false</code> — the payload never claims work that did not happen.</li><li><strong>retries_today</strong> — how many retry attempts were already used before this check.</li><li><strong>retry_run_statuses</strong> — the outcome for each stale aggregate in this retry attempt: <code>completed</code> or <code>failed</code> (the refresh really ran), or <code>skipped_in_flight</code> (another refresh of that aggregate was already running, so the monitor left it alone).</li><li><strong>sla_scope</strong> — always <code>all_aggregates</code>: the SLA counts only when every aggregate is fresh.</li><li><strong>breach_kind</strong> — decided purely by the on-time bucket. <code>full</code> means <strong>no</strong> aggregate met the deadline (zero on time) — every aggregate was late or stale. <code>partial</code> means at least one aggregate refreshed on time while others were late or stale. A partial breach means your dashboards are a mix of fresh and stale numbers — often more dangerous than fully stale data, because it looks plausible. Note: a model where every aggregate eventually refreshed but all after the deadline is a <code>full</code> breach (nothing was on time), even though no data is ultimately stale.</li><li><strong>aggregates_total / on_time / late / stale</strong> — the per-bucket counts behind the verdict.</li></ul>
+<h2>Recovery webhook payload</h2>
+<pre><code>{
+  &quot;model_id&quot;: &quot;&lt;uuid&gt;&quot;,
+  &quot;target_completion_time&quot;: &quot;07:00&quot;,
+  &quot;grace_period_minutes&quot;: 15,
+  &quot;last_completed_at&quot;: &quot;2026-06-12T08:03:11Z&quot;,
+  &quot;resolved_at&quot;: &quot;2026-06-12T09:00:02Z&quot;,
+  &quot;aggregates_total&quot;: 7
+}</code></pre>
+<p>Emitted once per episode (event type <code>refresh.sla_recovered</code>) when every aggregate has a successful refresh for the breached day. It is your &quot;all clear&quot;: the data is whole again, even though the deadline was missed.</p>
+<h2>Worked example</h2>
+<p>Model &quot;Sales&quot; refreshes nightly at 03:00 UTC and takes about 20 minutes. You declare: target 07:00, grace 15 minutes, max retries 1, alerts on.</p>
+<ul><li><strong>Normal night:</strong> refresh completes 03:21. At the 08:00 sweep the monitor sees every aggregate succeeded before 07:15 — SLA met, no alert, no retry.</li><li><strong>Bad night:</strong> the refresh fails at 03:15. At the 08:00 sweep no aggregate has a successful run before 07:15 — breach. The monitor reruns the stale aggregates; they complete at 08:03. You receive exactly one alert saying <code>retried: true</code> with <code>retry_run_statuses: [&quot;completed&quot;, ...]</code>. The 09:00 and later sweeps see the data is healed and stay quiet — no duplicate alerts, no pointless re-refreshes. The one alert is your signal to investigate why the 03:00 run failed.</li><li><strong>Partial night:</strong> five of seven aggregates refresh on time, two fail. That is a breach — <code>breach_kind: &quot;partial&quot;</code>, <code>aggregates_stale: 2</code>. Only the two stale aggregates are retried; the five healthy ones are left untouched.</li><li><strong>Very bad night:</strong> the retry fails too. The one alert says <code>retried: true</code> but the statuses show <code>failed</code>. Later sweeps keep retrying the stale aggregates until the budget (1) is used up, then stop until tomorrow — without sending more alerts. When a later run finally heals the data, you get a single <code>refresh.sla_recovered</code> event. Time to look at the refresh error in the run history.</li></ul>
+<h2>Best practices and pitfalls</h2>
+<ul><li><strong>Set the target after your scheduled refresh, with room to spare.</strong> If the refresh starts at 03:00 and takes up to an hour, a 07:00 target gives a comfortable buffer without hiding real problems.</li><li><strong>Mind the timezone.</strong> Targets are UTC. A &quot;07:00&quot; target is 07:00 UTC everywhere, in every season.</li><li><strong>Use the grace period for jitter, not for problems.</strong> 10–30 minutes of grace absorbs slow nights; hours of grace just delays the alarm.</li><li><strong>Keep max retries small.</strong> One or two retries heal transient failures; more usually just repeats the same error and delays a human looking at it.</li><li><strong>Breach alerts are worth reading even when the retry succeeded.</strong> The data is fine, but something made the scheduled run miss its window — that something tends to come back.</li></ul>
+<h2>Updating and deleting SLAs</h2>
+<p>SLAs can be updated via PATCH and deleted via DELETE (or with <strong>Edit</strong> / <strong>Remove</strong> in the Refresh SLA section). Deleting an SLA does not affect in-flight refreshes; breach checking simply stops from the next sweep cycle.</p>
+<h2>Limits</h2>
+<ul><li>One SLA per model.</li><li>The monitor sweep runs hourly, so a breach is detected on the first sweep after the deadline, not at the deadline itself.</li><li>The retry budget and the breach episode both reset at midnight UTC.</li><li>One breach alert and one recovery event per model per day, at most.</li><li>Only active aggregates are monitored. Retired and invalid aggregates are skipped entirely — they never cause a breach and are never retried by the monitor.</li><li>The recovery event (<code>refresh.sla_recovered</code>) is emitted only when the data heals <strong>within the same UTC day</strong> as the breach. If a breached day's data does not heal until after midnight UTC, the old day's episode simply ends with the day — no recovery event is sent for it. The new day is judged on its own deadline.</li><li>Turning alerts off (<code>alert_on_breach</code> = false) suppresses the webhook and email/Slack notifications only. The breach episode itself still opens and closes internally, so a healed model is reported as recovered rather than staying in breach for the rest of the day.</li><li>Webhook delivery is best-effort; it is not a guaranteed delivery channel.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="../modelling/manage-aggregate-schedules.html">Manage Aggregate Schedules</a></li><li><a href="../modelling/run-a-refresh.html">Run a Refresh</a></li><li><a href="webhooks.html">Webhooks</a></li></ul>
+<nav class="page-nav"><a href="security-audit-trail.html" class="page-nav-btn prev">&larr; Security Audit Trail</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="../system-admin/architecture-overview.html" class="page-nav-btn next">Architecture Overview &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

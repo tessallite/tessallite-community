@@ -1,0 +1,1 @@
+Screenshot of the Tessallite sign-in form at http://localhost:3000. The form shows three fields: Workspace (slug), Email, and Password. Below the main form fields is a small link labelled 'System admin login'. The Tessallite logo appears at the top. Background is mint (#F2F7F4). The Sign In button is primary green (#006C35). Dimensions: 1280x800px.

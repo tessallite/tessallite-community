@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Table Auto-Analysis — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Table Auto-Analysis</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-02</span></div>
+    <h1>Table Auto-Analysis</h1>
+<h2>What this covers</h2>
+<p>Table auto-analysis runs a heuristic engine against a source table&#x27;s column names and data types to suggest a table type (fact or dimension) and a role for each column (measure, dimension, date_key, or ignore). This page explains how the heuristics work, what confidence levels mean, and how to use the suggestions.</p>
+<h2>When to use auto-analysis</h2>
+<p>Auto-analysis is useful when:</p>
+<ul><li>You have added a table from a schema you are not deeply familiar with and want a first-pass classification.</li><li>You are onboarding a model and want to confirm that your fact/dimension designations match expected naming conventions.</li><li>You want a quick audit of column roles before defining measures and dimensions manually.</li></ul>
+<p>Auto-analysis does not modify the model. It returns suggestions only. You still define each dimension and measure manually, using the suggestions as a guide.</p>
+<h2>How it works</h2>
+<p>The heuristic engine examines each column&#x27;s name and data type:</p>
+<p><strong>Table type classification.</strong> A table is suggested as <code>fact</code> if it has numeric measure-like columns (names matching patterns like <code>amount</code>, <code>quantity</code>, <code>count</code>, <code>revenue</code>, <code>total</code>, <code>price</code>, <code>value</code>) or an auto-increment integer primary key alongside non-PK numeric columns. It is suggested as <code>dimension</code> if the majority of columns are string or small-integer types with code-like names.</p>
+<p><strong>Column role classification.</strong></p>
+<div class="table-wrapper"><table><thead><tr><th>Suggested role</th><th>Signal</th></tr></thead><tbody><tr><td><code>measure</code></td><td>Numeric column with an aggregation-friendly name (e.g. <code>amount</code>, <code>qty</code>, <code>revenue</code>, <code>cost</code>, <code>count</code>)</td></tr><tr><td><code>dimension</code></td><td>String column, or integer column with categorical naming (e.g. <code>type</code>, <code>status</code>, <code>code</code>, <code>category</code>, <code>group</code>)</td></tr><tr><td><code>date_key</code></td><td>Column name contains <code>date</code>, <code>day</code>, <code>ts</code>, <code>timestamp</code>, <code>_at</code>, <code>_on</code> and the data type is date, timestamp, or integer</td></tr><tr><td><code>ignore</code></td><td>Auto-increment primary keys, internal row-hash columns, ETL watermark columns</td></tr></tbody></table></div>
+<p><strong>Confidence levels.</strong></p>
+<div class="table-wrapper"><table><thead><tr><th>Level</th><th>Meaning</th></tr></thead><tbody><tr><td><code>high</code></td><td>Multiple strong signals align. Classification is almost always correct for tables conforming to standard naming conventions.</td></tr><tr><td><code>medium</code></td><td>Some signals present, some absent. Review before accepting.</td></tr><tr><td><code>low</code></td><td>Naming is ambiguous or atypical. Manual inspection is required.</td></tr></tbody></table></div>
+<h2>Running analysis</h2>
+<ol><li>Open the model canvas.</li><li>Hover over a table node; click the auto-analysis icon (wand icon) in the table header toolbar.</li><li>The Auto-Analysis dialog opens.</li><li>Click <strong>Run Analysis</strong>. The engine runs synchronously; typical analysis takes under a second.</li><li>Review the suggested table type, confidence level, and reasoning text.</li><li>Review the column suggestions table.</li><li>Close the dialog and manually create dimensions and measures using the suggestions as a guide.</li></ol>
+<p>To refresh the analysis after adding columns or changing the connection, click <strong>Re-run</strong> in the dialog.</p>
+<h2>Interpreting results</h2>
+<p>The <strong>reasoning</strong> text explains which patterns drove the table type classification. For example: _&quot;Table has 4 columns matching measure name patterns (amount, qty, price, total) and an integer primary key. Classified as fact.&quot;_</p>
+<p>The <strong>potential calendar column</strong> field, when present, identifies a date/timestamp column that could be used as the calendar anchor for time-variant measures. This is a suggestion only; it does not bind the calendar automatically.</p>
+<h2>Limits</h2>
+<ul><li>Auto-analysis is a naming convention heuristic. It does not query the data. A column named <code>status_code</code> holding monetary values will be misclassified as a dimension.</li><li>Non-standard naming conventions (e.g. German or abbreviated column names) will produce low-confidence or incorrect suggestions.</li><li>The analysis runs on the current column list of the table in the model. If the source schema has changed since the table was added, sync columns first.</li><li>Auto-analysis requires at least one column on the table. An empty table returns an empty suggestion list.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="add-tables-to-a-model.html">Add tables to a model</a></li><li><a href="define-dimensions.html">Define dimensions</a></li><li><a href="define-measures.html">Define measures</a></li></ul>
+<nav class="page-nav"><a href="source-statistics.html" class="page-nav-btn prev">&larr; Source Statistics</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="model-canvas-tour.html" class="page-nav-btn next">Model Canvas Tour &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

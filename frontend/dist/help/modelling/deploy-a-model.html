@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deploy a Model — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Deploy a Model</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-18</span></div>
+    <h1>Deploy a Model</h1>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/model-builder-toolbar-deploy.png" alt="Model Builder toolbar showing the Deploy and Undeploy buttons."></figure>
+<h2>What this covers</h2>
+<p>A model in Tessallite is in one of two states: <strong>Deployed</strong> or <strong>Ready</strong>. Only deployed models are visible to BI tools (Excel, Power BI), accept queries through the query router, and have their aggregates refreshed by the scheduler. Ready models are draft state — you can edit them freely, but nothing downstream sees them. This article covers deploying, undeploying, and the difference between the two states.</p>
+<h2>Before you start</h2>
+<ul><li>You must have at least one saved version. Click <strong>Save</strong> first if the status chip reads <strong>Edited</strong> or <strong>Empty</strong>. See <a href="save-and-version-a-model.html">Save and Version a Model</a>.</li><li>The Deploy and Undeploy buttons appear on the Model Builder top toolbar <strong>and</strong> on each model card in the project Explorer, so you can deploy or undeploy without opening the Builder.</li></ul>
+<h2>Deploying a model</h2>
+<ol><li>Open the Model Builder.</li><li>Make sure the status chip reads <strong>Saved v{N}</strong> (not <strong>Edited</strong> — Tessallite refuses to deploy edited state, because there is no version to deploy).</li><li>Click the <strong>Deploy</strong> button (rocket icon). Tessallite sets the model&#x27;s deploy pointer to the latest saved version and stamps <code>last_deployed_at</code>.</li><li>The status chip changes to <strong>Deployed v{N}</strong>.</li><li>Within seconds the query router, scheduler, and XMLA gateway start serving the model.</li></ol>
+<p>If the model has never been saved, clicking Deploy first prompts you to confirm Save-and-Deploy in one click.</p>
+<h2>Undeploying a model</h2>
+<ol><li>Open the Model Builder for a deployed model.</li><li>Click the <strong>Undeploy</strong> button (stop icon).</li><li>Type <code>undeploy</code> in the confirmation box and click <strong>Undeploy</strong>.</li><li>The deploy pointer is cleared. BI tools stop seeing the model immediately. The scheduler stops refreshing its aggregates.</li></ol>
+<p>The model&#x27;s saved versions stay intact. You can re-deploy any of them later via the Versions dialog.</p>
+<h2>Deploying or undeploying from the Explorer</h2>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/explorer-card-deploy-button.jpg" alt="Two model cards in the project Explorer — one Deployed with an Undeploy button, one Ready with a Deploy button."></figure>
+<p>Each model card in the project Explorer shows a single toggling button:</p>
+<ul><li><strong>Deploy</strong> when the model is currently undeployed (filled button). Clicking it deploys the latest saved version. If the model has no saved versions yet, the click surfaces the same error you would see in the Model Builder and the card stays unchanged.</li><li><strong>Undeploy</strong> when the model is currently deployed (outlined button). Clicking it asks for the typed-name confirmation (<code>undeploy</code>) and then clears the deploy pointer.</li></ul>
+<p>This is useful for oncall scenarios where you just need to flip one model without jumping into the Builder for each one.</p>
+<h2>Deployed vs Ready</h2>
+<div class="table-wrapper"><table><thead><tr><th>Behaviour</th><th>Deployed</th><th>Ready</th></tr></thead><tbody><tr><td>Visible to Excel / Power BI / other BI tools</td><td>Yes</td><td>No (XMLA gateway hides it)</td></tr><tr><td>Accepts queries from the query router</td><td>Yes</td><td>No (returns 409)</td></tr><tr><td>Aggregates refreshed by the scheduler</td><td>Yes</td><td>No</td></tr><tr><td>Schema-drift sweep runs against it</td><td>Yes</td><td>No</td></tr><tr><td>Editable in Model Builder</td><td>Yes (edits are unsaved)</td><td>Yes</td></tr></tbody></table></div>
+<h2>What deploying freezes</h2>
+<p>When you deploy, Tessallite takes a <strong>snapshot</strong> of the model's shape — its measures (names, formulas, aggregation, type), dimensions, hierarchy levels, and which columns are hidden — and serves <em>that snapshot</em> to BI tools. This is called <strong>pinning</strong>.</p>
+<p>Pinning is what makes your draft edits safe. After a model is deployed you can keep working in the Builder: rename a measure, change a formula from <code>SUM(amount)</code> to <code>SUM(amount) - SUM(discount)</code>, un-hide a column, add a hierarchy level. <strong>None of those edits reach Excel, Power BI, or the query router until you Save and Deploy again.</strong> BI tools keep seeing the deployed version exactly as it was, so a report never changes underneath the person reading it just because someone happened to be editing the model.</p>
+<p>Three things are deliberately <strong>not</strong> frozen, because they are safety controls that must take effect immediately:</p>
+<ul><li><strong>Row security and personas</strong> — if you tighten who can see which rows, the new restriction applies on the very next query. A security rule never waits for a redeploy.</li><li><strong>Column-level security (data tags)</strong> — restricting a tagged column takes effect at once, for the same reason. You should never have to redeploy to <em>remove</em> access.</li><li><strong>Aggregates and pocket tables</strong> — these are speed-up tables the scheduler and optimiser maintain underneath the pinned shape. Routing a query to one of them never changes <em>which</em> numbers come back; it only changes how fast.</li></ul>
+<p><strong>Worked example.</strong> You deploy v3 of a Sales model on Monday. On Tuesday you start reworking the Revenue measure but do not Deploy. An analyst querying from Excel all week still sees the v3 Revenue. On Friday your rework is ready; you Save and Deploy, and only then does the new Revenue reach BI tools. But if on Wednesday you had tightened a row-security rule, that restriction would have applied immediately — security is never left waiting.</p>
+<h2>Choosing which version to deploy</h2>
+<p>The default Deploy action deploys the <em>latest</em> saved version. To deploy an older version:</p>
+<ol><li>Open the Versions dialog (clock icon).</li><li>Find the version you want.</li><li>Click <strong>Deploy</strong> on that row.</li></ol>
+<p>The deploy pointer jumps; older saved versions are not deleted.</p>
+<h2>Tips</h2>
+<ul><li>Deploy is non-destructive: it sets a pointer, it does not modify saved versions.</li><li>Use Undeploy for time-bounded freezes (compliance reviews, model rebuilds in flight).</li><li>After a Save click, the toolbar chip shows whether the deployed version is in sync with the saved one. <strong>Deployed v3 · edited</strong> means: deploy points at v3, but the live state is now ahead of v3 — Save and Deploy again to ship.</li></ul>
+<h2>Related articles</h2>
+<ul><li><a href="save-and-version-a-model.html">Save and Version a Model</a></li><li><a href="export-and-import-a-model.html">Export and Import a Model</a></li><li><a href="run-a-refresh.html">Run a Refresh</a></li></ul>
+<nav class="page-nav"><a href="save-and-version-a-model.html" class="page-nav-btn prev">&larr; Save and Version a Model</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="export-and-import-a-model.html" class="page-nav-btn next">Export and Import a Model &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

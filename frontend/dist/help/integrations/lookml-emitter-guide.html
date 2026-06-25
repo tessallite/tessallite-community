@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LookML Emitter - Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header"><a href="../index.html" class="logo">Tessallite Help</a><nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>LookML Emitter</span></nav></header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-25</span></div>
+    <h1>LookML Emitter</h1>
+    <p>Tessallite creates a generated LookML adapter project from a deployed semantic model. Data Studio direct connections do not use this export. Use it only when a separate Looker instance will execute a Git-backed LookML project.</p>
+    <h2>Generate</h2>
+    <p>In the web application, open <strong>Export</strong> and select <strong>LookML (.zip)</strong>. Choose a deployed model and enter the connection name configured in the target Looker instance.</p>
+    <pre><code>POST /api/v1/projects/{project_id}/models/{model_id}/export/lookml
+{"connection": "tessallite_gateway"}
+
+GET /api/v1/projects/{project_id}/models/{model_id}/snapshot-export
+
+tessallite/scripts/tessallite-lookml-export \
+  --snapshot-file exported-model.json \
+  --project &lt;project-id-or-slug&gt; \
+  --model &lt;model-id-or-slug&gt; \
+  --out generated/lookml \
+  --connection tessallite_gateway</code></pre>
+    <p>Output contains table view files, an explore/model file, and <code>manifest.lkml</code> with model identity, deployed version, and drift hash. Generated views query <code>public.&lt;model_slug&gt;__&lt;table_alias&gt;</code>, exposed only when <code>LOOKER_GATEWAY_ENABLED=true</code>.</p>
+    <h2>Check drift</h2>
+    <p>Re-export after model changes and add <code>--check</code>. A non-zero exit means checked-in generated output no longer matches the Tessallite snapshot.</p>
+    <h2>Limits</h2>
+    <p>The emitter does not generate persistent derived tables, calculated or time-variant measures, arbitrary Liquid SQL, or composite primary keys. Hand edits are customer-owned drift.</p>
+    <nav class="page-nav"><a href="looker-studio-via-looker-guide.html" class="page-nav-btn prev">&larr; Optional Looker-hosted workflow</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="bi-compatibility.html" class="page-nav-btn next">BI Compatibility &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help - <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

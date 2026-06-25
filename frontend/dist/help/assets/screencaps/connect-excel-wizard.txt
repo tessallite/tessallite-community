@@ -1,0 +1,1 @@
+Screenshot of the Excel Data Connection Wizard, step 1. The 'Server name' field shows 'http://localhost:8080/api/v1/xmla/'. The 'Use the following User Name and Password' radio button is selected. Username and Password fields are visible below. Dimensions: 800x600px.

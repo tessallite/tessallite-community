@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 480" font-family="Inter, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#006C35"/>
+    </marker>
+    <marker id="arrow-gold" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#D4AF37"/>
+    </marker>
+    <marker id="arrow-dash" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#6B7280"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="400" y="24" fill="#006C35" font-size="15" font-weight="700" dominant-baseline="middle" text-anchor="middle">Query Path</text>
+
+  <!-- Row 1 boxes -->
+  <!-- BI Tool -->
+  <rect x="30" y="48" width="110" height="44" rx="10" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5"/>
+  <text x="85" y="70" fill="#333333" font-size="13" font-weight="600" dominant-baseline="middle" text-anchor="middle">BI Tool</text>
+
+  <!-- Gateway -->
+  <rect x="190" y="48" width="110" height="44" rx="10" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5"/>
+  <text x="245" y="70" fill="#333333" font-size="13" font-weight="600" dominant-baseline="middle" text-anchor="middle">Gateway</text>
+
+  <!-- Query Router -->
+  <rect x="350" y="48" width="130" height="44" rx="10" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5"/>
+  <text x="415" y="70" fill="#333333" font-size="13" font-weight="600" dominant-baseline="middle" text-anchor="middle">Query Router</text>
+
+  <!-- Aggregate Matcher -->
+  <rect x="530" y="48" width="150" height="44" rx="10" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5"/>
+  <text x="605" y="70" fill="#333333" font-size="13" font-weight="600" dominant-baseline="middle" text-anchor="middle">Aggregate Matcher</text>
+
+  <!-- Row 1 arrows -->
+  <!-- BI Tool -> Gateway -->
+  <line x1="140" y1="70" x2="187" y2="70" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <text x="163" y="86" fill="#6B7280" font-size="11" dominant-baseline="middle" text-anchor="middle">SQL / DAX</text>
+
+  <!-- Gateway -> Query Router -->
+  <line x1="300" y1="70" x2="347" y2="70" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Query Router -> Aggregate Matcher -->
+  <line x1="480" y1="70" x2="527" y2="70" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Branch A — Hit (left, green) -->
+  <!-- Arrow from Aggregate Matcher down-left to Rewrite query -->
+  <line x1="570" y1="92" x2="460" y2="160" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <text x="490" y="120" fill="#006C35" font-size="11" font-weight="600" dominant-baseline="middle" text-anchor="middle">Hit</text>
+
+  <!-- Rewrite query box -->
+  <rect x="370" y="160" width="130" height="40" rx="10" fill="#EFF7F3" stroke="#006C35" stroke-width="2"/>
+  <text x="435" y="180" fill="#333333" font-size="13" font-weight="600" dominant-baseline="middle" text-anchor="middle">Rewrite query</text>
+
+  <!-- Rewrite query -> Run aggregate -->
+  <line x1="435" y1="200" x2="435" y2="228" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Run aggregate box -->
+  <rect x="370" y="230" width="130" height="40" rx="10" fill="#EFF7F3" stroke="#006C35" stroke-width="2"/>
+  <text x="435" y="250" fill="#333333" font-size="13" font-weight="600" dominant-baseline="middle" text-anchor="middle">Run aggregate</text>
+
+  <!-- Branch B — Miss (right, gold) -->
+  <!-- Arrow from Aggregate Matcher down-right to Run raw source -->
+  <line x1="640" y1="92" x2="620" y2="160" stroke="#D4AF37" stroke-width="2" fill="none" marker-end="url(#arrow-gold)"/>
+  <text x="654" y="124" fill="#D4AF37" font-size="11" font-weight="600" dominant-baseline="middle" text-anchor="middle">Miss</text>
+
+  <!-- Run raw source box -->
+  <rect x="545" y="160" width="130" height="40" rx="10" fill="#FDF8E6" stroke="#D4AF37" stroke-width="1.5"/>
+  <text x="610" y="180" fill="#333333" font-size="13" font-weight="600" dominant-baseline="middle" text-anchor="middle">Run raw source</text>
+
+  <!-- Run raw source -> Log miss -->
+  <line x1="610" y1="200" x2="610" y2="228" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Log miss box -->
+  <rect x="545" y="230" width="130" height="40" rx="10" fill="#FDF8E6" stroke="#D4AF37" stroke-width="1.5"/>
+  <text x="610" y="250" fill="#333333" font-size="13" font-weight="600" dominant-baseline="middle" text-anchor="middle">Log miss</text>
+
+  <!-- Return result box -->
+  <rect x="350" y="310" width="210" height="44" rx="10" fill="#F2F7F4" stroke="#006C35" stroke-width="2"/>
+  <text x="455" y="332" fill="#333333" font-size="13" font-weight="600" dominant-baseline="middle" text-anchor="middle">Return result to BI Tool</text>
+
+  <!-- Run aggregate -> Return result -->
+  <line x1="435" y1="270" x2="435" y2="307" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Log miss -> Return result (angled) -->
+  <line x1="580" y1="270" x2="537" y2="307" stroke="#006C35" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Log miss -> Optimizer (dashed) -->
+  <line x1="675" y1="250" x2="718" y2="250" stroke="#6B7280" stroke-width="2" fill="none" stroke-dasharray="5,4" marker-end="url(#arrow-dash)"/>
+
+  <!-- Optimizer box -->
+  <rect x="718" y="230" width="62" height="40" rx="10" fill="#F2F7F4" stroke="#6B7280" stroke-width="1.5"/>
+  <text x="749" y="245" fill="#6B7280" font-size="10" font-weight="600" dominant-baseline="middle" text-anchor="middle">Optimizer</text>
+  <text x="749" y="259" fill="#6B7280" font-size="9" dominant-baseline="middle" text-anchor="middle">builds aggregate</text>
+</svg>

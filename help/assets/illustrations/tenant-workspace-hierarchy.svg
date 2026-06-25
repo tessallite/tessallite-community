@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 500" role="img" aria-label="Tessallite four-level organisational hierarchy">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#006C35"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="240" y="24" font-size="14" font-weight="700" fill="#006C35" text-anchor="middle" font-family="Inter, sans-serif">Tessallite Hierarchy</text>
+
+  <!-- Level 1: Platform -->
+  <rect x="100" y="50" width="280" height="44" rx="10" fill="#EFF7F3" stroke="#006C35" stroke-width="2"/>
+  <text x="240" y="76" font-size="13" font-weight="600" fill="#333333" text-anchor="middle" font-family="Inter, sans-serif">Platform</text>
+  <text x="240" y="112" font-size="11" fill="#6B7280" text-anchor="middle" font-family="Inter, sans-serif">Managed by System Admin</text>
+
+  <!-- Connector: Platform → Workspace -->
+  <line x1="240" y1="94" x2="240" y2="140" stroke="#CBD5E1" stroke-width="1.5"/>
+
+  <!-- Level 2: Workspace -->
+  <rect x="100" y="140" width="280" height="44" rx="10" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5"/>
+  <text x="240" y="166" font-size="13" font-weight="600" fill="#333333" text-anchor="middle" font-family="Inter, sans-serif">Workspace (Tenant)</text>
+  <text x="240" y="202" font-size="11" fill="#6B7280" text-anchor="middle" font-family="Inter, sans-serif">e.g. Acme Corp · isolated environment</text>
+
+  <!-- Connector: Workspace → Project -->
+  <line x1="240" y1="184" x2="240" y2="230" stroke="#CBD5E1" stroke-width="1.5"/>
+
+  <!-- Level 3: Project -->
+  <rect x="100" y="230" width="280" height="44" rx="10" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5"/>
+  <text x="240" y="256" font-size="13" font-weight="600" fill="#333333" text-anchor="middle" font-family="Inter, sans-serif">Project</text>
+  <text x="240" y="292" font-size="11" fill="#6B7280" text-anchor="middle" font-family="Inter, sans-serif">e.g. Sales Analytics · groups related models</text>
+
+  <!-- Connector: Project → Model -->
+  <line x1="240" y1="274" x2="240" y2="320" stroke="#CBD5E1" stroke-width="1.5"/>
+
+  <!-- Level 4: Model -->
+  <rect x="100" y="320" width="280" height="44" rx="10" fill="#F2F7F4" stroke="#006C35" stroke-width="1.5"/>
+  <text x="240" y="346" font-size="13" font-weight="600" fill="#333333" text-anchor="middle" font-family="Inter, sans-serif">Model</text>
+  <text x="240" y="382" font-size="11" fill="#6B7280" text-anchor="middle" font-family="Inter, sans-serif">e.g. Orders Model · one business fact</text>
+
+  <!-- Connector: Model → contents (dashed) -->
+  <line x1="240" y1="364" x2="240" y2="400" stroke="#CBD5E1" stroke-width="1.5" stroke-dasharray="4,3"/>
+
+  <!-- Level 5: Model contents — three boxes -->
+  <!-- Tables: center x=148, so rect x=110 -->
+  <rect x="110" y="400" width="76" height="36" rx="10" fill="#F2F7F4" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="148" y="422" font-size="11" fill="#333333" text-anchor="middle" font-family="Inter, sans-serif">Tables</text>
+
+  <!-- Dimensions: center x=240, so rect x=202 -->
+  <rect x="202" y="400" width="76" height="36" rx="10" fill="#F2F7F4" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="240" y="422" font-size="11" fill="#333333" text-anchor="middle" font-family="Inter, sans-serif">Dimensions</text>
+
+  <!-- Measures: center x=332, so rect x=294 -->
+  <rect x="294" y="400" width="76" height="36" rx="10" fill="#F2F7F4" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="332" y="422" font-size="11" fill="#333333" text-anchor="middle" font-family="Inter, sans-serif">Measures</text>
+</svg>

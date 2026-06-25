@@ -1,0 +1,82 @@
+{
+  "allowCaching": false,
+  "allowCustomDataForDataTypeAny": false,
+  "functions": [
+    {
+      "id": "LISTBYID",
+      "name": "LISTBYID",
+      "description": "Returns the members of a Tessallite named set as a spilled array.",
+      "helpUrl": "https://cloud.tessallite.io/help/integrations/excel-add-in.html",
+      "parameters": [
+        {
+          "name": "named_set_id",
+          "description": "The ID of the named set (e.g. the UUID shown in the Tessallite panel).",
+          "type": "string",
+          "dimensionality": "scalar"
+        }
+      ],
+      "result": {
+        "type": "string",
+        "dimensionality": "matrix"
+      },
+      "options": {
+        "stream": true,
+        "cancelable": true
+      }
+    },
+    {
+      "id": "KPIVALUE",
+      "name": "KPIVALUE",
+      "description": "Returns the current value of a Tessallite KPI.",
+      "helpUrl": "https://cloud.tessallite.io/help/concepts/kpis.html",
+      "parameters": [
+        {
+          "name": "kpi_id",
+          "description": "The ID of the KPI.",
+          "type": "string",
+          "dimensionality": "scalar"
+        }
+      ],
+      "result": {
+        "type": "any",
+        "dimensionality": "scalar"
+      }
+    },
+    {
+      "id": "KPIGOAL",
+      "name": "KPIGOAL",
+      "description": "Returns the goal (target) value of a Tessallite KPI.",
+      "helpUrl": "https://cloud.tessallite.io/help/concepts/kpis.html",
+      "parameters": [
+        {
+          "name": "kpi_id",
+          "description": "The ID of the KPI.",
+          "type": "string",
+          "dimensionality": "scalar"
+        }
+      ],
+      "result": {
+        "type": "any",
+        "dimensionality": "scalar"
+      }
+    },
+    {
+      "id": "KPISTATUS",
+      "name": "KPISTATUS",
+      "description": "Returns the status code of a Tessallite KPI (1 = Good, 0 = Warning, -1 = Poor).",
+      "helpUrl": "https://cloud.tessallite.io/help/concepts/kpis.html",
+      "parameters": [
+        {
+          "name": "kpi_id",
+          "description": "The ID of the KPI.",
+          "type": "string",
+          "dimensionality": "scalar"
+        }
+      ],
+      "result": {
+        "type": "any",
+        "dimensionality": "scalar"
+      }
+    }
+  ]
+}

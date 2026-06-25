@@ -1,0 +1,30 @@
+{
+  "anthropic": {
+    "input_per_1k": 0.003,
+    "output_per_1k": 0.015
+  },
+  "openai": {
+    "input_per_1k": 0.005,
+    "output_per_1k": 0.015
+  },
+  "gemini": {
+    "input_per_1k": 0.001,
+    "output_per_1k": 0.002
+  },
+  "google": {
+    "input_per_1k": 0.001,
+    "output_per_1k": 0.002
+  },
+  "deepseek": {
+    "input_per_1k": 0.00027,
+    "output_per_1k": 0.0011
+  },
+  "glm": {
+    "input_per_1k": 0.0006,
+    "output_per_1k": 0.0022
+  },
+  "_fallback": {
+    "input_per_1k": 0.005,
+    "output_per_1k": 0.015
+  }
+}

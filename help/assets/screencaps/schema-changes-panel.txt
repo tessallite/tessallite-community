@@ -1,0 +1,1 @@
+Live Schema Changes drawer for modely, opened from the Model Builder toolbelt, showing schema drift review and acknowledgement controls.

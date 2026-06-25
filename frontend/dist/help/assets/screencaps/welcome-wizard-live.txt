@@ -1,0 +1,1 @@
+Live Welcome route as rendered for the acme-demo admin account, showing the deployed application onboarding state.

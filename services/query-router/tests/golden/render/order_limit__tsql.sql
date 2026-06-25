@@ -1,0 +1,1 @@
+SELECT [f].[region] AS [region], SUM([f].[amount]) AS [amount] FROM [demo].[sales] AS [f] GROUP BY [f].[region] ORDER BY CASE WHEN [region] IS NULL THEN 1 ELSE 0 END, [region] ASC OFFSET 5 ROWS FETCH FIRST 10 ROWS ONLY

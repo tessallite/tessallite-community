@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>First-Time Setup — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Getting Started</span> / <span>First-Time Setup</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">system-admin, tenant-admin</span><span class="updated">Updated 2026-04-17</span></div>
+    <h1>First-Time Setup</h1>
+<h2>What this covers</h2>
+<p>The steps to take immediately after installation — signing in as system admin, creating a workspace, and signing in as a tenant user.</p>
+<h2>Before you start</h2>
+<ul><li>Tessallite must be installed. See <a href="install-local.html">Install locally</a> or <a href="install-gcp.html">Install on GCP</a>.</li><li>If the deploy script was used, the first workspace and admin user may already exist. The script reports their credentials when it completes.</li></ul>
+<h2>Part 1: Sign in as System Admin</h2>
+<p>A System Admin manages the platform itself. The System Admin creates workspaces and bootstraps user accounts. The System Admin&#x27;s credentials are set during deployment and are not stored in the application database.</p>
+<ol><li>Open a browser and navigate to the Tessallite frontend. For local installs, this is <code>http://localhost:3000</code>. For GCP installs, use the Cloud Run URL printed at the end of the deploy script.</li><li>The sign-in form appears. Below the main sign-in fields, find the link labelled <strong>System admin login</strong> and click it.</li><li>Enter the system admin email and password that were set during deployment.</li><li>Click <strong>Sign in</strong>. The System Administration screen opens.</li></ol>
+<h2>Part 2: Create a workspace</h2>
+<p>A workspace is an isolated environment for a team or organisation. Each workspace has its own users, projects, models, and data sources.</p>
+<ol><li>On the System Administration screen, click <strong>New Tenant</strong>.</li><li>Enter a <strong>Slug</strong> — a short, URL-safe identifier for the workspace. Use lowercase letters, numbers, and hyphens only (for example, <code>acme</code>). The slug cannot be changed after creation. It becomes the database name that BI tools use when connecting via JDBC.</li><li>Enter a <strong>Display name</strong> — a human-readable name for the workspace (for example, <code>Acme Corp</code>).</li><li>Click <strong>Create</strong>. The workspace appears in the tenant list.</li></ol>
+<h2>Part 3: Create the first tenant user</h2>
+<p>Skip this part if the deploy script already created a tenant user — the script reports whether it did.</p>
+<ol><li>On the System Administration screen, click on the workspace you just created.</li><li>Click <strong>Add user</strong>.</li><li>Enter the user&#x27;s email address, username, and a temporary password.</li><li>Click <strong>Create user</strong>.</li></ol>
+<h2>Part 4: Sign in as a tenant user</h2>
+<ol><li>Click <strong>Sign out</strong> in the top-right corner to leave the system admin session.</li><li>On the sign-in form, enter the workspace slug, the user&#x27;s email address, and the password.</li><li>Click <strong>Sign in</strong>. The Explorer screen opens. This is the main workspace for modellers and analysts.</li></ol>
+<figure class="illustration"><img class="illustration" src="../assets/illustrations/first-time-setup-flow.svg" alt="First-time setup flow."></figure>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr></thead><tbody><tr><td>System admin login link not visible</td><td>Page did not load completely</td><td>Scroll to the bottom of the sign-in form</td></tr><tr><td>Invalid credentials for system admin</td><td>Wrong email or password</td><td>Use the credentials from the deploy script output or from your .env file</td></tr><tr><td>Slug already taken</td><td>A workspace with this slug exists</td><td>Choose a different slug</td></tr><tr><td>Sign-in fails as tenant user</td><td>Wrong workspace slug</td><td>Check the slug in the System Administration screen</td></tr></tbody></table></div>
+<h2>Related</h2>
+<ul><li><a href="install-local.html">Install locally</a></li><li><a href="install-gcp.html">Install on GCP</a></li><li><a href="../admin/create-a-workspace.html">Create a workspace</a></li><li><a href="../admin/manage-users.html">Manage users</a></li></ul>
+<nav class="page-nav"><a href="how-tessallite-works.html" class="page-nav-btn prev">&larr; How Tessallite Works</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="welcome-wizard.html" class="page-nav-btn next">Welcome Wizard &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

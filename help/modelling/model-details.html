@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Model Details — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Model Details</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-06-04</span></div>
+<h1>Model Details</h1>
+
+<h2>What this covers</h2>
+<p>The <strong>Model Details</strong> panel is a quick reference for everything inside the open model. It has two tabs: <strong>Model</strong>, which lists the model's attributes and shows the SQL that produces them, and <strong>Documents</strong>, which holds the auto-generated model documentation. Open it from the toolbelt on the right of the Model Builder (the document icon).</p>
+
+<h2>The Model tab</h2>
+<p>The Model tab answers one question: <em>what does this model expose, and to whom?</em></p>
+
+<h3>Persona selector</h3>
+<p>At the top of the tab is a <strong>Persona</strong> dropdown.</p>
+<ul>
+<li>Leave it on <strong>Full model</strong> to see every attribute in the model.</li>
+<li>Pick a persona to see only the attributes that persona is allowed to see. Personas govern which measures, dimensions, and hierarchies a group of users can query; choosing one here filters the table to exactly those columns.</li>
+</ul>
+
+<h3>Attribute table</h3>
+<p>Each row is one attribute (a physical column or a user-defined attribute).</p>
+<table>
+<thead><tr><th>Column</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><strong>#</strong></td><td>Row number in the current view</td></tr>
+<tr><td><strong>Attribute</strong></td><td>The canonical (technical) name of the column</td></tr>
+<tr><td><strong>Data type</strong></td><td>The column's data type, e.g. <code>varchar</code>, <code>numeric</code></td></tr>
+<tr><td><strong>Display name</strong></td><td>The friendly name shown to business users</td></tr>
+<tr><td><strong>Description</strong></td><td>The business description. If the attribute is linked to a Business Glossary term, the glossary definition is shown; otherwise the attribute's own description is used</td></tr>
+<tr><td><strong>Type</strong></td><td><strong>Physical</strong> for a real source column, <strong>UDA</strong> for a user-defined attribute</td></tr>
+<tr><td><strong>Source table</strong></td><td>The table the attribute belongs to</td></tr>
+<tr><td><strong>Formula</strong></td><td>For UDAs, the expression that defines the attribute; blank for physical columns</td></tr>
+</tbody>
+</table>
+
+<h3>Export</h3>
+<p>The <strong>Export</strong> button downloads the table exactly as shown (respecting the persona filter) in your choice of format:</p>
+<ul>
+<li><strong>Excel (.xlsx)</strong> &mdash; a formatted spreadsheet</li>
+<li><strong>CSV</strong> &mdash; comma-separated values</li>
+<li><strong>JSON</strong> &mdash; structured data for integrations</li>
+<li><strong>Text</strong> &mdash; a plain, column-aligned table</li>
+</ul>
+
+<h3>Source SELECT statement</h3>
+<p>Below the table is a read-only, formatted <strong>SELECT statement</strong>. This is the query the platform runs for <code>SELECT * FROM &lt;model&gt;</code>, rewritten for the selected persona &mdash; so it projects exactly the columns the persona can see. Use the copy button to put it on your clipboard, for example to paste into the Query Panel or a BI tool. If the statement cannot be produced, a short notice appears instead.</p>
+
+<h2>The Documents tab</h2>
+<p>The Documents tab shows generated documentation for the model &mdash; its tables, measures, dimensions, and relationships. It is produced automatically when you open the tab; there is no button to press. Use the <strong>copy</strong> and <strong>download</strong> icons to take the documentation as Markdown.</p>
+
+<h2>Tips</h2>
+<ul>
+<li>The persona filter on the Model tab and the Source SELECT statement always agree: both reflect the same persona, so the SQL never references a column the table is hiding.</li>
+<li>Descriptions come from the <strong>Business Glossary</strong> when a term matches the attribute name. Curating the glossary improves this panel automatically.</li>
+</ul>
+
+<h2>Related</h2>
+<ul>
+<li><a href="configure-personas.html">Configure Personas</a></li>
+<li><a href="business-glossary.html">Business Glossary</a></li>
+<li><a href="query-panel.html">Query Panel</a></li>
+</ul>
+<nav class="page-nav"><a href="model-translations.html" class="page-nav-btn prev">&larr; Model Translations</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="../agent/agent-chat.html" class="page-nav-btn next">Agent Chat &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KPIs (Key Performance Indicators) — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Concepts</span> / <span>KPIs</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-06-14</span></div>
+    <h1>KPIs (Key Performance Indicators)</h1>
+
+<h2>What this covers</h2>
+<p>KPIs track how well your organisation is meeting its business objectives. Each KPI uses an <strong>expression</strong> written in the KPI formula language to compute a value, then compares that value against a <strong>target</strong> using <strong>threshold bands</strong> that produce a traffic-light status. This article explains what KPIs are, the expression system, KPI types, thresholds, time intelligence, the scorecard, snapshots, governance, and integrations.</p>
+
+<h2>How KPIs work</h2>
+<p>A KPI is a named metric definition stored within a semantic model. It uses a formula expression to derive a numeric value from one or more measures, then evaluates that value against configurable threshold bands to produce a status (good, warning, poor) and detects a trend direction (improving, stable, declining).</p>
+
+<h3>Expression system</h3>
+<p>KPIs are defined using a formula language with 21 built-in functions. The expression is compiled to SQL and executed against the source database via the query-router.</p>
+
+<h4>Core functions</h4>
+<div class="table-wrapper">
+<table>
+  <thead><tr><th>Function</th><th>Description</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td><code>measure("Name")</code></td><td>Reference a model measure.</td><td><code>measure("Revenue")</code></td></tr>
+    <tr><td><code>kpi("Name")</code></td><td>Reference another KPI's value.</td><td><code>kpi("Margin %")</code></td></tr>
+    <tr><td><code>literal(n)</code></td><td>A constant number.</td><td><code>literal(100)</code></td></tr>
+    <tr><td><code>safe_div(a, b)</code></td><td>Division returning NULL when b is zero.</td><td><code>safe_div(measure("Revenue"), measure("Cost"))</code></td></tr>
+    <tr><td><code>div(a, b, fallback)</code></td><td>Division with a fallback value.</td><td><code>div(measure("A"), measure("B"), 0)</code></td></tr>
+    <tr><td><code>coalesce(a, b, ...)</code></td><td>First non-NULL value.</td><td><code>coalesce(measure("A"), literal(0))</code></td></tr>
+    <tr><td><code>if_then_else(c, t, f)</code></td><td>Conditional.</td><td><code>if_then_else(measure("A"), measure("B"), literal(0))</code></td></tr>
+    <tr><td><code>abs(x)</code></td><td>Absolute value.</td><td><code>abs(measure("Variance"))</code></td></tr>
+    <tr><td><code>round(x, d)</code></td><td>Round to d decimal places.</td><td><code>round(measure("Rate"), literal(2))</code></td></tr>
+    <tr><td><code>min_of(a, b)</code></td><td>Smaller of two values.</td><td><code>min_of(measure("A"), measure("B"))</code></td></tr>
+    <tr><td><code>max_of(a, b)</code></td><td>Larger of two values.</td><td><code>max_of(measure("A"), measure("B"))</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>Time intelligence functions</h4>
+<div class="table-wrapper">
+<table>
+  <thead><tr><th>Function</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><code>prior_period(expr, grain)</code></td><td>Same expression from the prior period (year, quarter, month, week).</td></tr>
+    <tr><td><code>period_to_date(expr, grain)</code></td><td>Cumulative value from period start (YTD, QTD, MTD, WTD).</td></tr>
+    <tr><td><code>moving_avg(expr, n, grain)</code></td><td>Rolling average over n periods.</td></tr>
+    <tr><td><code>trailing_sum(expr, n, grain)</code></td><td>Rolling sum over n periods.</td></tr>
+    <tr><td><code>lag(expr, n, grain)</code></td><td>Value from n periods ago.</td></tr>
+    <tr><td><code>lead(expr, n, grain)</code></td><td>Value from n periods ahead.</td></tr>
+    <tr><td><code>pct_change(expr, grain)</code></td><td>Percentage change from prior period.</td></tr>
+    <tr><td><code>cagr(expr, n)</code></td><td>Compound annual growth rate over n years.</td></tr>
+    <tr><td><code>fiscal_period_to_date(expr, grain)</code></td><td>Period-to-date using fiscal calendar.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Arithmetic operators (<code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>) and parentheses are supported. Expressions are validated live in the wizard before saving.</p>
+
+<p><strong>How rolling windows are measured.</strong> Functions that look back over "the last n periods" (<code>moving_avg</code>, <code>trailing_sum</code>, <code>lag</code>, <code>prior_period</code>, <code>pct_change</code>) measure each period as a rolling interval counted back from today's date &mdash; not as a calendar period. A "month" window ending today covers the last 30-ish days (for example 12 May to 12 June), not the calendar month of May. Two consequences worth knowing:</p>
+<ul>
+  <li><strong>Windows are anchored to today.</strong> The same KPI evaluated tomorrow looks at slightly different rows. This keeps the number fresh for daily dashboards, but it means the value is not "May's average" &mdash; it is "the average of the 30 days before today".</li>
+  <li><strong>Empty periods are skipped, not counted as zero.</strong> If one of the windows contains no data at all (say your data ends two months ago), a 3-period moving average becomes the average of the 2 windows that do have data. The result is never diluted by phantom zeros &mdash; but it also means the "3-month average" label can quietly describe fewer than 3 months. If you need strict calendar periods, give the KPI a time window filter on calendar boundaries instead.</li>
+</ul>
+
+<h3>KPI types</h3>
+<p>The wizard offers six KPI type presets that generate the appropriate expression:</p>
+<div class="table-wrapper">
+<table>
+  <thead><tr><th>Type</th><th>Description</th><th>Expression pattern</th></tr></thead>
+  <tbody>
+    <tr><td>Simple measure</td><td>Track a single measure against a target.</td><td><code>measure("Revenue")</code></td></tr>
+    <tr><td>Ratio</td><td>Divide one measure by another.</td><td><code>safe_div(measure("Revenue"), measure("Cost"))</code></td></tr>
+    <tr><td>Variance</td><td>Difference between two measures.</td><td><code>measure("Actual") - measure("Budget")</code></td></tr>
+    <tr><td>Growth rate</td><td>Period-over-period change.</td><td><code>pct_change(measure("Revenue"), "month")</code></td></tr>
+    <tr><td>Moving window</td><td>Rolling average or trailing sum.</td><td><code>moving_avg(measure("Revenue"), literal(3), "month")</code></td></tr>
+    <tr><td>Composite</td><td>Weighted combination of other KPIs.</td><td><code>kpi("A") * literal(0.6) + kpi("B") * literal(0.4)</code></td></tr>
+  </tbody>
+</table>
+</div>
+<p>You can also write custom expressions directly in the formula editor.</p>
+
+<h3>Targets and direction</h3>
+<p>Each KPI can have a target value. The target determines the reference point for threshold evaluation.</p>
+<p><strong>Target types:</strong> no target, static value, from a measure, prior period value, or custom expression.</p>
+<p><strong>Direction</strong> controls which way is "good":</p>
+<div class="table-wrapper">
+<table>
+  <thead><tr><th>Direction</th><th>Meaning</th><th>Example KPIs</th></tr></thead>
+  <tbody>
+    <tr><td>Higher is better</td><td>A larger value is a better result.</td><td>Revenue, satisfaction score, conversion rate.</td></tr>
+    <tr><td>Lower is better</td><td>A smaller value is a better result.</td><td>Cost per unit, error rate, churn, response time.</td></tr>
+    <tr><td>Closer is better</td><td>The best result is exactly at the target; any deviation above or below is worse.</td><td>Budget adherence, inventory level, production tolerance.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Direction affects everything on the scorecard card:</p>
+<ul>
+  <li><strong>Gauge and chart visuals</strong> show the needle or bar at a position that reflects how well the KPI is performing relative to its target, not just the raw ratio. For example, a "lower is better" KPI with a value half its target shows the gauge at 200% (beating the goal by 2x), not at 50%.</li>
+  <li><strong>Variance</strong> is signed so that a positive number always means "beating the goal" and a negative number means "missing the goal", regardless of direction. A cost KPI (lower is better) that is 10 below target shows "+10", not "-10".</li>
+  <li><strong>Trend</strong> reflects whether the KPI is moving in the desired direction. For a "closer is better" KPI, moving from 110 to 105 when the target is 100 is "Improving" (getting closer), even though the raw value decreased. For a "lower is better" KPI, a decrease in value is "Improving".</li>
+  <li><strong>Colour coding</strong> on trend chips and goal-delta badges follows the direction-aware signal: green means the KPI is doing well relative to its goal, red means it is doing poorly.</li>
+</ul>
+
+<h3>Threshold bands</h3>
+<p>Threshold bands define when a KPI shows green, amber, or red. You can choose from presets (standard 3-band, standard 4-band, tight tolerance, centred deviation) or configure custom bands. Each band has a label, colour, and min/max range.</p>
+<p>When you set the KPI direction, the default threshold bands adjust automatically:</p>
+<ul>
+  <li><strong>Higher is better:</strong> green at the top of the scale (e.g. 80&ndash;100 = On Track), red at the bottom (0&ndash;50 = Off Target).</li>
+  <li><strong>Lower is better:</strong> green at the bottom (e.g. 0&ndash;50 = On Track), red at the top (80&ndash;100 = Off Target). This reflects the fact that low values are good.</li>
+  <li><strong>Closer is better:</strong> green in the middle (e.g. 70&ndash;100 = On Track), red at the extremes (0&ndash;30 = Off Target). This reflects the fact that the best result is near the target, and deviations in either direction are worse.</li>
+</ul>
+<p>You can always customise bands after the defaults are applied.</p>
+<p><strong>Evaluation types:</strong> percentage of target, absolute variance, percentage variance, z-score (statistical), percentile rank (peer group).</p>
+<p>A colour-blind-safe palette option is available.</p>
+
+<h3>Trend detection</h3>
+<div class="table-wrapper">
+<table>
+  <thead><tr><th>Trend</th><th>Icon</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>Improving</td><td>Green up arrow</td><td>Value is moving in the desired direction.</td></tr>
+    <tr><td>Stable</td><td>Grey flat arrow</td><td>Value is within the trend threshold.</td></tr>
+    <tr><td>Declining</td><td>Red down arrow</td><td>Value is moving against the desired direction.</td></tr>
+  </tbody>
+</table>
+</div>
+<p><strong>How direction affects trend:</strong></p>
+<ul>
+  <li><strong>Higher is better:</strong> an increase is improving, a decrease is declining.</li>
+  <li><strong>Lower is better:</strong> a decrease is improving, an increase is declining.</li>
+  <li><strong>Closer is better:</strong> moving closer to the target is improving, moving further from it is declining. This is measured by comparing the absolute distance from the target (|value &minus; target|), not the raw value direction. Moving from 90 to 95 when the target is 100 is improving (distance shrank from 10 to 5). Moving from 105 to 110 when the target is 100 is declining (distance grew from 5 to 10).</li>
+</ul>
+<p>The trend threshold (default 1%) and comparison period (day, week, month, quarter, year) are configurable per KPI.</p>
+
+<h3>Visual types</h3>
+<div class="table-wrapper">
+<table>
+  <thead><tr><th>Type</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>Traffic light</td><td>Three-lamp signal with the active lamp lit green, amber or red by status.</td></tr>
+    <tr><td>Gauge</td><td>Circular dial showing performance relative to target. The needle position accounts for the KPI direction, so a "lower is better" KPI that beats its target shows the needle in the green zone.</td></tr>
+    <tr><td>Bullet chart</td><td>Horizontal bar that grows to the value over translucent band lanes, with a target marker at the threshold to reach.</td></tr>
+    <tr><td>RAG bar</td><td>Solid red/amber/green track with a marker at the value.</td></tr>
+    <tr><td>Progress ring</td><td>Circular ring filling toward the target, coloured by status, with the percent shown in the centre.</td></tr>
+    <tr><td>Thermometer</td><td>Vertical column rising through the status bands.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Persona filtering</h3>
+<p>When a persona is active, KPIs are filtered to show only those whose referenced measures are within the persona's allowed measure list. If a KPI references a measure outside the persona scope, it is hidden from the list and blocked from evaluation. This applies to the scorecard, the API, and all evaluation endpoints.</p>
+
+<h2>Composite KPIs</h2>
+<p>Composite KPIs combine multiple child KPIs using weighted scores. Set a parent KPI and assign weights to each child. The composite value is computed as the weighted sum of child KPI values, with optional normalisation.</p>
+
+<h3>How the score is computed</h3>
+<ol>
+  <li>Each child is evaluated and <strong>normalised to a 0-100 score</strong> &mdash; by default as a percentage of the child's own target (a child at 100 against a target of 200 scores 50).</li>
+  <li>Weights are <strong>renormalised to sum to 1</strong>. Weights of 3 and 1 behave exactly like 0.75 and 0.25, so you can use any convenient scale.</li>
+  <li>Children with <strong>no value or no usable target are excluded</strong>, and the remaining weights are renormalised. If every child is excluded, the composite has no value.</li>
+  <li>The composite's own status, trend, and formatting are then computed from the score against the composite's target &mdash; exactly the same way as for any other KPI, and identically wherever the KPI appears (KPIs panel, Scorecard, the <code>$KPIs</code> table for BI tools).</li>
+</ol>
+
+<h3>When a child input breaks</h3>
+<p>There are two very different reasons a child can end up with no value, and the platform now treats them differently:</p>
+<ul>
+  <li><strong>No data.</strong> The child evaluated correctly but simply has nothing to show for the current slice (for example, a region with no sales this month). This is normal. The child is quietly dropped, the remaining weights renormalise, and the parent keeps showing a healthy score. Nothing is flagged.</li>
+  <li><strong>A broken input.</strong> The child's evaluation <strong>failed</strong> &mdash; for example its formula references something that no longer exists, the underlying query errored, or it tripped a nesting or circular-reference guard. This is not "no data"; it means one of the numbers feeding your score is broken.</li>
+</ul>
+<p>When a child is broken, the composite still computes its score from the children that did work, but it now carries a visible <strong>Degraded</strong> badge on its scorecard card. Hover the badge to see exactly which child failed and why. This stops a broken input from being silently swept under the rug while the parent shows a falsely confident number.</p>
+<p>If <strong>every</strong> child is broken, there is nothing trustworthy left to score from, so the composite shows an error instead of inventing a number.</p>
+
+<h3>Nested composites</h3>
+<p>A composite can itself be the child of another composite. The platform scores these <strong>recursively, from the bottom up</strong>: the inner composite's weighted score becomes its raw value inside the outer composite, and is normalised against the inner composite's own target like any other child. Example: an "Overall Health" composite whose only child is a "Financial Health" composite scoring 40 against a target of 50 evaluates to 80 (40/50 of target, normalised to 0-100).</p>
+<p>Two guard rails apply, and both fail with a clear error rather than a silently wrong number:</p>
+<ul>
+  <li><strong>Nesting is limited to 5 composite levels.</strong> Deeper hierarchies return "Composite evaluation failed &mdash; composite nesting deeper than 5 levels". If you hit this, your scorecard tree is probably trying to do too much in one number &mdash; split it.</li>
+  <li><strong>Circular references are rejected.</strong> A composite can never appear inside its own hierarchy.</li>
+</ul>
+
+<h3>Who sees what</h3>
+<p>Composite scores respect the viewer's privileges. Draft children are excluded for users who cannot see drafts, and children referencing measures outside the viewer's persona scope are excluded too &mdash; in both cases the remaining weights are renormalised. This means a viewer and an admin can legitimately see <strong>different composite scores for the same KPI</strong>: each sees the weighted score of the children they are allowed to see. When comparing numbers across users, check certification status and persona scope first.</p>
+
+<h2>The KPI Scorecard</h2>
+<p>The KPI Scorecard provides a live, at-a-glance view of all KPIs in a model.</p>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/kpi-scorecard.png" alt="The KPI Scorecard for the acme demo ModelX, open on the KPIs tab. The summary bar reads 6 total KPIs — 3 Good, 1 Warning, 2 Poor — with filters for certification, display folder, indicator type, and a viewing-as-persona preview. Below, the Sales Performance folder shows cards for Avg Transaction Value (bullet chart, $2,504.71, On Track), Gross Margin % (72.5%, On Track), and Net Sales (bullet chart, $141.5M, Near Target), each with its current value, goal, gap-to-goal, and status badge."></figure>
+<p>Each card is built from one server-computed evaluation, so the visual, the value, the gap-to-goal, and the status badge always tell the same story. The summary bar at the top counts how many KPIs are Good, Warning, or Poor, and the filters let you narrow by certification, folder, or indicator type — or preview the board as a specific persona before you publish.</p>
+<h3>What it shows</h3>
+<ul>
+  <li><strong>Summary bar</strong> &mdash; total KPI count and chips showing how many are Good, Warning, Poor, or Unknown.</li>
+  <li><strong>Filters</strong> &mdash; narrow the board several ways, in any combination:
+    <ul>
+      <li><strong>Certification</strong> &mdash; All, Certified only, or Deprecated.</li>
+      <li><strong>Display folder</strong> &mdash; show one folder, or all folders.</li>
+      <li><strong>Indicator type</strong> &mdash; show only Leading, only Lagging, or Unclassified KPIs. (Leading indicators predict where a number is heading; lagging ones report where it has already been.)</li>
+    </ul>
+  </li>
+  <li><strong>Viewing as persona</strong> &mdash; preview the board exactly as a chosen persona would see it. KPIs that reference a measure outside that persona's scope drop out of view, so you can confirm what each audience is allowed to see before you publish. Choose "Default (no persona)" to see everything you are allowed to see.</li>
+  <li><strong>KPI cards</strong> &mdash; a responsive grid of cards, each showing the KPI name, certification badge, current formatted value, status colour, trend arrow, and sparkline. On a card with a gauge, the needle, its coloured band, and the status badge always agree — they are plotted from one server-computed position, even for "lower is better" KPIs and percentile or z-score thresholds where the good and bad ends are reversed.</li>
+  <li><strong>Grouping</strong> &mdash; KPIs are grouped by their display folder.</li>
+</ul>
+
+<h3>How evaluation works</h3>
+<p>The scorecard evaluates KPIs using the <code>evaluate-batch</code> endpoint. Each KPI's expression is compiled to SQL and executed via the query-router. Results include the computed value, formatted value, status code, status colour, trend direction, and sparkline data points. Results are cached with a configurable TTL, invalidated when a KPI is updated or the model is deployed.</p>
+
+<h2>Snapshots</h2>
+<p>KPIs can capture periodic snapshots of their evaluated values for historical tracking. Snapshot frequency and retention are configured per KPI in the wizard (only available for non-draft KPIs).</p>
+<p>Available frequencies: hourly, daily (midnight or 6 AM), weekly (Mondays), monthly (1st), quarterly (1st of Jan/Apr/Jul/Oct). Retention ranges from 7 to 365 snapshots.</p>
+
+<h2>Governance</h2>
+<h3>Certification lifecycle</h3>
+<div class="table-wrapper">
+<table>
+  <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Draft</strong> (default)</td><td>Available for use, not formally endorsed.</td></tr>
+    <tr><td><strong>Certified</strong></td><td>Reviewed and approved for organisational use. Green badge.</td></tr>
+    <tr><td><strong>Deprecated</strong></td><td>No longer recommended. Orange badge. Optionally linked to a replacement KPI.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Certification and deprecation are gated by ownership: only the KPI owner or an admin can change the certification status.</p>
+
+<h3>Version history</h3>
+<p>Each save creates a new version. Versions can be compared and reverted from the wizard review step.</p>
+
+<h3>Audit trail</h3>
+<p>All KPI operations (create, update, delete, certify, deprecate, revert) are logged to the audit trail.</p>
+
+<h2>JDBC and XMLA exposure</h2>
+<ul>
+  <li><strong>XMLA</strong> &mdash; MDSCHEMA_KPIS rowset returns KPI metadata including expression, target, status, and trend. Composite parent/child relationships and weights are included.</li>
+  <li><strong>JDBC</strong> &mdash; A virtual <code>$KPIs</code> table is registered for each model (e.g. <code>Sales$KPIs</code>). BI clients can query it like a regular table:
+    <pre><code>SELECT * FROM "Sales$KPIs"</code></pre>
+    <p>The table returns one row per KPI with columns: <code>kpi_name</code>, <code>value</code>, <code>target</code>, <code>status</code>, <code>status_label</code>, <code>trend_pct</code>, <code>formatted_value</code>, <code>evaluated_at</code>. Values are refreshed automatically by the scheduler snapshot sweep and by on-demand batch evaluations.</p>
+  </li>
+</ul>
+
+<h2>KPIs in the conversational agent</h2>
+<p>The conversational agent can evaluate KPIs on demand using the <code>evaluate_kpi</code> tool. When a user asks about KPI performance, the agent retrieves the list of non-deprecated KPIs from the model profile and evaluates any of them.</p>
+
+<h2>KPIs in the Excel plugin</h2>
+<ul>
+  <li><code>=TESS.KPIVALUE("kpi_id")</code> &mdash; returns the current evaluated value.</li>
+  <li><code>=TESS.KPIGOAL("kpi_id")</code> &mdash; returns the target value.</li>
+  <li><code>=TESS.KPISTATUS("kpi_id")</code> &mdash; returns the status code (<code>1</code> = Good, <code>0</code> = Warning, <code>-1</code> = Poor).</li>
+</ul>
+
+<h2>Best practices</h2>
+<ul>
+  <li><strong>Use safe_div for division.</strong> Always use <code>safe_div()</code> instead of <code>/</code> to avoid divide-by-zero errors.</li>
+  <li><strong>Name KPIs clearly.</strong> Use display names that business users will recognise.</li>
+  <li><strong>Organise with display folders.</strong> Group related KPIs so the Scorecard is scannable.</li>
+  <li><strong>Certify KPIs before sharing.</strong> Certification signals which KPIs are the official, approved metrics.</li>
+  <li><strong>Deprecate instead of deleting.</strong> Deprecating preserves version history and audit trails.</li>
+  <li><strong>Set up alerts for critical KPIs.</strong> Use threshold breach alerts to get notified early.</li>
+  <li><strong>Assign a time dimension</strong> for time intelligence functions to work correctly.</li>
+  <li><strong>Use composite KPIs</strong> for balanced scorecards that combine multiple metrics.</li>
+</ul>
+
+<h2>Related</h2>
+<ul>
+  <li><a href="../admin/alert-configuration.html">Alert Configuration</a> &mdash; set up KPI alert routes.</li>
+  <li><a href="../modelling/define-measures.html">Define Measures</a> &mdash; create the measures that KPIs reference.</li>
+  <li><a href="../agent/agent-chat.html">Agent Chat</a> &mdash; ask the agent to evaluate KPIs in natural language.</li>
+  <li><a href="../integrations/excel-add-in.html">Tessallite Excel Add-in</a> &mdash; access KPIs from Excel.</li>
+</ul>
+
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+<nav class="page-nav"><a href="calendar-types.html" class="page-nav-btn prev">&larr; Calendar Types</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="../modelling/create-a-project.html" class="page-nav-btn next">Create a Project &rarr;</a></nav>
+</body>
+</html>

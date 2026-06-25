@@ -1,0 +1,49 @@
+{
+  "name": "tessallite-excel-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "certs:install": "node scripts/install-certs.mjs"
+  },
+  "dependencies": {
+    "@emotion/react": "^11.13.0",
+    "@emotion/styled": "^11.13.0",
+    "@microsoft/office-js": "^1.1.110",
+    "@mui/icons-material": "^5.16.0",
+    "@mui/material": "^5.16.0",
+    "@tanstack/react-query": "^5.51.0",
+    "@types/dompurify": "^3.0.5",
+    "@types/react-window": "^1.8.8",
+    "charts.css": "^1.2.0",
+    "dompurify": "^3.4.11",
+    "echarts": "^6.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^9.1.0",
+    "react-window": "^2.2.7",
+    "remark-gfm": "^4.0.1",
+    "zustand": "^5.0.14"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/custom-functions-runtime": "^1.6.12",
+    "@types/office-js": "^1.0.411",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-basic-ssl": "^1.1.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "jsdom": "^29.1.1",
+    "office-addin-dev-certs": "^2.0.9",
+    "typescript": "^5.5.3",
+    "vite": "^5.4.0",
+    "vite-plugin-mkcert": "^2.0.0",
+    "vitest": "^1.6.0"
+  }
+}

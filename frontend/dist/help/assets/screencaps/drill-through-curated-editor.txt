@@ -1,0 +1,1 @@
+Live Measures drawer for modely with the drill-through configuration control opened where available, showing the actual measure curation surface in the deployed app.
