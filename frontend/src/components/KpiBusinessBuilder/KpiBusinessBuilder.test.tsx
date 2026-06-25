@@ -1,6 +1,20 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, waitFor, within, act, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+
+// Bug-5510: KpiFilterBar's FilterEditor has a 300ms debounce timer that can
+// fire after component unmount. MUI Dialog/Select transitions also use real
+// setTimeout calls that, under full-suite CPU contention, cause waitFor
+// assertions to race with intermediate DOM states. Fake timers give
+// deterministic control: shouldAdvanceTime keeps userEvent and promise
+// resolution working, while afterEach flushes remaining timers before React
+// cleanup so no setState fires on an unmounted component tree.
+beforeEach(() => { vi.useFakeTimers({ shouldAdvanceTime: true }); });
+afterEach(() => {
+  act(() => { vi.runOnlyPendingTimers(); });
+  cleanup();
+  vi.useRealTimers();
+});
 
 import type { BusinessBuilderForm } from "./businessDefinition";
 import {

@@ -245,3 +245,45 @@ async def test_compound_expression_correction_flow():
     assert new_call.expression == good_expr
     new_errors = validate_expression(new_call.expression, new_call.steps)
     assert new_errors == []
+
+
+def test_compound_correction_andgate_rejects_invented_structured_field():
+    # Bug-5349 Phase 2/3 (Codex-R3 / Round-4) — the compound expression-correction
+    # retry accepts a corrected call ONLY when BOTH validate_expression AND
+    # validate_tool_call_against_bundle are clean. This pins the AND-gate: a
+    # correction that fixes the combine tree but smuggles an INVENTED field into
+    # a structured WHERE must still be rejected by the bundle validator.
+    from src.planning.validation import validate_tool_call_against_bundle
+    model_id = uuid.uuid4()
+    bundle = types.SimpleNamespace(
+        allow_list_model_ids=[model_id],
+        model_profiles=[types.SimpleNamespace(
+            id=model_id,
+            measure_names=["v"], dimension_names=["country"],
+            filterable_where_names=["country"],
+            sortable_names=["country", "v"],
+        )],
+        persona_scopes=None,
+    )
+    good_expr = _op("div", _ref("a", "v"), _ref("b", "v"))
+    corrected = json.dumps({"compound_query": {
+        "steps": [
+            {"name": "a", "model_id": str(model_id), "measures": ["v"],
+             "dimensions": ["country"],
+             # combine tree is fine, but this base field is invented:
+             "where": [{"left": {"fn": "lower", "args": [{"field": "ghost"}]},
+                        "op": "eq", "right": {"literal": "x"}}],
+             "having": [], "sort": []},
+            {"name": "b", "model_id": str(model_id), "measures": ["v"],
+             "dimensions": ["country"], "where": [], "having": [], "sort": []},
+        ],
+        "expression": good_expr,
+        "result_label": "Ratio",
+    }})
+    new_call = parse_tool_call(corrected)
+    # First gate (combine-tree) is clean...
+    assert validate_expression(new_call.expression, new_call.steps) == []
+    # ...but the second gate (bundle validator) catches the invented field, so
+    # the AND-condition rejects the correction.
+    bundle_issues = validate_tool_call_against_bundle(new_call, bundle)
+    assert any(i.field_name == "ghost" for i in bundle_issues)

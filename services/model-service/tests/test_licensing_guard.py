@@ -126,7 +126,7 @@ async def test_enforcement_on_blocks_at_cap(tmp_path, monkeypatch):
 
 async def test_unactivated_when_enabled_without_license(monkeypatch):
     # enforcement ON but no license -> fail-CLOSED: the unactivated manager DENIES creates
-    # (Bug-5474 fix). Not installing a licence must never grant the full product.
+    # (Bug-5496 fix). Not installing a licence must never grant the full product.
     monkeypatch.setattr(
         licensing_guard,
         "get_settings",
@@ -139,7 +139,7 @@ async def test_unactivated_when_enabled_without_license(monkeypatch):
 
 
 async def test_no_license_enforcement_on_is_unactivated_not_unlimited(monkeypatch):
-    # Regression for Bug-5474 (the breach): enforcement ON + no licence must NOT fall back
+    # Regression for Bug-5496 (the breach): enforcement ON + no licence must NOT fall back
     # to the full product. The manager is the fail-closed unactivated stub that denies every
     # create — so caps can't be bypassed by simply never installing a licence.
     monkeypatch.setattr(
@@ -160,6 +160,32 @@ def test_no_license_enforcement_off_is_full_product(monkeypatch):
     monkeypatch.setattr(licensing_guard, "get_settings", lambda: _settings())
     mgr = licensing_guard.get_license_manager()
     assert mgr.can_create("model", 999).allowed is True
+
+
+async def test_db_lookup_error_falls_back_to_file(tmp_path, monkeypatch):
+    # Regression for Bug-5485: if the system-DB licence lookup raises (e.g. the schema
+    # is not migrated yet — on K8s the migration runs as a post-install Job AFTER the
+    # pods start), load_license_doc_from_db must SWALLOW it and fall through to the
+    # file. Otherwise a file-mounted Community licence never loads and the manager is
+    # stuck unactivated, denying every create even with a valid licence installed.
+    lf, pk = _community_license_file(tmp_path, models=2)
+    monkeypatch.setattr(
+        licensing_guard,
+        "get_settings",
+        lambda: _settings(LICENSE_ENFORCEMENT_ENABLED=True, LICENSE_FILE=lf, LICENSE_PUBLIC_KEYS=pk),
+    )
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("relation \"system_settings\" does not exist")
+        yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(licensing_guard, "get_system_db", _boom)
+    doc = await licensing_guard.load_license_doc_from_db()
+    assert doc is not None and doc.get("license_id"), "file licence must load when the DB errors"
+
+    # end to end: reload from that file -> activated manager that enforces (not unactivated)
+    await licensing_guard.reload_license_manager()
+    assert licensing_guard.get_license_manager().status().get("activated") is True
 
 
 async def test_demo_source_locked_blocks_demo_tenant(tmp_path, monkeypatch):

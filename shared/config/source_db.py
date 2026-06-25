@@ -147,10 +147,28 @@ def resolve_target_schema(
         defaults (but not config ``dataset``) for BigQuery.
     """
     if connector == "bigquery":
+        # BigQuery's "schema" concept is a dataset. The configured target
+        # ``dataset`` wins; if the target config carries neither a dataset nor a
+        # schema, fall back to the system default *dataset* first
+        # (``agg_target.default_dataset``) and only then to the default schema —
+        # otherwise a BQ target with no config dataset would silently resolve to
+        # an empty/PG-shaped value and create the table in an unqualified ref.
+        #
+        # NOTE (behaviour change): the last-resort fallback for BigQuery is
+        # ``target_defaults.get("dataset")`` (the BQ-aware key) BEFORE
+        # ``target_defaults.get("schema")``. This intentionally changed the
+        # resolved dataset for a BQ target that has NO config.dataset, NO
+        # schema_override, and NO config.schema: it previously resolved to the
+        # PG-shaped default_schema (``agg_target.default_schema`` -> "aggregates")
+        # and now resolves to the BQ default_dataset
+        # (``agg_target.default_dataset`` -> "default"). Deployments that relied
+        # on the old PG-named fallback for a BigQuery target should set
+        # ``config.dataset`` explicitly on the target connection.
         schema = (
             target_config.get("dataset")
             or schema_override
             or target_config.get("schema")
+            or target_defaults.get("dataset")
             or target_defaults.get("schema", "")
         )
         bq_project = target_config.get("project_id", "")

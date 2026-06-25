@@ -1207,3 +1207,73 @@ class TestAgentExpressionDimensionContract:
         )
         ir = parse_sql_to_ir(sql, "m1")
         assert ir.has_function_grain is False
+
+    # --- Bug-5349 Phase 2/3 — WHERE / HAVING / projection / CASE expressions ---
+    # The exact SQL the agent-service now emits for these clauses must parse
+    # cleanly and bind to the model. None of these clauses are subqueries / CTEs
+    # / windows, so the parser must NOT flag them complex-SQL-only-via-those
+    # constructs; the function-on-column filters and computed projections route
+    # through the source path. (Engine read-only: no parser/binder/router edit.)
+
+    def test_where_function_on_column_parses(self):
+        # EXTRACT(MONTH FROM d) = 6 in WHERE — function-on-column filter.
+        sql = (
+            'SELECT "country_code", SUM("amount") AS "amount" FROM "modelx" '
+            'WHERE EXTRACT(MONTH FROM "business_date") = 6 '
+            'GROUP BY "country_code" ORDER BY "country_code" ASC LIMIT 101'
+        )
+        ir = parse_sql_to_ir(sql, "m1")
+        assert "country_code" in ir.requested_dimensions
+        assert "amount" in ir.requested_measures
+
+    def test_where_column_to_column_parses(self):
+        sql = (
+            'SELECT SUM("amount") AS "amount" FROM "modelx" '
+            'WHERE "settlement_date" > "transaction_date" LIMIT 101'
+        )
+        ir = parse_sql_to_ir(sql, "m1")
+        assert "amount" in ir.requested_measures
+
+    def test_where_or_not_grouped_predicate_parses(self):
+        sql = (
+            'SELECT SUM("amount") AS "amount" FROM "modelx" '
+            'WHERE ("city" = \'cairo\' OR (NOT "city" IS NULL)) LIMIT 101'
+        )
+        ir = parse_sql_to_ir(sql, "m1")
+        # The OR/NOT grouped predicate parses and the measure binds; the grouped
+        # boolean is not a subquery/CTE/window so it is not engine-complex SQL.
+        assert "amount" in ir.requested_measures
+        assert ir.has_complex_sql is False
+
+    def test_having_ratio_of_aggregates_parses(self):
+        sql = (
+            'SELECT "category", SUM("fees") AS "fees", SUM("amount") AS "amount" '
+            'FROM "modelx" GROUP BY "category" '
+            'HAVING (SUM("fees") / SUM("amount")) > 0.5 '
+            'ORDER BY "category" ASC LIMIT 101'
+        )
+        ir = parse_sql_to_ir(sql, "m1")
+        assert "fees" in ir.requested_measures
+        assert "amount" in ir.requested_measures
+
+    def test_projection_case_bucket_parses(self):
+        # A CASE computed projection alongside a grouping dimension.
+        sql = (
+            'SELECT "category", '
+            'CASE WHEN "amount" > 1000 THEN \'high\' ELSE \'low\' END AS "band" '
+            'FROM "modelx" GROUP BY "category" ORDER BY "category" ASC LIMIT 101'
+        )
+        ir = parse_sql_to_ir(sql, "m1")
+        assert "category" in ir.requested_dimensions
+
+    def test_projection_round_of_sum_parses_as_analytical(self):
+        # ROUND(SUM(amount), 2) — the engine already classifies the scalar
+        # wrapper around an aggregate as analytical (existing contract above).
+        sql = (
+            'SELECT "category", ROUND(SUM("amount"), 2) AS "amt" FROM "modelx" '
+            'GROUP BY "category" ORDER BY "category" ASC LIMIT 101'
+        )
+        ir = parse_sql_to_ir(sql, "m1")
+        assert "amount" in ir.requested_measures
+        analytics = [e for e in ir.select_expressions if e.classification == "analytical"]
+        assert any(e.agg_function == "sum" and e.inner_column == "amount" for e in analytics)

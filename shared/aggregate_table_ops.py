@@ -26,12 +26,15 @@ from shared.config.source_db import (
     resolve_aggregate_target_defaults,
     resolve_target_schema,
 )
+from shared.connection_scope import (
+    CrossProjectConnectionError,
+    resolve_endpoint_connection_for_model,
+)
 from shared.connector_qualify import quote_table_ref
 from shared.db.models import (
     AggregateDefinition,
     AggregateLifecycleEvent,
     DataTarget,
-    ProjectConnection,
 )
 from shared.source_executor import execute_source_ddl, resolve_connector_type
 
@@ -70,11 +73,30 @@ async def drop_aggregate_physical_table(
             agg.id, agg.target_id,
         )
         return False
-    target_conn = await db.get(ProjectConnection, target.project_connection_id)
-    if target_conn is None:
+
+    # Bug-5500 fail-closed: never issue DROP TABLE against a target connection
+    # in a different project than the aggregate's owning model. A legacy/imported
+    # cross-project DataTarget row would otherwise drop a table on another
+    # project's database during retire/cap/purge. Resolve through the shared
+    # connection-scope guard and refuse (no-op) on mismatch; a missing
+    # connection/model is treated like the existing best-effort no-op cleanup.
+    try:
+        target_conn = await resolve_endpoint_connection_for_model(
+            db, target, model_id=agg.model_id
+        )
+    except CrossProjectConnectionError:
+        logger.error(
+            "Refusing to drop physical table for aggregate %s — its target "
+            "connection belongs to a different project than model %s "
+            "(cross-project row rejected fail-closed)",
+            agg.id, agg.model_id,
+        )
+        return False
+    except ValueError:
         logger.warning(
-            "Cannot drop table for aggregate %s — ProjectConnection %s missing",
-            agg.id, target.project_connection_id,
+            "Cannot drop table for aggregate %s — target connection or owning "
+            "model could not be resolved",
+            agg.id,
         )
         return False
 

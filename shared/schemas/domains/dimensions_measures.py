@@ -37,6 +37,14 @@ class DimensionCreate(BaseModel):
     display_folder: Optional[str] = None
     source_table_id: Optional[uuid.UUID] = Field(default=None, description="ModelTable the column belongs to")
     source_column_name: Optional[str] = Field(default=None, description="Column name to resolve to source_column_id")
+    display_column_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Bug-5434: optional DISPLAY column (in the same source table) whose value "
+            "is surfaced as the member caption, distinct from the key column. "
+            "Only valid for a physical-column flat dimension."
+        ),
+    )
     data_type: Optional[str] = Field(default=None, description="Column data type; used to populate ModelColumn metadata")
     user_defined_attribute_id: Optional[uuid.UUID] = Field(default=None, description="User-defined attribute id")
     is_time_dim: bool = False
@@ -65,6 +73,9 @@ class DimensionUpdate(BaseModel):
     display_folder: Optional[str] = None
     source_table_id: Optional[uuid.UUID] = None
     source_column_name: Optional[str] = None
+    # Bug-5434: set to a column name to attach a distinct display column; pass an
+    # empty string / null (explicitly, exclude_unset-tracked) to clear it.
+    display_column_name: Optional[str] = None
     user_defined_attribute_id: Optional[uuid.UUID] = None
     is_time_dim: Optional[bool] = None
     time_grain: Optional[str] = None
@@ -130,6 +141,9 @@ class DimensionResponse(OrmBase):
     is_hidden: bool = False
     source_column_id: Optional[uuid.UUID]
     source_column_name: Optional[str] = None
+    # Bug-5434: distinct display column (caption source) for a flat dimension.
+    display_column_id: Optional[uuid.UUID] = None
+    display_column_name: Optional[str] = None
     data_type: Optional[str] = None
     source_table_id: Optional[uuid.UUID] = None
     source_table_alias: Optional[str] = None

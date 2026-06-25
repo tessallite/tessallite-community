@@ -21,8 +21,9 @@ import { useT } from "../i18n";
 
 const UPGRADE_URL = "https://tessallite.io/register.html";
 
-// Entitlement keys returned by /limits.entitlements. Projects are uncapped, so
-// they are presented as "unlimited" rather than a current/max bar.
+// Entitlement keys returned by /limits.entitlements, paired with the matching
+// current count from /limits.usage. When a cap is null/absent the resource is
+// presented as "unlimited" rather than a current/max bar.
 type LimitRow = {
   labelKey: string;
   used: number | null | undefined;
@@ -111,12 +112,12 @@ export default function LicenseAndEdition() {
   const rows: LimitRow[] = [
     {
       labelKey: "license.row.tenants",
-      used: undefined,
+      used: usage.tenants,
       max: ent.own_tenants as number | undefined,
     },
     {
       labelKey: "license.row.projects",
-      used: undefined,
+      used: usage.projects,
       max: ent.projects_per_own_tenant as number | undefined,
       unlimited: ent.projects_per_own_tenant == null,
     },

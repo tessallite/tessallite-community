@@ -43,6 +43,18 @@ pytestmark = [pytest.mark.integration]
 REL = 1e-6  # relative tolerance for float comparison
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _require_kpi_model(_measures):
+    """Skip the whole KPI module when the active model lacks the KPI measures.
+    These tests assume the dev acme-demo `modelx` (Revenue/net_sales/...); on the
+    demo bundle's `modely` they are absent, so skip cleanly (Bug-5453/5498)."""
+    if "net_sales" not in {m.get("name") for m in _measures}:
+        pytest.skip(
+            "active model lacks KPI measures (net_sales/...) — needs the dev "
+            "acme-demo modelx profile (Bug-5453/5498)"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Reference values via the JDBC gateway (independent of the KPI machinery)
 # ---------------------------------------------------------------------------
@@ -76,9 +88,23 @@ def dim_business_date_id(_dimensions):
 
 def _scalar(jdbc, sql: str) -> float | None:
     cur = jdbc.cursor()
-    cur.execute(sql)
-    row = cur.fetchone()
-    cur.close()
+    try:
+        try:
+            cur.execute(sql)
+        except Exception as exc:  # noqa: BLE001
+            # Profile-portable: these baseline queries reference the dev
+            # acme-demo `modelx` columns (Revenue/net_sales/...). On the demo
+            # bundle's `modely` they don't exist -> skip cleanly instead of
+            # failing (Bug-5453/5498 tracks full demo-bundle portability).
+            if "Unknown column" in str(exc) or "does not exist" in str(exc):
+                pytest.skip(
+                    f"baseline SQL column not on the active model ({exc}) — "
+                    f"needs the dev acme-demo modelx profile (Bug-5453/5498)"
+                )
+            raise
+        row = cur.fetchone()
+    finally:
+        cur.close()
     if row is None or row[0] is None:
         return None
     return float(row[0])

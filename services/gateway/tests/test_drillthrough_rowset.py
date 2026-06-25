@@ -106,7 +106,11 @@ def test_schema_contains_column_definitions():
     xml = build_drillthrough_rowset(["month", "amount"], [])
     assert 'name="month"' in xml
     assert 'name="amount"' in xml
-    assert 'type="string"' in xml
+    # Built-in XSD types must be xs:-prefixed so the inline schema is valid and
+    # Excel/MSOLAP accepts the rowset (Bug-5518); a bare type="string" resolves to
+    # the rowset target namespace where it is undefined.
+    assert 'type="xs:string"' in xml
+    assert 'type="string"' not in xml
 
 
 def test_parseable_xml():

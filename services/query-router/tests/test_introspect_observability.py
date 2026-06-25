@@ -145,7 +145,7 @@ class TestSingleIntrospectFailureLogging:
         async def _capture_log(*args, **kwargs):
             log_calls.append(kwargs if kwargs else {"args": args})
 
-        monkeypatch.setattr("src.api.introspect.load_authorized_model", AsyncMock(return_value=None))
+        monkeypatch.setattr("src.api.introspect.load_authorized_model", AsyncMock(return_value=MagicMock(project_id=uuid.uuid4())))
         monkeypatch.setattr("src.api.introspect.execute_source_sql", AsyncMock(
             side_effect=QueryTimeoutError("timed out"),
         ))
@@ -178,7 +178,7 @@ class TestSingleIntrospectFailureLogging:
         async def _capture_log(*args, **kwargs):
             log_calls.append(kwargs)
 
-        monkeypatch.setattr("src.api.introspect.load_authorized_model", AsyncMock(return_value=None))
+        monkeypatch.setattr("src.api.introspect.load_authorized_model", AsyncMock(return_value=MagicMock(project_id=uuid.uuid4())))
         monkeypatch.setattr("src.api.introspect.execute_source_sql", AsyncMock(
             side_effect=RuntimeError("source exploded"),
         ))
@@ -221,7 +221,7 @@ class TestBatchIntrospectFailureLogging:
                 raise RuntimeError("bad query")
             return ([{"x": 1}], ["x"])
 
-        monkeypatch.setattr("src.api.introspect.load_authorized_model", AsyncMock(return_value=None))
+        monkeypatch.setattr("src.api.introspect.load_authorized_model", AsyncMock(return_value=MagicMock(project_id=uuid.uuid4())))
         monkeypatch.setattr("src.api.introspect.execute_source_sql", _exec_alternating)
         monkeypatch.setattr("src.api.introspect._resolve_model_connection", AsyncMock(
             return_value=(MagicMock(), None),

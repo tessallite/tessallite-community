@@ -362,6 +362,24 @@
         {"name": "DIMENSION_IS_FACT_DIMENSION", "type": "boolean"},
         {"name": "DIMENSION_GRANULARITY", "type": "string"}
       ]
+    },
+    "DISCOVER_CSDL_METADATA": {
+      "columns": [
+        {"name": "Metadata", "type": "string", "required": true}
+      ]
+    },
+    "DISCOVER_CALC_DEPENDENCY": {
+      "columns": [
+        {"name": "OBJECT_TYPE", "type": "string"},
+        {"name": "TABLE", "type": "string"},
+        {"name": "OBJECT", "type": "string"},
+        {"name": "EXPRESSION", "type": "string"},
+        {"name": "REFERENCED_OBJECT_TYPE", "type": "string"},
+        {"name": "REFERENCED_TABLE", "type": "string"},
+        {"name": "REFERENCED_OBJECT", "type": "string"},
+        {"name": "REFERENCED_EXPRESSION", "type": "string"},
+        {"name": "QUERY", "type": "string"}
+      ]
     }
   },
 

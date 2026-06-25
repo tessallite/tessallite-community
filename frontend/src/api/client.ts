@@ -439,7 +439,12 @@ export type EditionStatus = {
 export type EditionLimits = {
   edition?: string;
   entitlements: Record<string, unknown>;
-  usage?: { models?: number | null; users?: number | null };
+  usage?: {
+    models?: number | null;
+    users?: number | null;
+    tenants?: number | null;
+    projects?: number | null;
+  };
 };
 
 export const editionApi = {

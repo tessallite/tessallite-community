@@ -26,6 +26,10 @@ export type ExplorerAction =
   | "project.importExport"
   | "project.toggleActive"
   | "project.delete"
+  // Source connection credentials — admin only (create/test/edit/delete).
+  // Mirrors api/connections.py write routes (require_role("admin")); the
+  // connection list/get stays visible to modeller (require_role("modeler")).
+  | "connection.manage"
   // Project/model setup actions — modeller and above.
   | "project.rename"
   | "project.configDrawer"
@@ -41,6 +45,7 @@ const TENANT_ADMIN_ACTIONS: ReadonlySet<ExplorerAction> = new Set<ExplorerAction
   "project.importExport",
   "project.toggleActive",
   "project.delete",
+  "connection.manage",
 ]);
 
 /**

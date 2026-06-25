@@ -612,28 +612,29 @@ class TestFilterExtraction:
         axis = "Filter({[Region].[Country].Members}, [Measures].[Sales] > 100)"
         spec = _extract_filter_spec(axis, {"Sales"})
         assert spec is not None
-        assert spec.measure == "Sales"
-        assert spec.operator == ">"
-        assert spec.value == "100"
+        assert len(spec.conditions) == 1
+        assert spec.conditions[0].measure == "Sales"
+        assert spec.conditions[0].operator == ">"
+        assert spec.conditions[0].value == "100"
 
     def test_filter_greater_or_equal(self):
         axis = "Filter({[Region].[Country].Members}, [Measures].[Amount] >= 50.5)"
         spec = _extract_filter_spec(axis, {"Amount"})
         assert spec is not None
-        assert spec.operator == ">="
-        assert spec.value == "50.5"
+        assert spec.conditions[0].operator == ">="
+        assert spec.conditions[0].value == "50.5"
 
     def test_filter_less_than(self):
         axis = "Filter({[Region].[Country].Members}, [Measures].[Cost] < 200)"
         spec = _extract_filter_spec(axis, {"Cost"})
         assert spec is not None
-        assert spec.operator == "<"
+        assert spec.conditions[0].operator == "<"
 
     def test_filter_not_equal(self):
         axis = "Filter({[Region].[Country].Members}, [Measures].[Sales] <> 0)"
         spec = _extract_filter_spec(axis, {"Sales"})
         assert spec is not None
-        assert spec.operator == "<>"
+        assert spec.conditions[0].operator == "<>"
 
     def test_filter_measure_not_in_set(self):
         axis = "Filter({[Region].[Country].Members}, [Measures].[Unknown] > 100)"
@@ -644,11 +645,331 @@ class TestFilterExtraction:
         axis = "Filter({[Region].[Country].Members}, [Measures].[sales] > 100)"
         spec = _extract_filter_spec(axis, {"Sales"})
         assert spec is not None
-        assert spec.measure == "sales"
+        assert spec.conditions[0].measure == "sales"
+
+    def test_filter_multiple_conditions_all_captured(self):
+        """Multi-condition filters (the compiler joins with one AND/OR) must
+        capture every predicate and the joining logic — not just the first."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Sales] > 100 AND [Measures].[Cost] < 50)"
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Cost"})
+        assert spec is not None
+        assert spec.logic == "AND"
+        assert len(spec.conditions) == 2
+        assert spec.conditions[0].measure == "Sales"
+        assert spec.conditions[1].measure == "Cost"
+        assert spec.conditions[1].operator == "<"
+        assert spec.conditions[1].value == "50"
+
+    def test_filter_mixed_and_or_rejected(self):
+        """A mixed AND/OR body cannot be flattened to one HAVING without
+        changing membership semantics — defer to the fail-loud guard."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Sales] > 100 AND [Measures].[Cost] < 50 "
+            "OR [Measures].[Revenue] > 10)"
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Cost", "Revenue"})
+        assert spec is None
+
+    def test_filter_unknown_measure_in_multi_defers(self):
+        """If any predicate references an unknown measure the spec is None so
+        the fail-loud guard rejects the whole Filter (no partial translation)."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Sales] > 100 AND [Measures].[Unknown] < 50)"
+        )
+        spec = _extract_filter_spec(axis, {"Sales"})
+        assert spec is None
+
+    def test_filter_multiple_or_conditions_use_or_logic(self):
+        """An all-numeric OR-joined filter keeps OR as the HAVING joiner."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Sales] > 100 OR [Measures].[Cost] < 50)"
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Cost"})
+        assert spec is not None
+        assert spec.logic == "OR"
+        assert len(spec.conditions) == 2
+
+    def test_filter_mixed_numeric_and_string_predicate_defers(self):
+        """A string-valued measure predicate cannot be expressed as an aggregate
+        HAVING threshold; mixing it with a numeric one must NOT silently drop the
+        string clause — the spec is None so the fail-loud guard rejects it."""
+        axis = (
+            'Filter({[Region].[Country].Members}, '
+            '[Measures].[Sales] > 100 AND [Measures].[Grade] = "A")'
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Grade"})
+        assert spec is None
+
+    def test_filter_outer_wrapper_does_not_over_capture_predicate(self):
+        """An outer wrapper carrying its own later argument must not leak that
+        argument into the Filter condition — only predicates inside the Filter
+        call's own parentheses are captured (paren-depth bounded, not rfind)."""
+        axis = (
+            "OuterFn(Filter({[Region].[Country].Members}, "
+            "[Measures].[Sales] > 100), [Measures].[Grade] > 5)"
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Grade"})
+        assert spec is not None
+        assert len(spec.conditions) == 1
+        assert spec.conditions[0].measure == "Sales"
 
     def test_no_filter_in_plain_axis(self):
         axis = "{[Region].[Country].Members}"
         spec = _extract_filter_spec(axis, {"Sales"})
+        assert spec is None
+
+    # -- Bug-5505: wrapped measure operands inside Filter() --------------------
+
+    def test_filter_paren_wrapped_measure_operand(self):
+        """`Filter(set, ([Measures].[net_sales]) > 5)` must translate to the same
+        single-value filter as the bare form, not a SOAP Fault."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "([Measures].[net_sales]) > 5)"
+        )
+        spec = _extract_filter_spec(axis, {"net_sales"})
+        assert spec is not None
+        assert len(spec.conditions) == 1
+        assert spec.conditions[0].measure == "net_sales"
+        assert spec.conditions[0].operator == ">"
+        assert spec.conditions[0].value == "5"
+
+    def test_filter_double_paren_wrapped_measure_operand(self):
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "(( [Measures].[net_sales] )) >= 10)"
+        )
+        spec = _extract_filter_spec(axis, {"net_sales"})
+        assert spec is not None
+        assert spec.conditions[0].operator == ">="
+        assert spec.conditions[0].value == "10"
+
+    def test_filter_function_wrapped_measure_operand(self):
+        """Bug-5523: `Filter(set, CoalesceEmpty([Measures].[m], 0) > 5)` is NOT
+        collapsed to the bare form. It must capture the coalesce default so the
+        HAVING can render `COALESCE(AGG(m), 0) > 5` and reproduce MDX's empty/null
+        handling — for `> 5` the result is identical to bare, but the spec must
+        still carry the default so non-neutral operators (`= 0`, `<= 0`) render
+        correctly through the same path."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "CoalesceEmpty([Measures].[net_sales], 0) > 5)"
+        )
+        spec = _extract_filter_spec(axis, {"net_sales"})
+        assert spec is not None
+        assert len(spec.conditions) == 1
+        assert spec.conditions[0].measure == "net_sales"
+        assert spec.conditions[0].operator == ">"
+        assert spec.conditions[0].value == "5"
+        assert spec.conditions[0].coalesce_default == "0"
+
+    def test_filter_wrapped_unknown_measure_still_defers(self):
+        """A wrapped operand referencing an unknown measure must still defer to
+        the fail-loud guard (no partial / wrong translation)."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "CoalesceEmpty([Measures].[Unknown], 0) > 5)"
+        )
+        spec = _extract_filter_spec(axis, {"net_sales"})
+        assert spec is None
+
+    def test_filter_wrapped_multi_condition_all_captured(self):
+        """Wrapped operands joined with AND must each translate, mirroring the
+        bare multi-condition path."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "([Measures].[Sales]) > 100 AND CoalesceEmpty([Measures].[Cost], 0) < 50)"
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Cost"})
+        assert spec is not None
+        assert spec.logic == "AND"
+        assert len(spec.conditions) == 2
+        assert {c.measure for c in spec.conditions} == {"Sales", "Cost"}
+        by_measure = {c.measure: c for c in spec.conditions}
+        # Bug-5523: the paren-wrapped Sales operand is neutral (no default); the
+        # CoalesceEmpty Cost operand must preserve its default for the HAVING.
+        assert by_measure["Sales"].coalesce_default is None
+        assert by_measure["Cost"].coalesce_default == "0"
+
+    def test_set_wrapped_axis_measure_not_unwrapped(self):
+        """A genuine set-wrapped axis measure `{[Measures].[m]}` is never adjacent
+        to a comparison operator, so it must NOT be collapsed into a predicate."""
+        from src.dax.xmla_server import _normalize_wrapped_filter_operands
+        cond = "{[Measures].[net_sales]}"
+        assert _normalize_wrapped_filter_operands(cond) == cond
+
+    # Bug-5523 hardening (Codex finding): an unconsumed CoalesceEmpty-on-a-measure
+    # operand on the RIGHT of the comparison, in a reversed value-op-function form,
+    # or NESTED inside another scalar function must make the whole Filter() fail
+    # loud (None spec → SOAP fault in `_mdx_to_sql`). The earlier guard only
+    # detected a coalesce IMMEDIATELY followed by an operator, so a DIFFERENT bare
+    # predicate could be extracted and the coalesce silently dropped — a
+    # partial/wrong spec instead of a fail-loud rejection.
+
+    def test_filter_coalesce_on_right_with_bare_left_fails_loud(self):
+        """Case 1: a bare `[Sales] > 0` AND a coalesce on the RIGHT of the
+        comparison (`5 < CoalesceEmpty([Cost], 0)`). The bare predicate must NOT be
+        extracted on its own while the coalesce predicate is dropped — the whole
+        Filter() must fail loud."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Sales] > 0 AND 5 < CoalesceEmpty([Measures].[Cost], 0))"
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Cost"})
+        assert spec is None
+
+    def test_filter_reversed_value_op_coalesce_fails_loud(self):
+        """Case 2: a reversed `value op CoalesceEmpty([m], d)` form. The coalesce
+        numeric matcher only consumes the `Coalesce(m, d) op value` order, so this
+        operand is unconsumed and must fail loud rather than yield an empty/partial
+        spec."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "5 < CoalesceEmpty([Measures].[Cost], 0))"
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Cost"})
+        assert spec is None
+
+    # Bug-5523 (Codex round 3): the WHOLE-CONDITION CONSUMED-SPAN CHECK. The
+    # earlier per-shape occurrence count guards only counted coalesce/bare
+    # comparisons *on a measure*, so a coalesce on a NON-measure attribute, an
+    # unhandled scalar function, or any other sub-condition under AND/OR could be
+    # left UNCONSUMED while a recognised predicate was still returned — a partial
+    # spec that silently dropped the unrecognised clause. The consumed-span check
+    # blanks every recognised predicate, strips only AND/OR/parens/whitespace, and
+    # rejects any residual content, closing the whole leak class.
+
+    def test_filter_coalesce_on_non_measure_attribute_fails_loud(self):
+        """Codex round 3 headline case: `[Sales] > 0 AND CoalesceEmpty([Dim].[Attr],
+        0) > 5`. The coalesce is on a NON-measure attribute, which the coalesce
+        matcher (measure-only) never consumes — the earlier count guard counted only
+        coalesce-on-a-measure and so left this clause unconsumed while returning a
+        partial Sales-only spec. The consumed-span check must now reject the whole
+        Filter() (None spec → SOAP fault)."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Sales] > 0 AND CoalesceEmpty([Dim].[Attr], 0) > 5)"
+        )
+        spec = _extract_filter_spec(axis, {"Sales"})
+        assert spec is None
+
+    def test_filter_bare_left_and_coalesce_right_fails_loud(self):
+        """`[Sales] > 0 AND 5 < CoalesceEmpty([Measures].[Cost], 0)` — the coalesce
+        sits on the RIGHT of the comparison (reversed order the matcher cannot
+        consume). The Sales clause alone must NOT be returned; the consumed-span
+        check leaves the reversed-coalesce text as residual and fails loud."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Sales] > 0 AND 5 < CoalesceEmpty([Measures].[Cost], 0))"
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Cost"})
+        assert spec is None
+
+    def test_filter_nested_coalesce_in_scalar_function_fails_loud(self):
+        """A coalesce NESTED inside another scalar function
+        (`Abs(CoalesceEmpty([m], 0)) > 5`) is not a recognised predicate shape; the
+        `Abs(...)` wrapper survives as residual and the whole Filter() fails loud."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "Abs(CoalesceEmpty([Measures].[Cost], 0)) > 5)"
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Cost"})
+        assert spec is None
+
+    def test_filter_and_with_unhandled_scalar_function_fails_loud(self):
+        """An AND where one side is an unrecognised scalar-function comparison
+        (`Abs([Measures].[Cost]) > 5`) must fail loud — only the bare Sales clause is
+        consumed, the `Abs(...)` comparison is residual."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Sales] > 0 AND Abs([Measures].[Cost]) > 5)"
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Cost"})
+        assert spec is None
+
+    def test_filter_and_with_dimension_member_predicate_fails_loud(self):
+        """An AND with a dimension-attribute comparison that is not a measure
+        threshold (`[Dim].[Attr] = "X"`) leaves a residual member reference and must
+        fail loud rather than translate only the Sales clause."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            '[Measures].[Sales] > 0 AND [Dim].[Attr] = "X")'
+        )
+        spec = _extract_filter_spec(axis, {"Sales"})
+        assert spec is None
+
+    def test_filter_or_with_unrecognised_side_fails_loud(self):
+        """The leak class is not AND-specific: an OR where one side is unrecognised
+        (`CoalesceEmpty([Dim].[Attr], 0) > 5`) must also fail loud."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Sales] > 0 OR CoalesceEmpty([Dim].[Attr], 0) > 5)"
+        )
+        spec = _extract_filter_spec(axis, {"Sales"})
+        assert spec is None
+
+    def test_filter_consumed_span_check_keeps_supported_multi_coalesce(self):
+        """No false fail-loud regression: a multi-condition AND of a bare measure
+        and a measure-coalesce predicate (a form already supported) must still
+        succeed with the consumed-span check in place."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Sales] > 100 AND CoalesceEmpty([Measures].[Cost], 0) < 50)"
+        )
+        spec = _extract_filter_spec(axis, {"Sales", "Cost"})
+        assert spec is not None
+        assert spec.logic == "AND"
+        assert len(spec.conditions) == 2
+        by_measure = {c.measure: c for c in spec.conditions}
+        assert by_measure["Sales"].coalesce_default is None
+        assert by_measure["Cost"].coalesce_default == "0"
+
+    def test_filter_measure_name_with_embedded_and_or_not_a_joiner(self):
+        """A measure name that literally contains a standalone AND/OR word
+        (`[Net AND Gross]`, `[Sub OR Total]`) must NOT be read as a boolean joiner.
+        Both the residual check and the AND/OR joiner detection read from the
+        span-blanked condition, so the bracket-embedded keyword (inside a consumed
+        predicate span) is already blanked and cannot poison `logic_tokens` into a
+        spurious mixed-AND/OR rejection."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Net AND Gross] > 5 OR [Measures].[Sub OR Total] < 9)"
+        )
+        spec = _extract_filter_spec(axis, {"Net AND Gross", "Sub OR Total"})
+        assert spec is not None
+        # The only genuine joiner is the OR between the two predicates.
+        assert spec.logic == "OR"
+        assert len(spec.conditions) == 2
+        assert {c.measure for c in spec.conditions} == {"Net AND Gross", "Sub OR Total"}
+
+    def test_filter_single_measure_name_with_embedded_and_keeps_and_default(self):
+        """A single predicate on a measure whose name contains a standalone `AND`
+        word must still produce a spec (default joiner AND, no second condition)."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "[Measures].[Net AND Gross] > 5)"
+        )
+        spec = _extract_filter_spec(axis, {"Net AND Gross"})
+        assert spec is not None
+        assert spec.logic == "AND"
+        assert len(spec.conditions) == 1
+        assert spec.conditions[0].measure == "Net AND Gross"
+
+    def test_filter_coalesce_nested_in_function_fails_loud(self):
+        """Case 3: a CoalesceEmpty nested inside another scalar function
+        (`Abs(CoalesceEmpty([m], 0)) > 5`). The aggregate HAVING cannot express the
+        outer function, so the operand is unconsumed and must fail loud."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "Abs(CoalesceEmpty([Measures].[m], 0)) > 5)"
+        )
+        spec = _extract_filter_spec(axis, {"m"})
         assert spec is None
 
 
@@ -729,6 +1050,133 @@ class TestTopNFilterFailLoud:
         )
         with pytest.raises(ValueError, match="Filter"):
             _mdx_to_sql(mdx, self._MEAS, self._DIMS, model_slug="demo")
+
+
+# ---------------------------------------------------------------------------
+# Bug-5523 — CoalesceEmpty filter must preserve null/empty semantics
+# ---------------------------------------------------------------------------
+
+class TestCoalesceEmptyFilterSemantics:
+    """A `CoalesceEmpty([Measures].[m], d) op value` operand replaces an
+    empty/null measure cell with `d` BEFORE the comparison in MDX, so a group
+    whose aggregate is NULL is tested as `d op value`. The earlier Bug-5505 fix
+    stripped the wrapper to a bare `AGG(m) op value`, which evaluates NULL groups
+    as unknown (excluded) — a different-cardinality result for `= 0`, `<= 0`,
+    `< d`. The fix renders `COALESCE(AGG(m), d) op value` so SQL reproduces the
+    MDX semantics for every operator.
+    """
+
+    _MEAS = [{"name": "net_sales", "default_agg": "sum"}]
+    _DIMS = [{"name": "Country"}]
+
+    def _sql(self, cond: str) -> str:
+        from src.dax.xmla_server import _mdx_to_sql
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            f"Filter({{[Country].[Country].[Country].Members}}, {cond}) ON ROWS "
+            "FROM [demo]"
+        )
+        sql, proto = _mdx_to_sql(mdx, self._MEAS, self._DIMS, model_slug="demo")
+        assert proto == "jdbc"
+        return sql
+
+    def test_coalesce_eq_zero_includes_null_groups(self):
+        """`= 0` is NOT neutral: MDX keeps NULL/empty groups (default 0 = 0). The
+        HAVING must wrap the aggregate in COALESCE so those groups survive — a
+        bare `SUM(...) = 0` would wrongly exclude them."""
+        sql = self._sql("CoalesceEmpty([Measures].[net_sales], 0) = 0")
+        assert "HAVING" in sql
+        assert 'COALESCE(SUM("net_sales"), 0) = 0' in sql
+        # Must NOT degrade to the unsafe bare rewrite.
+        assert 'HAVING SUM("net_sales") = 0' not in sql
+
+    def test_coalesce_leq_zero_includes_null_groups(self):
+        """`<= 0` is NOT neutral with default 0 — same COALESCE requirement."""
+        sql = self._sql("CoalesceEmpty([Measures].[net_sales], 0) <= 0")
+        assert 'COALESCE(SUM("net_sales"), 0) <= 0' in sql
+        assert 'HAVING SUM("net_sales") <= 0' not in sql
+
+    def test_coalesce_gt_five_neutral_still_renders_coalesce(self):
+        """`> 5` happens to be neutral (default 0 excludes NULL groups either
+        way), but the fix renders COALESCE uniformly — correct for both cases and
+        never the unsafe assumption-dependent rewrite."""
+        sql = self._sql("CoalesceEmpty([Measures].[net_sales], 0) > 5")
+        assert 'COALESCE(SUM("net_sales"), 0) > 5' in sql
+
+    def test_coalesce_nonzero_default_rendered(self):
+        """A non-zero coalesce default must flow through to the HAVING unchanged."""
+        sql = self._sql("CoalesceEmpty([Measures].[net_sales], 7) >= 7")
+        assert 'COALESCE(SUM("net_sales"), 7) >= 7' in sql
+
+    def test_coalesce_nonnumeric_default_fails_loud(self):
+        """A non-numeric coalesce default cannot be expressed as an aggregate
+        threshold; rather than silently mistranslate, the whole Filter must
+        fail loud (the 'Unsupported Filter() usage' SOAP fault)."""
+        from src.dax.xmla_server import _mdx_to_sql
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "Filter({[Country].[Country].[Country].Members}, "
+            'CoalesceEmpty([Measures].[net_sales], "x") = 0) ON ROWS '
+            "FROM [demo]"
+        )
+        with pytest.raises(ValueError, match="Filter"):
+            _mdx_to_sql(mdx, self._MEAS, self._DIMS, model_slug="demo")
+
+    def test_coalesce_on_right_with_bare_left_raises_soap_fault(self):
+        """Bug-5523 hardening (Codex case 1): a bare predicate must NOT be
+        extracted on its own while an unconsumed coalesce on the RIGHT of the
+        comparison is silently dropped. The whole Filter() must raise the
+        'Unsupported Filter() usage' SOAP fault, never emit a partial HAVING."""
+        from src.dax.xmla_server import _mdx_to_sql
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "Filter({[Country].[Country].[Country].Members}, "
+            "[Measures].[net_sales] > 0 AND 5 < CoalesceEmpty([Measures].[net_sales], 0)) "
+            "ON ROWS FROM [demo]"
+        )
+        with pytest.raises(ValueError, match="Filter"):
+            _mdx_to_sql(mdx, self._MEAS, self._DIMS, model_slug="demo")
+
+    def test_coalesce_reversed_value_op_fn_raises_soap_fault(self):
+        """Bug-5523 hardening (Codex case 2): a reversed `value op
+        CoalesceEmpty([m], d)` form is unconsumed and must fail loud."""
+        from src.dax.xmla_server import _mdx_to_sql
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "Filter({[Country].[Country].[Country].Members}, "
+            "5 < CoalesceEmpty([Measures].[net_sales], 0)) "
+            "ON ROWS FROM [demo]"
+        )
+        with pytest.raises(ValueError, match="Filter"):
+            _mdx_to_sql(mdx, self._MEAS, self._DIMS, model_slug="demo")
+
+    def test_coalesce_nested_in_function_raises_soap_fault(self):
+        """Bug-5523 hardening (Codex case 3): a CoalesceEmpty nested inside another
+        scalar function (`Abs(CoalesceEmpty([m], 0)) > 5`) cannot be expressed by
+        the aggregate HAVING and must fail loud."""
+        from src.dax.xmla_server import _mdx_to_sql
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "Filter({[Country].[Country].[Country].Members}, "
+            "Abs(CoalesceEmpty([Measures].[net_sales], 0)) > 5) "
+            "ON ROWS FROM [demo]"
+        )
+        with pytest.raises(ValueError, match="Filter"):
+            _mdx_to_sql(mdx, self._MEAS, self._DIMS, model_slug="demo")
+
+    def test_coalesce_spec_carries_default_eq_zero(self):
+        """Unit-level: the extracted spec keeps the default and the raw operator
+        for `= 0`, so the HAVING render is driven by real semantics."""
+        axis = (
+            "Filter({[Region].[Country].Members}, "
+            "CoalesceEmpty([Measures].[net_sales], 0) = 0)"
+        )
+        spec = _extract_filter_spec(axis, {"net_sales"})
+        assert spec is not None
+        assert len(spec.conditions) == 1
+        assert spec.conditions[0].operator == "="
+        assert spec.conditions[0].value == "0"
+        assert spec.conditions[0].coalesce_default == "0"
 
 
 # ---------------------------------------------------------------------------
@@ -1329,3 +1777,122 @@ class TestMemberKeyBracketEscape:
         )
         assert filters["city"] == ["Ber]lin"]
         assert filters["country"] == ["DE"]
+
+
+# ---------------------------------------------------------------------------
+# Bug-5514 — per-level .Members enumeration must return the requested level's
+# grain, not the hierarchy leaf. The failing client form is the TWO-bracket
+# abbreviation [Hierarchy].[Level].Members (Excel/Power BI collapse the
+# canonical three-bracket [Dim].[Dim].[Level] when dim and hierarchy share a
+# name). Each level's grain is a distinct backing dimension/column, so a level
+# request must group by that level's key — Year -> d_year, Quarter -> d_qoy,
+# Month -> d_moy, Date -> d_date (leaf).
+# ---------------------------------------------------------------------------
+
+class TestBug5514LevelGrainEnumeration:
+    # UDA-backed time hierarchy: each level maps to its own grain dimension.
+    UDA_LEVEL_DIM_MAP = {
+        "sales_date_hierarchy": {
+            "year": "d_year",
+            "quarter": "d_qoy",
+            "month": "d_moy",
+            "date": "d_date",
+        },
+    }
+    # Leaf (deepest) level is the default for a bare hierarchy reference.
+    UDA_DEFAULT_DIM_MAP = {"sales_date_hierarchy": "d_date"}
+    UDA_DIM_NAMES = {
+        "Sales_Date_Hierarchy", "d_year", "d_qoy", "d_moy", "d_date", "year",
+    }
+
+    # Physical-column hierarchy: levels resolve straight to physical columns.
+    PHYS_LEVEL_DIM_MAP = {
+        "sales date (physical)": {
+            "year": "d_year",
+            "quarter": "d_qoy",
+            "month": "d_moy",
+            "date": "d_date",
+        },
+    }
+    PHYS_DEFAULT_DIM_MAP = {"sales date (physical)": "d_date"}
+    PHYS_DIM_NAMES = {
+        "Sales Date (physical)", "d_year", "d_qoy", "d_moy", "d_date",
+    }
+
+    def _dims(self, expr, dim_names, level_map, default_map):
+        from src.dax.xmla_server import _mdx_extract_dimensions
+        return _mdx_extract_dimensions(
+            expr,
+            dim_names=dim_names,
+            hierarchy_level_dim_map=level_map,
+            hierarchy_default_dim_map=default_map,
+        )
+
+    def test_two_bracket_year_level_resolves_to_year_grain_uda(self):
+        dims = self._dims(
+            "[Sales_Date_Hierarchy].[Year].Members",
+            self.UDA_DIM_NAMES, self.UDA_LEVEL_DIM_MAP, self.UDA_DEFAULT_DIM_MAP,
+        )
+        # Year level must group by d_year, NOT the leaf d_date.
+        assert dims == ["d_year"]
+        assert "d_date" not in dims
+
+    def test_two_bracket_quarter_level_resolves_to_quarter_grain_uda(self):
+        dims = self._dims(
+            "[Sales_Date_Hierarchy].[Quarter].Members",
+            self.UDA_DIM_NAMES, self.UDA_LEVEL_DIM_MAP, self.UDA_DEFAULT_DIM_MAP,
+        )
+        assert dims == ["d_qoy"]
+
+    def test_two_bracket_month_level_resolves_to_month_grain_uda(self):
+        dims = self._dims(
+            "[Sales_Date_Hierarchy].[Month].Members",
+            self.UDA_DIM_NAMES, self.UDA_LEVEL_DIM_MAP, self.UDA_DEFAULT_DIM_MAP,
+        )
+        assert dims == ["d_moy"]
+
+    def test_two_bracket_year_level_resolves_to_year_grain_physical(self):
+        dims = self._dims(
+            "[Sales Date (physical)].[Year].Members",
+            self.PHYS_DIM_NAMES, self.PHYS_LEVEL_DIM_MAP, self.PHYS_DEFAULT_DIM_MAP,
+        )
+        assert dims == ["d_year"]
+        assert "d_date" not in dims
+
+    def test_three_bracket_level_form_still_resolves_to_level_grain(self):
+        # Canonical MDSCHEMA form must keep working (no regression).
+        dims = self._dims(
+            "[Sales_Date_Hierarchy].[Sales_Date_Hierarchy].[Year].Members",
+            self.UDA_DIM_NAMES, self.UDA_LEVEL_DIM_MAP, self.UDA_DEFAULT_DIM_MAP,
+        )
+        assert dims == ["d_year"]
+
+    def test_bare_hierarchy_reference_still_resolves_to_leaf_default(self):
+        # A bare [Hierarchy].Members (no level) must still resolve to the leaf
+        # grain — the fix must not hijack the default-member path.
+        dims = self._dims(
+            "[Sales_Date_Hierarchy].Members",
+            self.UDA_DIM_NAMES, self.UDA_LEVEL_DIM_MAP, self.UDA_DEFAULT_DIM_MAP,
+        )
+        assert dims == ["d_date"]
+
+    def test_flat_dim_members_unaffected(self):
+        # CONTROL: a flat dimension [year].[year].Members must keep resolving to
+        # its own grain regardless of the level-grain fix.
+        dims = self._dims(
+            "[year].[year].Members",
+            self.UDA_DIM_NAMES, self.UDA_LEVEL_DIM_MAP, self.UDA_DEFAULT_DIM_MAP,
+        )
+        assert dims == ["year"]
+
+    def test_second_segment_not_a_level_falls_back_to_dim(self):
+        # [Hierarchy].[NotALevel] where the 2nd segment is neither a level nor a
+        # known hierarchy must fall back to the hierarchy's own dim name.
+        dims = self._dims(
+            "[Sales_Date_Hierarchy].[Bogus].Members",
+            self.UDA_DIM_NAMES, self.UDA_LEVEL_DIM_MAP, self.UDA_DEFAULT_DIM_MAP,
+        )
+        # Falls through to the hierarchy's own dim name (legacy behaviour) — the
+        # fix only activates when the 2nd segment is a real level of the
+        # hierarchy named in the 1st segment.
+        assert dims == ["Sales_Date_Hierarchy"]

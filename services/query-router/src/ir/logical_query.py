@@ -105,6 +105,19 @@ class BoundQuery:
     # security audit to validate SELECT * results where the source DB
     # returns physical names rather than semantic dimension/measure names.
     allowed_physical_columns: set[str] = field(default_factory=set)
+    # Bug-5488: canonical model DIMENSION names referenced ONLY inside an
+    # unresolvable WHERE predicate (a function-wrapped or OR-compound shape
+    # that the parser's strict ``_extract_filters`` cannot turn into a
+    # ``LogicalFilter``). The binder collects these by walking the raw WHERE
+    # AST so the source rewriter can load their physical columns and join
+    # their tables even though they never appear in ``resolved_filters``,
+    # SELECT, or ORDER BY. Kept separate from ``resolved_filters`` so it does
+    # NOT feed the aggregate/pocket matchers, miss-log fingerprint, security
+    # audit, or rendered WHERE — only the source-path column/table collection.
+    # Dimensions only: a measure referenced solely in the WHERE cannot be
+    # resolved by the source path's dimension-backfill, so it is excluded (see
+    # ``_collect_where_referenced_fields``).
+    where_referenced_dimensions: set[str] = field(default_factory=set)
 
 
 @dataclass

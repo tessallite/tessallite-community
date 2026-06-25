@@ -52,6 +52,7 @@ import type {
 } from "../../api/types";
 import PersonaPicker from "../Persona/PersonaPicker";
 import PipelineDiagram from "../Builder/PipelineDiagram";
+import UnsavedDeployWarning from "../Builder/UnsavedDeployWarning";
 import SqlQueryEditor, { formatSql } from "../Sql/SqlQueryEditor";
 import { TIME_VARIANT_NAMES } from "../../constants/timeVariants";
 import CalendarBindingHint from "../CalendarBindingHint";
@@ -400,6 +401,7 @@ export default function QueryPanel() {
 
   return (
     <Stack spacing={1.5}>
+      <UnsavedDeployWarning />
       <CalendarBindingHint context="query" />
       {variantBaseMeasures.length > 0 && (
         <Box>

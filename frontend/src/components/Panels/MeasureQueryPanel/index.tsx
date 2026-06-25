@@ -75,6 +75,7 @@ import {
 import type { CellCoord, DrillContext, Slicer } from "./types";
 import { PIVOT_MAX_CELLS } from "./types";
 import CalendarBindingHint from "../../CalendarBindingHint";
+import UnsavedDeployWarning from "../../Builder/UnsavedDeployWarning";
 import { useT } from "../../../i18n";
 
 function extractError(err: unknown, requestFailedMsg: string): string {
@@ -946,6 +947,7 @@ export default function MeasureQueryPanel() {
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", height: "100%", p: 1, gap: 1 }}>
+      <UnsavedDeployWarning />
       <CalendarBindingHint context="pivot" />
 
       <Paper

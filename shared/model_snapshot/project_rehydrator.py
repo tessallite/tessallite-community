@@ -23,10 +23,12 @@ from shared.db.models import (
     AgentConversation,
     AgentJudgeRubric,
     AgentWebhookDlq,
+    AggregateDefinition,
     LLMProviderConfig,
     LocalUser,
     Model,
     Persona,
+    PocketDefinition,
     Project,
     ProjectAgentConfig,
     ProjectAgentModel,
@@ -34,6 +36,9 @@ from shared.db.models import (
     ProjectConnection,
     ProjectCrossModelRecipe,
     ProjectSetting,
+    QueryLog,
+    QueryMissLog,
+    RouteLog,
     UserAccessBinding,
 )
 from shared.model_snapshot.cascade_delete import delete_model_cascade
@@ -105,6 +110,87 @@ async def _count_rows(
         .where(model_cls.project_id == project_id)
     )
     return int(result.scalar_one() or 0)
+
+
+async def _count_rows_by_model(
+    tenant_db: AsyncSession, model_cls: Any, model_id: UUID
+) -> int:
+    result = await tenant_db.execute(
+        select(func.count())
+        .select_from(model_cls)
+        .where(model_cls.model_id == model_id)
+    )
+    return int(result.scalar_one() or 0)
+
+
+async def _model_cascade_counts(
+    tenant_db: AsyncSession, project_id: UUID
+) -> dict[str, Any]:
+    """Per-model cascade row volume that ``delete_model_cascade`` would remove.
+
+    Bug-4263: ``delete_counts["models"]`` reports only how many model rows a
+    replace deletes — it understates blast radius because each replaced model
+    cascades away its aggregates, pockets and query/route logs. This counts the
+    high-volume child tables per model so the dry-run plan shows the true
+    deletion scope.
+
+    Runs on the (non-hot) dry-run preview path only. ``route_logs`` has no
+    ``model_id`` column; it is reached through ``query_logs`` exactly as the
+    cascade SQL does, so its count mirrors what the delete removes.
+    """
+    rows = (await tenant_db.execute(
+        select(Model.id, Model.slug, Model.display_name)
+        .where(Model.project_id == project_id)
+    )).all()
+
+    per_model: list[dict[str, Any]] = []
+    totals = {
+        "aggregates": 0,
+        "pockets": 0,
+        "query_logs": 0,
+        "query_miss_logs": 0,
+        "route_logs": 0,
+    }
+    for model_id, slug, display_name in rows:
+        aggregates = await _count_rows_by_model(
+            tenant_db, AggregateDefinition, model_id
+        )
+        pockets = await _count_rows_by_model(
+            tenant_db, PocketDefinition, model_id
+        )
+        query_logs = await _count_rows_by_model(tenant_db, QueryLog, model_id)
+        query_miss_logs = await _count_rows_by_model(
+            tenant_db, QueryMissLog, model_id
+        )
+        # route_logs reach a model via query_logs.id (no direct model_id),
+        # matching the cascade-delete subquery.
+        route_logs = int((await tenant_db.execute(
+            select(func.count())
+            .select_from(RouteLog)
+            .where(
+                RouteLog.query_log_id.in_(
+                    select(QueryLog.id).where(QueryLog.model_id == model_id)
+                )
+            )
+        )).scalar_one() or 0)
+
+        counts = {
+            "aggregates": aggregates,
+            "pockets": pockets,
+            "query_logs": query_logs,
+            "query_miss_logs": query_miss_logs,
+            "route_logs": route_logs,
+        }
+        for key, value in counts.items():
+            totals[key] += value
+        per_model.append({
+            "model_id": str(model_id),
+            "slug": slug,
+            "display_name": display_name,
+            "counts": counts,
+        })
+
+    return {"per_model": per_model, "totals": totals}
 
 
 def _incoming_counts(bundle: dict[str, Any], included: set[str]) -> dict[str, int]:
@@ -341,6 +427,8 @@ async def plan_project_import(
 
     project_id: UUID | None = None
     delete_counts: dict[str, int] = {}
+    # Bug-4263: cascade row volume the replace would delete per model.
+    model_cascade_counts: dict[str, Any] = {"per_model": [], "totals": {}}
 
     if mode == "create":
         if project is not None:
@@ -356,6 +444,9 @@ async def plan_project_import(
         project_id = project.id
         delete_counts = await _replace_delete_counts(
             tenant_db, project_id, included
+        )
+        model_cascade_counts = await _model_cascade_counts(
+            tenant_db, project_id
         )
     else:
         raise ProjectImportError(f"Unknown import mode: {mode!r}")
@@ -398,6 +489,7 @@ async def plan_project_import(
         "will_create_project": mode == "create",
         "will_replace_project": mode == "replace",
         "delete_counts": delete_counts,
+        "model_cascade_counts": model_cascade_counts,
         "incoming_counts": _incoming_counts(bundle, included),
         "connection_actions": connection_actions,
         "model_slugs": model_slugs,

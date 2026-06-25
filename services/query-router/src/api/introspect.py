@@ -26,6 +26,10 @@ from shared.auth.middleware import (
     require_capability,
 )
 from shared.auth.project_access import load_authorized_model
+from shared.connection_scope import (
+    CrossProjectConnectionError,
+    resolve_endpoint_connection,
+)
 from shared.db.models import DataSource, ProjectConnection, QueryLog
 from shared.db.session import get_tenant_db
 from shared.source_executor import QueryTimeoutError, execute_source_sql
@@ -124,6 +128,7 @@ class IntrospectBatchResponse(BaseModel):
 
 async def _resolve_model_connection(
     db, model_id: str, source_id: str | None = None,
+    *, expected_project_id=None,
 ) -> tuple[ProjectConnection | None, str | None]:
     if source_id:
         source = await db.get(DataSource, UUID(source_id))
@@ -137,8 +142,25 @@ async def _resolve_model_connection(
         ).scalar_one_or_none()
         if source is None:
             return None, "No data source configured for this model."
-    conn = await db.get(ProjectConnection, source.project_connection_id)
-    if conn is None:
+    # Bug-5325: read-time fail-closed defense via the shared resolver (single
+    # source of truth shared with the model-service read sites and the
+    # normal-query / aggregate-target / pocket-target execution paths). A
+    # legacy/imported source row whose project_connection_id points at a
+    # connection in a DIFFERENT project must NOT be used to execute
+    # introspection against another project's source. expected_project_id is the
+    # model's project (from load_authorized_model in the caller).
+    if expected_project_id is None:
+        # Defensive: callers always pass the model's project_id. Refuse to
+        # resolve a connection without a project to validate against rather
+        # than fall back to an unchecked lookup.
+        return None, "Cannot resolve source connection without model project."
+    try:
+        conn = await resolve_endpoint_connection(
+            db, source, expected_project_id=expected_project_id
+        )
+    except CrossProjectConnectionError:
+        return None, "Source connection belongs to a different project."
+    except ValueError:
         return None, "Project connection for model source was not found."
     return conn, None
 
@@ -187,7 +209,7 @@ async def introspect_query(
     _assert_read_only(body.raw_sql)
 
     async for db in get_tenant_db(current_user.tenant_id):
-        await load_authorized_model(
+        model = await load_authorized_model(
             db,
             current_user,
             model_id=body.model_id,
@@ -195,6 +217,7 @@ async def introspect_query(
         )
         conn_obj, err = await _resolve_model_connection(
             db, body.model_id, source_id=body.source_id,
+            expected_project_id=model.project_id,
         )
         if err or conn_obj is None:
             raise HTTPException(status_code=422, detail=err or "Connection not found")
@@ -254,7 +277,7 @@ async def introspect_batch(
         _assert_read_only(item.raw_sql)
 
     async for db in get_tenant_db(current_user.tenant_id):
-        await load_authorized_model(
+        model = await load_authorized_model(
             db,
             current_user,
             model_id=body.model_id,
@@ -262,6 +285,7 @@ async def introspect_batch(
         )
         conn_obj, err = await _resolve_model_connection(
             db, body.model_id, source_id=body.source_id,
+            expected_project_id=model.project_id,
         )
         if err or conn_obj is None:
             raise HTTPException(status_code=422, detail=err or "Connection not found")

@@ -1106,10 +1106,42 @@ def test_task_preamble_all_examples_have_limit():
     # only fires when the limit is defaulted, so teaching a default limit there
     # would clip long trends (Bug-5349 Example G/H).
     from src.prompt.assembler import _TASK_PREAMBLE
-    import re
-    outputs = re.findall(r'Output: (\{.*?\})\}', _TASK_PREAMBLE, re.DOTALL)
-    for output in outputs:
-        full = output + "}"
+
+    def _balanced_objects(text: str) -> list[str]:
+        # Extract each complete, brace-balanced JSON object that follows an
+        # "Output: " marker. A non-greedy regex truncates deeply-nested example
+        # JSON (Bug-5349 structured WHERE/HAVING/projection examples), so balance
+        # the braces explicitly instead.
+        out: list[str] = []
+        idx = 0
+        marker = "Output: {"
+        while True:
+            start = text.find(marker, idx)
+            if start == -1:
+                break
+            brace_start = start + len(marker) - 1
+            depth = 0
+            i = brace_start
+            while i < len(text):
+                ch = text[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        out.append(text[brace_start : i + 1])
+                        break
+                i += 1
+            idx = i + 1
+        return out
+
+    outputs = _balanced_objects(_TASK_PREAMBLE)
+    assert outputs, "no Output examples found in task preamble"
+    for full in outputs:
+        # Expression examples (grain shorthand, {"expr":..} projection/dimension)
+        # intentionally OMIT limit: a date-grained trend relies on the Bug-5351
+        # trend floor, which only fires when the limit is defaulted (Example
+        # G/H/L). All other examples must carry an explicit limit.
         if '"grain"' in full or '"expr"' in full:
             assert '"limit"' not in full, (
                 f"Expression-dimension example must omit limit: {full[:80]}"

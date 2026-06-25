@@ -139,11 +139,11 @@ Same incremental sync engine as Solidatus:
 
 ## Related
 
-- [Solidatus Integration](solidatus-integration.html) — The equivalent integration for Solidatus lineage platform
-- [Model Configuration](../modelling/model-settings.html) — All model-level settings
-- [Glossary](../modelling/glossary.html) — Manage business terms
-- [Downstream Assets](../modelling/impact-analysis.html) — Tag dashboards, reports, and APIs
-- [API Reference](api-reference.html) — REST API documentation
+- [Solidatus Integration](solidatus-integration.md) — The equivalent integration for Solidatus lineage platform
+- [Model Configuration](../admin/model-configuration.md) — All model-level settings
+- [Business Glossary](../modelling/business-glossary.md) — Manage business terms
+- [Downstream Assets](../modelling/impact-analysis.md) — Tag dashboards, reports, and APIs
+- [API Reference](api-reference.md) — REST API documentation
 
 ---
 

@@ -173,22 +173,42 @@ def _persona_scope_violations(
     # generated alias, so a function (e.g. DATE_TRUNC('month', hidden_col))
     # cannot smuggle a field that is outside the persona scope. Violations
     # report the underlying base field, never the alias or function output.
+    # The same field-walk runs over every expression in EVERY clause
+    # (projection, WHERE, HAVING) — Bug-5349 Phase 2/3 SECURITY TRAP: a scoped
+    # column must never leak past persona filtering inside an expression of any
+    # clause. A base field is checked against measures OR dimensions because an
+    # expression operand may legitimately be a measure (e.g. ROUND(amount, 0))
+    # or a dimension (e.g. LOWER(city)).
+    allowed_base = scope.measures | scope.dimensions
     for ref in (call.dimension_refs or []):
-        violations += [f for f in ref.base_fields if f not in scope.dimensions]
-    # DR-B5349-P1-01 — a selected expression dimension's generated alias is a
-    # legitimate reference target for sort/having once its base fields have
-    # passed scope above (e.g. ORDER BY "business_date_month"). Add the selected
-    # aliases to the visible set so an explicit sort on an aliased expression is
-    # not falsely rejected. Bare-dimension aliases equal their names and are
-    # already covered by scope.dimensions, so this only widens for expressions.
+        violations += [f for f in ref.base_fields if f not in allowed_base]
+    for proj in (getattr(call, "projection_refs", None) or []):
+        violations += [f for f in proj.base_fields if f not in allowed_base]
+    for pref in (getattr(call, "where_refs", None) or []):
+        violations += [f for f in pref.base_fields if f not in allowed_base]
+    for href in (getattr(call, "having_refs", None) or []):
+        violations += [f for f in href.base_fields if f not in allowed_base]
+    # Flat {name,op,value} references. A flat WHERE / HAVING name binds to a
+    # REAL model column at execution time — SQL does not resolve SELECT aliases
+    # in WHERE / HAVING — so these MUST be validated against real scoped fields
+    # only. A generated expression alias is an arbitrary LLM-chosen string; it
+    # must NEVER widen the WHERE/HAVING visible set, or an expression aliased to
+    # a persona-hidden column name would let a flat filter reference that hidden
+    # column (Codex-1 persona-scope bypass). Only SORT may reference an alias,
+    # because ORDER BY resolves SELECT aliases in PostgreSQL (DR-B5349-P1-01 — a
+    # legitimate ``ORDER BY "business_date_month"`` on a selected expression).
+    real_scoped = scope.measures | scope.dimensions
     dim_aliases = {ref.alias for ref in (call.dimension_refs or [])}
-    visible = scope.measures | scope.dimensions | dim_aliases
-    referenced: list[str] = []
-    for f in list(call.where) + list(call.having) + list(call.sort):
+    proj_aliases = {p.alias for p in (getattr(call, "projection_refs", None) or [])}
+    sort_visible = real_scoped | dim_aliases | proj_aliases
+    for f in list(call.where) + list(call.having):
         name = f.get("name") if isinstance(f, dict) else None
-        if isinstance(name, str) and name:
-            referenced.append(name)
-    violations += [n for n in referenced if n not in visible]
+        if isinstance(name, str) and name and name not in real_scoped:
+            violations.append(name)
+    for f in list(call.sort):
+        name = f.get("name") if isinstance(f, dict) else None
+        if isinstance(name, str) and name and name not in sort_visible:
+            violations.append(name)
     return sorted(set(violations))
 
 
@@ -299,6 +319,11 @@ def build_sql(
     for m in call.measures:
         agg = (measure_aggs or {}).get(m, "SUM").upper()
         select_parts.append(f"{agg}({_quote_ident(m)}) AS {_quote_ident(m)}")
+    # Bug-5349 Phase 3 — computed projection columns (CASE / arithmetic /
+    # CONCAT / ROUND(SUM(..)) ...). Rendered after the bare measures so legacy
+    # SELECT order is unchanged when no projection is present.
+    for proj in (getattr(call, "projection_refs", None) or []):
+        select_parts.append(proj.render_select())
     if not select_parts:
         select_parts = ["*"]
 
@@ -307,8 +332,16 @@ def build_sql(
     where_preds: list[str] = []
     for f in call.where:
         pred = _filter_to_sql(f)
+        # Legacy contract: a None here is the documented "empty IN list is
+        # ignored" / no-op case (see tool spec). It is NOT dropped silently for
+        # a populated filter because the flat filter ops are all total.
         if pred:
             where_preds.append(pred)
+    # Bug-5349 Phase 2 — structured predicates (function-on-column,
+    # column-to-column, OR/NOT) render from the typed AST. These were validated
+    # at parse time (R3 fail-closed there), so render() never returns None.
+    for ref in (getattr(call, "where_refs", None) or []):
+        where_preds.append(ref.render())
     if where_preds:
         sql += " WHERE " + " AND ".join(where_preds)
 
@@ -325,6 +358,10 @@ def build_sql(
         pred = _filter_to_sql(h, agg_wrap=agg)
         if pred:
             having_preds.append(pred)
+    # Bug-5349 Phase 3 — structured HAVING predicates (ratio-of-aggregates,
+    # computed aggregate expressions, OR).
+    for ref in (getattr(call, "having_refs", None) or []):
+        having_preds.append(ref.render())
     if having_preds:
         sql += " HAVING " + " AND ".join(having_preds)
 

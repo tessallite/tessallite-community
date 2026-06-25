@@ -689,6 +689,148 @@ class TestDiscoverMembersPipeline:
         mock_audit_cols.assert_called_once_with(bound, ["Region"], None)
 
 
+class TestFlatDimDisplayColumn:
+    """Bug-5434: a flat dimension with a distinct DISPLAY column surfaces a member
+    caption that differs from the key. The discover handler augments the bound
+    query (engine-safe) to SELECT the display column alongside the key, then maps
+    the display value into the member ``caption`` while ``name``/``key`` stay the
+    key value (the gateway then emits the caption as MEMBER_NAME)."""
+
+    @pytest.mark.asyncio
+    async def test_augment_appends_display_dimension_and_select_expression(self):
+        from src.api.routes import (
+            _augment_discover_with_display_column,
+            _DISCOVER_DISPLAY_ALIAS,
+        )
+
+        display_col_id = uuid.uuid4()
+        bound = _make_bound("Customer")
+        bound.resolved_dimensions[0].display_column_id = display_col_id
+
+        db = AsyncMock()
+        db.get = AsyncMock(return_value=types.SimpleNamespace(
+            id=display_col_id, column_name="customer_name", model_table_id=uuid.uuid4(),
+        ))
+
+        alias = await _augment_discover_with_display_column(bound, db)
+
+        assert alias == _DISCOVER_DISPLAY_ALIAS
+        # A synthetic resolved dimension for the display column was appended.
+        assert len(bound.resolved_dimensions) == 2
+        disp_dim = bound.resolved_dimensions[1]
+        assert disp_dim.name == _DISCOVER_DISPLAY_ALIAS
+        assert disp_dim.source_column_id == display_col_id
+        # A passthrough SELECT expression makes it a standalone SELECT column.
+        se = bound.logical_query.select_expressions[-1]
+        assert se.inner_column == _DISCOVER_DISPLAY_ALIAS
+        assert se.classification == "passthrough"
+
+    @pytest.mark.asyncio
+    async def test_augment_noop_without_display_column(self):
+        from src.api.routes import _augment_discover_with_display_column
+
+        bound = _make_bound("Customer")
+        # No display_column_id attribute set -> getattr returns None.
+        db = AsyncMock()
+        alias = await _augment_discover_with_display_column(bound, db)
+        assert alias is None
+        assert len(bound.resolved_dimensions) == 1
+
+    @pytest.mark.asyncio
+    async def test_discover_surfaces_distinct_caption(self, client):
+        """End-to-end through the endpoint: the display column value becomes the
+        member caption while the key stays the name/key."""
+        display_col_id = uuid.uuid4()
+        bound = _make_bound("Customer")
+        bound.resolved_dimensions[0].display_column_id = display_col_id
+        decision = _make_decision()
+        # The source query now selects BOTH the key (Customer) and the display
+        # alias (__display_caption).
+        rows = [
+            {"Customer": "C001", "__display_caption": "Acme Corp"},
+            {"Customer": "C002", "__display_caption": "Globex"},
+        ]
+
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=MagicMock(
+            all=MagicMock(return_value=[]),
+            scalar_one_or_none=MagicMock(return_value=None),
+        ))
+        db.flush = AsyncMock()
+        # db.get(ModelColumn, display_col_id) -> the display column.
+        db.get = AsyncMock(return_value=types.SimpleNamespace(
+            id=display_col_id, column_name="customer_name", model_table_id=uuid.uuid4(),
+        ))
+
+        with (
+            patch("src.api.routes.get_tenant_db", _async_gen(db)),
+            patch("src.api.routes.load_authorized_model", AsyncMock(return_value=None)),
+            patch("src.api.routes.resolve_execution_persona", AsyncMock(return_value=None)),
+            patch("src.api.routes.bind_query_to_model", AsyncMock(return_value=bound)),
+            patch("src.api.routes.apply_persona_gate", AsyncMock(return_value=None)),
+            patch("src.api.routes.route_query", AsyncMock(return_value=decision)),
+            patch("src.api.routes.execute_routed_query", AsyncMock(
+                return_value=(rows, 0, ["Customer", "__display_caption"], MagicMock())
+            )),
+            patch("src.api.routes.audit_result_columns", MagicMock()),
+            patch("src.api.routes.log_query", AsyncMock()),
+        ):
+            resp = await client.post(
+                "/api/v1/discover/members",
+                json={"model_id": _MODEL_ID, "dimension_name": "Customer"},
+                headers=_auth(),
+            )
+
+        assert resp.status_code == 200
+        members = resp.json()["members"]
+        assert members[0]["name"] == "C001"
+        assert members[0]["key"] == "C001"
+        assert members[0]["caption"] == "Acme Corp"
+        assert members[1]["caption"] == "Globex"
+
+    @pytest.mark.asyncio
+    async def test_discover_caption_falls_back_to_key_when_display_null(self, client):
+        """A NULL display value falls back to the key as caption."""
+        display_col_id = uuid.uuid4()
+        bound = _make_bound("Customer")
+        bound.resolved_dimensions[0].display_column_id = display_col_id
+        decision = _make_decision()
+        rows = [{"Customer": "C003", "__display_caption": None}]
+
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=MagicMock(
+            all=MagicMock(return_value=[]),
+            scalar_one_or_none=MagicMock(return_value=None),
+        ))
+        db.flush = AsyncMock()
+        db.get = AsyncMock(return_value=types.SimpleNamespace(
+            id=display_col_id, column_name="customer_name", model_table_id=uuid.uuid4(),
+        ))
+
+        with (
+            patch("src.api.routes.get_tenant_db", _async_gen(db)),
+            patch("src.api.routes.load_authorized_model", AsyncMock(return_value=None)),
+            patch("src.api.routes.resolve_execution_persona", AsyncMock(return_value=None)),
+            patch("src.api.routes.bind_query_to_model", AsyncMock(return_value=bound)),
+            patch("src.api.routes.apply_persona_gate", AsyncMock(return_value=None)),
+            patch("src.api.routes.route_query", AsyncMock(return_value=decision)),
+            patch("src.api.routes.execute_routed_query", AsyncMock(
+                return_value=(rows, 0, ["Customer", "__display_caption"], MagicMock())
+            )),
+            patch("src.api.routes.audit_result_columns", MagicMock()),
+            patch("src.api.routes.log_query", AsyncMock()),
+        ):
+            resp = await client.post(
+                "/api/v1/discover/members",
+                json={"model_id": _MODEL_ID, "dimension_name": "Customer"},
+                headers=_auth(),
+            )
+
+        assert resp.status_code == 200
+        members = resp.json()["members"]
+        assert members[0]["caption"] == "C003"
+
+
 class TestNotInPersonaDefaultFilter:
     def test_not_in_operator_accepted(self):
         """not_in is in _SUPPORTED_OPERATORS and coerces correctly."""

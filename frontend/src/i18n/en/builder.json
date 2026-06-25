@@ -188,6 +188,8 @@
   "dimensions.description": "Description",
   "dimensions.displayFolder": "Display folder",
   "dimensions.displayFolderPlaceholder": "e.g. Customer / Demographics — groups items inside Excel pivot field lists.",
+  "dimensions.displayColumnLabel": "Display column",
+  "dimensions.displayColumnHelp": "Optional. A column whose value is shown as the caption for each member while the key column above stays the identity. Leave as None to show the key itself.",
   "dimensions.distinct": "Distinct",
   "dimensions.edit": "Edit",
   "dimensions.formulaExpression": "Formula Expression",

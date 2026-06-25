@@ -57,6 +57,56 @@ bulk_router = APIRouter(
 )
 
 
+async def _source_table_id_for_dim(db, dim) -> UUID | None:
+    """Return the ModelTable id that the dimension's KEY column belongs to, or
+    ``None`` when the dimension is not bound to a physical column."""
+    if getattr(dim, "source_column_id", None) is None:
+        return None
+    col = await db.get(ModelColumn, dim.source_column_id)
+    return col.model_table_id if col is not None else None
+
+
+async def _resolve_display_column_id(
+    db,
+    *,
+    display_column_name: str | None,
+    source_table_id: UUID | None,
+    source_column_id: UUID | None,
+    user_defined_attribute_id: UUID | None,
+) -> UUID | None:
+    """Bug-5434: resolve a flat dimension's optional DISPLAY column name to a
+    ``model_columns.id``, validating it is a legitimate distinct caption source.
+
+    Returns ``None`` when no display column is requested (or an empty string is
+    passed to clear it). Raises HTTP 422 when the request is invalid:
+      - a display column requires a physical-column (key-backed) flat dimension
+        (not a UDA dimension), so ``source_column_id`` must be set;
+      - the display column must resolve in the same source table as the key;
+      - the display column must differ from the key column.
+    """
+    if display_column_name is None:
+        return None
+    name = display_column_name.strip()
+    if not name:
+        # Explicit clear.
+        return None
+    if user_defined_attribute_id is not None or source_column_id is None or source_table_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "A display column can only be set on a physical-column dimension "
+                "(provide source_table_id and source_column_name)."
+            ),
+        )
+    disp_col = await resolve_column(db, source_table_id, name)
+    if disp_col.id == source_column_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="The display column must differ from the key (source) column.",
+        )
+    return disp_col.id
+
+
 async def _build_response(
     db,
     dim: Dimension,
@@ -89,6 +139,7 @@ async def _build_response(
     is_hidden = False
     high_cardinality: bool | None = None
     cardinality_estimate: int | None = None
+    display_col_name = None
     if dim.source_column_id:
         col = await db.get(ModelColumn, dim.source_column_id)
         if col:
@@ -97,6 +148,12 @@ async def _build_response(
             table_id = col.model_table_id
             is_hidden = bool(col.is_hidden)
             cardinality_estimate = col.cardinality_estimate
+    # Bug-5434: resolve the distinct display column's name for the response so the
+    # authoring UI / importers can round-trip it by name.
+    if getattr(dim, "display_column_id", None):
+        disp_col = await db.get(ModelColumn, dim.display_column_id)
+        if disp_col:
+            display_col_name = disp_col.column_name
     if dim.user_defined_attribute_id:
         uda = await db.get(UserDefinedAttribute, dim.user_defined_attribute_id)
         if uda:
@@ -142,6 +199,8 @@ async def _build_response(
         is_hidden=is_hidden,
         source_column_id=dim.source_column_id,
         source_column_name=col_name,
+        display_column_id=getattr(dim, "display_column_id", None),
+        display_column_name=display_col_name,
         data_type=col_data_type,
         source_table_id=table_id,
         source_table_alias=table_alias,
@@ -216,11 +275,23 @@ async def create_dimension(
             if uda is None or uda.model_id != model_id:
                 raise HTTPException(status_code=404, detail="User-defined attribute not found")
 
+        # Bug-5434: resolve the optional distinct DISPLAY column. Only a
+        # physical-column flat dimension may carry one, and it must differ from
+        # the key column.
+        display_column_id = await _resolve_display_column_id(
+            db,
+            display_column_name=body.display_column_name,
+            source_table_id=body.source_table_id,
+            source_column_id=source_column_id,
+            user_defined_attribute_id=user_defined_attribute_id,
+        )
+
         dim = Dimension(
             model_id=model_id,
             name=body.name,
             display_name=body.display_name or body.name,
             source_column_id=source_column_id,
+            display_column_id=display_column_id,
             user_defined_attribute_id=user_defined_attribute_id,
             is_time_dim=body.is_time_dim,
             time_grain=body.time_grain,
@@ -325,6 +396,9 @@ async def update_dimension(
                 status_code=400,
                 detail="Provide either source column fields or user_defined_attribute_id, not both",
             )
+        # Bug-5434: snapshot the key column's table BEFORE any source change so a
+        # later table move can drop a now-cross-table display column.
+        _prev_key_table_id = await _source_table_id_for_dim(db, d)
         # Resolve column name if provided
         if "source_table_id" in updates and "source_column_name" in updates:
             table_id = updates.pop("source_table_id")
@@ -345,6 +419,31 @@ async def update_dimension(
                 if uda is None or uda.model_id != model_id:
                     raise HTTPException(status_code=404, detail="User-defined attribute not found")
                 d.source_column_id = None
+        # Bug-5434: resolve / clear the distinct DISPLAY column. Re-resolve against
+        # the dimension's CURRENT source binding (after any source change above).
+        # Switching to a UDA binding or clearing the key column also clears the
+        # display column so it never dangles on a non-physical dimension.
+        if "display_column_name" in updates:
+            disp_name = updates.pop("display_column_name", None)
+            disp_table_id = await _source_table_id_for_dim(db, d)
+            d.display_column_id = await _resolve_display_column_id(
+                db,
+                display_column_name=disp_name,
+                source_table_id=disp_table_id,
+                source_column_id=d.source_column_id,
+                user_defined_attribute_id=d.user_defined_attribute_id,
+            )
+        elif d.source_column_id is None:
+            # Source binding moved off a physical column — drop any stale display.
+            d.display_column_id = None
+        elif getattr(d, "display_column_id", None) is not None:
+            # Key column moved to a DIFFERENT table while display_column_name was
+            # not in the payload — a display column bound to the old table would
+            # dangle / force an unintended join at discovery. Drop it when the key
+            # table changed.
+            _new_key_table_id = await _source_table_id_for_dim(db, d)
+            if _new_key_table_id != _prev_key_table_id:
+                d.display_column_id = None
         new_name = updates.get("name")
         old_name = d.name
         if new_name and "display_name" not in updates and (not d.display_name or d.display_name == d.name):

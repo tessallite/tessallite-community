@@ -54,7 +54,7 @@ class _UnlimitedManager(LicenseManager):
 
 
 class _UnactivatedManager(LicenseManager):
-    """Enforcement is ON but no valid license is installed: FAIL-CLOSED (Bug-5474).
+    """Enforcement is ON but no valid license is installed: FAIL-CLOSED (Bug-5496).
 
     Without this, a missing license fell back to ``_UnlimitedManager`` (full product) even
     with enforcement on — so Community caps were trivially bypassed by simply NOT installing
@@ -102,17 +102,30 @@ def license_public_keys() -> str:
 
 
 async def load_license_doc_from_db() -> Optional[dict]:
-    """The active license document: system DB first (UI-fed), then a legacy file."""
-    async for db in get_system_db():
-        row = (
-            await db.execute(
-                select(SystemSetting.value_json).where(
-                    SystemSetting.key == LICENSE_SETTING_KEY
+    """The active license document: system DB first (UI-fed), then a file (LICENSE_FILE).
+
+    The system-DB lookup is best-effort: at first startup the system schema may not be
+    migrated yet (on Kubernetes the migration runs as a post-install Job AFTER the pods
+    start), so the ``system_settings`` query can fail. Swallow that and fall through to the
+    file — otherwise a file-mounted licence (the Helm/Compose install path) never loads and
+    the manager is stuck unactivated, denying every create even with a valid licence
+    installed (Bug-5485)."""
+    try:
+        async for db in get_system_db():
+            row = (
+                await db.execute(
+                    select(SystemSetting.value_json).where(
+                        SystemSetting.key == LICENSE_SETTING_KEY
+                    )
                 )
-            )
-        ).scalar_one_or_none()
-        if row:
-            return row
+            ).scalar_one_or_none()
+            if row:
+                return row
+    except Exception:  # noqa: BLE001 — schema not migrated yet / DB unavailable -> use the file
+        logger.warning(
+            "system-DB licence lookup failed (schema not ready?); falling back to LICENSE_FILE",
+            exc_info=True,
+        )
     s = get_settings()
     if s.LICENSE_FILE:
         try:
@@ -125,7 +138,7 @@ async def load_license_doc_from_db() -> Optional[dict]:
 async def reload_license_manager() -> LicenseManager:
     """(Re)build the cached manager from the persisted license. No license -> unactivated
     (fail-closed) when enforcement is ON, full product when OFF (see _no_license_manager;
-    Bug-5474). Called at startup and after an install."""
+    Bug-5496). Called at startup and after an install."""
     global _MANAGER
     doc = await load_license_doc_from_db()
     if doc is None:
@@ -140,7 +153,7 @@ async def reload_license_manager() -> LicenseManager:
 def get_license_manager() -> LicenseManager:
     """Cached license manager. Before the first load completes, fall back fail-closed
     (unactivated) when enforcement is ON so the pre-load window can't bypass caps either
-    (Bug-5474)."""
+    (Bug-5496)."""
     return _MANAGER if _MANAGER is not None else _no_license_manager()
 
 

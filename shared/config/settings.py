@@ -64,6 +64,14 @@ class Settings(BaseSettings):
     LICENSE_FILE: str = ""  # path to the signed license JSON (Community installs)
     LICENSE_PUBLIC_KEYS: str = ""  # "key_id:base64rawpubkey[,key_id2:base64...]"
 
+    # Product-side licence beacon emitter (Bug-5459). Default OFF: with no URL the
+    # emitter never starts. The beacon carries license_id ONLY (no PII) and is the
+    # client counterpart to the issuer ``/beacon`` sink. The URL is the product's
+    # OWN endpoint var (distinct from the server-side ``ISSUER_BEACON`` sink selector).
+    LICENSE_BEACON_URL: str = ""  # e.g. https://issuer.tessallite.io/beacon
+    LICENSE_BEACON_INTERVAL_HOURS: float = 24.0  # cadence; floored to 60s in the emitter
+    LICENSE_BEACON_VERSION: str = ""  # product version reported on the beacon (non-PII)
+
     # Anti-exploitation: gate LLM configs that authenticate via cloud
     # service-account / OAuth (Application Default Credentials) instead of a
     # bring-your-own API key — e.g. Google Vertex AI mode (google_mode=vertex_ai).

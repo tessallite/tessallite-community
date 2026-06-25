@@ -32,8 +32,13 @@ describe("LicenseAndEdition", () => {
     mockLimits.mockReturnValue({
       data: {
         edition: "community",
-        entitlements: { own_tenants: 2, models: 2, users: 5 },
-        usage: { models: 1, users: 3 },
+        entitlements: {
+          own_tenants: 3,
+          projects_per_own_tenant: 4,
+          models: 9,
+          users: 5,
+        },
+        usage: { models: 7, users: 3, tenants: 1, projects: 2 },
       },
       isLoading: false,
     });
@@ -42,8 +47,12 @@ describe("LicenseAndEdition", () => {
       "Community",
     );
     expect(screen.getByText("Activated")).toBeInTheDocument();
+    // tenants usage current/max (platform-level own-tenant count)
+    expect(screen.getByText("1 / 3")).toBeInTheDocument();
+    // projects usage current/max (per-tenant project count)
+    expect(screen.getByText("2 / 4")).toBeInTheDocument();
     // models usage current/max
-    expect(screen.getByText("1 / 2")).toBeInTheDocument();
+    expect(screen.getByText("7 / 9")).toBeInTheDocument();
     // users usage current/max
     expect(screen.getByText("3 / 5")).toBeInTheDocument();
     // community (non-enterprise) shows the upgrade body + a "Get a license" CTA

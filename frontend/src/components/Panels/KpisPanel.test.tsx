@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, waitFor, within, act, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -51,6 +51,20 @@ vi.mock("../../api/client", () => ({
 vi.mock("../../auth/currentUser", () => ({
   canEditModelConfig: () => true,
   isTenantAdmin: () => true,
+}));
+
+// Bug-5486: KpiPreviewCard (rendered on wizard steps 0-3 once an expression
+// exists) debounces a live evaluate-adhoc call behind a real 600ms setTimeout.
+// That real timer fires at an unpredictable point relative to this suite's
+// multi-step userEvent walks, and its async settle runs an un-acted setState
+// that, under full-suite CPU contention, intermittently lands inside one of
+// the tests' `waitFor` polls and breaks it (the full-suite-only timeout flake).
+// The preview is incidental here — no test in this file asserts its output, so
+// we stub it to a no-op. This removes the async leak at its source while every
+// behavioural assertion (wizard build, payload shape, submit) is preserved.
+vi.mock("../KpiWizard/KpiPreviewCard", () => ({
+  __esModule: true,
+  default: () => null,
 }));
 
 import KpisPanel, { slugify } from "./KpisPanel";
@@ -169,7 +183,14 @@ describe("KPI helpers", () => {
 });
 
 describe("KpisPanel", () => {
+  // Bug-5510: MUI Dialog/Select transitions and any residual debounce timers
+  // (KpiPreviewCard is stubbed but MUI internal setTimeout calls remain) fire
+  // at unpredictable times under full-suite CPU contention and cause waitFor
+  // assertions to race with intermediate states. Fake timers give deterministic
+  // control: userEvent advances them during interactions, and afterEach flushes
+  // remaining timers before React cleanup to prevent setState-after-unmount.
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     listKpisMock.mockReset();
     createKpiMock.mockReset();
     updateKpiMock.mockReset();
@@ -183,6 +204,14 @@ describe("KpisPanel", () => {
     deprecateMock.mockReset();
     validateExpressionMock.mockReset().mockResolvedValue(VALID_RESPONSE);
     evaluateAdhocMock.mockReset().mockRejectedValue(new Error("not implemented"));
+  });
+
+  afterEach(() => {
+    // Flush all pending timers (MUI transitions, debounces) so their setState
+    // calls resolve while the component tree is still mounted.
+    act(() => { vi.runOnlyPendingTimers(); });
+    cleanup();
+    vi.useRealTimers();
   });
 
   it("renders heading", async () => {

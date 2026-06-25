@@ -2918,3 +2918,540 @@ def test_format_token_end_to_end_fmtvalue():
     # The gateway path: token -> format string -> formatted cell value.
     assert _format_cell_value(0.1234, format_token_to_mdx("percent_2dp")) == "12.34%"
     assert _format_cell_value(1234.5, format_token_to_mdx("currency")) == "$1,234.50"
+
+
+# ---------------------------------------------------------------------------
+# Bug-5492: a measure used as a predicate / sort-key operand inside a set
+# function (Filter / Order / TopCount ...) must NOT be counted as an axis
+# hierarchy. Before the fix, `Filter([dim].Members, [Measures].[m] > N)` on ROWS
+# leaked `[Measures]` into the row-hierarchy list, flipped has_measures_axis, and
+# corrupted axis/slicer classification so the member tuples were dropped and the
+# row axis rendered empty.
+# ---------------------------------------------------------------------------
+
+class TestFilterPredicateMeasureNotAxisHierarchy:
+
+    def _hiers(self, expr):
+        from src.dax.mdx_execute import _extract_hierarchies
+        return _extract_hierarchies(expr)
+
+    # --- the bug: Filter predicate measure must not leak onto the axis -------
+
+    def test_filter_predicate_measure_excluded_from_row_hierarchies(self):
+        hiers = self._hiers(
+            "Filter([item_category].[item_category].Members, "
+            "[Measures].[net_sales] > 480000000)"
+        )
+        assert hiers == ["[item_category].[item_category]"]
+        assert "[Measures]" not in hiers
+
+    def test_filter_predicate_measure_excluded_when_operator_reversed(self):
+        # `N < [Measures].[m]` is the same condition written the other way round.
+        hiers = self._hiers("Filter([d].[d].Members, 5 < [Measures].[m])")
+        assert hiers == ["[d].[d]"]
+
+    def test_filter_measure_versus_measure_predicate_excludes_both(self):
+        # `[Measures].[a] > [Measures].[b]` is a condition: neither operand is an
+        # axis member, so [Measures] must not leak onto the axis.
+        hiers = self._hiers("Filter([d].[d].Members, [Measures].[a] > [Measures].[b])")
+        assert hiers == ["[d].[d]"]
+
+    def test_filter_predicate_covers_all_comparison_operators(self):
+        for op in (">", ">=", "<", "<=", "=", "<>"):
+            hiers = self._hiers(f"Filter([d].[d].Members, [Measures].[m] {op} 5)")
+            assert hiers == ["[d].[d]"], op
+
+    # --- genuine axis measures must still be detected ------------------------
+
+    def test_plain_members_stay_clean(self):
+        assert self._hiers("[item_category].[item_category].Members") == [
+            "[item_category].[item_category]"
+        ]
+
+    def test_measure_on_axis_still_detected(self):
+        assert self._hiers("{[Measures].[net_sales]}") == ["[Measures]"]
+
+    def test_multiple_measures_on_axis_collapse_to_one_measures_hier(self):
+        assert self._hiers("{[Measures].[a], [Measures].[b]}") == ["[Measures]"]
+
+    def test_crossjoin_measure_axis_member_preserved(self):
+        # A bare measure argument of CrossJoin is a genuine axis member, not a
+        # sort key — it must survive the predicate-stripping.
+        assert self._hiers("CrossJoin([d].[d].Members, [Measures].[m])") == [
+            "[d].[d]",
+            "[Measures]",
+        ]
+
+    def test_filter_predicate_plus_real_axis_measure_keeps_measure(self):
+        # The predicate measure is excluded but the explicit axis measure stays.
+        assert self._hiers(
+            "CrossJoin(Filter([d].[d].Members, [Measures].[m] > 5), {[Measures].[m]})"
+        ) == ["[d].[d]", "[Measures]"]
+
+    # --- Order / TopCount sort-key measures share the same shape ------------
+
+    def test_order_sort_key_measure_excluded(self):
+        assert self._hiers("Order([d].[d].Members, [Measures].[m], BDESC)") == [
+            "[d].[d]"
+        ]
+
+    def test_topcount_sort_key_measure_excluded(self):
+        assert self._hiers("TopCount([d].[d].Members, 10, [Measures].[m])") == [
+            "[d].[d]"
+        ]
+
+    def test_order_over_filter_excludes_both_operand_measures(self):
+        assert self._hiers(
+            "Order(Filter([d].[d].Members, [Measures].[x] > 5), [Measures].[m], BDESC)"
+        ) == ["[d].[d]"]
+
+    def test_rank_sort_key_excluded_at_deep_nesting_depth(self):
+        # The set argument nests two levels (CrossJoin -> Filter); the sort-key
+        # measure must still be excluded regardless of head depth.
+        assert self._hiers(
+            "Order(CrossJoin([a].[a].Members, "
+            "Filter([b].[b].Members, [Measures].[z] > 1)), [Measures].[m], BDESC)"
+        ) == ["[a].[a]", "[b].[b]"]
+
+    def test_rank_set_argument_measures_preserved(self):
+        # A measure-set passed AS the ranked set (not the sort key) is a genuine
+        # axis member set and must survive; only the trailing sort key is dropped.
+        assert self._hiers(
+            "Order({[Measures].[a], [Measures].[b]}, [Measures].[m], BDESC)"
+        ) == ["[Measures]"]
+
+    def test_member_name_with_comma_does_not_split_argument(self):
+        # A bracketed member name containing a comma must not be split mid-name
+        # by the top-level argument scanner — the sort key still strips cleanly.
+        assert self._hiers(
+            "Order([d].[d].Members, [Measures].[Gross, Net], BDESC)"
+        ) == ["[d].[d]"]
+
+    def test_member_name_with_parens_does_not_break_balanced_scan(self):
+        # Parens inside a bracketed member name are literal text, not call
+        # structure — the balanced-paren span scan must ignore them.
+        assert self._hiers(
+            "Order([d].[d].Members, [Measures].[Sales (Net)], BDESC)"
+        ) == ["[d].[d]"]
+        assert self._hiers(
+            "Filter([d].[d].Members, [Measures].[Sales (Net)] > 5)"
+        ) == ["[d].[d]"]
+
+    # --- Bug-5495: PAREN / FUNCTION-wrapped predicate & sort-key operands -----
+    # A wrapped measure that is a comparison operand or a sort key is still a
+    # condition, not an axis member, so it must be stripped. A wrapped measure
+    # that is an AXIS member (set/tuple, CrossJoin) must be preserved.
+
+    def test_paren_wrapped_predicate_measure_stripped(self):
+        # `([Measures].[m]) > 5` — paren-wrapped comparison operand.
+        assert self._hiers(
+            "Filter([d].[d].Members, ([Measures].[m]) > 5)"
+        ) == ["[d].[d]"]
+
+    def test_paren_wrapped_predicate_measure_stripped_operator_reversed(self):
+        assert self._hiers(
+            "Filter([d].[d].Members, 5 < ([Measures].[m]))"
+        ) == ["[d].[d]"]
+
+    def test_function_wrapped_predicate_measure_stripped(self):
+        # `CoalesceEmpty([Measures].[m], 0) > 5` — the function call is the
+        # predicate operand; the measure inside it is a condition.
+        assert self._hiers(
+            "Filter([d].[d].Members, CoalesceEmpty([Measures].[m], 0) > 5)"
+        ) == ["[d].[d]"]
+
+    def test_function_wrapped_predicate_measure_stripped_operator_reversed(self):
+        # The comparison operator precedes the function name.
+        assert self._hiers(
+            "Filter([d].[d].Members, 5 < CoalesceEmpty([Measures].[m], 0))"
+        ) == ["[d].[d]"]
+
+    def test_function_wrapped_predicate_measure_in_multi_arg_function(self):
+        # `IIF(cond, [Measures].[m], 0) >= 5` — measure is a non-first argument of
+        # a multi-arg scalar function that is itself the predicate operand.
+        assert self._hiers(
+            "Filter([d].[d].Members, IIF([d].x, [Measures].[m], 0) >= 5)"
+        ) == ["[d].[d]"]
+
+    def test_function_wrapped_predicate_covers_all_comparison_operators(self):
+        for op in (">", ">=", "<", "<=", "=", "<>"):
+            assert self._hiers(
+                f"Filter([d].[d].Members, CoalesceEmpty([Measures].[m], 0) {op} 5)"
+            ) == ["[d].[d]"], op
+
+    def test_function_wrapped_sort_key_measure_stripped(self):
+        # `Order(set, CoalesceEmpty([Measures].[m], 0), BDESC)` — the scalar
+        # function-wrapped sort key is not an axis member.
+        assert self._hiers(
+            "Order([d].[d].Members, CoalesceEmpty([Measures].[m], 0), BDESC)"
+        ) == ["[d].[d]"]
+
+    def test_function_wrapped_topcount_sort_key_measure_stripped(self):
+        assert self._hiers(
+            "TopCount([d].[d].Members, 10, Abs([Measures].[m]))"
+        ) == ["[d].[d]"]
+
+    # --- wrapped AXIS measures must be PRESERVED (precision guard) ------------
+
+    def test_set_wrapped_axis_measure_preserved_not_stripped_as_wrapped(self):
+        # `{[Measures].[m]}` is a set-wrapped AXIS member, never a predicate/sort
+        # operand — it must survive the broadened wrapped-operand strip.
+        assert self._hiers("{[Measures].[net_sales]}") == ["[Measures]"]
+
+    def test_crossjoin_function_wrapped_axis_measure_preserved(self):
+        # A measure inside an axis set-function (CrossJoin) whose result is NOT
+        # compared is a genuine axis member and must be preserved.
+        assert self._hiers(
+            "CrossJoin([d].[d].Members, {[Measures].[m]})"
+        ) == ["[d].[d]", "[Measures]"]
+
+    def test_addcalculatedmembers_wrapped_axis_measure_preserved(self):
+        # AddCalculatedMembers is a set function; its measure set is an axis set.
+        assert self._hiers(
+            "AddCalculatedMembers({[Measures].[a]})"
+        ) == ["[Measures]"]
+
+    def test_rank_set_argument_function_wrapped_measures_preserved(self):
+        # The ranked SET argument (a measure set) is an axis set; only the trailing
+        # sort key is dropped. A function-wrapped sort key strips, the set survives.
+        assert self._hiers(
+            "Order({[Measures].[a], [Measures].[b]}, CoalesceEmpty([Measures].[m], 0), BDESC)"
+        ) == ["[Measures]"]
+
+    def test_function_wrapped_predicate_with_real_axis_measure_keeps_axis(self):
+        # The function-wrapped predicate measure is excluded, the explicit
+        # set-wrapped axis measure on the CrossJoin is kept.
+        assert self._hiers(
+            "CrossJoin(Filter([d].[d].Members, CoalesceEmpty([Measures].[m], 0) > 5), "
+            "{[Measures].[m]})"
+        ) == ["[d].[d]", "[Measures]"]
+
+
+class TestFilterOnRowsPopulatesMemberAxis:
+    """End-to-end: a Filter(...) named-set on ROWS with a measure predicate must
+    render a populated member axis (the named-list-display flow), not an empty
+    row axis. The measure on COLUMNS stays detected and the cells align."""
+
+    _NS = "{urn:schemas-microsoft-com:xml-analysis:mddataset}"
+
+    def _build(self):
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "Filter([item_category].[item_category].Members, "
+            "[Measures].[net_sales] > 480000000) ON ROWS "
+            "FROM [demo]"
+        )
+        rows = [
+            {"item_category": "Electronics", "net_sales": 500000000},
+            {"item_category": "Furniture", "net_sales": 490000000},
+        ]
+        return build_real_execute_response(
+            mdx=mdx,
+            catalog="demo",
+            columns=["item_category", "net_sales"],
+            rows=rows,
+            measures_meta=[{"name": "net_sales", "default_agg": "sum"}],
+            dimensions_meta=[{"name": "item_category"}],
+            client_app_name="Excel",
+        )
+
+    def _parse(self, xml):
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml)
+        axes: dict[str, list[list[str]]] = {}
+        for axis in root.iter(self._NS + "Axis"):
+            tuples = []
+            for t in axis.iter(self._NS + "Tuple"):
+                tuples.append([
+                    m.findtext(self._NS + "Caption")
+                    for m in t.iter(self._NS + "Member")
+                ])
+            axes[axis.get("name")] = tuples
+        return axes
+
+    def test_row_axis_is_populated_with_filtered_members(self):
+        axes = self._parse(self._build())
+        # Axis1 (ROWS) must carry the filtered category members, not be empty.
+        row_captions = [c for tup in axes.get("Axis1", []) for c in tup]
+        assert "Electronics" in row_captions
+        assert "Furniture" in row_captions
+        assert axes.get("Axis1"), "row axis rendered empty (Bug-5492 regression)"
+
+    def test_measure_on_columns_still_detected(self):
+        axes = self._parse(self._build())
+        col_captions = [c for tup in axes.get("Axis0", []) for c in tup]
+        assert "net_sales" in col_captions
+
+
+# ---------------------------------------------------------------------------
+# Bug-5499: a saved named set referenced BY NAME on an axis must expand into
+# its member tuples. The gateway inlines the named set's compiled expression
+# into the MDX before axis extraction, so the existing Filter/TopCount/member
+# machinery operates on the expanded expression.
+# ---------------------------------------------------------------------------
+
+class TestNamedSetInlining:
+    """Unit tests for _inline_named_sets: set names in MDX are replaced with
+    their compiled expressions."""
+
+    @staticmethod
+    def _inline(mdx, named_sets):
+        from src.dax.xmla_server import _inline_named_sets
+        return _inline_named_sets(mdx, named_sets)
+
+    def test_bracket_quoted_set_name_replaced(self):
+        ns = [{"name": "Top Customers", "expression": "TopCount([c].[c].Members, 5, [Measures].[Rev])"}]
+        mdx = "SELECT {[Measures].[Rev]} ON COLUMNS, {[Top Customers]} ON ROWS FROM [demo]"
+        result = self._inline(mdx, ns)
+        assert "TopCount([c].[c].Members, 5, [Measures].[Rev])" in result
+        assert "[Top Customers]" not in result
+
+    def test_bare_set_name_replaced(self):
+        ns = [{"name": "TopCust", "expression": "TopCount([c].[c].Members, 5, [Measures].[Rev])"}]
+        mdx = "SELECT {[Measures].[Rev]} ON COLUMNS, {TopCust} ON ROWS FROM [demo]"
+        result = self._inline(mdx, ns)
+        assert "TopCount" in result
+        assert "TopCust" not in result  # bare name replaced
+
+    def test_hierarchy_path_not_replaced(self):
+        """A set name that coincides with a dimension name must not be replaced
+        when it appears as part of a [Dim].[Hier] hierarchy path."""
+        ns = [{"name": "Geography", "expression": "Filter([Geography].[Geography].Members, [Measures].[Rev] > 100)"}]
+        mdx = "SELECT {[Geography].[Geography].Members} ON ROWS FROM [demo]"
+        result = self._inline(mdx, ns)
+        # The [Geography].[Geography].Members path must survive intact — only
+        # a bare [Geography] (not followed by .[) would be inlined.
+        assert "[Geography].[Geography].Members" in result
+
+    def test_case_insensitive_replacement(self):
+        ns = [{"name": "Top Items", "expression": "TopCount([d].[d].Members, 3, [Measures].[m])"}]
+        mdx = "SELECT {[top items]} ON ROWS FROM [demo]"
+        result = self._inline(mdx, ns)
+        assert "TopCount" in result
+
+    def test_empty_expression_skipped(self):
+        ns = [{"name": "EmptySet", "expression": ""}]
+        mdx = "SELECT {[EmptySet]} ON ROWS FROM [demo]"
+        result = self._inline(mdx, ns)
+        # Expression is empty, so replacement is skipped; original survives.
+        assert "[EmptySet]" in result
+
+    def test_no_named_sets_returns_unchanged(self):
+        mdx = "SELECT {[Measures].[Rev]} ON COLUMNS FROM [demo]"
+        assert self._inline(mdx, []) == mdx
+
+    def test_multiple_sets_all_replaced(self):
+        ns = [
+            {"name": "SetA", "expression": "TopCount([a].[a].Members, 3, [Measures].[m])"},
+            {"name": "SetB", "expression": "Filter([b].[b].Members, [Measures].[m] > 0)"},
+        ]
+        mdx = "SELECT {SetA} ON COLUMNS, {SetB} ON ROWS FROM [demo]"
+        result = self._inline(mdx, ns)
+        assert "TopCount([a]" in result
+        assert "Filter([b]" in result
+
+    def test_cube_name_not_replaced(self):
+        """FROM [cube] must not be replaced when a named set has the same name."""
+        ns = [{"name": "demo", "expression": "TopCount([c].[c].Members, 5, [Measures].[m])"}]
+        mdx = "SELECT {[Measures].[Rev]} ON COLUMNS FROM [demo]"
+        result = self._inline(mdx, ns)
+        assert "FROM [demo]" in result
+
+    def test_terminal_member_not_replaced(self):
+        """[Dim].[Hier].[Member] terminal bracket must not be replaced when a
+        named set has the same name as the member."""
+        ns = [{"name": "France", "expression": "TopCount([c].[c].Members, 5, [Measures].[m])"}]
+        mdx = "SELECT {[Measures].[Rev]} ON COLUMNS FROM [demo] WHERE ([Geography].[Geography].[France])"
+        result = self._inline(mdx, ns)
+        assert "[Geography].[Geography].[France]" in result
+
+    def test_where_measure_not_replaced(self):
+        """WHERE ([Measures].[SetName]) must not be replaced when a named set
+        has the same name as a measure."""
+        ns = [{"name": "Rev", "expression": "TopCount([c].[c].Members, 5, [Measures].[m])"}]
+        mdx = "SELECT {[d].[d].Members} ON COLUMNS FROM [demo] WHERE ([Measures].[Rev])"
+        result = self._inline(mdx, ns)
+        assert "[Measures].[Rev]" in result
+
+    def test_key_member_not_replaced(self):
+        """&[SetName] key member references must not be replaced."""
+        ns = [{"name": "TopCust", "expression": "TopCount([c].[c].Members, 5, [Measures].[m])"}]
+        mdx = "SELECT {[Measures].[Rev]} ON COLUMNS FROM [demo] WHERE ([Customer].[Customer].&[TopCust])"
+        result = self._inline(mdx, ns)
+        assert "&[TopCust]" in result
+
+
+class TestNamedSetOnRowsExpandsMembers:
+    """End-to-end: a saved named set (Top-N) referenced on ROWS must expand to
+    its member tuples in the MDDataSet response, not produce an empty axis.
+    Mirrors TestFilterOnRowsPopulatesMemberAxis for Bug-5492."""
+
+    _NS = "{urn:schemas-microsoft-com:xml-analysis:mddataset}"
+
+    def _build_topn(self):
+        """Simulate what happens when a saved TopCount named set is inlined
+        and then build_real_execute_response processes the expanded MDX."""
+        # The named set expression is inlined before this point; the MDX that
+        # reaches build_real_execute_response already contains the expansion.
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "TopCount([item_category].[item_category].Members, 3, "
+            "[Measures].[net_sales]) ON ROWS "
+            "FROM [demo]"
+        )
+        rows = [
+            {"item_category": "Electronics", "net_sales": 500000000},
+            {"item_category": "Furniture", "net_sales": 490000000},
+            {"item_category": "Apparel", "net_sales": 480000000},
+        ]
+        return build_real_execute_response(
+            mdx=mdx,
+            catalog="demo",
+            columns=["item_category", "net_sales"],
+            rows=rows,
+            measures_meta=[{"name": "net_sales", "default_agg": "sum"}],
+            dimensions_meta=[{"name": "item_category"}],
+            client_app_name="Excel",
+        )
+
+    def _build_filtered(self):
+        """Simulate a saved Filter named set inlined on ROWS."""
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "Filter([item_category].[item_category].Members, "
+            "[Measures].[net_sales] > 480000000) ON ROWS "
+            "FROM [demo]"
+        )
+        rows = [
+            {"item_category": "Electronics", "net_sales": 500000000},
+            {"item_category": "Furniture", "net_sales": 490000000},
+        ]
+        return build_real_execute_response(
+            mdx=mdx,
+            catalog="demo",
+            columns=["item_category", "net_sales"],
+            rows=rows,
+            measures_meta=[{"name": "net_sales", "default_agg": "sum"}],
+            dimensions_meta=[{"name": "item_category"}],
+            client_app_name="Excel",
+        )
+
+    def _parse(self, xml):
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml)
+        axes: dict[str, list[list[str]]] = {}
+        for axis in root.iter(self._NS + "Axis"):
+            tuples = []
+            for t in axis.iter(self._NS + "Tuple"):
+                tuples.append([
+                    m.findtext(self._NS + "Caption")
+                    for m in t.iter(self._NS + "Member")
+                ])
+            axes[axis.get("name")] = tuples
+        return axes
+
+    def test_topn_named_set_on_rows_expands_members(self):
+        axes = self._parse(self._build_topn())
+        row_captions = [c for tup in axes.get("Axis1", []) for c in tup]
+        assert "Electronics" in row_captions
+        assert "Furniture" in row_captions
+        assert "Apparel" in row_captions
+        assert axes.get("Axis1"), "row axis empty — named set not expanded (Bug-5499)"
+
+    def test_topn_named_set_measure_on_columns_detected(self):
+        axes = self._parse(self._build_topn())
+        col_captions = [c for tup in axes.get("Axis0", []) for c in tup]
+        assert "net_sales" in col_captions
+
+    def test_filtered_named_set_on_rows_expands_members(self):
+        axes = self._parse(self._build_filtered())
+        row_captions = [c for tup in axes.get("Axis1", []) for c in tup]
+        assert "Electronics" in row_captions
+        assert "Furniture" in row_captions
+        assert axes.get("Axis1"), "row axis empty — named set not expanded (Bug-5499)"
+
+
+# ---------------------------------------------------------------------------
+# Bug-5495: paren-wrapped and function-wrapped predicate operand measures must
+# be stripped from axis hierarchy detection. Without this fix,
+# `([Measures].[m]) > 5` or `CoalesceEmpty([Measures].[m], 0) > 5` leaks
+# [Measures] onto ROWS.
+# ---------------------------------------------------------------------------
+
+class TestWrappedPredicateMeasureStripping:
+    """_strip_predicate_measures must handle wrapped measure operands."""
+
+    def _hiers(self, expr):
+        from src.dax.mdx_execute import _extract_hierarchies
+        return _extract_hierarchies(expr)
+
+    # --- paren-wrapped predicate operands (Bug-5495) -------------------------
+
+    def test_paren_wrapped_measure_leading_stripped(self):
+        """([Measures].[m]) > 5 must not leak [Measures] onto the axis."""
+        hiers = self._hiers(
+            "Filter([d].[d].Members, ([Measures].[m]) > 5)"
+        )
+        assert hiers == ["[d].[d]"]
+
+    def test_paren_wrapped_measure_trailing_stripped(self):
+        """5 < ([Measures].[m]) must not leak [Measures] onto the axis."""
+        hiers = self._hiers(
+            "Filter([d].[d].Members, 5 < ([Measures].[m]))"
+        )
+        assert hiers == ["[d].[d]"]
+
+    # --- function-wrapped predicate operands (Bug-5495) ----------------------
+
+    def test_coalesce_empty_wrapped_measure_stripped(self):
+        """CoalesceEmpty([Measures].[m], 0) > 5 must not leak [Measures]."""
+        hiers = self._hiers(
+            "Filter([d].[d].Members, CoalesceEmpty([Measures].[m], 0) > 5)"
+        )
+        assert hiers == ["[d].[d]"]
+
+    def test_iif_wrapped_measure_stripped(self):
+        """IIF(cond, [Measures].[m], 0) > 5 must not leak [Measures]."""
+        hiers = self._hiers(
+            "Filter([d].[d].Members, IIF(1=1, [Measures].[m], 0) > 5)"
+        )
+        assert hiers == ["[d].[d]"]
+
+    def test_double_paren_wrapped_measure_stripped(self):
+        """(([Measures].[m])) > 5 must not leak [Measures] (Bug-5495)."""
+        hiers = self._hiers(
+            "Filter([d].[d].Members, (([Measures].[m])) > 5)"
+        )
+        assert hiers == ["[d].[d]"]
+
+    def test_paren_wrapped_func_call_comparison_stripped(self):
+        """(CoalesceEmpty([Measures].[m], 0)) > 5 must not leak [Measures]."""
+        hiers = self._hiers(
+            "Filter([d].[d].Members, (CoalesceEmpty([Measures].[m], 0)) > 5)"
+        )
+        assert hiers == ["[d].[d]"]
+
+    # --- genuine wrapped axis measures must NOT be stripped -------------------
+
+    def test_set_wrapped_axis_measure_preserved(self):
+        """{[Measures].[m]} is a genuine axis member, not a predicate operand."""
+        hiers = self._hiers("{[Measures].[m]}")
+        assert "[Measures]" in hiers
+
+    def test_addcalculated_members_axis_measure_preserved(self):
+        """AddCalculatedMembers({[Measures].[m]}) is a genuine axis usage."""
+        hiers = self._hiers("AddCalculatedMembers({[Measures].[m]})")
+        assert "[Measures]" in hiers
+
+    def test_crossjoin_axis_measure_preserved(self):
+        """CrossJoin([d].[d].Members, [Measures].[m]) — measure is axis member."""
+        hiers = self._hiers("CrossJoin([d].[d].Members, [Measures].[m])")
+        assert "[Measures]" in hiers
+
+    def test_filter_predicate_plus_genuine_axis_measure_preserved(self):
+        """Predicate measure is stripped but explicit axis measure stays."""
+        hiers = self._hiers(
+            "CrossJoin(Filter([d].[d].Members, ([Measures].[x]) > 5), {[Measures].[m]})"
+        )
+        assert "[Measures]" in hiers
+        assert "[d].[d]" in hiers

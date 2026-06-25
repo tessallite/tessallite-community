@@ -67,7 +67,7 @@ gcloud run services update SERVICE_NAME \
 <p>Never commit credential values to source control. In Community installs, keep <code>.env</code> with your installation backup, but outside git. Keep downloaded <code>license.json</code> files somewhere secure as records, but the active uploaded licence lives in the platform database. On GCP, secrets (<code>SYSTEM_DATABASE_URL</code>, <code>CREDENTIAL_ENCRYPTION_KEY</code>, <code>JWT_SECRET_KEY</code>, and other secret values) are stored in Secret Manager and mounted into Cloud Run at deploy time — they never appear in the service YAML. For key rotation, see <code>CREDENTIAL_ENCRYPTION_KEY_PREVIOUS</code> in the <a href="../../../docs/guides/guides_configuration-reference.md">Configuration Reference</a>.</p>
 <h2>Related</h2>
 <ul><li><a href="deploy-local.html">Deploy Locally</a></li><li><a href="deploy-gcp.html">Deploy on GCP</a></li><li><a href="service-reference.html">Service Reference</a></li></ul>
-<nav class="page-nav"><a href="deploy-gcp.html" class="page-nav-btn prev">&larr; Deploy on GCP</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="system-configuration.html" class="page-nav-btn next">System Configuration &rarr;</a></nav>
+<nav class="page-nav"><a href="deploy-kubernetes.html" class="page-nav-btn prev">&larr; Deploy on Kubernetes</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="system-configuration.html" class="page-nav-btn next">System Configuration &rarr;</a></nav>
   </main>
   <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
 </body>

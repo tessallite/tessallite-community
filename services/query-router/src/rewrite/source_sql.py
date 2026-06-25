@@ -1934,6 +1934,14 @@ async def _build_source_sql(
     if not dimensions_by_name:
         dimensions_by_name = {dim.name: dim for dim in bound_query.resolved_dimensions}
     filter_dim_names = {f.dimension_name for f in bound_query.resolved_filters}
+    # Bug-5488: dimensions referenced ONLY inside an unresolvable WHERE
+    # predicate (function-wrapped or OR-compound) never produce a LogicalFilter,
+    # so they are absent from ``resolved_filters``. The binder collected them by
+    # walking the raw WHERE AST; fold them in here so their physical columns are
+    # loaded (``col_ids``) and their tables joined (``required_table_ids``),
+    # which lets ``_get_phys_expr`` resolve them in ``_qualify_where`` instead of
+    # leaking the bare semantic name to the source DB ("column does not exist").
+    filter_dim_names |= set(getattr(bound_query, "where_referenced_dimensions", None) or set())
 
     missing_filter_dims = filter_dim_names - set(dimensions_by_name)
     if missing_filter_dims:

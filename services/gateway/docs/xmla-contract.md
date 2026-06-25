@@ -98,7 +98,36 @@ The gateway returns these capability flags in DISCOVER_PROPERTIES to match SSAS 
 | `MDSCHEMA_DIMENSIONS` | Yes | Returns dimensions for specified Catalog |
 | `MDSCHEMA_MEASURES` | Yes | Returns measures for specified Catalog |
 | `DISCOVER_SCHEMA_ROWSETS` | No | Returns all available schema types |
+| `DISCOVER_CSDL_METADATA` | Yes | Power BI / Tabular: minimal CSDL envelope describing the catalog (entity type + measure/dimension properties) |
+| `DISCOVER_CALC_DEPENDENCY` | Yes | Power BI / Tabular: conformant empty rowset (no Tabular calculation-dependency objects) |
 | `EXECUTE` | No (optional) | Executes query; uses Catalog if provided |
+
+### Power BI / Tabular surface (Bug-5430)
+
+Power BI Desktop and "Analyze in Excel" connect to the XMLA endpoint as a
+Tabular model and probe the Tabular metadata surface:
+
+- `DISCOVER_CSDL_METADATA` and `DISCOVER_CALC_DEPENDENCY` arrive as `Discover`
+  requests and are dispatched through the standard discovery path.
+- `$SYSTEM.TMSCHEMA_*` DMVs (`MODEL`, `TABLES`, `COLUMNS`, `MEASURES`,
+  `HIERARCHIES`, `LEVELS`, `PARTITIONS`, `RELATIONSHIPS`) arrive as `Execute`
+  statements (`SELECT ... FROM $SYSTEM.TMSCHEMA_<table>`). They are intercepted
+  before MDX translation and answered from model metadata as a flat Rowset.
+  Unknown TMSCHEMA tables return a conformant empty rowset.
+
+These are minimally-conformant projections of the semantic model — enough for a
+Power BI discovery sequence to succeed rather than hard-fail on an unrecognised
+request type.
+
+### Response compression and Cancel (Bug-5436b)
+
+- **Compression:** when the client advertises `Accept-Encoding: gzip` or
+  `deflate`, SOAP responses over ~512 bytes are compressed and tagged with
+  `Content-Encoding` (and `Vary: Accept-Encoding`). Identity is used otherwise.
+- **`<Cancel>`:** an `Execute` whose `Command` is `<Cancel>` is acknowledged with
+  an empty-success `ExecuteResponse`. Tessallite runs each Execute synchronously
+  to completion (no long-running cancellable server-side cursor), so the
+  acknowledgement is the conformant minimal behaviour.
 
 ## Backward Compatibility
 

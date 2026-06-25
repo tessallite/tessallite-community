@@ -558,6 +558,14 @@ class Dimension(TenantBase):
     description: Mapped[Optional[str]] = mapped_column(Text)
     display_folder: Mapped[Optional[str]] = mapped_column(String(255))
     source_column_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("model_columns.id", ondelete="SET NULL"), index=True)
+    # Bug-5434: optional DISPLAY column for a flat (single-level) dimension, distinct
+    # from the KEY column (``source_column_id``). When set, member discovery surfaces
+    # this column's value as the member CAPTION (MEMBER_NAME) while the key stays the
+    # member identity (MEMBER_KEY). NULL = caption equals key (legacy behaviour).
+    display_column_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("model_columns.id", ondelete="SET NULL"),
+        index=True,
+    )
     user_defined_attribute_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user_defined_attributes.id", ondelete="SET NULL"),
         index=True,

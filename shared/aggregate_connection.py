@@ -13,7 +13,8 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.db.models import DataSource, ModelTable, ProjectConnection
+from shared.connection_scope import assert_connection_in_project
+from shared.db.models import DataSource, Model, ModelTable, ProjectConnection
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,15 @@ async def resolve_source_connection(
         raise ValueError(
             f"ProjectConnection {conn_ids[0]} not found for model {model_id}"
         )
+
+    # Bug-5325 fail-closed: a legacy/imported DataSource can reference a
+    # ProjectConnection in a DIFFERENT project than the model that owns it.
+    # Reject it rather than materialise/execute against another project's
+    # source. The owning model defines the project the connection must match.
+    model = await db.get(Model, model_id)
+    if model is None:
+        raise ValueError(f"Model {model_id} not found for connection resolution")
+    assert_connection_in_project(conn, model.project_id)
     return conn
 
 

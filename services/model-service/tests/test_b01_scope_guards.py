@@ -6,7 +6,7 @@ import uuid
 import pytest
 from fastapi import HTTPException
 
-from shared.db.models import KPI, Model, ProjectConnection
+from shared.db.models import DataSource, KPI, Model, ProjectConnection
 from src.auth.middleware import CurrentEmbedUser, CurrentUser
 import src.api.kpis as kpis_module
 from src.api.kpis import (
@@ -16,6 +16,7 @@ from src.api.kpis import (
     _load_visible_kpi_or_404,
     router as kpi_router,
 )
+from src.api._scope import resolve_source_connection
 from src.api.sources import _validate_source_connection
 from src.api.targets import _validate_target_connection
 
@@ -249,3 +250,67 @@ async def test_kpi_router_scope_dependency_rejects_embed_outside_project(monkeyp
 
     assert exc.value.status_code == 403
     assert "Project not in embed token scope" in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
+# Bug-5325: read-time DataSource.project_connection_id defense
+# ---------------------------------------------------------------------------
+
+
+def _source(model_id, connection_id):
+    return types.SimpleNamespace(
+        id=uuid.uuid4(),
+        model_id=model_id,
+        project_connection_id=connection_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_source_connection_rejects_cross_project_row():
+    """A legacy/imported source whose connection belongs to a DIFFERENT
+    project must be rejected at read time (fail-closed), not silently used."""
+    owning_project = uuid.uuid4()
+    other_project = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    source = _source(uuid.uuid4(), connection_id)
+    db = _DB(conn=_conn(other_project))
+
+    with pytest.raises(HTTPException) as exc:
+        await resolve_source_connection(
+            db, source, expected_project_id=owning_project
+        )
+
+    assert exc.value.status_code == 422
+    assert "different project" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_resolve_source_connection_allows_matching_project_row():
+    """A well-formed source whose connection belongs to the SAME project
+    resolves to that connection."""
+    owning_project = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    conn = _conn(owning_project)
+    source = _source(uuid.uuid4(), connection_id)
+    db = _DB(conn=conn)
+
+    result = await resolve_source_connection(
+        db, source, expected_project_id=owning_project
+    )
+
+    assert result is conn
+
+
+@pytest.mark.asyncio
+async def test_resolve_source_connection_missing_connection_is_404():
+    """A dangling project_connection_id (row deleted) is rejected, not used."""
+    owning_project = uuid.uuid4()
+    source = _source(uuid.uuid4(), uuid.uuid4())
+    db = _DB(conn=None)
+
+    with pytest.raises(HTTPException) as exc:
+        await resolve_source_connection(
+            db, source, expected_project_id=owning_project
+        )
+
+    assert exc.value.status_code == 404

@@ -347,6 +347,8 @@
   "modelHealth.violations": "Violations",
   "modelHealth.warnings": "Warnings",
   "modelHealth.yes": "yes",
+  "modelSync.queryPanelWarning": "This model has unsaved or undeployed changes — query results reflect the last DEPLOYED version, not your current edits. Save and deploy to query the latest.",
+  "modelSync.statusBarLabel": "Unsaved / undeployed — results are from the deployed version",
   "pickerBar.addMeasure": "Add measure",
   "pickerBar.columnsLabel": "Columns",
   "pickerBar.executionMode": "Execution mode",

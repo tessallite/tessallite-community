@@ -1,14 +1,15 @@
 """Tests for calendar table name qualification and bind verification.
 
 Covers Bug-156 (discovery keystroke spam), Bug-157 (script tab never loads),
-Bug-158 (BQ table name qualification), and bind-to-nonexistent-table guard.
+Bug-158 (BQ table name qualification), bind-to-nonexistent-table guard, and
+Bug-5480 (consolidated calendar.py onto _table_qualify.qualify_physical_name).
 """
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
 # ---------------------------------------------------------------------------
-# _qualify_table_name tests (Bug-158)
+# qualify_physical_name tests (Bug-158, consolidated Bug-5480)
 # ---------------------------------------------------------------------------
 
 def _make_connection(conn_type: str, config: dict | None = None, creds: dict | None = None):
@@ -34,90 +35,90 @@ def _make_source(config: dict | None = None, default_schema: str | None = None):
 
 
 class TestQualifyTableName:
-    """Unit tests for _qualify_table_name."""
+    """Unit tests for qualify_physical_name (consolidated from calendar.py)."""
 
     def test_already_qualified_passes_through(self):
-        from src.api.calendar import _qualify_table_name
+        from src.api._table_qualify import qualify_physical_name
         conn, _ = _make_connection("postgresql")
-        result = _qualify_table_name("public.calendar", conn)
+        result = qualify_physical_name("public.calendar", conn)
         assert result == "public.calendar"
 
     def test_postgresql_uses_schema_from_connection_config(self):
-        from src.api.calendar import _qualify_table_name
+        from src.api._table_qualify import qualify_physical_name
         conn, _ = _make_connection("postgresql", config={"schema": "analytics"})
-        result = _qualify_table_name("calendar", conn)
+        result = qualify_physical_name("calendar", conn)
         assert result == "analytics.calendar"
 
     def test_postgresql_uses_source_config_schema(self):
-        from src.api.calendar import _qualify_table_name
+        from src.api._table_qualify import qualify_physical_name
         conn, _ = _make_connection("postgresql")
         source = _make_source(config={"schema": "dw"})
-        result = _qualify_table_name("calendar", conn, source)
+        result = qualify_physical_name("calendar", conn, source)
         assert result == "dw.calendar"
 
     def test_postgresql_source_config_overrides_connection_config(self):
-        from src.api.calendar import _qualify_table_name
+        from src.api._table_qualify import qualify_physical_name
         conn, _ = _make_connection("postgresql", config={"schema": "old_schema"})
         source = _make_source(config={"schema": "new_schema"})
-        result = _qualify_table_name("calendar", conn, source)
+        result = qualify_physical_name("calendar", conn, source)
         assert result == "new_schema.calendar"
 
     def test_postgresql_falls_back_to_default_schema(self):
-        from src.api.calendar import _qualify_table_name
+        from src.api._table_qualify import qualify_physical_name
         conn, _ = _make_connection("postgresql")
         source = _make_source(default_schema="public")
-        result = _qualify_table_name("calendar", conn, source)
+        result = qualify_physical_name("calendar", conn, source)
         assert result == "public.calendar"
 
     def test_postgresql_no_schema_returns_bare_name(self):
-        from src.api.calendar import _qualify_table_name
+        from src.api._table_qualify import qualify_physical_name
         conn, _ = _make_connection("postgresql")
-        result = _qualify_table_name("calendar", conn)
+        result = qualify_physical_name("calendar", conn)
         assert result == "calendar"
 
     def test_bigquery_uses_source_dataset_and_project(self):
-        from src.api.calendar import _qualify_table_name
+        from src.api._table_qualify import qualify_physical_name
         conn, _ = _make_connection(
             "bigquery",
             creds={"project_id": "my-project", "service_account_json": "{}"},
         )
         source = _make_source(config={"schema": "my_dataset"})
-        result = _qualify_table_name("calendar", conn, source)
+        result = qualify_physical_name("calendar", conn, source)
         assert result == "my-project.my_dataset.calendar"
 
     def test_bigquery_dataset_only_two_part_name(self):
-        from src.api.calendar import _qualify_table_name
+        from src.api._table_qualify import qualify_physical_name
         conn, _ = _make_connection("bigquery")
         source = _make_source(config={"dataset": "analytics"})
-        result = _qualify_table_name("calendar", conn, source)
+        result = qualify_physical_name("calendar", conn, source)
         assert result == "analytics.calendar"
 
     def test_bigquery_no_dataset_returns_bare_name(self):
-        from src.api.calendar import _qualify_table_name
+        from src.api._table_qualify import qualify_physical_name
         conn, _ = _make_connection("bigquery")
-        result = _qualify_table_name("calendar", conn)
+        result = qualify_physical_name("calendar", conn)
         assert result == "calendar"
 
     def test_bigquery_source_schema_field_treated_as_dataset(self):
         """Source created via SourcesPanel stores BQ dataset under 'schema' key."""
-        from src.api.calendar import _qualify_table_name
+        from src.api._table_qualify import qualify_physical_name
         conn, _ = _make_connection(
             "bigquery",
             creds={"project_id": "proj-1", "service_account_json": "{}"},
         )
         source = _make_source(config={"schema": "demo_data"})
-        result = _qualify_table_name("calendar", conn, source)
+        result = qualify_physical_name("calendar", conn, source)
         assert result == "proj-1.demo_data.calendar"
 
     def test_bigquery_schema_already_contains_project_no_duplication(self):
         """When schema stores 'project.dataset', don't prepend project again."""
-        from src.api.calendar import _qualify_table_name
+        from src.api._table_qualify import qualify_physical_name
         conn, _ = _make_connection(
             "bigquery",
             creds={"project_id": "tessallite-io", "service_account_json": "{}"},
         )
         source = _make_source(config={"schema": "tessallite-io.demo_data"})
-        result = _qualify_table_name("calendar", conn, source)
+        result = qualify_physical_name("calendar", conn, source)
         assert result == "tessallite-io.demo_data.calendar"
 
 
@@ -289,3 +290,81 @@ class TestWriteAccessGate:
     def test_connection_with_write_access_false_rejected(self):
         config = {"write_access": False}
         assert config.get("write_access", False) is False
+
+
+# ---------------------------------------------------------------------------
+# Bug-5325: _load_source_with_connection read-time cross-project defense
+# ---------------------------------------------------------------------------
+
+class TestCalendarSourceConnectionCrossProjectGuard:
+    """_load_source_with_connection must fail closed when the source's
+    connection belongs to a different project (legacy/imported malformed row)."""
+
+    @pytest.mark.asyncio
+    async def test_cross_project_connection_rejected(self):
+        import uuid as _uuid
+        from fastapi import HTTPException
+        from src.api.calendar import _load_source_with_connection
+
+        owning_project = _uuid.uuid4()
+        other_project = _uuid.uuid4()
+        model_id = _uuid.uuid4()
+        source_id = _uuid.uuid4()
+
+        source = MagicMock()
+        source.model_id = model_id
+        source.project_connection_id = _uuid.uuid4()
+        conn = MagicMock()
+        conn.project_id = other_project
+
+        db = MagicMock()
+
+        async def _get(cls, key):
+            from shared.db.models import DataSource, ProjectConnection
+            if cls is DataSource:
+                return source
+            if cls is ProjectConnection:
+                return conn
+            return None
+
+        db.get = _get
+
+        with pytest.raises(HTTPException) as exc:
+            await _load_source_with_connection(
+                db, source_id, model_id, project_id=owning_project
+            )
+        assert exc.value.status_code == 422
+        assert "different project" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_matching_project_connection_allowed(self):
+        import uuid as _uuid
+        from src.api.calendar import _load_source_with_connection
+
+        owning_project = _uuid.uuid4()
+        model_id = _uuid.uuid4()
+        source_id = _uuid.uuid4()
+
+        source = MagicMock()
+        source.model_id = model_id
+        source.project_connection_id = _uuid.uuid4()
+        conn = MagicMock()
+        conn.project_id = owning_project
+
+        db = MagicMock()
+
+        async def _get(cls, key):
+            from shared.db.models import DataSource, ProjectConnection
+            if cls is DataSource:
+                return source
+            if cls is ProjectConnection:
+                return conn
+            return None
+
+        db.get = _get
+
+        got_source, got_conn = await _load_source_with_connection(
+            db, source_id, model_id, project_id=owning_project
+        )
+        assert got_source is source
+        assert got_conn is conn

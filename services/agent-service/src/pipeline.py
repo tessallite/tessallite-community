@@ -752,12 +752,18 @@ async def _load_measure_formats(
 
 def _plan_dict(call: Any) -> dict[str, Any]:
     if isinstance(call, QueryToolCall):
+        # Bug-5349 Phase 2/3 — structured predicates live in *_refs, not the
+        # flat where/having lists. Re-merge their raw forms so a follow-up plan
+        # replay reconstructs them (otherwise the structured filter would be
+        # silently lost on the next turn).
+        where_out = list(call.where) + [r.raw for r in (call.where_refs or [])]
+        having_out = list(call.having) + [r.raw for r in (call.having_refs or [])]
         inner_q: dict[str, Any] = {
             "model_id": call.model_id,
             "measures": call.measures,
             "dimensions": call.dimensions,
-            "where": call.where,
-            "having": call.having,
+            "where": where_out,
+            "having": having_out,
             "sort": call.sort,
             "limit": call.limit,
         }
@@ -768,6 +774,9 @@ def _plan_dict(call: Any) -> dict[str, Any]:
         refs = call.dimension_refs or []
         if any(not r.is_bare for r in refs):
             inner_q["dimension_exprs"] = [r.raw for r in refs]
+        # Phase 3 — preserve computed projection columns for follow-up replay.
+        if call.projection_refs:
+            inner_q["projections"] = [p.raw for p in call.projection_refs]
         return {"query": inner_q}
     if isinstance(call, RunRecipeToolCall):
         return {"run_recipe": {
@@ -781,19 +790,23 @@ def _plan_dict(call: Any) -> dict[str, Any]:
             "result_label": call.result_label,
         }
         for s in call.steps:
+            step_where = list(s.where) + [r.raw for r in (s.where_refs or [])]
+            step_having = list(s.having) + [r.raw for r in (s.having_refs or [])]
             step: dict[str, Any] = {
                 "name": s.name,
                 "model_id": s.model_id,
                 "measures": s.measures,
                 "dimensions": s.dimensions,
-                "where": s.where,
-                "having": s.having,
+                "where": step_where,
+                "having": step_having,
                 "sort": s.sort,
                 "limit": s.limit,
             }
             refs = s.dimension_refs or []
             if any(not r.is_bare for r in refs):
                 step["dimension_exprs"] = [r.raw for r in refs]
+            if s.projection_refs:
+                step["projections"] = [p.raw for p in s.projection_refs]
             inner["steps"].append(step)
         if call.chart_type:
             inner["chart_type"] = call.chart_type
@@ -2151,6 +2164,13 @@ async def _run_compound_query_branch(
             limit=step.limit,
             limit_explicit=step.limit_explicit,
             dimension_refs=step.dimension_refs,
+            # Bug-5349 Phase 2/3 — carry the structured expression refs so the
+            # compound step's projections / structured predicates survive into
+            # SQL composition AND so their base fields reach persona-scope
+            # validation (Codex-2 — they were silently dropped before).
+            projection_refs=step.projection_refs,
+            where_refs=step.where_refs,
+            having_refs=step.having_refs,
         )
         complexity_reason = check_query_complexity(cfg, step_call_for_check)
         if complexity_reason:
@@ -2179,20 +2199,12 @@ async def _run_compound_query_branch(
 
     validation_errors = validate_expression(call.expression, call.steps)
     if validation_errors and conversation_id is not None:
-        body = {
-            "steps": [
-                {"name": s.name, "model_id": s.model_id,
-                 "measures": s.measures, "dimensions": s.dimensions,
-                 "where": s.where, "having": s.having,
-                 "sort": s.sort, "limit": s.limit}
-                for s in call.steps
-            ],
-            "expression": call.expression,
-            "result_label": call.result_label,
-        }
-        if call.chart_type:
-            body["chart_type"] = call.chart_type
-        failing_json = json.dumps({"compound_query": body}, indent=2)
+        # Bug-5349 — reuse the canonical plan-dict serialiser so the failing
+        # JSON shown to the correction LLM preserves every structured form
+        # (dimension_exprs, projections, structured where/having). A hand-rolled
+        # rebuild from s.where/s.having only would silently drop the structured
+        # filters/projections, so the corrected retry could lose them (Codex-R2).
+        failing_json = json.dumps(_plan_dict(call), indent=2)
         corrected = await _attempt_tool_call_correction(
             adapter, failing_json, "; ".join(validation_errors),
             db, conversation_id, usage_totals,
@@ -2204,7 +2216,16 @@ async def _run_compound_query_branch(
                     new_errors = validate_expression(
                         new_call.expression, new_call.steps,
                     )
-                    if not new_errors:
+                    # Bug-5349 Phase 2/3 (Codex-R3) — also re-run the pre-execution
+                    # bundle validator on the corrected steps. A correction that
+                    # fixes the combine expression could still introduce an
+                    # invented field inside a structured projection / where /
+                    # having; without this re-check it would bypass the metadata
+                    # gate and only surface as a raw binder error downstream.
+                    new_bundle_issues = validate_tool_call_against_bundle(
+                        new_call, bundle,
+                    )
+                    if not new_errors and not new_bundle_issues:
                         call = new_call
                         plan = _plan_dict(call)
                         validation_errors = []
@@ -2250,6 +2271,12 @@ async def _run_compound_query_branch(
             limit=step.limit,
             limit_explicit=step.limit_explicit,
             dimension_refs=step.dimension_refs,
+            # Bug-5349 Phase 2/3 / Codex-2 — structured refs flow into execution
+            # so compound-step projections/predicates render and their base
+            # fields are persona-scope checked at the execute_query chokepoint.
+            projection_refs=step.projection_refs,
+            where_refs=step.where_refs,
+            having_refs=step.having_refs,
         )
         try:
             execution = await execute_query(

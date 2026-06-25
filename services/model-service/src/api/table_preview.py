@@ -19,10 +19,11 @@ from sqlalchemy import select
 
 from shared.config.settings import get_settings
 from shared.connector_qualify import quote_table_ref, transpile_preview_sql
-from shared.db.models import DataSource, ModelTable, ProjectConnection
+from shared.db.models import DataSource, ModelTable
 from shared.db.session import get_tenant_db
 from shared.schemas.connection_type import normalize_connection_type
-from src.api._scope import ensure_model_in_project
+from src.api._scope import ensure_model_in_project, resolve_source_connection
+from src.api._table_qualify import qualify_physical_name
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 
@@ -75,7 +76,7 @@ def _extract_bearer(request: Request) -> str:
     raise HTTPException(status_code=401, detail="Bearer token required")
 
 
-async def _resolve_table_context(db, table_id: UUID):
+async def _resolve_table_context(db, table_id: UUID, *, expected_project_id: UUID):
     table = await db.get(ModelTable, table_id)
     if table is None:
         return None, None, None, "Table not found."
@@ -88,13 +89,23 @@ async def _resolve_table_context(db, table_id: UUID):
     if source is None:
         return None, None, None, "No data source configured for this table."
 
-    conn = await db.get(ProjectConnection, source.project_connection_id)
-    if conn is None:
-        return None, None, None, "Project connection not found."
+    # Bug-5325: fail closed when the source's connection belongs to a different
+    # project (legacy/imported malformed row) instead of previewing data from
+    # the wrong project's source. resolve_source_connection raises on mismatch.
+    conn = await resolve_source_connection(
+        db, source, expected_project_id=expected_project_id
+    )
 
     connector = normalize_connection_type((conn.connection_type or "").lower())
 
-    return connector, conn, table.physical_name, None
+    # Resolve the stored physical_name to a fully-qualified, *unquoted* dotted
+    # reference using the source's default schema/dataset (and BQ project).
+    # Bug-5470: previously the bare physical_name was quoted with PostgreSQL
+    # rules regardless of connector, so BigQuery sources whose physical_name
+    # lacked a dataset prefix produced "Table must be qualified with a dataset".
+    qualified_name = qualify_physical_name(table.physical_name, conn, source)
+
+    return connector, conn, qualified_name, None
 
 
 async def _introspect_via_router(
@@ -142,13 +153,16 @@ async def preview_table(
         if table is None or str(table.model_id) != str(model_id):
             raise HTTPException(status_code=404, detail="Table not found")
 
-        connector, conn_obj, physical_name, err = await _resolve_table_context(
-            db, table_id
+        connector, _, qualified_name, err = await _resolve_table_context(
+            db, table_id, expected_project_id=project_id
         )
         if err:
             raise HTTPException(status_code=422, detail=err)
 
-        pg_quoted = quote_table_ref("postgresql", physical_name)
+        # Quote the resolved dotted reference with canonical PostgreSQL rules,
+        # then transpile to the connector dialect via sqlglot (single canonical
+        # -> dialect path; BigQuery backticks come out of the transpile step).
+        pg_quoted = quote_table_ref("postgresql", qualified_name)
         offset = page * page_size
         canonical = f"SELECT * FROM {pg_quoted} LIMIT {page_size + 1} OFFSET {offset}"
         sql = transpile_preview_sql(connector, canonical)

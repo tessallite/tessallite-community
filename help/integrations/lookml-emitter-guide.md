@@ -68,4 +68,4 @@ regenerate and review them as owned drift.
 
 ---
 
-<- [Optional Looker-hosted workflow](looker-studio-via-looker-guide.md) | [Home](../index.md) | [BI Tool Compatibility Matrix ->](bi-compatibility.md)
+<- [Looker Cloud Core - Not Required](looker-cloud-core-connection-guide.md) | [Home](../index.md) | [BI Tool Compatibility Matrix ->](bi-compatibility.md)

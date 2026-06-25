@@ -105,4 +105,4 @@ Never commit credential values to source control. In Community installs, keep `.
 
 ---
 
-← [Deploy on GCP](deploy-gcp.md) | [Home](../index.md) | [System Configuration →](system-configuration.md)
+← [Deploy on Kubernetes](deploy-kubernetes.md) | [Home](../index.md) | [System Configuration →](system-configuration.md)

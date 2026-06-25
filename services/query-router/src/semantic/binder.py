@@ -425,7 +425,27 @@ async def bind_query_to_model(
             raise SemanticBindingError(
                 f"Unknown filter column: {f.dimension_name!r} in model {model.slug!r}"
             )
-            
+
+    # Bug-5488: collect model dimensions referenced ONLY inside an
+    # unresolvable WHERE predicate (function-wrapped comparison, OR-compound,
+    # etc.). The parser's strict ``_extract_filters`` deliberately produces no
+    # ``LogicalFilter`` for such shapes, so a column that appears nowhere else
+    # (not in SELECT, ORDER BY, or a representable filter) never reaches the
+    # source rewriter's column/table collection — its physical column is not
+    # loaded and its table is not joined, so the rewriter emits the bare name
+    # and the source DB raises "column does not exist". Walk the raw WHERE AST
+    # and record every column whose name resolves to a known model dimension or
+    # measure so the rewriter can fold these into its physical-column /
+    # join-table set. Restricted to names present in the model maps, so
+    # literals, aliases, and function/keyword tokens are never captured.
+    where_referenced_dimensions = _collect_where_referenced_fields(
+        query,
+        dimension_map=dimension_map,
+        dimension_map_lower=dimension_map_lower,
+        all_dim_map_for_filter=_all_dim_map_for_filter,
+        all_dim_map_lower_for_filter=_all_dim_map_lower_for_filter,
+    )
+
     # Strip surrounding SQL identifier quote characters (double-quote or backtick)
     # before comparing raw_text to inner_column. A bare quoted column like
     # "col_name" has raw_text='"col_name"' but inner_column='col_name'; they
@@ -538,6 +558,7 @@ async def bind_query_to_model(
         uses_invalid_objects=uses_invalid,
         persona_narrowed_star=narrowed_star,
         allowed_physical_columns=physical_columns,
+        where_referenced_dimensions=where_referenced_dimensions,
     )
 
 
@@ -581,6 +602,100 @@ async def load_inactive_aggregates(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _collect_where_referenced_fields(
+    query: LogicalQuery,
+    *,
+    dimension_map: dict,
+    dimension_map_lower: dict,
+    all_dim_map_for_filter: dict,
+    all_dim_map_lower_for_filter: dict,
+) -> set[str]:
+    """Return canonical model dimension names referenced anywhere in the
+    query's raw WHERE clause (Bug-5488).
+
+    Only runs for the unresolvable-WHERE path: a resolvable WHERE is already
+    fully represented by ``resolved_filters`` (and thus by the rewriter's
+    ``filter_dim_names``), so walking it would be redundant. Complex passthrough
+    queries skip semantic resolution entirely and go to source raw, so they need
+    no column collection here either.
+
+    The walk visits EVERY ``exp.Column`` in the WHERE subtree — including those
+    nested inside function calls (``UPPER(TRIM(col))``) and on both sides of
+    AND/OR compounds — and keeps only names that resolve to a known model
+    DIMENSION (exact case first, then case-insensitive, including hidden
+    dimensions that are valid WHERE predicates). Names that match nothing in the
+    dimension maps (string literals parsed as columns, output aliases, CTE
+    columns, function/keyword tokens) are ignored, so the set never captures a
+    non-model token. The returned values are the canonical model names, ready to
+    fold into the source rewriter's physical-column / join-table collection.
+
+    Scope (deep-review finding, Bug-5488): only DIMENSIONS are collected, not
+    measures. The source rewriter's filter backfill loads filter-only columns
+    from the ``Dimension`` table, and ``_get_phys_expr`` resolves a measure only
+    when it is in ``resolved_measures``/``_order_measures`` — neither of which
+    holds a measure referenced ONLY inside the WHERE. Collecting a measure name
+    here would therefore add it to ``filter_dim_names`` without the source path
+    being able to resolve it, so it is deliberately excluded. A measure used
+    only inside an unresolvable WHERE predicate (an unusual shape — measures
+    normally appear in SELECT/HAVING) remains out of scope for this fix.
+    """
+    if not getattr(query, "has_unresolvable_where", False):
+        return set()
+    if getattr(query, "has_complex_sql", False):
+        return set()
+    raw_sql = getattr(query, "raw_query", None)
+    if not raw_sql:
+        return set()
+
+    import sqlglot as _sg
+    from sqlglot import exp as _sg_exp
+
+    input_dialect = getattr(query, "input_dialect", "postgres") or "postgres"
+    try:
+        ast = _sg.parse_one(raw_sql, read=input_dialect, error_level=_sg.ErrorLevel.WARN)
+    except Exception:
+        # Parse failure: the rewriter's raw-WHERE path will re-parse and fail
+        # loudly itself; collecting nothing here is the safe (no-op) direction.
+        return set()
+
+    select_node = ast if isinstance(ast, _sg_exp.Select) else ast.find(_sg_exp.Select)
+    if select_node is None:
+        return set()
+    where_node = select_node.args.get("where")
+    # Bug-457 shape: WHERE may live inside a subquery wrapper. Mirror the
+    # rewriter's raw-WHERE extraction so we collect from the same subtree.
+    # sqlglot stores the FROM clause under the ``from_`` key (NOT ``from``) —
+    # this must match ``source_sql.py``'s own subquery-WHERE unwrap, otherwise
+    # the fallback is dead and a flattened identity-derived query whose
+    # unresolvable WHERE lives in the inner SELECT would still leak.
+    if where_node is None:
+        from_clause = select_node.args.get("from_")
+        if from_clause is not None and isinstance(getattr(from_clause, "this", None), _sg_exp.Subquery):
+            inner = from_clause.this.this
+            if isinstance(inner, _sg_exp.Select):
+                where_node = inner.args.get("where")
+    if where_node is None:
+        return set()
+
+    referenced: set[str] = set()
+    for col in where_node.find_all(_sg_exp.Column):
+        name = col.name
+        if not name:
+            continue
+        resolved = (
+            dimension_map.get(name)
+            or dimension_map_lower.get(name.lower())
+            or all_dim_map_for_filter.get(name)
+            or all_dim_map_lower_for_filter.get(name.lower())
+        )
+        if resolved is None:
+            continue
+        canonical = getattr(resolved, "name", None)
+        if canonical:
+            referenced.add(canonical)
+    return referenced
+
 
 async def _load_model(model_id: str, db: AsyncSession) -> Model | None:
     result = await db.execute(

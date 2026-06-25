@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Autocomplete,
   Box,
@@ -112,11 +112,15 @@ function FilterEditor({ modelId, dim, filter, onChange, onClose, onRemove }: Edi
     !!dim.is_time_dim &&
     (dt.includes("DATE") || dt.includes("TIMESTAMP") || dt.includes("DATETIME"));
 
-  function handleSearchInput(value: string) {
+  // Clear the debounce timer on unmount to prevent setState after unmount
+  // (Bug-5510: leaked timer caused test flakes under parallel load).
+  useEffect(() => () => clearTimeout(debounceRef.current), []);
+
+  const handleSearchInput = useCallback((value: string) => {
     setSearch(value);
     clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => setDebouncedSearch(value), 300);
-  }
+  }, []);
 
   const shouldFetchValues =
     needsValues(filter.operator) &&

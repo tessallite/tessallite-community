@@ -23,6 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.auth.middleware import CurrentUser, enforce_model_scope, require_capability, require_tenant_admin
 from shared.auth.project_access import load_authorized_model
+from shared.connection_scope import (
+    CrossProjectConnectionError,
+    resolve_endpoint_connection,
+)
 from shared.db.models import (
     AggregateColumn,
     AggregateDefinition,
@@ -38,7 +42,6 @@ from shared.db.models import (
     ModelColumn,
     ModelTable,
     PersonaTagRestriction,
-    ProjectConnection,
     QueryLog,
     UserDefinedAttribute,
     data_tag_columns,
@@ -1106,10 +1109,24 @@ async def _evaluate_bound_field_compatibility(
             issue = entry.incompatible_dimensions.get(dimension_id)
             if issue is None:
                 continue
-            hide_names = issue.code in {
-                PERSONA_FIELD_UNAVAILABLE,
-                HIDDEN_FIELD_UNAVAILABLE,
-            }
+            # Bug-5456 / Bug-3592 / Bug-5381: ``is_hidden`` is display CURATION,
+            # not an access boundary. The binder already resolved this dimension
+            # into ``bound.resolved_dimensions`` because it was named explicitly
+            # (``SELECT channel_code`` resolves for any caller even when
+            # ``include_hidden=False``; only ``SELECT *`` suppresses it). The
+            # real access boundary (persona / RLS / CLS) is enforced by the
+            # persona gate and surfaces as PERSONA_FIELD_UNAVAILABLE. Re-rejecting
+            # an already-resolved hidden dimension here only because a measure is
+            # also selected is inconsistent (``SELECT channel_code`` succeeds but
+            # ``SELECT channel_code, SUM(transaction_amount)`` would 422) and
+            # contradicts the documented curation-vs-access design, so a
+            # HIDDEN_FIELD_UNAVAILABLE issue must not gate execution.
+            if issue.code == HIDDEN_FIELD_UNAVAILABLE:
+                continue
+            # Only PERSONA_FIELD_UNAVAILABLE reaches here as a security-scoped
+            # issue now (HIDDEN_FIELD_UNAVAILABLE is dropped above), so field
+            # names are redacted for that code alone.
+            hide_names = issue.code == PERSONA_FIELD_UNAVAILABLE
             issues.append(
                 FieldCompatibilityIssueResponse(
                     code=issue.code,
@@ -1155,8 +1172,11 @@ def _has_security_scoped_compatibility_issue(
 ) -> bool:
     if feedback is None:
         return False
+    # HIDDEN_FIELD_UNAVAILABLE is no longer emitted into ``feedback.issues``
+    # (it is dropped in _evaluate_bound_field_compatibility: hidden is curation,
+    # not an access boundary). Only persona scoping is security-scoped here.
     return any(
-        issue.code in {PERSONA_FIELD_UNAVAILABLE, HIDDEN_FIELD_UNAVAILABLE}
+        issue.code == PERSONA_FIELD_UNAVAILABLE
         for issue in feedback.issues
     )
 
@@ -1699,6 +1719,25 @@ async def execute_with_observation(
     except QueryTimeoutError as e:
         await _log_query_failure(db, user_identity, tenant_id, bound, decision, start_ms, "timeout", str(e), persona_id=persona_uuid, client_kind=client_kind)
         raise HTTPException(status_code=status.HTTP_408_REQUEST_TIMEOUT, detail=str(e))
+    except CrossProjectConnectionError as e:
+        # Bug-5325: the routed source/target connection belongs to a different
+        # project than the model owning the query (legacy/imported malformed
+        # row). The guard already fired BEFORE any SQL ran, so the query is
+        # rejected fail-closed. Surface it as a clean 422 misconfiguration error
+        # rather than letting it fall through to the generic 502 execution path.
+        await _log_query_failure(
+            db, user_identity, tenant_id, bound, decision, start_ms,
+            "cross_project_connection", str(e),
+            persona_id=persona_uuid, client_kind=client_kind,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "This model's source/target connection belongs to a different "
+                "project and cannot be used. Re-point it at a connection in the "
+                "correct project."
+            ),
+        )
     except Exception as e:
         if decision.route_type in ("aggregate", "pocket") and _is_missing_relation_error(e):
             # Bug-5346: the routed aggregate's physical table is missing (it was
@@ -2256,7 +2295,15 @@ async def _build_trace(
         except HTTPException:
             src = None
     if src is not None:
-        conn = await db.get(ProjectConnection, src.project_connection_id)
+        # Bug-5325 fail-closed: this is metadata-only (no SQL is executed
+        # here), but resolve through the shared guard so a cross-project row
+        # never surfaces another project's connection details even in trace.
+        try:
+            conn = await resolve_endpoint_connection(
+                db, src, expected_project_id=bound.model.project_id
+            )
+        except ValueError:
+            conn = None
         location = ""
         if isinstance(src.config, dict):
             location = (
@@ -2614,6 +2661,67 @@ async def _log_discover_members_early_exit(
         await db.rollback()
 
 
+_DISCOVER_DISPLAY_ALIAS = "__display_caption"
+
+
+async def _augment_discover_with_display_column(
+    bound: Any,
+    db: AsyncSession,
+) -> str | None:
+    """Bug-5434: if the discovered (flat) dimension carries a distinct DISPLAY
+    column, add it to the bound query so the source rewriter selects it DISTINCT
+    alongside the key.
+
+    Appends:
+      - a synthetic resolved dimension whose ``source_column_id`` is the display
+        column (so ``_build_dimension_select_pieces`` emits the column), named
+        with a fixed internal alias that cannot collide with a user dimension;
+      - a passthrough ``SelectExpression`` for that alias so the rewriter marks
+        it a standalone SELECT column (otherwise dimensions are GROUP-BY-only).
+
+    Returns the internal alias the result rows will carry the display value under,
+    or ``None`` when the dimension has no display column (the legacy path).
+
+    Engine-safe: only the bound query (data) is mutated here; the binder, router
+    and rewriter are not modified.
+    """
+    if not bound.resolved_dimensions:
+        return None
+    key_dim = bound.resolved_dimensions[0]
+    display_column_id = getattr(key_dim, "display_column_id", None)
+    if display_column_id is None:
+        return None
+    disp_col = await db.get(ModelColumn, display_column_id)
+    if disp_col is None:
+        return None
+    alias = _DISCOVER_DISPLAY_ALIAS
+    # Synthetic resolved dimension for the display column. Mirrors the fields the
+    # source rewriter reads on a resolved dimension (name, source_column_id,
+    # user_defined_attribute_id, calc_expression, is_invalid).
+    display_dim = SimpleNamespace(
+        id=None,
+        name=alias,
+        source_column_id=display_column_id,
+        user_defined_attribute_id=None,
+        calc_expression=None,
+        is_invalid=False,
+    )
+    bound.resolved_dimensions.append(display_dim)
+    # Passthrough SELECT expression so the rewriter treats the display column as a
+    # standalone SELECT item (not GROUP-BY-only) and aliases it by ``alias``.
+    bound.logical_query.select_expressions.append(
+        SelectExpression(
+            raw_text=alias,
+            alias=None,
+            classification="passthrough",
+            agg_function=None,
+            inner_column=alias,
+            inner_literal=None,
+        )
+    )
+    return alias
+
+
 async def _handle_discover_members(
     body: DiscoverMembersRequest,
     db: AsyncSession,
@@ -2688,6 +2796,16 @@ async def _handle_discover_members(
         )
         if persona is not None:
             merge_default_filters(persona, bound)
+
+    # Bug-5434: flat-dim display attribute. When the resolved key dimension
+    # declares a distinct DISPLAY column, select it alongside the key so the
+    # discovered members carry a caption that differs from the key. This is an
+    # engine-safe augmentation of the CONSUMER (this handler): we append a
+    # synthetic resolved dimension + a passthrough select expression for the
+    # display column so the source rewriter emits both DISTINCT columns. The
+    # binder/router/rewriter are untouched. The display alias is internal and
+    # never collides with the user-facing dimension name.
+    display_alias = await _augment_discover_with_display_column(bound, db)
 
     principal = Principal.from_current_user(current_user)
     try:
@@ -2805,13 +2923,23 @@ async def _handle_discover_members(
             first_val = next(iter(row.values()), None) if row else None
             val = first_val if first_val is not None else ""
         str_val = str(val)
-        members.append({
+        # Bug-5434: when a distinct display column was selected, surface its value
+        # as the member CAPTION (the gateway emits it as MEMBER_NAME) while the key
+        # value remains the member identity (MEMBER_KEY / name). When no display
+        # column is configured, caption falls back to the key (legacy behaviour,
+        # the gateway's `mem.get("caption") or mname` already handles a missing
+        # caption, but we set it explicitly for clarity).
+        member = {
             "name": str_val,
             "key": str_val,
             "level": levels[0],
             "ordinal": i,
             "parent": "",
-        })
+        }
+        if display_alias is not None:
+            disp_val = row.get(display_alias)
+            member["caption"] = str(disp_val) if disp_val is not None else str_val
+        members.append(member)
 
     return DiscoverMembersResponse(members=members, levels=levels)
 
@@ -3065,12 +3193,11 @@ async def execute_routed_query(
                 f"DataTarget {agg.target_id} not found for aggregate "
                 f"{decision.aggregate_id}"
             )
-        conn = await db.get(ProjectConnection, target.project_connection_id)
-        if conn is None:
-            raise ValueError(
-                f"ProjectConnection {target.project_connection_id} not found "
-                f"for aggregate target {agg.target_id}"
-            )
+        # Bug-5325 fail-closed: reject an aggregate target whose connection
+        # belongs to a different project than the model owning the query.
+        conn = await resolve_endpoint_connection(
+            db, target, expected_project_id=bound.model.project_id
+        )
         rows, bytes_processed, columns = await execute_on_connection(
             decision.rewritten_query, conn, db
         )
@@ -3090,21 +3217,23 @@ async def execute_routed_query(
                 f"DataTarget {pocket.target_id} not found for pocket "
                 f"{decision.pocket_id}"
             )
-        conn = await db.get(ProjectConnection, target.project_connection_id)
-        if conn is None:
-            raise ValueError(
-                f"ProjectConnection {target.project_connection_id} not found "
-                f"for pocket target {pocket.target_id}"
-            )
+        # Bug-5325 fail-closed: reject a pocket target whose connection belongs
+        # to a different project than the model owning the query.
+        conn = await resolve_endpoint_connection(
+            db, target, expected_project_id=bound.model.project_id
+        )
         rows, bytes_processed, columns = await execute_on_connection(
             decision.rewritten_query, conn, db
         )
         return rows, bytes_processed, columns, target
 
     source = await _resolve_query_source(bound.model.id, db, bound=bound)
-    conn = await db.get(ProjectConnection, source.project_connection_id)
-    if conn is None:
-        raise ValueError(f"ProjectConnection {source.project_connection_id} not found")
+    # Bug-5325 fail-closed: reject a source whose connection belongs to a
+    # different project than the model owning the query, before executing
+    # any gateway SQL against another project's source database.
+    conn = await resolve_endpoint_connection(
+        db, source, expected_project_id=bound.model.project_id
+    )
     rows, bytes_processed, columns = await execute_on_connection(
         decision.rewritten_query, conn, db
     )

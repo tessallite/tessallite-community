@@ -224,6 +224,71 @@ def test_valid_grained_dimension_survives_validation():
     assert validate_tool_call_against_bundle(call, _bundle()) == []
 
 
+def test_structured_where_expression_with_invented_field_is_caught():
+    # Bug-5349 Phase 2/3 (Codex-R2) — an invented field hidden inside a
+    # structured WHERE predicate must be flagged by the pre-execution validator,
+    # not slip through to the binder. (revenue/country exist; "ghost" does not.)
+    from src.tools.spec import parse_tool_call
+    import json as _json
+    call = parse_tool_call(_json.dumps({"query": {
+        "model_id": str(MODEL_ID), "measures": ["revenue"], "dimensions": ["country"],
+        "where": [{"left": {"fn": "lower", "args": [{"field": "ghost"}]},
+                   "op": "eq", "right": {"literal": "x"}}],
+        "having": [], "sort": [],
+    }}))
+    issues = validate_tool_call_against_bundle(call, _bundle())
+    assert any(i.field_name == "ghost" for i in issues)
+
+
+def test_structured_projection_with_valid_fields_passes_validation():
+    from src.tools.spec import parse_tool_call
+    import json as _json
+    call = parse_tool_call(_json.dumps({"query": {
+        "model_id": str(MODEL_ID), "measures": [], "dimensions": ["country"],
+        "projections": [{"expr": {"fn": "round",
+                         "args": [{"field": "revenue"}, {"literal": 2}]}, "alias": "r"}],
+        "where": [], "having": [], "sort": [],
+    }}))
+    assert validate_tool_call_against_bundle(call, _bundle()) == []
+
+
+def test_structured_having_with_invented_measure_is_caught():
+    from src.tools.spec import parse_tool_call
+    import json as _json
+    call = parse_tool_call(_json.dumps({"query": {
+        "model_id": str(MODEL_ID), "measures": ["revenue"], "dimensions": ["country"],
+        "having": [{"left": {"fn": "sum", "args": [{"field": "phantom"}]},
+                    "op": "gt", "right": {"literal": 1}}],
+        "where": [], "sort": [],
+    }}))
+    issues = validate_tool_call_against_bundle(call, _bundle())
+    assert any(i.field_name == "phantom" for i in issues)
+
+
+def test_compound_step_structured_expression_invented_field_is_caught():
+    # Bug-5349 Phase 2/3 (Codex-R2 / Round-3) — an invented field inside a
+    # COMPOUND-step structured predicate must be flagged by the pre-execution
+    # bundle validator (the compound reconstruction threads the structured refs
+    # so _validate_query_like walks their base fields).
+    from src.tools.spec import parse_tool_call
+    import json as _json
+    call = parse_tool_call(_json.dumps({"compound_query": {
+        "steps": [
+            {"name": "a", "model_id": str(MODEL_ID), "measures": ["revenue"],
+             "dimensions": ["country"],
+             "where": [{"left": {"fn": "lower", "args": [{"field": "ghost_dim"}]},
+                        "op": "eq", "right": {"literal": "x"}}],
+             "having": [], "sort": []},
+            {"name": "b", "model_id": str(MODEL_ID), "measures": ["revenue"],
+             "dimensions": ["country"], "where": [], "having": [], "sort": []},
+        ],
+        "expression": {"ref": {"step": "a", "measure": "revenue"}},
+        "result_label": "x",
+    }}))
+    issues = validate_tool_call_against_bundle(call, _bundle())
+    assert any(i.field_name == "ghost_dim" for i in issues)
+
+
 def test_generated_month_alias_repairs_before_field_validation():
     call = QueryToolCall(
         model_id=str(MODEL_ID),

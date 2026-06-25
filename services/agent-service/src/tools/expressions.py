@@ -74,7 +74,77 @@ class FuncCall:
     args: tuple["ExprNode", ...]
 
 
-ExprNode = Union[FieldRef, Literal, FuncCall]
+@dataclass(frozen=True)
+class Arith:
+    """Binary arithmetic on two scalar nodes (Phase 3 projection / HAVING).
+    ``op`` is one of ``+ - * /``. Rendered fully parenthesised so precedence is
+    explicit and never ambiguous to the source dialect transpiler."""
+
+    op: str
+    left: "ExprNode"
+    right: "ExprNode"
+
+
+@dataclass(frozen=True)
+class CaseWhen:
+    """One WHEN <predicate> THEN <result> arm of a CASE expression."""
+
+    when: "PredNode"
+    then: "ExprNode"
+
+
+@dataclass(frozen=True)
+class Case:
+    """Structured searched-CASE conditional (Phase 3). Represented as its own
+    node — never a raw function call — so the LLM cannot smuggle SQL through a
+    function name. ``else_`` is optional (NULL when absent)."""
+
+    arms: tuple[CaseWhen, ...]
+    else_: Optional["ExprNode"]
+
+
+ExprNode = Union[FieldRef, Literal, FuncCall, Arith, Case]
+
+# Arithmetic operator allow-list (rendered verbatim between parens).
+_ARITH_OPS: dict[str, str] = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
+
+
+# ── predicate AST (Phase 2 WHERE / Phase 3 HAVING) ─────────────────────────
+@dataclass(frozen=True)
+class Comparison:
+    """A single comparison: ``<left> <op> <right>``. Both sides are scalar
+    ``ExprNode``s so a comparison can be column-to-column
+    (``settlement_date > transaction_date``), function-on-column
+    (``EXTRACT(MONTH FROM d) = 6``), or aggregate-to-aggregate in HAVING
+    (``SUM(a) / SUM(b) > 0.5``)."""
+
+    op: str          # eq/neq/gt/gte/lt/lte/in/between/like/is_null/is_not_null
+    left: ExprNode
+    right: Any       # ExprNode | tuple[ExprNode, ...] | None (op-dependent)
+
+
+@dataclass(frozen=True)
+class BoolOp:
+    """``AND`` / ``OR`` over two-or-more sub-predicates."""
+
+    op: str          # and / or
+    args: tuple["PredNode", ...]
+
+
+@dataclass(frozen=True)
+class NotPred:
+    """``NOT (<predicate>)``."""
+
+    arg: "PredNode"
+
+
+PredNode = Union[Comparison, BoolOp, NotPred]
+
+_COMPARE_SYMBOLS = {"eq": "=", "neq": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+# Operators that compare a left expression against a single right expression.
+_BINARY_OPS = frozenset(_COMPARE_SYMBOLS) | {"like"}
+# Full predicate operator allow-list.
+_PRED_OPS = _BINARY_OPS | {"in", "between", "is_null", "is_not_null"}
 
 
 # ── function registry ─────────────────────────────────────────────────────
@@ -268,9 +338,43 @@ def normalize_node(raw: Any, *, clause: Optional[str] = None, _depth: int = 0) -
         )
         spec.validate(args)
         return FuncCall(spec.key, args)
+    if "arith" in raw:
+        _reject_extra_keys(raw, {"arith", "left", "right"})
+        op = raw["arith"]
+        if not isinstance(op, str) or op.lower() not in _ARITH_OPS:
+            raise ExpressionError(
+                f"invalid arithmetic op {op!r}; allowed: {', '.join(sorted(_ARITH_OPS))}"
+            )
+        if "left" not in raw or "right" not in raw:
+            raise ExpressionError("arith node requires 'left' and 'right'")
+        left = normalize_node(raw["left"], clause=clause, _depth=_depth + 1)
+        right = normalize_node(raw["right"], clause=clause, _depth=_depth + 1)
+        return Arith(op.lower(), left, right)
+    if "case" in raw:
+        _reject_extra_keys(raw, {"case", "else"})
+        arms_raw = raw["case"]
+        if not isinstance(arms_raw, list) or not arms_raw:
+            raise ExpressionError("case node requires a non-empty 'case' arm list")
+        arms: list[CaseWhen] = []
+        for arm in arms_raw:
+            if not isinstance(arm, dict):
+                raise ExpressionError("each case arm must be an object")
+            _reject_extra_keys(arm, {"when", "then"})
+            if "when" not in arm or "then" not in arm:
+                raise ExpressionError("each case arm requires 'when' and 'then'")
+            when = normalize_predicate(arm["when"], clause=clause, _depth=_depth + 1)
+            then = normalize_node(arm["then"], clause=clause, _depth=_depth + 1)
+            arms.append(CaseWhen(when, then))
+        else_raw = raw.get("else")
+        else_ = (
+            normalize_node(else_raw, clause=clause, _depth=_depth + 1)
+            if else_raw is not None
+            else None
+        )
+        return Case(tuple(arms), else_)
     raise ExpressionError(
-        f"expression node must have one of 'field', 'literal', 'fn'; "
-        f"got keys {sorted(raw)}"
+        f"expression node must have one of 'field', 'literal', 'fn', 'arith', "
+        f"'case'; got keys {sorted(raw)}"
     )
 
 
@@ -282,6 +386,16 @@ def render(node: ExprNode) -> str:
         return _quote_literal(node.value)
     if isinstance(node, FuncCall):
         return FUNCTIONS[node.fn].render(node.args)
+    if isinstance(node, Arith):
+        return f"({render(node.left)} {_ARITH_OPS[node.op]} {render(node.right)})"
+    if isinstance(node, Case):
+        parts = ["CASE"]
+        for arm in node.arms:
+            parts.append(f"WHEN {render_predicate(arm.when)} THEN {render(arm.then)}")
+        if node.else_ is not None:
+            parts.append(f"ELSE {render(node.else_)}")
+        parts.append("END")
+        return " ".join(parts)
     raise ExpressionError(f"unrenderable node: {node!r}")
 
 
@@ -295,7 +409,159 @@ def base_field_names(node: ExprNode) -> set[str]:
         for a in node.args:
             out |= base_field_names(a)
         return out
+    if isinstance(node, Arith):
+        return base_field_names(node.left) | base_field_names(node.right)
+    if isinstance(node, Case):
+        out = set()
+        for arm in node.arms:
+            out |= predicate_base_fields(arm.when) | base_field_names(arm.then)
+        if node.else_ is not None:
+            out |= base_field_names(node.else_)
+        return out
     return set()
+
+
+def has_aggregate(node: ExprNode) -> bool:
+    """True when the scalar tree contains any aggregate function call —
+    used to enforce that a HAVING predicate references aggregates."""
+    if isinstance(node, FuncCall):
+        if FUNCTIONS[node.fn].is_aggregate:
+            return True
+        return any(has_aggregate(a) for a in node.args)
+    if isinstance(node, Arith):
+        return has_aggregate(node.left) or has_aggregate(node.right)
+    if isinstance(node, Case):
+        for arm in node.arms:
+            if predicate_has_aggregate(arm.when) or has_aggregate(arm.then):
+                return True
+        return node.else_ is not None and has_aggregate(node.else_)
+    return False
+
+
+# ── predicate normalization / render / field-walk ─────────────────────────
+def normalize_predicate(raw: Any, *, clause: str, _depth: int = 0) -> PredNode:
+    """Turn a raw JSON predicate node into a typed, validated ``PredNode``.
+
+    Forms:
+      {"and"|"or": [<pred>, ...]}                     boolean composition
+      {"not": <pred>}                                 negation
+      {"left": <node>, "op": "<cmp>", "right": <...>} a comparison
+
+    ``clause`` (WHERE / HAVING) restricts which functions the operand
+    expressions may use, exactly as the scalar path. Raises ExpressionError."""
+    if _depth > _MAX_DEPTH:
+        raise ExpressionError("predicate nesting too deep")
+    if not isinstance(raw, dict):
+        raise ExpressionError("predicate node must be an object")
+    if "and" in raw or "or" in raw:
+        bop = "and" if "and" in raw else "or"
+        _reject_extra_keys(raw, {bop})
+        sub = raw[bop]
+        if not isinstance(sub, list) or len(sub) < 2:
+            raise ExpressionError(f"{bop!r} requires a list of at least 2 predicates")
+        args = tuple(
+            normalize_predicate(s, clause=clause, _depth=_depth + 1) for s in sub
+        )
+        return BoolOp(bop, args)
+    if "not" in raw:
+        _reject_extra_keys(raw, {"not"})
+        return NotPred(normalize_predicate(raw["not"], clause=clause, _depth=_depth + 1))
+    # comparison
+    _reject_extra_keys(raw, {"left", "op", "right"})
+    if "left" not in raw or "op" not in raw:
+        raise ExpressionError("comparison predicate requires 'left' and 'op'")
+    op = raw["op"]
+    if not isinstance(op, str) or op.lower() not in _PRED_OPS:
+        raise ExpressionError(
+            f"invalid predicate op {op!r}; allowed: {', '.join(sorted(_PRED_OPS))}"
+        )
+    op = op.lower()
+    left = normalize_node(raw["left"], clause=clause, _depth=_depth + 1)
+    right_raw = raw.get("right")
+    if op in ("is_null", "is_not_null"):
+        if right_raw is not None:
+            raise ExpressionError(f"{op} takes no right operand")
+        return Comparison(op, left, None)
+    if op == "in":
+        if not isinstance(right_raw, list) or not right_raw:
+            raise ExpressionError("'in' requires a non-empty right list")
+        items = tuple(
+            normalize_node(r, clause=clause, _depth=_depth + 1) for r in right_raw
+        )
+        return Comparison(op, left, items)
+    if op == "between":
+        if not isinstance(right_raw, list) or len(right_raw) != 2:
+            raise ExpressionError("'between' requires a right list of exactly 2 values")
+        lo = normalize_node(right_raw[0], clause=clause, _depth=_depth + 1)
+        hi = normalize_node(right_raw[1], clause=clause, _depth=_depth + 1)
+        return Comparison(op, left, (lo, hi))
+    # binary op (eq/neq/gt/.../like): right is a single scalar node
+    if right_raw is None:
+        raise ExpressionError(f"{op} requires a 'right' operand")
+    right = normalize_node(right_raw, clause=clause, _depth=_depth + 1)
+    return Comparison(op, left, right)
+
+
+def render_predicate(node: PredNode) -> str:
+    """Render a typed predicate as PostgreSQL-canonical SQL (parenthesised)."""
+    if isinstance(node, BoolOp):
+        joiner = " AND " if node.op == "and" else " OR "
+        return "(" + joiner.join(render_predicate(a) for a in node.args) + ")"
+    if isinstance(node, NotPred):
+        return f"(NOT {render_predicate(node.arg)})"
+    if isinstance(node, Comparison):
+        left = render(node.left)
+        if node.op in _COMPARE_SYMBOLS:
+            return f"{left} {_COMPARE_SYMBOLS[node.op]} {render(node.right)}"
+        if node.op == "like":
+            return f"{left} LIKE {render(node.right)}"
+        if node.op == "in":
+            return f"{left} IN (" + ", ".join(render(r) for r in node.right) + ")"
+        if node.op == "between":
+            lo, hi = node.right
+            return f"{left} BETWEEN {render(lo)} AND {render(hi)}"
+        if node.op == "is_null":
+            return f"{left} IS NULL"
+        if node.op == "is_not_null":
+            return f"{left} IS NOT NULL"
+    raise ExpressionError(f"unrenderable predicate: {node!r}")
+
+
+def predicate_base_fields(node: PredNode) -> set[str]:
+    """Every semantic field name referenced anywhere in a predicate tree —
+    used by persona-scope validation (the Phase 2/3 security trap)."""
+    if isinstance(node, BoolOp):
+        out: set[str] = set()
+        for a in node.args:
+            out |= predicate_base_fields(a)
+        return out
+    if isinstance(node, NotPred):
+        return predicate_base_fields(node.arg)
+    if isinstance(node, Comparison):
+        out = base_field_names(node.left)
+        if isinstance(node.right, tuple):
+            for r in node.right:
+                out |= base_field_names(r)
+        elif node.right is not None:
+            out |= base_field_names(node.right)
+        return out
+    return set()
+
+
+def predicate_has_aggregate(node: PredNode) -> bool:
+    """True when any operand in the predicate is an aggregate (HAVING gate)."""
+    if isinstance(node, BoolOp):
+        return any(predicate_has_aggregate(a) for a in node.args)
+    if isinstance(node, NotPred):
+        return predicate_has_aggregate(node.arg)
+    if isinstance(node, Comparison):
+        if has_aggregate(node.left):
+            return True
+        if isinstance(node.right, tuple):
+            return any(has_aggregate(r) for r in node.right)
+        if node.right is not None:
+            return has_aggregate(node.right)
+    return False
 
 
 def default_alias(node: ExprNode) -> str:
@@ -306,6 +572,14 @@ def default_alias(node: ExprNode) -> str:
         fields = sorted(base_field_names(node))
         base = fields[0] if fields else node.fn
         return f"{base}_{node.fn}"
+    if isinstance(node, Arith):
+        fields = sorted(base_field_names(node))
+        base = fields[0] if fields else "expr"
+        return f"{base}_{node.op}"
+    if isinstance(node, Case):
+        fields = sorted(base_field_names(node))
+        base = fields[0] if fields else "case"
+        return f"{base}_case"
     return "expr"
 
 
@@ -409,3 +683,78 @@ def normalize_dimensions(entries: list[Any]) -> list[DimRef]:
     """Normalize a dimension list, sharing one alias-collision namespace."""
     taken: set[str] = set()
     return [normalize_dimension(e, taken) for e in entries]
+
+
+# ── projection reference (Phase 3 SELECT-derived columns) ──────────────────
+@dataclass(frozen=True)
+class ProjRef:
+    """A computed projection column: a registered scalar/arithmetic/CASE/
+    aggregate expression with a deterministic output alias. Drives the SELECT
+    list and persona scope (base fields walked exactly like a dimension)."""
+
+    alias: str
+    node: ExprNode
+    raw: Any
+
+    @property
+    def base_fields(self) -> tuple[str, ...]:
+        return tuple(sorted(base_field_names(self.node)))
+
+    def render_select(self) -> str:
+        return f"{render(self.node)} AS {_quote_ident(self.alias)}"
+
+
+def normalize_projection(entry: Any, taken: set[str]) -> ProjRef:
+    """Normalize one projection entry: ``{"expr": <node>, "alias"?: "a"}``.
+    Aggregates ARE permitted here (a computed column may wrap SUM/AVG/…)."""
+    if not isinstance(entry, dict) or "expr" not in entry:
+        raise ExpressionError(
+            "projection entry must be an object {\"expr\": <node>, \"alias\"?: ..}"
+        )
+    _reject_extra_keys(entry, {"expr", "alias"})
+    node = normalize_node(entry["expr"], clause=SELECT)
+    alias = entry.get("alias")
+    if alias is not None and (not isinstance(alias, str) or not alias):
+        raise ExpressionError("projection alias must be a non-empty string")
+    alias = dedupe_alias(alias or default_alias(node), taken)
+    return ProjRef(alias=alias, node=node, raw=entry)
+
+
+def normalize_projections(entries: list[Any], taken: set[str] | None = None) -> list[ProjRef]:
+    """Normalize a projection list, sharing the caller's alias namespace so a
+    computed column cannot collide with a dimension or measure alias."""
+    taken = taken if taken is not None else set()
+    return [normalize_projection(e, taken) for e in entries]
+
+
+# ── filter / having reference (Phase 2 / Phase 3 predicates) ───────────────
+@dataclass(frozen=True)
+class PredRef:
+    """A normalized predicate for a WHERE or HAVING clause. Carries the typed
+    predicate AST that drives SQL rendering and persona scope. The ``raw`` is
+    preserved for plan-dict round-trips."""
+
+    node: PredNode
+    raw: Any
+
+    @property
+    def base_fields(self) -> tuple[str, ...]:
+        return tuple(sorted(predicate_base_fields(self.node)))
+
+    def render(self) -> str:
+        return render_predicate(self.node)
+
+
+def normalize_filter(entry: Any, *, clause: str) -> PredRef:
+    """Normalize one structured WHERE/HAVING predicate entry. ``clause`` is
+    WHERE or HAVING and constrains which functions the operands may use."""
+    return PredRef(node=normalize_predicate(entry, clause=clause), raw=entry)
+
+
+def is_structured_predicate(entry: Any) -> bool:
+    """True when a where/having entry is a structured predicate (boolean
+    composition or {left/op/right}) rather than the legacy flat
+    {name/op/value} filter. Legacy entries are left untouched (back-compat)."""
+    if not isinstance(entry, dict):
+        return False
+    return any(k in entry for k in ("and", "or", "not", "left"))

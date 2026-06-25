@@ -23,6 +23,18 @@ from .conftest import API_BASE, TENANT_ID, EMAIL, PASSWORD, _measure_id, _dimens
 pytestmark = [pytest.mark.integration]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _require_kpi_model(_measures):
+    """Skip the whole KPI module when the active model lacks the KPI measures.
+    These tests assume the dev acme-demo `modelx` (Revenue/net_sales/...); on the
+    demo bundle's `modely` they are absent, so skip cleanly (Bug-5453/5498)."""
+    if "net_sales" not in {m.get("name") for m in _measures}:
+        pytest.skip(
+            "active model lacks KPI measures (net_sales/...) — needs the dev "
+            "acme-demo modelx profile (Bug-5453/5498)"
+        )
+
+
 @pytest.fixture(scope="module")
 def evaluate_url(project_id, model_id):
     return f"{API_BASE}/projects/{project_id}/models/{model_id}/kpis/evaluate-adhoc"
