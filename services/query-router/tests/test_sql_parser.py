@@ -462,6 +462,17 @@ def test_scientific_notation_literal_parses_as_float():
     assert isinstance(matches[0].value, float)
 
 
+def test_scientific_literal_preserves_original_spelling():
+    # Bug-5539 (Codex round-3 finding 3): the float value carries its ORIGINAL
+    # spelling so the strict render-time grammar can reject the scientific form
+    # as a bare token — without regressing F-003-10's float round-trip above.
+    from src.parsing.sql_parser import NumericLiteral
+    q = parse_sql_to_ir("SELECT a FROM modelx WHERE b > 1e5", "m1")
+    value = [f for f in q.filters if f.dimension_name == "b"][0].value
+    assert isinstance(value, NumericLiteral)
+    assert value.original_text == "1e5"
+
+
 def test_jdbc_rejects_stray_semicolon():
     # `SELECT a; FROM t` — stray semicolon truncates the parse; reject it.
     with pytest.raises(SyntaxErrorInSQL) as exc:
