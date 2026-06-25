@@ -681,16 +681,32 @@ def _extract_hierarchies(axis_expr: str) -> list[str]:
 def _extract_all_member_filters(axis_expr: str) -> dict[str, tuple[str, str]]:
     """
     Extract ALL level/member filters from an axis expression.
-    Returns dict: {hierarchy_unique_name: (name, operation)}
+    Returns dict: {hierarchy_unique_name: (member_name, operation)}
     Handles patterns like:
-      [Dim].[Hier].[Level].Members    → level query
-      [Dim].[Hier].[Member].Children  → member-children query
+      [Dim].[Hier].[Level].Members          → level query
+      [Dim].[Hier].[Member].Children        → member-children query (caption form)
+      [Dim].[Hier].&[key].Children          → member-children query (key form)
+      [Dim].[Hier].[Level].&[k0]&[k1].Children → composite key, path-qualified
+
+    Bug-5519 round-2 (Codex Finding 2): the key form `[Dim].[Hier].&[1999]`
+    (and the path-qualified `[Dim].[Hier].[Level].&[k0]&[k1]`) is the member
+    grammar Excel/Power BI commonly emit. Both caption and key forms must feed
+    the leaf resolver; the returned ``member_name`` is the deepest key for key
+    forms (the named member), the caption for caption forms. ``(All)`` parens
+    are normalised away so case/paren spellings reach the resolver intact.
     """
+    from src.dax.member_uname import (
+        KEYS_OR_CAPTION,
+        deepest_member_key,
+        parse_member_keys,
+    )
+
     result: dict[str, tuple[str, str]] = {}
-    bracket_content = r'([^]]+)'
+    bracket = r'([^\]]+)'
+
+    # Form A — caption member or level: `[Dim].[Hier].[Member].func`.
     for m in re.finditer(
-        rf'\[{bracket_content}\]\.\[{bracket_content}\]\.\[{bracket_content}\]'
-        rf'\s*\.(\w+)',
+        rf'\[{bracket}\]\.\[{bracket}\]\.\[{bracket}\]\s*\.(\w+)',
         axis_expr,
         re.IGNORECASE,
     ):
@@ -699,12 +715,36 @@ def _extract_all_member_filters(axis_expr: str) -> dict[str, tuple[str, str]]:
         third = m.group(3).strip()
         func = m.group(4).lower()
         hier = f"[{dim}].[{hier_name}]"
-        if func == "children":
-            result[hier] = (third, "children")
-        elif func == "members":
-            result[hier] = (third, "members")
-        else:
-            result[hier] = (third, "members")
+        op = "children" if func == "children" else "members"
+        result[hier] = (third, op)
+
+    # Form B — key member: `[Dim].[Hier].&[k0]&[k1].func` or path-qualified
+    # `[Dim].[Hier].[Level].&[k0]&[k1].func`. The member is the deepest key.
+    for m in re.finditer(
+        rf'\[{bracket}\]\.\[{bracket}\](?:\.\[{bracket}\])?'
+        rf'\.{KEYS_OR_CAPTION}\s*\.(\w+)',
+        axis_expr,
+        re.IGNORECASE,
+    ):
+        dim = m.group(1).strip()
+        hier_name = m.group(2).strip()
+        keys_part = m.group(4)
+        func = m.group(5).lower()
+        # Only react to genuine key forms here; pure caption forms are Form A.
+        if "&" not in (keys_part or ""):
+            continue
+        member = deepest_member_key(keys_part)
+        if member is None:
+            keys = parse_member_keys(keys_part)
+            if not keys:
+                continue
+            member = keys[-1]
+        hier = f"[{dim}].[{hier_name}]"
+        op = "children" if func == "children" else "members"
+        # A key form is the canonical member identity; let it win over any
+        # caption form captured for the same hierarchy.
+        result[hier] = (member.strip(), op)
+
     return result
 
 
@@ -845,6 +885,118 @@ def _normalize_member_name(name: str) -> str:
     if name.startswith("(") and name.endswith(")"):
         return name[1:-1]
     return name
+
+
+def _hierarchy_data_levels(
+    hier: str,
+    dimensions_meta: list[dict[str, Any]] | None,
+    hierarchy_defs: list[dict[str, Any]] | None,
+) -> list[str]:
+    """Ordered data-level names (below the (All) level) of a `[Dim].[Hier]`.
+
+    Mirrors the level metadata the MDSCHEMA_LEVELS / TREE_OP path uses so leaf
+    determination on the MDX `.Children` axis path agrees with the discovery
+    path (Bug-5431). Resolution order:
+
+      1. A defined multi-level hierarchy whose name matches `Hier` — its
+         ordered level names.
+      2. A flat dimension's auto-hierarchy (`[Dim].[Dim]`) — the single data
+         level named after the dimension.
+
+    Returns an empty list when the hierarchy is unknown (the caller then makes
+    no leaf claim and preserves existing behaviour).
+    """
+    m = re.match(r'\[([^\]]+)\]\.\[([^\]]+)\]', hier)
+    if not m:
+        return []
+    dim_name = m.group(1).strip()
+    hier_name = m.group(2).strip()
+
+    # 1. Defined hierarchy (multi-level) — match by hierarchy name.
+    for h in hierarchy_defs or []:
+        if str(h.get("name", "")).strip() != hier_name:
+            continue
+        levels = h.get("levels") or []
+        ordered = sorted(levels, key=lambda item: int(item.get("ordinal", 0)))
+        names = [str(item.get("name", "")).strip() for item in ordered]
+        names = [n for n in names if n]
+        if names:
+            return names
+
+    # 2. Flat dimension auto-hierarchy ([Dim].[Dim]) — one data level.
+    #
+    # Bug-5519 round-2 (Codex Finding 1): only the auto-hierarchy whose name
+    # equals the dimension name is the flat dim's single level. An UNKNOWN
+    # hierarchy over a known flat dim (`[year].[not_year]`) must NOT be treated
+    # as that single level — it is unresolved, so we return [] ("unknown") and
+    # the caller preserves the prior whole-level behaviour.
+    if hier_name != dim_name:
+        return []
+    for d in dimensions_meta or []:
+        if str(d.get("name", "")).strip() != dim_name:
+            continue
+        levels = d.get("levels") or []
+        if levels and isinstance(levels[0], dict):
+            ordered = sorted(levels, key=lambda item: int(item.get("ordinal", 0)))
+            names = [str(item.get("name", "")).strip() for item in ordered]
+            names = [n for n in names if n]
+            if names:
+                return names
+        if levels:
+            names = [str(x).strip() for x in levels if str(x).strip()]
+            if names:
+                return names
+        # Flat dimension with no explicit level metadata: its single data
+        # level is the dimension itself.
+        return [dim_name]
+
+    return []
+
+
+def _member_children_resolution(
+    hier: str,
+    member_name: str,
+    dimensions_meta: list[dict[str, Any]] | None,
+    hierarchy_defs: list[dict[str, Any]] | None,
+) -> str:
+    """Classify a `[Dim].[Hier].[Member].Children` request.
+
+    Returns one of:
+      "all"     — the member is the (All) member; its children are the members
+                  of the first (top) data level.
+      "leaf"    — the member sits at the deepest data level of its hierarchy;
+                  it has no level below, so `.Children` is the EMPTY set.
+      "unknown" — the hierarchy/level structure could not be resolved, or the
+                  member sits at an intermediate level. Preserve the existing
+                  default rendering rather than guess.
+
+    Root cause of Bug-5519: a leaf member's `.Children` previously fell through
+    to the whole-level enumeration. Leaf-ness is decided from the hierarchy's
+    level structure (the same metadata MDSCHEMA_LEVELS / TREE_OP uses), not by
+    guessing.
+    """
+    # Bug-5519 round-2 (Codex Finding 3): the (All) member spelling is
+    # case-insensitive — Excel/Power BI emit `[All]`, `[(All)]`, and clients
+    # may lower-case to `[all]` / `[(all)]`. Normalise parens then compare
+    # case-insensitively so an All member is never misclassified as a leaf.
+    norm = _normalize_member_name(member_name).strip().lower()
+    if norm == "all":
+        return "all"
+
+    levels = _hierarchy_data_levels(hier, dimensions_meta, hierarchy_defs)
+    if not levels:
+        return "unknown"
+
+    # A flat dimension has exactly one data level; any concrete member sits at
+    # that single (deepest) level, so its children are empty.
+    if len(levels) == 1:
+        return "leaf"
+
+    # Multi-level hierarchy: identify which level the named member belongs to.
+    # The named member's caption alone does not pin its level here (the axis
+    # path carries only the caption), so without per-member level data we make
+    # no leaf claim for intermediate names and preserve existing behaviour.
+    return "unknown"
 
 
 def _build_olap_info(
@@ -2111,6 +2263,7 @@ def build_real_execute_response(
     subtotal_hierarchy: Any | None = None,
     requery_results: dict[tuple, Any] | None = None,
     subtotal_hierarchies: list | None = None,
+    hierarchy_defs: list[dict[str, Any]] | None = None,
 ) -> str:
     """
     Build an MDDataSet Execute response from real query-router results.
@@ -2330,6 +2483,21 @@ def build_real_execute_response(
                     })
                 continue
             filter_spec = col_member_filters.get(hier)
+            if filter_spec and filter_spec[1] == "children":
+                # Bug-5519: `[Dim].[Hier].[Member].Children` on a LEAF member
+                # must resolve to the EMPTY set, not the whole level. Leaf-ness
+                # is read from the hierarchy's level structure (same metadata as
+                # MDSCHEMA_LEVELS / TREE_OP). `[All].Children` still yields the
+                # top data level's members; an unknown/intermediate member keeps
+                # the existing whole-level rendering.
+                _children_kind = _member_children_resolution(
+                    hier, filter_spec[0], dimensions_meta, hierarchy_defs,
+                )
+                if _children_kind == "leaf":
+                    # Leaf member has no level below it -> no axis members.
+                    continue
+                # "all"/"unknown" -> fall through to the whole-level rendering
+                # below (children of (All) = the top data level members).
             if filter_spec and filter_spec[1] == "members" and _normalize_member_name(filter_spec[0]) == "All":
                 # Bug-XMLA-001 fix: `[Hier].[(All)].Members` in MDX means
                 # "the children of the (All) level", not the (All) member
@@ -2438,6 +2606,15 @@ def build_real_execute_response(
                     })
                 continue
             filter_spec = row_member_filters.get(hier)
+            if filter_spec and filter_spec[1] == "children":
+                # Bug-5519: see column-axis branch above. A LEAF member's
+                # `.Children` is the EMPTY set; `[All].Children` is the top
+                # data level. Leaf-ness comes from the hierarchy level metadata.
+                _children_kind = _member_children_resolution(
+                    hier, filter_spec[0], dimensions_meta, hierarchy_defs,
+                )
+                if _children_kind == "leaf":
+                    continue
             if filter_spec and filter_spec[1] == "members" and _normalize_member_name(filter_spec[0]) == "All":
                 # Bug-XMLA-001 fix: see column-axis branch above. `(All).Members`
                 # means children-of-All, not the All node itself.

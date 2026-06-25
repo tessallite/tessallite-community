@@ -42,7 +42,12 @@ from src.rewrite.calendar_support import (
     _resolve_hierarchy_calendar_rules,
     _semi_additive_agg,
 )
-from src.rewrite.conditions import _render_condition, _render_where
+from src.rewrite.conditions import (
+    _render_condition,
+    _render_where,
+    is_numeric_col_type,
+    value_is_numeric_literal,
+)
 from src.rewrite.dialect_resolution import _resolve_target_dialect
 from src.rewrite.dialects import (
     _connector_to_dialect,
@@ -1787,12 +1792,27 @@ def _build_where_clause(
     field_expr_by_name: dict,
     filter_col_type_by_name: dict,
     _get_phys_expr,
+    _get_col_type=None,
+    _get_col_type_for_field=None,
 ) -> str:
     """Append the WHERE clause to ``sql`` (extracted from
     ``_build_source_sql``; Phase 3 internal decomposition, behaviour-identical).
 
     Returns the SQL string with the WHERE clause appended.
     """
+    # Bug-5538 (Codex round-2 finding 4): the raw-WHERE numeric gate resolves a
+    # rewritten field's type via the qualified (table_alias.column) resolver when
+    # available, so a semantic/physical bare-name collision cannot mis-type the
+    # literal. When the caller does not supply one (e.g. unit harness), fall back
+    # to the bare-name resolver keyed on the field node's column name — which is
+    # itself collision-safe (returns None on ambiguity).
+    if _get_col_type_for_field is None:
+        def _get_col_type_for_field(field_node):  # type: ignore[misc]
+            name = getattr(field_node, "name", None)
+            if name and _get_col_type is not None:
+                return _get_col_type(name)
+            return None
+
     # WHERE clause: if the query has unresolvable predicates (OR, EXISTS,
     # subqueries), preserve the raw WHERE clause from the original SQL with
     # column name substitution.  Otherwise, reconstruct from extracted filters.
@@ -1823,12 +1843,184 @@ def _build_where_clause(
             )
 
             def _is_known_field(name: str) -> bool:
+                # Recognise the semantic name, a name resolvable to a physical
+                # expression, AND a bare physical column name. The last case
+                # matters because the sqlglot transform (pre-order, left child
+                # before right) rewrites the field operand (``.this``) to its
+                # PHYSICAL column before the value operand is visited, so the
+                # value-side check sees the physical name — e.g. semantic
+                # ``year`` already rewritten to ``"dt"."d_year"`` when ``'1999'``
+                # is examined. ``_get_col_type`` also resolves by physical name
+                # as a fallback for the value-left / symmetric case.
                 return (
                     name.lower() in _known_fields_lower
                     or _get_phys_expr(name, pg_canonical=True) is not None
+                    or (_get_col_type is not None and _get_col_type(name) is not None)
                 )
 
+            def _value_literal(value: str, field_node):
+                """Build the literal for a quoted value-side token, typed by
+                the target FIELD's source data type.
+
+                Bug-5462: MDX/XMLA slicer members (and other BI clients) render
+                every member key as a quoted string, e.g. ``"d_year" = '1999'``.
+                When the target column is INTEGER/NUMERIC, BigQuery rejects the
+                INT64-vs-STRING comparison. Emit ``exp.Literal.number`` for a
+                numeric-typed column so sqlglot transpiles a bare numeric
+                literal (``= 1999``) for every dialect; keep the string literal
+                for text/date columns (unchanged). A non-numeric value against a
+                numeric column fails loud rather than silently corrupting the
+                predicate.
+                """
+                col_type = (
+                    _get_col_type_for_field(field_node)
+                    if isinstance(field_node, exp.Column)
+                    else None
+                )
+                if is_numeric_col_type(col_type):
+                    if value_is_numeric_literal(value):
+                        return exp.Literal.number(value)
+                    raise SemanticBindingError(
+                        f"Non-numeric value {value!r} compared to numeric "
+                        f"column '{getattr(field_node, 'name', '?')}' in WHERE "
+                        f"clause"
+                    )
+                return exp.Literal.string(value)
+
+            # Bug-5538 (Codex findings 2 & 3): genuine ``exp.Literal`` string
+            # members (e.g. ``d_year = '1999'`` / ``IN ('1999','2000')`` /
+            # ``IN (SELECT '1999')``) carry their text in ``.this`` rather than
+            # ``.name``; ``_value_literal`` re-types them identically.
+            _value_literal_from_str = _value_literal
+
+            def _in_subselect_field(node):
+                """If ``node`` is a top-level projection literal of a SELECT that
+                forms the RHS subquery of an outer ``exp.In``, return that IN's
+                LHS field column; else None.
+
+                Bug-5538 (Codex finding 3): a subselect filter form such as
+                ``d_year IN (SELECT '1999')`` projects the member as a string
+                literal inside the inner SELECT, so it never sits directly under
+                the IN. Walk up projection -> (Alias) -> Select -> Subquery -> In
+                to inherit the OUTER numeric column's type.
+                """
+                cur = node.parent
+                # Skip an enclosing alias on the projection (SELECT '1999' AS y).
+                if isinstance(cur, exp.Alias):
+                    cur = cur.parent
+                if not isinstance(cur, exp.Select):
+                    return None
+                # The literal must be a top-level projection, not buried in a
+                # nested expression / WHERE of the inner select.
+                if node not in cur.expressions and not any(
+                    proj is node or (isinstance(proj, exp.Alias) and proj.this is node)
+                    for proj in cur.expressions
+                ):
+                    return None
+                sub = cur.parent
+                if not isinstance(sub, exp.Subquery):
+                    return None
+                in_node = sub.parent
+                if isinstance(in_node, exp.In) and isinstance(in_node.this, exp.Column) \
+                        and _is_known_field(in_node.this.name):
+                    return in_node.this
+                return None
+
+            def _numeric_target_field(node):
+                """If ``node`` is a value-side literal (or a ``-literal``) whose
+                target FIELD is a known NUMERIC column, return that field node;
+                else None.
+
+                Bug-5538 (Codex round-2 finding 2): the value-side numeric gate
+                must cover EVERY RHS literal/token against a numeric column — not
+                only string literals. A numeric/raw literal RHS (``d_year = 1e9``,
+                ``= +1``, a dialect-parsed bare token) otherwise rendered as-is,
+                bypassing ``value_is_numeric_literal``. This resolves the target
+                field for the IN-member, binary-comparison and subselect shapes so
+                the caller can validate the literal text the same way for both
+                string and numeric literals.
+
+                Bug-5539 (Codex round-3 findings 1 & 2): two more value-side
+                shapes are resolved here so the SAME validator gates them too:
+                  - ``exp.Between`` low/high bounds — the target field is the
+                    BETWEEN's ``.this`` (``int_dim BETWEEN 1e9 AND 2e9`` under an
+                    OR / unresolvable WHERE previously skipped validation).
+                  - a sign-wrapped literal (``-1e9`` parses as ``Neg(Literal)``,
+                    so the literal's parent is the ``Neg``, not the comparison) —
+                    step over the ``Neg`` to find the real predicate parent so a
+                    negative scientific form is validated in its full spelling.
+                """
+                # Step over a unary-sign wrapper: a negative literal parses as
+                # Neg(Literal(...)), so the literal sits one level below the real
+                # predicate node. Treat the Neg as the value node for parent
+                # resolution; the caller validates the signed spelling.
+                value_node = node
+                if isinstance(node.parent, exp.Neg):
+                    value_node = node.parent
+                parent = value_node.parent
+                if isinstance(parent, exp.In) and value_node is not parent.this:
+                    field_node = parent.this
+                    if isinstance(field_node, exp.Column) and _is_known_field(field_node.name):
+                        return field_node
+                    return None
+                if isinstance(parent, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+                    other = parent.right if value_node is parent.left else parent.left
+                    if isinstance(other, exp.Column) and _is_known_field(other.name):
+                        return other
+                    return None
+                if isinstance(parent, exp.Between):
+                    field_node = parent.this
+                    if isinstance(field_node, exp.Column) and _is_known_field(field_node.name):
+                        return field_node
+                    return None
+                return _in_subselect_field(node)
+
             def _qualify_where(node):
+                # Bug-5538 (Codex findings 2 & 3): re-type / validate value-side
+                # literals so a numeric column gets a numeric literal in the raw
+                # OR / IN / subselect shapes (Excel set & multi-member slicers,
+                # subselect filters). Columns are handled below; this branch
+                # covers genuine ``exp.Literal`` members that the column-only path
+                # never visited.
+                if isinstance(node, exp.Literal):
+                    field_node = _numeric_target_field(node)
+                    if field_node is not None:
+                        if node.is_string:
+                            # String member: re-type for numeric columns, keep the
+                            # string literal for text/date columns (unchanged).
+                            return _value_literal_from_str(node.this, field_node)
+                        # Codex round-2 finding 2: a non-string (numeric/raw) RHS
+                        # token against a known NUMERIC column must clear the SAME
+                        # strict validator. A non-conforming token (``1e9``,
+                        # ``+1`` — sqlglot folds the sign, but defence-in-depth)
+                        # fails loud; a conforming integer/decimal is rebuilt as a
+                        # canonical numeric literal rather than passed through raw.
+                        col_type = (
+                            _get_col_type_for_field(field_node)
+                            if isinstance(field_node, exp.Column)
+                            else None
+                        )
+                        if is_numeric_col_type(col_type):
+                            # Bug-5539 (Codex round-3 finding 2): validate the
+                            # literal's ORIGINAL signed spelling. ``transform`` is
+                            # post-order, so a ``-1e9`` literal is visited (as the
+                            # inner ``Literal('1e9')``) BEFORE its ``Neg`` parent.
+                            # Build the signed token (``-1e9``) and run the strict
+                            # grammar on it so a negative scientific form fails
+                            # loud instead of leaving the ``Neg`` to emit a bare
+                            # ``-1e9``. Rebuild only the inner (unsigned) literal;
+                            # the surviving ``Neg`` re-applies the sign.
+                            is_negated = isinstance(node.parent, exp.Neg)
+                            spelling = ("-" + node.this) if is_negated else node.this
+                            if value_is_numeric_literal(spelling):
+                                return exp.Literal.number(node.this)
+                            raise SemanticBindingError(
+                                f"Non-numeric value {spelling!r} compared to "
+                                f"numeric column "
+                                f"'{getattr(field_node, 'name', '?')}' in WHERE "
+                                f"clause"
+                            )
+                    return node
                 if isinstance(node, exp.Column):
                     phys = _get_phys_expr(node.name, pg_canonical=True)
                     if phys:
@@ -1851,7 +2043,7 @@ def _build_where_clause(
                                 and _is_known_field(field_node.name)
                                 and node is not parent.this
                             ):
-                                return exp.Literal.string(node.name)
+                                return _value_literal(node.name, field_node)
                             raise SemanticBindingError(
                                 f"Unknown column '{node.name}' in WHERE clause"
                             )
@@ -1865,7 +2057,7 @@ def _build_where_clause(
                                 and _is_known_field(other.name)
                             )
                             if is_quoted and other_is_known:
-                                return exp.Literal.string(node.name)
+                                return _value_literal(node.name, other)
                             raise SemanticBindingError(
                                 f"Unknown column '{node.name}' in WHERE clause"
                             )
@@ -2285,6 +2477,124 @@ async def _build_source_sql(
                     return None
         return None
 
+    # Physical-column-name -> data_type fallback. The raw ``_qualify_where``
+    # path rewrites the field side to its PHYSICAL column before the value side
+    # is visited (sqlglot transform is bottom-up, left-to-right), so a
+    # by-semantic-name lookup misses there. Keying physical names too lets
+    # ``_get_col_type`` type the value correctly in both paths.
+    # When two tables share a column name but declare DIFFERENT types, the
+    # physical-name lookup is ambiguous — record None so the renderer keeps its
+    # safe string-literal default rather than guessing a wrong (possibly
+    # numeric) type. Same-name same-type is fine.
+    _data_type_by_phys_name: dict[str, str | None] = {}
+    for _mc in columns_by_id.values():
+        _cn = getattr(_mc, "column_name", None)
+        _dt = getattr(_mc, "data_type", None)
+        if not _cn or not _dt:
+            continue
+        _key = _cn.lower()
+        if _key in _data_type_by_phys_name:
+            if (_data_type_by_phys_name[_key] or "").upper() != _dt.upper():
+                _data_type_by_phys_name[_key] = None  # ambiguous
+        else:
+            _data_type_by_phys_name[_key] = _dt
+
+    # Bug-5538 (Codex round-2 finding 4): a QUALIFIED physical lookup keyed by
+    # ``table_alias.column`` (lower-cased) is unambiguous even when a bare column
+    # name collides with a semantic dimension name or repeats across tables.
+    # After ``_qualify_where`` rewrites a semantic field to its physical column,
+    # the field node carries the table alias, so the qualified key resolves the
+    # CORRECT type. The bare-name path stays a last resort and refuses to guess
+    # on any semantic/physical name collision (see ``_bare_name_is_ambiguous``).
+    _data_type_by_qualified_phys: dict[str, str] = {}
+    for _mc in columns_by_id.values():
+        _cn = getattr(_mc, "column_name", None)
+        _dt = getattr(_mc, "data_type", None)
+        _alias = alias_by_table_id.get(getattr(_mc, "model_table_id", None))
+        if not _cn or not _dt or not _alias:
+            continue
+        _data_type_by_qualified_phys[f"{_alias.lower()}.{_cn.lower()}"] = _dt
+
+    # Semantic dimension names whose lower-cased form collides with a physical
+    # column name of a DIFFERENT type. A bare lookup of such a name cannot decide
+    # which type is meant (semantic-for-INT vs physical-for-string), so it must
+    # resolve to UNKNOWN — the renderer then keeps its safe string-literal
+    # default rather than emitting a wrong-typed (possibly numeric) bare token.
+    _ambiguous_bare_names: set[str] = set()
+    for _dname, _dim in dimensions_by_name.items():
+        _key = _dname.lower()
+        _phys_dt = _data_type_by_phys_name.get(_key)
+        if _phys_dt is None:
+            continue
+        _mc = columns_by_id.get(getattr(_dim, "source_column_id", None))
+        _sem_dt = getattr(_mc, "data_type", None) if _mc is not None else None
+        if _sem_dt and _phys_dt.upper() != _sem_dt.upper():
+            _ambiguous_bare_names.add(_key)
+
+    def _get_col_type(name: str) -> str | None:
+        """Resolve a field's source data type (e.g. ``INT64``, ``STRING``,
+        ``DATE``) so WHERE rendering can emit a type-correct literal. Resolution
+        order mirrors ``_get_phys_expr``: dimension physical column / UDA, then
+        measure physical column / UDA, then a direct physical-column-name match.
+
+        Returns None when no type is known (the renderers then keep their
+        existing string-literal default). Used by BOTH WHERE paths — the
+        extracted-filter path (``filter_col_type_by_name``) and the raw
+        ``_qualify_where`` path — so an INTEGER-keyed dimension filter emits a
+        numeric literal regardless of which path the query takes.
+        """
+        dim = dimensions_by_name.get(name)
+        if dim is not None:
+            mc = columns_by_id.get(getattr(dim, "source_column_id", None))
+            if mc is not None and getattr(mc, "data_type", None):
+                return mc.data_type
+            uda_id = getattr(dim, "user_defined_attribute_id", None)
+            uda = uda_by_id.get(uda_id) if uda_id else None
+            if uda is not None and getattr(uda, "output_data_type", None):
+                return uda.output_data_type
+        for m in list(bound_query.resolved_measures) + _order_measures:
+            if m.name == name:
+                mc = columns_by_id.get(getattr(m, "source_column_id", None))
+                if mc is not None and getattr(mc, "data_type", None):
+                    return mc.data_type
+                uda_id = getattr(m, "user_defined_attribute_id", None)
+                uda = uda_by_id.get(uda_id) if uda_id else None
+                if uda is not None and getattr(uda, "output_data_type", None):
+                    return uda.output_data_type
+                break
+        # Bug-5538 (Codex round-2 finding 4): a bare name that collides between a
+        # semantic dimension and a physical column of a DIFFERENT type is
+        # ambiguous; refuse to guess (fail safe). Reached only when neither the
+        # semantic dimension nor a measure above produced a type — i.e. the bare
+        # name is the rewritten PHYSICAL column whose semantic twin has a
+        # different declared type. Prefer the qualified resolver for these.
+        if name.lower() in _ambiguous_bare_names:
+            return None
+        # Fallback: the raw-WHERE path passes the already-rewritten PHYSICAL
+        # column name.
+        return _data_type_by_phys_name.get(name.lower())
+
+    def _get_col_type_for_field(field_node) -> str | None:
+        """Type resolver for the raw ``_qualify_where`` path that prefers the
+        UNAMBIGUOUS qualified physical key (``table_alias.column``) when the
+        rewritten field node carries a table alias. Falls back to the bare-name
+        ``_get_col_type`` (which itself refuses ambiguous collisions). Bug-5538
+        (Codex round-2 finding 4): resolving by qualified physical expression
+        first prevents a semantic/physical bare-name collision from assigning the
+        wrong type (string-for-INT or numeric-for-string)."""
+        if isinstance(field_node, exp.Column):
+            tbl = field_node.table
+            col = field_node.name
+            if tbl and col:
+                qualified = _data_type_by_qualified_phys.get(
+                    f"{tbl.lower()}.{col.lower()}"
+                )
+                if qualified is not None:
+                    return qualified
+            if col:
+                return _get_col_type(col)
+        return None
+
     # Period-aware variant resolution: if any measure carries a period-aware
     # variant (YTD, prior-period, YoY, etc.), resolve calendar rules.
     # Path B (expression-first): derive period boundaries from the hierarchy's
@@ -2555,6 +2865,8 @@ async def _build_source_sql(
         field_expr_by_name=field_expr_by_name,
         filter_col_type_by_name=filter_col_type_by_name,
         _get_phys_expr=_get_phys_expr,
+        _get_col_type=_get_col_type,
+        _get_col_type_for_field=_get_col_type_for_field,
     )
     has_explicit_agg = any(e.agg_function is not None for e in getattr(bound_query.logical_query, "select_expressions", []))
     # Use the original grain (GROUP BY columns) not all dimensions.

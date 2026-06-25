@@ -3455,3 +3455,480 @@ class TestWrappedPredicateMeasureStripping:
         )
         assert "[Measures]" in hiers
         assert "[d].[d]" in hiers
+
+
+# ---------------------------------------------------------------------------
+# Bug-5519: a LEAF member's `.Children` must be the EMPTY set, not the level
+# ---------------------------------------------------------------------------
+
+class TestLeafChildrenEmpty:
+    """`[Dim].[Hier].[Member].Children` on a leaf member must yield no axis
+    members. `[All].Children` (and `.Members`) stay correct.
+
+    Repro: Excel year report-filter where each year "drills" to the full year
+    list -> infinite recursion -> Excel "insufficient memory". The MDX axis
+    `.Children` path returned the whole level for a leaf; the discovery
+    (TREE_OP) path was already correct (Bug-5431).
+    """
+
+    # A flat dimension (one data level), exactly like the demo `year` dim:
+    # the model-service dimension payload carries no explicit `levels`.
+    _FLAT_DIM = [{"name": "year"}]
+    _MEASURES = [{"name": "net_sales", "default_agg": "sum"}]
+
+    def _year_rows(self):
+        # The SQL behind `.Children` returns the whole year list (the symptom
+        # source); the fix must suppress it for a leaf regardless of the rows.
+        return [
+            {"year": "(blank)", "net_sales": 1},
+            {"year": "1998", "net_sales": 2},
+            {"year": "1999", "net_sales": 3},
+            {"year": "2000", "net_sales": 4},
+        ]
+
+    def test_leaf_children_is_empty_axis(self):
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "[year].[year].[1999].Children ON ROWS FROM [tpcds_retail]"
+        )
+        xml = build_real_execute_response(
+            mdx=mdx,
+            catalog="tpcds_retail",
+            columns=["year", "net_sales"],
+            rows=self._year_rows(),
+            measures_meta=self._MEASURES,
+            dimensions_meta=self._FLAT_DIM,
+        )
+        # No year member row may appear on the row axis.
+        assert "[year].[year].[1999]" not in xml
+        assert "[year].[year].[1998]" not in xml
+        assert "[year].[year].[2000]" not in xml
+        assert "<Caption>1999</Caption>" not in xml
+        assert "<Caption>1998</Caption>" not in xml
+        # No SOAP fault.
+        assert "<Fault" not in xml and "Exception" not in xml
+
+    def test_leaf_children_no_recursion_member_set(self):
+        """The whole-level set must never be emitted under a leaf's children —
+        this is what made Excel recurse and exhaust memory."""
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "[year].[year].[1999].Children ON ROWS FROM [tpcds_retail]"
+        )
+        xml = build_real_execute_response(
+            mdx=mdx,
+            catalog="tpcds_retail",
+            columns=["year", "net_sales"],
+            rows=self._year_rows(),
+            measures_meta=self._MEASURES,
+            dimensions_meta=self._FLAT_DIM,
+        )
+        # The leaf row axis (Axis1) declares the hierarchy but emits zero
+        # member tuples — only the measure member on Axis0 survives.
+        axes = xml[xml.find("<Axes>"):xml.find("</Axes>")]
+        axis1 = axes[axes.find('<Axis name="Axis1">'):]
+        assert "<UName>[year].[year]." not in axis1
+        # The single measure member on Axis0 is the only axis member emitted.
+        assert axes.count("<Member ") == 1
+        # CellData for an empty leaf axis is a single nil cell (the same shape
+        # an empty-result pivot already ships). Guards against a future change
+        # to the empty-axis fallback silently re-emitting per-member cells.
+        cell_data = xml[xml.find("<CellData>"):xml.find("</CellData>")]
+        assert cell_data.count("<Cell ") == 1
+        assert 'xsi:nil="true"' in cell_data
+
+    def test_all_children_returns_year_level(self):
+        """CONTROL: `[All].Children` = the children of the (All) level = the
+        year members. Must stay unchanged."""
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "[year].[year].[All].Children ON ROWS FROM [tpcds_retail]"
+        )
+        xml = build_real_execute_response(
+            mdx=mdx,
+            catalog="tpcds_retail",
+            columns=["year", "net_sales"],
+            rows=self._year_rows(),
+            measures_meta=self._MEASURES,
+            dimensions_meta=self._FLAT_DIM,
+        )
+        assert "<Caption>1998</Caption>" in xml
+        assert "<Caption>1999</Caption>" in xml
+        assert "<Caption>2000</Caption>" in xml
+
+    def test_members_unchanged_returns_year_level(self):
+        """CONTROL: `[year].[year].Members` returns the data years (unchanged)."""
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "[year].[year].Members ON ROWS FROM [tpcds_retail]"
+        )
+        xml = build_real_execute_response(
+            mdx=mdx,
+            catalog="tpcds_retail",
+            columns=["year", "net_sales"],
+            rows=self._year_rows(),
+            measures_meta=self._MEASURES,
+            dimensions_meta=self._FLAT_DIM,
+        )
+        assert "<Caption>1998</Caption>" in xml
+        assert "<Caption>1999</Caption>" in xml
+
+    def test_leaf_children_other_flat_dim_empty(self):
+        """Another flat dim (item_category) leaf `.Children` is also empty."""
+        mdx = (
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "[item_category].[item_category].[Electronics].Children ON ROWS "
+            "FROM [tpcds_retail]"
+        )
+        xml = build_real_execute_response(
+            mdx=mdx,
+            catalog="tpcds_retail",
+            columns=["item_category", "net_sales"],
+            rows=[
+                {"item_category": "Electronics", "net_sales": 5},
+                {"item_category": "Home", "net_sales": 6},
+            ],
+            measures_meta=self._MEASURES,
+            dimensions_meta=[{"name": "item_category"}],
+        )
+        assert "<Caption>Electronics</Caption>" not in xml
+        assert "<Caption>Home</Caption>" not in xml
+        assert "<Fault" not in xml
+
+    def test_leaf_children_on_columns_axis_empty(self):
+        """The leaf-children fix applies to the COLUMNS axis too."""
+        mdx = (
+            "SELECT [year].[year].[1999].Children ON COLUMNS, "
+            "{[Measures].[net_sales]} ON ROWS FROM [tpcds_retail]"
+        )
+        xml = build_real_execute_response(
+            mdx=mdx,
+            catalog="tpcds_retail",
+            columns=["year", "net_sales"],
+            rows=self._year_rows(),
+            measures_meta=self._MEASURES,
+            dimensions_meta=self._FLAT_DIM,
+        )
+        assert "<Caption>1999</Caption>" not in xml
+        assert "<Caption>1998</Caption>" not in xml
+        assert "<Fault" not in xml
+
+    # --- leaf-determination helper unit coverage -------------------------------
+
+    def test_resolution_flat_leaf(self):
+        from src.dax.mdx_execute import _member_children_resolution
+        assert _member_children_resolution(
+            "[year].[year]", "1999", [{"name": "year"}], [],
+        ) == "leaf"
+
+    def test_resolution_all_member(self):
+        from src.dax.mdx_execute import _member_children_resolution
+        assert _member_children_resolution(
+            "[year].[year]", "All", [{"name": "year"}], [],
+        ) == "all"
+        # Excel's parenthesised All form normalises identically.
+        assert _member_children_resolution(
+            "[year].[year]", "(All)", [{"name": "year"}], [],
+        ) == "all"
+
+    def test_resolution_unknown_hierarchy(self):
+        from src.dax.mdx_execute import _member_children_resolution
+        # Unknown dim/hier -> no leaf claim, preserve existing behaviour.
+        assert _member_children_resolution(
+            "[mystery].[mystery]", "X", [], [],
+        ) == "unknown"
+
+    def test_resolution_multilevel_intermediate_member_unknown(self):
+        from src.dax.mdx_execute import _member_children_resolution
+        # A defined 3-level hierarchy: a caption alone does not pin the level,
+        # so an intermediate member keeps existing behaviour (not falsely leaf).
+        hdefs = [{
+            "name": "Geo",
+            "levels": [
+                {"name": "Country", "ordinal": 0},
+                {"name": "Region", "ordinal": 1},
+                {"name": "City", "ordinal": 2},
+            ],
+        }]
+        assert _member_children_resolution(
+            "[Geo].[Geo]", "France", [{"name": "Country"}], hdefs,
+        ) == "unknown"
+
+    def test_data_levels_flat_no_explicit_levels(self):
+        from src.dax.mdx_execute import _hierarchy_data_levels
+        assert _hierarchy_data_levels(
+            "[year].[year]", [{"name": "year"}], [],
+        ) == ["year"]
+
+    def test_data_levels_multilevel_ordered(self):
+        from src.dax.mdx_execute import _hierarchy_data_levels
+        hdefs = [{
+            "name": "Geo",
+            "levels": [
+                {"name": "City", "ordinal": 2},
+                {"name": "Country", "ordinal": 0},
+                {"name": "Region", "ordinal": 1},
+            ],
+        }]
+        assert _hierarchy_data_levels("[Geo].[Geo]", [], hdefs) == [
+            "Country", "Region", "City",
+        ]
+
+
+class TestChildrenMatrix:
+    """Systematic `.Children` edge-case matrix (Bug-5519 round-2).
+
+    Cross-product of:
+      - member level:   {All member, leaf member, multi-level intermediate}
+      - member form:    {caption `[1999]`, key `&[1999]`, composite `&[k0]&[k1]`}
+      - All spelling:   {`[All]`, `(All)`, `[all]`, `[(all)]`}
+      - hierarchy kind: {flat auto-hierarchy `[Dim].[Dim]`, known multi-level,
+                         UNKNOWN hierarchy over a known dim, totally unknown dim}
+
+    Invariants asserted:
+      - leaf `.Children` -> EMPTY (caption AND key forms),
+      - All `.Children`  -> the data-level members (any All spelling),
+      - unknown-hierarchy / unknown-dim `.Children` -> prior whole-level
+        behaviour preserved (NOT wrongly emptied),
+      - multi-level intermediate caption -> "unknown" (no false leaf claim).
+
+    Each assertion is constructed to FAIL on the pre-fix code for the case it
+    targets (key-form leaf, unknown-hierarchy-over-flat-dim, lowercase All).
+    """
+
+    _FLAT_DIM = [{"name": "year"}]
+    _MEASURES = [{"name": "net_sales", "default_agg": "sum"}]
+    _MULTI_HDEF = [{
+        "name": "Geo",
+        "levels": [
+            {"name": "Country", "ordinal": 0},
+            {"name": "Region", "ordinal": 1},
+            {"name": "City", "ordinal": 2},
+        ],
+    }]
+    _MULTI_DIMS = [{"name": "Country"}, {"name": "Region"}, {"name": "City"}]
+
+    def _year_rows(self):
+        return [
+            {"year": "1998", "net_sales": 2},
+            {"year": "1999", "net_sales": 3},
+            {"year": "2000", "net_sales": 4},
+        ]
+
+    def _exec(self, mdx, *, rows=None, dims=None, hdefs=None, cols=None):
+        return build_real_execute_response(
+            mdx=mdx,
+            catalog="tpcds_retail",
+            columns=cols or ["year", "net_sales"],
+            rows=rows if rows is not None else self._year_rows(),
+            measures_meta=self._MEASURES,
+            dimensions_meta=dims or self._FLAT_DIM,
+            hierarchy_defs=hdefs,
+        )
+
+    # --- member-form extraction (Finding 2: key form must be captured) --------
+
+    def test_extract_caption_children(self):
+        from src.dax.mdx_execute import _extract_all_member_filters
+        out = _extract_all_member_filters("[year].[year].[1999].Children")
+        assert out["[year].[year]"] == ("1999", "children")
+
+    def test_extract_key_form_children(self):
+        from src.dax.mdx_execute import _extract_all_member_filters
+        # FAILS pre-fix: the old single-regex only matched the 3-bracket caption
+        # form, so the key form produced no children spec at all.
+        out = _extract_all_member_filters("[year].[year].&[1999].Children")
+        assert out["[year].[year]"] == ("1999", "children")
+
+    def test_extract_composite_key_children(self):
+        from src.dax.mdx_execute import _extract_all_member_filters
+        # Path-qualified composite key: the named member is the deepest key.
+        out = _extract_all_member_filters(
+            "[Geo].[Geo].[City].&[France]&[Paris].Children"
+        )
+        assert out["[Geo].[Geo]"] == ("Paris", "children")
+
+    def test_extract_key_form_members(self):
+        from src.dax.mdx_execute import _extract_all_member_filters
+        out = _extract_all_member_filters("[year].[year].&[1999].Members")
+        assert out["[year].[year]"] == ("1999", "members")
+
+    # --- resolution classification matrix -------------------------------------
+
+    def test_resolution_flat_leaf_caption(self):
+        from src.dax.mdx_execute import _member_children_resolution
+        assert _member_children_resolution(
+            "[year].[year]", "1999", self._FLAT_DIM, [],
+        ) == "leaf"
+
+    def test_resolution_flat_leaf_key(self):
+        from src.dax.mdx_execute import (
+            _extract_all_member_filters,
+            _member_children_resolution,
+        )
+        # Exercise the full key-form path: the extractor must pick the deepest
+        # key from `&[1999]`, and that member must classify as a flat leaf.
+        spec = _extract_all_member_filters("[year].[year].&[1999].Children")
+        member, op = spec["[year].[year]"]
+        assert (member, op) == ("1999", "children")
+        assert _member_children_resolution(
+            "[year].[year]", member, self._FLAT_DIM, [],
+        ) == "leaf"
+
+    @pytest.mark.parametrize("spelling", ["All", "(All)", "all", "(all)", "ALL"])
+    def test_resolution_all_spellings(self, spelling):
+        from src.dax.mdx_execute import _member_children_resolution
+        # FAILS pre-fix for "all"/"(all)"/"ALL": case-sensitive compare
+        # misclassified lower/upper-case All as a leaf -> wrongly EMPTY.
+        assert _member_children_resolution(
+            "[year].[year]", spelling, self._FLAT_DIM, [],
+        ) == "all"
+
+    def test_resolution_unknown_hierarchy_over_known_flat_dim(self):
+        from src.dax.mdx_execute import _member_children_resolution
+        # FAILS pre-fix: `[year].[not_year]` over the known `year` dim was
+        # misclassified as the flat dim's single level -> "leaf" -> EMPTY.
+        # It must be "unknown" so prior whole-level behaviour is preserved.
+        assert _member_children_resolution(
+            "[year].[not_year]", "1999", self._FLAT_DIM, [],
+        ) == "unknown"
+
+    def test_resolution_totally_unknown_dim(self):
+        from src.dax.mdx_execute import _member_children_resolution
+        assert _member_children_resolution(
+            "[mystery].[mystery]", "X", [], [],
+        ) == "unknown"
+
+    def test_resolution_multilevel_intermediate_unknown(self):
+        from src.dax.mdx_execute import _member_children_resolution
+        # A caption alone cannot pin a level in a multi-level hierarchy, so an
+        # intermediate member is "unknown" (no false leaf claim).
+        assert _member_children_resolution(
+            "[Geo].[Geo]", "France", self._MULTI_DIMS, self._MULTI_HDEF,
+        ) == "unknown"
+
+    def test_data_levels_unknown_hierarchy_over_flat_dim_empty(self):
+        from src.dax.mdx_execute import _hierarchy_data_levels
+        # FAILS pre-fix: returned ["year"] for the wrong-named hierarchy.
+        assert _hierarchy_data_levels(
+            "[year].[not_year]", self._FLAT_DIM, [],
+        ) == []
+
+    # --- end-to-end axis behaviour: leaf -> EMPTY (caption AND key) -----------
+
+    def test_e2e_leaf_caption_children_empty(self):
+        xml = self._exec(
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "[year].[year].[1999].Children ON ROWS FROM [tpcds_retail]"
+        )
+        assert "<Caption>1999</Caption>" not in xml
+        assert "<Caption>1998</Caption>" not in xml
+        assert "<Fault" not in xml
+
+    def test_e2e_leaf_key_children_empty(self):
+        # The important one: Excel/Power BI emit the `&[key]` member form.
+        # FAILS pre-fix: the key form bypassed the leaf resolver and the whole
+        # year level was re-rendered (the original infinite-drill bug).
+        xml = self._exec(
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "[year].[year].&[1999].Children ON ROWS FROM [tpcds_retail]"
+        )
+        assert "<Caption>1999</Caption>" not in xml
+        assert "<Caption>1998</Caption>" not in xml
+        assert "<Caption>2000</Caption>" not in xml
+        assert "[year].[year].[1999]" not in xml
+        assert "<Fault" not in xml
+
+    def test_e2e_leaf_key_children_empty_on_columns(self):
+        xml = self._exec(
+            "SELECT [year].[year].&[1999].Children ON COLUMNS, "
+            "{[Measures].[net_sales]} ON ROWS FROM [tpcds_retail]"
+        )
+        assert "<Caption>1999</Caption>" not in xml
+        assert "<Caption>1998</Caption>" not in xml
+        assert "<Fault" not in xml
+
+    # --- end-to-end: All spellings -> data-level members ----------------------
+
+    @pytest.mark.parametrize("spelling", ["[All]", "[(All)]", "[all]", "[(all)]"])
+    def test_e2e_all_spellings_return_year_level(self, spelling):
+        # FAILS pre-fix for `[all]`/`[(all)]`: lower-case All was classified as a
+        # leaf and the year members were wrongly suppressed.
+        xml = self._exec(
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            f"[year].[year].{spelling}.Children ON ROWS FROM [tpcds_retail]"
+        )
+        assert "<Caption>1998</Caption>" in xml
+        assert "<Caption>1999</Caption>" in xml
+        assert "<Caption>2000</Caption>" in xml
+
+    # --- end-to-end: unknown hierarchy / unknown dim -> whole level preserved -
+
+    def test_e2e_unknown_hierarchy_over_flat_dim_preserves_whole_level(self):
+        # FAILS pre-fix: `[year].[not_year].[1999].Children` was emptied. The
+        # old (pre-Bug-5519) behaviour rendered the whole level; that must be
+        # preserved for an unresolved hierarchy.
+        xml = self._exec(
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "[year].[not_year].[1999].Children ON ROWS FROM [tpcds_retail]"
+        )
+        assert "<Caption>1998</Caption>" in xml
+        assert "<Caption>1999</Caption>" in xml
+        assert "<Caption>2000</Caption>" in xml
+
+    def test_e2e_unknown_hierarchy_key_form_preserves_whole_level(self):
+        xml = self._exec(
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "[year].[not_year].&[1999].Children ON ROWS FROM [tpcds_retail]"
+        )
+        assert "<Caption>1998</Caption>" in xml
+        assert "<Caption>1999</Caption>" in xml
+
+    def test_e2e_totally_unknown_dim_preserves_whole_level(self):
+        # `[stuff].[stuff]` is an unknown dim, but the result column matches the
+        # hierarchy dim name so the whole-level rendering can be observed. The
+        # resolver makes no leaf claim (unknown), so members are NOT emptied.
+        rows = [
+            {"stuff": "A", "net_sales": 1},
+            {"stuff": "B", "net_sales": 2},
+        ]
+        xml = self._exec(
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "[stuff].[stuff].[A].Children ON ROWS FROM [tpcds_retail]",
+            rows=rows,
+            cols=["stuff", "net_sales"],
+            dims=[{"name": "stuff_other"}],  # known dims, but not [stuff]
+        )
+        assert "<Caption>A</Caption>" in xml
+        assert "<Caption>B</Caption>" in xml
+
+    # --- end-to-end: multi-level intermediate member --------------------------
+
+    def test_e2e_multilevel_intermediate_caption_preserves_behaviour(self):
+        # An intermediate caption in a multi-level hierarchy is "unknown" -> the
+        # documented scope is to preserve existing (whole-level) rendering. The
+        # result column matches the hierarchy dim name (`Geo`) so the whole-level
+        # member set is observable; a false leaf claim would empty it.
+        hdef = [{
+            "name": "Geo",
+            "levels": [
+                {"name": "Country", "ordinal": 0},
+                {"name": "Region", "ordinal": 1},
+                {"name": "City", "ordinal": 2},
+            ],
+        }]
+        rows = [
+            {"Geo": "North", "net_sales": 1},
+            {"Geo": "South", "net_sales": 2},
+        ]
+        xml = self._exec(
+            "SELECT {[Measures].[net_sales]} ON COLUMNS, "
+            "[Geo].[Geo].[France].Children ON ROWS FROM [tpcds_retail]",
+            rows=rows,
+            cols=["Geo", "net_sales"],
+            dims=[{"name": "Geo"}],
+            hdefs=hdef,
+        )
+        assert "<Caption>North</Caption>" in xml
+        assert "<Caption>South</Caption>" in xml
+        assert "<Fault" not in xml
