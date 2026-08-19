@@ -222,6 +222,72 @@ class TestUpdateCollibraConfig:
             )
         assert resp.status_code == 404
 
+    @pytest.mark.anyio
+    async def test_explicit_null_clears_optional_field(self, client):
+        """Bug-6490: sending null for community_id / domain_id must clear them."""
+        conn_id = uuid.uuid4()
+        conn = _make_collibra_connection(
+            conn_id=conn_id,
+        )
+        # Verify the connection starts with non-null values
+        assert conn.community_id == "community-123"
+        assert conn.domain_id == "domain-456"
+
+        db = _setup_db_for_cud()
+        model = make_model()
+        db.get = AsyncMock(side_effect=lambda model_cls, pk: (
+            model if pk == TEST_MODEL_ID else conn
+        ))
+        db.commit = AsyncMock()
+
+        with patch("src.api.collibra.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.collibra.audit", new_callable=AsyncMock):
+            resp = await client.put(
+                f"{COLLIBRA_PREFIX}/config/{conn_id}",
+                json={"community_id": None, "domain_id": None},
+            )
+        assert resp.status_code == 200, resp.text
+        # The mock connection object should have been mutated to None
+        assert conn.community_id is None, (
+            "community_id must be cleared when explicit null is sent"
+        )
+        assert conn.domain_id is None, (
+            "domain_id must be cleared when explicit null is sent"
+        )
+        data = resp.json()
+        assert data["community_id"] is None
+        assert data["domain_id"] is None
+
+    @pytest.mark.anyio
+    async def test_omitted_field_left_unchanged(self, client):
+        """Bug-6490: omitting community_id / domain_id must leave them unchanged."""
+        conn_id = uuid.uuid4()
+        conn = _make_collibra_connection(conn_id=conn_id)
+        original_community = conn.community_id
+        original_domain = conn.domain_id
+
+        db = _setup_db_for_cud()
+        model = make_model()
+        db.get = AsyncMock(side_effect=lambda model_cls, pk: (
+            model if pk == TEST_MODEL_ID else conn
+        ))
+        db.commit = AsyncMock()
+
+        with patch("src.api.collibra.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.collibra.audit", new_callable=AsyncMock):
+            # Only send display_name — community_id and domain_id are omitted
+            resp = await client.put(
+                f"{COLLIBRA_PREFIX}/config/{conn_id}",
+                json={"display_name": "Renamed"},
+            )
+        assert resp.status_code == 200, resp.text
+        assert conn.community_id == original_community, (
+            "community_id must stay unchanged when omitted from payload"
+        )
+        assert conn.domain_id == original_domain, (
+            "domain_id must stay unchanged when omitted from payload"
+        )
+
 
 # ------------------------------------------------------------------ #
 # DELETE /config/{id}

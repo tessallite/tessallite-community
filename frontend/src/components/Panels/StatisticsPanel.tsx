@@ -36,6 +36,7 @@ import {
 import RefreshIcon from "@mui/icons-material/Refresh";
 import { optimizerApiClient } from "../../api/client";
 import { useSources } from "../../api/hooks";
+import { isTenantAdmin } from "../../auth/currentUser";
 import type {
   ColumnStatistics,
   Source,
@@ -141,6 +142,10 @@ export default function StatisticsPanel({ initialSourceId }: StatisticsPanelProp
     },
   });
 
+  // Bug-5909: only tenant admins can refresh stats and change cadence.
+  // Non-admins see the inspector read-only.
+  const canMutate = isTenantAdmin();
+
   const activeSource = sourceList.find((s) => s.id === activeSourceId) ?? null;
   const activeStats = activeSourceId ? statsBySourceId[activeSourceId] : undefined;
   const activeQuery = sourceList.findIndex((s) => s.id === activeSourceId);
@@ -205,15 +210,17 @@ export default function StatisticsPanel({ initialSourceId }: StatisticsPanelProp
             ))}
           </Select>
         </FormControl>
-        <Button
-          size="small"
-          variant="contained"
-          startIcon={<RefreshIcon />}
-          disabled={!activeSourceId || refreshMutation.isPending}
-          onClick={handleRecomputeClick}
-        >
-          {refreshMutation.isPending ? t("statistics.refreshing") : t("statistics.recompute")}
-        </Button>
+        {canMutate && (
+          <Button
+            size="small"
+            variant="contained"
+            startIcon={<RefreshIcon />}
+            disabled={!activeSourceId || refreshMutation.isPending}
+            onClick={handleRecomputeClick}
+          >
+            {refreshMutation.isPending ? t("statistics.refreshing") : t("statistics.recompute")}
+          </Button>
+        )}
         {refreshMutation.isError && (
           <Alert severity="error" sx={{ flexGrow: 1 }}>
             {String((refreshMutation.error as Error).message ?? t("statistics.refreshFailed"))}
@@ -246,6 +253,7 @@ export default function StatisticsPanel({ initialSourceId }: StatisticsPanelProp
             })
           }
           cadenceSaving={cadenceMutation.isPending}
+          canMutate={canMutate}
         />
       ))}
 
@@ -312,10 +320,12 @@ function TableCard({
   table,
   onCadenceChange,
   cadenceSaving,
+  canMutate = true,
 }: {
   table: TableStatistics;
   onCadenceChange: (next: StatsRefreshCadence) => void;
   cadenceSaving: boolean;
+  canMutate?: boolean;
 }) {
   const t = useT();
   const fresh = freshnessLabel(table.last_refreshed_at, t);
@@ -339,11 +349,13 @@ function TableCard({
             label={t("statistics.size", { size: formatBytes(table.table_size_bytes) })}
             variant="outlined"
           />
-          <RefreshScheduleSelect
-            value={table.refresh_cadence}
-            onChange={onCadenceChange}
-            disabled={cadenceSaving}
-          />
+          {canMutate && (
+            <RefreshScheduleSelect
+              value={table.refresh_cadence}
+              onChange={onCadenceChange}
+              disabled={cadenceSaving}
+            />
+          )}
           <Chip
             size="small"
             label={t("statistics.refreshed", { time: fresh.label })}
@@ -357,6 +369,14 @@ function TableCard({
             />
           )}
         </Stack>
+        {/* Bug-6158: last_error is surfaced by the API but was never rendered,
+            so a failed probe left the table looking silently up to date. Show
+            it so operators can see and act on the failure. */}
+        {table.last_error && (
+          <Alert severity="error" sx={{ mt: 1 }}>
+            {t("statistics.lastError", { error: table.last_error })}
+          </Alert>
+        )}
         {table.columns.length === 0 ? (
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1 }}>
             {t("statistics.noColumnStatistics")}

@@ -21,7 +21,12 @@ class TrendResult:
     """Result of trend evaluation."""
     trend: Optional[int]        # 1=improving, 0=stable, -1=declining, None=insufficient data
     trend_label: Optional[str]
-    trend_pct: Optional[float]  # percentage change as decimal (0.05 = 5%)
+    trend_pct: Optional[float]  # raw percentage change as decimal (0.05 = 5%)
+    # Bug-7238: direction-normalised percentage — positive means improving,
+    # negative means declining, regardless of direction preference.  The
+    # scorecard improvement chip should use this field, not the raw trend_pct,
+    # so the sign and colour never contradict each other.
+    trend_pct_normalised: Optional[float] = None
 
 
 # Map trend integer to label
@@ -31,6 +36,7 @@ INSUFFICIENT_DATA = TrendResult(
     trend=None,
     trend_label="Insufficient Data",
     trend_pct=None,
+    trend_pct_normalised=None,
 )
 
 
@@ -76,7 +82,7 @@ def evaluate_trend(
     # Compute percentage change
     if prior_value == 0:
         if current_value == 0:
-            return TrendResult(trend=0, trend_label="Stable", trend_pct=0.0)
+            return TrendResult(trend=0, trend_label="Stable", trend_pct=0.0, trend_pct_normalised=0.0)
         # Can't compute percentage change from zero
         return INSUFFICIENT_DATA
 
@@ -106,6 +112,9 @@ def evaluate_trend(
         trend=trend_int,
         trend_label=_TREND_LABELS[trend_int],
         trend_pct=pct_change,
+        # Bug-7238: normalised percentage — same magnitude as pct_change but
+        # the sign follows the direction preference (positive = improving).
+        trend_pct_normalised=effective_change,
     )
 
 

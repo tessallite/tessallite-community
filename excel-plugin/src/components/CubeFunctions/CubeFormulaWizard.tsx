@@ -8,10 +8,12 @@ import { CheckCircle, ErrorOutline } from '@mui/icons-material';
 import { tokens, theme } from '../../theme';
 import { generateCubeValue, measureMemberRef, dimensionMemberRef } from '../../utils/excelFormulas';
 import { discoverMembers } from '../../api/queryRouter';
+import { rowSecurityDeniedAll } from '../../utils/rowSecurity';
 import { useExcelConnections } from '../../hooks/useExcelConnections';
 import { useFieldCompatibility } from '../../hooks/useModel';
 import { dimensionCompatibilityById } from '../../utils/fieldCompatibility';
 import type { Measure, Dimension } from '../../types/tessallite';
+import { strings, templates } from '../../i18n/strings';
 
 interface CubeFormulaWizardProps {
   open: boolean;
@@ -34,6 +36,7 @@ export default function CubeFormulaWizard({
   const [selectedMember, setSelectedMember] = useState('');
   const [members, setMembers] = useState<{ name: string; key: string }[]>([]);
   const [membersLoading, setMembersLoading] = useState(false);
+  const [membersDenied, setMembersDenied] = useState(false);
   const [targetCell, setTargetCell] = useState('A1');
   const [validating, setValidating] = useState(false);
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
@@ -84,6 +87,15 @@ export default function CubeFormulaWizard({
     try {
       const dim = dimensions.find(d => d.id === dimId);
       const result = await discoverMembers(modelId, dim?.name ?? dimId, personaId);
+      // Bug-8453 / R4 finding 3: a row-security deny-all returns zero members.
+      // Leaving the list silently empty would have the modeller conclude the
+      // dimension has none and author a formula around that.
+      if (rowSecurityDeniedAll(result)) {
+        setMembers([]);
+        setMembersDenied(true);
+        return;
+      }
+      setMembersDenied(false);
       setMembers(result.members || []);
     } catch {
       setMembers([]);
@@ -161,16 +173,16 @@ export default function CubeFormulaWizard({
 
     const measure = measures.find(m => m.id === selectedMeasure);
     if (!measure) {
-      errors.push('Selected measure not found in model');
+      errors.push(strings.cubeWizard.measureNotFound);
     }
     if (selectedDimension) {
       const dim = dimensions.find(d => d.id === selectedDimension);
       if (!dim) {
-        errors.push('Selected dimension not found in model');
+        errors.push(strings.cubeWizard.dimensionNotFound);
       } else if (!selectedMember) {
-        errors.push('Select a member for the dimension filter, or remove the filter');
+        errors.push(strings.cubeWizard.selectMember);
       } else if (!members.some(mem => mem.key === selectedMember)) {
-        errors.push('Selected member is no longer available for this dimension');
+        errors.push(strings.cubeWizard.memberUnavailable);
       }
     }
 
@@ -198,19 +210,19 @@ export default function CubeFormulaWizard({
     <ThemeProvider theme={theme}>
     <Dialog open={open} onClose={handleClose} maxWidth={false} sx={{ '& .MuiDialog-paper': { width: 340, borderRadius: 2 } }}>
       <DialogTitle sx={{ fontSize: 14, fontWeight: 700, pb: 0 }}>
-        Cube Function Wizard
+        {strings.cubeWizard.title}
         <Box component="span" sx={{ fontSize: 11, color: tokens.colorTextSecondary, ml: 1 }}>
-          Step {step + 1} of 3
+          {templates.cubeWizard.stepOf(step + 1, 3)}
         </Box>
       </DialogTitle>
 
       <DialogContent sx={{ p: 2 }}>
         {step === 0 && (
           <FormControl fullWidth size="small">
-            <InputLabel>Measure</InputLabel>
+            <InputLabel>{strings.cubeWizard.measureLabel}</InputLabel>
             <Select
               value={selectedMeasure}
-              label="Measure"
+              label={strings.cubeWizard.measureLabel}
               onChange={e => setSelectedMeasure(e.target.value)}
             >
               {measures.map(m => (
@@ -228,13 +240,13 @@ export default function CubeFormulaWizard({
         {step === 1 && (
           <Box>
             <FormControl fullWidth size="small" sx={{ mb: 1.5 }}>
-              <InputLabel>Filter (optional)</InputLabel>
+              <InputLabel>{strings.cubeWizard.filterOptional}</InputLabel>
               <Select
                 value={selectedDimension}
-                label="Filter (optional)"
+                label={strings.cubeWizard.filterOptional}
                 onChange={e => handleDimensionChange(e.target.value)}
               >
-                <MenuItem value="">None</MenuItem>
+                <MenuItem value="">{strings.cubeWizard.none}</MenuItem>
                 {compatibleDimensions.map(d => (
                   <MenuItem key={d.id} value={d.id}>{d.display_name}</MenuItem>
                 ))}
@@ -243,7 +255,7 @@ export default function CubeFormulaWizard({
 
             {selectedMeasure && fieldCompatibility.data && compatibleDimensions.length === 0 && (
               <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, mb: 1 }}>
-                No compatible dimensions are available for this measure.
+                {strings.cubeWizard.noDimensionsAvailable}
               </Typography>
             )}
 
@@ -255,10 +267,10 @@ export default function CubeFormulaWizard({
 
             {selectedDimension && !membersLoading && members.length > 0 && (
               <FormControl fullWidth size="small">
-                <InputLabel>Member</InputLabel>
+                <InputLabel>{strings.cubeWizard.memberLabel}</InputLabel>
                 <Select
                   value={selectedMember}
-                  label="Member"
+                  label={strings.cubeWizard.memberLabel}
                   onChange={e => setSelectedMember(e.target.value)}
                 >
                   {members.map(mem => (
@@ -270,7 +282,7 @@ export default function CubeFormulaWizard({
 
             {selectedDimension && !membersLoading && members.length === 0 && (
               <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>
-                No members found for this dimension.
+                {strings.cubeWizard.noMembers}
               </Typography>
             )}
           </Box>
@@ -286,22 +298,19 @@ export default function CubeFormulaWizard({
             <TextField
               fullWidth
               size="small"
-              label="Target cell"
+              label={strings.cubeWizard.targetCell}
               value={targetCell}
               onChange={e => setTargetCell(e.target.value)}
               sx={{ mb: 1 }}
             />
             <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, mb: 0.5 }}>
-              CUBE formulas resolve against a workbook connection named "{connectionName}".
-              If you have not set one up yet, open Report Builder and use "Live connection"
-              to create it. The formula is inserted regardless; it will show #N/A until the
-              connection exists.
+              {templates.cubeWizard.connectionHintWithName(connectionName)}
             </Typography>
             {validating && (
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
                 <CircularProgress size={12} sx={{ color: tokens.colorPrimary }} />
                 <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>
-                  Validating...
+                  {strings.cubeWizard.validating}
                 </Typography>
               </Box>
             )}
@@ -321,7 +330,7 @@ export default function CubeFormulaWizard({
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
                 <CheckCircle sx={{ fontSize: 14, color: tokens.colorPrimary }} />
                 <Typography sx={{ fontSize: 11, color: tokens.colorPrimary }}>
-                  Ready to insert at {targetCell}
+                  {templates.cubeWizard.readyToInsert(targetCell)}
                 </Typography>
               </Box>
             )}
@@ -330,10 +339,10 @@ export default function CubeFormulaWizard({
       </DialogContent>
 
       <DialogActions sx={{ px: 2, pb: 1.5 }}>
-        <Button size="small" onClick={handleClose} sx={{ textTransform: 'none' }}>Cancel</Button>
+        <Button size="small" onClick={handleClose} sx={{ textTransform: 'none' }}>{strings.cubeWizard.cancel}</Button>
         <Box sx={{ flex: 1 }} />
         {step > 0 && (
-          <Button size="small" variant="outlined" onClick={handleBack} sx={{ textTransform: 'none' }}>Back</Button>
+          <Button size="small" variant="outlined" onClick={handleBack} sx={{ textTransform: 'none' }}>{strings.cubeWizard.back}</Button>
         )}
         {step < 2 ? (
           <Button
@@ -343,7 +352,7 @@ export default function CubeFormulaWizard({
             disabled={step === 0 && !selectedMeasure}
             sx={{ textTransform: 'none' }}
           >
-            Next
+            {strings.cubeWizard.next}
           </Button>
         ) : (
           <Button
@@ -353,7 +362,7 @@ export default function CubeFormulaWizard({
             disabled={!selectedMeasure || validating || validationErrors.length > 0}
             sx={{ textTransform: 'none' }}
           >
-            Insert Formula
+            {strings.cubeWizard.insertFormula}
           </Button>
         )}
       </DialogActions>

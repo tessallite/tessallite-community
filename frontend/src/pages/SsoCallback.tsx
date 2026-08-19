@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { Box, CircularProgress, Typography } from "@mui/material";
 import { useT } from "../i18n";
 import { authApi } from "../api/client";
+import { BRANDING_CHANGED_EVENT } from "../utils/brandingEvents";
 
 export default function SsoCallback() {
   const t = useT();
@@ -12,7 +13,13 @@ export default function SsoCallback() {
 
   useEffect(() => {
     const tenant = params.get("tenant_id");
-    if (tenant) localStorage.setItem("tenant_id", tenant);
+    if (tenant) {
+      localStorage.setItem("tenant_id", tenant);
+      // Bug-5982: the SSO path bypasses Login.tsx, so it must independently
+      // tell the theme owner (main.tsx Root) to re-read tenant_id and
+      // refetch branding for the newly-known tenant in this same tab.
+      window.dispatchEvent(new Event(BRANDING_CHANGED_EVENT));
+    }
 
     // Bug-836/837 fix: resolve role from server via /users/me instead of
     // trusting URL parameters. The JWT cookie was already set by the SSO

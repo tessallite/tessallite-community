@@ -9,16 +9,22 @@ beats the registry default but creds/config still beat both.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from cryptography.fernet import Fernet
 
 from shared.config.resolver import clear_cache
 from shared.config.source_db import (
+    BigQueryProjectResolutionError,
+    MissingConnectionHostError,
     resolve_aggregate_target_defaults,
+    resolve_connection_bq_project,
     resolve_source_db_endpoint,
     resolve_spark_thrift_defaults,
     resolve_target_schema,
+    target_connection_authority_is_provable,
 )
 
 
@@ -57,9 +63,51 @@ async def test_config_fills_in_when_creds_missing():
 
 @pytest.mark.asyncio
 async def test_falls_through_to_registry_default_when_nothing_set():
-    """No tenant_session, no creds, no config → registry defaults."""
-    host, port, db = await resolve_source_db_endpoint({}, {})
-    assert (host, port, db) == ("localhost", 5432, "postgres")
+    """Design change (Bug-7172): a HOST that resolves to nothing but the
+    registry's compiled-in default ("localhost") now fails loudly instead of
+    silently. Before this fix, ``resolve_source_db_endpoint({}, {})`` (no
+    creds, no config, no session) returned ``("localhost", 5432, "postgres")``
+    — a connection string that looked valid and masked the real
+    misconfiguration (no host anywhere). It now raises
+    ``MissingConnectionHostError`` at config-resolution time, per CLAUDE.md's
+    "fail clearly and early". Port/database keep the original silent-default
+    behaviour (see ``test_port_and_database_still_fall_through_with_a_real_host``);
+    only host is fail-closed, because a wrong default port/database is
+    comparatively benign next to a wrong default HOST.
+    """
+    with pytest.raises(MissingConnectionHostError):
+        await resolve_source_db_endpoint({}, {})
+
+
+@pytest.mark.asyncio
+async def test_missing_host_raises_error():
+    """Bug-7172: a host that cannot be PROVEN — not merely a session that
+    happens to be absent — must also raise. This is the production-relevant
+    shape: every real call site opens a genuine system session
+    (``_resolve_source_db_endpoint_scoped`` in shared/source_executor.py), so
+    the meaningful guard is "no admin override row exists", not "no session
+    was passed". A ``system_session`` that answers the fallback-host query
+    with ``None`` (no row) must raise exactly like the no-session case.
+    """
+    system_session = AsyncMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = None
+    system_session.execute = AsyncMock(return_value=result)
+
+    with pytest.raises(MissingConnectionHostError, match="No source DB host"):
+        await resolve_source_db_endpoint({}, {}, system_session=system_session)
+
+
+@pytest.mark.asyncio
+async def test_missing_host_does_not_raise_when_creds_supply_one():
+    """Sanity control: an explicit creds/config host never triggers the
+    fail-closed path, even with no session at all."""
+    host, port, db = await resolve_source_db_endpoint(
+        {"host": "explicit.example.com"}, {}
+    )
+    assert host == "explicit.example.com"
+    assert port == 5432
+    assert db == "postgres"
 
 
 @pytest.mark.asyncio
@@ -123,8 +171,10 @@ def test_bigquery_config_dataset_wins():
         {"dataset": "cfg_dataset", "schema": "cfg_schema", "project_id": "proj-1"},
         _DEFAULTS,
         schema_override="override_ds",
+        connection_bq_project="proj-1",
     )
     assert ref.schema == "cfg_dataset"
+    # Bug-8790: the connection project is authoritative, not the target config.
     assert ref.bq_project == "proj-1"
     assert ref.qualified_table("agg_sales") == "proj-1.cfg_dataset.agg_sales"
 
@@ -232,3 +282,103 @@ def test_unsupported_connector_raises_value_error():
     """Unknown connector raises a clear ValueError naming the connector."""
     with pytest.raises(ValueError, match="unsupported connector 'mysql'"):
         resolve_target_schema("mysql", {}, _DEFAULTS)
+
+
+# ---------------------------------------------------------------------------
+# BigQuery connection project resolution. The target write API and every
+# aggregate/pocket DDL caller use this single resolver.
+# ---------------------------------------------------------------------------
+
+
+def _connection(connection_type="bigquery", *, config=None, credentials=None):
+    return SimpleNamespace(
+        id="connection-under-test",
+        connection_type=connection_type,
+        config={} if config is None else config,
+        encrypted_credentials=credentials,
+    )
+
+
+def _encrypt_credentials(monkeypatch, credentials):
+    from shared.security import credential_crypto
+
+    monkeypatch.setenv("CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("CREDENTIAL_ENCRYPTION_KEY_PREVIOUS", "")
+    credential_crypto._multifernet_cached.cache_clear()
+    return credential_crypto.encrypt_json(credentials)
+
+
+def test_bq_project_uses_explicit_config_without_reading_credentials():
+    conn = _connection(config={"project_id": " config-project "}, credentials=b"bad")
+    assert resolve_connection_bq_project(conn) == "config-project"
+
+
+def test_bq_project_uses_encrypted_credential_project(monkeypatch):
+    encrypted = _encrypt_credentials(monkeypatch, {"project_id": "credential-project"})
+    assert resolve_connection_bq_project(_connection(credentials=encrypted)) == "credential-project"
+
+
+def test_bq_project_uses_encrypted_service_account_project(monkeypatch):
+    encrypted = _encrypt_credentials(
+        monkeypatch,
+        {"service_account_json": {"project_id": "service-account-project"}},
+    )
+    assert (
+        resolve_connection_bq_project(_connection(credentials=encrypted))
+        == "service-account-project"
+    )
+
+
+def test_bq_project_allows_only_a_genuine_adc_empty_connection():
+    assert resolve_connection_bq_project(_connection(config={}, credentials=None)) is None
+
+
+def test_non_bigquery_connection_never_reads_its_config_or_credentials():
+    assert (
+        resolve_connection_bq_project(
+            _connection("postgresql", config="malformed", credentials=b"bad")
+        )
+        is None
+    )
+
+
+def test_bq_project_rejects_unreadable_encrypted_credentials():
+    with pytest.raises(BigQueryProjectResolutionError, match="credentials could not be read"):
+        resolve_connection_bq_project(_connection(credentials=b"not-a-fernet-token"))
+
+
+def test_bq_target_qualification_uses_the_connection_project_only():
+    ref = resolve_target_schema(
+        "bigquery",
+        {"dataset": "aggregate_dataset", "project_id": "ignored-target-project"},
+        _DEFAULTS,
+        connection_bq_project="connection-project",
+    )
+    assert ref.qualified_table("daily_sales") == "connection-project.aggregate_dataset.daily_sales"
+
+
+@pytest.mark.parametrize(
+    ("target_type", "config", "expected"),
+    [
+        ("bigquery", {"dataset": "analytics"}, True),
+        ("bigquery", {"dataset": "analytics", "project_id": "connection-project"}, True),
+        ("bigquery", {"dataset": "other.analytics"}, False),
+        ("bigquery", {"dataset": "analytics", "project_id": "other-project"}, False),
+        ("postgresql", {"dataset": "analytics"}, False),
+    ],
+)
+def test_target_connection_authority_is_provable_for_bigquery_legacy_state(
+    target_type, config, expected
+):
+    target = SimpleNamespace(target_type=target_type, config=config)
+    conn = _connection(config={"project_id": "connection-project"})
+    assert target_connection_authority_is_provable(target, conn) is expected
+
+
+def test_target_connection_authority_refuses_adc_and_non_bigquery_legacy_mismatch():
+    target = SimpleNamespace(target_type="bigquery", config={"dataset": "analytics"})
+    assert target_connection_authority_is_provable(target, _connection(config={})) is False
+    assert target_connection_authority_is_provable(
+        SimpleNamespace(target_type="bigquery", config={}),
+        _connection("postgresql", config={}),
+    ) is False

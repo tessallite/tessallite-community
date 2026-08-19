@@ -8,6 +8,12 @@ export interface AggregateROI {
   hit_count: number;
   storage_bytes: number | null;
   agg_row_count: number | null;
+  /** F-009-04: the create-slot ranker's net $/day quantity — authoritative for
+   *  keep/retire. null when it cannot be computed (no source row count). */
+  net_value_per_day: number | null;
+  /** Hits per MB — a space-utilisation ratio, not dollars. */
+  storage_efficiency: number;
+  /** Legacy alias of storage_efficiency, retained for backward compatibility. */
   roi_score: number;
 }
 
@@ -17,6 +23,7 @@ export interface ROISummaryItem {
   aggregate_count: number;
   total_hit_count: number;
   total_storage_bytes: number;
+  top_net_value_per_day: number | null;
   top_roi_score: number;
 }
 
@@ -27,6 +34,8 @@ export interface ProfiledColumn {
   column_name: string;
   data_type: string;
   is_nullable: boolean;
+  /** PRIMARY KEY membership from the source catalogue (Bug-8618). */
+  is_primary_key?: boolean;
   approx_distinct: number | null;
   cardinality_ratio: number | null;
   suggested_role: "measure" | "dimension" | "time_dimension";
@@ -53,4 +62,3 @@ export interface ProfiledTable {
   cardinality_available?: boolean;
   columns: ProfiledColumn[];
 }
-

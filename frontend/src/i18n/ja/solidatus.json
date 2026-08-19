@@ -1,8 +1,10 @@
 {
+  "solidatus.activate": "アクティブ化",
   "solidatus.addConnection": "接続を追加",
   "solidatus.baseUrl": "ベースURL",
   "solidatus.breakdownHeading": "ノードタイプ別",
   "solidatus.baseUrlPlaceholder": "https://customer.solidatus.example.com",
+  "solidatus.deactivate": "非アクティブ化",
   "solidatus.delete": "削除",
   "solidatus.deleteFailed": "削除に失敗しました。",
   "solidatus.details": "詳細",

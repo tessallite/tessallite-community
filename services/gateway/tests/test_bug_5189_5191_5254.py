@@ -22,8 +22,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.dax import mdschema
 from src.dax.xmla_server import (
-    _extract_label_filter_specs,
     _label_filter_to_sql,
+    _translate_label_filter_calls,
 )
 
 
@@ -53,7 +53,7 @@ class TestBug5189PersonaMemberDiscovery:
                 "includes_hidden_columns": False,
                 "included_dimension_ids": [],
                 "included_measure_ids": [],
-            }
+            }, None
 
         async def fake_get_model_measures(model_id, tenant_slug, jwt_token, **kw):
             return [{"id": "m1", "name": "Revenue", "default_agg": "sum"}]
@@ -61,7 +61,7 @@ class TestBug5189PersonaMemberDiscovery:
         async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, **kw):
             return [{"id": "d1", "name": "Region", "source": "column"}]
 
-        async def fake_get_model_hierarchies(*, model_id, tenant_slug, jwt_token, **kw):
+        async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, **kw):
             return []
 
         async def fake_list_all_models(tenant_slug, jwt_token):
@@ -126,7 +126,7 @@ class TestBug5189PersonaMemberDiscovery:
         captured_persona_ids: list[str | None] = []
 
         async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
-            return "model-1", "project-1", None  # business base
+            return "model-1", "project-1", None, None  # business base
 
         async def fake_get_model_measures(model_id, tenant_slug, jwt_token, **kw):
             return [{"id": "m1", "name": "Revenue", "default_agg": "sum"}]
@@ -134,7 +134,7 @@ class TestBug5189PersonaMemberDiscovery:
         async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, **kw):
             return [{"id": "d1", "name": "Region", "source": "column"}]
 
-        async def fake_get_model_hierarchies(*, model_id, tenant_slug, jwt_token, **kw):
+        async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, **kw):
             return []
 
         async def fake_list_all_models(tenant_slug, jwt_token):
@@ -226,10 +226,11 @@ class TestBug5191LabelFilterRequery:
             'Filter([Product].[Product].Members, '
             'Left([Product].[Product].CurrentMember.Name, 3) = "Wid")'
         )
-        specs = _extract_label_filter_specs(
+        specs = _translate_label_filter_calls(
             axis, {"Product"},
             hierarchy_level_dim_map={},
             hierarchy_default_dim_map={},
+            quote_fn=lambda n: f'"{n}"',
         )
         assert len(specs) == 1
         assert specs[0].dim_ref == "Product"
@@ -264,7 +265,7 @@ class TestBug5191LabelFilterRequery:
         captured_sqls: list[str] = []
 
         async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
-            return "model-1", "project-1", None
+            return "model-1", "project-1", None, None
 
         async def fake_get_model_measures(model_id, tenant_slug, jwt_token, **kw):
             return [
@@ -276,7 +277,7 @@ class TestBug5191LabelFilterRequery:
                 {"id": "d1", "name": "Region"},
             ]
 
-        async def fake_get_model_hierarchies(*, model_id, tenant_slug, jwt_token, **kw):
+        async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, **kw):
             return []
 
         async def fake_execute_query(
@@ -330,276 +331,371 @@ FROM [m]
         method_el = xmla_server._find_method(root)
         assert method_el is not None
 
-        await xmla_server._handle_execute(
+        response = await xmla_server._handle_execute(
             method_el, tenant_slug="demo", jwt_token="tok",
             session_id="sid-test",
         )
 
-        # Check that at least one captured SQL (the re-query) contains the
-        # label filter LIKE clause. The main query is the first call; the
-        # re-query for AVG is subsequent.
-        requery_sqls = [s for s in captured_sqls if "AVG" in s.upper()]
-        if requery_sqls:
-            # When re-queries are triggered, they must include the label filter
-            assert any("LIKE" in s and "us" in s.lower() for s in requery_sqls), (
-                f"Re-query SQL must contain the label filter LIKE clause. "
-                f"Got: {requery_sqls}"
-            )
+        # Bug-8925 re-arm. This test used to guard its only real assertion
+        # behind `if requery_sqls:`, and on the pre-fix tip the Execute never
+        # reached execute_query at all — the axis audit rejected
+        # `[Region].[Region].CurrentMember` inside the label filter — so the
+        # body never ran and the fault went unnoticed. Every step is now a hard
+        # assertion.
+        body = response.body.decode("utf-8", "replace")
+        assert "Fault" not in body, (
+            f"_handle_execute returned a SOAP Fault instead of a result: {body}"
+        )
+        assert captured_sqls, "Execute never reached execute_query"
+        # The MAIN detail query is the first call and must carry the filter.
+        assert "LIKE" in captured_sqls[0] and "us" in captured_sqls[0].lower(), (
+            f"Main SQL must carry the label filter LIKE clause. "
+            f"Got: {captured_sqls[0]}"
+        )
+        # Every SUBSEQUENT call is a re-query. They are checked separately from
+        # the main query on purpose: the main query is itself an AVG query here,
+        # so an `"AVG" in s`-style filter would let the main query alone satisfy
+        # the assertion and mask a re-query that dropped the label filter.
+        requery_sqls = captured_sqls[1:]
+        assert requery_sqls, (
+            f"expected AVG/COUNT_DISTINCT re-query was not issued; "
+            f"captured={captured_sqls}"
+        )
+        assert all("AVG" in s.upper() for s in requery_sqls), (
+            f"expected the re-queries to be AVG aggregates; got {requery_sqls}"
+        )
+        assert all("LIKE" in s and "us" in s.lower() for s in requery_sqls), (
+            f"Every re-query SQL must contain the label filter LIKE clause. "
+            f"Got: {requery_sqls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_requery_failure_faults_not_blank(self, monkeypatch):
+        """F-002-03: when a REQUIRED custom-group AVG/COUNT_DISTINCT re-query
+        fails for a non-resource reason, the Execute must fail CLOSED (SOAP
+        Fault), never render the swallowed None as a legitimately-blank cell
+        (which looks like real no-data while the leaf rows look fine)."""
+        from src.dax import xmla_server
+        from defusedxml import ElementTree as ET
+
+        async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
+            return "model-1", "project-1", None, None
+
+        async def fake_get_model_measures(model_id, tenant_slug, jwt_token, **kw):
+            return [{"id": "m1", "name": "Sales", "default_agg": "avg"}]
+
+        async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, **kw):
+            return [{"id": "d1", "name": "Region"}]
+
+        async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, **kw):
+            return []
+
+        calls = {"n": 0}
+
+        async def fake_execute_query(sql, model_id, tenant_slug, jwt_token,
+                                     protocol="dax", **_kwargs):
+            calls["n"] += 1
+            # First call = main query (leaf rows look fine). Any subsequent
+            # call is the required AVG re-query -> raise a transient failure.
+            if "AVG" in sql.upper():
+                raise RuntimeError("transient source failure")
+            return {
+                "columns": ["Region", "Sales"],
+                "rows": [
+                    {"Region": "US-East", "Sales": 100},
+                    {"Region": "US-West", "Sales": 200},
+                ],
+            }
+
+        monkeypatch.setattr(xmla_server, "_resolve_model_id", fake_resolve_model_id)
+        monkeypatch.setattr(xmla_server, "get_model_measures", fake_get_model_measures)
+        monkeypatch.setattr(xmla_server, "get_model_dimensions", fake_get_model_dimensions)
+        monkeypatch.setattr(xmla_server, "get_model_hierarchies", fake_get_model_hierarchies)
+        monkeypatch.setattr(xmla_server, "execute_query", fake_execute_query)
+
+        execute_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <Execute xmlns="urn:schemas-microsoft-com:xml-analysis">
+      <Command>
+        <Statement>
+WITH MEMBER [Region].[Region].[Custom Group] AS
+  AGGREGATE({[Region].[Region].[US-East], [Region].[Region].[US-West]})
+SELECT
+  {[Region].[Region].Members} ON ROWS,
+  {[Measures].[Sales]} ON COLUMNS
+FROM [m]
+        </Statement>
+      </Command>
+      <Properties>
+        <PropertyList><Catalog>m</Catalog></PropertyList>
+      </Properties>
+    </Execute>
+  </soap:Body>
+</soap:Envelope>"""
+
+        root = ET.fromstring(execute_xml)
+        method_el = xmla_server._find_method(root)
+        resp = await xmla_server._handle_execute(
+            method_el, tenant_slug="demo", jwt_token="tok", session_id="sid-fail",
+        )
+        body = resp.body.decode() if isinstance(resp.body, bytes) else str(resp.body)
+        # A re-query WAS attempted and failed -> the response must be a fault,
+        # not a normal result carrying a blank custom-group cell.
+        assert "Fault" in body or "faultstring" in body, (
+            f"Re-query failure must fail closed with a SOAP Fault. Got: {body[:500]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_requery_resource_limit_faults_not_blank(self, monkeypatch):
+        """R1 finding 1: a resource-limit exception on a required re-query must
+        also fail CLOSED. Previously it re-raised out of _gather_bounded into the
+        block-level swallow, leaving the fault list empty and rendering anyway."""
+        from src.dax import xmla_server
+        from src.router_client import QueryByteCeilingExceeded
+        from defusedxml import ElementTree as ET
+
+        async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
+            return "model-1", "project-1", None, None
+
+        async def fake_get_model_measures(model_id, tenant_slug, jwt_token, **kw):
+            return [{"id": "m1", "name": "Sales", "default_agg": "avg"}]
+
+        async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, **kw):
+            return [{"id": "d1", "name": "Region"}]
+
+        async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, **kw):
+            return []
+
+        async def fake_execute_query(sql, model_id, tenant_slug, jwt_token,
+                                     protocol="dax", **_kwargs):
+            if "AVG" in sql.upper():
+                raise QueryByteCeilingExceeded(response_bytes=10 ** 9, ceiling=1)
+            return {
+                "columns": ["Region", "Sales"],
+                "rows": [
+                    {"Region": "US-East", "Sales": 100},
+                    {"Region": "US-West", "Sales": 200},
+                ],
+            }
+
+        monkeypatch.setattr(xmla_server, "_resolve_model_id", fake_resolve_model_id)
+        monkeypatch.setattr(xmla_server, "get_model_measures", fake_get_model_measures)
+        monkeypatch.setattr(xmla_server, "get_model_dimensions", fake_get_model_dimensions)
+        monkeypatch.setattr(xmla_server, "get_model_hierarchies", fake_get_model_hierarchies)
+        monkeypatch.setattr(xmla_server, "execute_query", fake_execute_query)
+
+        execute_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <Execute xmlns="urn:schemas-microsoft-com:xml-analysis">
+      <Command>
+        <Statement>
+WITH MEMBER [Region].[Region].[Custom Group] AS
+  AGGREGATE({[Region].[Region].[US-East], [Region].[Region].[US-West]})
+SELECT
+  {[Region].[Region].Members} ON ROWS,
+  {[Measures].[Sales]} ON COLUMNS
+FROM [m]
+        </Statement>
+      </Command>
+      <Properties>
+        <PropertyList><Catalog>m</Catalog></PropertyList>
+      </Properties>
+    </Execute>
+  </soap:Body>
+</soap:Envelope>"""
+
+        root = ET.fromstring(execute_xml)
+        method_el = xmla_server._find_method(root)
+        resp = await xmla_server._handle_execute(
+            method_el, tenant_slug="demo", jwt_token="tok", session_id="sid-rl",
+        )
+        body = resp.body.decode() if isinstance(resp.body, bytes) else str(resp.body)
+        assert "Fault" in body or "faultstring" in body, (
+            f"Resource-limit re-query failure must fail closed. Got: {body[:500]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_requery_sql_builder_exception_faults_not_blank(self, monkeypatch):
+        """R2 observation: a re-query SQL-BUILDER exception (raised inside
+        _exec_one's try, not from execute_query) must also fail closed via the
+        _FAIL sentinel, never render a blank cell."""
+        from src.dax import xmla_server
+        from src.dax import mdx_calc_members
+        from defusedxml import ElementTree as ET
+
+        async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
+            return "model-1", "project-1", None, None
+
+        async def fake_get_model_measures(model_id, tenant_slug, jwt_token, **kw):
+            return [{"id": "m1", "name": "Sales", "default_agg": "avg"}]
+
+        async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, **kw):
+            return [{"id": "d1", "name": "Region"}]
+
+        async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, **kw):
+            return []
+
+        async def fake_execute_query(sql, model_id, tenant_slug, jwt_token,
+                                     protocol="dax", **_kwargs):
+            return {
+                "columns": ["Region", "Sales"],
+                "rows": [
+                    {"Region": "US-East", "Sales": 100},
+                    {"Region": "US-West", "Sales": 200},
+                ],
+            }
+
+        def boom(_spec):
+            raise RuntimeError("SQL builder blew up")
+
+        monkeypatch.setattr(xmla_server, "_resolve_model_id", fake_resolve_model_id)
+        monkeypatch.setattr(xmla_server, "get_model_measures", fake_get_model_measures)
+        monkeypatch.setattr(xmla_server, "get_model_dimensions", fake_get_model_dimensions)
+        monkeypatch.setattr(xmla_server, "get_model_hierarchies", fake_get_model_hierarchies)
+        monkeypatch.setattr(xmla_server, "execute_query", fake_execute_query)
+        # Force the aggregate-set re-query SQL builder to raise.
+        monkeypatch.setattr(mdx_calc_members, "build_requery_sql", boom)
+
+        execute_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <Execute xmlns="urn:schemas-microsoft-com:xml-analysis">
+      <Command>
+        <Statement>
+WITH MEMBER [Region].[Region].[Custom Group] AS
+  AGGREGATE({[Region].[Region].[US-East], [Region].[Region].[US-West]})
+SELECT
+  {[Region].[Region].Members} ON ROWS,
+  {[Measures].[Sales]} ON COLUMNS
+FROM [m]
+        </Statement>
+      </Command>
+      <Properties>
+        <PropertyList><Catalog>m</Catalog></PropertyList>
+      </Properties>
+    </Execute>
+  </soap:Body>
+</soap:Envelope>"""
+
+        root = ET.fromstring(execute_xml)
+        method_el = xmla_server._find_method(root)
+        resp = await xmla_server._handle_execute(
+            method_el, tenant_slug="demo", jwt_token="tok", session_id="sid-build",
+        )
+        body = resp.body.decode() if isinstance(resp.body, bytes) else str(resp.body)
+        assert "Fault" in body or "faultstring" in body, (
+            f"Builder exception must fail closed with a SOAP Fault. Got: {body[:500]}"
+        )
+
+
 
 
 # ============================================================================
-# Bug-5254: KPI status expression derived from bands
+# Bug-6608: KPI status serves the RAW value + annotation (no gateway band verdict)
 # ============================================================================
 
 
-class TestBug5254KpiBandStatus:
-    """Verify that MDSCHEMA_KPIS status expressions use presentation_meta.bands
-    when available, rather than hardcoded 90%/110% thresholds."""
+class TestBug6608KpiRawStatus:
+    """The gateway must NOT replicate the KPI band/direction matrix. KPI_STATUS
+    serves the modeller-authored status expression, else (Bug-8288) the synthetic
+    GOVERNED status member the Execute path resolves to the -1/0/1 verdict; never a
+    gateway CASE verdict. The authored band context is still published as an
+    annotation."""
 
     CATALOG = "sales_model"
-    MEASURES = [
-        {"id": "m1", "name": "Revenue", "default_agg": "sum"},
-    ]
+    MEASURES = [{"id": "m1", "name": "Revenue", "default_agg": "sum"}]
 
-    def _make_v2_kpi(
-        self,
-        *,
-        direction="higher_is_better",
-        presentation_meta=None,
-        target_value=100,
-    ):
+    def _v2_kpi(self, *, direction="higher_is_better", presentation_meta=None):
         return {
-            "id": "k1",
-            "name": "test_kpi",
-            "display_name": "Test KPI",
-            "description": "",
-            "display_folder": "",
+            "id": "k1", "name": "test_kpi", "display_name": "Test KPI",
+            "description": "", "display_folder": "",
             "expression": 'measure("Revenue")',
-            "target_type": "static",
-            "target_value": target_value,
-            "target_expression": None,
-            "status_expression": "",
-            "trend_expression": "",
-            "weight": None,
-            "parent_kpi_id": None,
-            "presentation_type": "gauge",
-            "value_measure_id": None,
-            "goal_measure_id": None,
-            "direction": direction,
+            "target_type": "static", "target_value": 100,
+            "target_expression": None, "status_expression": "",
+            "trend_expression": "", "weight": None, "parent_kpi_id": None,
+            "presentation_type": "gauge", "value_measure_id": None,
+            "goal_measure_id": None, "direction": direction,
             "presentation_meta": presentation_meta,
         }
 
-    def test_bands_produce_threshold_based_expression(self):
-        """When presentation_meta.bands are provided, the status expression
-        should use band boundaries, not the hardcoded 0.9/1.1 thresholds."""
-        kpi = self._make_v2_kpi(
-            direction="higher_is_better",
-            presentation_meta={
-                "evaluation_type": "absolute_value",
-                "bands": [
-                    {"label": "Off Target", "color": "#D32F2F", "min": None, "max": 60},
-                    {"label": "Near Target", "color": "#F57C00", "min": 60, "max": 90},
-                    {"label": "On Track", "color": "#388E3C", "min": 90, "max": None},
-                ],
-            },
-        )
-        rows = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)
-        status = rows[0]["KPI_STATUS"]
-        # Must reference the actual band thresholds (60, 90), not 0.9/1.1
-        assert "60" in status
-        assert "90" in status
-        # Must NOT contain the old hardcoded multipliers
-        assert "* 0.9" not in status
-        assert "* 1.1" not in status
+    _BANDS_META = {
+        "evaluation_type": "percentage_of_target",
+        "bands": [
+            {"label": "Off Target", "color": "#D32F2F", "min": None, "max": 0.80},
+            {"label": "Near Target", "color": "#F57C00", "min": 0.80, "max": 1.00},
+            {"label": "On Track", "color": "#388E3C", "min": 1.00, "max": None},
+        ],
+    }
 
-    def test_bands_status_maps_to_correct_rag_values(self):
-        """Band colours map to correct -1/0/1 status values: red=-1,
-        orange/amber=0, green=1."""
-        kpi = self._make_v2_kpi(
-            presentation_meta={
-                "evaluation_type": "absolute_value",
-                "bands": [
-                    {"label": "Off Target", "color": "#D32F2F", "min": None, "max": 50},
-                    {"label": "Near Target", "color": "#F57C00", "min": 50, "max": 80},
-                    {"label": "On Track", "color": "#388E3C", "min": 80, "max": None},
-                ],
-            },
-        )
-        rows = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)
-        status = rows[0]["KPI_STATUS"]
-        # Red band (< 50) -> -1
-        assert "THEN -1" in status
-        # Orange band (50..80) -> 0
-        assert "THEN 0" in status
-        # Green band (>= 80) -> 1
-        assert "THEN 1" in status
+    def test_expression_kpi_status_is_governed_member_not_case(self):
+        kpi = self._v2_kpi(presentation_meta=self._BANDS_META)
+        row = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)[0]
+        # Bug-8288: status is the synthetic GOVERNED status member (verdict basis
+        # via bands/target), NEVER a gateway band CASE verdict and NEVER the raw
+        # value member (which would show a business number under a -1/0/1 icon).
+        assert row["KPI_STATUS"] == "[Measures].[Test KPI Status]"
+        assert row["KPI_STATUS"] != row["KPI_VALUE"]
+        assert not row["KPI_STATUS"].upper().startswith("CASE")
 
-    def test_ratio_based_bands_use_percentage_expression(self):
-        """For percentage_of_target evaluation, the expression should divide
-        value by goal and multiply by 100."""
-        kpi = self._make_v2_kpi(
-            presentation_meta={
-                "evaluation_type": "percentage_of_target",
-                "bands": [
-                    {"label": "Off Target", "color": "#D32F2F", "min": None, "max": 80},
-                    {"label": "Near Target", "color": "#F57C00", "min": 80, "max": 100},
-                    {"label": "On Track", "color": "#388E3C", "min": 100, "max": None},
-                ],
-            },
-        )
-        rows = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)
-        status = rows[0]["KPI_STATUS"]
-        # Must contain the percentage-of-target ratio expression
-        assert "/ 100 * 100" in status or "* 100" in status
-
-    def test_no_bands_falls_back_to_direction_heuristic(self):
-        """When no bands are in presentation_meta, the old direction-based
-        heuristic is used (but this is still a valid CASE expression)."""
-        kpi = self._make_v2_kpi(
-            direction="higher_is_better",
-            presentation_meta=None,
-        )
-        rows = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)
-        status = rows[0]["KPI_STATUS"]
-        assert status.startswith("CASE WHEN")
-        # Fallback uses the 0.9 multiplier
-        assert "* 0.9" in status
-
-    def test_lower_is_better_fallback(self):
-        """For lower_is_better without bands, the 1.1 heuristic is used."""
-        kpi = self._make_v2_kpi(
-            direction="lower_is_better",
-            presentation_meta=None,
-        )
-        rows = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)
-        status = rows[0]["KPI_STATUS"]
-        assert "* 1.1" in status
-
-    def test_legacy_status_expression_preserved(self):
-        """A legacy KPI with an explicit status_expression must use that
-        expression verbatim, not the band-derived one."""
+    def test_legacy_kpi_status_is_governed_member(self):
         kpi = {
-            "id": "k1",
-            "name": "legacy",
-            "display_name": "Legacy",
-            "description": "",
-            "display_folder": "",
-            "expression": "",
-            "value_measure_id": "m1",
-            "goal_measure_id": "m1",
-            "status_expression": "IIF(KpiValue > KpiGoal, 1, -1)",
-            "trend_expression": "",
-            "weight": None,
-            "parent_kpi_id": None,
-            "presentation_type": None,
-            "presentation_meta": {
-                "bands": [
-                    {"label": "Bad", "color": "#D32F2F", "min": None, "max": 50},
-                    {"label": "Good", "color": "#388E3C", "min": 50, "max": None},
-                ],
-            },
+            "id": "k1", "name": "legacy", "display_name": "Legacy",
+            "description": "", "display_folder": "", "expression": "",
+            "value_measure_id": "m1", "goal_measure_id": "m1",
+            "status_expression": "", "trend_expression": "", "weight": None,
+            "parent_kpi_id": None, "presentation_type": None,
+            "direction": "higher_is_better", "presentation_meta": self._BANDS_META,
         }
-        rows = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)
-        assert rows[0]["KPI_STATUS"] == "IIF(KpiValue > KpiGoal, 1, -1)"
+        row = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)[0]
+        # Bug-8288: legacy KPI with a goal basis advertises the synthetic governed
+        # status member, not the raw value member or a CASE verdict.
+        assert row["KPI_STATUS"] == "[Measures].[Legacy Status]"
+        assert not row["KPI_STATUS"].upper().startswith("CASE")
 
-    def test_empty_bands_list_uses_fallback(self):
-        """An empty bands list should fall back to direction heuristic."""
-        kpi = self._make_v2_kpi(
-            presentation_meta={"bands": [], "evaluation_type": "absolute_value"},
-        )
-        rows = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)
-        status = rows[0]["KPI_STATUS"]
-        assert status.startswith("CASE WHEN")
+    def test_authored_status_expression_preserved_verbatim(self):
+        kpi = self._v2_kpi(presentation_meta=self._BANDS_META)
+        kpi["status_expression"] = "IIF(KpiValue > KpiGoal, 1, -1)"
+        row = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)[0]
+        assert row["KPI_STATUS"] == "IIF(KpiValue > KpiGoal, 1, -1)"
 
-    def test_single_band_uses_fallback(self):
-        """A single band (fewer than 2) should fall back to direction heuristic."""
-        kpi = self._make_v2_kpi(
-            presentation_meta={
-                "bands": [{"label": "On Track", "color": "#388E3C", "min": None, "max": None}],
-                "evaluation_type": "absolute_value",
-            },
-        )
-        rows = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)
-        status = rows[0]["KPI_STATUS"]
-        assert status.startswith("CASE WHEN")
+    def test_band_context_published_as_annotation(self):
+        kpi = self._v2_kpi(presentation_meta=self._BANDS_META)
+        row = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)[0]
+        annotation = row["ANNOTATIONS"]
+        assert annotation, "band context must be published for banded KPIs"
+        # Bug-6608 un-gated: the status is now the governed traffic-light verdict;
+        # the annotation is informational band context (labels + direction).
+        assert "governed traffic-light" in annotation.lower()
+        assert "On Track" in annotation
+        assert "higher is better" in annotation
+        # And it is also folded into the KPI description tooltip.
+        assert annotation in row["KPI_DESCRIPTION"]
 
-    def test_custom_four_band_kpi(self):
-        """A KPI with 4 custom bands should produce a CASE with the correct
-        number of WHEN clauses."""
-        kpi = self._make_v2_kpi(
-            presentation_meta={
-                "evaluation_type": "absolute_value",
-                "bands": [
-                    {"label": "Critical", "color": "#D32F2F", "min": None, "max": 25},
-                    {"label": "Low", "color": "#F57C00", "min": 25, "max": 50},
-                    {"label": "Medium", "color": "#FBC02D", "min": 50, "max": 75},
-                    {"label": "High", "color": "#388E3C", "min": 75, "max": None},
-                ],
-            },
-        )
-        rows = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)
-        status = rows[0]["KPI_STATUS"]
-        assert status.startswith("CASE")
-        # Should have WHEN clauses for all 4 bands
-        assert status.count("WHEN") == 4
+    def test_band_context_kpi_graphic_restored_with_governed_member(self):
+        # Bug-8288: KPI_STATUS is now the synthetic GOVERNED status member (which
+        # the Execute path resolves to the -1/0/1 verdict), so the status graphic is
+        # advertised again over that real verdict domain (previously suppressed
+        # because the member was the raw value).
+        kpi = self._v2_kpi(presentation_meta=self._BANDS_META)
+        row = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)[0]
+        assert row["KPI_STATUS"] == "[Measures].[Test KPI Status]"
+        assert row["KPI_STATUS_GRAPHIC"] == "Gauge"
 
+    def test_no_bands_still_governed_via_target_basis(self):
+        # No direction and no bands -> no informational annotation. But the KPI
+        # still has a static target (verdict basis), so KPI_STATUS is the governed
+        # synthetic member (not the raw value), and the graphic is advertised.
+        kpi = self._v2_kpi(direction="", presentation_meta=None)
+        row = mdschema._rows_kpis(self.CATALOG, [kpi], self.MEASURES)[0]
+        assert row["ANNOTATIONS"] == ""
+        assert row["KPI_STATUS"] == "[Measures].[Test KPI Status]"
+        assert row["KPI_STATUS_GRAPHIC"] == "Gauge"
 
-class TestBuildKpiStatusExpression:
-    """Direct unit tests for the _build_kpi_status_expression helper."""
+    def test_annotation_builder_empty_without_context(self):
+        assert mdschema._build_kpi_band_annotation({}) == ""
 
-    def test_absolute_value_three_bands(self):
-        expr = mdschema._build_kpi_status_expression(
-            "[Measures].[KPI Value]", "100",
-            bands=[
-                {"label": "Off Target", "color": "#D32F2F", "min": None, "max": 80},
-                {"label": "Near Target", "color": "#F57C00", "min": 80, "max": 100},
-                {"label": "On Track", "color": "#388E3C", "min": 100, "max": None},
-            ],
-            evaluation_type="absolute_value",
-        )
-        assert "CASE" in expr
-        assert "80" in expr
-        assert "100" in expr
-        # Red -> -1, Orange -> 0, Green -> 1
-        assert "THEN -1" in expr
-        assert "THEN 0" in expr
-        assert "THEN 1" in expr
-
-    def test_percentage_of_target_uses_ratio(self):
-        expr = mdschema._build_kpi_status_expression(
-            "[Measures].[V]", "[Measures].[G]",
-            bands=[
-                {"label": "Bad", "color": "#D32F2F", "min": None, "max": 80},
-                {"label": "OK", "color": "#F57C00", "min": 80, "max": 100},
-                {"label": "Good", "color": "#388E3C", "min": 100, "max": None},
-            ],
-            evaluation_type="percentage_of_target",
-        )
-        # Must use value/goal*100 ratio
-        assert "[Measures].[V] / [Measures].[G] * 100" in expr
-
-    def test_no_bands_higher_is_better(self):
-        expr = mdschema._build_kpi_status_expression(
-            "[Measures].[V]", "[Measures].[G]",
-            bands=None,
-            direction="higher_is_better",
-        )
-        assert "* 0.9" in expr
-        assert "THEN 1" in expr
-
-    def test_no_bands_lower_is_better(self):
-        expr = mdschema._build_kpi_status_expression(
-            "[Measures].[V]", "[Measures].[G]",
-            bands=None,
-            direction="lower_is_better",
-        )
-        assert "* 1.1" in expr
-
-    def test_band_status_from_color(self):
-        """Known RAG colours should map to correct status values."""
-        assert mdschema._band_status_from_color("#D32F2F") == -1  # red
-        assert mdschema._band_status_from_color("#F57C00") == 0   # orange
-        assert mdschema._band_status_from_color("#388E3C") == 1   # green
-        assert mdschema._band_status_from_color("#1565C0") == 1   # blue
-        assert mdschema._band_status_from_color("#757575") == -1  # grey (bad)
-        assert mdschema._band_status_from_color("#UNKNOWN") is None
+    # The live governed KPIStatus path (−1/0/1 through the model-service /evaluate
+    # authority) is covered in test_kpi_member_functions.py::
+    # test_live_status_is_governed_minus_one_zero_one and siblings.

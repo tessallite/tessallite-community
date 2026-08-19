@@ -12,9 +12,92 @@ from itertools import product
 
 from shared.config.bootstrap import system_snapshot_get
 from shared.schemas.measure_formats import format_token_to_mdx
-from src.dax.mdx_calc_members import parse_calc_members, evaluate_calc_members
+from src.dax.mdx_calc_members import (
+    BLANK_MEMBER,
+    parse_calc_members,
+    evaluate_calc_members,
+)
 
 logger = logging.getLogger(__name__)
+
+# Bug-6659: the companion result column that carries a dimension member's CAPTION
+# (from the dimension's display_column_name) alongside its key. The translated
+# SQL (xmla_server._mdx_to_sql) projects the display column under this alias; the
+# Execute axis builder reads it to emit UName=key, Caption=caption. Producer and
+# consumer MUST use this one helper so the alias matches end to end.
+_MEMBER_CAPTION_SUFFIX = "__caption"
+
+
+def _member_caption_col(dim_name: str) -> str:
+    """Return the companion caption-column alias for a dimension (Bug-6659)."""
+    return f"{dim_name}{_MEMBER_CAPTION_SUFFIX}"
+
+
+def _normalize_member_captions(
+    members: list[dict[str, Any]],
+    measure_caption_map: dict[str, str],
+    member_caption_lookup: dict[str, dict[str, str]],
+) -> None:
+    """Rewrite Execute axis captions to the field-list friendly labels (F-002-05).
+
+    - Measure members (``hierarchy == "[Measures]"``): caption <- display_name
+      (Bug-6657). The UName (and parallel ``name``) keep the internal measure
+      name; cell resolution MUST read that, not caption (F-002-01 / F-103-01).
+    - Dimension members: caption <- the display-column value for the member's key
+      (Bug-6659). The dim_col is read from the member's ``lname`` (``[hier].[dc]``)
+      so only members of a dimension that declared a display column are remapped;
+      the key stays the UName. Missing captions leave the existing key caption.
+    """
+    for m in members:
+        hier = m.get("hierarchy", "")
+        if hier == "[Measures]":
+            # Map key is the internal name (UName / parallel ``name``). Caption
+            # is rewritten for the axis label only (Bug-6657); cell lookup
+            # must not use the rewritten caption (F-002-01 / F-103-01).
+            internal = m.get("name") or m.get("caption")
+            if internal and internal in measure_caption_map:
+                m["caption"] = measure_caption_map[internal]
+            continue
+        if not member_caption_lookup:
+            continue
+        # Resolve the dim_col from lname = "[hier].[dc]".
+        lname = m.get("lname", "")
+        lm = re.search(r'\.\[((?:[^\]]|\]\])+)\]\s*$', lname)
+        dc = lm.group(1).replace("]]", "]") if lm else ""
+        lut = member_caption_lookup.get(dc)
+        if not lut:
+            continue
+        key = m.get("key", m.get("caption"))
+        if key is not None and str(key) in lut:
+            m["caption"] = lut[str(key)]
+
+
+def _internal_measure_name(member: dict[str, Any]) -> str:
+    """SQL-column / format_map key for a Measures axis member (F-002-01).
+
+    After Bug-6657, ``caption`` is the field-list display_name and is an axis
+    label only. Cell lookup stays on the internal name stored in UName
+    (``[Measures].[base_amount]``) or the parallel ``name`` field. Never use
+    caption as a result-column key — that is how live pivots emitted
+    ``xsi:nil`` while JDBC/SPA returned numbers (F-103-01 / Bug-9232).
+    """
+    uname = str(member.get("uname") or "")
+    names = _extract_measure_names(uname)
+    if names:
+        return names[0]
+    explicit = member.get("name")
+    if explicit:
+        return str(explicit)
+    return ""
+
+
+def _escape_mdx_bracket(name: str) -> str:
+    """Escape ``]`` inside an MDX bracketed identifier by doubling it.
+
+    Bug-6717: aligned with ``mdschema._escape_mdx_bracket`` and the
+    excel-plugin's ``escapeMdxBracketContent`` helper.
+    """
+    return name.replace("]", "]]")
 
 
 def _escape_xml(text: str) -> str:
@@ -62,21 +145,76 @@ def _format_cell_value(value, fmt_str: str | None) -> str | None:
     s = s.split(";", 1)[0].strip()
     if not s:
         return None
-    # decimals = count of 0/# after the first '.'; thousands = ',' in integer part.
-    int_part, _, frac_part = s.partition(".")
-    decimals = sum(1 for c in frac_part if c in "0#")
-    thousands = "," in int_part
     if s.endswith("%"):
+        # decimals/thousands read from the numeric core (drop the trailing '%').
+        core = s[:-1]
+        int_part, _, frac_part = core.partition(".")
+        decimals = sum(1 for c in frac_part if c in "0#")
+        thousands = "," in int_part
         return (f"{v * 100:,.{decimals}f}%" if thousands
                 else f"{v * 100:.{decimals}f}%")
-    prefix = s[0] if s[:1] in ("$", "€", "£") else ""
+    # Bug-6070: currency is not always a leading '$'. Locate the numeric core
+    # (the run of #/0 with optional grouping/decimal marks) and preserve ANY
+    # currency literal that sits BEFORE it (e.g. ``$#,##0.00``, ``€#,##0``) OR
+    # AFTER it (suffix currencies: ``#,##0.00 €``, ``#,##0.00 kr``,
+    # ``#,##0 zł``). The previous code only recognised a leading $/€/£ and
+    # dropped every suffix symbol; it also let suffix text pollute the decimal
+    # count. Currency symbol for the named "Currency" format stays "$" (the
+    # en-US .NET default) because no connection locale is available here.
+    # The numeric core is a run of #/0 with optional grouping and an optional
+    # fractional part, OR a leading-dot fraction (``.00``) with no integer digit.
+    core_match = re.search(r"[#0][#0,]*(?:\.[#0]+)?|\.[#0]+", s)
+    if not core_match:
+        return None
+    core = core_match.group(0)
+    int_part, _, frac_part = core.partition(".")
+    decimals = sum(1 for c in frac_part if c in "0#")
+    thousands = "," in int_part
+
+    def _literal_text(fragment: str) -> str:
+        # .NET custom format strings wrap literal text in single/double quotes
+        # or escape one character with a backslash; strip those so only the
+        # visible currency/symbol text remains.
+        return re.sub(r"[\\\"']", "", fragment)
+
+    prefix = _literal_text(s[:core_match.start()])
+    suffix = _literal_text(s[core_match.end():])
     body = f"{v:,.{decimals}f}" if thousands else f"{v:.{decimals}f}"
-    return f"{prefix}{body}"
+    return f"{prefix}{body}{suffix}"
 
 
 # ---------------------------------------------------------------------------
 # KPI member-function resolution (Bug-3657)
 # ---------------------------------------------------------------------------
+
+def _kpi_single_measure_from_expression(expression: str | None) -> str:
+    """Return the single measure name a KPI value expression reduces to, else "".
+
+    Bug-6702: v2 expression KPIs carry no ``value_measure_id`` — their value is
+    defined by ``expression``. When the WHOLE expression is exactly one bare
+    measure reference (``measure("X")`` / ``measure('X')``, optionally wrapped in
+    surrounding whitespace or parentheses) the KPI value IS that measure, and the
+    executable XMLA member is ``[Measures].[X]``. Any additional operator,
+    literal, function wrapper (e.g. ``safe_div(...)``), or second measure makes
+    the expression COMPOSITE — it has no single executable measure member on the
+    XMLA surface, so this returns "" and the caller advertises no value member
+    (rather than a member Execute cannot resolve). The live acme-demo ``Net
+    Revenue`` KPI is ``measure("net_amount")`` — the single-measure case.
+    """
+    text = (expression or "").strip()
+    if not text:
+        return ""
+    # Peel a single layer of wrapping parentheses at a time, e.g. `(measure("X"))`.
+    while text.startswith("(") and text.endswith(")"):
+        inner = text[1:-1].strip()
+        if not inner:
+            break
+        text = inner
+    m = re.fullmatch(r'measure\(\s*"([^"]+)"\s*\)', text, re.IGNORECASE)
+    if m is None:
+        m = re.fullmatch(r"measure\(\s*'([^']+)'\s*\)", text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
 
 def resolve_kpi_property_expr(
     kpi: dict[str, Any],
@@ -95,21 +233,28 @@ def resolve_kpi_property_expr(
     because its value measure is unresolved.
     """
     measure_map = {str(m.get("id", "")): m for m in measures_meta}
+    measure_names = {m.get("name", "") for m in measures_meta if m.get("name")}
 
     value_m = measure_map.get(str(kpi.get("value_measure_id", "")), {})
     value_name = value_m.get("name", "") if value_m else ""
-    kpi_value = f"[Measures].[{value_name}]" if value_name else ""
+    # Bug-6702: fall back to the KPI value EXPRESSION when there is no explicit
+    # value measure. A single-measure expression resolves to that measure's
+    # executable member; a composite expression stays "" (KPI value has no single
+    # XMLA-executable member). The resolved measure MUST exist in the executable
+    # `measures_meta` set so the advertised member and the Execute path agree.
+    if not value_name:
+        single = _kpi_single_measure_from_expression(kpi.get("expression"))
+        if single and single in measure_names:
+            value_name = single
+    kpi_value = f"[Measures].[{_escape_mdx_bracket(value_name)}]" if value_name else ""
 
-    # Goal: static literal, measure/expression target, or legacy goal measure.
-    target_type = kpi.get("target_type") or ""
-    target_value = kpi.get("target_value")
-    if target_type == "static" and target_value is not None:
-        kpi_goal = str(target_value)
-    elif target_type in ("measure", "expression"):
-        kpi_goal = kpi.get("target_expression") or ""
-    else:
-        goal_m = measure_map.get(str(kpi.get("goal_measure_id", "")), {})
-        kpi_goal = f"[Measures].[{goal_m.get('name', '')}]" if goal_m else ""
+    # Goal: static literal, measure target (by id), or legacy goal measure.
+    # Bug-6259/Bug-5695: shared resolver — a ``measure`` target renders as
+    # [Measures].[<name>]; an ``expression``/``prior_period`` DSL target is not
+    # executable MDX and resolves to "" (KPIGoal then reports undefined rather
+    # than advertising non-executable content).
+    from src.dax.mdschema import resolve_kpi_goal_mdx
+    kpi_goal = resolve_kpi_goal_mdx(kpi, measure_map)
 
     if prop == "KPIValue":
         if not kpi_value:
@@ -122,21 +267,17 @@ def resolve_kpi_property_expr(
         return kpi_goal or None
 
     if prop == "KPIStatus":
+        # Bug-6608 (un-gated 2026-07-21): the LIVE KPIStatus value is the governed
+        # −1/0/1 RAG verdict served by the model-service authority through the
+        # KPIStatus member-function interception in xmla_server (identical to the
+        # SPA scorecard and the Excel custom function). This resolver only supplies
+        # the ADDRESSABLE metadata member for MDSCHEMA_KPIS: an authored status
+        # expression verbatim, else the value member so native pivot clients have a
+        # member to bind. The verdict itself does not come from this string.
         legacy_status = kpi.get("status_expression") or ""
         if legacy_status:
             return legacy_status
-        if kpi_value and kpi_goal:
-            direction = kpi.get("direction") or "higher_is_better"
-            if direction == "lower_is_better":
-                return (
-                    f"CASE WHEN {kpi_value} <= {kpi_goal} THEN 1 "
-                    f"WHEN {kpi_value} <= {kpi_goal} * 1.1 THEN 0 ELSE -1 END"
-                )
-            return (
-                f"CASE WHEN {kpi_value} >= {kpi_goal} THEN 1 "
-                f"WHEN {kpi_value} >= {kpi_goal} * 0.9 THEN 0 ELSE -1 END"
-            )
-        return None
+        return kpi_value or None
 
     if prop == "KPITrend":
         return kpi.get("trend_expression") or None
@@ -154,7 +295,9 @@ def _meta_modified() -> str:
 # pivot's column/grand totals no longer reconciled with the source. Normalising
 # the value once — before any axis or cell building — keeps the axis member key,
 # the cell-matching key, and the subtotal grain key aligned on the same string.
-BLANK_MEMBER = "(blank)"
+# R2 finding 2: BLANK_MEMBER is the single source of truth in mdx_calc_members
+# (imported above) so the row rewrite here and the denominator re-query planner
+# there can never diverge.
 
 _MDDATASET_NS = "urn:schemas-microsoft-com:xml-analysis:mddataset"
 _XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
@@ -238,11 +381,51 @@ _EXECUTE_XSD = (
 )
 
 
+def _axis_dim_split(
+    mdx: str, dim_cols: list[str],
+) -> tuple[list[str], list[str]]:
+    """Split ``dim_cols`` into (row_axis_dims, col_axis_dims) by the axis each
+    dimension appears on in the MDX (Bug-8206).
+
+    A dim_col is on the COLUMN axis if its bracketed name ``[dc]`` occurs in the
+    ON COLUMNS axis expression, on the ROW axis if it occurs in the ON ROWS
+    expression. A dim absent from both (or ambiguous, appearing in neither) is
+    left out of both lists — the axis-total evaluator then fails closed for it.
+    Used only to scope % of Row/Column Total; other calc types ignore the split.
+    """
+    col_expr = _get_axis_expr(mdx, "COLUMNS")
+    row_expr = _get_axis_expr(mdx, "ROWS")
+    row_dims: list[str] = []
+    col_dims: list[str] = []
+    for dc in dim_cols:
+        token = f"[{_escape_mdx_bracket(dc)}]"
+        in_col = token in col_expr
+        in_row = token in row_expr
+        # Assign to exactly one axis; a name on both (unusual) is left unassigned
+        # so it is neither summed nor pinned ambiguously.
+        if in_col and not in_row:
+            col_dims.append(dc)
+        elif in_row and not in_col:
+            row_dims.append(dc)
+    return row_dims, col_dims
+
+
 def _get_axis_expr(mdx: str, axis_name: str) -> str:
     """Extract the raw expression for a specific axis from a multi-axis SELECT.
     Handles: SELECT <expr0> ON COLUMNS, <expr1> ON ROWS FROM ...
     Strips NON EMPTY prefix and Hierarchize/AddCalculatedMembers wrappers.
+
+    Bug-8770: the WITH prelude is stripped first (see
+    ``xmla_server._mdx_statement_body``) so a comma, SELECT token, or FROM
+    token inside a calc-member expression or bracketed caption cannot anchor
+    the axis extraction regex. Mirrors the identical fix Bug-8750 applied to
+    ``xmla_server._mdx_axis_expr``.
     """
+    # Bug-8770: normalise to the statement body (past the WITH prelude).
+    # Lazy import to break the circular xmla_server <-> mdx_execute dependency.
+    from src.dax.xmla_server import _mdx_statement_body
+    mdx = _mdx_statement_body(mdx)
+
     # Extract the full SELECT body (between SELECT and FROM)
     select_match = re.search(r'SELECT\s+(.+?)\s+FROM\s+\[', mdx, re.IGNORECASE | re.DOTALL)
     if not select_match:
@@ -278,7 +461,25 @@ def _get_axis_expr(mdx: str, axis_name: str) -> str:
 
 
 # A single measure reference: `[Measures].[m]` or `[Measures].m`.
-_MEASURE_REF = r'\[Measures\]\.(?:\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)'
+# Bug-6717: accept `]]` inside bracket bodies (MDX escaping of `]`).
+_MEASURE_REF = r'\[Measures\]\.(?:\[(?:[^\]]|\]\])+\]|[A-Za-z_][A-Za-z0-9_]*)'
+
+# Bug-6746: escape-aware bracket-body fragment for dimension/hierarchy/level
+# names. MDX escapes a literal ``]`` inside a bracket body by doubling it
+# (``]]``), so ``[^\]]+`` truncates any name that contains ``]``. ``_BB`` is a
+# CAPTURING group that accepts ``]]`` runs; ``_BBN`` is its non-capturing form
+# for use inside larger patterns where the body is not extracted. Re-emission
+# sites keep the captured (still-escaped) body inside ``[...]`` so the rebuilt
+# key stays consistent with emit-side keys; sites that compare a body against a
+# RAW model name unescape with :func:`_unbracket` first.
+_BB = r'((?:[^\]]|\]\])+)'
+_BBN = r'(?:[^\]]|\]\])+'
+
+
+def _unbracket(body: str) -> str:
+    """Unescape an MDX bracket body: ``]]`` -> ``]`` (Bug-6746)."""
+    return body.replace("]]", "]")
+
 
 _CMP_OP = r'(?:>=|<=|<>|>|<|=)'
 
@@ -635,7 +836,9 @@ def _extract_hierarchies(axis_expr: str) -> list[str]:
     axis_expr = _strip_predicate_measures(axis_expr)
 
     # Inner capture pattern for bracket contents like [(All)], [Continent], etc.
-    _BC = r'([^\]]+)'
+    # Bug-6746: escape-aware so a name containing ``]`` (written ``]]``) is
+    # captured whole rather than truncated.
+    _BC = _BB
 
     hierarchies: list[str] = []
     seen: set[str] = set()
@@ -657,7 +860,7 @@ def _extract_hierarchies(axis_expr: str) -> list[str]:
             seen.add(hier)
             hierarchies.append(hier)
 
-    for m in re.finditer(r'\[([^\]]+)\]\.\[([^\]]+)\]', axis_expr):
+    for m in re.finditer(rf'\[{_BB}\]\.\[{_BB}\]', axis_expr):
         dim = m.group(1).strip()
         name = m.group(2).strip()
 
@@ -702,7 +905,7 @@ def _extract_all_member_filters(axis_expr: str) -> dict[str, tuple[str, str]]:
     )
 
     result: dict[str, tuple[str, str]] = {}
-    bracket = r'([^\]]+)'
+    bracket = _BB  # Bug-6746: escape-aware bracket body
 
     # Form A — caption member or level: `[Dim].[Hier].[Member].func`.
     for m in re.finditer(
@@ -752,7 +955,7 @@ def _extract_currentmember_ascendants(axis_expr: str) -> dict[str, str]:
     """Extract Ascendants([Dim].[Hier].CurrentMember) references from an axis expression."""
     result: dict[str, str] = {}
     for m in re.finditer(
-        r'Ascendants\s*\(\s*\[([^\]]+)\]\.\[([^\]]+)\]\.currentmember\s*\)',
+        rf'Ascendants\s*\(\s*\[{_BB}\]\.\[{_BB}\]\.currentmember\s*\)',
         axis_expr,
         re.IGNORECASE,
     ):
@@ -770,7 +973,7 @@ def _extract_all_drilldown_members(axis_expr: str) -> dict[str, str]:
     """
     result: dict[str, str] = {}
     for m in re.finditer(
-        r'DrilldownLevel\s*\(\s*\{\s*\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\]\s*\}\s*\)',
+        rf'DrilldownLevel\s*\(\s*\{{\s*\[{_BB}\]\.\[{_BB}\]\.\[{_BB}\]\s*\}}\s*\)',
         axis_expr,
         re.IGNORECASE,
     ):
@@ -813,7 +1016,7 @@ def _extract_drilldown_member_expansions(axis_expr: str) -> dict[str, list[str]]
         members: list[str] = []
         hier = None
         for member_match in re.finditer(
-            r'\[([^\]]+)\]\.\[([^\]]+)\](?:\.\[([^\]]+)\])?((?:\.?\&\[[^\]]+\])+)?',
+            rf'\[{_BB}\]\.\[{_BB}\](?:\.\[{_BB}\])?((?:\.?\&\[[^\]]+\])+)?',
             member_list_str,
         ):
             dim = member_match.group(1).strip()
@@ -837,24 +1040,35 @@ def _extract_drilldown_member_expansions(axis_expr: str) -> dict[str, list[str]]
 
 
 def _parse_where_measure(mdx: str) -> str | None:
-    """Extract measure name from WHERE ([Measures].[MeasureName]) clause."""
-    match = re.search(r'WHERE\s*\(\s*\[Measures\]\.\[([^\]]+)\]', mdx, re.IGNORECASE)
+    """Extract measure name from WHERE ([Measures].[MeasureName]) clause.
+
+    Bug-6717: accepts ``]]`` inside bracket bodies and unescapes to the
+    raw technical name.
+    """
+    match = re.search(
+        r'WHERE\s*\(\s*\[Measures\]\.\[((?:[^\]]|\]\])+)\]', mdx, re.IGNORECASE,
+    )
     if match:
-        return match.group(1).strip()
+        return match.group(1).strip().replace("]]", "]")
     return None
 
 
 def _extract_measure_names(expr: str) -> list[str]:
     """Extract measure references from an axis expression.
     Supports both [Measures].[name] and [Measures].name forms.
+
+    Bug-6717: the bracket pattern accepts ``]]`` (escaped ``]``) inside
+    bracketed names and unescapes the captured content so the returned names
+    are the raw technical names suitable for model-metadata lookup.
     """
     names: list[str] = []
     for pattern in (
-        r'\[Measures\]\.\[([^\]]+)\]',
+        r'\[Measures\]\.\[((?:[^\]]|\]\])+)\]',
         r'\[Measures\]\.([A-Za-z_][A-Za-z0-9_]*)',
     ):
         for m in re.finditer(pattern, expr):
-            name = m.group(1).strip()
+            # Bug-6717: unescape ]] -> ] for model-metadata lookup
+            name = m.group(1).strip().replace("]]", "]")
             if name not in names:
                 names.append(name)
     return names
@@ -869,9 +1083,11 @@ def _parse_where_dimension_members(mdx: str) -> dict[str, str]:
     if not match:
         return filters
     where_expr = match.group(1)
-    for m in re.finditer(r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\]', where_expr):
-        dim = m.group(1).strip()
-        member = m.group(3).strip().strip("()")
+    for m in re.finditer(rf'\[{_BB}\]\.\[{_BB}\]\.\[{_BB}\]', where_expr):
+        # Bug-6746: dim is compared against raw model dimension names downstream
+        # (slicer resolution), so unescape ``]]`` -> ``]``.
+        dim = _unbracket(m.group(1).strip())
+        member = _unbracket(m.group(3).strip().strip("()"))
         if dim != "Measures" and dim not in filters:
             filters[dim] = member
     return filters
@@ -906,11 +1122,13 @@ def _hierarchy_data_levels(
     Returns an empty list when the hierarchy is unknown (the caller then makes
     no leaf claim and preserves existing behaviour).
     """
-    m = re.match(r'\[([^\]]+)\]\.\[([^\]]+)\]', hier)
+    m = re.match(rf'\[{_BB}\]\.\[{_BB}\]', hier)
     if not m:
         return []
-    dim_name = m.group(1).strip()
-    hier_name = m.group(2).strip()
+    # Bug-6746: compared against RAW model dim/hierarchy names below, so unescape
+    # ``]]`` -> ``]`` here.
+    dim_name = _unbracket(m.group(1).strip())
+    hier_name = _unbracket(m.group(2).strip())
 
     # 1. Defined hierarchy (multi-level) — match by hierarchy name.
     for h in hierarchy_defs or []:
@@ -999,6 +1217,36 @@ def _member_children_resolution(
     return "unknown"
 
 
+def _normalize_cube_timestamp(value: Any) -> str:
+    """Normalise a model refresh/schema timestamp to the CubeInfo string form.
+
+    Accepts ISO-8601 (``2026-07-15T09:30:00`` / with fractional seconds / ``Z``)
+    and returns ``YYYY-MM-DDTHH:MM:SS`` (xs:dateTime with the ``T`` separator).
+    The XSD declares LastDataUpdate/LastSchemaUpdate as ``xs:dateTime``, so the
+    ``T`` is required — MSOLAP rejects a space separator with a parse error.
+    Returns "" for an empty/unparseable value so the caller can fall back.
+    """
+    if not value:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    cleaned = s.replace(" ", "T")
+    # Drop fractional seconds.
+    cleaned = cleaned.split(".")[0]
+    # Drop any trailing timezone marker: a ``Z`` or a numeric ``+HH:MM`` /
+    # ``-HH:MM`` offset (a TIMESTAMPTZ .isoformat() with zero microseconds yields
+    # e.g. ``2026-07-01T08:30:00+00:00``). Only strip the offset AFTER the time,
+    # never the date's own hyphens.
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1]
+    else:
+        _m = re.search(r'[+-]\d{2}:?\d{2}$', cleaned)
+        if _m:
+            cleaned = cleaned[:_m.start()]
+    return cleaned.strip()
+
+
 def _build_olap_info(
     cube: str,
     col_hierarchies: list[str],
@@ -1008,20 +1256,32 @@ def _build_olap_info(
     dims: dict[str, Any],
     dim_props: list[str],
     minimal_excel_props: bool = False,
+    last_data_update: str | None = None,
 ) -> str:
     """Build the OlapInfo section of the MDDataSet response.
-    Order matches the MDDataSet schema: CubeInfo → AxesInfo → CellInfo."""
+    Order matches the MDDataSet schema: CubeInfo → AxesInfo → CellInfo.
+
+    ``last_data_update`` (F-002-10): the model's real data-refresh time
+    (``trust_meta.last_refreshed_at``). Excel / Power BI read CubeInfo
+    ``LastDataUpdate`` as the honest data-freshness signal, so it must reflect
+    when the underlying data was actually refreshed — NOT the static system
+    metadata-config clock, which made stale (aggregate-served) pivots advertise
+    themselves as fresh. When no model refresh time is available it falls back to
+    the metadata stamp. ``LastSchemaUpdate`` continues to use the metadata stamp:
+    a true deploy/schema timestamp is not currently propagated to the gateway.
+    """
     xml = '<OlapInfo>'
 
     # CubeInfo
-    _ts = _meta_modified()
+    _schema_ts = _meta_modified()
+    _data_ts = _normalize_cube_timestamp(last_data_update) or _schema_ts
     xml += (
         f'<CubeInfo><Cube>'
         f'<CubeName>{_xe(cube)}</CubeName>'
         f'<LastDataUpdate xmlns="http://schemas.microsoft.com/analysisservices/2003/engine">'
-        f'{_ts}</LastDataUpdate>'
+        f'{_xe(_data_ts)}</LastDataUpdate>'
         f'<LastSchemaUpdate xmlns="http://schemas.microsoft.com/analysisservices/2003/engine">'
-        f'{_ts}</LastSchemaUpdate>'
+        f'{_xe(_schema_ts)}</LastSchemaUpdate>'
         f'</Cube></CubeInfo>'
     )
 
@@ -1109,12 +1369,16 @@ def _parse_dimension_properties(mdx: str) -> list[dict[str, str | None]]:
             if not token:
                 continue
             hierarchy: str | None = None
-            scoped = re.match(r'^\[([^\]]+)\]\.\[([^\]]+)\]\.\[[^\]]+\]\.\[([^\]]+)\]$', token)
+            scoped = re.match(
+                rf'^\[{_BB}\]\.\[{_BB}\]\.\[{_BBN}\]\.\[{_BB}\]$', token,
+            )
             if scoped:
+                # Bug-6746: keep the hierarchy body escaped in the rebuilt
+                # unique-name (consistent with emit-side keys).
                 hierarchy = f'[{scoped.group(1).strip()}].[{scoped.group(2).strip()}]'
                 bare = scoped.group(3).strip()
             else:
-                bare = re.sub(r'^(?:\[[^\]]+\]\.)+', '', token)
+                bare = re.sub(rf'^(?:\[{_BBN}\]\.)+', '', token)
                 bare = bare.strip('[]')
             key = (hierarchy, bare)
             if bare and key not in seen:
@@ -1248,7 +1512,7 @@ def _build_cross_product_tuples(
 def _build_existing_axis_tuples(
     hierarchies: list[str],
     rows: list[dict[str, Any]],
-) -> list[list[dict[str, str]]]:
+) -> list[list[dict[str, str]]] | None:
     """Build only the tuples that actually exist in the result rows for a multi-hierarchy axis.
 
     Bug-XMLA-003 fix: every member carries a unique ``member_ordinal``
@@ -1263,7 +1527,18 @@ def _build_existing_axis_tuples(
     The cartesian tuple list itself is still built from the result
     rows so only the combinations Excel will actually render are
     included (``NonEmpty`` semantics).
+
+    Bug-9246 / F-002-01 / XLC-01: an axis that includes ``[Measures]``
+    cannot be reconstructed from result-row columns (``row.get("Measures")``
+    is always None, so every row was marked invalid and this function
+    returned ``[]``). Callers treat ``[]`` as a real empty tuple list and
+    emit empty Axis0 plus ``xsi:nil`` cells. Return ``None`` instead so
+    both callers fall back to the member cross-product. Dim-only axes
+    keep NonEmpty row-derived tuples.
     """
+    if any("[Measures]" in h for h in hierarchies):
+        return None
+
     # Assign each distinct value within each hierarchy a stable
     # first-appearance ordinal. Two tuples that share the same
     # country_code member emit the same ordinal for that slot.
@@ -1277,11 +1552,12 @@ def _build_existing_axis_tuples(
         key_parts: list[str] = []
         valid = True
         for hier in hierarchies:
-            dim_match = re.match(r'\[([^\]]+)\]', hier)
+            dim_match = re.match(rf'\[{_BB}\]', hier)
             if not dim_match:
                 valid = False
                 break
-            dname = dim_match.group(1).strip()
+            # Bug-6746: dname keys into the raw result row, so unescape.
+            dname = _unbracket(dim_match.group(1).strip())
             value = row.get(dname)
             if value in (None, ""):
                 valid = False
@@ -1380,7 +1656,8 @@ def _build_axes(
     if slicer_measure:
         slicer_members.append({
             "hierarchy": "[Measures]",
-            "uname": f"[Measures].[{slicer_measure}]",
+            "uname": f"[Measures].[{_escape_mdx_bracket(slicer_measure)}]",
+            "name": slicer_measure,
             "caption": slicer_measure,
             "lname": "[Measures]",
             "lnum": 0,
@@ -1925,8 +2202,9 @@ def _build_flat_column_positions(
         return None
 
     def _dim_of(hier: str) -> str:
-        m = re.match(r'\[([^\]]+)\]', hier)
-        return m.group(1).strip() if m else ""
+        # Bug-6746: dim name keys into raw result rows downstream; unescape ]].
+        m = re.match(rf'\[{_BB}\]', hier)
+        return _unbracket(m.group(1).strip()) if m else ""
 
     if len(col_hierarchies) > 1:
         axis_tuples = _build_cross_product_tuples(col_hierarchies, col_members)
@@ -1945,7 +2223,7 @@ def _build_flat_column_positions(
             mname = default_measure
             for mem in t:
                 if "[Measures]" in mem.get("hierarchy", ""):
-                    mname = mem.get("caption", "")
+                    mname = _internal_measure_name(mem)
                 else:
                     combo.append(str(mem.get("caption", "")))
             entries.append((tuple(combo), mname))
@@ -2023,7 +2301,8 @@ def _build_mirror_subtotal_cell_data(
     measure_members: list[dict[str, str]] = [
         {
             "hierarchy": "[Measures]",
-            "uname": f"[Measures].[{m}]",
+            "uname": f"[Measures].[{_escape_mdx_bracket(m)}]",
+            "name": m,
             "caption": m,
             "lname": "[Measures]",
             "lnum": "0",
@@ -2158,7 +2437,7 @@ def _build_subtotal_cell_data(
     col_measure_names: list[str] = []
     for m in col_members:
         if "[Measures]" in m.get("hierarchy", ""):
-            col_measure_names.append(m.get("caption", ""))
+            col_measure_names.append(_internal_measure_name(m))
 
     active_measures = col_measure_names or ([slicer_measure] if slicer_measure else measure_cols)
 
@@ -2225,7 +2504,7 @@ def _build_subtotal_cell_data(
         for row_idx, row in enumerate(rows):
             pos = row_position[row_idx] if row_position is not None else row_idx
             for cm_idx, cm in enumerate(col_members):
-                mname = cm.get("caption", "")
+                mname = _internal_measure_name(cm)
                 if "[Measures]" not in cm.get("hierarchy", ""):
                     continue
                 _emit_cell(pos * len(col_members) + cm_idx, row.get(mname), mname)
@@ -2251,6 +2530,87 @@ def _build_subtotal_cell_data(
     return "".join(xml_parts)
 
 
+def _mdx_strip_literals_and_comments(mdx: str) -> str:
+    """Blank out bracketed identifiers, quoted strings, and comments.
+
+    Used only to count real ``MEMBER`` *declarations* (a declaration keyword
+    always sits outside brackets/strings/comments). Every stripped character is
+    replaced by a space so word boundaries around surviving tokens are
+    preserved and no false ``MEMBER`` token is created by splicing.
+
+    Bug-6612: SSAS MDX block comments NEST — ``/* a /* b */ c */`` is one
+    comment. A non-greedy ``/\\*[\\s\\S]*?\\*/`` regex closes at the FIRST
+    ``*/`` and leaves the outer comment's tail (``c */``) as live text, which
+    can re-introduce a false ``MEMBER`` and fault a valid query. This scanner
+    tracks block-comment nesting depth so the whole nested comment is stripped.
+    Brackets and string literals take precedence over comment markers, so a
+    ``/*`` / ``//`` / ``--`` inside a caption or string is treated as literal
+    text, not a comment (mirrors the previous regex's alternative ordering and
+    the SSAS ``]]`` bracket escape).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(mdx)
+    while i < n:
+        ch = mdx[i]
+        # Bracketed identifier: [ ... ] tolerating the ]] escape.
+        if ch == '[':
+            out.append(' ')
+            i += 1
+            while i < n:
+                if mdx[i] == ']':
+                    if i + 1 < n and mdx[i + 1] == ']':
+                        out.append('  ')
+                        i += 2
+                        continue
+                    out.append(' ')
+                    i += 1
+                    break
+                out.append(' ')
+                i += 1
+            continue
+        # String literal (single or double quoted).
+        if ch in ('"', "'"):
+            quote = ch
+            out.append(' ')
+            i += 1
+            while i < n:
+                out.append(' ')
+                closing = mdx[i] == quote
+                i += 1
+                if closing:
+                    break
+            continue
+        # Line comment: // or -- to end of line.
+        if (ch == '/' and i + 1 < n and mdx[i + 1] == '/') or \
+           (ch == '-' and i + 1 < n and mdx[i + 1] == '-'):
+            while i < n and mdx[i] != '\n':
+                out.append(' ')
+                i += 1
+            continue
+        # Block comment: /* ... */ with nesting.
+        if ch == '/' and i + 1 < n and mdx[i + 1] == '*':
+            depth = 1
+            out.append('  ')
+            i += 2
+            while i < n and depth > 0:
+                if mdx[i] == '/' and i + 1 < n and mdx[i + 1] == '*':
+                    depth += 1
+                    out.append('  ')
+                    i += 2
+                elif mdx[i] == '*' and i + 1 < n and mdx[i + 1] == '/':
+                    depth -= 1
+                    out.append('  ')
+                    i += 2
+                else:
+                    out.append(' ')
+                    i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
 def build_real_execute_response(
     mdx: str,
     catalog: str,
@@ -2264,6 +2624,8 @@ def build_real_execute_response(
     requery_results: dict[tuple, Any] | None = None,
     subtotal_hierarchies: list | None = None,
     hierarchy_defs: list[dict[str, Any]] | None = None,
+    denom_requery_results: dict[tuple, Any] | None = None,
+    last_data_update: str | None = None,
 ) -> str:
     """
     Build an MDDataSet Execute response from real query-router results.
@@ -2286,21 +2648,58 @@ def build_real_execute_response(
 
     # Classify columns into dimensions and measures
     measure_names_set: set[str] = set()
+    # Bug-6657: the field list (MDSCHEMA_MEASURES) advertises the friendly
+    # MEASURE_CAPTION (display_name), but the Execute measure axis previously
+    # captioned members with the INTERNAL measure name (the result column). Map
+    # the internal name to display_name so the pivot header shows the SAME caption
+    # the user picked from the field list.
+    measure_caption_map: dict[str, str] = {}
     if measures_meta:
         for m in measures_meta:
-            measure_names_set.add(m.get("name", ""))
+            _mn = m.get("name", "")
+            measure_names_set.add(_mn)
+            if _mn:
+                measure_caption_map[_mn] = (m.get("display_name") or _mn)
 
     dim_names_set: set[str] = set()
+    # Bug-6659: a flat dimension may carry a DISPLAY column (display_column_name,
+    # Bug-5434) whose value is the member CAPTION, distinct from the key. The
+    # translated SQL projects that caption alongside the key into a companion
+    # column (``<dim>__caption``); map dim_col -> caption column so the Execute
+    # axis can emit UName=key, Caption=caption instead of the raw key twice.
+    dim_caption_col_map: dict[str, str] = {}
     if dimensions_meta:
         for d in dimensions_meta:
-            dim_names_set.add(d.get("name", ""))
+            _dn = d.get("name", "")
+            dim_names_set.add(_dn)
+            _disp = (d.get("display_column_name") or "").strip()
+            if _dn and _disp and _disp != _dn:
+                dim_caption_col_map[_dn] = _member_caption_col(_dn)
 
-    # Classify result columns (skip subtotal marker columns)
-    _marker_cols = {"_subtotal_level", "_subtotal_grain"}
+    # Bug-6659: the companion caption columns are lookups, not axis members —
+    # exclude them from dim/measure classification. Build a per-dim key->caption
+    # map from the rows so the axis builder can look up each member's caption.
+    _caption_cols = set(dim_caption_col_map.values())
+    member_caption_lookup: dict[str, dict[str, str]] = {}
+    for _dn, _cc in dim_caption_col_map.items():
+        _m: dict[str, str] = {}
+        for r in rows:
+            _k = r.get(_dn)
+            _c = r.get(_cc)
+            if _k is not None and _c is not None:
+                _m[str(_k)] = str(_c)
+        if _m:
+            member_caption_lookup[_dn] = _m
+
+    # Classify result columns (skip subtotal marker + caption companion columns).
+    # Import the marker names rather than re-spelling them: a literal copy is the
+    # same drift mechanism that left Bug-8379 open for a release.
+    from src.dax.subtotal_engine import SUBTOTAL_GRAIN_KEY, SUBTOTAL_LEVEL_KEY
+    _marker_cols = {SUBTOTAL_LEVEL_KEY, SUBTOTAL_GRAIN_KEY}
     dim_cols: list[str] = []
     measure_cols: list[str] = []
     for col in columns:
-        if col in _marker_cols:
+        if col in _marker_cols or col in _caption_cols:
             continue
         if col in measure_names_set:
             measure_cols.append(col)
@@ -2322,9 +2721,17 @@ def build_real_execute_response(
             else:
                 dim_cols.append(col)
 
-    # If no measures detected, use all numeric columns
+    # If no measures detected, use all numeric columns. Bug-8285: the caption
+    # companion columns (and subtotal markers) are lookups, not axis members or
+    # measures — they were skipped in the classification loop above, so they land
+    # in neither dim_cols nor measure_cols. Exclude them here too, otherwise a
+    # measure-less (dimension-only) pivot over a captioned dimension would render
+    # ``<dim>__caption`` as a phantom measure column.
     if not measure_cols:
-        measure_cols = [c for c in columns if c not in dim_cols]
+        measure_cols = [
+            c for c in columns
+            if c not in dim_cols and c not in _caption_cols and c not in _marker_cols
+        ]
 
     # F-002-10: map NULL/empty dimension members to the stable "(blank)" member
     # in place, so the fact stays on the pivot (SSAS semantics) and every
@@ -2336,21 +2743,154 @@ def build_real_execute_response(
                 if v is None or (isinstance(v, str) and v == ""):
                     r[dc] = BLANK_MEMBER
 
-    # Parse WITH MEMBER definitions and evaluate calculated members
+    # Parse WITH MEMBER definitions and evaluate calculated members.
+    # Bug-6066: the parse step is best-effort — if tree-sitter cannot parse the
+    # statement the axis layout is still recovered by the regex helpers below,
+    # so a parse failure must stay non-fatal. But a calc-member EVALUATION
+    # failure must SURFACE: previously it was swallowed with a bare ``pass``,
+    # which dropped every WITH MEMBER column and returned a silently-incomplete
+    # result. The caller converts a ValueError into a proper SOAP fault, so a
+    # failed calc member now tells the BI client the query failed instead of
+    # rendering blank columns.
     calc_members = []
+    parsed = None
+
+    # Count MEMBER *declarations* up front, on a copy of the MDX with every
+    # bracketed identifier, quoted string literal, and COMMENT stripped. A
+    # declaration keyword always sits OUTSIDE brackets / quotes / comments
+    # (``MEMBER [x] AS ...``), so stripping only removes FALSE occurrences of the
+    # word "Member" — inside a caption (``[Total Member Revenue]``), a WHERE
+    # member (``[Segment].[Member]``), a string literal, or a comment
+    # (``// member calc``) — that would otherwise be mistaken for a declaration.
+    # The bracket pattern tolerates the SSAS ``]]`` escape so an escaped caption
+    # is fully stripped (mirrors ``_CM_BRACKET_BODY`` in mdx_calc_members).
+    # Comments must be stripped because the Tree-sitter MDX grammar has no comment
+    # rule, so ANY comment (``//`` ``--`` ``/* */``, all valid SSAS MDX) sets
+    # ``has_error`` on an otherwise perfectly-parsed statement — and a comment
+    # containing the word "member" would then inflate the count and FALSELY fault
+    # a valid commented query (Bug-6611). String/bracket alternatives precede the
+    # comment handling so a comment marker inside a literal is consumed as
+    # part of the literal, not treated as a comment. This count gates BOTH the
+    # parser-unavailable branch and the parse-error guard, so a WITH SET-only
+    # query (zero MEMBER declarations) with a "Member"-word caption or comment is
+    # never mistaken for a calc-member statement (Bug-6607 / Bug-6611).
+    # Bug-6612: block comments NEST in SSAS MDX, so a depth-aware scanner strips
+    # them (a non-greedy regex closed at the first ``*/`` and leaked the tail).
+    _mdx_no_literals = _mdx_strip_literals_and_comments(mdx)
+    _declared_members = len(re.findall(r'\bMEMBER\b', _mdx_no_literals, re.IGNORECASE))
+    _declares_with_member = _declared_members > 0
+
     try:
         from src.dax.ts_mdx_parser import parse_mdx
         parsed = parse_mdx(mdx)
-        if parsed.with_members:
+    except Exception as exc:
+        # Parse failure is non-fatal ONLY when there are no calculated members
+        # to lose — the axis layout is still recovered by the regex helpers
+        # below. But if the statement DECLARES a WITH ... MEMBER clause, a parse
+        # failure would silently drop those columns (the Bug-6066 defect), so
+        # surface it as a client fault instead.
+        if _declares_with_member:
+            raise ValueError(
+                f"Calculated member parse failed: {exc}"
+            ) from exc
+        parsed = None
+
+    # Bug-6066 (root fix): parse_mdx does NOT raise on a grammar-level parse
+    # error — it returns a ParsedMDX carrying a "Tree-sitter parse error"
+    # warning. The ``except`` branch above only fires when the parser itself is
+    # unavailable (missing grammar DLL), so a REAL unparseable ``WITH ... MEMBER``
+    # statement slipped straight through: the grammar could not extract the
+    # member, ``with_members`` came back EMPTY, and the response was returned with
+    # every calculated column silently dropped (the exact Fable finding —
+    # ``warnings=[parse error]`` + ``with_members=[]``, never a raised exception).
+    #
+    # When the statement DECLARES at least one WITH ... MEMBER (``_declared_members
+    # > 0``) and the parse errored, fault if the recovered members are
+    # UNTRUSTWORTHY, rather than returning a silently-incomplete result. Three
+    # signals mark untrustworthy recovery:
+    #   (a) no members recovered at all (total drop);
+    #   (b) a recovered member has an empty/whitespace expression — the grammar
+    #       appended a WithMemberDef but lost its ``calc_expression`` sub-node
+    #       (``ts_mdx_parser._walk_with_member_def`` always appends), which
+    #       classifies as ``custom`` → ``_eval_arithmetic`` → a silently blank
+    #       column; and
+    #   (c) fewer usable members recovered than the client DECLARED (a MEMBER was
+    #       dropped entirely, e.g. one valid + one garbled member).
+    # Gating on ``_declared_members > 0`` means a query with ZERO member
+    # declarations (e.g. WITH SET only) can never fault here, even when the
+    # grammar over-flags ``has_error`` on an unrelated axis construct and a
+    # caption happens to contain the word "Member" (Bug-6607).
+    #
+    # This is deliberately NOT "fault on any parse-error warning": the grammar's
+    # error recovery frequently reports ``has_error`` for an UNRELATED axis
+    # construct (e.g. Generate/Ascendants) while still correctly extracting every
+    # calc member, and those results are valid. A plain query with a parse-error
+    # warning also stays non-fatal (axis recovered by the regex helpers below).
+    # Residual limitation: a member recovered with a NON-empty but semantically
+    # truncated/garbage expression that happens to compile cannot be detected
+    # here without re-validating each expression; the total-drop, empty-expr, and
+    # dropped-member modes — the observed Bug-6066 failure modes — are covered.
+    if parsed is not None and _declares_with_member:
+        _parse_errored = any(
+            "parse error" in (w or "").lower() for w in parsed.warnings
+        )
+        if _parse_errored:
+            _usable = [m for m in parsed.with_members if (m.expression or "").strip()]
+            if (
+                not parsed.with_members
+                or len(_usable) < len(parsed.with_members)
+                or len(_usable) < _declared_members
+            ):
+                raise ValueError(
+                    "Calculated member parse failed: the MDX WITH ... MEMBER "
+                    "clause could not be fully parsed. Refusing to return a "
+                    "result with calculated columns silently dropped."
+                )
+
+    if parsed is not None and parsed.with_members:
+        try:
             calc_members = parse_calc_members(parsed.with_members)
-            rows = evaluate_calc_members(calc_members, rows, measure_cols, dim_cols, measures_meta, requery_results)
-            for cm in calc_members:
-                if cm.name not in measure_cols:
-                    measure_cols.append(cm.name)
-    except ValueError:
-        raise
-    except Exception:
-        pass
+            # F-002-07 (adversarial R3 F1/F2): a map from each hierarchy / flat
+            # dimension name to the result dim_col names it covers, so the
+            # % of Grand Total vs % of Row/Column Total guard compares the pinned
+            # (All) hierarchies against dim_cols in the correct namespace (a
+            # defined hierarchy pins all its level columns at once).
+            _hier_level_dims: dict[str, list[str]] = {}
+            for _h in (hierarchy_defs or []):
+                _hn = str(_h.get("name", "")).strip()
+                if not _hn:
+                    continue
+                _lvls = [
+                    str(_l.get("name", "")).strip()
+                    for _l in (_h.get("levels") or [])
+                    if str(_l.get("name", "")).strip()
+                ]
+                if _lvls:
+                    _hier_level_dims[_hn] = _lvls
+            # Bug-8206: compute the row/col axis dim split so % of Row/Column
+            # Total holds the correct axis fixed. Cheap regex over the axis
+            # exprs; other calc types ignore the split.
+            _row_axis_dims, _col_axis_dims = _axis_dim_split(mdx, dim_cols)
+            rows = evaluate_calc_members(
+                calc_members, rows, measure_cols, dim_cols,
+                measures_meta, requery_results,
+                denom_requery_results=denom_requery_results,
+                hierarchy_level_dims=_hier_level_dims or None,
+                row_axis_dims=_row_axis_dims,
+                col_axis_dims=_col_axis_dims,
+            )
+        except ValueError:
+            # Already a client-facing message (e.g. circular reference).
+            raise
+        except Exception as exc:
+            # Any other parse/eval failure is surfaced as a client fault rather
+            # than 500-ing or silently dropping the WITH MEMBER columns.
+            raise ValueError(
+                f"Calculated member evaluation failed: {exc}"
+            ) from exc
+        for cm in calc_members:
+            if cm.name not in measure_cols:
+                measure_cols.append(cm.name)
 
     # Parse MDX to determine axis layout
     col_expr = _get_axis_expr(mdx, "COLUMNS")
@@ -2441,7 +2981,8 @@ def build_real_execute_response(
             for mname in active_measures:
                 col_members.append({
                     "hierarchy": "[Measures]",
-                    "uname": f"[Measures].[{mname}]",
+                    "uname": f"[Measures].[{_escape_mdx_bracket(mname)}]",
+                    "name": mname,
                     "caption": mname,
                     "lname": "[Measures]",
                     "lnum": "0",
@@ -2449,10 +2990,11 @@ def build_real_execute_response(
                     "has_children": False,
                 })
         else:
-            dim_match = re.match(r'\[([^\]]+)\]', hier)
+            dim_match = re.match(rf'\[{_BB}\]', hier)
             if not dim_match:
                 continue
-            dname = dim_match.group(1).strip()
+            # Bug-6746: dname keys into raw member maps/rows; unescape ]].
+            dname = _unbracket(dim_match.group(1).strip())
             drill_member = _normalize_member_name(col_drilldowns.get(hier, ""))
             if hier in col_ascendants:
                 col_members.append({
@@ -2564,7 +3106,8 @@ def build_real_execute_response(
             for mname in active_measures:
                 row_members.append({
                     "hierarchy": "[Measures]",
-                    "uname": f"[Measures].[{mname}]",
+                    "uname": f"[Measures].[{_escape_mdx_bracket(mname)}]",
+                    "name": mname,
                     "caption": mname,
                     "lname": "[Measures]",
                     "lnum": "0",
@@ -2572,10 +3115,11 @@ def build_real_execute_response(
                     "has_children": False,
                 })
         else:
-            dim_match = re.match(r'\[([^\]]+)\]', hier)
+            dim_match = re.match(rf'\[{_BB}\]', hier)
             if not dim_match:
                 continue
-            dname = dim_match.group(1).strip()
+            # Bug-6746: dname keys into raw member maps/rows; unescape ]].
+            dname = _unbracket(dim_match.group(1).strip())
             drill_member = _normalize_member_name(row_drilldowns.get(hier, ""))
             if hier in row_ascendants:
                 row_members.append({
@@ -2668,6 +3212,19 @@ def build_real_execute_response(
                     "member_type": 1,
                     "member_ordinal": idx,
                 })
+
+    # F-002-05: normalise captions so the Execute axis shows the SAME friendly
+    # labels the field list advertised. Measure members: caption <- display_name
+    # (Bug-6657). Dimension members: caption <- the projected display-column value
+    # keyed by the member's key (Bug-6659); UName keeps the key so cell coordinate
+    # matching is unaffected. Applied to the plain (non-subtotal) axis members;
+    # the subtotal tuple builders below carry their own captions.
+    _normalize_member_captions(
+        col_members, measure_caption_map, member_caption_lookup,
+    )
+    _normalize_member_captions(
+        row_members, measure_caption_map, member_caption_lookup,
+    )
 
     _use_subtotal_cell_data = False
     _cross_axis_subtotals = False
@@ -2828,6 +3385,7 @@ def build_real_execute_response(
         cube, col_hierarchies, row_hierarchies,
         slicer_dims, slicer_measure, dims_for_slicer, dim_props,
         minimal_excel_props=minimal_excel_props,
+        last_data_update=last_data_update,
     )
 
     # Build Axes
@@ -2939,7 +3497,7 @@ def _build_real_cell_data(
     col_dim_members_by_hier: dict[str, list[str]] = {}
     for m in col_members:
         if "[Measures]" in m["hierarchy"]:
-            col_measure_names.append(m["caption"])
+            col_measure_names.append(_internal_measure_name(m))
         else:
             col_dim_members_by_hier.setdefault(m["hierarchy"], []).append(m["caption"])
 
@@ -2947,7 +3505,7 @@ def _build_real_cell_data(
     row_measure_names: list[str] = []
     for m in row_members:
         if "[Measures]" in m["hierarchy"]:
-            row_measure_names.append(m["caption"])
+            row_measure_names.append(_internal_measure_name(m))
         else:
             row_dim_members_by_hier.setdefault(m["hierarchy"], []).append(m["caption"])
 
@@ -2959,21 +3517,23 @@ def _build_real_cell_data(
             entry: dict[str, str] = {}
             for cm in combo:
                 if "[Measures]" in cm["hierarchy"]:
-                    entry["__measure__"] = cm["caption"]
+                    entry["__measure__"] = _internal_measure_name(cm)
                 else:
-                    dim_match = re.match(r'\[([^\]]+)\]', cm["hierarchy"])
+                    dim_match = re.match(rf'\[{_BB}\]', cm["hierarchy"])
                     if dim_match:
-                        entry[dim_match.group(1)] = cm["caption"]
+                        # Bug-6746: dim key matched against raw result columns.
+                        entry[_unbracket(dim_match.group(1))] = cm["caption"]
             col_tuples.append(entry)
     else:
         for cm in col_members:
             entry = {}
             if "[Measures]" in cm["hierarchy"]:
-                entry["__measure__"] = cm["caption"]
+                entry["__measure__"] = _internal_measure_name(cm)
             else:
-                dim_match = re.match(r'\[([^\]]+)\]', cm["hierarchy"])
+                dim_match = re.match(rf'\[{_BB}\]', cm["hierarchy"])
                 if dim_match:
-                    entry[dim_match.group(1)] = cm["caption"]
+                    # Bug-6746: dim key matched against raw result columns.
+                    entry[_unbracket(dim_match.group(1))] = cm["caption"]
             col_tuples.append(entry)
 
     # Build row tuples
@@ -2984,21 +3544,23 @@ def _build_real_cell_data(
             entry = {}
             for rm in combo:
                 if "[Measures]" in rm["hierarchy"]:
-                    entry["__measure__"] = rm["caption"]
+                    entry["__measure__"] = _internal_measure_name(rm)
                 else:
-                    dim_match = re.match(r'\[([^\]]+)\]', rm["hierarchy"])
+                    dim_match = re.match(rf'\[{_BB}\]', rm["hierarchy"])
                     if dim_match:
-                        entry[dim_match.group(1)] = rm["caption"]
+                        # Bug-6746: dim key matched against raw result columns.
+                        entry[_unbracket(dim_match.group(1))] = rm["caption"]
             row_tuples.append(entry)
     else:
         for rm in row_members:
             entry = {}
             if "[Measures]" in rm["hierarchy"]:
-                entry["__measure__"] = rm["caption"]
+                entry["__measure__"] = _internal_measure_name(rm)
             else:
-                dim_match = re.match(r'\[([^\]]+)\]', rm["hierarchy"])
+                dim_match = re.match(rf'\[{_BB}\]', rm["hierarchy"])
                 if dim_match:
-                    entry[dim_match.group(1)] = rm["caption"]
+                    # Bug-6746: dim key matched against raw result columns.
+                    entry[_unbracket(dim_match.group(1))] = rm["caption"]
             row_tuples.append(entry)
 
     if not row_tuples:

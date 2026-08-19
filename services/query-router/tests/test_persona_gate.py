@@ -11,6 +11,7 @@ from src.ir.logical_query import LogicalFilter
 from src.security.persona_gate import (
     apply_persona_gate,
     enforce_persona,
+    enforce_persona_gate,
     merge_default_filters,
 )
 
@@ -58,6 +59,9 @@ def test_measure_in_list_passes():
 
 
 def test_measure_not_in_list_raises_403():
+    # F-008-02: a persona-allow-list denial must NOT disclose the object name,
+    # kind, or persona identity to the client — a restricted 403 is
+    # indistinguishable from an unknown-object 403 (no existence oracle).
     measure = make_measure("revenue")
     other = uuid.uuid4()
     bound = make_bound_query(dimensions=[], measures=[measure])
@@ -67,12 +71,16 @@ def test_measure_not_in_list_raises_403():
 
     assert exc.value.status_code == 403
     detail = exc.value.detail
-    assert detail["error_code"] == "PERSONA_OBJECT_NOT_INCLUDED"
-    assert detail["object_kind"] == "measure"
-    assert detail["object_name"] == "revenue"
+    assert detail["error_code"] == "OBJECT_NOT_AVAILABLE"
+    # The measure name / kind / persona must NOT leak in the client payload.
+    assert "object_kind" not in detail
+    assert "object_name" not in detail
+    assert "persona_id" not in detail
+    assert "revenue" not in detail.get("message", "")
 
 
 def test_dimension_not_in_list_raises_403():
+    # F-008-02: non-disclosing denial (see test_measure_not_in_list_raises_403).
     dim = make_dimension("region")
     other = uuid.uuid4()
     bound = make_bound_query(dimensions=[dim], measures=[])
@@ -81,7 +89,10 @@ def test_dimension_not_in_list_raises_403():
         enforce_persona(_persona(dimension_ids=[str(other)]), bound)
 
     assert exc.value.status_code == 403
-    assert exc.value.detail["object_kind"] == "dimension"
+    detail = exc.value.detail
+    assert detail["error_code"] == "OBJECT_NOT_AVAILABLE"
+    assert "object_kind" not in detail
+    assert "region" not in detail.get("message", "")
 
 
 def test_hierarchy_filter_uses_dimension_hierarchy_id():
@@ -94,7 +105,10 @@ def test_hierarchy_filter_uses_dimension_hierarchy_id():
     with pytest.raises(HTTPException) as exc:
         enforce_persona(_persona(hierarchy_ids=[str(h_id)]), bound)
 
-    assert exc.value.detail["object_kind"] == "hierarchy"
+    # F-008-02: denied, but non-disclosing (no object_kind / name in payload).
+    assert exc.value.status_code == 403
+    assert exc.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"
+    assert "object_kind" not in exc.value.detail
 
 
 def test_hierarchy_filter_skips_dimensions_without_hierarchy():
@@ -167,8 +181,9 @@ def test_explicit_query_still_rejects_disallowed_measure():
 
 
 class _FakeDB:
-    def __init__(self, persona):
+    def __init__(self, persona, *, execute_error: BaseException | None = None):
         self._persona = persona
+        self._execute_error = execute_error
 
     async def get(self, cls, key):  # noqa: ARG002 — mimic AsyncSession.get
         if self._persona is None:
@@ -176,6 +191,16 @@ class _FakeDB:
         if str(key) != str(self._persona.id):
             return None
         return self._persona
+
+    async def execute(self, stmt):  # noqa: ARG002
+        if self._execute_error is not None:
+            raise self._execute_error
+
+        class _R:
+            def all(self):
+                return []
+
+        return _R()
 
 
 @pytest.mark.asyncio
@@ -244,6 +269,25 @@ async def test_apply_returns_persona_on_pass():
     assert result is p
 
 
+@pytest.mark.asyncio
+async def test_f008_01_backing_lookup_failure_refuses_query():
+    """Bug-9260: when the excluded-measure backing lookup raises, the
+    query is refused rather than served with the F-008-01 guard disabled.
+    """
+    measure = make_measure("revenue")
+    dim = make_dimension("fee_amount")
+    bound = make_bound_query(dimensions=[dim], measures=[], select_star=False)
+    p = _persona(measure_ids=[str(measure.id)])
+    db = _FakeDB(persona=p, execute_error=RuntimeError("simulated timeout"))
+
+    with pytest.raises(HTTPException) as exc:
+        await enforce_persona_gate(
+            db, persona=p, model_id="model-1", bound=bound,
+        )
+    assert exc.value.status_code == 403
+    assert exc.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"
+
+
 # ---------------------------------------------------------------------------
 # merge_default_filters (Phase 8.B.4)
 # ---------------------------------------------------------------------------
@@ -273,7 +317,13 @@ def test_merge_uses_in_for_list_value():
     assert bound.resolved_filters[0].value == ["EMEA", "APAC"]
 
 
-def test_merge_skips_dimension_already_filtered_by_user():
+def test_merge_default_filter_is_mandatory_not_overridable():
+    """F-008-01: a persona default filter is a MANDATORY security predicate,
+    never overridable by a user filter on the same dimension. Both the user's
+    filter and the persona default are present and AND-composed at render time,
+    so a user assigned to EMEA who requests APAC gets EMEA AND APAC (their scope
+    is inescapable). The prior behaviour ('user filter wins, skip the persona
+    default') let an EMEA user read out-of-persona rows."""
     bound = make_bound_query(
         dimensions=[],
         measures=[],
@@ -283,11 +333,13 @@ def test_merge_skips_dimension_already_filtered_by_user():
 
     merged = merge_default_filters(p, bound)
 
-    assert merged == ["region"]
-    # User's year filter unchanged; persona's year skipped.
+    # Both persona defaults are appended (mandatory), even the colliding one.
+    assert set(merged) == {"year", "region"}
+    # The user's year filter is retained AND the persona's year default is added
+    # — they AND together, so the user cannot escape the persona's year scope.
     year_filters = [f for f in bound.resolved_filters if f.dimension_name == "year"]
-    assert len(year_filters) == 1
-    assert year_filters[0].value == 2025
+    assert len(year_filters) == 2
+    assert {f.value for f in year_filters} == {2025, 2026}
 
 
 def test_merge_supports_dict_operator_form():
@@ -315,6 +367,33 @@ def test_merge_noop_when_default_filters_empty():
     p = _persona(default_filters={})
 
     assert merge_default_filters(p, bound) == []
+    assert bound.resolved_filters == []
+
+
+def test_merge_skips_at_parameter_keys():
+    """Bug-7662: @-prefixed keys in default_filters are parameter overrides
+    consumed by _bind_query_parameters, NOT dimension filters. Treating them
+    as dimension names appends an unresolvable LogicalFilter that breaks
+    every query for this persona."""
+    bound = make_bound_query(dimensions=[], measures=[])
+    p = _persona(default_filters={"@region": "APAC", "year": 2026})
+
+    merged = merge_default_filters(p, bound)
+
+    # Only the real dimension filter is merged; @region is skipped.
+    assert merged == ["year"]
+    assert len(bound.resolved_filters) == 1
+    assert bound.resolved_filters[0].dimension_name == "year"
+
+
+def test_merge_skips_all_at_prefixed_keys():
+    """Bug-7662: verify ALL @-prefixed keys are skipped, not just the first."""
+    bound = make_bound_query(dimensions=[], measures=[])
+    p = _persona(default_filters={"@p1": "x", "@p2": ["a", "b"]})
+
+    merged = merge_default_filters(p, bound)
+
+    assert merged == []
     assert bound.resolved_filters == []
 
 
@@ -414,3 +493,69 @@ def test_count_star_survives_star_narrowing():
     assert "revenue" in names
     assert "__row_count" in names
     assert "cost" not in names
+
+
+def test_f008_01_bare_select_of_hidden_measure_as_dimension_is_403():
+    """F-008-01: binder wraps ``SELECT fee_amount`` as a virtual dimension
+    whose id is the measure id. The measure allow-list must 403 it.
+    """
+    fee = make_measure("fee_amount")
+    fee.is_measure_as_dimension = True
+    allowed = make_measure("revenue")
+    bound = make_bound_query(dimensions=[fee], measures=[], select_star=False)
+
+    with pytest.raises(HTTPException) as exc:
+        enforce_persona(_persona(measure_ids=[str(allowed.id)]), bound)
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"
+
+
+def test_f008_01_star_drops_hidden_measure_as_dimension():
+    """F-008-01: SELECT * silently drops the virtual measure-dimension."""
+    fee = make_measure("fee_amount")
+    fee.is_measure_as_dimension = True
+    region = make_dimension("region")
+    allowed = make_measure("revenue")
+    bound = make_bound_query(
+        dimensions=[fee, region], measures=[allowed], select_star=True,
+    )
+
+    enforce_persona(_persona(measure_ids=[str(allowed.id)]), bound)
+
+    names = [d.name for d in bound.resolved_dimensions]
+    assert "fee_amount" not in names
+    assert "region" in names
+    assert bound.persona_narrowed_star is True
+
+
+def test_f008_01_sum_of_excluded_measure_is_403():
+    """F-008-01: SUM(hidden_measure) is 403 when the measure is not on the allow-list."""
+    measure = make_measure("fee_amount")
+    bound = make_bound_query(dimensions=[], measures=[measure])
+    with pytest.raises(HTTPException) as exc:
+        enforce_persona(_persona(measure_ids=[str(uuid.uuid4())]), bound)
+    assert exc.value.status_code == 403
+    assert exc.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"
+
+
+def test_f008_01_real_dim_sharing_excluded_measure_backing_column_is_403():
+    """F-008-01: a real dimension whose source_column_id is the backing
+    column of a hidden measure must 403 on explicit SELECT.
+    """
+    col_id = uuid.uuid4()
+    fee = make_measure("fee_amount")
+    dim = make_dimension("fee_amount")
+    dim.source_column_id = col_id
+    allowed = make_measure("revenue")
+    bound = make_bound_query(dimensions=[dim], measures=[], select_star=False)
+
+    with pytest.raises(HTTPException) as exc:
+        enforce_persona(
+            _persona(measure_ids=[str(allowed.id)]),
+            bound,
+            excluded_measure_column_ids={str(col_id)},
+        )
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"

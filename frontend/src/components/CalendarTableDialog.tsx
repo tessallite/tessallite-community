@@ -41,6 +41,14 @@ import { calendarApi } from "../api/client";
 import { useT } from "../i18n";
 
 type Flow = "view" | "auto-create" | "script" | "bind";
+type CalendarColumnKey =
+  | "date_column"
+  | "year_column"
+  | "half_column"
+  | "quarter_column"
+  | "month_column"
+  | "week_column"
+  | "day_column";
 
 const CALENDAR_TYPE_VALUES = [
   "standard",
@@ -50,13 +58,6 @@ const CALENDAR_TYPE_VALUES = [
   "hijri",
   "thai_buddhist",
 ] as const;
-
-// F-016-14: the Hijri emitter requires the `hijri-converter` Python package,
-// which is not yet a project dependency (pending approval). Until it ships,
-// the Hijri option is disabled with an explanatory tooltip so a modeller does
-// not pick it and hit an HTTP 400 with a developer pip-install message. Flip to
-// true once the dependency is added to the model-service pyproject.
-const HIJRI_AVAILABLE = false;
 
 const CALENDAR_TYPE_COLUMNS: Record<string, Record<string, string>> = {
   standard: {
@@ -82,6 +83,35 @@ const CALENDAR_TYPE_COLUMNS: Record<string, Record<string, string>> = {
     quarter_column: "quarter_no", month_column: "month_no", week_column: "week_no", day_column: "day_no",
   },
 };
+
+const CALENDAR_COLUMN_FIELDS: Array<{ key: CalendarColumnKey; labelKey: string }> = [
+  { key: "date_column", labelKey: "calendar.dateColumn" },
+  { key: "year_column", labelKey: "calendar.yearColumn" },
+  { key: "half_column", labelKey: "calendar.halfColumn" },
+  { key: "quarter_column", labelKey: "calendar.quarterColumn" },
+  { key: "month_column", labelKey: "calendar.monthColumn" },
+  { key: "week_column", labelKey: "calendar.weekColumn" },
+  { key: "day_column", labelKey: "calendar.dayColumn" },
+];
+
+const EMPTY_BIND_COLUMNS: Record<CalendarColumnKey, string> = {
+  date_column: "",
+  year_column: "",
+  half_column: "",
+  quarter_column: "",
+  month_column: "",
+  week_column: "",
+  day_column: "",
+};
+
+function bindColumnPayload(columns: Record<CalendarColumnKey, string>) {
+  const payload: Partial<Record<CalendarColumnKey, string>> = {};
+  for (const field of CALENDAR_COLUMN_FIELDS) {
+    const value = columns[field.key].trim();
+    if (value) payload[field.key] = value;
+  }
+  return payload;
+}
 
 function extractError(err: unknown, t: (key: string) => string): { message: string; ddl?: string } {
   if (!err) return { message: t("calendarTable.operationFailed") };
@@ -128,12 +158,29 @@ export default function CalendarTableDialog({
   const [fiscalStartMonth, setFiscalStartMonth] = useState(4);
   const [scriptOutput, setScriptOutput] = useState<string | null>(null);
   const [autoCreatedAliases, setAutoCreatedAliases] = useState<string[]>([]);
+  const [bindColumns, setBindColumns] =
+    useState<Record<CalendarColumnKey, string>>(EMPTY_BIND_COLUMNS);
 
   const list = useQuery({
     queryKey: ["calendars", projectId, modelId, sourceId],
     queryFn: () => calendarApi.list(projectId, modelId, sourceId),
     enabled: open,
   });
+
+  // Bug-5920: fetch backend-computed calendar type availability instead of
+  // a hardcoded frontend flag, so a type becomes selectable the moment its
+  // optional dependency is installed server-side.
+  const typesQuery = useQuery({
+    queryKey: ["calendarTypes", projectId, modelId, sourceId],
+    queryFn: () => calendarApi.types(projectId, modelId, sourceId),
+    enabled: open,
+    staleTime: 5 * 60 * 1000,
+  });
+  const unavailableTypes = new Set(
+    (typesQuery.data ?? [])
+      .filter((t) => !t.available)
+      .map((t) => t.calendar_type),
+  );
 
   const invalidate = () => {
     qc.removeQueries({ queryKey: ["calendars", projectId, modelId, sourceId] });
@@ -187,12 +234,14 @@ export default function CalendarTableDialog({
   });
 
   const columnDefaults = CALENDAR_TYPE_COLUMNS[calendarType] ?? CALENDAR_TYPE_COLUMNS.standard;
+  const hasRequiredBindColumn =
+    Boolean(bindColumns.date_column.trim()) || Boolean(bindColumns.year_column.trim());
 
   const bindMut = useMutation({
     mutationFn: () =>
       calendarApi.bind(projectId, modelId, sourceId, {
         table_name: tableName,
-        ...columnDefaults,
+        ...bindColumnPayload(bindColumns),
         alias: aliasField,
         fiscal_year_start_month: effectiveFys,
         calendar_type: calendarType,
@@ -217,6 +266,7 @@ export default function CalendarTableDialog({
     bindMut.reset();
     setScriptOutput(null);
     setAutoCreatedAliases([]);
+    setBindColumns(EMPTY_BIND_COLUMNS);
   }
 
   const autoCreateError = autoMut.isError ? extractError(autoMut.error, t) : null;
@@ -224,8 +274,9 @@ export default function CalendarTableDialog({
   const CALENDAR_TYPE_OPTIONS = CALENDAR_TYPE_VALUES.map((v) => ({
     value: v,
     label: t(`calendar.${v === "iso_week" ? "isoWeek" : v === "retail_445" ? "retail445" : v === "thai_buddhist" ? "thaiBuddhist" : v}`),
-    // F-016-14: Hijri requires a backend dependency that is not installed.
-    disabled: v === "hijri" && !HIJRI_AVAILABLE,
+    // Bug-5920: availability is now backend-computed (see typesQuery
+    // above) instead of a hardcoded per-type flag.
+    disabled: unavailableTypes.has(v),
   }));
 
   const FISCAL_MONTHS: Array<[number, string]> = [
@@ -380,8 +431,10 @@ export default function CalendarTableDialog({
               </Typography>
             )}
             <FormControl size="small" fullWidth>
-              <InputLabel>{t("calendar.calendarType")}</InputLabel>
+              <InputLabel id="calendar-type-label">{t("calendar.calendarType")}</InputLabel>
               <Select
+                labelId="calendar-type-label"
+                id="calendar-type-select"
                 value={calendarType}
                 label={t("calendar.calendarType")}
                 onChange={(e) => setCalendarType(e.target.value)}
@@ -397,8 +450,10 @@ export default function CalendarTableDialog({
             </FormControl>
             {calendarType === "fiscal" && (
               <FormControl size="small" sx={{ minWidth: 180 }}>
-                <InputLabel>{t("calendar.fiscalStartMonth")}</InputLabel>
+                <InputLabel id="calendar-fiscal-month-label">{t("calendar.fiscalStartMonth")}</InputLabel>
                 <Select
+                  labelId="calendar-fiscal-month-label"
+                  id="calendar-fiscal-month-select"
                   value={fiscalStartMonth}
                   label={t("calendar.fiscalStartMonth")}
                   onChange={(e) => setFiscalStartMonth(Number(e.target.value))}
@@ -408,6 +463,32 @@ export default function CalendarTableDialog({
                   ))}
                 </Select>
               </FormControl>
+            )}
+            {flow === "bind" && (
+              <Box
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
+                  gap: 1,
+                }}
+              >
+                {CALENDAR_COLUMN_FIELDS.map((field) => (
+                  <TextField
+                    key={field.key}
+                    label={t(field.labelKey)}
+                    size="small"
+                    value={bindColumns[field.key]}
+                    placeholder={columnDefaults[field.key] ?? ""}
+                    helperText={field.key === "date_column" ? t("calendar.dateOrYearRequired") : " "}
+                    onChange={(e) =>
+                      setBindColumns((current) => ({
+                        ...current,
+                        [field.key]: e.target.value,
+                      }))
+                    }
+                  />
+                ))}
+              </Box>
             )}
           </Stack>
         )}
@@ -505,7 +586,7 @@ export default function CalendarTableDialog({
           <Button
             variant="contained"
             onClick={() => bindMut.mutate()}
-            disabled={bindMut.isPending || !tableName.trim()}
+            disabled={bindMut.isPending || !tableName.trim() || !hasRequiredBindColumn}
           >
             {bindMut.isPending ? <CircularProgress size={16} /> : t("calendar.bind")}
           </Button>

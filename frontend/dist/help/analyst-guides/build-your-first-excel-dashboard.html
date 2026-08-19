@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Build Your First Excel Dashboard — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Analyst Guides</span> / <span>Build Your First Excel Dashboard</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">end user</span><span class="updated">Updated 2026-08-04</span></div>
+    <h1>Build Your First Excel Dashboard</h1>
+<h2>What this covers</h2>
+<p>A complete walk from an empty Excel workbook to a finished sales dashboard: a live PivotTable of sales by product, a date timeline, a country slicer, a KPI strip with traffic lights, and a chart — all reading the Tessallite demo model, and all refreshable with one button tomorrow morning.</p>
+<h2>Before you start</h2>
+<ul>
+<li>You need Excel connected to Tessallite over XMLA. If you have not done that yet, follow <a href="../getting-started/connect-excel.html">Connect Excel via XMLA</a> first — it takes about five minutes — then come back.</li>
+<li>The examples use the demo workspace (<code>acme-demo</code>) and its <code>modelx</code> model, which contains retail-style sales data. If your workspace has its own models, the same clicks work; only the field names change.</li>
+<li>Role required: Analyst (Viewer) or higher.</li>
+</ul>
+<h2>The dashboard we are building</h2>
+<p>Meet Maya. Maya looks after sales reporting, and every Monday she assembles the same pack: sales by product, a trend over time, and the health-check KPIs her director watches. Today she builds it once in Excel, connected to Tessallite, so next Monday the whole pack refreshes itself.</p>
+<p>The finished sheet has four parts:</p>
+<ol>
+<li>A <strong>KPI strip</strong> across the top: Net Sales, Revenue, and Gross Margin %, each with its governed traffic-light status.</li>
+<li>A <strong>PivotTable</strong> of Net Sales by product, trimmed to the top ten.</li>
+<li>A <strong>timeline and slicer</strong> so anyone can re-cut the numbers by period and country without touching the query.</li>
+<li>A <strong>chart</strong> that draws itself from the PivotTable.</li>
+</ol>
+<p>Nothing is pasted. Every cell is a live view of the model.</p>
+<h2>Step 1 — Start the PivotTable from the model</h2>
+<ol>
+<li>Open a blank workbook.</li>
+<li>Go to <strong>Insert &gt; PivotTable &gt; From External Data Source</strong>, and choose the Tessallite connection you set up earlier. (On some Excel builds this is <strong>Insert &gt; PivotTable &gt; Use an external data source &gt; Choose Connection</strong>.)</li>
+<li>Pick the <code>modelx</code> model when Excel asks which cube to use.</li>
+<li>Excel opens an empty PivotTable with the field list on the right. The field list is the model: folders of <strong>dimensions</strong> (the ways you can slice, like <code>product_name</code> and <code>country_code</code>) and <strong>measures</strong> (the governed numbers, like <code>net_sales</code>).</li>
+</ol>
+<p>If the field list is empty, the model has not been deployed yet — ask your modeller. A model you cannot see is a model that is not published.</p>
+<h2>Step 2 — Sales by product, top ten only</h2>
+<ol>
+<li>Drag <strong><code>product_name</code></strong> to the <strong>Rows</strong> area.</li>
+<li>Drag <strong><code>net_sales</code></strong> to the <strong>Values</strong> area. Excel fills in every product and its sales.</li>
+<li>Now trim it to the leaders. Click the drop-down arrow on the <code>product_name</code> field, choose <strong>Value Filters &gt; Top 10</strong>, and keep the defaults (Top 10 by net sales).</li>
+</ol>
+<p>Here is the part worth pausing on: the Top 10 is decided <strong>inside the database</strong>, over every product the model can see, and only the ten winners are sent back to Excel. You are not looking at the ten biggest rows of whatever happened to fit on screen — you are looking at the genuine top ten. If you had instead hidden rows by hand, the subtotals would lie and tomorrow's refresh would quietly unhide them.</p>
+<h2>Step 3 — A timeline for the date range</h2>
+<ol>
+<li>Click inside the PivotTable, then go to <strong>Insert &gt; Timeline</strong> (on some builds: <strong>PivotTable Analyze &gt; Insert Timeline</strong>).</li>
+<li>Tick the date hierarchy for <code>business_date</code> and click <strong>OK</strong>.</li>
+<li>Drag the timeline handle to cover the period you care about — this quarter, say.</li>
+</ol>
+<p>The moment you let go of the handle, every number on the sheet recomputes. Tessallite turns your drag into a date filter on the query itself, so the database does the narrowing — Excel never downloads the out-of-range rows at all. This is why a timeline over a hundred thousand rows still feels instant.</p>
+<h2>Step 4 — The KPI strip</h2>
+<p>Above the PivotTable, Maya wants the three numbers her director reads first, with their traffic lights.</p>
+<ol>
+<li>In the field list, find the <strong>KPI folder</strong>. Each published KPI — Net Sales, Revenue, Gross Margin % — appears with up to four members you can tick: <strong>Value</strong>, <strong>Goal</strong>, <strong>Status</strong>, and <strong>Trend</strong>.</li>
+<li>On a fresh area of the sheet, start a second PivotTable from the same connection. Tick <strong>Value</strong> and <strong>Status</strong> for the Net Sales KPI.</li>
+<li>The Value cell shows the headline figure. The Status cell shows <code>1</code>, <code>0</code>, or <code>-1</code> — and because a real governed verdict sits underneath, Excel can draw the red, amber, or green icon over it. Right-click the Status cell, choose <strong>Number Format</strong> or use <strong>Conditional Formatting &gt; Icon Sets</strong>, and the traffic light appears.</li>
+</ol>
+<p>Two things to know about Status:</p>
+<ul>
+<li><strong>It is the model owner's verdict, not Excel's guess.</strong> Green means exactly what the model owner decided green means — the same verdict shown on the Tessallite scorecard and in the Excel add-in.</li>
+<li><strong>Status is model-wide.</strong> It cannot be broken down per product or per country — if you drop a dimension next to it, Tessallite politely asks you to remove the breakdown rather than repeat one overall verdict forty times. To compare regions, use the measure (<code>net_sales</code>) and let the model owner define regional KPIs.</li>
+</ul>
+<p>Repeat for Revenue and Gross Margin % and the strip is done.</p>
+<h2>Step 5 — Add the chart</h2>
+<ol>
+<li>Click anywhere in the product PivotTable.</li>
+<li>Go to <strong>Insert &gt; PivotChart</strong> and pick a <strong>bar chart</strong> (bars beat columns for long product names — the labels stay readable).</li>
+<li>Excel draws the top-ten products. Because the chart reads the PivotTable, it follows the timeline and slicer automatically. No re-pointing, ever.</li>
+</ol>
+<h2>Step 6 — A slicer for country, then arrange</h2>
+<ol>
+<li>Click the PivotTable, then <strong>Insert &gt; Slicer</strong>, and tick <strong><code>country_code</code></strong>.</li>
+<li>A tidy button panel appears. Click <code>US</code> and the whole sheet — PivotTable, chart, everything wired to the connection — recomputes for US sales only.</li>
+<li>Arrange the four parts on one sheet: KPI strip on top, chart beside the PivotTable, timeline and slicer along the left where they are easy to reach.</li>
+</ol>
+<p>Save the workbook. Tomorrow, or next Monday, click <strong>Data &gt; Refresh All</strong>. Every step you just did re-runs against the current data, with the same security and the same definitions everyone else's reports use. Maya's Monday pack is now a one-button job.</p>
+<h2>What Tessallite did while you were clicking</h2>
+<p>Every drag, filter, and timeline movement became a query against the semantic model — not against a copy of the data in your workbook. If a pre-computed summary (an aggregate) covers what you asked, Tessallite silently answered from it, which is why even the first drag felt quick. If not, the query went to the governed source path. Either way, the number is the same number your colleague in Power BI gets for the same question — that is the whole point of putting a semantic layer in the middle.</p>
+<figure class="illustration"><img class="illustration" src="../assets/illustrations/query-routing-flow.svg" alt="Query routing flow."></figure>
+<h2>Good habits and common traps</h2>
+<blockquote><p><strong>Good habit: filter the period first.</strong> Set the timeline before you build the rest. Every later step then works on less data, so the whole build feels snappier.</p></blockquote>
+<blockquote><p><strong>Good habit: drill through instead of rebuilding.</strong> Double-click any PivotTable value cell and Tessallite returns the fact rows behind it on a new sheet — curated by the model, filtered by your security, and guaranteed to reconcile with the cell you clicked. Far safer than writing a second query by hand and hoping it matches.</p></blockquote>
+<blockquote><p><strong>Common trap: deleting rows by hand.</strong> Hiding or deleting PivotTable rows in Excel breaks subtotals and does not survive refresh. If you want fewer rows, use a <strong>Value Filter</strong> — it lives in the query, so it is still correct after every refresh.</p></blockquote>
+<blockquote><p><strong>Common trap: inventing a metric in the sheet.</strong> A Calculated Field is fine for presentation maths like margin divided by sales. But if the business needs a new number everyone shares — a blended margin, a growth target — ask the modeller to add it to the model. Then it is governed, reusable, and identical in every tool, not just in your workbook.</p></blockquote>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr></thead><tbody>
+<tr><td>No models when choosing a connection</td><td>Nothing deployed in the workspace</td><td>Ask your modeller to deploy a model</td></tr>
+<tr><td>Field list shows fields you did not expect</td><td>You are scoped to a different persona than intended</td><td>Personas shape what you can see; check with your administrator if something you need is missing</td></tr>
+<tr><td>KPI Status cell is blank</td><td>The KPI has no target or bands to judge against</td><td>Use Value and Goal; ask the model owner to add bands if a verdict is wanted</td></tr>
+<tr><td>Drill-through shows fewer rows than expected</td><td>Row security is filtering the detail</td><td>This is the security working, not a bug — the detail always matches what you are allowed to see</td></tr>
+<tr><td>Refresh asks for the password again</td><td>The saved credentials expired</td><td>Re-enter your Tessallite password in the connection prompt</td></tr>
+</tbody></table></div>
+<h2>Related</h2>
+<ul>
+<li><a href="../getting-started/connect-excel.html">Connect Excel via XMLA</a></li>
+<li><a href="../integrations/excel-pivottable-features.html">Excel PivotTable Features</a></li>
+<li><a href="excel-formulas-that-stay-live.html">Excel Formulas That Stay Live</a></li>
+<li><a href="../integrations/excel-add-in.html">Tessallite Excel Add-in</a></li>
+</ul>
+<nav class="page-nav"><a href="choosing-your-connection.html" class="page-nav-btn prev">&larr; Choose Your Connection</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="build-a-report-with-the-excel-add-in.html" class="page-nav-btn next">Build a Report with the Excel Add-in &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

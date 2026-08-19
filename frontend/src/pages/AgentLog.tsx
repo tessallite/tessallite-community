@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Alert,
   Box,
@@ -29,9 +29,10 @@ import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import ThumbUpIcon from "@mui/icons-material/ThumbUp";
 import ThumbDownIcon from "@mui/icons-material/ThumbDown";
 import { useProject } from "../api/hooks";
-import { agentApi, type AgentKpis, type LogFilters, type LogTurnRow } from "../api/agentApi";
+import { agentApi, type AgentKpis, type EvalReport, type LogFilters, type LogTurnRow } from "../api/agentApi";
 import { statusColor } from "../theme/tokens";
 import HelpIconButton from "../components/HelpIconButton";
+import { canEditModelConfig } from "../auth/currentUser";
 import { useT } from "../i18n";
 
 function formatTokens(n: number): string {
@@ -337,6 +338,106 @@ function KpiStrip({ projectId }: { projectId: string }) {
   );
 }
 
+/**
+ * The agent eval harness, given a way in.
+ *
+ * ``agentApi.runEval`` and the whole ``POST .../agent/eval/run`` endpoint have
+ * existed with no caller: the only way to replay a project's example questions
+ * and see whether the agent regressed was to call the API by hand. The run
+ * spends real LLM budget and is gated server-side on the project modeller role,
+ * so the control is shown to the same tier rather than to every viewer.
+ */
+function EvalStrip({ projectId }: { projectId: string }) {
+  const t = useT();
+  const evalMutation = useMutation({
+    mutationFn: () => agentApi.runEval(projectId),
+  });
+  const report: EvalReport | undefined = evalMutation.data;
+
+  return (
+    <Card variant="outlined">
+      <CardContent sx={{ py: 1, px: 1.5, "&:last-child": { pb: 1 } }}>
+        <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: "wrap" }} useFlexGap>
+          <Typography variant="subtitle2" fontWeight={600}>
+            {t("agentLog.evalTitle")}
+          </Typography>
+          <Button
+            variant="outlined"
+            size="small"
+            disabled={evalMutation.isPending}
+            onClick={() => evalMutation.mutate()}
+          >
+            {evalMutation.isPending ? t("agentLog.evalRunning") : t("agentLog.evalRunButton")}
+          </Button>
+          {evalMutation.isPending && <CircularProgress size={14} />}
+          <Typography variant="caption" color="text.secondary">
+            {t("agentLog.evalDescription")}
+          </Typography>
+        </Stack>
+
+        {evalMutation.isError && (
+          <Alert severity="error" sx={{ mt: 1 }}>
+            {t("agentLog.evalError", {
+              error: (evalMutation.error as Error)?.message ?? "",
+            })}
+          </Alert>
+        )}
+
+        {report && (
+          <>
+            {/* A regression is the outcome that matters: the server documents
+                it as a FAILED run whatever the ok/refused/error counts say, so
+                it is stated as its own verdict rather than left to be inferred
+                from the numbers beside it. */}
+            <Alert
+              severity={report.regressed ? "error" : "success"}
+              sx={{ mt: 1 }}
+            >
+              {report.regressed
+                ? t("agentLog.evalRegressed")
+                : t("agentLog.evalNotRegressed")}
+            </Alert>
+            {report.budget_stopped && (
+              <Alert severity="warning" sx={{ mt: 1 }}>
+                {t("agentLog.evalBudgetStopped", { reason: report.budget_stopped })}
+              </Alert>
+            )}
+            <Stack
+              direction="row"
+              spacing={1}
+              sx={{ flexWrap: "wrap", mt: 1 }}
+              useFlexGap
+            >
+              <KpiCard label={t("agentLog.evalTotal")} value={report.total} />
+              <KpiCard label={t("agentLog.evalOk")} value={report.ok} />
+              <KpiCard label={t("agentLog.evalRefused")} value={report.refused} />
+              <KpiCard label={t("agentLog.evalClarify")} value={report.clarify} />
+              <KpiCard label={t("agentLog.evalErrors")} value={report.error} />
+              {report.accuracy_score != null && (
+                <KpiCard
+                  label={t("agentLog.evalAccuracy")}
+                  value={`${(report.accuracy_score * 100).toFixed(0)}%`}
+                />
+              )}
+            </Stack>
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ mt: 0.5, display: "block" }}
+            >
+              {t("agentLog.evalDecompositionStats", {
+                compared: String(report.decomposition_compared),
+                unparseable: String(report.decomposition_unparseable),
+                regressions: String(report.decomposition_regressions),
+              })}
+            </Typography>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function AgentLog() {
   const t = useT();
   const { tenantId, projectId } = useParams<{
@@ -510,6 +611,9 @@ export default function AgentLog() {
 
       {/* KPI strip */}
       <KpiStrip projectId={projectId!} />
+
+      {/* Eval harness — modeller tier, mirroring the endpoint gate */}
+      {canEditModelConfig() && <EvalStrip projectId={projectId!} />}
 
       {/* Loading */}
       {logQuery.isLoading && (

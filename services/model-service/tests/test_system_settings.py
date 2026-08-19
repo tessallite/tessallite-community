@@ -148,3 +148,43 @@ async def test_bootstrap_masks_secrets(http_client):
     # DSN password is redacted but user/host visible
     assert "*****" in by_name["SYSTEM_DATABASE_URL"]["value"]
     assert by_name["SYSTEM_DATABASE_URL"]["value"].startswith("postgresql+asyncpg://tessallite:")
+
+
+# ---------------------------------------------------------------------------
+# Bug-7902: derived_expression_routing_mode must be writable
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_put_derived_expression_routing_mode_succeeds(http_client):
+    """Bug-7902: the query.derived_expression_routing_mode setting must be
+    writable through the system settings API. Previously surfaced=False
+    caused a 400 rejection, making the serve gate unreachable.
+    """
+    mock_db = _mock_system_db(None)
+    async def _gen():
+        yield mock_db
+
+    with patch("shared.db.session.get_system_db", _gen), \
+         patch("src.api.system_settings.set_setting", new_callable=AsyncMock) as mock_set, \
+         patch("src.api.system_settings.update_snapshot"):
+        resp = await http_client.put(
+            "/api/v1/system/settings/query.derived_expression_routing_mode",
+            json={"value": "shadow"},
+        )
+
+    assert resp.status_code == 200, (
+        f"Bug-7902: setting routing_mode to 'shadow' must succeed, got {resp.status_code}: {resp.text}"
+    )
+    mock_set.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_derived_expression_routing_mode_is_surfaced():
+    """Bug-7902: the setting must appear in the surfaced system settings list
+    (surfaced=True in the registry), so the write guard allows it.
+    """
+    from shared.config.registry import get_def
+    d = get_def("query.derived_expression_routing_mode", "system")
+    assert d.surfaced is True, (
+        "Bug-7902: query.derived_expression_routing_mode must be surfaced=True"
+    )

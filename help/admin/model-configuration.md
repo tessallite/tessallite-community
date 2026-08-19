@@ -42,6 +42,12 @@ Knobs for the optimiser sweep that proposes new aggregates on this model:
 - **Lookback hours** — how far back the optimiser reads telemetry to pick candidates.
 - **Max creates per run** and **auto-create cap per sweep** — upper bounds on what the optimiser can materialise unattended.
 - **Confidence threshold** — recommendations below this are dropped.
+- **Derived-expression auto-build** (`derived_expression_auto_build`) — controls whether the optimiser builds the *enriched* aggregates that carry a dimension's detail column alongside its key, so a proven attribute relationship can be served by relabelling (see [Dimension Attribute Relationships](../modelling/dimension-attribute-relationships.md)). Three settings:
+  - **Off** (default) — the optimiser never adds detail passengers. Attribute relationships can be declared and proven but have no aggregate to serve from, so those queries stay on the source path.
+  - **Approval** — the optimiser proposes enriched aggregates but does not materialise them until a modeller approves each one. This is the recommended middle ground: you keep control over the extra storage while getting candidates surfaced.
+  - **Automatic** — the optimiser materialises enriched aggregates unattended, the same way it auto-creates ordinary aggregates. Fastest to benefit, but it adds columns and refresh cost without a review step.
+
+  This mirrors the ordinary AI-Optimizer auto-create tradeoff: automatic favours speed and hit-rate, approval favours control and cost discipline, off keeps the model unchanged. It only governs *building* the enriched aggregates; whether the platform actually relabels live queries from them is a separate system-wide switch an administrator sets. Both must be on before a proven relationship changes how any query runs; until then, results are always correct from the ordinary path.
 
 Override these when a model has a different signal density than the project default — high-traffic models often want a tighter cron and a higher cap; low-traffic models can run with a longer lookback.
 

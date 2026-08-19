@@ -12,6 +12,7 @@ import {
   AccordionDetails,
   AccordionSummary,
   Alert,
+  AlertTitle,
   Box,
   Button,
   Chip,
@@ -57,6 +58,7 @@ import SqlQueryEditor, { formatSql } from "../Sql/SqlQueryEditor";
 import { TIME_VARIANT_NAMES } from "../../constants/timeVariants";
 import CalendarBindingHint from "../CalendarBindingHint";
 import { ui } from "../../theme/tokens";
+import { rowSecurityDeniedAll } from "../../utils/rowSecurity";
 import { useBuilderStore } from "../../store/builderStore";
 import {
   extractQueryFieldCompatibilityFromError,
@@ -374,6 +376,8 @@ export default function QueryPanel() {
     : explainResult?.rewritten_query ?? "";
 
   const allRows = executeResult?.rows ?? [];
+  // Bug-8453: classify via the shared contract, never via allRows.length.
+  const executeRowSecurityDenied = rowSecurityDeniedAll(executeResult);
   const pagedRows = useMemo(
     () => allRows.slice(page * pageSize, page * pageSize + pageSize),
     [allRows, page, pageSize],
@@ -628,7 +632,11 @@ export default function QueryPanel() {
         <Box>
           <Box display="flex" gap={1} flexWrap="wrap" mb={0.5}>
             <Tooltip
-              title={executeResult.reason || `${t("query.routeType")}: ${executeResult.route_type}`}
+              title={routeReasonLabel(
+                executeResult.route_type,
+                executeResult.reason,
+                t,
+              )}
               placement="top"
               arrow
             >
@@ -652,7 +660,21 @@ export default function QueryPanel() {
             feedback={executeResult.field_compatibility}
             t={t}
           />
-          {allRows.length === 0 ? (
+          {/* Bug-8453: a row-security deny-all previously rendered as a bare
+              empty grid, indistinguishable from "there is genuinely no data".
+              Shown regardless of row count, because a denied query still
+              returns a row for COUNT-shaped SQL (WHERE 0 = 1 -> 0). */}
+          {executeRowSecurityDenied && (
+            <Alert severity="warning" sx={{ mb: 1 }}>
+              <AlertTitle>{t("query.rowSecurityDeniedTitle")}</AlertTitle>
+              {t("query.rowSecurityDeniedBody")}
+            </Alert>
+          )}
+          {/* R5 finding F6: suppress the RESULT too, not just the empty-state
+              text. A denial can return a COUNT row containing 0, and a
+              screenshot of that cell does not travel with the warning above --
+              the same policy the pivot panel applies. */}
+          {executeRowSecurityDenied ? null : allRows.length === 0 ? (
             <Typography variant="caption" color="text.secondary">
               {t("query.noRowsReturned")}
             </Typography>
@@ -790,6 +812,29 @@ function QueryFieldCompatibilityAlert({
       )}
     </Alert>
   );
+}
+
+function routeReasonLabel(
+  routeType: string,
+  reason: string | undefined,
+  t: (key: string) => string,
+): string {
+  // The routing narrative is no longer withheld from any authenticated caller
+  // (decision 2026-08-11, option C), so `reason` is always prose.
+  const localizedReason = reason;
+  const LOCALIZED: Record<string, string> = {
+    source: "query.routeReasonSource",
+    aggregate: "query.routeReasonAggregate",
+    pocket: "query.routeReasonPocket",
+  };
+  const i18nKey = LOCALIZED[routeType];
+  if (i18nKey) {
+    const summary = t(i18nKey);
+    // Bug-6971: surface the router's detailed reason string instead of
+    // discarding it for known route types.
+    return localizedReason ? `${summary}\n${localizedReason}` : summary;
+  }
+  return localizedReason || `${t("query.routeType")}: ${routeType}`;
 }
 
 function routeBadgeLabel(routeType: string, t: (key: string) => string): string {

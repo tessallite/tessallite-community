@@ -1,6 +1,7 @@
 import { Box, Typography } from '@mui/material';
 import { tokens } from '../../theme';
 import type { DrillOption } from '../../types/tessallite';
+import { strings } from '../../i18n/strings';
 
 interface DrillPathPickerProps {
   options: DrillOption[];
@@ -18,7 +19,7 @@ export default function DrillPathPicker({
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25, px: 1.5, py: 0.5 }}>
       <Typography sx={{ fontSize: 11, fontWeight: 600, color: tokens.colorTextSecondary, mb: 0.25 }}>
-        Drill paths
+        {strings.drill.drillPaths}
       </Typography>
       {options.map(o => (
         <Box

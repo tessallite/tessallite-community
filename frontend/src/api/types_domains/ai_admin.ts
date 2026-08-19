@@ -125,6 +125,9 @@ export interface AIOptimizerRun {
   recommendations_count: number;
   aggregates_created: number;
   aggregates_skipped: number;
+  // F-011-04: provider-reported per-run spend (tokens); null when unavailable.
+  input_tokens: number | null;
+  output_tokens: number | null;
   error_message: string | null;
   raw_llm_response: string | null;
   diagnostics_log: Array<{ step: string; message: string; code_map?: Record<string, string> }> | null;
@@ -136,13 +139,80 @@ export interface SchedulerTriggerRequest {
   aggregate_id?: string;
   model_id?: string;
   mode?: "full" | "incremental";
+  // Bug-8131: optional per-request completion callback. Delivered ONLY through
+  // the durable SIGNED webhook contract — the URL must match a registered
+  // webhook endpoint that carries a valid signing secret, otherwise the
+  // callback is refused (never sent unsigned).
+  webhook_url?: string;
 }
+
+// Bug-8131: disposition of the optional completion callback.
+// - "enqueued": a durable signed delivery was persisted + dispatched.
+// - "refused_unsigned": a matching endpoint exists but has no valid signing
+//   secret; a terminal DLQ refusal was recorded and nothing was sent.
+// - "refused_no_endpoint": the URL is not a registered signed endpoint; a
+//   durable audit refusal record was written and nothing was sent.
+// null when no webhook_url was supplied.
+export type CallbackStatus =
+  | "enqueued"
+  | "refused_unsigned"
+  | "refused_no_endpoint";
+
 export interface TriggerRefreshResponse {
   run_id: string;
   aggregate_id: string;
   status: string;
   refresh_mode: string;
   error_message: string | null;
+  callback_status?: CallbackStatus | null;
+  callback_delivery_id?: string | null;
+}
+
+export interface TriggerPocketRefreshResponse {
+  run_id: string;
+  pocket_id: string;
+  status: string;
+  refresh_mode: string;
+  error_message: string | null;
+  callback_status?: CallbackStatus | null;
+  callback_delivery_id?: string | null;
+}
+
+// Bug-8132: GET /scheduler/jobs now carries the durable last-run outcome from
+// the scheduler_job_executions ledger, not just the next run time.
+export interface SchedulerJobInfo {
+  job_id: string;
+  name: string;
+  next_run_time: string | null;
+  last_status: string | null; // started | success | partial | error | misfire | busy
+  last_run_at: string | null;
+  last_finished_at: string | null;
+  last_outcome: string | null;
+  last_error: string | null;
+  last_trigger_source: string | null; // scheduled | manual
+}
+
+export interface ListSchedulerJobsResponse {
+  jobs: SchedulerJobInfo[];
+}
+
+// Bug-8133: POST /scheduler/trigger/{job_id} — allowlisted manual trigger for
+// the six system-wide maintenance jobs (system-admin only). ``status`` is the
+// sweep's TRUTHFUL outcome: success | partial | error | busy.
+export type ManualJobId =
+  | "daily_audit_purge_sweep"
+  | "daily_query_log_purge_sweep"
+  | "hourly_sla_sweep"
+  | "daily_agent_retention_sweep"
+  | "webhook_drain_sweep"
+  | "daily_webhook_retention_sweep";
+
+export interface ManualTriggerResponse {
+  job_id: string;
+  status: string; // success | partial | error | busy
+  execution_id: string | null;
+  trigger_source: string; // "manual"
+  detail: string | null;
 }
 
 export interface SLAConfig {
@@ -216,6 +286,8 @@ export interface RowSecuritySimulateRequest {
   roles: string[];
   groups?: string[];
   claims?: Record<string, unknown>;
+  probe_query?: string | null;
+  persona_id?: string | null;
 }
 
 export interface RowSecuritySimulateResponse {
@@ -223,6 +295,17 @@ export interface RowSecuritySimulateResponse {
   roles: string[];
   active_rule_ids: string[];
   compiled_predicate: string | null;
+  // Bug-8904: non-null when the server could NOT resolve the model's connector
+  // definitively and compiled the preview with a fallback dialect. The
+  // predicate above may then quote identifiers differently from the connector
+  // that actually runs the query, so this must be shown, not dropped.
+  connector_note?: string | null;
+  // F-007-03 / Bug-8987: real-result fields when a probe_query ran.
+  executed?: boolean;
+  route_type?: string | null;
+  columns?: string[] | null;
+  rows?: unknown[][] | null;
+  row_count?: number | null;
 }
 
 export interface SecurityAuditEntry {
@@ -294,7 +377,9 @@ export interface PredictiveCandidate {
   fact_table: string;
   score: number;
   score_pct: number;
-  expected_hit_rate: number;
+  // F-010-02 (honest relabel): cardinality-based heuristic priority score,
+  // NOT a predicted or measured hit rate. Renamed from expected_hit_rate.
+  heuristic_reuse_score: number;
   row_reduction: number;
   estimated_rows: number;
   rationale: string;
@@ -306,13 +391,27 @@ export interface PredictivePreview {
   had_stats?: boolean;
 }
 
+export interface PredictiveBuildAccepted {
+  model_id: string;
+  build_id: string;
+  status: string;
+}
+
 export interface PredictiveBuildResult {
   model_id: string;
+  build_id?: string;
   requested: number;
   created_aggregate_ids: string[];
   skipped_count: number;
   errors: string[];
   had_stats?: boolean;
+  status?: string;
+  // Bug-7091 consumer: governance/capacity outcomes (e.g. byte-ceiling trimming
+  // of successfully-built aggregates) are NOT errors — status stays "completed".
+  // Without surfacing these, a build whose aggregates were all ceiling-trimmed
+  // shows a success alert with created_aggregate_ids=[] and no explanation.
+  // Rendered as an informational notice, distinct from errors.
+  governance_notes?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +487,8 @@ export interface AuthBackendsResponse {
   backends: string[];
   saml_enabled: boolean;
   oidc_enabled: boolean;
+  ldap_enabled?: boolean;
+  gcp_iam_enabled?: boolean;
 }
 
 export interface GroupMapping {
@@ -428,11 +529,28 @@ export interface WebhookCreate {
   event_filters: string[];
 }
 
+/** Returned by POST create — includes the one-time plaintext signing secret. */
+export interface WebhookCreateResponse extends WebhookEndpoint {
+  signing_secret: string;
+}
+
 export interface WebhookUpdate {
   name?: string;
   url?: string;
   event_filters?: string[];
   is_active?: boolean;
+}
+
+/**
+ * Returned by PUT update. Bug-8556: repointing an endpoint at a different
+ * receiver rotates the signing secret server-side, and `signing_secret` carries
+ * the one-time plaintext for exactly that case. It is `null` for every update
+ * that did not rotate (name, event filters, an unchanged URL), so the caller
+ * shows the one-time secret dialog only when there is a new secret to hand
+ * over.
+ */
+export interface WebhookUpdateResponse extends WebhookEndpoint {
+  signing_secret: string | null;
 }
 
 export interface WebhookDelivery {

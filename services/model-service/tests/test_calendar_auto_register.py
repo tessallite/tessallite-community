@@ -66,6 +66,37 @@ async def test_no_unassigned_cols_returns_zero():
 
 
 @pytest.mark.asyncio
+async def test_missing_calendar_date_key_returns_three_tuple():
+    """Bug-6242 regression: when the calendar date-key column is not present on
+    the calendar alias, the function must return a well-formed 3-tuple that the
+    callers can unpack. It previously returned a 2-tuple, raising 'not enough
+    values to unpack' — which the calendar.py swallow hid, leaving a committed
+    calendar with no date hierarchy and a success response."""
+    from src.api.hierarchies import _auto_create_date_hierarchies_for_model
+
+    db = AsyncMock()
+    cal_mt = MagicMock()
+    cal_mt.calendar_table_id = uuid4()
+    cal_mt.id = uuid4()
+    cal_info = MagicMock()
+    cal_info.date_column = "date_key"
+    db.get = AsyncMock(side_effect=[cal_mt, cal_info])
+    col_result = MagicMock()
+    col_result.scalar_one_or_none.return_value = None  # date-key column absent
+    db.execute = AsyncMock(return_value=col_result)
+
+    # Must NOT raise a ValueError on unpack.
+    created, skipped, aliases = await _auto_create_date_hierarchies_for_model(
+        db, model_id=uuid4(), calendar_model_table_id=cal_mt.id, grain="y_m_d"
+    )
+
+    assert created == 0
+    assert aliases == []
+    assert len(skipped) == 1
+    assert "not found in calendar alias" in skipped[0]
+
+
+@pytest.mark.asyncio
 async def test_col_belonging_to_calendar_is_skipped():
     """Column that lives on the calendar table itself is skipped."""
     from src.api.hierarchies import _auto_create_date_hierarchies_for_model
@@ -188,7 +219,15 @@ async def test_auto_setup_creates_join_for_fact_date_to_alias():
     join_objs = [o for o in added_objects if isinstance(o, Join)]
     assert len(join_objs) == 1
     assert join_objs[0].left_column_id == attr.id
-    assert join_objs[0].join_type == "many_to_one"
+    # Join orientation and cardinality are SEPARATE fields (join-orientation
+    # contract, invariant 3). This edge runs owning-table -> calendar alias:
+    # many rows to one calendar day, preserved on the owning (many, anchor-ward)
+    # side, which is a LEFT join. Persisting the cardinality label into
+    # ``join_type`` — as this path used to — leaves the field that decides
+    # which rows survive undeclared, and the pocket row-population proof then
+    # refuses the whole model.
+    assert join_objs[0].join_type == "left"
+    assert join_objs[0].cardinality == "many_to_one"
 
 
 @pytest.mark.asyncio

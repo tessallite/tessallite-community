@@ -29,7 +29,14 @@ from fastapi import HTTPException
 from src.api.measures import _resolve_calendar_alias_for_measure
 from src.api.tables import create_table
 
+from .scope_fake_db import ScopedFakeDB
+
 pytestmark = pytest.mark.unit
+
+# Bug-8862: ``create_table`` now proves the path project owns the path model
+# before it touches the source, so these fixtures must model a real
+# project -> model chain instead of a random project id.
+PROJECT_ID = uuid.uuid4()
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +127,10 @@ def _patch_create_table_db(
     async def _get(model, key):
         if model.__name__ == "DataSource":
             return source
+        if model.__name__ == "Model":
+            # Bug-8862: the project -> model proof that now precedes the source
+            # lookup. Returning None here would make every create 404.
+            return types.SimpleNamespace(id=key, project_id=PROJECT_ID)
         return None
 
     db.get = AsyncMock(side_effect=_get)
@@ -188,7 +199,7 @@ async def test_create_table_first_use_alias_defaults_to_base_name(monkeypatch):
     )
     user = types.SimpleNamespace(tenant_id="t", user_id="u", email="u")
     response = await create_table(
-        project_id=uuid.uuid4(),
+        project_id=PROJECT_ID,
         model_id=model_id,
         source_id=source.id,
         body=body,  # type: ignore[arg-type]
@@ -221,7 +232,7 @@ async def test_create_table_second_use_auto_sequences_alias(monkeypatch):
     )
     user = types.SimpleNamespace(tenant_id="t", user_id="u", email="u")
     await create_table(
-        project_id=uuid.uuid4(),
+        project_id=PROJECT_ID,
         model_id=model_id,
         source_id=source.id,
         body=body,  # type: ignore[arg-type]
@@ -252,7 +263,7 @@ async def test_create_table_explicit_alias_is_respected(monkeypatch):
     )
     user = types.SimpleNamespace(tenant_id="t", user_id="u", email="u")
     await create_table(
-        project_id=uuid.uuid4(),
+        project_id=PROJECT_ID,
         model_id=model_id,
         source_id=source.id,
         body=body,  # type: ignore[arg-type]
@@ -293,7 +304,7 @@ async def test_create_table_rejects_sql_unsafe_alias(monkeypatch, bad_alias):
     user = types.SimpleNamespace(tenant_id="t", user_id="u", email="u")
     with pytest.raises(HTTPException) as exc:
         await create_table(
-            project_id=uuid.uuid4(),
+            project_id=PROJECT_ID,
             model_id=model_id,
             source_id=source.id,
             body=body,  # type: ignore[arg-type]
@@ -350,7 +361,7 @@ async def test_create_table_alias_inherits_sibling_columns(monkeypatch):
     )
     user = types.SimpleNamespace(tenant_id="t", user_id="u", email="u")
     await create_table(
-        project_id=uuid.uuid4(),
+        project_id=PROJECT_ID,
         model_id=model_id,
         source_id=source.id,
         body=body,  # type: ignore[arg-type]
@@ -399,7 +410,7 @@ async def test_create_table_rejects_duplicate_alias_in_model(monkeypatch):
     user = types.SimpleNamespace(tenant_id="t", user_id="u", email="u")
     with pytest.raises(HTTPException) as exc:
         await create_table(
-            project_id=uuid.uuid4(),
+            project_id=PROJECT_ID,
             model_id=model_id,
             source_id=source.id,
             body=body,  # type: ignore[arg-type]
@@ -409,19 +420,34 @@ async def test_create_table_rejects_duplicate_alias_in_model(monkeypatch):
     assert "already in use" in exc.value.detail
 
 
+
+
 # ---------------------------------------------------------------------------
-# _resolve_calendar_alias_for_measure — base measures
+# _resolve_calendar_alias_for_measure — body-FK ownership
 # ---------------------------------------------------------------------------
+#
+# These used to drive the resolver with ``AsyncMock.get`` because the resolver
+# hand-rolled its own ``db.get(...) ... != model_id`` pair. It now proves
+# ownership through the canonical body-FK primitive in ``src/api/_scope.py``,
+# which resolves the whole project -> model -> row chain inside ONE scoped
+# SELECT and answers 422 with the family's uniform detail. The intent of every
+# case below is unchanged (accept in-model, reject foreign, reject a plain
+# table, reject an unknown base); what changed is that the double now really
+# evaluates the ownership predicate instead of returning a canned row, so an
+# accept-everything OR a deny-everything regression is visible.
+
+
+def _alias_db():
+    return ScopedFakeDB(project_id=PROJECT_ID, model_id=uuid.uuid4())
 
 
 async def test_calendar_alias_none_passes_through_for_base():
-    model_id = uuid.uuid4()
-    db = AsyncMock()
-    db.get = AsyncMock(return_value=None)
+    db = _alias_db()
 
     out = await _resolve_calendar_alias_for_measure(
         db,
-        model_id=model_id,
+        model_id=db.model_id,
+        project_id=db.project_id,
         variant_kind=None,
         variant_of_measure_id=None,
         calendar_model_table_id=None,
@@ -430,16 +456,15 @@ async def test_calendar_alias_none_passes_through_for_base():
 
 
 async def test_calendar_alias_valid_returns_id():
-    model_id = uuid.uuid4()
-    cal_table_id = uuid.uuid4()
-    alias_table = _fake_modeltable(model_id=model_id, calendar_table_id=cal_table_id)
-
-    db = AsyncMock()
-    db.get = AsyncMock(return_value=alias_table)
+    db = _alias_db()
+    alias_table = db.add_table(
+        model_id=db.model_id, calendar_table_id=uuid.uuid4(),
+    )
 
     out = await _resolve_calendar_alias_for_measure(
         db,
-        model_id=model_id,
+        model_id=db.model_id,
+        project_id=db.project_id,
         variant_kind=None,
         variant_of_measure_id=None,
         calendar_model_table_id=alias_table.id,
@@ -448,44 +473,88 @@ async def test_calendar_alias_valid_returns_id():
 
 
 async def test_calendar_alias_in_other_model_rejected():
-    this_model = uuid.uuid4()
-    other_model = uuid.uuid4()
-    alias_table = _fake_modeltable(model_id=other_model, calendar_table_id=uuid.uuid4())
-
-    db = AsyncMock()
-    db.get = AsyncMock(return_value=alias_table)
+    """A calendar alias owned by a SIBLING model in the SAME project is still
+    refused — the near miss, not just the far one."""
+    db = _alias_db()
+    sibling_model = uuid.uuid4()
+    db.register_model(sibling_model, db.project_id)
+    foreign_alias = db.add_table(
+        model_id=sibling_model, calendar_table_id=uuid.uuid4(),
+    )
 
     with pytest.raises(HTTPException) as exc:
         await _resolve_calendar_alias_for_measure(
             db,
-            model_id=this_model,
+            model_id=db.model_id,
+            project_id=db.project_id,
             variant_kind=None,
             variant_of_measure_id=None,
-            calendar_model_table_id=alias_table.id,
+            calendar_model_table_id=foreign_alias.id,
         )
-    assert exc.value.status_code == 400
-    assert "ModelTable in this model" in exc.value.detail
+    assert exc.value.status_code == 422
+    assert exc.value.detail["error_code"] == "CALENDAR_ALIAS_TABLE_NOT_IN_MODEL"
+    assert exc.value.detail["field"] == "calendar_model_table_id"
+
+
+async def test_calendar_alias_unknown_and_foreign_project_are_indistinguishable():
+    """A calendar alias in ANOTHER PROJECT is refused, and refused IDENTICALLY
+    to an id that does not exist at all — the response must not tell the caller
+    which of the two it was (Bug-7253's existence-oracle lesson)."""
+    db = _alias_db()
+    other_project = uuid.uuid4()
+    other_model = uuid.uuid4()
+    db.register_model(other_model, other_project)
+    foreign_alias = db.add_table(
+        model_id=other_model, calendar_table_id=uuid.uuid4(),
+    )
+    unknown_id = uuid.uuid4()
+
+    details = []
+    for candidate in (foreign_alias.id, unknown_id):
+        with pytest.raises(HTTPException) as exc:
+            await _resolve_calendar_alias_for_measure(
+                db,
+                model_id=db.model_id,
+                project_id=db.project_id,
+                variant_kind=None,
+                variant_of_measure_id=None,
+                calendar_model_table_id=candidate,
+            )
+        assert exc.value.status_code == 422
+        details.append(dict(exc.value.detail))
+
+    foreign, unknown = details
+    # Everything except the echo of the caller's own id must be identical.
+    assert foreign["error_code"] == unknown["error_code"]
+    assert foreign["field"] == unknown["field"]
+    assert foreign["message"].replace(str(foreign_alias.id), "X") == (
+        unknown["message"].replace(str(unknown_id), "X")
+    )
 
 
 async def test_calendar_alias_without_calendar_binding_rejected():
     """A ModelTable that is not a calendar alias (calendar_table_id IS NULL)
-    cannot be used as a measure's calendar — covers Q5/Q3."""
-    model_id = uuid.uuid4()
-    plain_table = _fake_modeltable(model_id=model_id, calendar_table_id=None)
+    cannot be used as a measure's calendar — covers Q5/Q3.
 
-    db = AsyncMock()
-    db.get = AsyncMock(return_value=plain_table)
+    Distinct from the ownership rejection on purpose: this table IS in the
+    model, so the ownership guard must ACCEPT it and the state check must be
+    what refuses it. One merged error would hide an over-broad guard.
+    """
+    db = _alias_db()
+    plain_table = db.add_table(model_id=db.model_id, calendar_table_id=None)
 
     with pytest.raises(HTTPException) as exc:
         await _resolve_calendar_alias_for_measure(
             db,
-            model_id=model_id,
+            model_id=db.model_id,
+            project_id=db.project_id,
             variant_kind=None,
             variant_of_measure_id=None,
             calendar_model_table_id=plain_table.id,
         )
-    assert exc.value.status_code == 400
-    assert "not a calendar alias" in exc.value.detail
+    assert exc.value.status_code == 422
+    assert exc.value.detail["error_code"] == "NOT_A_CALENDAR_ALIAS"
+    assert "not a calendar alias" in exc.value.detail["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -497,16 +566,16 @@ async def test_variant_inherits_calendar_from_base():
     """Variant rows ignore any calendar_model_table_id they're handed and
     pick up the base measure's binding instead — Q4 (one calendar per
     measure, applied to every enabled variant)."""
-    model_id = uuid.uuid4()
+    db = _alias_db()
     base_cal = uuid.uuid4()
-    base = _fake_measure(model_id=model_id, calendar_model_table_id=base_cal)
-
-    db = AsyncMock()
-    db.get = AsyncMock(return_value=base)
+    base = db.add_measure(
+        model_id=db.model_id, calendar_model_table_id=base_cal,
+    )
 
     out = await _resolve_calendar_alias_for_measure(
         db,
-        model_id=model_id,
+        model_id=db.model_id,
+        project_id=db.project_id,
         variant_kind="ytd",
         variant_of_measure_id=base.id,
         calendar_model_table_id=uuid.uuid4(),  # ignored on variant rows
@@ -517,15 +586,13 @@ async def test_variant_inherits_calendar_from_base():
 async def test_period_aware_variant_allowed_without_calendar_on_base():
     """Period-aware variants no longer require calendar_model_table_id;
     period boundaries are computed from expressions on the hierarchy."""
-    model_id = uuid.uuid4()
-    base = _fake_measure(model_id=model_id, calendar_model_table_id=None)
-
-    db = AsyncMock()
-    db.get = AsyncMock(return_value=base)
+    db = _alias_db()
+    base = db.add_measure(model_id=db.model_id, calendar_model_table_id=None)
 
     out = await _resolve_calendar_alias_for_measure(
         db,
-        model_id=model_id,
+        model_id=db.model_id,
+        project_id=db.project_id,
         variant_kind="ytd",
         variant_of_measure_id=base.id,
         calendar_model_table_id=None,
@@ -536,15 +603,13 @@ async def test_period_aware_variant_allowed_without_calendar_on_base():
 async def test_pure_window_variant_does_not_require_calendar_on_base():
     """``lag`` / ``trailing_n`` / ``moving_avg_n`` are pure-window — they
     can be created against a base that has no calendar bound."""
-    model_id = uuid.uuid4()
-    base = _fake_measure(model_id=model_id, calendar_model_table_id=None)
-
-    db = AsyncMock()
-    db.get = AsyncMock(return_value=base)
+    db = _alias_db()
+    base = db.add_measure(model_id=db.model_id, calendar_model_table_id=None)
 
     out = await _resolve_calendar_alias_for_measure(
         db,
-        model_id=model_id,
+        model_id=db.model_id,
+        project_id=db.project_id,
         variant_kind="lag",
         variant_of_measure_id=base.id,
         calendar_model_table_id=None,
@@ -553,16 +618,41 @@ async def test_pure_window_variant_does_not_require_calendar_on_base():
 
 
 async def test_variant_against_unknown_base_is_rejected():
-    db = AsyncMock()
-    db.get = AsyncMock(return_value=None)
+    db = _alias_db()
 
     with pytest.raises(HTTPException) as exc:
         await _resolve_calendar_alias_for_measure(
             db,
-            model_id=uuid.uuid4(),
+            model_id=db.model_id,
+            project_id=db.project_id,
             variant_kind="ytd",
             variant_of_measure_id=uuid.uuid4(),
             calendar_model_table_id=None,
         )
-    assert exc.value.status_code == 400
-    assert "variant_of_measure_id" in exc.value.detail
+    assert exc.value.status_code == 422
+    assert exc.value.detail["error_code"] == "VARIANT_BASE_NOT_IN_MODEL"
+    assert exc.value.detail["field"] == "variant_of_measure_id"
+
+
+async def test_variant_base_in_another_project_is_rejected():
+    """The defect this lane closes: a base measure in a project the caller has
+    no binding for must not become a variant's parent."""
+    db = _alias_db()
+    other_project = uuid.uuid4()
+    other_model = uuid.uuid4()
+    db.register_model(other_model, other_project)
+    foreign_base = db.add_measure(
+        model_id=other_model, calendar_model_table_id=uuid.uuid4(),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await _resolve_calendar_alias_for_measure(
+            db,
+            model_id=db.model_id,
+            project_id=db.project_id,
+            variant_kind="ytd",
+            variant_of_measure_id=foreign_base.id,
+            calendar_model_table_id=None,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["error_code"] == "VARIANT_BASE_NOT_IN_MODEL"

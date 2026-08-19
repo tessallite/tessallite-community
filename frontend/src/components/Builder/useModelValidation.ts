@@ -43,13 +43,31 @@ export function useModelValidation(
     enabled: ready && Boolean(projectId) && Boolean(modelId),
   });
 
+  // F-026-03: distinguish "no server alerts" from "the alerts feed failed to
+  // load". Collapsing both into an empty list makes an unreachable validation
+  // engine look like a clean model. On query error we keep the last-known
+  // server alerts (React Query retains `data` as stale on a failed refetch) and
+  // add a persistent, retryable "validation unavailable" issue so the tray
+  // never presents a broken feed as no problems.
+  const alertsError = alerts.isError;
+
   // `t` is intentionally not a dependency: useT returns a fresh closure every
   // render (see Bug-1010), which would re-run the effect each render. The
   // locale value drives re-translation instead.
   /* eslint-disable react-hooks/exhaustive-deps */
   useEffect(() => {
     if (!ready) return;
+    const feedIssue: ValidationIssue[] = alertsError
+      ? [
+          {
+            id: "validation-feed-unavailable",
+            severity: "warning",
+            message: t("validation.feed.unavailable"),
+          },
+        ]
+      : [];
     const issues = [
+      ...feedIssue,
       ...mapAlertsToIssues(t, alerts.data ?? []),
       ...computeStructuralIssues(t, tables, joins, hasTarget),
     ];
@@ -59,6 +77,7 @@ export function useModelValidation(
   }, [
     ready,
     alerts.data,
+    alertsError,
     tables,
     joins,
     hasTarget,

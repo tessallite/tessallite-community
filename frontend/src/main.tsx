@@ -11,14 +11,20 @@ import "@fontsource/jetbrains-mono/700.css";
 import React, { useEffect, useMemo, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import createCache from "@emotion/cache";
+import { CacheProvider } from "@emotion/react";
 import { CssBaseline, ThemeProvider, createTheme } from "@mui/material";
 import type { PaletteMode } from "@mui/material";
+import rtlPlugin from "stylis-plugin-rtl";
 import { palette, font } from "./theme/tokens";
 import { registerTessalliteEChartsTheme } from "./theme/echartsTheme";
 import App from "./App";
 import StaleBundleGuard from "./components/StaleBundleGuard";
 import { safeLocalGet } from "./utils/safeLocalStorage";
+import { BRANDING_CHANGED_EVENT } from "./utils/brandingEvents";
 import { brandingApi, type BrandingConfig } from "./api/client";
+import { useBuilderStore } from "./store/builderStore";
+import { localeDirection, type ThemeDirection } from "./theme/direction";
 
 // Register Tessallite-branded ECharts theme once at startup
 registerTessalliteEChartsTheme();
@@ -63,7 +69,14 @@ function isValidHex(c: string | null | undefined): c is string {
   return typeof c === "string" && /^#[0-9a-fA-F]{3,8}$/.test(c);
 }
 
-function buildBrandTheme(mode: PaletteMode, branding?: BrandingConfig | null) {
+const ltrCache = createCache({ key: "mui" });
+const rtlCache = createCache({ key: "mui-rtl", stylisPlugins: [rtlPlugin] });
+
+function buildBrandTheme(
+  mode: PaletteMode,
+  direction: ThemeDirection,
+  branding?: BrandingConfig | null,
+) {
   const light = mode === "light";
   const primaryMain = isValidHex(branding?.primary_color)
     ? branding.primary_color
@@ -73,6 +86,7 @@ function buildBrandTheme(mode: PaletteMode, branding?: BrandingConfig | null) {
     : "#D4AF37";
   const fontFamily = branding?.font_family || font.sans;
   return createTheme({
+    direction,
     palette: light
       ? {
           mode: "light",
@@ -104,6 +118,8 @@ function Root() {
   const [preference, setPreference] = useState<ThemePreference>(() => readThemePreference());
   const [prefersDark, setPrefersDark] = useState<boolean>(() => systemPrefersDark());
   const [branding, setBranding] = useState<BrandingConfig | null>(null);
+  const [tenantId, setTenantId] = useState(() => safeLocalGet("tenant_id", ""));
+  const displayLocale = useBuilderStore((s) => s.displayLocale);
 
   useEffect(() => {
     const media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
@@ -114,35 +130,50 @@ function Root() {
     }
 
     const refreshPreference = () => setPreference(readThemePreference());
+    const refreshTenant = () => setTenantId(safeLocalGet("tenant_id", ""));
     window.addEventListener("storage", refreshPreference);
+    window.addEventListener("storage", refreshTenant);
     window.addEventListener(SETTINGS_CHANGED_EVENT, refreshPreference);
+    window.addEventListener(BRANDING_CHANGED_EVENT, refreshTenant);
 
     return () => {
       if (media) {
         media.removeEventListener("change", onMediaChange);
       }
       window.removeEventListener("storage", refreshPreference);
+      window.removeEventListener("storage", refreshTenant);
       window.removeEventListener(SETTINGS_CHANGED_EVENT, refreshPreference);
+      window.removeEventListener(BRANDING_CHANGED_EVENT, refreshTenant);
     };
   }, []);
 
+  // Fetch branding whenever tenant changes or branding is saved
   useEffect(() => {
-    const tenantId = safeLocalGet("tenant_id", "");
     if (!tenantId) return;
     brandingApi.get(tenantId).then(setBranding).catch(() => {});
-  }, []);
+
+    const refreshBranding = () => {
+      brandingApi.get(tenantId).then(setBranding).catch(() => {});
+    };
+    window.addEventListener(BRANDING_CHANGED_EVENT, refreshBranding);
+    return () => window.removeEventListener(BRANDING_CHANGED_EVENT, refreshBranding);
+  }, [tenantId]);
 
   const paletteMode: PaletteMode =
     preference === "dark" ? "dark" : preference === "light" ? "light" : prefersDark ? "dark" : "light";
-  const theme = useMemo(() => buildBrandTheme(paletteMode, branding), [paletteMode, branding]);
+  const direction = localeDirection(displayLocale);
+  const theme = useMemo(() => buildBrandTheme(paletteMode, direction, branding), [paletteMode, direction, branding]);
+  const emotionCache = direction === "rtl" ? rtlCache : ltrCache;
 
   return (
     <QueryClientProvider client={queryClient}>
-      <ThemeProvider theme={theme}>
-        <CssBaseline />
-        <StaleBundleGuard />
-        <App />
-      </ThemeProvider>
+      <CacheProvider value={emotionCache}>
+        <ThemeProvider theme={theme}>
+          <CssBaseline />
+          <StaleBundleGuard />
+          <App />
+        </ThemeProvider>
+      </CacheProvider>
     </QueryClientProvider>
   );
 }

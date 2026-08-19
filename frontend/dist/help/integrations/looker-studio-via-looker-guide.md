@@ -62,4 +62,4 @@ screenshots and captured gateway queries are signed off.
 
 ---
 
-<- [Looker Studio Direct Connection](looker-studio-connection-guide.md) | [Home](../index.md) | [LookML Emitter ->](lookml-emitter-guide.md)
+<- [Looker Studio Direct Connection](looker-studio-connection-guide.md) | [Home](../index.md) | [Looker Cloud Core - Not Required ->](looker-cloud-core-connection-guide.md)

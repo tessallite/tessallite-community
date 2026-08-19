@@ -15,6 +15,7 @@ persona ID does not resolve to a persona on this model.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any, Optional
 
@@ -26,6 +27,42 @@ from shared.db.models import Persona
 from shared.security.persona_resolver import resolve_effective_persona
 
 from src.ir.logical_query import BoundQuery, LogicalFilter
+
+logger = logging.getLogger(__name__)
+
+# F-008-02: non-disclosing persona/CLS denial. A restricted-object 403 must be
+# indistinguishable from an unknown-object 403 to the client — object name, tag
+# name, and persona identity are an existence oracle (an analyst can prove that
+# a hidden field such as ``salary`` exists). The generic contract below is what
+# leaves the process; the specific object/tag/persona detail goes only to the
+# server log for a privileged operator.
+_PERSONA_DENY_ERROR_CODE = "OBJECT_NOT_AVAILABLE"
+_PERSONA_DENY_MESSAGE = (
+    "One or more requested objects are not available for this query. They may "
+    "not exist or may not be accessible with your current access."
+)
+
+
+def _persona_denied(
+    *,
+    object_kind: str,
+    object_name: Any,
+    persona: Persona,
+    reason: str,
+) -> HTTPException:
+    """Build a non-disclosing 403 and log the (privileged) detail server-side."""
+    logger.info(
+        "[PERSONA_DENY] reason=%s kind=%s object=%r persona_id=%s persona=%r",
+        reason, object_kind, object_name, str(persona.id),
+        getattr(persona, "name", None),
+    )
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "error_code": _PERSONA_DENY_ERROR_CODE,
+            "message": _PERSONA_DENY_MESSAGE,
+        },
+    )
 
 
 # F-008-18: ``resolve_embed_persona`` was dead — the locked-persona path is
@@ -131,6 +168,8 @@ def enforce_persona(
     persona: Persona,
     bound: BoundQuery,
     excluded_level_attrs: set[str] | None = None,
+    excluded_measure_column_ids: set[str] | None = None,
+    excluded_measure_phys_names: set[str] | None = None,
 ) -> None:
     """Reject or filter the bound query based on the persona's allow list.
 
@@ -159,6 +198,13 @@ def enforce_persona(
         or hierarchy_allow
         or (persona.default_filters or {})
     ):
+        # F-008-02: the complex-SQL rejection names neither the persona nor the
+        # allow lists — a generic "rewrite as a plain SELECT" message. The
+        # persona identity/scope is logged, not returned.
+        logger.info(
+            "[PERSONA_DENY] reason=complex_sql persona_id=%s persona=%r",
+            str(persona.id), getattr(persona, "name", None),
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -167,11 +213,9 @@ def enforce_persona(
                     "This query uses advanced SQL constructs (for example "
                     "subqueries, CTEs, set operations, window functions, or "
                     "non-standard aggregates) that cannot be verified against "
-                    f"the allow lists or default filters of persona "
-                    f"'{persona.name}', so it was rejected. Rewrite the query "
-                    "as a plain SELECT over the model."
+                    "your effective access, so it was rejected. Rewrite the "
+                    "query as a plain SELECT over the model."
                 ),
-                "persona_id": str(persona.id),
             },
         )
 
@@ -193,18 +237,50 @@ def enforce_persona(
                 if getattr(m, "id", None) is None:
                     continue
                 if str(m.id) not in measure_allow:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail={
-                            "error_code": "PERSONA_OBJECT_NOT_INCLUDED",
-                            "message": (
-                                f"Measure {m.name!r} is not included in persona "
-                                f"{persona.name!r}."
-                            ),
-                            "object_kind": "measure",
-                            "object_name": m.name,
-                            "persona_id": str(persona.id),
-                        },
+                    raise _persona_denied(
+                        object_kind="measure",
+                        object_name=m.name,
+                        persona=persona,
+                        reason="measure_not_included",
+                    )
+
+        # F-008-01: the binder wraps a non-aggregated measure as a virtual
+        # dimension (``is_measure_as_dimension``). That path never hits
+        # ``resolved_measures``, so the measure allow-list must also gate
+        # those dimensions (and real dims that share an excluded measure's
+        # backing column / physical name).
+        excluded_cols = excluded_measure_column_ids or set()
+        excluded_phys = excluded_measure_phys_names or set()
+
+        def _hidden_measure_surface(d: Any) -> bool:
+            if getattr(d, "is_measure_as_dimension", False):
+                return str(getattr(d, "id", "")) not in measure_allow
+            src = getattr(d, "source_column_id", None)
+            if src is not None and str(src) in excluded_cols:
+                return True
+            phys = (
+                getattr(d, "physical_column", None)
+                or getattr(d, "column_name", None)
+                or ""
+            ).lower()
+            return bool(phys and phys in excluded_phys)
+
+        if is_star:
+            before = len(bound.resolved_dimensions)
+            bound.resolved_dimensions = [
+                d for d in bound.resolved_dimensions
+                if not _hidden_measure_surface(d)
+            ]
+            if len(bound.resolved_dimensions) != before:
+                bound.persona_narrowed_star = True
+        else:
+            for d in bound.resolved_dimensions:
+                if _hidden_measure_surface(d):
+                    raise _persona_denied(
+                        object_kind="measure",
+                        object_name=getattr(d, "name", None),
+                        persona=persona,
+                        reason="measure_as_dimension_not_included",
                     )
 
     if dimension_allow:
@@ -235,18 +311,11 @@ def enforce_persona(
         else:
             for d in bound.resolved_dimensions:
                 if not _dim_allowed(d):
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail={
-                            "error_code": "PERSONA_OBJECT_NOT_INCLUDED",
-                            "message": (
-                                f"Dimension {d.name!r} is not included in persona "
-                                f"{persona.name!r}."
-                            ),
-                            "object_kind": "dimension",
-                            "object_name": d.name,
-                            "persona_id": str(persona.id),
-                        },
+                    raise _persona_denied(
+                        object_kind="dimension",
+                        object_name=d.name,
+                        persona=persona,
+                        reason="dimension_not_included",
                     )
     if hierarchy_allow:
         if is_star:
@@ -266,19 +335,62 @@ def enforce_persona(
                 if hid is None:
                     continue
                 if str(hid) not in hierarchy_allow:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail={
-                            "error_code": "PERSONA_OBJECT_NOT_INCLUDED",
-                            "message": (
-                                f"Dimension {d.name!r} belongs to a hierarchy that is not "
-                                f"included in persona {persona.name!r}."
-                            ),
-                            "object_kind": "hierarchy",
-                            "object_name": d.name,
-                            "persona_id": str(persona.id),
-                        },
+                    raise _persona_denied(
+                        object_kind="hierarchy",
+                        object_name=d.name,
+                        persona=persona,
+                        reason="hierarchy_not_included",
                     )
+
+
+async def _get_excluded_measure_backing(
+    db: AsyncSession, model_id: str, persona: Persona,
+) -> tuple[set[str], set[str]]:
+    """Backing columns / physical names of measures OUTSIDE the allow-list.
+
+    F-008-01: used to deny a real dimension whose ``source_column_id`` (or
+    physical name) is the backing column of a hidden measure. Returns empty
+    sets when there is no measure restriction. Lookup failure refuses the
+    query (Bug-9260) instead of serving unrestricted.
+    """
+    measure_allow = _ids_as_strings(persona.included_measure_ids)
+    if not measure_allow:
+        return set(), set()
+    from sqlalchemy import select
+    from shared.db.models import Measure, ModelColumn
+
+    try:
+        result = await db.execute(
+            select(Measure.id, Measure.source_column_id, ModelColumn.column_name)
+            .outerjoin(ModelColumn, ModelColumn.id == Measure.source_column_id)
+            .where(Measure.model_id == model_id)
+        )
+        col_ids: set[str] = set()
+        phys: set[str] = set()
+        for mid, src, cname in result.all():
+            if str(mid) in measure_allow:
+                continue
+            if src is not None:
+                col_ids.add(str(src))
+            if cname:
+                phys.add(str(cname).lower())
+        return col_ids, phys
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Bug-9260: swallowing the lookup returned empty sets and disabled
+        # the F-008-01 backing-column guard. A timeout then served a real
+        # dimension whose source_column_id backs an excluded measure.
+        logger.exception(
+            "Bug-9260: excluded measure backing lookup failed; refusing query"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error_code": _PERSONA_DENY_ERROR_CODE,
+                "message": _PERSONA_DENY_MESSAGE,
+            },
+        ) from exc
 
 
 async def enforce_persona_gate(
@@ -294,7 +406,16 @@ async def enforce_persona_gate(
     allow-list, then delegates to ``enforce_persona``.
     """
     excluded = await _get_excluded_level_attribute_ids(db, model_id, persona)
-    enforce_persona(persona, bound, excluded_level_attrs=excluded)
+    excluded_cols, excluded_phys = await _get_excluded_measure_backing(
+        db, model_id, persona,
+    )
+    enforce_persona(
+        persona,
+        bound,
+        excluded_level_attrs=excluded,
+        excluded_measure_column_ids=excluded_cols,
+        excluded_measure_phys_names=excluded_phys,
+    )
 
 
 async def apply_persona_gate(
@@ -329,10 +450,15 @@ from shared.schemas.domains.aggregates_security import (
 def merge_default_filters(persona: Persona, bound: BoundQuery) -> list[str]:
     """Append the persona's default_filters into the bound query's WHERE.
 
-    Conflict policy: if the caller's query already references a dimension
-    by name, the user filter wins and the persona default is skipped.
-    Anything else is appended as an additional ``LogicalFilter`` so it
-    flows through the existing rewriter ``_render_where`` pipeline.
+    F-008-01 — MANDATORY, non-overridable security scope. A persona default
+    filter is a security predicate, not a UX default. The persona default is
+    ALWAYS appended, even when the caller already filters the same dimension.
+    Both filters flow to the rewriter's ``_render_where`` and are AND-composed,
+    so a user assigned to EMEA who requests APAC gets ``Region = 'EMEA' AND
+    Region = 'APAC'`` (empty result) — they can NARROW within their scope but
+    can never replace or escape it. The prior "user filter wins, skip the
+    persona default" behaviour let an EMEA user read APAC rows (row-scope
+    authorization failure).
 
     Supported value shapes per dimension:
       * scalar  -> eq
@@ -346,14 +472,20 @@ def merge_default_filters(persona: Persona, bound: BoundQuery) -> list[str]:
     defaults = persona.default_filters or {}
     if not defaults:
         return []
-    user_dim_names = {f.dimension_name for f in bound.resolved_filters}
     merged: list[str] = []
     for dim_name, raw in defaults.items():
-        if dim_name in user_dim_names:
+        # Bug-7662: @-prefixed keys are parameter overrides consumed by
+        # _bind_query_parameters (resolver.py), NOT dimension filters.
+        # Treating them as dimension names appends an unresolvable
+        # LogicalFilter that breaks every query for this persona.
+        if dim_name.startswith("@"):
             continue
         operator, value = _coerce_filter(raw)
         if operator is None:
             continue
+        # F-008-01: append unconditionally (mandatory AND). A user filter on the
+        # same dimension is NOT allowed to suppress the persona's default — the
+        # two AND together at render time, so the persona scope is inescapable.
         bound.resolved_filters.append(
             LogicalFilter(dimension_name=dim_name, operator=operator, value=value)
         )

@@ -18,6 +18,15 @@ export interface Source {
   config: Record<string, unknown>;
 }
 
+// Bug-5920: backend-computed calendar type availability (a canonical type
+// can require an optional runtime dependency not installed in this
+// deployment, e.g. hijri-converter for "hijri"). Frontend must render its
+// picker from this instead of a hardcoded per-type flag.
+export interface CalendarTypeAvailability {
+  calendar_type: string;
+  available: boolean;
+}
+
 export interface CalendarTable {
   id: string;
   data_source_id: string;
@@ -113,14 +122,16 @@ export interface Target {
 // ---------------------------------------------------------------------------
 // ModelTable / ModelColumn
 // ---------------------------------------------------------------------------
+// Bug-8930 / Bug-8876: no `source_id` and no `calendar_table_id` here.
+// `source_id` is a path parameter on the create route; `calendar_table_id` is
+// derived server-side and can only be set afterwards through
+// `ModelTableUpdate` (PATCH), which is ownership-guarded.
 export interface ModelTableCreate {
-  source_id: string;
   table_type: "fact" | "dim_aggregate" | "dim_detail" | "unclassified" | "calendar";
   physical_name: string;
   alias?: string;
   display_name: string;
   description?: string | null;
-  calendar_table_id?: string | null;
 }
 export interface ModelTableUpdate {
   table_type?: "fact" | "dim_aggregate" | "dim_detail" | "unclassified" | "calendar";
@@ -215,6 +226,12 @@ export interface DiscoveredColumn {
   column_name: string;
   data_type: string;
   is_nullable: boolean;
+  /**
+   * PRIMARY KEY membership read from the source catalogue (Bug-8618).
+   * Absent when the catalogue read failed — that is "unknown", NOT "not a
+   * key", and the sync endpoint leaves the stored flag alone for it.
+   */
+  is_primary_key?: boolean;
 }
 
 export interface TablePreviewResponse {
@@ -474,7 +491,27 @@ export interface GrainSuggestion {
 export interface HierarchyHealthStatus {
   hierarchy_id: string;
   hierarchy_name: string;
-  status: "ok" | "warning" | "error";
+  /**
+   * Verdict of the checks that RAN — not of every check that exists. F-016-08:
+   * a clean metadata check with no member probe reports `unverified_members`
+   * (not `ok`), so the status field itself is honest that member integrity was
+   * never looked at. `ok` is only reported when the probe ran and covered every
+   * adjacent level pair.
+   */
+  status: "ok" | "warning" | "error" | "unverified_members";
+  /**
+   * Bug-8510: authoritative statement from the API that the live
+   * member-integrity probe ran for this hierarchy AND scanned every adjacent
+   * level pair. Only `status === "ok" && members_probed` is genuinely healthy.
+   * Never re-derive this from the request, the caller's role, or the issue
+   * list.
+   *
+   * Declared required because every supported backend sends it, but test for
+   * it as `members_probed === true`, never as `!== false`: during a rolling
+   * deploy the served build can be older than this contract and omit the
+   * field, and "the server did not say" must read as not checked.
+   */
+  members_probed: boolean;
   issues: Array<{ issue_type: string; severity: string; detail: Record<string, unknown> }>;
 }
 
@@ -532,4 +569,3 @@ export interface DataQualityValidateResponse {
   violations_found: number;
   rule_results: Array<{ rule_id: string; rule_name: string; violation_count: number }>;
 }
-

@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Add a Data Source</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-18</span></div>
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-08-17</span></div>
     <h1>Add a Data Source</h1>
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/data-source-settings.png" alt="Model Builder — data source settings panel."></figure>
 <h2>What this covers</h2>
@@ -41,6 +41,10 @@
 <p>The test asks the gateway to authenticate against the source using the parameters you entered. It confirms:</p>
 <ul><li>The host is reachable from the gateway&#x27;s network.</li><li>The port is open and the database service is listening.</li><li>The credentials are accepted.</li><li>For BigQuery: the service account JSON is valid and has sufficient permissions.</li></ul>
 <p>A successful test does not validate that specific schemas or tables exist.</p>
+<p>Test Connection runs through the same query path as table discovery and profiling. Tessallite does not open your source database from the settings page itself.</p>
+<h2>Large catalogues and BigQuery profiling</h2>
+<p>The Sources panel lists up to about 500 tables (and about 50 BigQuery datasets). If your catalogue is larger, a banner explains that the list is incomplete — filter by schema to see the rest. The incomplete listing is a warning, not a table you can add to the model.</p>
+<p>When you classify or profile a BigQuery table, Tessallite uses approximate distinct counts and the dataset <code>__TABLES__</code> metadata for row counts. It does not run a billed <code>COUNT(*)</code> full table scan for that profile step.</p>
 <h2>Common connection failures</h2>
 <div class="table-wrapper"><table><thead><tr><th>Error</th><th>Likely cause</th><th>Remedy</th></tr></thead><tbody><tr><td>Connection timed out</td><td>Host not reachable; firewall or VPC block.</td><td>Allow the gateway&#x27;s outbound IP through the source&#x27;s firewall rules.</td></tr><tr><td>Connection refused</td><td>Database service not running on specified port, or wrong port.</td><td>Verify port number and confirm the database service is running.</td></tr><tr><td>Authentication failed</td><td>Wrong credentials or expired service account key.</td><td>Re-enter credentials. For BigQuery, generate a new key in the GCP console.</td></tr><tr><td>Database does not exist</td><td>Misspelled database name or user lacks access.</td><td>Confirm the database name and access grant.</td></tr><tr><td>Permission denied</td><td>User can connect but lacks SELECT on target schema.</td><td>Grant SELECT on the relevant schemas and tables.</td></tr></tbody></table></div>
 <h2>Schema search and filter</h2>

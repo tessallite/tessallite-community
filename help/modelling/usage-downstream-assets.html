@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Usage &amp; Downstream Assets — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Usage &amp; Downstream Assets</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="audience-badge">beta</span></div>
+    <h1>Usage &amp; Downstream Assets</h1>
+<h2>What this covers</h2>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/impact-panel.png" alt="Usage &amp; Downstream Assets panel opened from Model Builder."></figure>
+<p>This panel helps you keep a record of who and what depends on a model. It has three tabs: manually recorded <strong>downstream assets</strong>, table-level <strong>query usage</strong>, and producer-derived <strong>column usage</strong>. Together they show known consumers and the successful queries observed through Tessallite before you change a model.</p>
+<p class="callout-note"><strong>Beta.</strong> This feature is implemented and unit-tested but has not completed its acceptance run. Treat the results as informational rather than a complete inventory.</p>
+<h2>What this feature does &mdash; and does not &mdash; do</h2>
+<p>It is important to be precise about the scope, because the three tabs have real limits:</p>
+<ul>
+<li><strong>Manual downstream assets are exactly what you enter.</strong> Nothing is discovered automatically. If a dashboard is not tagged, the panel does not know about it.</li>
+<li><strong>The usage scan reads Tessallite&#x27;s own query log, not the source database.</strong> It looks at queries that flowed <em>through the Tessallite gateway</em> and were logged there. It does <strong>not</strong> read the source database&#x27;s own query history (for example PostgreSQL <code>pg_stat_statements</code> or BigQuery <code>INFORMATION_SCHEMA.JOBS</code>). Queries that reach the source by some other path are invisible to it.</li>
+<li><strong>Column Usage uses semantic references recorded by the query router.</strong> New log rows carry stable model-column IDs for selected, filtered, grouped, and measure-backed fields. Older rows without those references use semantic and rewritten-SQL names as a fallback, and ambiguous matches are labelled.</li>
+<li><strong>Calculated and UDA-backed fields ARE traced back to the columns they read.</strong> If a measure is worked out from other measures, or a field is built from an attribute, Tessallite follows the chain and marks the underlying columns as used. So a column you only ever use inside a calculation still shows up as in use, and you will not drop it by mistake.</li>
+</ul>
+<p>In short: this is a usage-and-consumption record, not a full lineage or breaking-change analyser. Use it to build awareness of consumers, not as a guarantee that you have found every dependency.</p>
+<h2>Three parts of the panel</h2>
+<h3>Downstream assets (manual)</h3>
+<p>You register downstream assets by hand. This is the authoritative list and gives you full control over what is tracked.</p>
+<ol><li>Open the <strong>Usage &amp; Downstream Assets</strong> panel in Model Builder (Toolbelt sidebar).</li><li>Click <strong>Add Asset</strong>.</li><li>Enter the asset details:</li></ol>
+<ul><li><strong>Name</strong> (e.g. &quot;Sales Dashboard&quot;, &quot;Weekly Revenue Report&quot;)</li><li><strong>Type</strong> (Dashboard, Report, ML Job, API, Other)</li><li><strong>Owner</strong> (person or team responsible)</li><li><strong>URL</strong> (optional link to the asset)</li><li><strong>Notes</strong> (optional free text)</li></ul>
+<ol><li>Click <strong>Save</strong>. The asset appears in the downstream assets list.</li></ol>
+<p>Because the list is manual, its value depends on keeping it current. When a dashboard is retired or a new report is built, update the list so it stays a reliable record.</p>
+<h3>Usage scan (query log)</h3>
+<p>Tessallite scans its <strong>own internal gateway query log</strong> to discover which of the model&#x27;s physical tables have been queried through the platform. The scan searches the recorded query text of successful gateway queries for the model&#x27;s physical table names, matched as whole identifier tokens (so <code>order</code> does not match <code>orders</code>).</p>
+<p>To run a scan:</p>
+<ol><li>Open the <strong>Usage &amp; Downstream Assets</strong> panel.</li><li>Switch to the <strong>Query Usage</strong> tab.</li><li>Click <strong>Run scan</strong>. Tessallite reviews the gateway query log for this model and looks for the model&#x27;s table names in the recorded queries.</li><li>Review the results. Each row shows the matched table, the user who ran the query, how many times the pattern was seen (hit count), and when it was last observed.</li></ol>
+<p>The scan is incremental: it only reads log rows newer than the last scan, so pressing the button again on an unchanged log adds nothing. It is a supplement to the manual list &mdash; it can surface table-level usage you had not tagged, within the limits described above.</p>
+<h3>Column usage (query log)</h3>
+<p>Open the <strong>Column Usage</strong> tab to see stable column references recorded during semantic binding. Each row identifies the model table and column, the number of references, the number of distinct queries, and the latest observed use. This view reads the query log directly; <strong>Run scan</strong> is only needed to refresh the persisted table-usage summary.</p>
+<p>For legacy rows without stable references, Tessallite reconciles semantic and rewritten SQL names against model columns. A warning marks results where a name maps to more than one model column.</p>
+<h2>Reading the panel</h2>
+<h3>Summary line</h3>
+<p>When at least one downstream asset is registered, a summary line shows how many assets depend on the model, broken down by type.</p>
+<h3>Downstream assets list</h3>
+<p>Each asset shows its name (linked if you supplied a URL), type, owner, and the number of columns you associated with it. Click the edit icon to change an asset, or the delete icon to remove it.</p>
+<h3>Query Usage tab</h3>
+<p>Shows, for this model:</p>
+<ul><li>The model&#x27;s physical tables that appeared in logged gateway queries</li><li>Hit count (how many distinct logged query patterns referenced each table)</li><li>The user who ran the query and when it was last seen</li></ul>
+<h3>Column Usage tab</h3>
+<p>Shows which column each reference belongs to, how many times it was referenced, how many separate queries touched it, and when it was last used. Columns reached indirectly - through a calculated measure, a time-comparison variant, or an attribute-backed field - are included, so the list covers what queries really read, not only what they spell out.</p>
+<h2>When to use it</h2>
+<ul><li><strong>Before retiring or heavily changing a model.</strong> Check the downstream assets list to see who to notify, and run a usage scan to see which tables were actually queried recently.</li><li><strong>During model reviews.</strong> A model with many recorded consumers and active query usage deserves more care than one with none.</li><li><strong>To keep a shared consumer record.</strong> The manual list is a lightweight place for the team to record known dashboards, reports, and jobs in one spot.</li></ul>
+<h2>Best practices</h2>
+<ul><li><strong>Keep the manual list current.</strong> Its usefulness comes entirely from being up to date. When a dashboard is retired or a report changes, update the entry.</li><li><strong>Run usage scans periodically.</strong> New consumers may appear in the query log that were never tagged by hand. The scan picks up where it left off and reads a batch at a time: if the panel says more entries remain, press Run scan again to keep going. If it says nothing new was recorded, that simply means no one has queried the model since the last scan - it does not mean the model is unused.</li><li><strong>Do not treat usage as complete.</strong> It only sees queries logged by the Tessallite gateway. Consumers that reach the source another way, or that you never tagged, will not appear. Column Usage also reads only the most recent batch of query log entries and tells you when older ones exist beyond it, so an empty result means &quot;nothing found in what was read&quot;, not &quot;nothing uses this&quot;. A <code>SELECT *</code> query names no individual column, so it counts as table usage but adds nothing to Column Usage.</li><li><strong>Combine all three tabs.</strong> The manual list captures known consumers with owners; the usage views show observed table and direct column references. Read them together.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="view-model-lineage.html">View Model Lineage</a></li><li><a href="save-and-version-a-model.html">Save and Version a Model</a></li><li><a href="deploy-a-model.html">Deploy a Model</a></li></ul>
+<nav class="page-nav"><a href="data-quality-rules.html" class="page-nav-btn prev">&larr; Data Quality Rules</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="named-queries.html" class="page-nav-btn next">Named Queries &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

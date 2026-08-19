@@ -17,6 +17,7 @@ import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 import TuneIcon from "@mui/icons-material/Tune";
 import type { Dimension, Measure } from "../../../../api/types";
 import DimChipList from "./DimChipList";
+import MeasureInfoPopover, { type MeasureGlossaryInfo } from "./MeasureInfoPopover";
 import ExecutionModeDialog, { type ExecutionMode } from "./ExecutionModeDialog";
 import FormatPopover from "./FormatPopover";
 import { PIVOT_MAX_COL_DIMS, PIVOT_MAX_ROW_DIMS } from "../types";
@@ -28,6 +29,10 @@ type Props = {
   modelId: string;
   // Available base measures (already includes the synthetic Record Count).
   measures: Measure[];
+  // Bug-8102: approved glossary definition/synonyms keyed by measure id, for
+  // the contextual measure-info popover. Optional — the popover falls back to
+  // the measure's own description when a glossary entry is absent.
+  glossaryByMeasureId?: Map<string, MeasureGlossaryInfo>;
   dimensions: Dimension[];
   selections: MeasureSel[];
   rowDimIds: string[];
@@ -48,6 +53,7 @@ export default function PickerBar({
   projectId,
   modelId,
   measures,
+  glossaryByMeasureId,
   dimensions,
   selections,
   rowDimIds,
@@ -137,6 +143,10 @@ export default function PickerBar({
                       ({m.variant_kind})
                     </Typography>
                   )}
+                  <MeasureInfoPopover
+                    measure={m}
+                    glossary={glossaryByMeasureId?.get(m.id)}
+                  />
                 </Stack>
               </MenuItem>
             ))}
@@ -167,6 +177,10 @@ export default function PickerBar({
               >
                 {m.display_name || m.name}
               </Typography>
+              <MeasureInfoPopover
+                measure={m}
+                glossary={glossaryByMeasureId?.get(m.id)}
+              />
               {aggLocked ? (
                 <Typography variant="caption" color="text.secondary">
                   {t(`pivot.agg.${currentAgg.toLowerCase()}`)}

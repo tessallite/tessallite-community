@@ -72,7 +72,7 @@ async def test_stream_endpoint_returns_event_stream_content_type():
     with (
         patch("src.api.conversations._run_turn_into_publisher", side_effect=fake_run),
         patch("src.api.conversations.get_tenant_db", async_gen_from(db)),
-        patch("src.api.conversations._require_agent_enabled", new_callable=AsyncMock),
+        patch("src.api.conversations._require_project_access_and_agent", new_callable=AsyncMock),
     ):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"
@@ -114,7 +114,7 @@ async def test_stream_narration_delta_events_accumulate():
     with (
         patch("src.api.conversations._run_turn_into_publisher", side_effect=fake_run),
         patch("src.api.conversations.get_tenant_db", async_gen_from(db)),
-        patch("src.api.conversations._require_agent_enabled", new_callable=AsyncMock),
+        patch("src.api.conversations._require_project_access_and_agent", new_callable=AsyncMock),
     ):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"
@@ -153,7 +153,7 @@ async def test_stream_ends_with_closed_sentinel():
     with (
         patch("src.api.conversations._run_turn_into_publisher", side_effect=fake_run),
         patch("src.api.conversations.get_tenant_db", async_gen_from(db)),
-        patch("src.api.conversations._require_agent_enabled", new_callable=AsyncMock),
+        patch("src.api.conversations._require_project_access_and_agent", new_callable=AsyncMock),
     ):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver"

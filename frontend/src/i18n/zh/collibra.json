@@ -1,4 +1,5 @@
 {
+  "collibra.activate": "激活",
   "collibra.addConnection": "添加连接",
   "collibra.assets": "资产",
   "collibra.assetsCount": "{{count}} 个资产",
@@ -8,6 +9,7 @@
   "collibra.baseUrlPlaceholder": "https://your-company.collibra.com",
   "collibra.communityChip": "社区: {{value}}",
   "collibra.communityId": "社区 ID",
+  "collibra.deactivate": "停用",
   "collibra.delete": "删除",
   "collibra.deleteFailed": "删除失败。",
   "collibra.details": "详情",

@@ -29,6 +29,7 @@ MEASURES = [
     {"id": "m1", "name": "Revenue", "default_agg": "sum", "display_name": "Revenue"},
     {"id": "m2", "name": "Cost", "default_agg": "sum", "display_name": "Cost"},
     {"id": "m3", "name": "Units", "default_agg": "sum", "display_name": "Units Sold"},
+    {"id": "m4", "name": "Target_AOV", "default_agg": "avg", "display_name": "Target AOV"},
 ]
 
 LEGACY_KPIS = [
@@ -76,6 +77,9 @@ V2_KPIS = [
         "expression": 'safe_div(measure("Revenue"), measure("Orders"))',
         "target_type": "measure",
         "target_value": None,
+        # A measure target is identified by target_measure_id (a measure ref),
+        # NOT a DSL string. The gateway resolves it to executable MDX.
+        "target_measure_id": "m4",
         "target_expression": 'measure("Target_AOV")',
         "status_expression": "",
         "trend_expression": "",
@@ -222,45 +226,74 @@ class TestRowsKpisV2:
     """Tests for v2 expression-based KPIs."""
 
     def test_v2_kpi_uses_mdx_member_as_value(self):
-        # F-017-23: KPI_VALUE must be an executable MDX member reference to the
-        # inline-exposed KPI measure ([Measures].[[KPI] <name>]), NOT the raw
-        # Tessallite DSL string (which Excel KPI consumers cannot execute).
+        # Bug-6702: KPI_VALUE must be an EXECUTABLE measure member the XMLA Execute
+        # path can resolve. The old F-017-23 synthetic [Measures].[[KPI] <name>]
+        # inline column is never present in the XMLA measure set, so Execute
+        # refused it. A COMPOSITE expression (safe_div(measure("Orders"),
+        # measure("Visits"))) has no single executable measure member, so KPI_VALUE
+        # is "" (undefined) rather than a member Execute cannot run — catalogue and
+        # Execute agree by construction.
         rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
         assert len(rows) == 2
-        assert rows[0]["KPI_VALUE"] == "[Measures].[[KPI] conversion_rate]"
+        assert rows[0]["KPI_VALUE"] == ""
 
-    def test_v2_kpi_status_is_executable_mdx(self):
-        # F-017-23: legacy status_expression is empty for v2 KPIs, so KPI_STATUS
-        # was blank. It must now carry a direction-aware MDX status CASE built
-        # from the value member and the goal.
+    def test_v2_single_measure_expression_value_is_executable_member(self):
+        # Bug-6702: a v2 KPI whose value expression is a single bare measure
+        # (measure("Revenue")) resolves to that measure's executable XMLA member.
+        kpi = {
+            **V2_KPIS[0],
+            "id": "k2s",
+            "name": "revenue_kpi",
+            "expression": 'measure("Revenue")',
+        }
+        rows = mdschema._rows_kpis(CATALOG, [kpi], MEASURES)
+        assert rows[0]["KPI_VALUE"] == "[Measures].[Revenue]"
+
+    def test_v2_kpi_status_is_addressable_member_not_case(self):
+        # Bug-6608 (un-gated): MDSCHEMA_KPIS advertises the addressable status
+        # MEMBER (never a band CASE). The live −1/0/1 verdict is governed by the
+        # model-service authority, not this metadata string. Bug-6702: a composite
+        # expression with no single executable member has "" (== KPI_VALUE), never a
+        # synthetic inline column.
         rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
         status = rows[0]["KPI_STATUS"]
-        assert status.startswith("CASE WHEN")
-        assert "[Measures].[[KPI] conversion_rate]" in status
+        assert status == ""
+        assert status == rows[0]["KPI_VALUE"]
+        assert not status.upper().startswith("CASE")
 
     def test_v2_static_target(self):
+        # Bug-6888: a static target is advertised as the synthetic goal support
+        # MEMBER (a bare scalar is not addable from Excel's KPI field list);
+        # the Execute path resolves the member to the 0.05 constant.
         rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
-        assert rows[0]["KPI_GOAL"] == "0.05"
+        assert rows[0]["KPI_GOAL"] == "[Measures].[Conversion Rate Goal]"
 
     def test_v2_measure_target(self):
+        # Bug-6259: a measure target resolves to an EXECUTABLE MDX member
+        # reference (via target_measure_id), never the raw Tessallite DSL string.
         rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
-        assert rows[1]["KPI_GOAL"] == 'measure("Target_AOV")'
+        assert rows[1]["KPI_GOAL"] == "[Measures].[Target_AOV]"
 
     def test_v2_weight(self):
         rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
         assert rows[0]["KPI_WEIGHT"] == "0.4"
         assert rows[1]["KPI_WEIGHT"] == "0.6"
 
-    def test_v2_gauge_status_graphic(self):
+    def test_v2_status_graphic_suppressed_without_authored_status(self):
+        # Fable R1 finding 1: MDSCHEMA KPI_STATUS is the value member, which a
+        # native pivot binds directly (no KPIStatus() interception) -> graphic
+        # suppressed to avoid clamping a raw value onto -1/0/1 icon domain. Only
+        # authored status_expression KPIs keep the graphic. (Both V2_KPIS lack
+        # an authored status_expression.)
         rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
-        assert rows[0]["KPI_STATUS_GRAPHIC"] == "Gauge"  # gauge type
+        assert rows[0]["KPI_STATUS_GRAPHIC"] == ""
+        assert rows[1]["KPI_STATUS_GRAPHIC"] == ""
 
-    def test_v2_bullet_status_graphic(self):
-        # Bug-5343: bullet_chart maps to the linear "Gauge" graphic. "Thermometer"
-        # is now a distinct presentation type with its own dedicated graphic, so
-        # the old bullet→Thermometer mapping no longer applies.
-        rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
-        assert rows[1]["KPI_STATUS_GRAPHIC"] == "Gauge"  # bullet_chart type
+    def test_authored_status_expression_keeps_graphic(self):
+        # A modeller-authored status expression IS a verdict, so its graphic stays.
+        rows = mdschema._rows_kpis(CATALOG, LEGACY_KPIS, MEASURES)
+        # LEGACY_KPIS[0] has presentation_type None -> default "Traffic Light".
+        assert rows[0]["KPI_STATUS_GRAPHIC"] == "Traffic Light"
 
     def test_v2_display_folder(self):
         rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)

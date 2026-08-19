@@ -51,6 +51,37 @@ describe("builderStore", () => {
     });
   });
 
+  // Bug-6374 / F-026-02: displayLocale is a persisted user preference and must
+  // survive reset() (which runs on every model mount). Before the fix, reset()
+  // spread initialState (displayLocale: null), so opening any model silently
+  // reverted the whole UI to English for non-English users.
+  describe("display locale persists across reset (Bug-6374)", () => {
+    it("keeps the chosen locale after reset", () => {
+      act(() => useBuilderStore.getState().setDisplayLocale("fr"));
+      expect(localStorage.getItem("display_locale")).toBe("fr");
+      act(() => useBuilderStore.getState().reset());
+      expect(useBuilderStore.getState().displayLocale).toBe("fr");
+      // Restore default English so this test doesn't bleed into others.
+      act(() => useBuilderStore.getState().setDisplayLocale(null));
+    });
+
+    it("resets to null when no locale is persisted (default English)", () => {
+      act(() => useBuilderStore.getState().setDisplayLocale(null));
+      expect(localStorage.getItem("display_locale")).toBeNull();
+      act(() => useBuilderStore.getState().reset());
+      expect(useBuilderStore.getState().displayLocale).toBeNull();
+    });
+  });
+
+  describe("read-only share-link state persists across reset (Bug-6377)", () => {
+    it("keeps readOnly enabled after reset", () => {
+      act(() => useBuilderStore.getState().setReadOnly(true));
+      act(() => useBuilderStore.getState().reset());
+      expect(useBuilderStore.getState().readOnly).toBe(true);
+      act(() => useBuilderStore.getState().setReadOnly(false));
+    });
+  });
+
   describe("panel management", () => {
     it("starts with no active panel", () => {
       expect(useBuilderStore.getState().activePanel).toBeNull();

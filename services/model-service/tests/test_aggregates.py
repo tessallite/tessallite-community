@@ -14,6 +14,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from .result_fakes import FakeScalarResult
 
 from .conftest import (
     TEST_AGG_ID,
@@ -50,7 +51,7 @@ class _ScalarResult:
         self._items = items
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return self._items
@@ -59,6 +60,10 @@ class _ScalarResult:
         return self._items[0] if self._items else 0
 
     def scalar_one_or_none(self):
+        return self._items[0] if self._items else None
+
+    def one_or_none(self):
+        # ``_scope._lookup_scoped`` calls ``.scalars().one_or_none()``.
         return self._items[0] if self._items else None
 
 
@@ -88,6 +93,64 @@ def _make_execute_script(*results):
             return next(iterator)
         except StopIteration:
             return _EMPTY_RESULT
+
+    return AsyncMock(side_effect=_side)
+
+
+def _owned_target_result():
+    """The row the Bug-8026 ``target_id`` ownership guard resolves.
+
+    ``create_aggregate`` now proves the body's ``target_id`` names a DataTarget
+    inside the path project+model (``_scope.ensure_ref_in_model``) before it
+    does anything else, so that SELECT is the FIRST statement every create test
+    issues. Returning a row here is fixture setup, not a relaxed assertion: the
+    denial behaviour is asserted by its own tests below and against real
+    Postgres in ``tests/integration/test_body_fk_route_adoption_db.py``.
+    """
+    return _ScalarResult([
+        types.SimpleNamespace(id=TARGET_ID, model_id=TEST_MODEL_ID)
+    ])
+
+
+def _make_create_script(
+    *cap_results,
+    dims=None,
+    measures=None,
+    tables=None,
+    columns=None,
+    udas=None,
+    joins=None,
+):
+    """Statement-aware create-path fixture.
+
+    Bug-8939 moved cap selection after all request validation.  Keying fixture
+    rows to the queried domain instead of positional call order keeps the tests
+    faithful to that contract and ensures a future unsafe reorder cannot be
+    hidden by reshuffling mock results.
+    """
+    cap_iter = iter(cap_results)
+    by_table = {
+        "dimensions": _ScalarResult(dims or []),
+        "measures": _ScalarResult(measures or []),
+        "model_tables": _ScalarResult(tables or []),
+        "model_columns": _ScalarResult(columns or []),
+        "user_defined_attributes": _ScalarResult(udas or []),
+        "joins": _ScalarResult(joins or []),
+    }
+
+    async def _side(stmt, *_args, **_kwargs):
+        sql = str(stmt)
+        if "data_targets" in sql:
+            return _owned_target_result()
+        for table, result in by_table.items():
+            if f"FROM {table}" in sql:
+                return result
+        if "aggregate_definitions" in sql:
+            try:
+                return next(cap_iter)
+            except StopIteration:
+                return _EMPTY_RESULT
+        return _EMPTY_RESULT
 
     return AsyncMock(side_effect=_side)
 
@@ -128,12 +191,12 @@ async def test_create_aggregate_success(client):
     agg = make_aggregate()
     mock_db = make_mock_db()
 
-    # _enforce_max_aggregates: get(Model) + execute(count)
+    # Validation collections are empty; cap count is 0 (below the limit).
     mock_db.get = AsyncMock(return_value=model)
     # count query returns 0 (below cap); subsequent queries issued by the
     # resolver + redundant-partner + _get_measure_names helpers return
     # empty results so the handler completes its happy path.
-    mock_db.execute = _make_execute_script(_ScalarResult([0]))
+    mock_db.execute = _make_create_script(_ScalarResult([0]))
 
     async def _refresh(obj):
         obj.id = agg.id
@@ -169,6 +232,74 @@ async def test_create_aggregate_success(client):
     assert data["grain"] == ["country"]
 
 
+@pytest.mark.asyncio
+async def test_create_aggregate_quantiles_registers_only_routable_median(client):
+    """Bug-5891 (DEC-PERCENTILE): creating an aggregate with include_quantiles
+    must register ONLY the routable p50 coverage row for each numeric measure —
+    never the non-median percentiles (p90/p95/p99/...), which SQL routing cannot
+    reach and would materialise into dead columns."""
+    from shared.db.models import AggregateColumn
+    from shared.semantic.grain_resolver import (
+        ResolvedAggregateLayout,
+        ResolvedMeasureCol,
+    )
+
+    model = make_model(max_aggregates=50)
+    agg = make_aggregate()
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(return_value=model)
+    mock_db.execute = _make_create_script(_ScalarResult([0]))
+
+    async def _refresh(obj):
+        obj.id = agg.id
+        obj.model_id = TEST_MODEL_ID
+        obj.source_row_count = None
+        obj.agg_row_count = None
+        obj.estimated_hit_rate = None
+        obj.created_at = NOW
+        obj.updated_at = NOW
+        obj.last_refreshed_at = None
+        obj.retired_at = None
+        obj.status = "active"
+        obj.target_schema = "public"
+
+    mock_db.refresh = _refresh
+
+    measure_col = ResolvedMeasureCol(
+        measure_id=uuid.uuid4(),
+        measure_name="revenue",
+        stat_type="sum",
+        aggregation_function="sum",
+        source_table_id=uuid.uuid4(),
+        source_column_name="amount",
+        physical_col_name="revenue__sum",
+    )
+    layout = ResolvedAggregateLayout(grain_cols=[], measure_cols=[measure_col])
+
+    body = _agg_body()
+    body["include_quantiles"] = True
+
+    with (
+        patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)),
+        patch("src.api.aggregates.resolve_aggregate_layout", return_value=layout),
+        patch("src.api.aggregates.compute_redundant_partners", return_value={}),
+    ):
+        resp = await client.post(PREFIX, json=body)
+
+    assert resp.status_code == 201
+
+    quantile_stats = {
+        obj.stat_type
+        for (call_args, _kw) in [(c.args, c.kwargs) for c in mock_db.add.call_args_list]
+        for obj in call_args
+        if isinstance(obj, AggregateColumn) and (obj.stat_type or "").startswith("p")
+    }
+    # The routable median is registered; nothing else.
+    assert quantile_stats == {"p50"}
+    for dead in ("p01", "p05", "p10", "p25", "p75", "p90", "p95", "p99"):
+        assert dead not in quantile_stats
+
+
 # ---------------------------------------------------------------------------
 # Bug-1091 — non-materialisable variant measures rejected at creation
 # ---------------------------------------------------------------------------
@@ -198,11 +329,9 @@ async def test_create_aggregate_rejects_period_aware_variant(client):
     variant = _make_variant_measure("revenue_ytd", "ytd")
     mock_db = make_mock_db()
     mock_db.get = AsyncMock(return_value=model)
-    # _enforce_max_aggregates count(0) → dims(empty) → measures([variant])
-    mock_db.execute = _make_execute_script(
-        _ScalarResult([0]),
-        _EMPTY_RESULT,
-        _ScalarResult([variant]),
+    # Validation resolves the variant before cap selection is reached.
+    mock_db.execute = _make_create_script(
+        dims=[], measures=[variant]
     )
 
     body = _agg_body()
@@ -245,11 +374,9 @@ async def test_create_aggregate_rejects_variant_without_source_snapshot(client):
     )
     mock_db = make_mock_db()
     mock_db.get = AsyncMock(return_value=model)
-    # _enforce_max_aggregates count(0) → dims([time_dim]) → measures([variant])
-    mock_db.execute = _make_execute_script(
-        _ScalarResult([0]),
-        _ScalarResult([time_dim]),
-        _ScalarResult([variant]),
+    # Validation resolves the time dimension + variant before cap selection.
+    mock_db.execute = _make_create_script(
+        dims=[time_dim], measures=[variant]
     )
 
     body = _agg_body()
@@ -286,6 +413,220 @@ async def test_patch_aggregate_with_grain_returns_422(client):
         )
 
     assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.parametrize("bad_status", ["banana", None])
+@pytest.mark.asyncio
+async def test_patch_aggregate_invalid_status_returns_422(client, bad_status):
+    """Bug-6549: AggregateDefinition.status is a controlled lifecycle enum.
+    An unknown value ("banana") or an explicit null must fail closed with 422 —
+    never persist a NOT NULL 500 or an unroutable free-string status that
+    silently pulls the aggregate out of every status-driven routing path."""
+    agg = make_aggregate()
+    model = make_model()
+    mock_db = make_mock_db()
+    # db.get is called for the Model then the AggregateDefinition; an explicit
+    # null passes schema parse and reaches the endpoint body, so both lookups
+    # must resolve before the status guard rejects it.
+    mock_db.get = AsyncMock(side_effect=[model, agg])
+
+    with patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)):
+        resp = await client.patch(
+            f"{PREFIX}/{agg.id}",
+            json={"status": bad_status},
+        )
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.parametrize("system_status", ["pending", "invalid"])
+@pytest.mark.asyncio
+async def test_patch_status_rejected_while_system_managed(client, system_status):
+    """Bug-7903 (Fable HIGH #1): a status PATCH must be rejected (409) while the
+    aggregate is in a system-managed lifecycle state (pending/invalid). The
+    uniform refresh pending-guard commits status="pending" BEFORE it durably
+    replaces the target rows; a user PATCH to "active" in that window would re-open
+    the DG99-CRITICAL-01 window (serving new rows under the prior run's proof).
+    Only the refresh engine may transition out of pending/invalid."""
+    from shared.db.models import Model
+
+    agg = make_aggregate(status=system_status)
+    model = make_model()
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(side_effect=[model, agg])
+
+    with patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)):
+        resp = await client.patch(
+            f"{PREFIX}/{agg.id}",
+            json={"status": "active"},
+        )
+
+    assert resp.status_code == 409, resp.text
+    assert system_status in resp.text
+
+
+# ---------------------------------------------------------------------------
+# PATCH — disabled->active flips refresh policy (Bug-6170 enable-path)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_patch_disabled_to_active_enables_refresh_policy(client):
+    """Bug-6170: when an aggregate transitions disabled->active via PATCH,
+    its AggregateRefreshPolicy.is_enabled must be set to True and the
+    aggregate's is_stale must be set to True so the scheduler picks it up
+    for its first build.  Without this, an AI aggregate enabled via the UI
+    stays permanently unscheduled."""
+    from shared.db.models import AggregateDefinition, AggregateRefreshPolicy, Model
+
+    model = make_model()
+    agg = make_aggregate(status="disabled")
+    agg.is_stale = False
+    agg.include_stats = False
+    agg.include_quantiles = False
+
+    # Simulate an existing policy row with is_enabled=False (the optimizer
+    # creates these for disabled AI aggregates).
+    policy = types.SimpleNamespace(
+        id=uuid.uuid4(),
+        aggregate_definition_id=agg.id,
+        refresh_mode="scheduled",
+        cron_expression="0 * * * *",
+        is_enabled=False,
+    )
+
+    mock_db = make_mock_db()
+
+    async def _get(cls, _id):
+        return model if cls is Model else agg
+    mock_db.get = AsyncMock(side_effect=_get)
+
+    # The disabled->active path queries for the AggregateRefreshPolicy row.
+    # Subsequent queries (_get_measure_names, _get_ai_rationale) fall through
+    # to the empty default.
+    mock_db.execute = _make_execute_script(
+        _ScalarResult([policy]),   # policy lookup
+    )
+
+    with patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)):
+        resp = await client.patch(
+            f"{PREFIX}/{agg.id}",
+            json={"status": "active"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    # Policy must have been flipped to enabled.
+    assert policy.is_enabled is True
+    # Aggregate must be marked stale so the scheduler rebuilds it.
+    assert agg.is_stale is True
+
+
+@pytest.mark.asyncio
+async def test_patch_disabled_to_active_creates_policy_when_missing(client):
+    """Bug-6170 edge case: if no AggregateRefreshPolicy row exists for the
+    aggregate (e.g. a legacy aggregate created before the optimizer added
+    policies), the disabled->active transition must create one following
+    the same pattern as the create endpoint."""
+    from shared.db.models import AggregateDefinition, AggregateRefreshPolicy, Model
+
+    model = make_model()
+    agg = make_aggregate(status="disabled")
+    agg.is_stale = False
+    agg.include_stats = False
+    agg.include_quantiles = False
+
+    mock_db = make_mock_db()
+
+    async def _get(cls, _id):
+        return model if cls is Model else agg
+    mock_db.get = AsyncMock(side_effect=_get)
+
+    # Policy lookup returns None (no row exists).
+    mock_db.execute = _make_execute_script(
+        _ScalarResult([]),   # scalar_one_or_none -> None
+    )
+
+    with (
+        patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)),
+        patch("src.api.aggregates.get_setting", new_callable=AsyncMock, return_value="0 * * * *"),
+    ):
+        resp = await client.patch(
+            f"{PREFIX}/{agg.id}",
+            json={"status": "active"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    # A new policy must have been created.
+    added = [c.args[0] for c in mock_db.add.call_args_list]
+    policies = [r for r in added if isinstance(r, AggregateRefreshPolicy)]
+    assert len(policies) == 1
+    assert policies[0].is_enabled is True
+    assert policies[0].aggregate_definition_id == agg.id
+    assert agg.is_stale is True
+
+
+@pytest.mark.asyncio
+async def test_patch_target_schema_change_marks_aggregate_for_rebuild(client):
+    """A changed physical location withholds the old build from routing while
+    leaving the existing refresh policy untouched."""
+    from shared.db.models import AggregateRefreshPolicy, Model
+
+    model = make_model()
+    agg = make_aggregate(status="active")
+    agg.is_stale = False
+    agg.last_refreshed_at = NOW
+    agg.include_stats = False
+    agg.include_quantiles = False
+
+    mock_db = make_mock_db()
+
+    async def _get(cls, _id):
+        return model if cls is Model else agg
+    mock_db.get = AsyncMock(side_effect=_get)
+    mock_db.execute = _make_execute_script()  # all queries fall through to empty
+
+    with patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)):
+        resp = await client.patch(
+            f"{PREFIX}/{agg.id}",
+            json={"target_schema": "analytics"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    # No policy-related objects should have been added.
+    added = [c.args[0] for c in mock_db.add.call_args_list]
+    policies = [r for r in added if isinstance(r, AggregateRefreshPolicy)]
+    assert len(policies) == 0
+    assert agg.is_stale is True
+    assert agg.last_refreshed_at is None
+
+
+@pytest.mark.asyncio
+async def test_patch_same_target_schema_is_a_freshness_noop(client):
+    """Re-saving the same physical location must not trigger a rebuild."""
+    from shared.db.models import Model
+
+    model = make_model()
+    agg = make_aggregate(status="active")
+    agg.is_stale = False
+    agg.last_refreshed_at = NOW
+    agg.include_stats = False
+    agg.include_quantiles = False
+
+    mock_db = make_mock_db()
+
+    async def _get(cls, _id):
+        return model if cls is Model else agg
+    mock_db.get = AsyncMock(side_effect=_get)
+    mock_db.execute = _make_execute_script()
+
+    with patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)):
+        resp = await client.patch(
+            f"{PREFIX}/{agg.id}",
+            json={"target_schema": "public"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert agg.is_stale is False
+    assert agg.last_refreshed_at == NOW
 
 
 # ---------------------------------------------------------------------------
@@ -391,12 +732,211 @@ async def test_patch_disable_include_stats_removes_coverage_rows(client):
 
 
 # ---------------------------------------------------------------------------
+# Bug-8026 (API half) — the body ``target_id`` must belong to the path model
+# ---------------------------------------------------------------------------
+#
+# Test escape: ``create_aggregate`` built ``AggregateDefinition(model_id=...,
+# **body.model_dump())`` and ``target_id`` is a NOT NULL foreign key to
+# ``data_targets``. Every existing create test supplied a target id that no
+# assertion ever tied to the model, so nothing noticed that the id was never
+# checked. The optimizer's lifecycle twin has validated it since Bug-8026;
+# only this API path was left open, and a foreign target_id points the
+# materialisation CTAS and every scheduled refresh at another project's
+# warehouse connection.
+#
+# Guard: these tests plus the real-Postgres route tests in
+# ``tests/integration/test_body_fk_route_adoption_db.py``. Tier: T3.
+#
+# Each denial test asserts the rejection REASON, not merely the status: 422 is
+# also FastAPI's own request-validation status, and its detail is a LIST, so a
+# bare status assertion could pass for an entirely unrelated reason.
+
+@pytest.mark.asyncio
+async def test_create_aggregate_rejects_a_target_outside_the_model(client):
+    """A target id that does not resolve inside the path project+model is
+    refused with the body-FK 422, and nothing is persisted."""
+    model = make_model(max_aggregates=50)
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(return_value=model)
+    # The ownership SELECT is the first statement and finds nothing — the one
+    # outcome the primitive produces for "no such target" and "another
+    # project's target" alike (its anti-oracle property).
+    mock_db.execute = _make_execute_script(_EMPTY_RESULT)
+
+    with (
+        patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "src.api.aggregates.resolve_aggregate_layout",
+            return_value=_stub_layout(),
+        ),
+        patch("src.api.aggregates.compute_redundant_partners", return_value={}),
+    ):
+        resp = await client.post(PREFIX, json=_agg_body())
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert isinstance(detail, dict), (
+        "must be the body-FK error shape, not FastAPI's own 422 validation list"
+    )
+    assert detail["error_code"] == "REF_NOT_IN_MODEL"
+    assert detail["field"] == "target_id"
+    assert detail["ids"] == [str(TARGET_ID)]
+    assert "a data target" in detail["message"]
+    mock_db.add.assert_not_called()
+    mock_db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_aggregate_refuses_a_foreign_target_before_evicting(client):
+    """The guard runs BEFORE ``_enforce_max_aggregates``.
+
+    At the cap, cap enforcement retires the lowest-scored aggregate and DROPS
+    its physical table. Validating the target afterwards would let a request
+    that is about to be refused destroy a live aggregate on its way out — a
+    denial-of-service reachable by any modeler in the caller's own project.
+    """
+    model = make_model(max_aggregates=2)
+    lowest = make_aggregate(agg_id=uuid.uuid4(), status="active", estimated_hit_rate=0.05)
+
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(return_value=model)
+    mock_db.execute = _make_execute_script(
+        _EMPTY_RESULT,            # target ownership lookup: no such target here
+        _ScalarResult([2]),       # count query: at cap (must never be reached)
+        _ScalarResult([lowest]),  # lowest-scored query
+    )
+    drop_table = AsyncMock(return_value=False)
+
+    with (
+        patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "src.api.aggregates.resolve_aggregate_layout",
+            return_value=_stub_layout(),
+        ),
+        patch("src.api.aggregates.compute_redundant_partners", return_value={}),
+        patch(
+            "src.api.aggregates.drop_aggregate_physical_table", new=drop_table
+        ),
+    ):
+        resp = await client.post(PREFIX, json=_agg_body())
+
+    assert resp.status_code == 422
+    assert lowest.status == "active", "a refused create must not retire anything"
+    assert lowest.retired_at is None
+    drop_table.assert_not_awaited()
+    mock_db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bug_8939_invalid_create_does_not_drop_live_cap_victim(client):
+    """A rejectable create must finish validation before cap eviction.
+
+    The physical DROP is outside the metadata transaction.  Before Bug-8939,
+    an unknown measure at the cap selected and dropped the incumbent and only
+    then returned 400; rolling back restored ``active`` metadata over a missing
+    table.  This guard makes the incumbent observable and asserts both halves:
+    no DROP and no in-memory retirement on the rejected request.
+    """
+    model = make_model(max_aggregates=1)
+    incumbent = make_aggregate(
+        agg_id=uuid.uuid4(), status="active", estimated_hit_rate=0.05
+    )
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(return_value=model)
+
+    async def _execute(stmt, *_args, **_kwargs):
+        sql = str(stmt)
+        if "data_targets" in sql:
+            return _owned_target_result()
+        if "count(*)" in sql and "aggregate_definitions" in sql:
+            return _ScalarResult([1])
+        if "aggregate_definitions" in sql:
+            return _ScalarResult([incumbent])
+        # The model intentionally has no measures, so the submitted name is
+        # invalid.  Every other validation collection is empty.
+        return _EMPTY_RESULT
+
+    mock_db.execute = AsyncMock(side_effect=_execute)
+    drop_table = AsyncMock(return_value=True)
+    body = _agg_body()
+    body["measure_names"] = ["does_not_exist"]
+
+    with (
+        patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "src.api.aggregates.drop_aggregate_physical_table", new=drop_table
+        ),
+    ):
+        resp = await client.post(PREFIX, json=body)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Unknown measure: 'does_not_exist'"
+    assert incumbent.status == "active"
+    assert incumbent.retired_at is None
+    drop_table.assert_not_awaited()
+    mock_db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_aggregate_accepts_a_target_owned_by_the_model(client):
+    """The guard is an ownership check, not a blanket denial.
+
+    Bug-8864 shipped a scope guard that rejected essentially everything; only a
+    positive test catches that direction. This one also pins the producer side:
+    the accepted ``target_id`` is what actually lands on the persisted
+    definition, so the aggregate materialises where the modeller asked.
+    """
+    from shared.db.models import AggregateDefinition
+
+    model = make_model(max_aggregates=50)
+    agg = make_aggregate()
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(return_value=model)
+    mock_db.execute = _make_create_script(_ScalarResult([0]))
+
+    async def _refresh(obj):
+        obj.id = agg.id
+        obj.model_id = TEST_MODEL_ID
+        obj.source_row_count = None
+        obj.agg_row_count = None
+        obj.estimated_hit_rate = None
+        obj.created_at = NOW
+        obj.updated_at = NOW
+        obj.last_refreshed_at = None
+        obj.retired_at = None
+        obj.status = "active"
+        obj.target_schema = "public"
+
+    mock_db.refresh = _refresh
+
+    with (
+        patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "src.api.aggregates.resolve_aggregate_layout",
+            return_value=_stub_layout(),
+        ),
+        patch("src.api.aggregates.compute_redundant_partners", return_value={}),
+    ):
+        resp = await client.post(PREFIX, json=_agg_body())
+
+    assert resp.status_code == 201
+    definitions = [
+        c.args[0]
+        for c in mock_db.add.call_args_list
+        if isinstance(c.args[0], AggregateDefinition)
+    ]
+    assert len(definitions) == 1
+    assert definitions[0].target_id == TARGET_ID
+    assert definitions[0].model_id == TEST_MODEL_ID
+
+
+# ---------------------------------------------------------------------------
 # Cap enforcement — lowest hit-rate is retired
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_cap_enforcement_retires_lowest_hit_rate(client):
-    """When count == max_aggregates, lowest hit-rate aggregate is retired."""
+async def test_bug_8939_cap_retirement_commits_before_physical_drop(client):
+    """Cap replacement follows stop-routing -> commit -> DROP -> evidence."""
     from shared.db.models import AggregateLifecycleEvent
 
     model = make_model(max_aggregates=2)
@@ -404,9 +944,22 @@ async def test_cap_enforcement_retires_lowest_hit_rate(client):
     new_agg = make_aggregate(agg_id=uuid.uuid4())
 
     mock_db = make_mock_db()
+    order: list[str] = []
+
+    async def _commit():
+        order.append("commit")
+
+    async def _drop(_agg, _db, *, reason):
+        assert _agg.status == "retired"
+        assert order == ["commit"], (
+            "the victim must be durably non-routable before physical removal"
+        )
+        order.append("drop")
+        return True
 
     mock_db.get = AsyncMock(return_value=model)
-    mock_db.execute = _make_execute_script(
+    mock_db.commit = AsyncMock(side_effect=_commit)
+    mock_db.execute = _make_create_script(
         _ScalarResult([2]),       # count query: at cap
         _ScalarResult([lowest]),  # lowest-scored query
     )
@@ -436,13 +989,11 @@ async def test_cap_enforcement_retires_lowest_hit_rate(client):
             "src.api.aggregates.compute_redundant_partners",
             return_value={},
         ),
-        # The retire path now drops the physical table via the shared helper;
-        # stub it out (this mock_db.get returns the model for every lookup, so
-        # the real helper can't resolve a target). This test asserts the
-        # retire + lifecycle-event behaviour, not the DROP.
+        # Exercise the post-commit purge boundary without resolving a real
+        # target connection. The side effect above asserts lifecycle order.
         patch(
             "src.api.aggregates.drop_aggregate_physical_table",
-            new=AsyncMock(return_value=False),
+            new=AsyncMock(side_effect=_drop),
         ),
     ):
         resp = await client.post(PREFIX, json=_agg_body())
@@ -460,6 +1011,9 @@ async def test_cap_enforcement_retires_lowest_hit_rate(client):
     assert lifecycle_events[0].aggregate_id == lowest.id
     assert lifecycle_events[0].event_type == "retired"
     assert lifecycle_events[0].reason.startswith("cap_enforcement:")
+    assert order == ["commit", "drop", "commit"], (
+        "the second commit durably records purge terminal evidence"
+    )
     # flush is now called multiple times along the handler: once after
     # the retirement, once after the new aggregate insert, and once
     # per helper hop. Any non-zero count is fine — the invariant is
@@ -477,7 +1031,7 @@ async def test_cap_enforcement_not_triggered_below_cap(client):
 
     mock_db = make_mock_db()
     mock_db.get = AsyncMock(return_value=model)
-    mock_db.execute = _make_execute_script(_ScalarResult([5]))  # 5 < 50, others fall through
+    mock_db.execute = _make_create_script(_ScalarResult([5]))  # 5 < 50, others fall through
 
     async def _refresh(obj):
         obj.id = agg.id
@@ -656,7 +1210,7 @@ async def test_create_aggregate_always_adds_row_count_column(client):
     mock_db = make_mock_db()
 
     mock_db.get = AsyncMock(return_value=model)
-    mock_db.execute = _make_execute_script(_ScalarResult([0]))
+    mock_db.execute = _make_create_script(_ScalarResult([0]))
 
     async def _refresh(obj):
         obj.id = agg.id

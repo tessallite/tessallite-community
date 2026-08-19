@@ -2,14 +2,14 @@
 title: "Manage Users"
 audience: tenant-admin
 area: Admin
-updated: 2026-04-17
+updated: 2026-08-11
 ---
 
 ![Admin panel Users tab listing tenant users.](../assets/screencaps/admin-users-tab.png)
 
 ## What this covers
 
-This article covers all user management tasks available to a Tenant Admin: viewing the user list, inviting new users, removing users, resetting passwords, and reading user details.
+This article covers all user management tasks available to a Tenant Admin: viewing the user list, adding new users, removing users, resetting passwords, and reading user details.
 
 ---
 
@@ -23,20 +23,30 @@ The Users tab displays all users in the workspace with their email address, role
 
 ---
 
-## Inviting a user
+## Adding a user
 
-1. On the Users tab, click **Invite User**.
-2. Enter the user's email address.
-3. Select the role to assign: Tenant Admin, Modeller, Analyst, or `model_technical`.
-4. Click **Send Invitation**.
+Tessallite does not send invitation emails. You create each account directly,
+set its first password, and pass the credentials to the person out of band (or
+let them sign in through single sign-on -- see below).
 
-The user receives an email containing a one-time invitation link, valid for 48 hours. On first sign-in, the user sets their own password.
+1. On the Users tab, click **New user**.
+2. Enter a username and the user's email address.
+3. Type an initial password. It must meet the complexity rule shown under the
+   field (see [Password rules](#password-rules) below); the **Save** button
+   stays greyed out until it does.
+4. Select the role to assign: Tenant Admin, Modeller, Analyst, or `model_technical`.
+5. Click **Save**, then give the email address and password to the new user so
+   they can sign in. They can change their password later.
 
 The `model_technical` choice is a special **audience** role rather than a permission level: it pins the user to the technical persona for column-level security and data tags, and grants no project access on its own. Pick it only for users who should see technical column detail; they will still need a project-level Viewer or Modeller binding to open a project. See [Manage roles](manage-roles.md) and [Configure personas](../modelling/configure-personas.md).
 
-### If the invitation expires
+### Single sign-on users
 
-Return to the Users tab. The invited user appears with status **Invitation expired**. Click **Resend** next to their row. A new invitation link is generated; the old link is invalidated.
+If your workspace uses single sign-on, you do not add these users by hand. The
+first time someone signs in through the identity provider, Tessallite creates
+their account automatically (just-in-time provisioning) and assigns the role
+your SSO mapping specifies. Their password is owned by the identity provider, so
+the **Reset Password** action does not apply to them.
 
 ---
 
@@ -56,9 +66,31 @@ A Tenant Admin cannot remove another Tenant Admin. Only the System Admin can rem
 
 1. On the Users tab, click the user's name to open their detail view.
 2. Click **Reset Password**.
-3. Confirm in the dialog.
+3. Type the new password (it must meet the same complexity rule) and confirm.
 
-The user receives a password reset link valid for 24 hours. Their current password remains active until they complete the reset.
+You set the new password directly; Tessallite does not email a reset link. The
+change takes effect immediately and ends the user's active sessions, so pass the
+new password to them out of band. This action does not apply to single sign-on
+users, whose password is managed by the identity provider.
+
+---
+
+### Password rules
+
+Where you type a password directly — creating a user, or setting a new one for
+someone — Tessallite requires at least **12 characters**, with at least one
+**capital letter**, one **small letter**, and one **number**. The form states
+this under the password box and the Save button stays greyed out until the
+password satisfies it, so you find out before you submit rather than after.
+
+## How quickly access changes take effect
+
+Changes to a user's access are enforced by the length of their sign-in session:
+
+- **Web app sessions** end as soon as you remove a user or change their role.
+- **BI-tool connections** (Excel, Power BI, and other tools connected over XMLA or JDBC) hold a signed session token. After you disable a user or reset their password, an already-connected BI tool can keep working on its existing token until that token expires — up to the session lifetime, **60 minutes by default**. New connections are refused right away, but a live one is not cut off mid-session.
+
+If you need to be certain a disabled account cannot query at all, wait out the session lifetime (default 60 minutes) after disabling, or rotate the connection credentials the BI tool uses. Immediate token cut-off on disable is a planned enhancement.
 
 ---
 

@@ -2,22 +2,29 @@
 title: "Configure Calendar Table"
 audience: modeller
 area: modelling
-updated: 2026-05-06
+updated: 2026-07-04
 ---
 
 ## What this covers
 
 A calendar table holds one row per date with pre-computed period columns — year, quarter, month, week, day. Period-aware time variants (`_ytd`, `_prior_year`, `_yoy_growth`, ...) can use calendar table columns for period boundaries when the table is present.
 
-A calendar table is **not required** for time variants. Tessallite computes period boundaries from SQL expressions derived from the hierarchy's calendar type — `EXTRACT`-based expressions for standard and ISO calendars, fiscal CASE expressions for shifted fiscal years. Calendar tables remain valuable for three use cases:
+A calendar table is **not required** for most time variants. Tessallite computes standard, fiscal, ISO Week, and Thai Buddhist period boundaries from SQL expressions derived from the hierarchy calendar type. Physical calendar tables are required only for table-bound calendars and explicit physical-table workflows:
 
-- **Retail 4-4-5 calendars** — the 4-week/5-week period pattern cannot be expressed as simple date arithmetic and requires a physical lookup table.
-- **Dense date enumeration** — when a query needs every date in a range (including dates with no fact rows), a calendar table provides the dense spine.
-- **Custom period definitions** — non-standard period boundaries (e.g. company-specific fiscal periods, 13-period years) that don't follow a formulaic pattern.
+- **Retail 4-4-5 calendars** - the 4-week/5-week period pattern cannot be expressed as simple date arithmetic and requires a physical lookup table.
+- **Hijri calendars** - month and year boundaries depend on the calendar authority used, so Tessallite must read the mapping from a bound table.
+- **Dense date enumeration** - when a query needs every date in a range (including dates with no fact rows), a calendar table provides the dense spine.
+- **Custom period definitions** - non-standard period boundaries (e.g. company-specific fiscal periods, 13-period years) that do not follow a formulaic pattern.
 
-Tessallite supports six calendar types: Standard (Gregorian), Fiscal, ISO Week, Retail 4-4-5, Hijri (Islamic), and Thai Buddhist. A single model can use multiple calendar types — for example, fiscal for finance and 4-4-5 for retail reporting. Each calendar type is a separate physical table on the source. See [Calendar Types](../concepts/calendar-types.md) for when to use each type.
+Tessallite supports six calendar types: Standard (Gregorian), Fiscal, ISO Week, Retail 4-4-5, Hijri (Islamic), and Thai Buddhist. A single model can use multiple calendar types, for example fiscal for finance and 4-4-5 for retail reporting. A physical table is only needed when the calendar type or modelling workflow requires one. See [Calendar Types](../concepts/calendar-types.md) for when to use each type.
 
 This article explains how to create, bind, and manage calendar tables.
+
+## Calendar table requirement rule
+
+Use a physical calendar table only when the calendar or workflow needs one. Standard, fiscal, ISO Week, and Thai Buddhist time variants can use the calendar type on the time hierarchy without a bound table. Retail 4-4-5 and Hijri time variants need a bound physical calendar table. Dense date enumeration, custom business period columns, coverage checks, and role-playing calendar aliases also need a bound table because those workflows join to or inspect real calendar rows.
+
+When you bind an existing table, map the real source columns. Do not keep default names such as `date_key` or `year_no` unless those columns actually exist in the source.
 
 ---
 
@@ -165,4 +172,4 @@ Run this whenever you load new fact data, change the calendar's range, or notice
 
 ---
 
-← [Configure Time Variants](configure-time-variants.md) | [Home](../index.md) | [Associate Calendar with Dimensions →](associate-calendar-with-dimensions.md)
+← [Understanding Window Functions](window-functions.md) | [Home](../index.md) | [Associate Calendar with Dimensions →](associate-calendar-with-dimensions.md)

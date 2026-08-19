@@ -34,6 +34,13 @@ Connecting a JDBC-compatible BI tool — Tableau, Power BI, DBeaver, or any Post
 
 The workspace slug is the identifier for your tenant. It is case-sensitive. If you are uncertain of the slug, ask your system administrator.
 
+**Scoping the connection to one model.** The Database field also accepts two longer forms when you want the connection to open on a specific model instead of the whole workspace:
+
+- `acme/sales` — workspace slug plus a model slug.
+- `acme/finance/sales` — workspace, project, and model slug, useful when two projects contain models with the same name.
+
+If the model or project you name does not exist, the connection is refused with a message that tells you the accepted formats, so a typo is easy to spot.
+
 ---
 
 ## Connecting with DBeaver

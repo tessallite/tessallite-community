@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
+  Alert,
   Box,
   Button,
   Container,
@@ -27,6 +28,7 @@ export default function WelcomeWizard() {
   const qc = useQueryClient();
   const [activeStep, setActiveStep] = useState(0);
   const [completing, setCompleting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const STEPS = [
     { label: t("wizard.stepLabel.welcome"), component: WelcomeStep },
@@ -39,11 +41,18 @@ export default function WelcomeWizard() {
   const isLast = activeStep === STEPS.length - 1;
   const StepComponent = STEPS[activeStep].component;
 
+  // Bug-7447: only navigate and update cache when the server POST succeeds.
+  // On failure, restore `completing`, retain the current step, and show a
+  // localized retryable error instead of trapping the user in a redirect
+  // loop between the wizard and App.tsx's onboarding guard.
   async function markOnboardingDone() {
+    setError(null);
     try {
       await authApi.completeOnboarding();
     } catch {
-      // best-effort
+      setCompleting(false);
+      setError(t("wizard.completeFailed"));
+      return;
     }
     qc.setQueryData<User>(["me"], (old) =>
       old ? { ...old, has_completed_onboarding: true } : old,
@@ -80,6 +89,12 @@ export default function WelcomeWizard() {
         <Box sx={{ minHeight: 240, mb: 3 }}>
           <StepComponent />
         </Box>
+
+        {error && (
+          <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError(null)}>
+            {error}
+          </Alert>
+        )}
 
         <Box display="flex" justifyContent="space-between" alignItems="center">
           <Link

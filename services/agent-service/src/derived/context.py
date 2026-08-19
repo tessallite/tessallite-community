@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.db.models import (
@@ -29,6 +29,7 @@ from shared.db.models import (
     Dimension,
     Model,
     ModelAliasMap,
+    ModelTable,
     ProjectAgentModelContext,
 )
 
@@ -62,14 +63,46 @@ async def _calendar_aliases(
 ) -> list[dict[str, Any]]:
     """Find calendar tables reachable from the model's data sources and
     return their column-shape so the LLM understands what 'month'/'quarter'
-    actually map to."""
+    actually map to.
+
+    Bug-5956 — previously this function loaded ALL calendar tables in the
+    tenant, causing cross-model alias leakage.  Now scoped to calendars
+    that are either (a) explicitly linked via ModelTable.calendar_table_id,
+    or (b) owned by data sources used by the model's tables."""
     model = await db.get(Model, model_id)
     if model is None:
         return []
-    # Calendars are owned by data_sources; we don't have a direct join here,
-    # so list all calendars in the tenant and filter by data_source_id of
-    # this model's tables. For the size of typical workspaces this is fine.
-    rows = await db.execute(select(CalendarTable))
+
+    # Collect calendar IDs explicitly linked via model tables AND the
+    # data source IDs of the model's tables (for calendar tables that are
+    # not explicitly linked but share the same data source).
+    mt_rows = await db.execute(
+        select(ModelTable.calendar_table_id, ModelTable.source_id).where(
+            ModelTable.model_id == model_id,
+        )
+    )
+    explicit_cal_ids: set[UUID] = set()
+    model_source_ids: set[UUID] = set()
+    for cal_id, source_id in mt_rows.all():
+        if cal_id is not None:
+            explicit_cal_ids.add(cal_id)
+        if source_id is not None:
+            model_source_ids.add(source_id)
+
+    if not explicit_cal_ids and not model_source_ids:
+        return []
+
+    # Build a combined filter: calendars explicitly linked OR owned by
+    # any of the model's data sources.
+    conditions = []
+    if explicit_cal_ids:
+        conditions.append(CalendarTable.id.in_(explicit_cal_ids))
+    if model_source_ids:
+        conditions.append(CalendarTable.data_source_id.in_(model_source_ids))
+
+    rows = await db.execute(
+        select(CalendarTable).where(or_(*conditions))
+    )
     out: list[dict[str, Any]] = []
     for cal in rows.scalars().all():
         out.append(
@@ -122,6 +155,13 @@ async def derive_model_context(
     existing context rows)."""
     record = await db.get(ProjectAgentModelContext, (project_id, model_id))
     if record is None:
+        logger.warning(
+            "No ProjectAgentModelContext row for project_id=%s model_id=%s — "
+            "derivation skipped; the planner will operate with empty "
+            "aggregates/calendar/alias context for this model.",
+            project_id,
+            model_id,
+        )
         return None
 
     record.aggregates_summary = await _aggregates_summary(db, model_id)

@@ -21,7 +21,7 @@ compatible Looker instance, generated LookML can be evaluated through the
 Looker Studio -> PostgreSQL connector
   -> PostgreSQL connection to Tessallite Gateway on port 5433
   -> Tessallite query router
-  -> source warehouse
+  -> source
 ```
 
 This direct path does not consume or execute LookML.
@@ -36,4 +36,4 @@ This direct path does not consume or execute LookML.
 
 ---
 
-<- [Looker Studio Direct Connection](looker-studio-connection-guide.md) | [Home](../index.md) | [LookML Emitter ->](lookml-emitter-guide.md)
+<- [Optional Looker-hosted workflow](looker-studio-via-looker-guide.md) | [Home](../index.md) | [LookML Emitter ->](lookml-emitter-guide.md)

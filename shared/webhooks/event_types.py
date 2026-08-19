@@ -40,6 +40,23 @@ WEBHOOK_EVENT_LABELS: dict[str, str] = {
     # event so orchestrators can observe outcomes without polling run history.
     "refresh.completed": "Aggregate Refresh Completed",
     "refresh.failed": "Aggregate Refresh Failed",
+    "access.granted": "Access Granted",
+    "access.revoked": "Access Revoked",
+    "license.installed": "License Installed",
+    "license.uninstalled": "License Uninstalled",
+    "tenant.deleted": "Tenant Deleted",
+    "user.updated": "User Updated",
+    "embed_token.created": "Embed Token Created",
+    "embed_token.revoked": "Embed Token Revoked",
+    "glossary.share_token.issue": "Glossary Share Token Issued",
+    "glossary.share_token.revoke": "Glossary Share Token Revoked",
+    "model.export": "Model Exported",
+    "security.persona_create": "Persona Created",
+    "security.persona_update": "Persona Updated",
+    "security.persona_delete": "Persona Deleted",
+    "security.rule_create": "Row-Security Rule Created",
+    "security.rule_update": "Row-Security Rule Updated",
+    "security.rule_delete": "Row-Security Rule Deleted",
 }
 
 # The wildcard subscribes to every event. Stored filters may contain it.

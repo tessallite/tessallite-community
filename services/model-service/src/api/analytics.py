@@ -16,6 +16,7 @@ from shared.db.models import (
     QueryMissLog,
 )
 from shared.db.session import get_tenant_db
+from shared.hit_rate import UNACCELERATABLE_ROUTE_TYPES, eligible_hit_rate
 from src.api._scope import ensure_model_in_project
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
@@ -30,10 +31,33 @@ router = APIRouter(
 # count toward any usage statistic, hit rate, top-user, or routing breakdown.
 _EXCLUDED_ROUTE_TYPES = ("introspect",)
 
+# Bug-6425 (routed from QR-1): member-discovery queries (XMLA/JDBC catalogue
+# member enumeration) are logged with ``protocol="discover_members"`` by the
+# query-router for auditability, but they are BI-client metadata probes, not
+# user queries — they must be excluded from every usage number for the same
+# reason introspect probes are. IS DISTINCT FROM keeps NULL-protocol rows in.
+_DISCOVERY_PROTOCOL = "discover_members"
+
+# Bug-6426: an in-TTL result-cache re-serve is logged with the original
+# route_type (so volume/top-user analytics stay correct) but did NOT execute a
+# route — its execution_ms/bytes are 0 and are not real measurements. It carries
+# ``cache_status="cache_hit"``. The ACCELERATION RATE and AVG accelerated
+# response time must not count/average cache re-serves, or the headline numbers a
+# business user reads are inflated (rate) and understated (avg ms). NULL means a
+# live execution, so ``IS DISTINCT FROM 'cache_hit'`` keeps live/historical rows.
+_CACHE_HIT_STATUS = "cache_hit"
+
 
 def _exclude_probes(stmt):
-    """Filter introspect probe rows out of any QueryLog aggregation (F-030-09)."""
-    return stmt.where(QueryLog.route_type.notin_(_EXCLUDED_ROUTE_TYPES))
+    """Filter probe rows out of any QueryLog aggregation.
+
+    Excludes introspect route-type rows (F-030-09) and member-discovery
+    protocol rows (Bug-6425) so neither is counted as a user query.
+    """
+    return stmt.where(
+        QueryLog.route_type.notin_(_EXCLUDED_ROUTE_TYPES),
+        QueryLog.protocol.is_distinct_from(_DISCOVERY_PROTOCOL),
+    )
 
 
 class QueryVolumeBucket(BaseModel):
@@ -224,14 +248,31 @@ async def analytics_summary(
         # F-030-08: count both acceleration mechanisms. ``aggregate_hits`` keeps
         # the aggregate-only breakdown (aggregate_id IS NOT NULL); ``accel_hits``
         # counts aggregate + pocket routes for the headline acceleration rate.
+        # Bug-6426: a cache re-serve is NOT a real acceleration event — exclude
+        # cache_hit rows from both counters so the headline acceleration rate is
+        # not inflated by results served from the result cache.
+        _is_live = QueryLog.cache_status.is_distinct_from(_CACHE_HIT_STATUS)
         hit_stmt = _exclude_probes(select(
             func.count().label("total"),
             func.sum(
-                case((QueryLog.aggregate_id.isnot(None), 1), else_=0)
+                case((QueryLog.aggregate_id.isnot(None) & _is_live, 1), else_=0)
             ).label("agg_hits"),
             func.sum(
-                case((QueryLog.route_type.in_(["aggregate", "pocket"]), 1), else_=0)
+                case(
+                    (QueryLog.route_type.in_(["aggregate", "pocket"]) & _is_live, 1),
+                    else_=0,
+                )
             ).label("accel_hits"),
+            # F-030-05 (Bug-9134): count structurally unacceleratable ``raw``
+            # detail queries so the acceleration-rate DENOMINATOR excludes them,
+            # exactly like Model Health's eligible_hit_rate. Without this the two
+            # tabs divided by different totals and showed two percentages.
+            func.sum(
+                case(
+                    (QueryLog.route_type.in_(UNACCELERATABLE_ROUTE_TYPES), 1),
+                    else_=0,
+                )
+            ).label("unacceleratable"),
         ).where(
             QueryLog.model_id == model_id,
             QueryLog.created_at >= since,
@@ -240,17 +281,32 @@ async def analytics_summary(
         hit_result = await db.execute(hit_stmt)
         hit_row = hit_result.one()
         total_for_rate = int(hit_row.total) if hit_row.total else 0
+        accel_hits = int(hit_row.accel_hits or 0)
+        agg_hits = int(hit_row.agg_hits or 0)
+        unacceleratable = int(hit_row.unacceleratable or 0)
+        eligible_for_rate = total_for_rate - unacceleratable
         aggregate_hit_rate = (
-            (int(hit_row.agg_hits) / total_for_rate * 100) if total_for_rate > 0 else 0.0
+            (agg_hits / eligible_for_rate * 100) if eligible_for_rate > 0 else 0.0
         )
-        acceleration_rate = (
-            (int(hit_row.accel_hits) / total_for_rate * 100) if total_for_rate > 0 else 0.0
-        )
+        # F-030-05: ONE formula, shared with Model Health. accel_hits already
+        # excludes cache re-serves (numerator); the denominator excludes raw.
+        acceleration_rate = eligible_hit_rate(
+            aggregate_hits=accel_hits,
+            pocket_hits=0,
+            total_queries=total_for_rate,
+            unacceleratable_queries=unacceleratable,
+        ) * 100
 
+        # Bug-6426: a cache re-serve carries execution_ms=0 as a served-from-cache
+        # SENTINEL, not a measured latency. Averaging those zeros drags the
+        # reported avg response time toward 0 and misrepresents real execution
+        # latency (models.py: these zeros "must never be averaged into" savings/
+        # timing). Exclude cache re-serves so avg_response_ms reflects real runs.
         avg_stmt = _exclude_probes(select(func.avg(QueryLog.execution_ms)).where(
             QueryLog.model_id == model_id,
             QueryLog.created_at >= since,
             QueryLog.execution_ms.isnot(None),
+            QueryLog.cache_status.is_distinct_from(_CACHE_HIT_STATUS),
             QueryLog.status == "success",
         ))
         avg_result = await db.execute(avg_stmt)
@@ -314,9 +370,17 @@ async def routing_breakdown(
     since = _date_range(days)
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        # Bug-6426: a cache re-serve keeps its original route_type on the row,
+        # but grouping it under "aggregate"/"pocket" overstates real acceleration
+        # in the routing breakdown. Relabel cache_hit rows to a distinct "cache"
+        # bucket so the breakdown honestly separates cache-serve from execution.
+        effective_route = case(
+            (QueryLog.cache_status == _CACHE_HIT_STATUS, "cache"),
+            else_=QueryLog.route_type,
+        ).label("route_type")
         stmt = (
             select(
-                QueryLog.route_type,
+                effective_route,
                 func.count().label("cnt"),
             )
             .where(
@@ -324,7 +388,7 @@ async def routing_breakdown(
                 QueryLog.created_at >= since,
                 QueryLog.status == "success",
             )
-            .group_by(QueryLog.route_type)
+            .group_by(effective_route)
             .order_by(text("cnt DESC"))
         )
         stmt = _exclude_probes(stmt)
@@ -369,26 +433,39 @@ async def estimated_savings(
         total_result = await db.execute(total_stmt)
         total = total_result.scalar_one()
 
-        accel_stmt = select(
+        # Bug-5848: both sub-queries must exclude probe rows (introspect)
+        # via _exclude_probes, matching every other analytics aggregation.
+        # Without this, internal health-check probes inflate the accelerated
+        # query count and skew the savings estimate.
+        # Bug-6426: a cache re-serve carries execution_ms=0 and did not execute a
+        # route. Counting it as an accelerated query and averaging its 0ms drags
+        # ``accel_avg`` toward 0 AND inflates ``accel_count`` — so the CFO-facing
+        # ``time_saved_ms = (source_avg - accel_avg) * accel_count`` is inflated
+        # on BOTH factors. Exclude cache_hit rows from the accelerated set and
+        # from the source baseline so savings reflect REAL executions only.
+        _is_live = QueryLog.cache_status.is_distinct_from(_CACHE_HIT_STATUS)
+        accel_stmt = _exclude_probes(select(
             func.count().label("cnt"),
             func.avg(QueryLog.execution_ms).label("avg_ms"),
         ).where(
             QueryLog.model_id == model_id,
             QueryLog.created_at >= since,
             QueryLog.route_type.in_(["aggregate", "pocket"]),
+            _is_live,
             QueryLog.status == "success",
-        )
+        ))
         accel_result = await db.execute(accel_stmt)
         accel = accel_result.one()
 
-        source_stmt = select(
+        source_stmt = _exclude_probes(select(
             func.avg(QueryLog.execution_ms).label("avg_ms"),
         ).where(
             QueryLog.model_id == model_id,
             QueryLog.created_at >= since,
             QueryLog.route_type == "source",
+            _is_live,
             QueryLog.status == "success",
-        )
+        ))
         source_result = await db.execute(source_stmt)
         source_avg = source_result.scalar_one()
 

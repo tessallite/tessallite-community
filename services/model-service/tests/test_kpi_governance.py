@@ -6,6 +6,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from .result_fakes import FakeScalarResult
 
 from src.auth.middleware import CurrentUser, get_current_user
 from src.main import app
@@ -20,7 +21,9 @@ from .conftest import (
     make_mock_db,
 )
 
-pytestmark = pytest.mark.unit
+# F-017-12: shim caller_has_role to the token-role decision for these
+# mocked-db unit tests (see conftest.kpi_effective_role).
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("kpi_effective_role")]
 
 PREFIX = f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/kpis"
 
@@ -30,7 +33,7 @@ class _ScalarResult:
         self._items = items
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return list(self._items)
@@ -102,6 +105,33 @@ def _make_user(role: str | None = None, email: str = TEST_USER_ID) -> CurrentUse
     return CurrentUser(
         user_id=email, tenant_id=TEST_TENANT, email=email, role=role,
     )
+
+
+def _binding_rbac_db(role: str = "viewer"):
+    """A mock DB whose ``user_access_bindings`` lookup resolves to a *role*
+    binding, so the route dependency ``require_role("modeler")`` sees the
+    caller's EFFECTIVE persisted binding as *role* and denies (403) when it is
+    below modeler.
+
+    This exercises the REAL production enforcement point — the route
+    dependency, which reads the persisted binding, not the coarse token role
+    (Wave C decision #8 / Bug-9402). The certify/deprecate/patch handlers used
+    to carry an inner owner-or-privileged re-check as a second gate; that check
+    was dead (any caller past ``require_role("modeler")`` already holds
+    modeler+) and was removed in the F-021-04 hard-cutover round-2 cleanup (F1).
+    The security assertion "a viewer cannot certify/deprecate/set a privileged
+    status" is unchanged — it is now proven at the gate that actually runs in
+    production. Overrides the ``mock_rbac_get_tenant_db`` autouse admin binding.
+    """
+    binding = types.SimpleNamespace(
+        id=uuid.uuid4(), role=role, model_id=None,
+        project_id=None, user_identity="*",
+    )
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = binding
+    db.execute = AsyncMock(return_value=result)
+    return db
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +234,10 @@ class TestAuditTrail:
         mock_audit.assert_called_once()
         call_kwargs = mock_audit.call_args.kwargs
         assert call_kwargs["action"] == "kpi.certify"
-        assert call_kwargs["severity"] == "info"
+        # CP-08 (c0b3580f) raised certify/deprecate governance transitions to
+        # "warn" severity, consistent with kpi.delete/deploy/undeploy; routine
+        # create/update/revert stay "info".
+        assert call_kwargs["severity"] == "warn"
         assert "certifier" in call_kwargs["detail"]
 
     @pytest.mark.asyncio
@@ -232,7 +265,8 @@ class TestAuditTrail:
         mock_audit.assert_called_once()
         call_kwargs = mock_audit.call_args.kwargs
         assert call_kwargs["action"] == "kpi.deprecate"
-        assert call_kwargs["severity"] == "info"
+        # CP-08 (c0b3580f) raised certify/deprecate to "warn" (see certify test).
+        assert call_kwargs["severity"] == "warn"
 
 
 # ---------------------------------------------------------------------------
@@ -331,19 +365,49 @@ class TestOwnershipGate:
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_non_owner_non_admin_cannot_certify(self, client):
-        other_user = _make_user(role="modeler", email="other@test.com")
+    async def test_non_owner_without_modeler_binding_cannot_certify(self, client):
+        # Bug-9402 / Wave C decision #8: certify authority is the caller's
+        # EFFECTIVE project/model binding (modeler+), not the coarse token role.
+        # A non-owner WITHOUT a modeler+ binding (viewer) is denied 403 at the
+        # route dependency ``require_role("modeler")`` — the real production gate
+        # (F-021-04 round-2, F1 removed the dead inner re-check).
+        other_user = _make_user(role="viewer", email="other@test.com")
         app.dependency_overrides[get_current_user] = lambda: other_user
 
         kpi = _kpi(owner_user_id="owner@test.com", certification_status="draft")
         db = make_mock_db()
         db.get = AsyncMock(return_value=kpi)
         with (
+            patch("src.auth.rbac.get_tenant_db", async_gen_from(_binding_rbac_db("viewer"))),
             patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
             patch("src.api.kpis.audit", new_callable=AsyncMock),
         ):
             resp = await client.post(f"{PREFIX}/{kpi.id}/certify", json={})
         assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_non_owner_modeler_can_certify(self, client):
+        # Bug-9402 / decision #8: a non-owner WITH a modeler+ effective binding
+        # is now authorized to certify (authority is the binding, not ownership
+        # or the coarse token role).
+        other_user = _make_user(role="modeler", email="other@test.com")
+        app.dependency_overrides[get_current_user] = lambda: other_user
+
+        kpi = _kpi(owner_user_id="owner@test.com", certification_status="draft")
+        db = make_mock_db()
+        db.get = AsyncMock(return_value=kpi)
+
+        async def mock_refresh(obj):
+            for attr, val in vars(kpi).items():
+                setattr(obj, attr, val)
+
+        db.refresh = mock_refresh
+        with (
+            patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
+            patch("src.api.kpis.audit", new_callable=AsyncMock),
+        ):
+            resp = await client.post(f"{PREFIX}/{kpi.id}/certify", json={})
+        assert resp.status_code == 200
 
     @pytest.mark.asyncio
     async def test_admin_can_certify_others_kpi(self, client):
@@ -367,14 +431,19 @@ class TestOwnershipGate:
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_non_owner_non_admin_cannot_deprecate(self, client):
-        other_user = _make_user(role="modeler", email="other@test.com")
+    async def test_non_owner_without_modeler_binding_cannot_deprecate(self, client):
+        # Bug-9402 / decision #8: deprecate authority is the effective binding
+        # (modeler+). A non-owner viewer (no modeler+ binding) is denied 403 at
+        # the route dependency ``require_role("modeler")`` — the real production
+        # gate (F-021-04 round-2, F1 removed the dead inner re-check).
+        other_user = _make_user(role="viewer", email="other@test.com")
         app.dependency_overrides[get_current_user] = lambda: other_user
 
         kpi = _kpi(owner_user_id="owner@test.com", certification_status="certified")
         db = make_mock_db()
         db.get = AsyncMock(return_value=kpi)
         with (
+            patch("src.auth.rbac.get_tenant_db", async_gen_from(_binding_rbac_db("viewer"))),
             patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
             patch("src.api.kpis.audit", new_callable=AsyncMock),
         ):
@@ -403,3 +472,87 @@ class TestOwnershipGate:
         ):
             resp = await client.post(f"{PREFIX}/{kpi.id}/certify", json={})
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Bug-6264 — PATCH certification_status: enum + privileged-status authorization
+# ---------------------------------------------------------------------------
+
+
+class TestPatchCertificationGuard:
+    @pytest.mark.asyncio
+    async def test_non_privileged_cannot_set_shared_via_patch(self, client):
+        """'shared' is certified-equivalent (renders as [Certified] in the XMLA
+        catalogue). Bug-9402 / decision #8: the write authority is the caller's
+        EFFECTIVE project/model binding (modeler+), not the coarse token role.
+        A caller WITHOUT a modeler+ binding (viewer) promoting a draft KPI to
+        'shared' via PATCH is blocked 403 at the route dependency
+        ``require_role("modeler")`` — the real production gate (F-021-04
+        round-2, F1 removed the dead inner cert-authority re-check)."""
+        viewer = _make_user(role="viewer")
+        app.dependency_overrides[get_current_user] = lambda: viewer
+
+        kpi = _kpi(certification_status="draft")
+        db = make_mock_db()
+        db.get = AsyncMock(return_value=kpi)
+        with (
+            patch("src.auth.rbac.get_tenant_db", async_gen_from(_binding_rbac_db("viewer"))),
+            patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
+        ):
+            resp = await client.patch(
+                f"{PREFIX}/{kpi.id}", json={"certification_status": "shared"},
+            )
+        assert resp.status_code == 403, resp.text
+        assert kpi.certification_status == "draft"
+
+    @pytest.mark.asyncio
+    async def test_modeler_binding_can_set_shared_via_patch(self, client):
+        """Bug-9402 / decision #8: a caller WITH a modeler+ effective binding
+        may set the privileged 'shared' status via PATCH — the coarse token
+        role is no longer the authority."""
+        modeler = _make_user(role="modeler")
+        app.dependency_overrides[get_current_user] = lambda: modeler
+
+        kpi = _kpi(certification_status="draft")
+        db = make_mock_db()
+        db.get = AsyncMock(return_value=kpi)
+
+        async def mock_refresh(obj):
+            for attr, val in vars(kpi).items():
+                setattr(obj, attr, val)
+
+        db.refresh = mock_refresh
+        with (
+            patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
+            patch("src.api.kpis.audit", new_callable=AsyncMock),
+            patch(
+                "src.api.kpis._invalidate_kpi_and_dependents",
+                new_callable=AsyncMock,
+            ),
+        ):
+            resp = await client.patch(
+                f"{PREFIX}/{kpi.id}", json={"certification_status": "shared"},
+            )
+        assert resp.status_code == 200, resp.text
+        assert kpi.certification_status == "shared"
+
+    @pytest.mark.parametrize("bad_status", ["banana", None])
+    @pytest.mark.asyncio
+    async def test_patch_invalid_certification_status_returns_422(
+        self, client, bad_status
+    ):
+        """certification_status is a controlled enum; an unknown string or an
+        explicit null must fail closed with 422, never bypass the privileged
+        gate or hit a NOT NULL 500."""
+        admin = _make_user(role="admin")
+        app.dependency_overrides[get_current_user] = lambda: admin
+
+        kpi = _kpi(certification_status="draft")
+        db = make_mock_db()
+        db.get = AsyncMock(return_value=kpi)
+        with patch("src.api.kpis.get_tenant_db", async_gen_from(db)):
+            resp = await client.patch(
+                f"{PREFIX}/{kpi.id}", json={"certification_status": bad_status},
+            )
+        assert resp.status_code == 422, resp.text
+        assert kpi.certification_status == "draft"

@@ -125,6 +125,52 @@ async def test_preview_accepts_persona_id_parameter(client):
 
 
 @pytest.mark.asyncio
+async def test_f007_16_preview_compile_error_is_422_not_500(client):
+    """F-007-16 / Bug-9021: bad RLS DSL on hierarchy preview is 422, not 500."""
+    from shared.security import RowSecurityCompileError
+
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(return_value=make_model())
+    hierarchy_id = uuid.uuid4()
+    persona = _make_persona()
+    levels = _make_levels()
+
+    with (
+        patch("src.api.hierarchies.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "src.api.hierarchies.resolve_effective_persona",
+            new=AsyncMock(return_value=persona),
+        ),
+        patch(
+            "src.api.hierarchies._load_hierarchy_or_404",
+            new=AsyncMock(
+                return_value=types.SimpleNamespace(
+                    id=hierarchy_id, name="Geo", model_id=TEST_MODEL_ID,
+                ),
+            ),
+        ),
+        patch("src.api.hierarchies._levels_for_hierarchy", new=AsyncMock(return_value=levels)),
+        patch(
+            "src.api.hierarchies.compile_row_security",
+            new=AsyncMock(side_effect=RowSecurityCompileError(
+                "unknown row-security function: 'dimension_in'"
+            )),
+        ),
+    ):
+        resp = await client.get(
+            f"{PREFIX}/hierarchies/{hierarchy_id}/preview"
+            f"?sample_size=10&persona_id={persona.id}",
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+    assert resp.status_code == 422
+    body = resp.json()
+    detail = body.get("detail", body)
+    assert detail.get("error_type") == "row_security_misconfigured"
+    assert "dimension_in" not in str(detail)
+
+
+@pytest.mark.asyncio
 async def test_preview_returns_404_when_persona_excludes_hierarchy(client):
     """If the persona's included_hierarchy_ids does not include the
     requested hierarchy, the preview endpoint must return 404."""

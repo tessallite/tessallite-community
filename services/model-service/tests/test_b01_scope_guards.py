@@ -4,6 +4,7 @@ import types
 import uuid
 
 import pytest
+from .result_fakes import FakeScalarResult
 from fastapi import HTTPException
 
 from shared.db.models import DataSource, KPI, Model, ProjectConnection
@@ -19,6 +20,12 @@ from src.api.kpis import (
 from src.api._scope import resolve_source_connection
 from src.api.sources import _validate_source_connection
 from src.api.targets import _validate_target_connection
+
+# F-017-12: the KPI draft-visibility guard now resolves privilege via
+# caller_has_role (a user_access_bindings lookup) — shim it to the token-role
+# decision for these mocked-db guard tests; the real binding behaviour is
+# covered by test_kpi_draft_visibility.
+pytestmark = pytest.mark.usefixtures("kpi_effective_role")
 
 
 class _DB:
@@ -43,7 +50,7 @@ class _DB:
                 self._rows = rows
 
             def scalars(self):
-                return self
+                return FakeScalarResult(self._rows)
 
             def all(self):
                 return self._rows
@@ -132,6 +139,188 @@ def test_saved_kpi_visibility_allows_visible_target_dependencies():
             "visible_target": target_id,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug-6329 model-side: dimension lineage persona gate
+# ---------------------------------------------------------------------------
+
+
+def test_kpi_persona_rejects_hidden_dimension_via_time_dimension_id():
+    """Bug-6329 model-side: a KPI whose time_dimension_id points to a
+    dimension the persona cannot see must be hidden (fail-closed)."""
+    m_id = uuid.uuid4()
+    visible_d_id = uuid.uuid4()
+    hidden_d_id = uuid.uuid4()
+    kpi_id = uuid.uuid4()
+    kpi = types.SimpleNamespace(
+        id=kpi_id,
+        expression='measure("revenue")',
+        target_expression=None,
+        target_measure_id=None,
+        value_measure_id=None,
+        goal_measure_id=None,
+        time_dimension_id=hidden_d_id,
+    )
+    scope = {
+        "allowed_dimension_ids": [visible_d_id],
+        "dimension_name_to_id": {"visible_date": visible_d_id, "hidden_date": hidden_d_id},
+        "measure_id_to_name": {m_id: "revenue"},
+        "dimension_id_to_name": {visible_d_id: "visible_date", hidden_d_id: "hidden_date"},
+        "all_kpis_by_name": {},
+    }
+    assert not _kpi_visible_to_persona(
+        kpi, [m_id], {"revenue": m_id}, dim_scope=scope,
+    )
+
+
+def test_kpi_persona_rejects_hidden_dimension_in_expression():
+    """Bug-6329 model-side: a KPI whose expression references a hidden
+    dimension via dimension() must be hidden."""
+    m_id = uuid.uuid4()
+    d_visible = uuid.uuid4()
+    d_hidden = uuid.uuid4()
+    kpi_id = uuid.uuid4()
+    kpi = types.SimpleNamespace(
+        id=kpi_id,
+        expression='measure("revenue") + dimension("hidden_region")',
+        target_expression=None,
+        target_measure_id=None,
+        value_measure_id=None,
+        goal_measure_id=None,
+        time_dimension_id=None,
+    )
+    scope = {
+        "allowed_dimension_ids": [d_visible],
+        "dimension_name_to_id": {"visible_region": d_visible, "hidden_region": d_hidden},
+        "measure_id_to_name": {m_id: "revenue"},
+        "dimension_id_to_name": {d_visible: "visible_region", d_hidden: "hidden_region"},
+        "all_kpis_by_name": {},
+    }
+    assert not _kpi_visible_to_persona(
+        kpi, [m_id], {"revenue": m_id}, dim_scope=scope,
+    )
+
+
+def test_kpi_persona_allows_when_all_lineage_visible():
+    """Bug-6329 model-side: a KPI whose full lineage (measures + dimensions)
+    is within the persona scope is visible."""
+    m_id = uuid.uuid4()
+    d_id = uuid.uuid4()
+    kpi_id = uuid.uuid4()
+    kpi = types.SimpleNamespace(
+        id=kpi_id,
+        expression='measure("revenue")',
+        target_expression=None,
+        target_measure_id=None,
+        value_measure_id=None,
+        goal_measure_id=None,
+        time_dimension_id=d_id,
+    )
+    scope = {
+        "allowed_dimension_ids": [d_id],
+        "dimension_name_to_id": {"order_date": d_id},
+        "measure_id_to_name": {m_id: "revenue"},
+        "dimension_id_to_name": {d_id: "order_date"},
+        "all_kpis_by_name": {},
+    }
+    assert _kpi_visible_to_persona(
+        kpi, [m_id], {"revenue": m_id}, dim_scope=scope,
+    )
+
+
+def test_kpi_persona_rejects_transitive_kpi_hidden_dimension():
+    """Bug-6329 model-side: a KPI referencing kpi('child') where the child
+    has a hidden dimension in its lineage must be hidden."""
+    m_id = uuid.uuid4()
+    d_visible = uuid.uuid4()
+    d_hidden = uuid.uuid4()
+    parent_id = uuid.uuid4()
+    child_id = uuid.uuid4()
+    child = types.SimpleNamespace(
+        id=child_id,
+        expression='measure("revenue")',
+        target_expression=None,
+        target_measure_id=None,
+        value_measure_id=None,
+        goal_measure_id=None,
+        time_dimension_id=d_hidden,
+    )
+    parent = types.SimpleNamespace(
+        id=parent_id,
+        expression='kpi("child_kpi")',
+        target_expression=None,
+        target_measure_id=None,
+        value_measure_id=None,
+        goal_measure_id=None,
+        time_dimension_id=None,
+    )
+    scope = {
+        "allowed_dimension_ids": [d_visible],
+        "dimension_name_to_id": {"visible_date": d_visible, "hidden_date": d_hidden},
+        "measure_id_to_name": {m_id: "revenue"},
+        "dimension_id_to_name": {d_visible: "visible_date", d_hidden: "hidden_date"},
+        "all_kpis_by_name": {"child_kpi": child},
+    }
+    assert not _kpi_visible_to_persona(
+        parent, [m_id], {"revenue": m_id}, dim_scope=scope,
+    )
+
+
+@pytest.mark.asyncio
+async def test_named_set_persona_rejects_hidden_dimension_via_dimensions_field():
+    """Bug-6329 model-side: a named set whose persisted dimensions field
+    names a dimension the persona cannot see must be hidden."""
+    from src.api.named_sets import _named_set_visible_to_persona
+
+    visible_d_id = uuid.uuid4()
+    hidden_d_id = uuid.uuid4()
+    model_id = uuid.uuid4()
+    ns = types.SimpleNamespace(
+        expression=None,
+        dimensions="hidden_dim",
+    )
+
+    class _DimDB:
+        async def execute(self, _stmt):
+            class _R:
+                def all(self):
+                    return [
+                        (visible_d_id, "visible_dim"),
+                        (hidden_d_id, "hidden_dim"),
+                    ]
+            return _R()
+
+    result = await _named_set_visible_to_persona(
+        _DimDB(), ns, model_id, [visible_d_id],
+    )
+    assert not result
+
+
+@pytest.mark.asyncio
+async def test_named_set_persona_allows_when_dimension_visible():
+    """Bug-6329 model-side: a named set whose dimensions field only names
+    visible dimensions is accessible."""
+    from src.api.named_sets import _named_set_visible_to_persona
+
+    visible_d_id = uuid.uuid4()
+    model_id = uuid.uuid4()
+    ns = types.SimpleNamespace(
+        expression=None,
+        dimensions="visible_dim",
+    )
+
+    class _DimDB:
+        async def execute(self, _stmt):
+            class _R:
+                def all(self):
+                    return [(visible_d_id, "visible_dim")]
+            return _R()
+
+    result = await _named_set_visible_to_persona(
+        _DimDB(), ns, model_id, [visible_d_id],
+    )
+    assert result
 
 
 @pytest.mark.asyncio

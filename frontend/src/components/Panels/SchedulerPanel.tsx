@@ -95,6 +95,11 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
 
   // Sync from server on initial load only — NOT after save.
   const [initialized, setInitialized] = useState(false);
+  // Whether the AI Optimiser form currently differs from the saved config.
+  // Gates "Run AI now" so a change made and not yet saved cannot be run
+  // against stale server state (Bug-7117, mirrors SmartBuilderSection's
+  // F-011-16b guard).
+  const [dirty, setDirty] = useState(false);
   useEffect(() => {
     if (config && !initialized) {
       setAiEnabled(config.ai_enabled);
@@ -104,6 +109,7 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
       setMaxCreates(config.max_creates_per_run);
       setDryRun(config.dry_run);
       setInitialized(true);
+      setDirty(false);
     }
   }, [config, initialized, t]);
 
@@ -142,6 +148,7 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
       setLookbackDays(Math.round(saved.lookback_hours / 24));
       setMaxCreates(saved.max_creates_per_run);
       setDryRun(saved.dry_run);
+      setDirty(false);
       setMessage({ type: "success", text: t("scheduler.saveSuccess") });
     } catch (err: unknown) {
       const detail =
@@ -154,6 +161,16 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
   }, [projectId, modelId, aiEnabled, scheduleLabel, loadedCron, lookbackDays, maxCreates, dryRun, t]);
 
   const handleRunNow = useCallback(async () => {
+    // Bug-7117: running against unsaved changes (e.g. flipping AI on then
+    // clicking Run before Save) hits the backend with stale config and
+    // surfaces a raw error such as "AI optimiser is not enabled for model
+    // <uuid>" — the exact UX SmartBuilderSection's F-011-16b guard already
+    // fixed for its own Run AI button. Block it here with a clear, translated
+    // prompt to save first instead.
+    if (dirty) {
+      setMessage({ type: "error", text: t("scheduler.saveBeforeRun") });
+      return;
+    }
     setRunning(true);
     setMessage(null);
     try {
@@ -178,7 +195,7 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
     } finally {
       setRunning(false);
     }
-  }, [tenantId, modelId, dryRun, t]);
+  }, [tenantId, modelId, dryRun, dirty, t]);
 
   const handleRefreshAll = useCallback(async () => {
     const active = (aggregates.data ?? []).filter((a) => a.status === "active");
@@ -255,6 +272,20 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
           text: t("scheduler.kpiSnapshotSweepPartial", {
             written: String(result.snapshots_written),
             failed: String(result.models_failed),
+          }),
+        });
+      } else if (result.latest_suppressed > 0) {
+        // Bug-7982 epoch-monotonicity guard (opus5 completion-round R4):
+        // a suppressed write is the guard working as intended (a fresher
+        // $KPIs value was already published, e.g. by the post-deploy
+        // re-eval trigger), not a failure — status stays "completed". But
+        // it must still be surfaced, not silently identical to a sweep
+        // with nothing suppressed, so a CHRONIC condition is noticeable.
+        setMessage({
+          type: "warning",
+          text: t("scheduler.kpiSnapshotSweepSuccessWithSuppressed", {
+            count: String(result.snapshots_written),
+            suppressed: String(result.latest_suppressed),
           }),
         });
       } else {
@@ -377,7 +408,7 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
       >
         <Stack spacing={2}>
           <FormControlLabel
-            control={<Switch checked={aiEnabled} onChange={(e) => setAiEnabled(e.target.checked)} disabled={readOnly} />}
+            control={<Switch checked={aiEnabled} onChange={(e) => { setAiEnabled(e.target.checked); setDirty(true); }} disabled={readOnly} />}
             label={t("scheduler.enableAiOptimiser")}
           />
 
@@ -386,7 +417,7 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
             <Select
               value={scheduleLabel}
               label={t("scheduler.runFrequency")}
-              onChange={(e) => setScheduleLabel(e.target.value)}
+              onChange={(e) => { setScheduleLabel(e.target.value); setDirty(true); }}
             >
               {SCHEDULE_CRON_OPTIONS.map((o) => (
                 <MenuItem key={o.cron} value={t(o.key)}>{t(o.key)}</MenuItem>
@@ -406,7 +437,7 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
             </Typography>
             <Slider
               value={lookbackDays}
-              onChange={(_, v) => setLookbackDays(v as number)}
+              onChange={(_, v) => { setLookbackDays(v as number); setDirty(true); }}
               min={1}
               max={30}
               step={1}
@@ -431,7 +462,7 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
             </Typography>
             <Slider
               value={maxCreates}
-              onChange={(_, v) => setMaxCreates(v as number)}
+              onChange={(_, v) => { setMaxCreates(v as number); setDirty(true); }}
               min={1}
               max={10}
               step={1}
@@ -446,7 +477,7 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
           </Box>
 
           <FormControlLabel
-            control={<Switch checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />}
+            control={<Switch checked={dryRun} onChange={(e) => { setDryRun(e.target.checked); setDirty(true); }} />}
             label={t("scheduler.previewOnly")}
             disabled={readOnly || !aiEnabled}
           />

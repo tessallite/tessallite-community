@@ -6,7 +6,6 @@ from __future__ import annotations
 import csv
 import io
 from datetime import datetime
-from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -15,6 +14,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from shared.db.models import Model, QueryLog, QueryMissLog, RouteLog
+from shared.query_log_client_kinds import ClientKindLiteral
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import (
     PaginatedQueryLogResponse,
@@ -25,6 +25,24 @@ from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 
 router = APIRouter(prefix="/projects/{project_id}/logs", tags=["logs"])
+
+# Bug-7451: probe/introspection rows (route_type="introspect") and BI-client
+# catalogue member-enumeration queries (protocol="discover_members") are logged
+# for auditability but are NOT user queries.  The metrics and analytics
+# endpoints already exclude them (F-030-09, Bug-6425); the query-log list and
+# CSV export must do the same by default so a modeler sees real user traffic.
+# The caller can opt in to probe rows via ``include_probes=true``.
+_PROBE_EXCLUDED_ROUTE_TYPES = ("introspect",)
+_PROBE_DISCOVERY_PROTOCOL = "discover_members"
+
+# Bug-7451 / CF-030-DS-F03002: the client_kind literal that FastAPI validates
+# must include every value produced by the query-router, gateway, and other
+# writers.  "headless", "agent", and "mcp" were added to writers but never to
+# the filter type, causing 422 when a user tries to filter by those sources.
+# Bug-8070: that recurred (the KPI bridge shipped with no origin at all), so the
+# domain now lives in ONE place and this filter derives from it rather than
+# restating it.
+_CLIENT_KIND_LITERAL = ClientKindLiteral
 
 
 def _apply_query_log_filters(
@@ -38,7 +56,16 @@ def _apply_query_log_filters(
     user_identity: str | None,
     date_from: datetime | None,
     date_to: datetime | None,
+    include_probes: bool = False,
 ):
+    # Bug-7451: exclude probe traffic by default so the user-facing query log
+    # shows only real user queries.  When include_probes=True the rows are
+    # retained (a modeler can still inspect them explicitly).
+    if not include_probes:
+        stmt = stmt.where(
+            QueryLog.route_type.notin_(_PROBE_EXCLUDED_ROUTE_TYPES),
+            QueryLog.protocol.is_distinct_from(_PROBE_DISCOVERY_PROTOCOL),
+        )
     if model_id is not None:
         stmt = stmt.where(QueryLog.model_id == model_id)
     if status is not None and status != "all":
@@ -66,12 +93,19 @@ async def list_query_logs(
     status: str | None = Query(None, description="Filter: success, error, or all"),
     error_type: str | None = Query(None, description="Filter by error_type"),
     route_type: str | None = Query(None, description="Filter: source, aggregate, pocket"),
-    client_kind: Literal["looker_studio", "looker_cloud", "plugin"] | None = Query(
-        None, description="Filter: looker_studio or looker_cloud"
+    client_kind: _CLIENT_KIND_LITERAL | None = Query(
+        None, description="Filter by client kind",
     ),
     user_identity: str | None = Query(None, description="Partial match on user identity"),
     date_from: datetime | None = Query(None, description="Start of date range (ISO 8601)"),
     date_to: datetime | None = Query(None, description="End of date range (ISO 8601)"),
+    include_probes: bool = Query(
+        False,
+        description=(
+            "Bug-7451: include introspect/discover-members probe traffic. "
+            "Default false — the log shows only real user queries."
+        ),
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     current_user: CurrentUser = Depends(forbid_embed_user),
@@ -96,7 +130,7 @@ async def list_query_logs(
         filter_kw = dict(
             model_id=model_id, status=status, error_type=error_type,
             route_type=route_type, client_kind=client_kind, user_identity=user_identity,
-            date_from=date_from, date_to=date_to,
+            date_from=date_from, date_to=date_to, include_probes=include_probes,
         )
         stmt = _apply_query_log_filters(stmt, **filter_kw)
         count_stmt = _apply_query_log_filters(count_stmt, **filter_kw)
@@ -149,10 +183,14 @@ async def export_query_logs_csv(
     status: str | None = Query(None),
     error_type: str | None = Query(None),
     route_type: str | None = Query(None),
-    client_kind: Literal["looker_studio", "looker_cloud", "plugin"] | None = Query(None),
+    client_kind: _CLIENT_KIND_LITERAL | None = Query(None),
     user_identity: str | None = Query(None),
     date_from: datetime | None = Query(None),
     date_to: datetime | None = Query(None),
+    include_probes: bool = Query(
+        False,
+        description="Bug-7451: include probe traffic in the CSV export.",
+    ),
     current_user: CurrentUser = Depends(forbid_embed_user),
     # F-030-02: bulk CSV export of up to 50,000 raw query rows is a stricter
     # operation than reading a page — require modeler+ (matches the report's
@@ -170,7 +208,7 @@ async def export_query_logs_csv(
         stmt = _apply_query_log_filters(
             stmt, model_id=model_id, status=status, error_type=error_type,
             route_type=route_type, client_kind=client_kind, user_identity=user_identity,
-            date_from=date_from, date_to=date_to,
+            date_from=date_from, date_to=date_to, include_probes=include_probes,
         )
         result = await db.execute(stmt)
         rows = result.scalars().all()

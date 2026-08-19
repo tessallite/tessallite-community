@@ -1,13 +1,24 @@
 """Tests for embed user conversation ownership and management API denial."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import uuid
 
 import pytest
 from fastapi import HTTPException
 
-from shared.auth.middleware import CurrentEmbedUser, CurrentUser, forbid_embed_user
+from shared.auth.middleware import (
+    CurrentEmbedUser,
+    CurrentServiceUser,
+    CurrentUser,
+    forbid_embed_user,
+)
 from src.api.conversations import _enforce_conversation_ownership
+from src.api.personas import (
+    _require_project_modeller as _require_persona_modeller,
+    _require_project_viewer as _require_persona_viewer,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -36,12 +47,42 @@ class TestConversationOwnership:
             _enforce_conversation_ownership(conv, user)
         assert exc_info.value.status_code == 404
 
-    def test_regular_user_can_access_any_conversation(self):
+    def test_tenant_admin_can_access_other_conversation_for_admin_surfaces(self):
         user = CurrentUser(
             user_id="admin@tenant.com", tenant_id="t", email="admin@tenant.com",
             role="tenant_admin",
         )
         conv = _make_conv("other@tenant.com")
+        _enforce_conversation_ownership(conv, user)
+
+    def test_service_principal_cannot_access_other_conversation_by_admin_role(self):
+        user = CurrentServiceUser(
+            principal="pocket-refresh",
+            tenant_id="t",
+            role="system_admin",
+            scopes=["query-router.pocket-refresh"],
+        )
+        conv = _make_conv("other@tenant.com")
+        with pytest.raises(HTTPException) as exc_info:
+            _enforce_conversation_ownership(conv, user)
+        assert exc_info.value.status_code == 404
+
+    def test_regular_user_blocked_from_other_conversation(self):
+        user = CurrentUser(
+            user_id="viewer@tenant.com", tenant_id="t", email="viewer@tenant.com",
+            role="member",
+        )
+        conv = _make_conv("other@tenant.com")
+        with pytest.raises(HTTPException) as exc_info:
+            _enforce_conversation_ownership(conv, user)
+        assert exc_info.value.status_code == 404
+
+    def test_regular_user_can_access_own_conversation(self):
+        user = CurrentUser(
+            user_id="viewer@tenant.com", tenant_id="t", email="viewer@tenant.com",
+            role="member",
+        )
+        conv = _make_conv("viewer@tenant.com")
         _enforce_conversation_ownership(conv, user)
 
     def test_embed_user_blocked_from_tenant_user_conversation(self):
@@ -71,6 +112,66 @@ class TestForbidEmbedUser:
         )
         result = await forbid_embed_user(user)
         assert result is user
+
+
+def _db_without_binding():
+    db = AsyncMock()
+    no_binding = MagicMock()
+    no_binding.scalar_one_or_none.return_value = None
+    some_binding_exists = MagicMock()
+    some_binding_exists.scalar_one_or_none.return_value = object()
+    db.execute = AsyncMock(side_effect=[no_binding, some_binding_exists])
+    return db
+
+
+def _gen(db):
+    async def _g(*_args, **_kwargs):
+        yield db
+    return _g
+
+
+class TestPersonaHumanAdminGates:
+    @pytest.mark.asyncio
+    async def test_service_principal_does_not_bypass_persona_modeller_gate(self):
+        user = CurrentServiceUser(
+            principal="glossary-bootstrap-service",
+            tenant_id="t",
+            role="tenant_admin",
+            scopes=["optimizer.stats-refresh"],
+        )
+        with patch("src.api.personas.get_tenant_db", _gen(_db_without_binding())):
+            with pytest.raises(HTTPException) as exc_info:
+                await _require_persona_modeller(uuid.uuid4(), user)
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_service_principal_does_not_bypass_persona_viewer_gate(self):
+        user = CurrentServiceUser(
+            principal="data-quality-validator",
+            tenant_id="t",
+            role="system_admin",
+            scopes=["query-router.data-quality"],
+        )
+        with patch("src.api.personas.get_tenant_db", _gen(_db_without_binding())):
+            with pytest.raises(HTTPException) as exc_info:
+                await _require_persona_viewer(uuid.uuid4(), user)
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_human_tenant_admin_still_bypasses_persona_gate(self):
+        user = CurrentUser(
+            user_id="admin@tenant.com",
+            tenant_id="t",
+            email="admin@tenant.com",
+            role="tenant_admin",
+        )
+        async def _explode(*_args, **_kwargs):
+            raise AssertionError("human tenant_admin should not need binding lookup")
+            yield
+
+        with patch("src.api.personas.get_tenant_db", _explode):
+            await _require_persona_modeller(uuid.uuid4(), user)
+            await _require_persona_viewer(uuid.uuid4(), user)
 
 
 class TestProjectScope:

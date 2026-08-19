@@ -80,6 +80,13 @@ Three things are deliberately **not** frozen, because they are safety controls t
 - **Column-level security (data tags)** — restricting a tagged column takes effect at once, for the same reason. You should never have to redeploy to *remove* access.
 - **Aggregates and pocket tables** — these are speed-up tables the scheduler and optimiser maintain underneath the pinned shape. Routing a query to one of them never changes *which* numbers come back; it only changes how fast.
 
+Two other actions apply immediately without a Deploy, because the product treats them as **governance actions** (like un-deploying) rather than definition edits:
+
+- **Deleting a KPI** — removes it from BI tools at once. There is no "undo by not deploying."
+- **Deleting a named set** — removes it from Excel and Power BI immediately. Any report referencing it renders empty on the next refresh.
+
+These differ from field edits (renaming a KPI, changing its formula), which DO wait for a Deploy. Deleting the whole object is irreversible outside the deployment cycle.
+
 **Worked example.** You deploy v3 of a Sales model on Monday. On Tuesday you start reworking the Revenue measure but do not Deploy. An analyst querying from Excel all week still sees the v3 Revenue. On Friday your rework is ready; you Save and Deploy, and only then does the new Revenue reach BI tools. But if on Wednesday you had tightened a row-security rule, that restriction would have applied immediately — security is never left waiting.
 
 ---

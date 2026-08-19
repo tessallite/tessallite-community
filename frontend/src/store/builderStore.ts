@@ -44,6 +44,7 @@ export const PANEL_IDS = [
   "data-quality",
   "data-tags",
   "impact",
+  "impact-analysis",
   "schema-changes",
   "named-sets",
   "saved-queries",
@@ -162,6 +163,11 @@ interface BuilderState {
      should check this to disable editing controls (Bug-5301). */
   readOnly: boolean;
 
+  /* Immediate (non-debounced) canvas layout flush. Registered by Canvas on
+     mount, cleared on unmount. Returns a Promise that resolves when the
+     server PATCH completes. Used by the Save dialog's "layout only" mode. */
+  flushCanvasLayoutNow: (() => Promise<void>) | null;
+
   // ---- actions ----
   openPanel: (panel: PanelId) => void;
   closePanel: () => void;
@@ -190,6 +196,7 @@ interface BuilderState {
   setDisplayLocale: (locale: string | null) => void;
   setPendingSql: (sql: string | null) => void;
   setReadOnly: (readOnly: boolean) => void;
+  setFlushCanvasLayoutNow: (fn: (() => Promise<void>) | null) => void;
   reset: () => void;
 }
 
@@ -236,6 +243,16 @@ function loadTerminalOverrides(): TerminalOverrideMap {
   }
 }
 
+// The active display locale is a user preference persisted to localStorage by
+// setDisplayLocale. Like the relation prefs above it must be re-read (not reset
+// to English) whenever the store is reset on a model mount — otherwise opening
+// any model silently reverts the whole UI to English for non-English users
+// (Bug-6374 / F-026-02).
+function loadDisplayLocale(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("display_locale") || null;
+}
+
 function persist(key: string, value: string): void {
   if (typeof window === "undefined") return;
   try {
@@ -276,12 +293,13 @@ const initialState = {
     executeResult: null as unknown | null,
     error: null as string | null,
   },
-  displayLocale: null as string | null,
+  displayLocale: loadDisplayLocale() as string | null,
   pendingSql: null as string | null,
   readOnly: false,
+  flushCanvasLayoutNow: null as (() => Promise<void>) | null,
 };
 
-export const useBuilderStore = create<BuilderState>()((set) => ({
+export const useBuilderStore = create<BuilderState>()((set, get) => ({
   ...initialState,
 
   openPanel: (panel) => set({ activePanel: panel }),
@@ -349,24 +367,21 @@ export const useBuilderStore = create<BuilderState>()((set) => ({
   },
   setPendingSql: (sql) => set({ pendingSql: sql }),
   setReadOnly: (readOnly) => set({ readOnly }),
+  setFlushCanvasLayoutNow: (fn) => set({ flushCanvasLayoutNow: fn }),
 
-  // reset() runs on every model mount. Relation display preferences and the
-  // per-join terminal overrides are persisted (F-026-18) and must survive the
-  // reset — re-read them from localStorage so a model switch keeps the user's
-  // notation/pathing/cardinality choices instead of silently reverting them.
+  // reset() runs on every model mount. Relation display preferences, the
+  // per-join terminal overrides (F-026-18) and the active display locale
+  // (Bug-6374) are persisted to localStorage and must survive the reset —
+  // re-read them so a model switch keeps the user's notation/pathing/cardinality
+  // choices and their chosen UI language instead of silently reverting to
+  // defaults / English.
   reset: () =>
     set({
       ...initialState,
       relationNotation: loadRelationNotation(),
       relationPathing: loadRelationPathing(),
       relationTerminalOverrides: loadTerminalOverrides(),
+      displayLocale: loadDisplayLocale(),
+      readOnly: get().readOnly,
     }),
 }));
-
-// Initialize displayLocale from localStorage on app startup
-if (typeof window !== "undefined") {
-  const savedLocale = localStorage.getItem("display_locale");
-  if (savedLocale) {
-    useBuilderStore.setState({ displayLocale: savedLocale });
-  }
-}

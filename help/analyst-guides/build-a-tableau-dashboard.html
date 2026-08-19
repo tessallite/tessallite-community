@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Build a Tableau Dashboard — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Analyst Guides</span> / <span>Build a Tableau Dashboard</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">end user</span><span class="updated">Updated 2026-08-04</span></div>
+    <h1>Build a Tableau Dashboard</h1>
+<h2>What this covers</h2>
+<p>A complete walk from a blank Tableau Desktop workbook to a small, polished dashboard on the Tessallite demo model: a sales map-by-country table, a product leaderboard, a monthly trend, and a filter that ties them together — on a <strong>live</strong> connection, so the dashboard reads current governed data every time it opens.</p>
+<h2>Before you start</h2>
+<ul>
+<li>Tableau Desktop.</li>
+<li>Your Tessallite sign-in, the workspace slug, and the gateway address. On the local demo: <code>admin@acme-demo.com</code> / <code>acme-demo</code>, slug <code>acme-demo</code>, gateway <code>localhost</code>, port <code>5433</code>.</li>
+<li>The connection mechanics are the same as any PostgreSQL source; the reference is <a href="../getting-started/connect-a-bi-tool.html">Connect a BI Tool via JDBC</a>. This page starts once you can see the model in Tableau.</li>
+</ul>
+<h2>Step 1 — Connect, and stay live</h2>
+<ol>
+<li>Open Tableau Desktop. In the <strong>Connect</strong> pane, choose <strong>PostgreSQL</strong>.</li>
+<li><strong>Server</strong>: <code>localhost</code>. <strong>Port</strong>: <code>5433</code>. <strong>Database</strong>: <code>acme-demo</code> (or <code>acme-demo/modelx</code> to scope to the model this walkthrough uses).</li>
+<li><strong>Username</strong>: your Tessallite email. <strong>Password</strong>: your Tessallite password. Click <strong>Sign In</strong>.</li>
+<li>On the data source page, drag the <strong><code>modelx</code></strong> table onto the canvas.</li>
+<li>At the top right, choose <strong>Live</strong> (not Extract).</li>
+</ol>
+<p><strong>Why live matters here.</strong> An extract freezes a copy of the data into the workbook. It cannot be accelerated by new summaries, it drifts stale until refreshed, and — most quietly dangerous — it is a copy of governed data sitting outside the reach of the rules. A live connection asks Tessallite a fresh, security-checked, accelerated question every time someone opens or filters the dashboard.</p>
+<h2>Step 2 — Meet the model in the Data pane</h2>
+<p>Look at the left-hand Data pane. Everything in it comes from the semantic model:</p>
+<ul>
+<li><strong>Dimensions</strong> — the ways to slice: <code>country_code</code>, <code>product_name</code>, <code>customer_segment</code>, <code>channel_code</code>, <code>business_date</code>, and friends.</li>
+<li><strong>Measures</strong> — the governed numbers: <code>net_sales</code>, <code>gross_margin</code>, <code>transaction_count</code>, <code>Revenue</code>.</li>
+</ul>
+<p>The measures arrive with their definitions already attached. <code>net_sales</code> is not "whatever sum someone typed into this workbook" — it is the model owner's definition, the same one Excel and Power BI see. Tableau aggregates them as you drag, and Tessallite computes the aggregation in the database.</p>
+<blockquote><p><strong>Tip: let Tableau aggregate, never pre-sum.</strong> Drag the raw measure and let Tableau wrap it (<code>SUM(net_sales)</code>). Do not build a custom SQL fragment that sums first — the model's measures are defined to be aggregated at query time, and pre-summing breaks exactly the cases (ratios, distinct counts) the definitions protect.</p></blockquote>
+<h2>Step 3 — Sheet one: the country view</h2>
+<ol>
+<li>Double-click <strong><code>country_code</code></strong>. Tableau reads it as geography and draws a map (if it lands as text instead, drag <code>country_code</code> to <strong>Rows</strong> — a tidy table is just as good for this walkthrough).</li>
+<li>Drag <strong><code>net_sales</code></strong> onto <strong>Colour</strong> (on the map) or onto <strong>Text</strong> (in the table). Darker or bigger means more sales.</li>
+<li>Rename the sheet <strong>Sales by Country</strong> (double-click the tab).</li>
+</ol>
+<p>That double-click was a query: Tessallite grouped sales by country and returned only the result — one value per country — not the hundred thousand rows behind it.</p>
+<h2>Step 4 — Sheet two: the product leaderboard</h2>
+<ol>
+<li>New sheet (<strong>Worksheet &gt; New Worksheet</strong>), named <strong>Top Products</strong>.</li>
+<li>Drag <strong><code>product_name</code></strong> to <strong>Rows</strong>, <strong><code>net_sales</code></strong> to <strong>Columns</strong>. Bars appear.</li>
+<li>Click the <strong>Sort descending</strong> button in the toolbar — longest bar on top.</li>
+<li>To keep it to the leaders: drag <code>product_name</code> to <strong>Filters</strong>, open the <strong>Top</strong> tab, choose <strong>By field &gt; Top 10 by SUM(net_sales)</strong>.</li>
+</ol>
+<p>The Top 10 is computed over the full set of products in the database, then the ten winners are drawn — the genuine leaderboard, not the ten biggest of whatever was on screen.</p>
+<h2>Step 5 — Sheet three: the monthly trend</h2>
+<ol>
+<li>New sheet, named <strong>Monthly Trend</strong>.</li>
+<li>Drag <strong><code>business_date</code></strong> to <strong>Columns</strong>. Tableau defaults to YEAR; click the little <strong>+</strong> on the pill (or right-click it and choose <strong>Month</strong>) to walk down to months.</li>
+<li>Drag <strong><code>net_sales</code></strong> to <strong>Rows</strong>. The trend line draws itself.</li>
+</ol>
+<h2>Step 6 — Assemble the dashboard and wire the filter</h2>
+<ol>
+<li><strong>Dashboard &gt; New Dashboard</strong>. Drag the three sheets onto the canvas: country view top-left, leaderboard top-right, trend along the bottom.</li>
+<li>On the <strong>Sales by Country</strong> sheet (inside the dashboard), click the small funnel icon — <strong>Use as Filter</strong>. Now clicking a country re-queries the other two sheets for that country alone.</li>
+<li>Add a quick filter for a second slice if you like: on any sheet, right-click <strong><code>channel_code</code> &gt; Show Filter</strong>, and the tick-box panel appears on the dashboard.</li>
+</ol>
+<p>Every click on the dashboard is a fresh live query. Tessallite answers each one through the same routing as every other tool — summary when one fits, governed source path otherwise — and applies your security on the way.</p>
+<h2>Step 7 — The number-checking habit</h2>
+<p>Before you circulate the dashboard, do the five-second check Maya does: glance at the grand total of <code>net_sales</code> on the leaderboard sheet and compare it with the same figure in the Tessallite web app's query panel (or ask the agent). They match — they must, because both come from the one model — and being able to say "this ties to the governed number" is what separates a dashboard people trust from one people debate.</p>
+<blockquote><p><strong>Common trap: blending in a second, ungoverned source.</strong> Tableau makes it easy to drag in a spreadsheet of "adjustments" and blend it with the model. The moment you do, the dashboard shows numbers nobody else can reproduce and the trust check above fails. If an adjustment is real, it belongs in the model — one definition, every tool. See <a href="why-your-numbers-match.html">Why Your Numbers Match</a>.</p></blockquote>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr></thead><tbody>
+<tr><td>Cannot sign in</td><td>Wrong slug, email, or password</td><td>All three are exact; the slug is case-sensitive</td></tr>
+<tr><td>The model table is not listed</td><td>No deployed models, or the connection is scoped to the wrong workspace</td><td>Check the Database field; ask your modeller to deploy</td></tr>
+<tr><td>Everything feels slow on first open</td><td>Queries are hitting the source path</td><td>Still correct; summaries are created over time as the optimizer learns the workload</td></tr>
+<tr><td>A date shows as a number or text</td><td>The pill is set to the wrong type</td><td>Right-click the pill and choose the date granularity you want</td></tr>
+<tr><td>Numbers differ from a colleague's workbook</td><td>They filtered differently, or you are on different personas</td><td>Compare filters first; personas can legitimately show different rows</td></tr>
+</tbody></table></div>
+<h2>Related</h2>
+<ul>
+<li><a href="../getting-started/connect-a-bi-tool.html">Connect a BI Tool via JDBC</a></li>
+<li><a href="../integrations/jdbc-connection-guide.html">JDBC Connection Guide</a></li>
+<li><a href="build-a-power-bi-report.html">Build a Power BI Report</a></li>
+<li><a href="choosing-your-connection.html">Choose Your Connection</a></li>
+</ul>
+<nav class="page-nav"><a href="build-a-power-bi-report.html" class="page-nav-btn prev">&larr; Build a Power BI Report</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="query-tessallite-from-jupyter.html" class="page-nav-btn next">Query Tessallite from a Jupyter Notebook &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

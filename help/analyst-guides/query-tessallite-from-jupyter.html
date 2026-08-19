@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Query Tessallite from a Jupyter Notebook — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Analyst Guides</span> / <span>Query Tessallite from a Jupyter Notebook</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">end user</span><span class="updated">Updated 2026-08-04</span></div>
+    <h1>Query Tessallite from a Jupyter Notebook</h1>
+<h2>What this covers</h2>
+<p>For when the destination is not a chart but an analysis: pulling governed data from Tessallite into a Jupyter notebook with Python, shaping it with pandas, plotting it, and training a small machine-learning model on it — using the same sign-in and the same numbers as every BI tool in the building.</p>
+<h2>Before you start</h2>
+<ul>
+<li>Python 3 with Jupyter (or JupyterLab), and permission to <code>pip install</code> packages.</li>
+<li>Your Tessallite sign-in, the workspace slug, and the gateway address. On the local demo: <code>admin@acme-demo.com</code> / <code>acme-demo</code>, slug <code>acme-demo</code>, gateway <code>localhost</code>, port <code>5433</code>.</li>
+<li>The demo <code>modelx</code> model deployed, as with the rest of this section.</li>
+</ul>
+<p>Install the two packages this page needs (plus two for the later steps):</p>
+<pre><code>pip install psycopg2-binary pandas matplotlib scikit-learn</code></pre>
+<h2>Why not connect straight to the source database?</h2>
+<p>You could — the credentials might even work. But three things would quietly change:</p>
+<ol>
+<li><strong>Definitions.</strong> Tessallite knows that <code>net_sales</code> means a specific governed calculation. A hand-written <code>SUM(...)</code> against raw tables is your private interpretation of it, and next quarter it will disagree with the official dashboard.</li>
+<li><strong>Security.</strong> Row security, column restrictions, and personas are applied by Tessallite before any data leaves. A direct connection bypasses all of it.</li>
+<li><strong>Speed.</strong> Queries through Tessallite are answered from pre-computed summaries when they can be. Your notebook gets the same acceleration as the executive dashboard.</li>
+</ol>
+<p>Going through Tessallite means your experiment reconciles with the business's numbers — which is the difference between an analysis that changes a decision and one that gets debated.</p>
+<h2>Step 1 — Connect</h2>
+<p>Tessallite speaks the PostgreSQL wire protocol on port <code>5433</code>, so the standard <code>psycopg2</code> driver connects directly:</p>
+<pre><code>import psycopg2
+import pandas as pd
+
+conn = psycopg2.connect(
+    host="localhost",        # or your gateway hostname
+    port=5433,
+    dbname="acme-demo",      # the workspace slug — case-sensitive
+    user="admin@acme-demo.com",
+    password="acme-demo",
+)</code></pre>
+<p>To scope the connection to one model, extend the <code>dbname</code>: <code>"acme-demo/modelx"</code>.</p>
+<h2>Step 2 — Your first governed dataframe</h2>
+<p>Query the model the way you would query any SQL table. The model appears as a table whose columns are its dimensions and measures:</p>
+<pre><code>df = pd.read_sql(
+    """
+    SELECT product_name, SUM(net_sales) AS net_sales
+    FROM modelx
+    GROUP BY product_name
+    ORDER BY net_sales DESC
+    LIMIT 10
+    """,
+    conn,
+)
+df</code></pre>
+<p>Ten rows: the product leaderboard, computed by Tessallite (from a summary if one covers it), identical to the number Excel and Power BI would show. Note what you did <strong>not</strong> write: no joins, no table names from the source system, no metric definitions. The model supplies all three.</p>
+<blockquote><p><strong>Tip: ask for grouped data, not raw rows.</strong> Let Tessallite aggregate and bring back the summary (<code>GROUP BY</code> in the query), rather than pulling raw rows into pandas and summing them yourself. It is faster, kinder to the network, and it keeps the arithmetic where the definitions live.</p></blockquote>
+<h2>Step 3 — Plot it</h2>
+<pre><code>import matplotlib.pyplot as plt
+
+df.plot(kind="barh", x="product_name", y="net_sales", legend=False)
+plt.xlabel("Net sales")
+plt.tight_layout()
+plt.show()</code></pre>
+<p>A horizontal bar chart of the top ten products — the same leaderboard the Tableau walkthrough built, now reproducible in code and re-runnable every morning.</p>
+<h2>Step 4 — A small machine-learning example</h2>
+<p>The notebook pattern that matters most for ML: <strong>use governed measures as your features.</strong> Then the training data agrees with the reports the business reads, and the model's results can be explained in the same vocabulary.</p>
+<p>Here is a complete, honest little example — predicting a country's <code>net_sales</code> from its <code>transaction_count</code> and average transaction size, using ordinary least squares:</p>
+<pre><code>from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+
+features = pd.read_sql(
+    """
+    SELECT country_code,
+           SUM(transaction_count) AS transactions,
+           AVG(transaction_amount) AS avg_transaction,
+           SUM(net_sales)         AS net_sales
+    FROM modelx
+    GROUP BY country_code
+    """,
+    conn,
+).dropna()
+
+X = features[["transactions", "avg_transaction"]]
+y = features["net_sales"]
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+model = LinearRegression().fit(X_train, y_train)
+print("R^2 on held-out countries:", model.score(X_test, y_test))</code></pre>
+<p>A few interpretations to keep you honest:</p>
+<ul>
+<li>The target and both features are <strong>governed measures</strong> — so "transactions" here means exactly what the sales dashboard means by it.</li>
+<li>This is deliberately tiny: a teaching example with a handful of countries, not a production forecast. Real work would add time features, more dimensions, and proper validation — but the data-sourcing pattern stays exactly this one.</li>
+<li>When the model eventually matters, the features can be recomputed on fresh data at any time by re-running the same query. No extract to babysit.</li>
+</ul>
+<h2>Step 5 — Tidy up</h2>
+<pre><code>conn.close()</code></pre>
+<p>And a habit worth forming: keep the connection string in one cell at the top, never paste password cells into shared notebooks, and prefer environment variables or a secrets file for real credentials. The demo password above is public knowledge; yours is not.</p>
+<h2>When the notebook becomes a product</h2>
+<p>If the end result of your experiment is something an application should call — a score, a forecast, a governed metric inside your own product — the notebook stops being the right delivery vehicle. That is what the <a href="../integrations/headless-api.html">Headless API</a> is for: the same governed questions, answered as JSON, callable from any backend. The query you prototyped here transfers directly.</p>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr></thead><tbody>
+<tr><td><code>connection refused</code> on port 5433</td><td>Gateway not running, or wrong host</td><td>Confirm the host with your administrator; on a local install check the stack is up</td></tr>
+<tr><td><code>password authentication failed</code></td><td>Wrong slug, email, or password</td><td><code>dbname</code> is the workspace slug and is case-sensitive</td></tr>
+<tr><td><code>relation "modelx" does not exist</code></td><td>The model is not deployed, or the connection is scoped elsewhere</td><td>Check the deployed models in the web app; adjust the <code>dbname</code> scoping</td></tr>
+<tr><td>A column name is not found</td><td>Dimensions and measures use their model names</td><td>List them in the web app or query <code>SELECT * FROM modelx LIMIT 1</code> and inspect the columns</td></tr>
+<tr><td>Results differ from a colleague's notebook</td><td>Different filters, or different personas</td><td>Personas legitimately change which rows you see — compare like for like</td></tr>
+</tbody></table></div>
+<h2>Related</h2>
+<ul>
+<li><a href="../getting-started/connect-a-bi-tool.html">Connect a BI Tool via JDBC</a></li>
+<li><a href="../integrations/headless-api.html">Headless API</a></li>
+<li><a href="../integrations/api-authentication.html">API Authentication</a></li>
+<li><a href="why-your-numbers-match.html">Why Your Numbers Match</a></li>
+</ul>
+<nav class="page-nav"><a href="build-a-tableau-dashboard.html" class="page-nav-btn prev">&larr; Build a Tableau Dashboard</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="why-your-numbers-match.html" class="page-nav-btn next">Why Your Numbers Match &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -41,6 +41,7 @@ import {
   useDownstreamAssets,
   useDownstreamAssetSummary,
   useGatewayQueryReferences,
+  useColumnUsage,
 } from "../../api/hooks";
 import { useConfirm } from "../Confirm";
 import { useT } from "../../i18n";
@@ -100,6 +101,7 @@ export default function ImpactPanel() {
   const assets = useDownstreamAssets(projectId!, modelId!);
   const summary = useDownstreamAssetSummary(projectId!, modelId!);
   const queryRefs = useGatewayQueryReferences(projectId!, modelId!);
+  const columnUsage = useColumnUsage(projectId!, modelId!);
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["downstream-assets", projectId, modelId] });
@@ -134,6 +136,7 @@ export default function ImpactPanel() {
     mutationFn: () => impactScanApi.scan(projectId!, modelId!),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["gateway-query-refs", projectId, modelId] });
+      qc.invalidateQueries({ queryKey: ["column-usage", projectId, modelId] });
     },
   });
 
@@ -203,6 +206,7 @@ export default function ImpactPanel() {
       <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ mb: 2 }}>
         <Tab label={t("impact.downstreamAssetsTab")} />
         <Tab label={t("impact.queryAuditTab")} />
+        <Tab label={t("impact.columnUsageTab")} />
       </Tabs>
 
       {tab === 0 && (
@@ -301,8 +305,30 @@ export default function ImpactPanel() {
           </Stack>
 
           {scanMut.isSuccess && (
-            <Alert severity="success" sx={{ mb: 1 }}>
+            <Alert
+              severity={
+                scanMut.data.logs_scanned === 0 || scanMut.data.tables_matched === 0
+                  ? "info"
+                  : "success"
+              }
+              sx={{ mb: 1 }}
+            >
               {(() => {
+                // The scan is incremental: it resumes from the newest usage it
+                // already recorded. Reporting "0 tables checked" when there was
+                // simply nothing new reads as "this model is unused", which is
+                // the opposite of the question the panel answers.
+                if (scanMut.data.logs_scanned === 0) {
+                  return t("impact.scanCompleteNothingNew");
+                }
+                // Rows were read but none touched this model. Saying
+                // "0 tables checked" implies the model is unused; the truth is
+                // that the traffic in that window belongs to something else.
+                if (scanMut.data.tables_matched === 0) {
+                  return t("impact.scanCompleteNoMatches", {
+                    logsScanned: String(scanMut.data.logs_scanned),
+                  });
+                }
                 const tablesOne = scanMut.data.tables_matched === 1;
                 const refsOne = scanMut.data.references_upserted === 1;
                 const key = tablesOne
@@ -311,7 +337,11 @@ export default function ImpactPanel() {
                 const params: Record<string, string> = {};
                 if (!tablesOne) params.tablesMatched = String(scanMut.data.tables_matched);
                 if (!refsOne) params.referencesUpserted = String(scanMut.data.references_upserted);
-                return t(key, params);
+                const done = t(key, params);
+                if (!scanMut.data.more_remaining) return done;
+                return `${done} ${t("impact.scanMoreRemaining", {
+                  logsScanned: String(scanMut.data.logs_scanned),
+                })}`;
               })()}
             </Alert>
           )}
@@ -342,6 +372,73 @@ export default function ImpactPanel() {
                     <TableCell align="right">{r.hit_count}</TableCell>
                     <TableCell>
                       {new Date(r.last_seen_at).toLocaleDateString()}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </Box>
+      )}
+
+      {tab === 2 && (
+        <Box>
+          {columnUsage.isLoading && <CircularProgress size={24} />}
+          {columnUsage.isError && (
+            <Alert severity="error">{t("impact.columnUsageError")}</Alert>
+          )}
+          {columnUsage.data && (
+            <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1 }}>
+              {t("impact.columnUsageCoverage", {
+                parsed: String(columnUsage.data.total_queries_parsed),
+                skipped: String(columnUsage.data.total_queries_skipped),
+              })}
+            </Typography>
+          )}
+          {columnUsage.data && columnUsage.data.truncated && (
+            <Alert severity="warning" sx={{ mb: 1 }}>
+              {t("impact.columnUsageTruncated", {
+                examined: String(
+                  columnUsage.data.total_queries_parsed +
+                    columnUsage.data.total_queries_skipped,
+                ),
+                available: String(columnUsage.data.logs_available),
+              })}
+            </Alert>
+          )}
+          {columnUsage.data && columnUsage.data.columns.length === 0 && (
+            <Typography color="text.secondary" sx={{ py: 2 }}>
+              {t("impact.noColumnUsageMessage")}
+            </Typography>
+          )}
+          {columnUsage.data && columnUsage.data.columns.length > 0 && (
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>{t("impact.tableHeader")}</TableCell>
+                  <TableCell>{t("impact.columnHeader")}</TableCell>
+                  <TableCell align="right">{t("impact.queryCountHeader")}</TableCell>
+                  <TableCell align="right">{t("impact.referenceCountHeader")}</TableCell>
+                  <TableCell>{t("impact.lastSeenHeader")}</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {columnUsage.data.columns.map((column, index) => (
+                  <TableRow key={`${column.table_name}:${column.column_name}:${index}`}>
+                    <TableCell>
+                      {column.ambiguous
+                        ? t("impact.ambiguousTable", {
+                            tables: column.candidate_tables.join(", "),
+                          })
+                        : column.table_name}
+                    </TableCell>
+                    <TableCell>{column.column_name}</TableCell>
+                    <TableCell align="right">{column.query_count}</TableCell>
+                    <TableCell align="right">{column.hit_count}</TableCell>
+                    <TableCell>
+                      {column.last_seen_at
+                        ? new Date(column.last_seen_at).toLocaleString()
+                        : t("common.na")}
                     </TableCell>
                   </TableRow>
                 ))}

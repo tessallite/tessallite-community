@@ -54,6 +54,24 @@ Replace `target_schema` and `tessallite_user` with the values from your data sou
 
 ---
 
+## Why didn't my query get relabel-served
+
+A query grouped by a dimension detail column (for example `country_name`) can be served from an aggregate built on the key (for example `country_code`) only when a proven one-to-one relationship links the two. When that does not happen and the query goes to the source instead, the relationship failed closed for a reason. This is a safety behaviour, not a bug — the answer is always correct; it is just not accelerated. Common reasons:
+
+| Reason | What it means | Resolution |
+|--------|---------------|------------|
+| No relationship declared | The detail column is only a display caption, not a declared relationship | Declare an attribute relationship on the dimension linking the key and detail columns. |
+| Relationship not proven | The relationship is declared but has not passed data verification for the current model version | Re-deploy the model so the relationship is checked against the full data. |
+| Relationship broke on the data | The mapping is no longer one-to-one (two keys now share a detail, or vice versa) | Fix the source data, or reclassify the relationship as many-to-one if that is the true shape. |
+| Null endpoints | The key or detail column contains null values, which the REJECT_NULL rule refuses | Clean the column so every row is populated, then re-deploy. |
+| Enriched aggregate not built | The aggregate does not carry the detail column as a passenger | Enable derived-expression auto-build on the model (approval or automatic) so the enriched aggregate is created. |
+| Serving disabled | The system-wide relabel-serving switch is off | An administrator must enable relabel serving before proven relationships route live queries. |
+| Row-level security active | The query runs under a persona that filters rows | Relabel serving is intentionally disabled under row security; the query correctly uses the source path. |
+
+See [Dimension Attribute Relationships](../modelling/dimension-attribute-relationships.md) for the full concept and [Query Routing](../concepts/query-routing.md) for how the relabel route fits the overall routing decision.
+
+---
+
 ## Related
 
 - [Query Returns Wrong Results](query-returns-wrong-results.md)

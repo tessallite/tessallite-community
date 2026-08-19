@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 import {
+  Alert,
   Box,
   Button,
   Chip,
@@ -40,6 +41,18 @@ const SEVERITY_COLORS: Record<string, "error" | "warning" | "info" | "default"> 
 
 const PAGE_SIZES = [25, 50, 100];
 
+// Bug-6315: the `datetime-local` filter inputs yield a naive local wall-clock
+// string (e.g. "2026-07-01T14:30"). The audit timestamp column is stored in
+// UTC (TIMESTAMPTZ) and rendered here in local time, so a raw local string
+// sent to the API is interpreted as UTC — shifting the admin's chosen window
+// by their timezone offset (both the list and the CSV export). Convert to a
+// UTC ISO instant so the filter matches the timestamps the table displays.
+export function localInputToUtcIso(value?: string): string | undefined {
+  if (!value) return undefined;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
+}
+
 export default function AuditLog() {
   const t = useT();
   const [filters, setFilters] = useState<AuditEventFilters>({
@@ -48,10 +61,26 @@ export default function AuditLog() {
   });
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
+  // Filters as sent to the API: local wall-clock date inputs converted to UTC
+  // instants (Bug-6315). Display state (`filters`) keeps the raw local strings
+  // so the datetime-local inputs stay bound correctly.
+  const apiFilters = useMemo<AuditEventFilters>(
+    () => ({
+      ...filters,
+      from_date: localInputToUtcIso(filters.from_date),
+      to_date: localInputToUtcIso(filters.to_date),
+    }),
+    [filters],
+  );
+
   const query = useQuery({
-    queryKey: ["audit-events", filters],
-    queryFn: () => auditApi.list(filters),
+    queryKey: ["audit-events", apiFilters],
+    queryFn: () => auditApi.list(apiFilters),
     refetchInterval: 30_000,
+  });
+  const actionsQuery = useQuery({
+    queryKey: ["audit-event-actions"],
+    queryFn: () => auditApi.listActions(),
   });
 
   const page = Math.floor((filters.offset ?? 0) / (filters.limit ?? 50));
@@ -78,20 +107,20 @@ export default function AuditLog() {
   );
 
   const handleExport = useCallback(async () => {
-    const blob = await auditApi.exportCsv(filters);
+    const blob = await auditApi.exportCsv(apiFilters);
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     a.download = "audit_events.csv";
     a.click();
     URL.revokeObjectURL(url);
-  }, [filters]);
+  }, [apiFilters]);
 
   const actionOptions = useMemo(() => {
-    const actions = new Set<string>();
-    (query.data?.items ?? []).forEach((e) => actions.add(e.action));
+    const actions = new Set<string>(actionsQuery.data ?? []);
+    if (filters.action) actions.add(filters.action);
     return Array.from(actions).sort();
-  }, [query.data]);
+  }, [actionsQuery.data, filters.action]);
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
@@ -148,13 +177,21 @@ export default function AuditLog() {
             <MenuItem value="info">{t("auditLog.filterSeverityInfo")}</MenuItem>
           </Select>
         </FormControl>
-        <TextField
-          size="small"
-          label={t("auditLog.filterAction")}
-          value={filters.action ?? ""}
-          onChange={(e) => handleFilterChange("action", e.target.value)}
-          sx={{ width: 200 }}
-        />
+        <FormControl size="small" sx={{ width: 200 }}>
+          <InputLabel>{t("auditLog.filterAction")}</InputLabel>
+          <Select
+            value={filters.action ?? ""}
+            label={t("auditLog.filterAction")}
+            onChange={(e) => handleFilterChange("action", e.target.value)}
+          >
+            <MenuItem value="">{t("auditLog.filterActionAll")}</MenuItem>
+            {actionOptions.map((action) => (
+              <MenuItem key={action} value={action}>
+                {action}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
         <TextField
           size="small"
           label={t("auditLog.filterTargetType")}
@@ -186,6 +223,27 @@ export default function AuditLog() {
         {query.isLoading ? (
           <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}>
             <CircularProgress size={28} />
+          </Box>
+        ) : query.isError ? (
+          // A failed request used to fall through to "No audit events found",
+          // which tells a compliance reviewer the opposite of the truth: an
+          // unreadable log reads as a clean one.
+          <Box sx={{ py: 4, display: "flex", justifyContent: "center" }}>
+            <Alert
+              severity="error"
+              sx={{ maxWidth: 480 }}
+              action={
+                <Button
+                  color="inherit"
+                  size="small"
+                  onClick={() => query.refetch()}
+                >
+                  {t("auditLog.retry")}
+                </Button>
+              }
+            >
+              {t("auditLog.loadFailed")}
+            </Alert>
           </Box>
         ) : !query.data?.items.length ? (
           <Box sx={{ py: 4, textAlign: "center" }}>

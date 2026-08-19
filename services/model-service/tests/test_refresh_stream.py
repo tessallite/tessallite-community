@@ -18,6 +18,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from shared.db.models import Model
+
 from .conftest import (
     TEST_MODEL_ID,
     TEST_PROJECT_ID,
@@ -59,6 +61,19 @@ def _make_pocket_run(status: str = "running") -> types.SimpleNamespace:
 
 def _db_returning(agg_runs=(), pocket_runs=()):
     db = make_mock_db()
+    # Bug-8862: the route now proves project -> model before opening the
+    # stream, so the mock session must resolve a Model owned by the path
+    # project. See test_misc_binding_scoping_8862.py for the denial cases.
+    #
+    # Discriminate on the entity rather than returning one object for every
+    # db.get: a blanket return would silently satisfy any future second
+    # db.get on a different entity and hide a missing guard.
+    async def _get(entity, entity_id):
+        if entity is Model:
+            return types.SimpleNamespace(id=entity_id, project_id=TEST_PROJECT_ID)
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
 
     def _exec(stmt):
         text = str(stmt)

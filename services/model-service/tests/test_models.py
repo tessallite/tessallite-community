@@ -16,6 +16,7 @@ import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from .result_fakes import FakeScalarResult
 
 from .conftest import (
     NOW,
@@ -45,12 +46,16 @@ class _ScalarResult:
         self._items = items
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return self._items
 
     def scalar_one_or_none(self):
+        return self._items[0] if self._items else None
+
+    def first(self):
+        # Existence probe used by resolve_listable_model_scope / bootstrap path.
         return self._items[0] if self._items else None
 
 
@@ -73,13 +78,20 @@ async def test_list_models(client):
     model = make_model()
     model.deployed_version_id = None
     mock_db = make_mock_db()
-    # F-013-12: list decoration is now batched. Query order is
-    #   1. list models
-    #   2. grouped last_saved version per model  -> rows of (model_id, n)
-    #   3. grouped latest refresh per model       -> rows of (model_id, ts)
-    #   4. first DataSource per model              -> scalars
+    # Bug-8101 follow-up: list_models authorizes + filters via
+    # resolve_listable_model_scope first. F-021-04 (decision #9) removed the
+    # zero-binding bootstrap path, so the caller must hold a binding. A
+    # PROJECT-WIDE binding (model_id=None) grants visibility of ALL models, so
+    # resolve makes ONE query (user bindings) and returns "see all".
+    # F-013-12: batched list decoration follows. Query order:
+    #   1. resolve: user bindings load -> rows of (model_id,) [(None,) = project-wide -> all]
+    #   2. list models
+    #   3. grouped last_saved version per model  -> rows of (model_id, n)
+    #   4. grouped latest refresh per model       -> rows of (model_id, ts)
+    #   5. first DataSource per model              -> scalars
     # (the deployed-pointer lookup is skipped because no model has a pointer)
     mock_db.execute = AsyncMock(side_effect=[
+        _ScalarResult([(None,)]),  # resolve: caller has a project-wide binding -> sees all
         _ScalarResult([model]),
         _ScalarResult([]),   # no saved versions
         _ScalarResult([]),   # no refreshed aggregates
@@ -155,7 +167,9 @@ async def test_create_model_seed_is_generated(client):
     with patch("src.api.models.get_tenant_db", async_gen_from(mock_db)):
         resp = await client.post(
             PREFIX,
-            json={"slug": "my-model", "display_name": "My Model"},
+            # BI-safe slug: hyphens are rejected (BI clients parse them as
+            # operators) — underscores only.
+            json={"slug": "my_model", "display_name": "My Model"},
         )
 
     assert resp.status_code == 201
@@ -190,6 +204,44 @@ async def test_create_model_seed_unique_across_calls(client):
 
     assert len(seeds) == 2
     assert seeds[0] != seeds[1], "seeds must be unique per model"
+
+
+@pytest.mark.asyncio
+async def test_create_model_seeds_technical_persona(client):
+    """Bug-6138: creating a model must seed the canonical Technical persona in
+    the SAME transaction (before commit), so the hidden-columns technical
+    catalog is live for new models — not only for models that predate the
+    seeding migration. Guards the endpoint boundary: if the seed call is
+    removed from create_model, this fails."""
+    mock_db = make_mock_db()
+
+    async def _refresh(obj):
+        obj.id = TEST_MODEL_ID
+        obj.created_at = obj.updated_at = NOW
+        obj.description = None
+        obj.target_id = None
+        obj.status = "active"
+        obj.refresh_strategy = "scheduled"
+        obj.miss_threshold_daily = 3
+        obj.miss_threshold_weekly = 5
+        obj.schema_drift_interval_hours = 24
+
+    mock_db.refresh = _refresh
+    seed_mock = AsyncMock()
+
+    with (
+        patch("src.api.models.get_tenant_db", async_gen_from(mock_db)),
+        patch("src.api.models.seed_technical_persona", seed_mock),
+    ):
+        resp = await client.post(
+            PREFIX, json={"slug": "my_model", "display_name": "My Model"}
+        )
+
+    assert resp.status_code == 201
+    seed_mock.assert_awaited_once()
+    # Seeded against the tenant session, before the transaction commits.
+    assert seed_mock.await_args.args[0] is mock_db
+    assert mock_db.commit.await_count >= 1
 
 
 # ---------------------------------------------------------------------------

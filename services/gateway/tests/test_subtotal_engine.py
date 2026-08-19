@@ -105,6 +105,33 @@ class TestDetectSubtotalHierarchies:
         )
         assert len(result) == 0
 
+    def test_two_part_level_scoped_members_not_subtotal(self):
+        """Bug-6892: Excel emits a level-scoped request as
+        [Hierarchy].[Level].Members — the same two-part shape as
+        [Dim].[Hier].Members. When the first part is the hierarchy and the
+        second names one of its LEVELS, no subtotal expansion may trigger
+        (it grouped the SQL by every grain and a Year pivot returned
+        day-level rows)."""
+        col_expr = "{[Measures].[amount]}"
+        row_expr = "{[Calendar].[Year].Members}"
+        result = detect_subtotal_hierarchies(
+            col_expr, row_expr,
+            _make_hierarchy_meta(), _make_level_dim_map(),
+        )
+        assert result == []
+
+    def test_two_part_hier_repeated_still_subtotal(self):
+        """[Hier].[Hier].Members (SSAS self-qualified form) is still a full
+        hierarchy expansion."""
+        col_expr = "{[Measures].[amount]}"
+        row_expr = "{[Calendar].[Calendar].Members}"
+        result = detect_subtotal_hierarchies(
+            col_expr, row_expr,
+            _make_hierarchy_meta(), _make_level_dim_map(),
+        )
+        assert len(result) == 1
+        assert result[0].hierarchy_name == "Calendar"
+
     def test_ignores_when_no_members(self):
         col_expr = "{[Measures].[amount]}"
         row_expr = "[Business Date].[Calendar].[2024]"

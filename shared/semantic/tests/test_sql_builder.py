@@ -129,7 +129,7 @@ def _build_db():
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def test_build_pocket_select_sql_expands_from_and_qualifies_where():

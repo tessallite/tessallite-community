@@ -19,9 +19,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import httpx
+from shared.config.fastapi_drift import check_fastapi_version_drift
 
-from src.main import app
-from src.auth.middleware import CurrentUser, get_current_user
+# Bug-8467 ordering: the drift guard must run before ANY import that can crash
+# under a drifted interpreter.  The repository-gate probe
+# (tests/unit/test_repo_gate_contracts.py) imports this conftest as a bare
+# top-level module with a stubbed fastapi; the relative result_fakes import
+# dies there with "attempted relative import with no known parent package" and
+# masks the fail-closed Bug-8467 message the probe asserts.  Call the guard
+# first so a drifted collection always fails with the named contract.
+check_fastapi_version_drift()
+
+from .result_fakes import FakeResult, FakeScalarResult
+
+from src.main import app  # noqa: E402
+from src.auth.middleware import CurrentUser, get_current_user  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -54,41 +66,76 @@ def disable_rate_limiting():
 
 
 @pytest.fixture(autouse=True)
+def configure_public_base_url(monkeypatch):
+    """Bug-6307: SSO no longer reconstructs its callback origin from the
+    request's client-controlled Host / X-Forwarded-Host headers.
+
+    A deployment must declare its external origin (``PUBLIC_BASE_URL``) or have
+    the request origin match a configured CORS origin; anything else fails
+    closed. TestClient requests arrive as ``http://testserver``, which is
+    neither, so every SSO-touching route test must run as a correctly
+    configured deployment. Applied here rather than per file so a new test that
+    exercises /auth/saml/* or /auth/oidc/* does not silently 500.
+
+    The guard itself is covered in ``test_sso_base_url_injection.py``, which
+    patches ``get_settings`` directly and is unaffected by this fixture.
+    """
+    from shared.config.settings import get_settings
+
+    monkeypatch.setattr(
+        get_settings(), "PUBLIC_BASE_URL", "https://sso.test.example",
+        raising=False,
+    )
+    # F-031-01: production default is enforcement ON. Unit tests are the
+    # internal-unlimited hatch so JIT/create paths do not open the system DB.
+    monkeypatch.setattr(
+        get_settings(), "LICENSE_ENFORCEMENT_ENABLED", False, raising=False,
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def mock_rbac_get_tenant_db():
     """
-    Patch get_tenant_db inside src.auth.rbac so require_role() always follows
-    the bootstrap-admin path (no binding found, no bindings exist → implicit admin).
+    Patch get_tenant_db inside src.auth.rbac so require_role() resolves the
+    caller as holding an admin binding (F-021-04 hard cutover, decision #9,
+    removed the zero-binding bootstrap-admin grant, so require_role now DENIES a
+    caller with no binding). Returning a fake admin binding keeps the harness's
+    "route-dependency admits, inner gates differentiate role" model intact
+    WITHOUT depending on the deleted bootstrap path. Tests that specifically
+    exercise require_role DENIAL patch ``src.auth.rbac.get_tenant_db``
+    themselves, overriding this default.
+
     Also patch src.api.kpis.load_authorized_model with a smart stub that:
       - preserves embed-token scope checks (so b01 scope-guard tests still work)
-      - skips all DB queries for regular users (bootstrap-admin implicit grant)
+      - skips all DB queries for regular/admin users
     This prevents RBAC machinery from consuming execute() calls that tests
     configure for their own route-handler queries.
     """
+    # Fake admin binding so require_role's model/project-scoped lookups resolve
+    # to "admin" (admits any min_role) — replaces the removed bootstrap grant.
+    _fake_admin_binding = types.SimpleNamespace(
+        id=uuid.uuid4(), role="admin", model_id=None,
+        project_id=None, user_identity="*",
+    )
     mock_db = AsyncMock()
+    mock_db.add = MagicMock()
     execute_result = MagicMock()
-    execute_result.scalar_one_or_none.return_value = None  # no caller binding
-    # Bootstrap existence probe reads via .first() (F-H27R1-01); None means
-    # the project has zero bindings → implicit admin (bootstrap path).
-    execute_result.first.return_value = None
+    execute_result.scalar_one_or_none.return_value = _fake_admin_binding
+    execute_result.first.return_value = (_fake_admin_binding.id,)
     mock_db.execute = AsyncMock(return_value=execute_result)
 
-    # Noop DB whose execute always returns "no binding" — used by the smart
-    # load_authorized_model stub to run ensure_project_model_access without
-    # touching the test's own DB mock.
-    noop_db = AsyncMock()
-    noop_result = MagicMock()
-    noop_result.scalar_one_or_none.return_value = None
-    noop_result.first.return_value = None
-    noop_db.execute = AsyncMock(return_value=noop_result)
-
-    async def _stub_load_authorized_model(db, current_user, *, model_id, project_id=None, min_role="viewer"):
+    async def _stub_load_authorized_model(db, current_user, *, model_id, project_id=None, min_role="viewer", service_scope_verified=False):
         """Stub that preserves embed-token scope enforcement but bypasses DB RBAC.
 
         For embed users: delegate to the real ensure_project_model_access so
-        project_ids / model_ids scope rejections (403) are still raised.
-        For regular/admin users: noop (no DB calls).
+        project_ids / model_ids scope rejections (403) are still raised (that
+        branch is DB-free and never hit the removed bootstrap path).
+        For regular/admin users: noop (no DB calls) — equivalent to holding a
+        binding; require_role-level denial is covered by dedicated tests.
         """
         from uuid import UUID as _UUID
+        from shared.auth.middleware import CurrentEmbedUser
         from shared.auth.project_access import ensure_project_model_access
 
         def _as_uuid(v):
@@ -97,15 +144,16 @@ def mock_rbac_get_tenant_db():
         stub_project_id = _as_uuid(project_id) if project_id else TEST_PROJECT_ID
         stub_model_id = _as_uuid(model_id)
 
-        # Run access control through noop_db so embed checks fire but no
-        # real DB queries happen and no side-effects bleed into test's db mock.
-        await ensure_project_model_access(
-            noop_db,
-            current_user,
-            project_id=stub_project_id,
-            model_id=stub_model_id,
-            min_role=min_role,
-        )
+        if isinstance(current_user, CurrentEmbedUser):
+            # Embed scope enforcement is DB-free; run it so out-of-scope
+            # project/model rejections (403) still fire.
+            await ensure_project_model_access(
+                AsyncMock(),
+                current_user,
+                project_id=stub_project_id,
+                model_id=stub_model_id,
+                min_role=min_role,
+            )
         import types as _types
         return _types.SimpleNamespace(
             id=stub_model_id,
@@ -130,8 +178,71 @@ def mock_emit_webhook():
         patch("src.api.versions.emit_webhook", noop),
         patch("src.api.project_settings.emit_webhook", noop),
         patch("src.api.model_settings.emit_webhook", noop),
+        patch("src.api.access.emit_webhook", noop),
+        patch("src.api.admin.emit_webhook", noop),
+        patch("src.api.tenants.emit_webhook", noop),
+        patch("src.api.embed.emit_webhook", noop),
+        patch("src.api.export.emit_webhook", noop),
+        patch("src.api.glossary.emit_webhook", noop),
+        patch("src.api.personas.emit_webhook", noop),
+        patch("src.api.row_security.emit_webhook", noop),
     ):
         yield
+
+
+# Bug-7982 (Codex re-gate residual 1): every ordinary definition/governance
+# writer (measures/dimensions/tables/table_attributes/joins/hierarchies/UDAs/
+# calendar/data-tags/personas/row-security) now acquires the per-model
+# advisory lock via ``acquire_model_definition_lock`` before reading, so it
+# serialises with a concurrent revert. That adds one
+# ``db.execute(SELECT pg_advisory_xact_lock)`` per writer, which would shift
+# these modules' ordered-mock ``db.execute`` side-effect lists. Stub the lock
+# to a no-op in THESE modules only (the lock's real serialisation is covered
+# by test_model_lock_coverage + the DB integration suite). versions.py /
+# named_sets.py / kpis.py are intentionally NOT stubbed — their lock-assertion
+# tests exercise the real acquisition.
+#
+# Bug-8437 / Bug-8441 added three more: ``models`` (update_model writes the model
+# scalars a revert restores), ``sources`` and ``targets`` (the revert upserts
+# every column of a surviving row and HARD-DELETES rows absent from the
+# snapshot, and create/delete_target additionally write ``models.target_id``).
+#
+# Bug-8710: a stub here means NO unit test can observe the real acquisition, so
+# the claim "these endpoints serialise" must be carried by something that runs
+# the real thing. It now is — ``tests/integration/test_bug7982_r7_db.py``
+# (``test_newly_locked_writers_block_on_a_held_revert_lock`` and
+# ``test_a_revert_and_a_concurrent_model_rename_cannot_interleave``) drives the
+# REAL handlers against a REAL Postgres with the revert's lock held, restoring
+# the un-stubbed lock for the duration. Removing the acquire line from any of
+# the three turns those tests red. Do not add a module here without adding its
+# behavioural counterpart there.
+_LOCK_STUBBED_MODULES = (
+    "measures", "dimensions", "tables", "table_attributes", "joins",
+    "hierarchies", "user_defined_attributes", "calendar", "data_tags",
+    "personas", "row_security", "models", "sources", "targets",
+)
+
+
+@pytest.fixture(autouse=True)
+def _stub_ordinary_writer_model_lock():
+    import importlib
+
+    stub = AsyncMock()
+    patchers = []
+    for modname in _LOCK_STUBBED_MODULES:
+        try:
+            mod = importlib.import_module(f"src.api.{modname}")
+        except Exception:
+            continue
+        if hasattr(mod, "acquire_model_definition_lock"):
+            patchers.append(patch.object(mod, "acquire_model_definition_lock", stub))
+    for p in patchers:
+        p.start()
+    try:
+        yield stub
+    finally:
+        for p in patchers:
+            p.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +335,58 @@ def async_gen_from(value):
     return _gen
 
 
+@pytest.fixture
+def kpi_effective_role(monkeypatch):
+    """F-017-12 / Bug-8728: the KPI draft-visibility gates now decide privilege
+    from the caller's EFFECTIVE project/model binding via ``caller_has_role``,
+    which issues a ``user_access_bindings`` lookup. Unit tests here mock the db
+    with strict positional ``side_effect`` sequences that cannot answer that
+    extra query, so patch ``caller_has_role`` to derive privilege from the token
+    role — reproducing the exact privilege decision these tests already assert,
+    without weakening any assertion. The REAL binding-vs-token behaviour is
+    covered end-to-end by ``test_kpi_draft_visibility`` (which does not use this
+    shim); binding-specific cases elsewhere override the patch. Mirrors the
+    ``_default_effective_role`` fixture in ``test_named_sets_draft_visibility``.
+    """
+    async def _caller_has_role(_db, current_user, _project_id, _role, _model_id=None):
+        return getattr(current_user, "role", None) in {
+            "modeler", "admin", "tenant_admin", "system_admin",
+        }
+
+    monkeypatch.setattr("src.api.kpis.caller_has_role", _caller_has_role)
+
+
+def routed_execute(**rows_by_table):
+    """Build an ``AsyncSession.execute`` side_effect that answers per STATEMENT.
+
+    Each keyword is the SELECTED-FROM table name (``named_sets=[...]``,
+    ``dimensions=[...]``); a statement with no matching FROM gets an EMPTY
+    ``FakeResult``. Prefer this over a positional ``side_effect=[...]`` list: a
+    positional list silently misaligns the moment a route gains or loses a
+    query, which is how the RBAC binding lookup in ``caller_has_role`` ended up
+    being handed a route's own rows.
+
+    Matching is on ``FROM <table>``, not a bare substring, because a bare
+    substring is ambiguous: ``select(NamedSet)`` renders the column
+    ``named_sets.dimensions``, so ``"dimensions" in str(stmt)`` is True for the
+    named-set query too and the answer would depend on keyword ORDER.
+
+    An empty answer for ``user_access_bindings`` means "this caller has no
+    binding", so ``caller_has_role`` returns False (F-021-04 hard cutover,
+    decision #9, removed the zero-binding bootstrap-admin grant). Tests that
+    need a privileged decision either shim ``caller_has_role`` (see
+    ``kpi_effective_role`` / the named-set ``_default_effective_role``) or
+    provide a matching binding row for the ``user_access_bindings`` query.
+    """
+    async def _execute(statement, *args, **kwargs):
+        text = str(statement)
+        for table, rows in rows_by_table.items():
+            if f"FROM {table}" in text:
+                return FakeResult(rows)
+        return FakeResult([])
+    return _execute
+
+
 # ---------------------------------------------------------------------------
 # ORM object factories (SimpleNamespace — no SQLAlchemy needed)
 # ---------------------------------------------------------------------------
@@ -271,6 +434,7 @@ def make_model(
         canvas_layout=None,
         deployed_version_id=None,
         last_deployed_at=None,
+        deploy_epoch=0,
         created_at=NOW,
         updated_at=NOW,
     )

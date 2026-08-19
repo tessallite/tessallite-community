@@ -2,7 +2,7 @@
 title: "Parameterized Filters"
 audience: modeler
 area: Modelling
-updated: 2026-05-01
+updated: 2026-08-02
 ---
 
 # Parameterized Filters
@@ -78,6 +78,40 @@ SET app.date_end = '2025-12-31';
 The `app.` prefix is required. Session variables persist for the lifetime of the JDBC connection and are cleared when the client disconnects.
 
 This mechanism works with any PostgreSQL-compatible client: DBeaver, Tableau (custom SQL), psycopg2, JDBC drivers. The gateway captures the SET commands and passes the values to the query router as part of the query context.
+
+### Setting a multi-value parameter over JDBC
+
+A `multi_value` parameter holds a list, but a `SET` command can only send one piece of text. There are two ways to write that list.
+
+**The simple way — separate the values with commas.** Use this when none of your values contain a comma.
+
+```sql
+SET app.region = 'EMEA,APAC,AMER';
+SELECT country, SUM(revenue) FROM sales WHERE region IN (@region) GROUP BY country;
+```
+
+That filters on three regions: `EMEA`, `APAC` and `AMER`.
+
+**The safe way — write the list as a JSON array.** Use this whenever a value might contain a comma, a quote, or leading/trailing spaces.
+
+```sql
+SET app.city = '["New York, NY","Paris"]';
+SELECT store, SUM(revenue) FROM sales WHERE city IN (@city) GROUP BY store;
+```
+
+That filters on exactly two cities: `New York, NY` and `Paris`.
+
+**Why this matters.** With the simple comma form, `'New York, NY,Paris'` cannot be told apart from three separate values, so the filter would look for `New York`, `NY` and `Paris` — three cities that are not what you asked for, and no error to warn you. The JSON array form removes the guesswork: whatever is inside each pair of quotes is one value, commas and all.
+
+**Rules for the JSON form**
+
+- Wrap the whole list in square brackets and put each value in double quotes.
+- Values must be text or numbers. A `true`/`false`, a `null`, a nested list, or an object is rejected with a clear message, because none of those is a filter value.
+- Numbers are treated as text, so `[10, 20]` and `'10,20'` filter identically.
+- The list must contain at least one value. An empty list is rejected — there is no such thing as a filter on nothing.
+- If the text starts with `[` **or** ends with `]`, it is treated as attempted JSON. Malformed or partial arrays fail with an error naming the parameter rather than quietly falling back to comma splitting.
+
+**Tip.** Most SQL clients let you build the string in a variable. If your tool escapes quotes differently, run the `SET` line on its own first and check that the following query returns the row count you expect.
 
 ---
 

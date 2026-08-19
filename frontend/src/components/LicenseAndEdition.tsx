@@ -1,4 +1,5 @@
 import {
+  Alert,
   Box,
   Button,
   Chip,
@@ -19,7 +20,7 @@ import { useT } from "../i18n";
  * enforcement logic (the backend manager owns that).
  */
 
-const UPGRADE_URL = "https://tessallite.io/register.html";
+const UPGRADE_URL_FALLBACK = "https://tessallite.io/register.html";
 
 // Entitlement keys returned by /limits.entitlements, paired with the matching
 // current count from /limits.usage. When a cap is null/absent the resource is
@@ -82,8 +83,18 @@ function ResourceRow({ row }: { row: LimitRow }) {
 
 export default function LicenseAndEdition() {
   const t = useT();
-  const { data: edition, isLoading: editionLoading } = useEdition();
-  const { data: limits, isLoading: limitsLoading } = useLimits();
+  const {
+    data: edition,
+    isLoading: editionLoading,
+    isError: editionError,
+    refetch: refetchEdition,
+  } = useEdition();
+  const {
+    data: limits,
+    isLoading: limitsLoading,
+    isError: limitsError,
+    refetch: refetchLimits,
+  } = useLimits();
 
   if (editionLoading || limitsLoading) {
     return (
@@ -96,7 +107,45 @@ export default function LicenseAndEdition() {
     );
   }
 
+  // Bug-7470: a failed /edition or /limits read must NOT be silently collapsed
+  // into the "unactivated / unlimited" default — that misrepresents a network
+  // error as a legitimate licence state. Surface an explicit, retryable error.
+  if (editionError || limitsError) {
+    return (
+      <Box data-testid="license-edition">
+        <Alert
+          severity="error"
+          data-testid="license-load-error"
+          action={
+            <Button
+              color="inherit"
+              size="small"
+              onClick={() => {
+                if (editionError) refetchEdition();
+                if (limitsError) refetchLimits();
+              }}
+            >
+              {t("common.retry")}
+            </Button>
+          }
+        >
+          {t("license.loadError")}
+        </Alert>
+      </Box>
+    );
+  }
+
   const name = edition?.edition ?? "unactivated";
+  // Bug-7680: an installed-but-invalid licence (verifier rejected an expired or
+  // untrusted document) reports ``license_state: "invalid"``. It is fail-closed
+  // like the unactivated state, but must be shown distinctly so an admin knows a
+  // licence WAS installed and needs renewing/replacing — not that none was ever
+  // provided.
+  // Bug-7851 / G-license-term: a licence that expires after manager load reports
+  // ``license_state: "expired"`` — distinct from "invalid" (untrusted signature).
+  // Both are non-active states with a distinct error chip and banner.
+  const licenseInvalid = edition?.license_state === "invalid";
+  const licenseExpired = edition?.license_state === "expired";
   const editionLabel =
     name === "community"
       ? t("edition.community")
@@ -149,7 +198,7 @@ export default function LicenseAndEdition() {
           label={editionLabel}
           data-testid="license-edition-chip"
         />
-        {edition?.activated && (
+        {edition?.activated && !licenseInvalid && !licenseExpired && (
           <Chip
             size="small"
             color="success"
@@ -157,7 +206,42 @@ export default function LicenseAndEdition() {
             label={t("license.activated")}
           />
         )}
+        {licenseInvalid && (
+          <Chip
+            size="small"
+            color="error"
+            variant="filled"
+            label={t("license.invalidChip")}
+            data-testid="license-invalid-chip"
+          />
+        )}
+        {licenseExpired && (
+          <Chip
+            size="small"
+            color="error"
+            variant="filled"
+            label={t("license.expiredChip")}
+            data-testid="license-expired-chip"
+          />
+        )}
       </Stack>
+
+      {/* Bug-7680: installed-but-invalid licence — surface a distinct error
+          banner so an admin renews/replaces the licence rather than assuming a
+          normal, active state (or that no licence was ever installed). */}
+      {licenseInvalid && (
+        <Alert severity="error" data-testid="license-invalid-banner" sx={{ mt: 1 }}>
+          {t("license.invalidBody")}
+        </Alert>
+      )}
+
+      {/* Bug-7851 / G-license-term: expired licence — distinct from invalid
+          (expired was once valid; invalid was never accepted by the verifier). */}
+      {licenseExpired && (
+        <Alert severity="warning" data-testid="license-expired-banner" sx={{ mt: 1 }}>
+          {t("license.expiredBody")}
+        </Alert>
+      )}
 
       {edition?.expires_at && (
         <Typography variant="caption" color="text.secondary">
@@ -180,7 +264,7 @@ export default function LicenseAndEdition() {
         <Button
           variant="contained"
           size="small"
-          href={UPGRADE_URL}
+          href={t("license.upgradeUrl") || UPGRADE_URL_FALLBACK}
           target="_blank"
           rel="noopener noreferrer"
           endIcon={<OpenInNewIcon fontSize="small" />}

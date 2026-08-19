@@ -9,14 +9,19 @@ from __future__ import annotations
 import logging
 import os
 import warnings
+from pathlib import Path
 from typing import Optional
 
 from .dax_parser import ParsedDAX
+from .tree_sitter_artifacts import resolve_grammar_artifact
 
 logger = logging.getLogger(__name__)
 
-_GRAMMAR_DIR = os.path.join(os.path.dirname(__file__), "grammars", "tree-sitter-dax")
-_SO_PATH = os.path.join(os.path.dirname(__file__), "grammars", "dax.so")
+_GRAMMARS_ROOT = Path(__file__).resolve().parent / "grammars"
+_ARTIFACT = resolve_grammar_artifact(grammar_name="dax", base_dir=_GRAMMARS_ROOT)
+_GRAMMAR_DIR = str(_ARTIFACT.grammar_dir)
+_LIBRARY_PATH = str(_ARTIFACT.library_path)
+_SO_PATH = _LIBRARY_PATH
 
 _TIME_INTEL_MAP = {
     "totalytd": "ytd",
@@ -46,9 +51,10 @@ def _load_parser():
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning)
         from tree_sitter import Language, Parser
-        if not os.path.exists(_SO_PATH):
-            Language.build_library(_SO_PATH, [_GRAMMAR_DIR])
-        lang = Language(_SO_PATH, "dax")
+        if not os.path.exists(_LIBRARY_PATH):
+            os.makedirs(os.path.dirname(_LIBRARY_PATH), exist_ok=True)
+            Language.build_library(_LIBRARY_PATH, [_GRAMMAR_DIR])
+        lang = Language(_LIBRARY_PATH, "dax")
     parser = Parser()
     parser.set_language(lang)
     return parser

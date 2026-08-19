@@ -40,7 +40,7 @@ No Tessallite login page is shown. The end user's identity comes from the `user_
 | `persona_id` | string | no | null | Lock to this persona's permissions |
 | `project_ids` | string[] | no | null | Restrict access to these project IDs only |
 | `model_ids` | string[] | no | null | Restrict visible models |
-| `capabilities` | string[] | no | all | Allowed features: `query`, `chat`, `explore` |
+| `capabilities` | string[] | no | `[]` (deny-all) | Allowed features: `query`, `chat`, `explore`. Omit or pass `[]` for no capabilities. |
 | `expiry_minutes` | integer | no | 180 | Token lifetime (min 5, max 1440) |
 
 **Response:**
@@ -76,7 +76,7 @@ No Tessallite login page is shown. The end user's identity comes from the `user_
 - `chat` — use the conversational agent
 - `explore` — browse model metadata (dimensions, measures, hierarchies)
 
-If a capability is excluded, API calls to the corresponding service return 403. This lets you embed only the chat, without exposing the query panel.
+If omitted or an empty list is sent, **no** capabilities are granted (deny-all). Pass an explicit list such as `["query", "chat", "explore"]` to enable features. If a capability is excluded, API calls to the corresponding service return 403. This lets you embed only the chat, without exposing the query panel.
 
 ---
 
@@ -94,7 +94,11 @@ A token normally stays valid until it expires. If a token leaks, or you simply w
 
 **Endpoint:** `DELETE /api/v1/auth/embed-token/{jti}`
 
-The `{jti}` is the token's unique ID — the `jti` claim inside the signed JWT you minted. Only a tenant admin may revoke. Once revoked, the token stops working within about a minute (the platform refreshes its revocation list roughly once a minute), and every query or chat call made with it returns 403. The revocation is recorded in the Audit Log as `embed_token.revoked`. The platform cleans up the revocation record automatically once the token would have expired anyway (at most 24 hours, the maximum token lifetime), so the blocklist never grows without bound.
+The `{jti}` is the token's unique ID — the `jti` claim inside the signed JWT you minted. Only a tenant admin may revoke. Once revoked, the token stops working within about a minute (the platform refreshes its revocation list roughly once a minute), and every query or chat call made with it is rejected as unauthorised (401). The revocation is recorded in the Audit Log as `embed_token.revoked`.
+
+A revocation only applies to tokens belonging to your own tenant, so naming a token id that is not yours does nothing. If you are signed in as a **system administrator** — whose account is not itself inside any tenant — add `?tenant_id=<tenant-slug>` to say which tenant's token you are revoking; without it the request is rejected rather than quietly having no effect.
+
+The platform deletes the revocation record automatically once the token would have expired anyway (at most 24 hours, the maximum token lifetime), so the blocklist does not grow without bound.
 
 Revocation fails safe: if the platform cannot confirm a token is still valid, it refuses the request rather than letting it through. Build a revoke call into your "sign out" or "rotate credentials" flow so a leaked link can be cut off immediately rather than waiting out its expiry.
 

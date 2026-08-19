@@ -110,6 +110,7 @@
   "publicGlossary.downloadPdf": "Download PDF",
   "publicGlossary.entryCount": "{{visible}} of {{total}} entries",
   "publicGlossary.invalidLink": "This share link is invalid or has expired. Ask the model owner to generate a new one.",
+  "publicGlossary.loadError": "The glossary could not be loaded. Please try again later or contact the model owner.",
   "publicGlossary.noResults": "No glossary entries match your search.",
   "publicGlossary.overline": "Tessallite glossary",
   "publicGlossary.searchPlaceholder": "Search terms, definitions, synonyms…",

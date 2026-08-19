@@ -6,13 +6,13 @@ project_rehydrator can consume it directly.
 """
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from shared.importers.atscale_parser import (
     SmlCalculation,
+    SmlConnection,
     SmlDataset,
     SmlDimension,
     SmlMetric,
@@ -20,6 +20,18 @@ from shared.importers.atscale_parser import (
     SmlParseResult,
     SmlRelationship,
 )
+from shared.importers.import_warnings import (
+    ImportWarningResponse,
+    extend_known_import_warnings,
+    make_import_warning,
+)
+from shared.model_snapshot.slug_utils import slugify
+from shared.semantic.join_keyword import split_join_token
+
+# An SML relationship is fact -> dimension: many fact rows to one dimension
+# row. Derived once, through the shared classifier, so the orientation and the
+# cardinality can never disagree here.
+_ATSCALE_JOIN_TYPE, _ATSCALE_CARDINALITY = split_join_token("many_to_one")
 
 
 _CALC_METHOD_MAP: dict[str, str] = {
@@ -30,21 +42,34 @@ _CALC_METHOD_MAP: dict[str, str] = {
     "count non-null": "count",
     "estimated count distinct": "count_distinct",
     "count_distinct": "count_distinct",
-    "average": "average",
-    "avg": "average",
+    # Bug-6591: emit the CANONICAL default_agg tokens the runtime understands
+    # (VALID_DEFAULT_AGGS: sum/avg/min/max/count/count_distinct + pNN). The
+    # previous values "average"/"median"/"percentile" were non-canonical and
+    # passed the import gate (which only checked semi_additive_behavior) but
+    # failed LATE at query time (AVERAGE(x)/MEDIAN(x) — no such SQL function).
+    "average": "avg",
+    "avg": "avg",
     "minimum": "min",
     "min": "min",
     "maximum": "max",
     "max": "max",
-    "median": "median",
-    "percentile": "percentile",
+    # median == the exact 50th percentile → the p50 quantile stat.
+    "median": "p50",
+    # NOTE: a bare "percentile" carries no fraction here, so it cannot resolve
+    # to a specific pNN. It is intentionally absent so _resolve_calc_method
+    # imports it as a disabled measure rather than guessing a percentile.
 }
 
 # F-020-08: statistical aggregations Tessallite cannot represent. They are
-# deliberately NOT in _CALC_METHOD_MAP so they fall to the warning path and
-# import as disabled measures (default_agg=None) rather than silently mapping
-# to SUM, which produced confidently wrong business numbers (e.g. stddev of
-# 10,20,30 → 8.16 expected, SUM → 60).
+# deliberately NOT in _CALC_METHOD_MAP so they fall to the warning path in
+# _resolve_calc_method, which imports them as DISABLED measures: default_agg is
+# reset to the NOT-NULL column default "sum" AND is_invalid is set with a
+# reason (see _resolve_calc_method returning ("sum", reason) and the caller
+# setting is_invalid=invalid_reason is not None). The disabled flag — not the
+# agg token — is what marks the measure unusable; without it a stddev would map
+# to a silently wrong SUM (e.g. stddev of 10,20,30 → 8.16 expected, SUM → 60).
+# The snapshot rehydrator mirrors this exact convention for unresolvable legacy
+# default_agg tokens (rehydrator._validate_measure_enums).
 _UNREPRESENTABLE_METHODS: frozenset[str] = frozenset({
     "stddev_pop", "stddev_samp", "var_pop", "var_samp",
 })
@@ -64,7 +89,57 @@ _SEMI_ADDITIVE_POSITION_MAP: dict[str, str] = {
 @dataclass
 class MapResult:
     bundle: dict[str, Any]
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[ImportWarningResponse] = field(default_factory=list)
+
+
+# Bug-5939 (F-020-03): normalise a free-text AtScale platform/connection
+# label to one of Tessallite's ALLOWED_CONNECTION_TYPES
+# (shared.schemas.connection_type). Ordered so more specific tokens are
+# checked before shorter ones that could collide (e.g. "sql server" before
+# a bare "sql").
+_PLATFORM_KEYWORD_MAP: list[tuple[str, str]] = [
+    ("bigquery", "bigquery"),
+    ("big query", "bigquery"),
+    ("snowflake", "snowflake"),
+    ("redshift", "redshift"),
+    ("databricks", "hadoop_spark"),
+    ("spark", "hadoop_spark"),
+    ("hive", "hadoop_spark"),
+    ("sql server", "sqlserver"),
+    ("sqlserver", "sqlserver"),
+    ("mssql", "sqlserver"),
+    ("azure synapse", "sqlserver"),
+    ("postgres", "postgresql"),  # matches both "postgres" and "postgresql"
+]
+
+
+def _detect_connector_type(conn: SmlConnection | None) -> tuple[str, bool]:
+    """Return (connector_type, confident) for a parsed SmlConnection.
+
+    Bug-5939: the AtScale mapper previously always stamped
+    ``source_type: "postgresql"`` regardless of the actual platform,
+    misleading operators reviewing a Snowflake/BigQuery/Databricks import.
+    Tries the explicit ``platform`` field the parser captures first (any of
+    several plausible SML key spellings — AtScale's public schema isn't
+    consistent across connector versions), then falls back to matching
+    known platform keywords in the connection's unique_name/label (AtScale
+    projects conventionally name connections after their platform, e.g.
+    "Snowflake" or "Postgres"). Returns ``("postgresql", False)`` when
+    neither signal resolves — the caller must then mark the resulting
+    data source as an unconfigured placeholder and warn, not present it as
+    a confirmed PostgreSQL source.
+    """
+    if conn is None:
+        return "postgresql", False
+    candidates = [conn.platform, conn.unique_name, conn.label]
+    for text in candidates:
+        if not text:
+            continue
+        lowered = text.lower()
+        for keyword, connector in _PLATFORM_KEYWORD_MAP:
+            if keyword in lowered:
+                return connector, True
+    return "postgresql", False
 
 
 def map_atscale_to_tessallite(
@@ -72,7 +147,8 @@ def map_atscale_to_tessallite(
     project_name: str = "atscale-import",
     project_display_name: str = "AtScale Import",
 ) -> MapResult:
-    warnings: list[str] = list(parsed.warnings)
+    warnings: list[ImportWarningResponse] = []
+    extend_known_import_warnings(warnings, parsed.warnings)
     gen = _id_gen()
 
     dataset_map = {ds.unique_name: ds for ds in parsed.datasets}
@@ -81,14 +157,43 @@ def map_atscale_to_tessallite(
     calc_map = {c.unique_name: c for c in parsed.calculations}
     conn_map = {c.unique_name: c for c in parsed.connections}
 
-    # Resolve default schema from the first SML connection referenced by datasets.
+    # Resolve default schema and connector type from the first SML
+    # connection referenced by datasets (Bug-5939: previously schema-only).
     default_schema = ""
+    default_source_type = "postgresql"
+    source_type_confident = False
     for ds in parsed.datasets:
         if ds.connection_id and ds.connection_id in conn_map:
-            schema = conn_map[ds.connection_id].schema
-            if schema:
-                default_schema = schema
+            conn = conn_map[ds.connection_id]
+            if conn.schema and not default_schema:
+                default_schema = conn.schema
+            detected_type, confident = _detect_connector_type(conn)
+            if confident:
+                default_source_type = detected_type
+                source_type_confident = True
+                if default_schema:
+                    break
+    if not source_type_confident and parsed.connections:
+        # No dataset resolved a confident connector; try any parsed
+        # connection object directly (covers bundles where datasets
+        # reference connections by an id the parser didn't resolve).
+        for conn in parsed.connections:
+            detected_type, confident = _detect_connector_type(conn)
+            if confident:
+                default_source_type = detected_type
+                source_type_confident = True
                 break
+    if not source_type_confident:
+        warnings.append(make_import_warning(
+            code="atscale.connection_type_unresolved",
+            params={},
+            detail=(
+                "Could not determine the source database platform from the "
+                "AtScale connection metadata; the imported data source is "
+                "marked as an unconfigured placeholder (defaulted to "
+                "postgresql) — set the correct connection type before use."
+            ),
+        ))
 
     models_out: list[dict[str, Any]] = []
 
@@ -96,6 +201,8 @@ def map_atscale_to_tessallite(
         snap = _map_model(
             sml_model, dataset_map, dimension_map, metric_map, calc_map,
             gen, warnings, default_schema=default_schema,
+            source_type=default_source_type,
+            source_type_confident=source_type_confident,
         )
         models_out.append(snap)
 
@@ -103,6 +210,8 @@ def map_atscale_to_tessallite(
         snap = _map_standalone_metrics(
             parsed.metrics, parsed.calculations, dataset_map, gen, warnings,
             default_schema=default_schema,
+            source_type=default_source_type,
+            source_type_confident=source_type_confident,
         )
         models_out.append(snap)
 
@@ -126,8 +235,10 @@ def _map_model(
     dimension_map: dict[str, SmlDimension],
     metric_map: dict[str, SmlMetric],
     calc_map: dict[str, SmlCalculation],
-    gen, warnings: list[str],
+    gen, warnings: list[ImportWarningResponse],
     default_schema: str = "",
+    source_type: str = "postgresql",
+    source_type_confident: bool = False,
 ) -> dict[str, Any]:
     model_id = gen()
     source_id = gen()
@@ -145,7 +256,11 @@ def _map_model(
     for ds_name in fact_datasets:
         ds = dataset_map.get(ds_name)
         if not ds:
-            warnings.append(f"Dataset '{ds_name}' referenced but not found")
+            warnings.append(make_import_warning(
+                code="atscale.dataset_missing",
+                params={"dataset": ds_name, "usage": "fact"},
+                detail=f"Dataset '{ds_name}' referenced but not found",
+            ))
             continue
         table_id = gen()
         table_id_map[ds_name] = table_id
@@ -226,11 +341,20 @@ def _map_model(
                     }]
                 levels_out.append(lvl_entry)
             if skipped_levels:
-                warnings.append(
-                    f"Hierarchy '{hier.unique_name or dim.unique_name}' in dimension "
-                    f"'{dim.unique_name}': skipped levels {skipped_levels} — "
-                    f"source column could not be resolved"
-                )
+                hierarchy_name = hier.unique_name or dim.unique_name
+                warnings.append(make_import_warning(
+                    code="atscale.hierarchy_levels_skipped",
+                    params={
+                        "hierarchy": hierarchy_name,
+                        "dimension": dim.unique_name,
+                        "count": len(skipped_levels),
+                    },
+                    detail=(
+                        f"Hierarchy '{hierarchy_name}' in dimension "
+                        f"'{dim.unique_name}': skipped levels {skipped_levels} — "
+                        "source column could not be resolved"
+                    ),
+                ))
             if not levels_out:
                 continue
             hier_out.append({
@@ -270,10 +394,15 @@ def _map_model(
                 "semi_additive_behavior": semi_additive,
             })
         elif calc:
-            warnings.append(
-                f"Calculated metric '{calc.unique_name}' uses MDX expression — "
-                f"create a calculated measure manually in Tessallite"
-            )
+            warnings.append(make_import_warning(
+                code="atscale.calculation_manual",
+                params={"metric": calc.unique_name},
+                detail=(
+                    f"Calculated metric '{calc.unique_name}' uses MDX "
+                    "expression — create a calculated measure manually in "
+                    "Tessallite"
+                ),
+            ))
             measures_out.append({
                 "id": gen(),
                 "model_id": model_id,
@@ -287,7 +416,11 @@ def _map_model(
                 "semi_additive_behavior": None,
             })
         else:
-            warnings.append(f"Metric ref '{ref_name}' not found in project")
+            warnings.append(make_import_warning(
+                code="atscale.metric_reference_missing",
+                params={"metric": ref_name},
+                detail=f"Metric ref '{ref_name}' not found in project",
+            ))
 
     joins_out: list[dict[str, Any]] = []
     for rel in sml_model.relationships:
@@ -317,10 +450,15 @@ def _map_model(
                 )
 
         if not all([left_tid, left_cid, right_tid, right_cid]):
-            warnings.append(
-                f"Join '{rel.unique_name}' skipped — could not resolve "
-                f"table/column IDs for {rel.from_dataset} -> {rel.to_dimension}"
-            )
+            warnings.append(make_import_warning(
+                code="atscale.join_skipped",
+                params={"join": rel.unique_name or "unnamed"},
+                detail=(
+                    f"Join '{rel.unique_name}' skipped — could not resolve "
+                    f"table/column IDs for {rel.from_dataset} -> "
+                    f"{rel.to_dimension}"
+                ),
+            ))
             continue
 
         joins_out.append({
@@ -330,7 +468,14 @@ def _map_model(
             "left_column_id": left_cid,
             "right_table_id": right_tid,
             "right_column_id": right_cid,
-            "join_type": "many_to_one",
+            # An SML relationship runs from a fact dataset to a dimension, so
+            # its CARDINALITY is many-to-one. Orientation is a separate field
+            # (join-orientation contract, invariant 3); ``split_join_token``
+            # derives the orientation that preserves the many side (the fact),
+            # so the import lands a real join type instead of parking a
+            # cardinality label in the field that decides which rows survive.
+            "join_type": _ATSCALE_JOIN_TYPE,
+            "cardinality": _ATSCALE_CARDINALITY,
         })
 
     snapshot: dict[str, Any] = {
@@ -365,10 +510,17 @@ def _map_model(
         "data_sources": [{
             "id": source_id,
             "model_id": model_id,
-            "source_type": "postgresql",
+            "source_type": source_type,
             "display_name": "AtScale Import Source",
             "default_schema": default_schema or None,
-            "config": {},
+            # Bug-5939: only mark the source as an unconfigured placeholder
+            # (same convention as dbt_import.py/cube_import.py) when the
+            # connector type could NOT be determined from the SML bundle —
+            # a confidently-detected type is a real, usable value.
+            "config": (
+                {} if source_type_confident
+                else {"unconfigured": True, "import_placeholder": True}
+            ),
         }],
         "data_targets": [],
     }
@@ -379,8 +531,10 @@ def _map_standalone_metrics(
     metrics: list[SmlMetric],
     calculations: list[SmlCalculation],
     dataset_map: dict[str, SmlDataset],
-    gen, warnings: list[str],
+    gen, warnings: list[ImportWarningResponse],
     default_schema: str = "",
+    source_type: str = "postgresql",
+    source_type_confident: bool = False,
 ) -> dict[str, Any]:
     """Fallback: if no model file exists, create a single model from metrics."""
     model_id = gen()
@@ -395,7 +549,13 @@ def _map_standalone_metrics(
     for ds_name in metric_datasets:
         ds = dataset_map.get(ds_name)
         if not ds:
-            warnings.append(f"Dataset '{ds_name}' referenced by metric but not found")
+            warnings.append(make_import_warning(
+                code="atscale.dataset_missing",
+                params={"dataset": ds_name, "usage": "metric"},
+                detail=(
+                    f"Dataset '{ds_name}' referenced by metric but not found"
+                ),
+            ))
             continue
         table_id = gen()
         table_id_map[ds_name] = table_id
@@ -436,9 +596,14 @@ def _map_standalone_metrics(
             "semi_additive_behavior": semi_additive,
         })
     for calc in calculations:
-        warnings.append(
-            f"Calculated metric '{calc.unique_name}' uses MDX — manual setup needed"
-        )
+        warnings.append(make_import_warning(
+            code="atscale.calculation_manual",
+            params={"metric": calc.unique_name},
+            detail=(
+                f"Calculated metric '{calc.unique_name}' uses MDX — manual "
+                "setup needed"
+            ),
+        ))
     return {
         "schema_version": 2,
         "model_id": model_id,
@@ -471,17 +636,22 @@ def _map_standalone_metrics(
         "data_sources": [{
             "id": source_id,
             "model_id": model_id,
-            "source_type": "postgresql",
+            "source_type": source_type,
             "display_name": "AtScale Import Source",
             "default_schema": default_schema or None,
-            "config": {},
+            "config": (
+                {} if source_type_confident
+                else {"unconfigured": True, "import_placeholder": True}
+            ),
         }],
         "data_targets": [],
     }
 
 
 def _resolve_calc_method(
-    method: str | None, metric_name: str, warnings: list[str],
+    method: str | None,
+    metric_name: str,
+    warnings: list[ImportWarningResponse],
 ) -> tuple[str, str | None]:
     """Resolve an AtScale calculation_method to a Tessallite agg.
 
@@ -497,7 +667,11 @@ def _resolve_calc_method(
             f"Tessallite cannot compute — imported as a disabled measure. "
             f"Recreate it as a calculated measure if needed."
         )
-        warnings.append(reason)
+        warnings.append(make_import_warning(
+            code="atscale.metric_disabled",
+            params={"metric": metric_name, "reason": raw},
+            detail=reason,
+        ))
         return "sum", reason
     if raw in _CALC_METHOD_MAP:
         return _CALC_METHOD_MAP[raw], None
@@ -506,12 +680,18 @@ def _resolve_calc_method(
         f"'{metric_name}' — imported as a disabled measure (defaulted to "
         f"'sum'). Review and re-enable after import."
     )
-    warnings.append(reason)
+    warnings.append(make_import_warning(
+        code="atscale.metric_disabled",
+        params={"metric": metric_name, "reason": raw or "unknown"},
+        detail=reason,
+    ))
     return "sum", reason
 
 
 def _resolve_semi_additive(
-    semi_additive: Any, metric_name: str, warnings: list[str],
+    semi_additive: Any,
+    metric_name: str,
+    warnings: list[ImportWarningResponse],
 ) -> str | None:
     """Map an AtScale semi-additive position to a valid Tessallite enum.
 
@@ -524,11 +704,15 @@ def _resolve_semi_additive(
     position = (getattr(semi_additive, "position", "") or "").lower().strip()
     mapped = _SEMI_ADDITIVE_POSITION_MAP.get(position)
     if mapped is None:
-        warnings.append(
-            f"Semi-additive position '{position}' on metric "
-            f"'{metric_name}' has no Tessallite equivalent — imported as "
-            f"fully additive. Set the semi-additive behaviour manually."
-        )
+        warnings.append(make_import_warning(
+            code="atscale.semi_additive_omitted",
+            params={"metric": metric_name, "position": position or "unknown"},
+            detail=(
+                f"Semi-additive position '{position}' on metric "
+                f"'{metric_name}' has no Tessallite equivalent — imported as "
+                "fully additive. Set the semi-additive behaviour manually."
+            ),
+        ))
         return None
     return mapped
 
@@ -602,7 +786,7 @@ def _import_dimension_datasets(
     columns_out: list[dict[str, Any]],
     table_id_map: dict[str, str],
     col_id_map: dict[tuple[str, str], str],
-    warnings: list[str],
+    warnings: list[ImportWarningResponse],
 ) -> None:
     for la in dim.level_attributes:
         ds_name = la.dataset
@@ -610,7 +794,13 @@ def _import_dimension_datasets(
             continue
         ds = dataset_map.get(ds_name)
         if not ds:
-            warnings.append(f"Dimension dataset '{ds_name}' referenced but not found")
+            warnings.append(make_import_warning(
+                code="atscale.dataset_missing",
+                params={"dataset": ds_name, "usage": "dimension"},
+                detail=(
+                    f"Dimension dataset '{ds_name}' referenced but not found"
+                ),
+            ))
             continue
         table_id = gen()
         table_id_map[ds_name] = table_id
@@ -649,8 +839,10 @@ def _normalize_data_type(dt: str) -> str:
 
 
 def _slugify(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", name.lower().strip())
-    return slug.strip("_")
+    # Bug-7622: delegate to the shared BI-safe generator so digit-leading and
+    # symbol-only names produce a valid slug instead of one that later trips
+    # validate_bi_safe_slug and raises an uncaught 500 in the import endpoint.
+    return slugify(name, fallback="atscale_model", separator="_")
 
 
 def _id_gen():

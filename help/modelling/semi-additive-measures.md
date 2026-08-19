@@ -53,7 +53,7 @@ Tessallite supports six aggregation types. Choose the one that matches the busin
 | **count_distinct** | Count unique values (not composable -- re-queries the source). | Unique customers, unique products sold. |
 | **average** | Compute the weighted average (not composable -- re-queries the source). | Average order value, average response time. |
 
-> **By Account is not yet available.** You may see a **By Account** behaviour listed in the semi-additive dropdown shown as *(not yet supported)* and greyed out. This mode would let each account in an account dimension carry its own additivity rule (some accounts sum over time, some take the last balance). The per-account aggregation engine is not implemented yet, so the option is disabled and a query that uses it is rejected with a clear message rather than returning a wrong number. Use **last_non_empty** for balance-style accounts in the meantime.
+> **By Account is not a supported behaviour.** You may have seen a **By Account** option in older versions. It would have let each account in an account dimension carry its own additivity rule (some accounts sum over time, some take the last balance), but the per-account aggregation engine was never built, so the option has been removed from the semi-additive dropdown. Use **last_non_empty** for balance-style accounts instead. If an older model still has a measure set to By Account, that measure is flagged as invalid until you pick a supported behaviour and re-enable it.
 
 ---
 

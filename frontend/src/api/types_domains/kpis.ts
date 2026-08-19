@@ -137,6 +137,12 @@ export type TimeWindowPreset =
   | "last_12_months"
   | "custom_range";
 
+// Bug-5924: top_n/bottom_n were advertised in this union and the backend
+// FILTER_OPERATORS set, but the compiler always rejected them ("requires
+// measure-based ranking" — not implemented) and the UI never rendered
+// them. Removed from the public contract rather than left half-advertised;
+// see docs/execution/execution_future-features.md for the ranking-filter
+// feature request if it is approved for a later phase.
 export type BusinessFilterOp =
   | "eq"
   | "ne"
@@ -150,9 +156,7 @@ export type BusinessFilterOp =
   | "like"
   | "not_like"
   | "is_null"
-  | "is_not_null"
-  | "top_n"
-  | "bottom_n";
+  | "is_not_null";
 
 export type PeriodGrain = "day" | "week" | "month" | "quarter" | "year";
 
@@ -212,8 +216,6 @@ export interface BusinessFilter {
   default_value?: string | string[];
   label?: string;
   description?: string;
-  n?: number;
-  by_measure_id?: string;
 }
 
 export interface BusinessTarget {
@@ -427,6 +429,13 @@ export interface KpiEvaluateResponse {
   trend: number | null;
   trend_label: string | null;
   trend_pct: number | null;
+  // F-017-02 (Bug-7238/Bug-7988): direction-normalised percentage change.
+  // Positive means IMPROVING, negative means DECLINING, regardless of the KPI's
+  // direction preference. The scorecard improvement chip must render THIS field
+  // so the sign always agrees with the colour; raw `trend_pct` is only for a
+  // labelled raw-change detail. For a lower-is-better cost falling 100 -> 80 the
+  // backend emits trend_pct=-0.2 (raw) and trend_pct_normalised=+0.2 (improving).
+  trend_pct_normalised: number | null;
   formatted_value: string | null;
   formatted_target: string | null;
   formatted_variance: string | null;
@@ -437,13 +446,25 @@ export interface KpiEvaluateResponse {
   // Actual SQL sent to the query gateway for execution (may be several
   // statements for time-intelligence KPIs).
   compiled_sql?: string | null;
-  // Bug-4255: composite-KPI health. `composite_status` is "ok" / "degraded" /
-  // "error" for a composite (null for a non-composite). "degraded" means the
-  // score was computed but at least one child KPI's evaluation FAILED (a broken
-  // input, not no-data); "error" means every child errored. `errored_children`
-  // lists the failed children so the card can show which input is broken.
-  composite_status?: "ok" | "degraded" | "error" | null;
+  // Bug-4255 / Bug-8449: composite-KPI health. "restricted" means row security
+  // withheld at least one child, so the backend refused to publish a partial
+  // score. `errored_children` lists broken inputs for degraded/error outcomes.
+  composite_status?: "ok" | "degraded" | "error" | "restricted" | null;
   errored_children?: KpiErroredChild[] | null;
+  // Bug-8449 / Bug-8427: true when this KPI produced no value BECAUSE the
+  // model's row-level security denied the caller every row, rather than
+  // because the slice is empty or the expression is broken. Render an explicit
+  // "restricted" state, never the generic "N/A" no-data state — otherwise a
+  // modeller debugs a perfectly correct measure. Absent/false does NOT mean
+  // the caller saw every row: a narrowing rule may still have applied and the
+  // value is then correct FOR THAT CALLER.
+  row_security_restricted?: boolean | null;
+  // F-017-09: which engine produced this value — "sql" (compiled + executed on
+  // the gateway), "python" (SQL compiler could not handle the expression so the
+  // model-service Python evaluator answered), or "refused". Shown as a chip when
+  // not "sql" so a SQL-vs-Python divergence is visible. fallback_reason explains.
+  evaluation_path?: string | null;
+  fallback_reason?: string | null;
   // Legacy fields for v1 compatibility
   goal: number | null;
   formatted_goal: string | null;
@@ -553,14 +574,22 @@ export interface EntityUsageEntry {
   reported_at: string;
 }
 
+// Mirrors UserPreferenceToggle.entity_type in
+// shared/schemas/domains/governance_advanced.py. "model" scopes by identity —
+// entity_id must be the model in the path (Bug-8183 / Bug-8899).
 export interface UserPreferenceToggle {
-  entity_type: "kpi" | "named_set";
+  entity_type: "kpi" | "named_set" | "model";
   entity_id: string;
 }
 
 export interface UserPreferencesResponse {
   favourites: Record<string, string[]>;
   recently_used: Record<string, string[]>;
+}
+
+/** Every model in one project the calling user has favourited. */
+export interface FavouriteModelsResponse {
+  model_ids: string[];
 }
 
 export interface PersonaTagRestrictionRequest {
@@ -573,4 +602,3 @@ export interface PersonaTagRestriction {
   description: string | null;
   column_count: number;
 }
-

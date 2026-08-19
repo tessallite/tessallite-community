@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from .result_fakes import FakeScalarResult
 
 from src.main import app
 from src.auth.middleware import CurrentUser, get_current_user
@@ -158,3 +159,66 @@ class TestSavedQueryOwnership:
         with patch("src.api.saved_queries.get_tenant_db", async_gen_from(db)):
             resp = await client.delete(f"{BASE}/{uuid.uuid4()}")
         assert resp.status_code == 404
+
+
+class TestSavedQueryCanEditFlag:
+    """Bug-5983: the list response must expose ``can_edit`` distinctly from
+    ``is_owner`` so the panel can show edit/delete for a modeler viewing a
+    colleague's query, not just the query's actual owner."""
+
+    def _db_with_list(self, rows: list) -> AsyncMock:
+        db = make_mock_db()
+        model = make_model()
+        db.get = AsyncMock(return_value=model)
+
+        class _ScalarResult:
+            def scalars(self):
+                return FakeScalarResult(rows)
+
+            def all(self):
+                return rows
+
+        db.execute = AsyncMock(return_value=_ScalarResult())
+        return db
+
+    @pytest.mark.asyncio
+    async def test_owner_row_is_editable(self, client):
+        q = _make_query(created_by=OWNER_EMAIL)
+        db = self._db_with_list([q])
+        with patch("src.api.saved_queries.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.saved_queries.caller_has_role",
+                   AsyncMock(return_value=False)):
+            resp = await client.get(BASE)
+        assert resp.status_code == 200
+        row = resp.json()[0]
+        assert row["is_owner"] is True
+        assert row["can_edit"] is True
+
+    @pytest.mark.asyncio
+    async def test_modeler_non_owner_row_is_editable(self, client):
+        """A modeler is not the owner but the backend mutation endpoints
+        allow them to edit/delete -- the UI flag must reflect that, not
+        hide controls the modeler can actually use."""
+        q = _make_query(created_by=OTHER_EMAIL)
+        db = self._db_with_list([q])
+        with patch("src.api.saved_queries.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.saved_queries.caller_has_role",
+                   AsyncMock(return_value=True)):
+            resp = await client.get(BASE)
+        assert resp.status_code == 200
+        row = resp.json()[0]
+        assert row["is_owner"] is False
+        assert row["can_edit"] is True
+
+    @pytest.mark.asyncio
+    async def test_viewer_non_owner_row_is_not_editable(self, client):
+        q = _make_query(created_by=OTHER_EMAIL)
+        db = self._db_with_list([q])
+        with patch("src.api.saved_queries.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.saved_queries.caller_has_role",
+                   AsyncMock(return_value=False)):
+            resp = await client.get(BASE)
+        assert resp.status_code == 200
+        row = resp.json()[0]
+        assert row["is_owner"] is False
+        assert row["can_edit"] is False

@@ -81,7 +81,7 @@ The **Force Live** toggle sits next to the Execute button. Switching it on force
 
 **Force Live is a per-query flag.** It resets to off on panel reload. It never becomes a default for a model. This is deliberate: forcing live on every query would defeat the purpose of aggregates. Force Live is an investigative tool.
 
-**Row security is always enforced.** Force Live changes which table the query reads from, not which rows the caller is allowed to see. Every live query is still wrapped with the same row-security predicate that applies to aggregate and pocket routes. See [Configure Row Security](../modelling/configure-row-security.md).
+**Row security is always enforced.** Force Live changes which table the query reads from, not which rows the caller is allowed to see. The compiled RLS predicate is injected into every protected source, aggregate, and pocket scan; outer wrapping is not the security boundary. See [Configure Row Security](../modelling/configure-row-security.md).
 
 ---
 

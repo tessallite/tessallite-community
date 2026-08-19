@@ -105,45 +105,68 @@ Before you start, ask your Collibra administrator for:
 
 Live push to Collibra is not implemented in this build, so the **Sync** button is disabled. The dry run in Step 7 lets you confirm exactly what would be created. When a live Collibra client is wired in, this button will push the previewed assets, relations, and responsibilities and record the result in run history.
 
-## How sync works (under the hood)
+## Available now: preview and dry run
 
-Same incremental sync engine as Solidatus:
+Everything here works today. It reads your model and computes the governance
+payload locally — nothing is sent to Collibra.
 
 1. **Build governance graph** — reads all model objects from the snapshot.
 2. **Map to Collibra format** — converts to assets (with attributes + status), relations, and responsibilities.
 3. **Hash every object** — SHA256 fingerprint for diffing.
-4. **Compare with previous sync** — identifies new, changed, and unchanged objects.
-5. **Push only changes** — sends only new and updated assets/relations to Collibra.
-6. **Persist mappings** — saves Tessallite→Collibra ID mappings for incremental sync.
+4. **Compare with the previous run's mapping** — identifies new, changed, and unchanged objects so the dry run can show what a future push *would* create or update.
+5. **Record the run** — saves the run in history with the exact model snapshot it was built from, the asset/relation counts, and any governance warnings.
+
+The dry run computes what a push would do; it does not contact Collibra and
+does not create, update, or deprecate anything remotely.
+
+## Not available yet: live connector
+
+Live validation and live push are **not implemented** in this build. Until a
+tenant-specific Collibra client is wired in, the following do NOT happen:
+
+- **Live push** — the Sync button is disabled and the API returns "not
+  implemented". No asset, relation, or responsibility is created or updated in
+  Collibra.
+- **Remote deprecation** — when you remove objects from your model, the dry run
+  records them as removed locally, but nothing is marked Deprecated inside
+  Collibra, because no remote call is made.
+- **Live connection checks** — Test Connection is simulated (see Step 5); a
+  wrong URL, expired token, or missing Community/Domain is not caught until live
+  validation exists.
+
+When the live client lands, this page will be updated with the remote push,
+deprecation, and troubleshooting behaviour it introduces.
 
 ## Tips and best practices
 
-- **Sync after deploy** — The sync exports the deployed model state. Draft changes won't appear until deployed.
-- **Community and Domain matter** — Make sure the Community and Domain IDs are correct. If they don't exist in Collibra, the sync will fail.
-- **Ownership flows through** — KPIs with an owner and downstream assets with an owner become Collibra responsibilities automatically. Measures and dimensions have no owner field, so they export without a responsibility.
-- **Deprecate, don't delete** — Removed objects are marked Deprecated in Collibra, preserving audit history.
+- **Export the deployed version** — Preview and dry run use the deployed model state by default. Draft changes won't appear until deployed (or unless you enable "export draft").
+- **Ownership flows through** — KPIs with an owner and downstream assets with an owner become Collibra responsibilities in the payload. Measures and dimensions have no owner field, so they export without a responsibility.
+- **Read the governance warnings** — A dry run flags objects missing a description or owner, and KPIs / calculated measures whose expression could not be fully resolved.
+- **Check the recorded snapshot** — Each run records the exact model snapshot it was built from.
 - **Business vs Technical** — The export supports separate business and technical views. Hidden columns are included in technical exports with `is_hidden = true` metadata.
-- **Asset type mappings** — The default asset type names work with standard Collibra installations. If your organization uses custom asset types, you can configure the mapping in the connection settings.
+- **Asset type mappings** — The default asset type names work with standard Collibra installations. If your organization uses custom asset types, configure the mapping in the connection settings.
 
-## Troubleshooting
+## Troubleshooting (preview / dry run)
+
+These cover the preview and dry-run surfaces that work today. There is no live
+troubleshooting yet because no remote call is made.
 
 | Problem | Likely cause | Solution |
 |---|---|---|
 | "Connection not found" | No connection configured | Click Add Connection first |
 | "Model not found" | Not inside a model | Open a model in Model Builder |
-| Community/Domain not found | Wrong IDs | Verify Community ID and Domain ID with your Collibra admin |
-| Sync fails with auth error | Invalid token | Edit connection and update the API token |
-| Assets don't appear in Collibra | Wrong Community/Domain | Check the IDs in your connection settings |
+| Preview shows 0 assets | Model has no objects yet | Add tables, measures, dimensions first |
+| Preview warns about unresolved KPI/measure lineage | A KPI or calculated-measure expression references a measure that is missing or misspelled | Open the measure/KPI and fix the reference |
 | "Model not deployed" warning | Model has no deployed version | Deploy the model first |
 | Missing asset types | Custom Collibra setup | Use the asset type mapping config to match your Collibra operating model |
 
 ## Related
 
-- [Solidatus Integration](solidatus-integration.html) — The equivalent integration for Solidatus lineage platform
-- [Model Configuration](../modelling/model-settings.html) — All model-level settings
-- [Glossary](../modelling/glossary.html) — Manage business terms
-- [Downstream Assets](../modelling/impact-analysis.html) — Tag dashboards, reports, and APIs
-- [API Reference](api-reference.html) — REST API documentation
+- [Solidatus Integration](solidatus-integration.md) — The equivalent integration for Solidatus lineage platform
+- [Model Configuration](../admin/model-configuration.md) — All model-level settings
+- [Business Glossary](../modelling/business-glossary.md) — Manage business terms
+- [Usage & Downstream Assets](../modelling/usage-downstream-assets.md) — Tag dashboards, reports, and APIs
+- [API Reference](api-reference.md) — REST API documentation
 
 ---
 

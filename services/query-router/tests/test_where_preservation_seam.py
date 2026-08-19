@@ -102,6 +102,37 @@ _DANGEROUS_WHERE_SHAPES = [
         "CONCAT('1', a) = '1foo'",
         "function-call-eq-literal",
     ),
+    # Bug-6081 / F-003-15: a bare boolean column used directly as a predicate
+    # (``WHERE is_active``) is not a comparison/In/Between/Like/Is node, so the
+    # extractor produces no filter for it. Before the fail-closed audit it was
+    # NOT flagged either, so the predicate vanished from both filters and the
+    # preserved raw WHERE — inactive rows silently included.
+    (
+        "SELECT a FROM t WHERE is_active",
+        "is_active",
+        "bare-boolean-column",
+    ),
+    # Boolean literal predicate (``WHERE FALSE``) — DB returns zero rows; a
+    # silent drop returns every row.
+    (
+        "SELECT a FROM t WHERE FALSE",
+        "FALSE",
+        "boolean-literal-false",
+    ),
+    # Boolean literal comparison (``WHERE 1=0``) is semantically the same
+    # zero-row class as FALSE; dropping it returns every row.
+    (
+        "SELECT a FROM t WHERE 1=0",
+        "1=0",
+        "boolean-comparison-literal-false",
+    ),
+    # Mixed: the region comparison IS extractable, but the bare boolean conjunct
+    # must still force raw-WHERE preservation so ``is_active`` is not lost.
+    (
+        "SELECT a FROM t WHERE is_active AND region = 'EU'",
+        "is_active AND region = 'EU'",
+        "bare-boolean-and-comparison",
+    ),
 ]
 
 

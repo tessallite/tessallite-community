@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Choose Your Connection — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Analyst Guides</span> / <span>Choose Your Connection</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">end user</span><span class="updated">Updated 2026-08-04</span></div>
+    <h1>Choose Your Connection</h1>
+<h2>What this covers</h2>
+<p>There are six ways to get numbers out of Tessallite, and they all read the same governed models. This page helps you pick the right one for the job you are about to do — building an Excel dashboard, writing a Power BI report, exploring in Tableau, or pulling data into a Python notebook — before the walkthrough pages that follow show you each one step by step.</p>
+<h2>The short version</h2>
+<div class="table-wrapper"><table><thead><tr><th>If you are about to...</th><th>Use this</th><th>Walkthrough</th></tr></thead><tbody>
+<tr><td>Build or refresh a dashboard inside Excel</td><td>Tessallite Excel add-in, or a native PivotTable over XMLA</td><td><a href="build-your-first-excel-dashboard.html">Build Your First Excel Dashboard</a> and <a href="build-a-report-with-the-excel-add-in.html">Build a Report with the Excel Add-in</a></td></tr>
+<tr><td>Drop single governed numbers into Excel cells</td><td><code>TESSALLITE.*</code> worksheet functions</td><td><a href="excel-formulas-that-stay-live.html">Excel Formulas That Stay Live</a></td></tr>
+<tr><td>Build a shareable report in Power BI</td><td>PostgreSQL connector with DirectQuery</td><td><a href="build-a-power-bi-report.html">Build a Power BI Report</a></td></tr>
+<tr><td>Explore visually and build dashboards in Tableau</td><td>PostgreSQL connector, live connection</td><td><a href="build-a-tableau-dashboard.html">Build a Tableau Dashboard</a></td></tr>
+<tr><td>Analyse data in Python or train a model in Jupyter</td><td><code>psycopg2</code> over the JDBC endpoint</td><td><a href="query-tessallite-from-jupyter.html">Query Tessallite from a Jupyter Notebook</a></td></tr>
+<tr><td>Put governed metrics inside your own app</td><td>Headless API (JSON in, rows out)</td><td><a href="../integrations/headless-api.html">Headless API</a></td></tr>
+</tbody></table></div>
+<p>Whichever you pick, three things are always true:</p>
+<ol>
+<li><strong>The numbers match.</strong> Every connection reads the same semantic model, so Excel, Power BI, and a notebook all return the same figure for the same question.</li>
+<li><strong>The security follows you.</strong> Row security, column restrictions, and your persona apply on every connection. You cannot accidentally see more than you are allowed to.</li>
+<li><strong>The speed follows you too.</strong> Tessallite routes each query to a pre-computed summary when one exists, on every connection, with no setting to turn on.</li>
+</ol>
+<h2>The two Excel paths, side by side</h2>
+<p>Excel gets two entries in the table because they suit different habits. Both are fully supported and both read the same models.</p>
+<div class="table-wrapper"><table><thead><tr><th></th><th>Excel add-in</th><th>Native PivotTable (XMLA)</th></tr></thead><tbody>
+<tr><td>What it feels like</td><td>A guided task pane inside Excel: drag measures and dimensions, ask questions in plain language, insert results</td><td>The familiar PivotTable field list connected to a cube</td></tr>
+<tr><td>Best for</td><td>Analysts who want help assembling a report, or who want the agent inside Excel</td><td>Analysts who already think in PivotTables and want slicers, timelines, and Show Values As</td></tr>
+<tr><td>Needs</td><td>The add-in manifest from your administrator</td><td>A workbook data connection to the XMLA endpoint</td></tr>
+<tr><td>Extra tricks</td><td><code>TESSALLITE.VALUE</code> cell formulas, KPI inserts, persona switcher, one-click charts</td><td>Top 10 value filters, drill-through by double-click, <code>GETPIVOTDATA</code>, CUBE formulas</td></tr>
+</tbody></table></div>
+<p>If you are not sure, start with the add-in: it is the gentler on-ramp, and you can add a native PivotTable later in the same workbook.</p>
+<blockquote><p><strong>Tip.</strong> You do not have to choose forever. A workbook can hold an add-in report on one sheet and an XMLA PivotTable on another, and they will agree with each other, because both are views of the same model.</p></blockquote>
+<h2>Power BI and Tableau: live, not imported</h2>
+<p>Both tools connect to Tessallite through the PostgreSQL connector on port <code>5433</code>. The one setting that matters is the connection mode:</p>
+<ul>
+<li><strong>Power BI: choose DirectQuery.</strong> Every visual then asks Tessallite a live question when the report refreshes, so aggregate routing keeps working and you never report on a stale extract.</li>
+<li><strong>Tableau: choose Live Connection.</strong> Same idea — each worksheet queries Tessallite as you build, instead of freezing a copy into an extract.</li>
+</ul>
+<p>An imported extract still works, but it is a photograph of the data at one moment: it cannot be accelerated by new aggregates, and it drifts out of date until someone refreshes it. Live connections stay current and stay fast.</p>
+<h2>Jupyter and Python: when a BI tool is not the destination</h2>
+<p>Sometimes the report is not the end of the work. You might be building features for a machine-learning model, running a statistical check, or feeding a pandas pipeline. For that, Tessallite looks like an ordinary PostgreSQL database on port <code>5433</code>, and the standard <code>psycopg2</code> driver connects with your normal Tessallite sign-in. The walkthrough at <a href="query-tessallite-from-jupyter.html">Query Tessallite from a Jupyter Notebook</a> goes from <code>pip install</code> to a plotted chart and a trained model in one sitting.</p>
+<p>The reason to go through Tessallite rather than straight to the source database is the same as everywhere else: the measure definitions, the security rules, and the row filtering are applied before the data reaches your notebook, so the numbers in your experiment reconcile with the numbers on the executive dashboard.</p>
+<h2>The headless API: for builders, not readers</h2>
+<p>If you are embedding metrics in your own application — a mobile screen, a customer portal, a scheduled job — the headless API lets your code ask for measures and dimensions by name and get JSON rows back, with the same routing and security as every other path. It is documented for developers at <a href="../integrations/headless-api.html">Headless API</a>. If your goal is a chart you look at rather than a product you ship, one of the five paths above is simpler.</p>
+<h2>What you need for any of them</h2>
+<ul>
+<li><strong>Your Tessallite sign-in</strong>: your email address and password.</li>
+<li><strong>The workspace slug</strong>: the short identifier for your workspace, such as <code>acme-demo</code>. It is case-sensitive. Your administrator can tell you yours.</li>
+<li><strong>The gateway address</strong>: <code>localhost</code> for a local install, or a hostname from your administrator for a cloud install.</li>
+<li><strong>At least one deployed model.</strong> If you connect and see no tables, no model has been published yet — ask your modeller to deploy one.</li>
+</ul>
+<blockquote><p><strong>Trying this on the demo workspace?</strong> A local demo install uses workspace slug <code>acme-demo</code>, sign-in <code>admin@acme-demo.com</code> with password <code>acme-demo</code>, and gateway <code>localhost</code>. The walkthroughs in this section use those values and the demo <code>modelx</code> model, so you can follow along click for click.</p></blockquote>
+<h2>Related</h2>
+<ul>
+<li><a href="../getting-started/connect-a-bi-tool.html">Connect a BI Tool via JDBC</a></li>
+<li><a href="../getting-started/connect-excel.html">Connect Excel via XMLA</a></li>
+<li><a href="../integrations/excel-add-in.html">Tessallite Excel Add-in</a></li>
+<li><a href="../integrations/bi-compatibility.html">BI Tool Compatibility Matrix</a></li>
+</ul>
+<nav class="page-nav"><a href="../getting-started/tessallite-features.html" class="page-nav-btn prev">&larr; Tessallite Features</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="build-your-first-excel-dashboard.html" class="page-nav-btn next">Build Your First Excel Dashboard &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

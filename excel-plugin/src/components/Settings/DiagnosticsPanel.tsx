@@ -11,6 +11,7 @@ import {
   clearDiagnostics,
 } from '../../utils/diagnostics';
 import { runCompatibilitySpike, type CompatibilityMatrix } from '../../utils/officeSpike';
+import { strings, templates as tpl } from '../../i18n/strings';
 
 interface DiagnosticsPanelProps {
   open: boolean;
@@ -56,13 +57,13 @@ export default function DiagnosticsPanel({
       setSpikeResult(result);
     } catch (e) {
       setSpikeResult({
-        host: 'unknown', platform: 'unknown',
-        insertTable: `failed: ${(e as Error).message}`,
-        insertChart: 'skipped', localPivotTable: 'skipped',
-        cubeFormulas: 'skipped', createXmlaConnection: 'skipped',
-        readSelectedCubeFormula: 'skipped', readActiveCell: 'skipped',
-        getActiveCellAddress: 'skipped', detectWorkbookConnections: 'skipped',
-        notes: 'Spike runner failed',
+        host: strings.diagnostics.spikeUnknown, platform: strings.diagnostics.spikeUnknown,
+        insertTable: tpl.diagnostics.spikeFailed((e as Error).message),
+        insertChart: strings.diagnostics.spikeSkipped, localPivotTable: strings.diagnostics.spikeSkipped,
+        cubeFormulas: strings.diagnostics.spikeSkipped, createXmlaConnection: strings.diagnostics.spikeSkipped,
+        readSelectedCubeFormula: strings.diagnostics.spikeSkipped, readActiveCell: strings.diagnostics.spikeSkipped,
+        getActiveCellAddress: strings.diagnostics.spikeSkipped, detectWorkbookConnections: strings.diagnostics.spikeSkipped,
+        notes: strings.diagnostics.spikeRunnerFailed,
       });
     } finally {
       setSpikeRunning(false);
@@ -72,13 +73,13 @@ export default function DiagnosticsPanel({
   const pluginVersion = '0.1.0';
   const platform = typeof Office !== 'undefined' && Office.context?.platform
     ? Office.context.platform
-    : 'Unknown';
+    : strings.diagnostics.unknownPlatform;
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
       <DialogTitle sx={{ fontSize: 14, fontWeight: 700, display: 'flex', alignItems: 'center', pb: 1 }}>
-        Diagnostics
-        <IconButton size="small" onClick={onClose} aria-label="Close diagnostics" sx={{ ml: 'auto' }}>
+        {strings.diagnostics.title}
+        <IconButton size="small" onClick={onClose} aria-label={strings.diagnostics.closeAria} sx={{ ml: 'auto' }}>
           <Close fontSize="small" />
         </IconButton>
       </DialogTitle>
@@ -86,22 +87,22 @@ export default function DiagnosticsPanel({
       <DialogContent sx={{ p: 2 }}>
         <Box sx={{ mb: 2 }}>
           <Typography sx={{ fontSize: 11, fontWeight: 600, color: tokens.colorTextSecondary, mb: 0.5 }}>
-            Environment
+            {strings.diagnostics.environment}
           </Typography>
           <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
             <Box sx={{ px: 1.5, py: 0.5, bgcolor: tokens.colorSubtleFill, borderRadius: 1 }}>
-              <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>Version</Typography>
+              <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>{strings.diagnostics.version}</Typography>
               <Typography sx={{ fontSize: 12, fontWeight: 600 }}>{pluginVersion}</Typography>
             </Box>
             <Box sx={{ px: 1.5, py: 0.5, bgcolor: tokens.colorSubtleFill, borderRadius: 1 }}>
-              <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>Excel Host</Typography>
+              <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>{strings.diagnostics.excelHost}</Typography>
               <Typography sx={{ fontSize: 12, fontWeight: 600 }}>{platform}</Typography>
             </Box>
           </Box>
         </Box>
 
         <Typography sx={{ fontSize: 11, fontWeight: 600, color: tokens.colorTextSecondary, mb: 0.5 }}>
-          Event Log
+          {strings.diagnostics.eventLog}
         </Typography>
 
         <TableContainer
@@ -112,9 +113,9 @@ export default function DiagnosticsPanel({
           <Table size="small" stickyHeader>
             <TableHead>
               <TableRow>
-                <TableCell sx={{ whiteSpace: 'nowrap', fontWeight: 600 }}>Time</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap', fontWeight: 600 }}>Type</TableCell>
-                <TableCell sx={{ fontWeight: 600 }}>Detail</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap', fontWeight: 600 }}>{strings.diagnostics.colTime}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap', fontWeight: 600 }}>{strings.diagnostics.colType}</TableCell>
+                <TableCell sx={{ fontWeight: 600 }}>{strings.diagnostics.colDetail}</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
@@ -166,7 +167,7 @@ export default function DiagnosticsPanel({
           onClick={handleClear}
           sx={{ textTransform: 'none' }}
         >
-          Clear Log
+          {strings.diagnostics.clearLog}
         </Button>
         <Box sx={{ flex: 1 }} />
         <Button
@@ -177,7 +178,7 @@ export default function DiagnosticsPanel({
           disabled={spikeRunning}
           sx={{ textTransform: 'none', mr: 0.5 }}
         >
-          {spikeRunning ? 'Running...' : 'Run Spike'}
+          {spikeRunning ? strings.diagnostics.running : strings.diagnostics.runSpike}
         </Button>
         <Button
           size="small"
@@ -186,14 +187,14 @@ export default function DiagnosticsPanel({
           onClick={handleCopy}
           sx={{ textTransform: 'none' }}
         >
-          {copied ? 'Copied' : 'Copy Diagnostics'}
+          {copied ? strings.diagnostics.copied : strings.diagnostics.copyDiagnostics}
         </Button>
       </DialogActions>
 
       {spikeResult && (
         <Box sx={{ px: 2, pb: 2 }}>
           <Typography sx={{ fontSize: 11, fontWeight: 600, color: tokens.colorTextSecondary, mb: 0.5 }}>
-            Compatibility Spike — {spikeResult.host} / {spikeResult.platform}
+            {tpl.diagnostics.spikeHeading(spikeResult.host, spikeResult.platform)}
           </Typography>
           <Box
             sx={{ bgcolor: tokens.colorSubtleFill, p: 1, borderRadius: 1, fontFamily: tokens.fontMono, fontSize: 10, whiteSpace: 'pre-wrap', maxHeight: 200, overflow: 'auto' }}
@@ -204,21 +205,18 @@ export default function DiagnosticsPanel({
       )}
 
       <Dialog open={spikeConfirmOpen} onClose={() => setSpikeConfirmOpen(false)} maxWidth="xs">
-        <DialogTitle sx={{ fontSize: 14, fontWeight: 700 }}>Run compatibility spike?</DialogTitle>
+        <DialogTitle sx={{ fontSize: 14, fontWeight: 700 }}>{strings.diagnostics.spikeConfirmTitle}</DialogTitle>
         <DialogContent sx={{ pt: 0 }}>
           <Typography sx={{ fontSize: 12 }}>
-            The spike checks whether this Excel host supports tables, charts and CUBE
-            formulas. It writes its test data into a temporary hidden worksheet that
-            is deleted immediately afterwards, and reads (but does not change) your
-            current cell selection. Your workbook content is not modified.
+            {strings.diagnostics.spikeConfirmDescription}
           </Typography>
         </DialogContent>
         <DialogActions sx={{ px: 2, pb: 1.5 }}>
           <Button size="small" onClick={() => setSpikeConfirmOpen(false)} sx={{ textTransform: 'none' }}>
-            Cancel
+            {strings.diagnostics.cancel}
           </Button>
           <Button size="small" variant="contained" onClick={handleSpike} sx={{ textTransform: 'none' }}>
-            Run Spike
+            {strings.diagnostics.runSpike}
           </Button>
         </DialogActions>
       </Dialog>

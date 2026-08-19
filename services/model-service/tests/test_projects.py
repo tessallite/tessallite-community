@@ -13,6 +13,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from .result_fakes import FakeScalarResult
 
 from src.auth.middleware import CurrentUser
 
@@ -49,7 +50,7 @@ class _ScalarResult:
         self._items = items
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return self._items
@@ -71,7 +72,7 @@ class _ExecuteResultWithAll:
         self._items = items
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return self._items
@@ -79,16 +80,18 @@ class _ExecuteResultWithAll:
 
 @pytest.mark.asyncio
 async def test_list_projects(client):
+    from .conftest import TEST_USER_ID
+
     project = make_project()
     mock_db = make_mock_db()
 
-    # Two execute calls: first returns projects, second returns
-    # access bindings (empty → bootstrap rule makes the project
-    # visible to everyone).
+    # Two execute calls: first returns projects, second returns access
+    # bindings. F-021-04 (decision #9) removed the zero-binding bootstrap
+    # visibility, so the caller must hold a binding to see the project.
     execute_results = iter(
         [
             _ScalarResult([project]),
-            _ExecuteResultWithAll([]),
+            _ExecuteResultWithAll([(project.id, TEST_USER_ID)]),
         ]
     )
 
@@ -108,26 +111,56 @@ async def test_list_projects(client):
 
 
 @pytest.mark.asyncio
+async def test_list_projects_hides_zero_binding_project(client):
+    """F-021-04 hard cutover (decision #9): a project with ZERO bindings is no
+    longer visible to an ordinary caller in tenant discovery — the zero-binding
+    bootstrap visibility was removed."""
+    from .conftest import TEST_USER_ID
+
+    bound_project = make_project(project_id=uuid.uuid4(), slug="bound-project")
+    zero_binding_project = make_project(
+        project_id=uuid.uuid4(), slug="zero-binding-project"
+    )
+
+    mock_db = make_mock_db()
+    execute_results = iter(
+        [
+            _ScalarResult([bound_project, zero_binding_project]),
+            _ExecuteResultWithAll([(bound_project.id, TEST_USER_ID)]),
+        ]
+    )
+
+    async def _execute(_stmt):
+        return next(execute_results)
+
+    mock_db.execute = AsyncMock(side_effect=_execute)
+
+    with patch("src.api.projects.get_tenant_db", async_gen_from(mock_db)):
+        resp = await client.get(PREFIX)
+
+    assert resp.status_code == 200
+    slugs = {p["slug"] for p in resp.json()}
+    assert "bound-project" in slugs
+    assert "zero-binding-project" not in slugs  # no bootstrap visibility
+
+
+@pytest.mark.asyncio
 async def test_list_projects_hides_projects_user_has_no_binding_on(client):
-    """Bug-F1 regression: when at least one binding exists on a
-    project, only users with a matching binding can see it in the
-    tenant discovery list. Bootstrap projects (no bindings at all)
-    stay visible."""
+    """Bug-F1 regression: only users with a matching binding can see a project
+    in the tenant discovery list. F-021-04 (decision #9): a project the caller
+    holds no binding on is hidden — regardless of whether OTHER users hold
+    bindings on it."""
     visible_project = make_project(
         project_id=uuid.uuid4(), slug="visible-project"
     )
     hidden_project = make_project(
         project_id=uuid.uuid4(), slug="hidden-project"
     )
-    bootstrap_project = make_project(
-        project_id=uuid.uuid4(), slug="bootstrap-project"
-    )
 
     mock_db = make_mock_db()
 
-    # Bindings: the caller has a binding on visible_project, a
-    # different user owns hidden_project, bootstrap_project has no
-    # bindings at all.
+    # Bindings: the caller has a binding on visible_project; a different user
+    # owns hidden_project (so the caller cannot see it).
     from .conftest import TEST_USER_ID
 
     bindings = [
@@ -137,7 +170,7 @@ async def test_list_projects_hides_projects_user_has_no_binding_on(client):
 
     execute_results = iter(
         [
-            _ScalarResult([visible_project, hidden_project, bootstrap_project]),
+            _ScalarResult([visible_project, hidden_project]),
             _ExecuteResultWithAll(bindings),
         ]
     )
@@ -153,7 +186,6 @@ async def test_list_projects_hides_projects_user_has_no_binding_on(client):
     assert resp.status_code == 200
     slugs = {p["slug"] for p in resp.json()}
     assert "visible-project" in slugs
-    assert "bootstrap-project" in slugs  # bootstrap rule
     assert "hidden-project" not in slugs
 
 
@@ -208,6 +240,71 @@ async def test_create_project(client):
 
     assert resp.status_code == 201
     assert resp.json()["slug"] == "new-proj"
+
+
+@_as_tenant_admin
+@pytest.mark.asyncio
+async def test_create_project_creates_creator_admin_binding_atomically(client):
+    """F-021-04 (decision #9): project creation atomically creates the creator's
+    admin UserAccessBinding in the SAME transaction — a project is never
+    persisted binding-less (there is no zero-binding bootstrap grant, so a
+    binding-less project would lock everyone out)."""
+    from shared.db.models import UserAccessBinding
+
+    project = make_project(slug="atomic-proj", display_name="Atomic")
+    mock_db = make_mock_db()
+
+    added: list = []
+    mock_db.add = MagicMock(side_effect=lambda obj: added.append(obj))
+
+    commit_calls = {"n": 0}
+    flushed_before_binding = {"ok": False}
+
+    async def _commit():
+        commit_calls["n"] += 1
+
+    mock_db.commit = AsyncMock(side_effect=_commit)
+
+    async def _flush():
+        # Simulate the real flush applying Project.id's client-side default
+        # (SQLAlchemy sets a ``default=uuid.uuid4`` PK at flush, not __init__),
+        # then record that the binding is added AFTER flush (references project.id).
+        from shared.db.models import Project as _Project
+
+        for obj in added:
+            if isinstance(obj, _Project) and getattr(obj, "id", None) is None:
+                obj.id = project.id
+        flushed_before_binding["ok"] = not any(
+            isinstance(o, UserAccessBinding) for o in added
+        )
+
+    mock_db.flush = AsyncMock(side_effect=_flush)
+
+    async def _refresh(obj):
+        obj.id = project.id
+        obj.created_at = project.created_at
+        obj.updated_at = project.updated_at
+        obj.is_active = True
+
+    mock_db.refresh = _refresh
+
+    with patch("src.api.projects.get_tenant_db", async_gen_from(mock_db)):
+        resp = await client.post(
+            PREFIX, json={"slug": "atomic-proj", "display_name": "Atomic"}
+        )
+
+    assert resp.status_code == 201
+    bindings = [o for o in added if isinstance(o, UserAccessBinding)]
+    assert len(bindings) == 1, "exactly one creator binding must be created"
+    binding = bindings[0]
+    assert binding.role == "admin"
+    assert binding.model_id is None  # project-wide binding
+    assert binding.project_id is not None
+    assert binding.user_identity  # creator identity persisted
+    # Atomic: flush ran before the binding was added, and there is a single
+    # commit for the whole (project + binding) transaction.
+    assert flushed_before_binding["ok"] is True
+    assert commit_calls["n"] == 1
 
 
 @_as_tenant_admin

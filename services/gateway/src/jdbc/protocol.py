@@ -52,6 +52,24 @@ class FrameTooLargeError(ValueError):
     """Raised when a client-declared frame length exceeds the allowed bound."""
 
 
+class ParamDecodeError(ValueError):
+    """A bound parameter cannot be terminated into a safe typed SQL literal.
+
+    Wave C #6: the gateway TERMINATES pgwire Bind parameters into typed safe SQL
+    literals; it must never GUESS a value. This is raised for an unsupported
+    parameter type OID, or a binary encoding it cannot decode exactly (unknown
+    OID, wrong byte width, or invalid UTF-8). The Bind handler maps it to a stable
+    protocol ErrorResponse (``sqlstate``) instead of inlining a guessed value that
+    could silently change a number. Carries a stable SQLSTATE (default
+    ``0A000`` feature_not_supported; ``22P03`` invalid_binary_representation for a
+    malformed binary payload).
+    """
+
+    def __init__(self, message: str, sqlstate: str = "0A000"):
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
 def _checked_frame_length(length: int, limit: int) -> int:
     """Validate the declared frame length against *limit* (F-001-07)."""
     if length < 4 or (length - 4) > limit:
@@ -79,8 +97,10 @@ OID_FLOAT8 = 701
 OID_BOOL = 16
 OID_NUMERIC = 1700
 OID_DATE = 1082
+OID_TIME = 1083
 OID_TIMESTAMP = 1114
 OID_TIMESTAMPTZ = 1184
+OID_TIMETZ = 1266
 
 # Bug-3655 (option b): OIDs the gateway emits as TEXT even when a client
 # requests binary result format. The gateway has no true PG binary wire
@@ -91,7 +111,7 @@ OID_TIMESTAMPTZ = 1184
 # Forcing format code 0 for these columns keeps row_description and data_row
 # in lockstep regardless of the requested format.
 _TEXT_ONLY_BINARY_OIDS = frozenset({
-    OID_NUMERIC, OID_DATE, OID_TIMESTAMP, OID_TIMESTAMPTZ,
+    OID_NUMERIC, OID_DATE, OID_TIME, OID_TIMESTAMP, OID_TIMESTAMPTZ, OID_TIMETZ,
 })
 
 
@@ -389,6 +409,15 @@ def no_data() -> bytes:
     return _msg("n", b"")
 
 
+def portal_suspended() -> bytes:
+    """PortalSuspended (s) — sent when Execute stops before exhausting all rows.
+
+    Bug-6935: clients that request bounded fetches (max_rows > 0 in Execute)
+    expect PortalSuspended followed by further Execute calls.
+    """
+    return _msg("s", b"")
+
+
 def parameter_description(type_oids: list[int] | None = None) -> bytes:
     """ParameterDescription (t) — describes statement parameters.
 
@@ -546,86 +575,98 @@ NUMERIC_PARAM_OIDS = frozenset({
     26,  # OID
 })
 
+# Wave C #6: text-like OIDs whose binary wire form is just UTF-8 bytes.
+_TEXTLIKE_OIDS = frozenset({
+    OID_TEXT, 1043, 1042, 18, 19, 2950,  # text/varchar/char/"char"/name/uuid
+})
+
+# Wave C #6: OIDs the gateway can decode from PG BINARY wire format into an
+# EXACT text value, with the exact byte width PostgreSQL uses. A binary payload
+# of any other width (or an OID absent from this table AND not text-like) is
+# refused as ``ParamDecodeError`` rather than guessed. NUMERIC/TIME/TIMETZ have
+# no lossless scalar binary decoder here, so they are intentionally NOT listed —
+# a binary value of those types is refused (the client may send them as text).
+_BINARY_FIXED_WIDTH = {
+    OID_BOOL: 1,
+    OID_INT2: 2,
+    OID_INT4: 4, 26: 4,
+    OID_INT8: 8,
+    OID_FLOAT4: 4,
+    OID_FLOAT8: 8,
+    OID_DATE: 4,
+    OID_TIMESTAMP: 8,
+    OID_TIMESTAMPTZ: 8,
+}
+
+# Wave C #6: the full set of parameter type OIDs the gateway will terminate into
+# a safe SQL literal (in either text or binary format). OID 0 (unspecified) is
+# treated as a text literal — PostgreSQL infers its type in context. A non-zero
+# OID outside this set is refused rather than mis-typed.
+SUPPORTED_PARAM_OIDS = frozenset(
+    {0, OID_NUMERIC, OID_TIME, OID_TIMETZ}
+    | set(_TEXTLIKE_OIDS)
+    | set(NUMERIC_PARAM_OIDS)
+    | {OID_BOOL}
+    | {OID_DATE, OID_TIMESTAMP, OID_TIMESTAMPTZ}
+)
+
 
 def _decode_binary_param(data: bytes, oid: int = 0) -> str:
-    """Decode a binary-format parameter value to its text representation.
+    """Decode a BINARY-format Bind parameter into its exact text representation.
 
-    Bug-5187: uses the declared parameter OID from the Parse message to
-    choose the correct decoder. Falls back to a byte-length heuristic only
-    when no OID is declared (oid == 0), which preserves backwards
-    compatibility for clients that omit type declarations.
-
-    Without OID-driven decoding, a 4-byte UTF-8 text string (e.g. a date
-    like "2024") would be mis-decoded as an int32, and an 8-byte text
-    string would be mis-decoded as an int64, silently corrupting the value.
+    Wave C #6: strictly OID-driven and length-checked — NEVER a byte-length
+    guess. A binary payload is decoded only when its declared OID has a known,
+    lossless decoder AND the byte width matches PostgreSQL's wire width. An
+    unknown/undeclared OID (including ``0``), an unsupported binary type
+    (NUMERIC/TIME/TIMETZ), a wrong width, or invalid UTF-8 raises
+    :class:`ParamDecodeError` so the gateway emits a stable protocol error rather
+    than a guessed value (a guess can silently corrupt a number).
     """
     n = len(data)
 
-    # --- OID-driven decoding (preferred path) ---
-    if oid == OID_BOOL:
-        return "true" if (n >= 1 and data[0]) else "false"
-    if oid == OID_INT2 and n >= 2:
-        return str(struct.unpack_from("!h", data, 0)[0])
-    if oid in (OID_INT4, 26) and n >= 4:  # 26 = OID type
-        return str(struct.unpack_from("!i", data, 0)[0])
-    if oid == OID_INT8 and n >= 8:
-        return str(struct.unpack_from("!q", data, 0)[0])
-    if oid == OID_FLOAT4 and n >= 4:
-        return str(struct.unpack_from("!f", data, 0)[0])
-    if oid == OID_FLOAT8 and n >= 8:
-        return str(struct.unpack_from("!d", data, 0)[0])
-    if oid in (OID_TEXT, 1043, 1042, 18):
-        # TEXT (25), VARCHAR (1043), CHAR (1042), "char" (18) — decode as UTF-8.
+    if oid in _TEXTLIKE_OIDS:
         try:
             return data.decode("utf-8")
-        except UnicodeDecodeError:
-            return data.hex()
-    if oid == OID_DATE:
-        # PG binary date: int32 = days since 2000-01-01.
-        if n == 4:
-            from datetime import date, timedelta
-            days = struct.unpack_from("!i", data, 0)[0]
-            return str(date(2000, 1, 1) + timedelta(days=days))
-        # Non-standard length — try UTF-8 text representation.
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            return data.hex()
-    if oid in (OID_TIMESTAMP, OID_TIMESTAMPTZ):
-        # PG binary timestamp: int64 = microseconds since 2000-01-01 00:00:00.
-        if n == 8:
-            from datetime import datetime, timedelta, timezone
-            microseconds = struct.unpack_from("!q", data, 0)[0]
-            base = datetime(2000, 1, 1)
-            dt = base + timedelta(microseconds=microseconds)
-            if oid == OID_TIMESTAMPTZ:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return str(dt)
-        # Non-standard length — try UTF-8 text representation.
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            return data.hex()
-    if oid != 0:
-        # Known OID but no specific decoder — treat as text.
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            return data.hex()
+        except UnicodeDecodeError as exc:
+            raise ParamDecodeError(
+                f"binary parameter for type OID {oid} is not valid UTF-8",
+                sqlstate="22P03",
+            ) from exc
 
-    # --- Legacy byte-length heuristic (OID unknown / 0) ---
-    if n == 1:
+    width = _BINARY_FIXED_WIDTH.get(oid)
+    if width is None:
+        raise ParamDecodeError(
+            f"binary-format parameter with type OID {oid} is not supported; "
+            "declare a supported scalar type or send the value in text format."
+        )
+    if n != width:
+        raise ParamDecodeError(
+            f"binary parameter for type OID {oid} has {n} byte(s), "
+            f"expected {width}.",
+            sqlstate="22P03",
+        )
+
+    if oid == OID_BOOL:
         return "true" if data[0] else "false"
-    if n == 2:
-        return str(struct.unpack_from("!h", data, 0)[0])
-    if n == 4:
-        return str(struct.unpack_from("!i", data, 0)[0])
-    if n == 8:
-        return str(struct.unpack_from("!q", data, 0)[0])
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return data.hex()
+    if oid == OID_INT2:
+        return str(struct.unpack("!h", data)[0])
+    if oid in (OID_INT4, 26):
+        return str(struct.unpack("!i", data)[0])
+    if oid == OID_INT8:
+        return str(struct.unpack("!q", data)[0])
+    if oid == OID_FLOAT4:
+        return str(struct.unpack("!f", data)[0])
+    if oid == OID_FLOAT8:
+        return str(struct.unpack("!d", data)[0])
+    if oid == OID_DATE:
+        from datetime import date, timedelta
+        return str(date(2000, 1, 1) + timedelta(days=struct.unpack("!i", data)[0]))
+    # OID_TIMESTAMP / OID_TIMESTAMPTZ (8-byte microseconds since 2000-01-01).
+    from datetime import datetime, timedelta, timezone
+    dt = datetime(2000, 1, 1) + timedelta(microseconds=struct.unpack("!q", data)[0])
+    if oid == OID_TIMESTAMPTZ:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return str(dt)
 
 
 # ---------------------------------------------------------------------------

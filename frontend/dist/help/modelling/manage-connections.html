@@ -12,20 +12,28 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Manage Connections</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-15</span></div>
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-08-11</span></div>
     <h1>Manage Connections</h1>
     <h2>What this covers</h2>
-    <p>The <strong>Connections</strong> panel manages reusable credentials and endpoints for a project. A connection answers "how does Tessallite reach this database or warehouse?" It is not the same thing as a model source. A source answers "which schema or dataset from that connection is added to this model?"</p>
+    <p>The <strong>Connections</strong> panel manages reusable credentials and endpoints for a project. A connection answers "how does Tessallite reach this database or source system?" It is not the same thing as a model source. A source answers "which schema or dataset from that connection is added to this model?"</p>
     <p>Use this page when the help icon is opened from the Connections panel or the standalone Connections page.</p>
     <h2>What belongs in a connection</h2>
     <div class="table-wrapper"><table><thead><tr><th>Field</th><th>Purpose</th></tr></thead><tbody><tr><td>Display name</td><td>Human-readable name shown when modellers bind sources and targets.</td></tr><tr><td>Connection type</td><td>PostgreSQL, BigQuery, Hadoop/Spark, or another configured connector.</td></tr><tr><td>Credentials</td><td>Secrets such as password, service-account JSON, or token material.</td></tr><tr><td>Config</td><td>Non-secret options such as schema defaults, dataset, write access, and connector flags.</td></tr></tbody></table></div>
     <p>Credentials are stored by the backend and are never shown back in full after save. Edit screens may show previews or blank password fields; leaving a password blank preserves the saved secret.</p>
+    <h3>Why secrets must never go in Config</h3>
+    <p>Think of the two boxes differently. <strong>Credentials</strong> is a locked box: Tessallite scrambles everything you put in it, and nobody — not even another user on your team — can read it back. <strong>Config</strong> is a labelled box with a glass lid: it holds the harmless "where to look" details, and anyone who can view the project can see straight through it.</p>
+    <p>Put a password in the glass box and everyone can read it. So Tessallite refuses. If you try to save a Config entry whose name looks like a secret — anything containing <code>password</code>, <code>secret</code>, <code>token</code>, <code>key</code>, <code>credential</code>, or a whole connection string — the save is rejected and the message tells you which entry to move. If an older connection was created before this check existed and still has something secret-looking in Config, Tessallite hides it when the connection is displayed, so it cannot leak to a viewer.</p>
+    <p>The same rule applies to an LLM provider's Config section. The provider API key has its own locked box; the Config section is for plain settings such as the Google project and location.</p>
+    <p><strong>Example.</strong> You are wiring up a Snowflake connection.</p>
+    <ul><li>Right: Credentials holds <code>password</code>. Config holds <code>warehouse</code> and <code>schema</code>.</li><li>Wrong: Config holds <code>db_password</code>. Tessallite rejects the save and asks you to move it to Credentials.</li></ul>
     <h2>Typical workflow</h2>
     <ol><li>Open the project.</li><li>Open <strong>Connections</strong> from the Model Builder toolbelt, or open the project Connections page.</li><li>Click <strong>Add Connection</strong>.</li><li>Enter a display name and select the connection type.</li><li>Fill the required fields for the connector.</li><li>Click <strong>Test</strong> before saving.</li><li>Save the connection.</li><li>Go to <strong>Sources &amp; Targets</strong> to bind schemas, datasets, model sources, or writable targets to this connection.</li></ol>
     <h2>Test results</h2>
     <p>The test button checks network reachability, authentication, and connector-specific credential shape. It does not prove that every table a modeller later wants is accessible. Table access is validated when a source is added and tables are discovered.</p>
     <h2>Editing and deleting</h2>
     <p>Editing a connection updates future reads and writes that use that connection. Existing sources remain bound to the same connection record, so a corrected host, token, or service account takes effect without recreating all model tables.</p>
+    <p>A field you leave blank means "leave this one alone". That is what lets you change the host without retyping the password. It also means a blank field cannot be used to <em>erase</em> something you no longer want. If you are calling the REST API directly rather than using the screen, two special values cover that:</p>
+    <div class="table-wrapper"><table><thead><tr><th>Send this as the value</th><th>What happens</th></tr></thead><tbody><tr><td><code>__CLEAR__</code></td><td>The field is removed completely, as if it had never been set. Use this to wipe a password you no longer want stored.</td></tr><tr><td><code>__EMPTY__</code></td><td>The field is kept but set to nothing. Use this when the connector needs to see the field present and blank.</td></tr></tbody></table></div>
     <p>Deleting a connection can be blocked when sources or targets still depend on it. Remove or rebind those sources first.</p>
     <h2>Related</h2>
     <ul><li><a href="add-a-data-source.html">Add a Data Source</a></li><li><a href="add-tables-to-a-model.html">Add Tables to a Model</a></li><li><a href="../integrations/supported-data-sources.html">Supported Data Sources</a></li></ul>

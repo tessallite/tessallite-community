@@ -62,6 +62,7 @@
 </tbody></table></div>
 <p><strong>Permissions required</strong>: Service account must have <code>bigquery.jobs.create</code> and <code>bigquery.tables.getData</code> IAM roles. For aggregate writes, add <code>bigquery.tables.create</code>, <code>bigquery.tables.updateData</code>, and <code>bigquery.tables.delete</code>.</p>
 <p><strong>Query dialect</strong>: Standard SQL.</p>
+<p><strong>Aggregate and pocket targets</strong>: A target always uses the project configured on its BigQuery connection. Enter a bare dataset name such as <code>analytics</code>; do not enter <code>project.dataset</code> or a different target project. To use data in a different project, ask a BigQuery administrator to create a view in this connection's project that reads the external table with its fully-qualified name, then target that local view/project.</p>
 
 <h2>Snowflake</h2>
 <p>Requires <code>snowflake-connector-python</code>. Install the optional dependency: <code>pip install tessallite-shared[snowflake]</code>.</p>

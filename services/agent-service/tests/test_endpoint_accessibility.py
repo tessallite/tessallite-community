@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, APIWebSocketRoute
+from starlette.routing import Route, WebSocketRoute
 
 from src.main import app
 from src.auth.middleware import (
@@ -19,6 +20,13 @@ from src.auth.middleware import (
 _DUMMY_UUID = "00000000-0000-4000-8000-000000000001"
 _TEST_TENANT = "test-tenant"
 _SKIP_METHODS = {"HEAD", "OPTIONS"}
+
+# Floor for Bug-8448: the recursive walker below must find at least this many
+# real APIRoutes. Well under the ~51 the service actually registers, but far
+# above zero, so a FastAPI upgrade that hides included routers (0.139+ wraps
+# them in an opaque container the old flat scan could not see) makes this suite
+# FAIL CLOSED instead of passing on an empty parameter set.
+_MIN_ROUTES = 40
 
 _INFRA_ROUTES: set[str] = {
     "POST /api/v1/projects/{project_id}/agent/webhook/rotate-secret",
@@ -47,11 +55,55 @@ def _resolve_path(path: str) -> str:
     return re.sub(r"\{(\w+)\}", _sub, path)
 
 
+class _UnknownRouteShape(TypeError):
+    """A route object the walker does not recognise. Raised so the walker
+    FAILS CLOSED on an un-enumerated shape instead of silently skipping it."""
+
+
+# Non-API leaf routes the accessibility property does not cover: the
+# docs / openapi / redoc endpoints Starlette mounts, and websockets.
+_IGNORED_LEAF = (Route, WebSocketRoute, APIWebSocketRoute)
+
+
+def _walk(router):
+    """Recursively yield every APIRoute reachable from ``router``.
+
+    Bug-8448. Enumeration scope, audited per CLAUDE.md's coverage-tool
+    blind-spot rule. The walker is keyed on STRUCTURE (the presence of a
+    ``.routes`` collection), never on a path shape, so it is not blind to a
+    ``{project_id}``-shaped bulk route the way a ``{model_id}``-keyed matcher
+    would be. For each child route:
+
+      * ``APIRoute``                     -> yielded (the property applies).
+      * a container exposing ``.routes`` -> descended: ``APIRouter``, Starlette
+        ``Router``/``Mount``/``Host``, and FastAPI 0.139+'s opaque
+        ``_IncludedRouter`` wrapper — matched by having ``.routes``, not by
+        class name, so a future wrapper class is handled the same way.
+      * a recognised non-API leaf        -> ignored: ``Route`` (docs/openapi),
+        ``WebSocketRoute``/``APIWebSocketRoute``.
+
+    Anything else raises ``_UnknownRouteShape`` — FAIL CLOSED, never skip.
+    """
+    routes = getattr(router, "routes", None)
+    if routes is None:
+        raise _UnknownRouteShape(f"{router!r} exposes no .routes to walk")
+    for route in routes:
+        if isinstance(route, APIRoute):
+            yield route
+        elif getattr(route, "routes", None) is not None:
+            yield from _walk(route)
+        elif isinstance(route, _IGNORED_LEAF):
+            continue
+        else:
+            raise _UnknownRouteShape(
+                f"unrecognised route shape {type(route).__name__} "
+                f"({route!r}); refusing to skip it silently"
+            )
+
+
 def _collect_routes():
     seen: set[str] = set()
-    for route in app.routes:
-        if not isinstance(route, APIRoute):
-            continue
+    for route in _walk(app):
         for method in sorted(route.methods - _SKIP_METHODS):
             key = f"{method} {route.path}"
             if key not in seen:
@@ -144,3 +196,55 @@ async def test_endpoint_accessible(client, method, path):
     assert resp.status_code < 500, (
         f"{method} {url} -> {resp.status_code}: {resp.text[:300]}"
     )
+
+
+# ── Bug-8448: coverage guard must fail closed on route drift ──────────────
+def _dummy_api_route(path: str = "/x") -> APIRoute:
+    async def _ep():  # pragma: no cover - never invoked
+        return {}
+
+    return APIRoute(path, endpoint=_ep, methods=["GET"])
+
+
+def test_route_coverage_floor():
+    """Fail closed if route collection collapses.
+
+    Under a FastAPI that wraps ``include_router`` routes in an opaque
+    container, a flat ``app.routes`` + ``isinstance(APIRoute)`` scan silently
+    collected zero routes and the parametrised suite passed on nothing. The
+    recursive walker plus this floor make that regression RED instead.
+
+    Test escape: a parametrised suite with zero parameters is green.
+    Guard: this floor. Tier: T1.
+    """
+    collected = list(_walk(app))
+    assert len(collected) >= _MIN_ROUTES, (
+        f"route coverage floor breached: {len(collected)} < {_MIN_ROUTES}; "
+        "the accessibility guard would pass vacuously"
+    )
+
+
+def test_walk_descends_opaque_included_router():
+    """A route reachable only through a container that just exposes ``.routes``
+    (the shape FastAPI 0.139+ produces for ``include_router``) is still found —
+    the walker descends by structure, not by class name."""
+    inner = _dummy_api_route("/nested")
+
+    class _FakeIncludedRouter:  # opaque wrapper: no APIRoute-ness, only .routes
+        routes = [inner]
+
+    class _FakeApp:
+        routes = [_FakeIncludedRouter()]
+
+    assert list(_walk(_FakeApp())) == [inner]
+
+
+def test_walk_fails_closed_on_unknown_shape():
+    """An unrecognised route object raises instead of being silently skipped —
+    the walker's own enumeration blind-spot guard."""
+
+    class _FakeApp:
+        routes = [object()]
+
+    with pytest.raises(_UnknownRouteShape):
+        list(_walk(_FakeApp()))

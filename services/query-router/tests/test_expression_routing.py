@@ -8,11 +8,14 @@ and fallback path.
 from __future__ import annotations
 
 import types
-from unittest.mock import MagicMock
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from shared.semantic.canonical_dimensions import CanonicalDim
 from src.parsing.sql_parser import parse_sql_to_ir
+from src.routing.aggregate_matcher import find_best_aggregate
 from src.rewrite.query_rewriter import rewrite_for_aggregate
 from src.ir.logical_query import BoundQuery, LogicalFilter, LogicalQuery, SelectExpression
 
@@ -29,6 +32,11 @@ def _make_agg(grain, columns, *, target_schema="public", physical_table_name="ag
         target_schema=target_schema,
         grain=grain,
         columns=columns,
+        status="active",
+        last_refreshed_at=datetime.now(timezone.utc),
+        persona_id=None,
+        built_for_version_id="v1",
+        built_for_epoch=0,
     )
 
 
@@ -52,9 +60,14 @@ def _make_row_count_col():
 
 def _bind(ir, measures, dimensions, *, filters=None):
     """Build a BoundQuery from an IR + list of (name, default_agg) tuples."""
+    # A2: use a SimpleNamespace with explicit deployed_version_id so the
+    # artifact-to-version gate sees a deterministic value matching the
+    # built_for default in _make_agg, not a MagicMock that auto-creates
+    # a non-matching object.
+    _model = types.SimpleNamespace(id="model-1", slug="test_model", deployed_version_id="v1", deploy_epoch=0)
     return BoundQuery(
         logical_query=ir,
-        model=MagicMock(),
+        model=_model,
         resolved_measures=[
             types.SimpleNamespace(name=n, default_agg=a, is_additive=True)
             for n, a in measures
@@ -638,6 +651,7 @@ class TestRewriterCountDistinct:
         sql = rewrite_for_aggregate(bq, agg)
 
         assert '"user_id__count_distinct"' in sql
+        assert "NULL" not in sql.upper()
         # The raw COUNT(DISTINCT ...) function call must NOT survive — the bare
         # ``user_id`` column does not exist in the aggregate table. The stored
         # column name (count_distinct suffix) is fine; a COUNT( function call
@@ -1088,28 +1102,88 @@ class TestPercentileParsing:
         assert a[0].inner_column == "amount"
         assert "amount" in ir.requested_measures
 
-    def test_percentile_cont_within_group_is_passthrough(self):
-        # F-003-07: ordered-set aggregates (WITHIN GROUP) are source-passthrough
-        # by design (query-shape catalog shape #86). The parser must flag them
-        # complex — NOT classify them as a routable pNN, which produced dead,
-        # self-contradicting machinery (the binder discards complex-SQL
-        # measures so the pNN classification could never route).
+    def test_percentile_cont_within_group_is_routable(self):
+        # Bug-6969/5891: the ONE safe ordered-set shape
+        # (PERCENTILE_CONT(literal) WITHIN GROUP (ORDER BY single-column)) is now
+        # RECOGNISED and routable — NOT flagged complex (the historical F-003-07
+        # dead-code trap is closed because one shared recogniser governs both the
+        # complex-SQL gate and the SELECT classifier). It classifies as a pNN
+        # analytical item carrying method/direction/fraction, so the binder can
+        # build the QuantileRequest inventory and the coverage proof can gate it.
         ir = parse_sql_to_ir(
             "SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount) AS p FROM t", "m1")
-        assert ir.has_complex_sql is True
-        assert not any(e.classification == "analytical" for e in ir.select_expressions)
+        assert ir.has_complex_sql is False
+        a = [e for e in ir.select_expressions if e.classification == "analytical"]
+        assert len(a) == 1
+        assert a[0].agg_function == "p90"
+        assert a[0].inner_column == "amount"
+        assert a[0].quantile_meta == {
+            "method": "continuous", "direction": "asc", "fraction_text": "0.9",
+            "source_syntax": "ordered_set",
+        }
 
-    def test_percentile_disc_within_group_is_passthrough(self):
+    def test_percentile_disc_within_group_is_routable(self):
         ir = parse_sql_to_ir(
             "SELECT PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY amount) FROM t", "m1")
-        assert ir.has_complex_sql is True
-        assert not any(e.classification == "analytical" for e in ir.select_expressions)
+        assert ir.has_complex_sql is False
+        a = [e for e in ir.select_expressions if e.classification == "analytical"]
+        assert len(a) == 1
+        assert a[0].agg_function == "p25"
+        assert a[0].quantile_meta["method"] == "discrete"
 
-    def test_non_canonical_percentile_stays_passthrough(self):
+    def test_percentile_disc_desc_carries_direction(self):
+        # Reviewer §4.1: discrete DESC has no ascending equivalent; the parser
+        # must carry the authored direction so the proof can require
+        # direction-identical coverage (never serve DESC from ASC coverage).
+        ir = parse_sql_to_ir(
+            "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY amount DESC) FROM t", "m1")
+        a = [e for e in ir.select_expressions if e.classification == "analytical"]
+        assert a[0].quantile_meta == {
+            "method": "discrete", "direction": "desc", "fraction_text": "0.5",
+            "source_syntax": "ordered_set",
+        }
+
+    def test_non_canonical_percentile_recognised_but_unmapped(self):
+        # A recognised shape with a non-canonical fraction (0.37 -> no pNN
+        # column) is bound but carries the ``__quantile_unmapped__`` sentinel
+        # agg_function, so the matcher finds no stat column and routes to source
+        # — never a wrong serve. It is NOT flagged complex (the shape is valid).
         ir = parse_sql_to_ir(
             "SELECT PERCENTILE_CONT(0.37) WITHIN GROUP (ORDER BY amount) FROM t", "m1")
+        assert ir.has_complex_sql is False
+        a = [e for e in ir.select_expressions if e.classification == "analytical"]
+        assert len(a) == 1
+        assert a[0].agg_function == "__quantile_unmapped__"
+        assert a[0].quantile_meta["fraction_text"] == "0.37"
+
+    def test_percentile_expression_order_key_stays_complex(self):
+        # An expression (non-bare-column) order key is NOT the safe shape and
+        # must stay complex -> source.
+        ir = parse_sql_to_ir(
+            "SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY a + b) FROM t", "m1")
         assert ir.has_complex_sql is True
-        assert not any(e.classification == "analytical" for e in ir.select_expressions)
+
+    def test_percentile_in_having_stays_complex(self):
+        # I1 single-inventory (Fable R1): the exemption is SELECT-projection
+        # only. A percentile in HAVING is NOT inventoried, so it must stay
+        # complex -> source (never served from an artifact un-inventoried).
+        ir = parse_sql_to_ir(
+            "SELECT dim1, SUM(amount) FROM t GROUP BY dim1 "
+            "HAVING PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount) > 5", "m1")
+        assert ir.has_complex_sql is True
+
+    def test_percentile_in_order_by_stays_complex(self):
+        ir = parse_sql_to_ir(
+            "SELECT dim1 FROM t GROUP BY dim1 "
+            "ORDER BY PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount)", "m1")
+        assert ir.has_complex_sql is True
+
+    def test_percentile_nested_in_expression_stays_complex(self):
+        # PERCENTILE_CONT(...)/100 is nested, not a direct SELECT projection ->
+        # not inventoried -> complex -> source.
+        ir = parse_sql_to_ir(
+            "SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount) / 100 FROM t", "m1")
+        assert ir.has_complex_sql is True
 
     def test_median_exact_grain_reads_p50_column(self):
         ir = parse_sql_to_ir("SELECT dim1, MEDIAN(amount) AS m FROM t GROUP BY dim1", "m1")
@@ -1117,7 +1191,54 @@ class TestPercentileParsing:
         bq = _bind(ir, [("amount", "sum")], ["dim1"])
         sql = rewrite_for_aggregate(bq, agg)
         assert '"amount__p50"' in sql
+        assert "NULL" not in sql.upper()
         assert "MEDIAN" not in sql.upper()
+
+    def test_bare_quantile_default_measure_reads_exact_pNN_not_fuzzy_first_column(self):
+        # Fable R3 HIGH (wrong-numbers): a BARE measure whose default_agg is a
+        # quantile stat (p90) is a passthrough item; the rewriter must read the
+        # EXACT (measure, default_agg) column, never the fuzzy first stored column.
+        # The aggregate stores latency__sum BEFORE latency__p90, so the old fuzzy
+        # (name, None) lookup would emit latency__sum AS latency (a SUM served as
+        # the p90). Assert it reads latency__p90.
+        ir = parse_sql_to_ir("SELECT dim1, latency FROM t GROUP BY dim1", "m1")
+        agg = _make_agg(
+            ["dim1"],
+            [_make_col("latency", "sum"), _make_col("latency", "p90"), _make_row_count_col()],
+        )
+        bq = BoundQuery(
+            logical_query=ir,
+            model=MagicMock(),
+            resolved_measures=[
+                types.SimpleNamespace(name="latency", default_agg="p90", is_additive=False)
+            ],
+            resolved_dimensions=[types.SimpleNamespace(name="dim1")],
+            resolved_filters=[],
+        )
+        sql = rewrite_for_aggregate(bq, agg)
+        assert '"latency__p90"' in sql
+        assert "latency__sum" not in sql  # the SUM column is NEVER served as p90
+
+    def test_bare_quantile_default_measure_missing_column_fails_closed(self):
+        # If the aggregate has no p90 column for a p90-default measure, the
+        # rewriter must raise (router -> source), never emit a fuzzy wrong column.
+        from src.rewrite.aggregate import AggregateRewriteUnsupported
+        ir = parse_sql_to_ir("SELECT dim1, latency FROM t GROUP BY dim1", "m1")
+        agg = _make_agg(
+            ["dim1"],
+            [_make_col("latency", "sum"), _make_row_count_col()],  # no p90
+        )
+        bq = BoundQuery(
+            logical_query=ir,
+            model=MagicMock(),
+            resolved_measures=[
+                types.SimpleNamespace(name="latency", default_agg="p90", is_additive=False)
+            ],
+            resolved_dimensions=[types.SimpleNamespace(name="dim1")],
+            resolved_filters=[],
+        )
+        with pytest.raises(AggregateRewriteUnsupported):
+            rewrite_for_aggregate(bq, agg)
 
 # NOTE (F-003-07): the former ``test_percentile_cont_exact_grain_reads_p90_column``
 # was removed. It hand-built a BoundQuery via the ``_bind`` helper with
@@ -1163,6 +1284,7 @@ class TestStatParsingAndRewrite:
         bq = _bind(ir, [("amount", "sum")], ["dim1"])
         sql = rewrite_for_aggregate(bq, agg)
         assert '"amount__stddev_samp"' in sql
+        assert "NULL" not in sql.upper()
         # the stored column is read directly — no STDDEV function CALL remains
         assert "STDDEV(" not in sql.upper() and "STDDEV_SAMP(" not in sql.upper()
 
@@ -1173,6 +1295,95 @@ class TestStatParsingAndRewrite:
         sql = rewrite_for_aggregate(bq, agg)
         assert '"amount__var_samp"' in sql
         assert "VARIANCE(" not in sql.upper() and "VAR_SAMP(" not in sql.upper()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("raw_sql", "measure_name", "stat_type", "expected_col", "forbidden"),
+        [
+            (
+                'SELECT "hierarchy_a.year", COUNT(DISTINCT user_id) AS uu '
+                'FROM t GROUP BY "hierarchy_a.year"',
+                "user_id",
+                "count_distinct",
+                '"user_id__count_distinct"',
+                "COUNT(",
+            ),
+            (
+                'SELECT "hierarchy_a.year", MEDIAN(amount) AS p50 '
+                'FROM t GROUP BY "hierarchy_a.year"',
+                "amount",
+                "p50",
+                '"amount__p50"',
+                "MEDIAN",
+            ),
+            (
+                'SELECT "hierarchy_a.year", STDDEV_SAMP(amount) AS s '
+                'FROM t GROUP BY "hierarchy_a.year"',
+                "amount",
+                "stddev_samp",
+                '"amount__stddev_samp"',
+                "STDDEV_SAMP(",
+            ),
+        ],
+    )
+    async def test_exact_grain_non_additive_matcher_result_rewrites_stored_column(
+        self,
+        raw_sql,
+        measure_name,
+        stat_type,
+        expected_col,
+        forbidden,
+    ):
+        """Bug-6092 guard: a committed exact-grain match for non-additive
+        stored-stat families must treat canonical-equivalent raw grain names as
+        exact grain and read the materialised stat column, not emit NULL or
+        leave the raw aggregate function for the aggregate table."""
+        ir = parse_sql_to_ir(raw_sql, "m1")
+        agg = _make_agg(
+            ["hierarchy_b.year"],
+            [_make_col(measure_name, stat_type), _make_row_count_col()],
+        )
+        bq = _bind(ir, [(measure_name, stat_type)], ["hierarchy_a.year"])
+
+        canonical_dims = [
+            CanonicalDim(
+                canonical_name="year",
+                backing_key="uda:shared-year",
+                all_names={"hierarchy_a.year", "hierarchy_b.year", "year"},
+            )
+        ]
+
+        with (
+            patch(
+                "src.routing.aggregate_matcher.load_active_aggregates",
+                new_callable=AsyncMock,
+                return_value=[agg],
+            ),
+            patch(
+                "shared.semantic.canonical_dimensions.build_canonical_dimension_list",
+                new_callable=AsyncMock,
+                return_value=canonical_dims,
+            ),
+            patch(
+                "shared.semantic.canonical_dimensions.build_canonical_dimension_list_from_snapshot",
+                return_value=canonical_dims,
+            ),
+        ):
+            match = await find_best_aggregate(bq, AsyncMock())
+
+        assert match.aggregate is agg
+        assert match.logical_to_aggregate_grain == {
+            "hierarchy_a.year": "hierarchy_b.year",
+        }
+        sql = rewrite_for_aggregate(
+            bq,
+            match.aggregate,
+            logical_to_aggregate_grain=match.logical_to_aggregate_grain,
+        )
+        assert '"hierarchy_b.year" AS "hierarchy_a.year"' in sql
+        assert expected_col in sql
+        assert "NULL" not in sql.upper()
+        assert forbidden not in sql.upper()
 
 
 # ---------------------------------------------------------------------------

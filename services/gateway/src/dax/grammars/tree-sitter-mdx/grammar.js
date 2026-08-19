@@ -3,13 +3,33 @@
  *
  * Structural parser — captures WITH MEMBER/SET, SELECT ... ON axis,
  * FROM [cube], WHERE (tuple), and DIMENSION PROPERTIES.
- * Axis body expressions are captured as raw text for downstream regex
- * helpers that already handle drill-down, hierarchize, etc.
+ * Axis and calc-body expressions are captured as raw text for downstream regex
+ * helpers that already handle drill-down, hierarchize, etc. The grammar is
+ * PERMISSIVE inside expressions (operators, parens, sets, function calls,
+ * comments, single-quoted bodies) so VALID SSAS MDX never sets root.has_error —
+ * the XMLA Execute admission gate (xmla_server._parse_mdx_for_execute) fails
+ * closed on has_error, so a false positive would refuse a valid Excel/Power BI
+ * query. The structural skeleton (SELECT/axis/ON/FROM cube/WHERE) stays strict
+ * so genuinely malformed MDX still errors.
+ *
+ * REGENERATION (Wave C, Bug-9443): the committed src/parser.c and the two
+ * mdx.so artifacts MUST stay ABI 14 to load with the runtime `tree_sitter`
+ * 0.21.3. Regenerate with the pinned CLI and the explicit ABI flag:
+ *
+ *     cd tessallite/services/gateway/src/dax/grammars/tree-sitter-mdx
+ *     npm install                              # tree-sitter-cli 0.26.8 (pinned)
+ *     ./node_modules/.bin/tree-sitter generate --abi 14
+ *     # then rebuild both mdx.so via tree_sitter.Language.build_library(...)
+ *
+ * The default (ABI 15) will NOT load with the 0.21.3 runtime.
  */
 module.exports = grammar({
   name: "mdx",
 
-  extras: $ => [/\s+/],
+  // Whitespace and comments are ignored between tokens. The committed grammar
+  // had no comment rule, so ANY SSAS comment (// -- /* */) previously set
+  // root.has_error on an otherwise valid statement.
+  extras: $ => [/\s+/, $.comment],
 
   word: $ => $.identifier,
 
@@ -57,15 +77,18 @@ module.exports = grammar({
 
     with_member_def: $ => seq(
       ci("MEMBER"),
-      field("name", $.dotted_ref),
+      field("name", choice($.dotted_ref, $.identifier)),
       ci("AS"),
       field("expression", $.calc_expression),
       repeat(seq(",", $.member_property)),
     ),
 
+    // SSAS names a WITH SET / MEMBER with a bracketed name (``[FS]``) OR a bare
+    // identifier (``WITH SET FilteredMembers AS ...``). Only the bracketed form
+    // parsed before, so every bare-named set set has_error.
     with_set_def: $ => seq(
       ci("SET"),
-      field("name", $.dotted_ref),
+      field("name", choice($.dotted_ref, $.identifier)),
       ci("AS"),
       field("expression", $.calc_expression),
     ),
@@ -81,18 +104,26 @@ module.exports = grammar({
     // axis_body.
     calc_expression: $ => prec.left(repeat1($.calc_atom)),
 
+    // A WITH MEMBER / SET body atom. Includes sets ({...}) and function calls
+    // (AGGREGATE(...), SUM(...), IIF(...)) so a calc member over a set —
+    // ``AGGREGATE({[A],[B],[C]})`` — parses without has_error.
     calc_atom: $ => choice(
       $.dotted_ref,
       $.number,
       $.string_literal,
       $.identifier,
+      $.set_literal,
+      $.func_call,
       $.calc_paren,
       $.operator,
     ),
 
-    calc_paren: $ => seq("(", repeat($.calc_atom), ")"),
+    calc_paren: $ => seq("(", repeat(choice($.calc_atom, ",", ":")), ")"),
 
-    operator: $ => choice("+", "-", "*", "/", "=", "<>", "<", ">", "<=", ">=", ","),
+    // Comma is a structural separator (sets, function args, member-property
+    // list), never an expression operator — keeping it here made ``,`` ambiguous
+    // once calc_paren accepted explicit commas.
+    operator: $ => choice("+", "-", "*", "/", "=", "<>", "<", ">", "<=", ">="),
 
     // ---- SELECT statement ----
 
@@ -102,6 +133,16 @@ module.exports = grammar({
       ci("FROM"),
       $.from_clause,
       optional($.where_clause),
+      optional($.cell_properties),
+    ),
+
+    // Trailing ``CELL PROPERTIES <prop>, ...`` clause (Excel sends
+    // ``CELL PROPERTIES CELL_ORDINAL, VALUE, FORMATTED_VALUE``). Ignored by the
+    // walker, but it must be part of the grammar or it sets has_error.
+    cell_properties: $ => seq(
+      ci("CELL"),
+      ci("PROPERTIES"),
+      commaSep1(choice($.dotted_ref, $.identifier)),
     ),
 
     axis_list: $ => seq(
@@ -123,6 +164,10 @@ module.exports = grammar({
     // We capture it as a sequence of tokens so downstream regex helpers can process it.
     axis_body: $ => repeat1($.axis_token),
 
+    // An axis body token. Includes operators and parenthesised groups so a
+    // valid MDX predicate/expression on an axis — Filter(set, Left(x,2) = "US"),
+    // a subselect tuple ({...}), Generate/Ascendants, etc. — parses without
+    // has_error. The body is still captured as raw text for the regex helpers.
     axis_token: $ => choice(
       $.dotted_ref,
       $.set_literal,
@@ -130,17 +175,40 @@ module.exports = grammar({
       $.number,
       $.string_literal,
       $.identifier,
+      $.paren_group,
+      $.op,
+      $.at_param,
     ),
 
-    func_call: $ => seq(
+    // Comparison / arithmetic operators usable inside an axis expression
+    // (a boolean predicate such as ``Left(x,2) = "US"`` inside Filter()).
+    // Comma stays a structural separator, not an operator, to avoid ambiguity.
+    op: $ => choice("+", "-", "*", "/", "=", "<>", "<", ">", "<=", ">="),
+
+    // A bare parenthesised group on an axis: a tuple, or the ``({...})`` that a
+    // subselect axis wraps its member set in.
+    paren_group: $ => seq(
+      "(",
+      repeat(choice(
+        $.axis_token,
+        ",",
+        ":",
+      )),
+      ")",
+    ),
+
+    // prec(1): an identifier immediately followed by "(" is a function call,
+    // not a bare identifier followed by a paren_group.
+    func_call: $ => prec(1, seq(
       $.identifier,
       "(",
       repeat(choice(
         $.axis_token,
         ",",
+        ":",
       )),
       ")",
-    ),
+    )),
 
     set_literal: $ => seq(
       "{",
@@ -178,12 +246,26 @@ module.exports = grammar({
       $.where_tuple,
     ),
 
+    // A WHERE slicer body. Permissive the SAME way axis bodies are — a slicer can
+    // be a tuple, a set, a KPI/STRTOSET/STRTOMEMBER function call, an inline @param,
+    // an arithmetic expression, or a nested-paren tuple. dotted_ref and set_literal
+    // stay DIRECT children so the walker's where-member extraction keeps working
+    // for the common single-member/set slicers; the extra shapes parse clean and
+    // are read from raw text by the regex helpers. The outer ``(`` ... ``)`` with
+    // repeat1 keeps the skeleton strict, so a malformed/empty slicer still errors.
     where_tuple: $ => seq(
       "(",
       repeat1(choice(
         $.dotted_ref,
         $.set_literal,
+        $.func_call,
+        $.paren_group,
+        $.op,
+        $.at_param,
+        $.number,
+        $.string_literal,
         ",",
+        ":",
       )),
       ")",
     ),
@@ -212,9 +294,27 @@ module.exports = grammar({
 
     identifier: $ => /[A-Za-z_]\w*/,
 
+    // SSAS inline parameter token: STRTOSET(@Region, CONSTRAINED),
+    // STRTOMEMBER(@Year). Without this the ``@`` set has_error.
+    at_param: $ => /@[A-Za-z_]\w*/,
+
     number: $ => /-?\d+(\.\d+)?/,
 
-    string_literal: $ => /"[^"]*"/,
+    // MDX uses BOTH double-quoted string literals and single-quoted calc /
+    // named-set expression bodies (``AS '{...}'``). The committed grammar only
+    // recognised double quotes, so every single-quoted WITH MEMBER/SET body set
+    // has_error.
+    string_literal: $ => token(choice(
+      /"[^"]*"/,
+      /'[^']*'/,
+    )),
+
+    // Line (// and --) and block (/* */) comments — all valid SSAS MDX.
+    comment: $ => token(choice(
+      seq("//", /[^\n]*/),
+      seq("--", /[^\n]*/),
+      seq("/*", /[^*]*\*+([^/*][^*]*\*+)*/, "/"),
+    )),
   },
 });
 

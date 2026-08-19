@@ -10,6 +10,10 @@ from shared.importers.dbt_mapper import map_dbt_to_tessallite
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "dbt"
 
 
+def _details(warnings):
+    return [warning.detail for warning in warnings]
+
+
 SAMPLE_DBT_YAML = textwrap.dedent("""\
     semantic_models:
       - name: orders
@@ -252,7 +256,7 @@ def test_expr_dimension_becomes_uda_not_column():
     assert "case when" in rev_uda["expression"]
     assert rev_uda["validated"] is False
 
-    assert any("SQL expression" in w for w in result.warnings)
+    assert any("SQL expression" in w for w in _details(result.warnings))
 
 
 def test_map_applies_simple_metric_labels():
@@ -268,7 +272,7 @@ def test_map_applies_simple_metric_labels():
 def test_map_warns_on_derived_metric():
     parsed = parse_dbt_yaml(SAMPLE_DBT_YAML)
     result = map_dbt_to_tessallite(parsed)
-    derived_warnings = [w for w in result.warnings if "large_orders" in w]
+    derived_warnings = [w for w in _details(result.warnings) if "large_orders" in w]
     assert len(derived_warnings) == 1
     assert "calculated measure" in derived_warnings[0].lower()
 
@@ -276,7 +280,7 @@ def test_map_warns_on_derived_metric():
 def test_map_warns_on_foreign_entity():
     parsed = parse_dbt_yaml(SAMPLE_DBT_YAML)
     result = map_dbt_to_tessallite(parsed)
-    foreign_warnings = [w for w in result.warnings if "customer_id" in w]
+    foreign_warnings = [w for w in _details(result.warnings) if "customer_id" in w]
     assert len(foreign_warnings) == 1
 
 
@@ -291,7 +295,7 @@ def test_map_warns_on_unsupported_aggregation():
     """)
     parsed = parse_dbt_yaml(yaml_str)
     result = map_dbt_to_tessallite(parsed)
-    agg_warnings = [w for w in result.warnings if "hyperloglog" in w]
+    agg_warnings = [w for w in _details(result.warnings) if "hyperloglog" in w]
     assert len(agg_warnings) == 1
 
 
@@ -482,7 +486,7 @@ class TestSavedQueryParsing:
         """)
         parsed = parse_dbt_yaml(yaml_str)
         assert len(parsed.saved_queries) == 1
-        export_warnings = [w for w in parsed.warnings if "export" in w.lower()]
+        export_warnings = [w for w in _details(parsed.warnings) if "export" in w.lower()]
         assert len(export_warnings) == 1
 
     def test_saved_query_mapped_to_warning(self):
@@ -503,7 +507,7 @@ class TestSavedQueryParsing:
         """)
         parsed = parse_dbt_yaml(yaml_str)
         result = map_dbt_to_tessallite(parsed)
-        sq_warnings = [w for w in result.warnings if "my_report" in w]
+        sq_warnings = [w for w in _details(result.warnings) if "my_report" in w]
         assert len(sq_warnings) == 1
         assert "report template" in sq_warnings[0].lower() or "saved view" in sq_warnings[0].lower()
 
@@ -522,12 +526,16 @@ class TestSavedQueryParsing:
         """)
         parsed = parse_dbt_yaml(yaml_str)
         assert len(parsed.saved_queries) == 0
-        skip_warnings = [w for w in parsed.warnings if "missing 'name'" in w]
+        skip_warnings = [w for w in _details(parsed.warnings) if "missing 'name'" in w]
         assert len(skip_warnings) == 1
 
 
 class TestMetricFilterMapping:
-    def test_simple_metric_filter_mapped_to_persona(self):
+    def test_simple_metric_filter_not_mapped_to_persona(self):
+        # Bug-7301 [WRONG NUMBERS]: a dbt metric filter is scoped to its own
+        # metric. Landing it in the persona default_filters would scope EVERY
+        # measure the persona exposes — wrong numbers for everyone. The importer
+        # must persist nothing and warn instead.
         yaml_str = textwrap.dedent("""\
             semantic_models:
               - name: orders
@@ -551,12 +559,14 @@ class TestMetricFilterMapping:
         assert parsed.metrics[0].filter is not None
         result = map_dbt_to_tessallite(parsed)
         persona = result.bundle["models"][0]["personas"][0]
-        # F-020-16: filters now land in the REAL persona default_filters dict
-        # shape ({dim_name: value}) the query router reads — not a junk list of
-        # {source_metric, filter_sql} the platform ignored.
-        df = persona["default_filters"]
-        assert isinstance(df, dict)
-        assert df["status"] == "completed"
+        # The metric filter did NOT contaminate the persona default_filters.
+        df = persona.get("default_filters")
+        assert not df, f"metric filter leaked into persona defaults: {df!r}"
+        # The user is told the filter was not imported, by metric name.
+        assert any(
+            "completed_revenue" in w and "NOT imported" in w
+            for w in _details(result.warnings)
+        ), _details(result.warnings)
 
     def test_metric_without_filter_not_mapped(self):
         parsed = parse_dbt_yaml(SAMPLE_DBT_YAML)
@@ -712,9 +722,10 @@ class TestFixtureFiles:
         content = (FIXTURES_DIR / "jaffle_shop.yml").read_text(encoding="utf-8")
         parsed = parse_dbt_yaml(content)
         result = map_dbt_to_tessallite(parsed)
-        has_derived_warning = any("derived" in w.lower() or "Derived" in w for w in result.warnings)
-        has_cumulative_warning = any("cumulative" in w.lower() or "Cumulative" in w for w in result.warnings)
-        has_ratio_warning = any("ratio" in w.lower() or "Ratio" in w for w in result.warnings)
+        details = _details(result.warnings)
+        has_derived_warning = any("derived" in w.lower() for w in details)
+        has_cumulative_warning = any("cumulative" in w.lower() for w in details)
+        has_ratio_warning = any("ratio" in w.lower() for w in details)
         assert has_derived_warning
         assert has_cumulative_warning
         assert has_ratio_warning
@@ -751,7 +762,7 @@ class TestFixtureFiles:
         conversion = next(m for m in parsed.metrics if m.name == "conversion_rate")
         assert conversion.metric_type == "conversion"
         result = map_dbt_to_tessallite(parsed)
-        conversion_warnings = [w for w in result.warnings if "conversion" in w.lower()]
+        conversion_warnings = [w for w in _details(result.warnings) if "conversion" in w.lower()]
         assert len(conversion_warnings) >= 1
 
     def test_community_ecommerce_list_filter_parsed(self):
@@ -790,7 +801,48 @@ def test_sum_boolean_imported_as_disabled_not_count():
     model = result.bundle["models"][0]
     m = next(x for x in model["measures"] if x["name"] == "active_count")
     assert m["is_invalid"] is True
-    assert any("sum_boolean" in w for w in result.warnings)
+    assert any("sum_boolean" in w for w in _details(result.warnings))
+
+
+class TestBug7622SlugSafety:
+    """Bug-7622: a semantic model whose name is digit-leading or symbol-only
+    must map to a BI-safe slug, not one that later trips validate_bi_safe_slug
+    and 500s the import endpoint."""
+
+    def test_digit_leading_model_name_produces_bi_safe_slug(self):
+        from shared.model_snapshot.slug_utils import validate_bi_safe_slug
+        yaml_str = textwrap.dedent("""\
+            semantic_models:
+              - name: "123orders"
+                model: ref('orders')
+                measures:
+                  - name: revenue
+                    agg: sum
+                    expr: amount
+        """)
+        parsed = parse_dbt_yaml(yaml_str)
+        result = map_dbt_to_tessallite(parsed)
+        slug = result.bundle["models"][0]["model"]["slug"]
+        # Does not raise — this is the exact contract the endpoint relies on.
+        validate_bi_safe_slug(slug)
+        assert slug == "_123orders"
+
+    def test_symbol_only_model_name_falls_back_to_bi_safe_slug(self):
+        from shared.model_snapshot.slug_utils import validate_bi_safe_slug
+        yaml_str = textwrap.dedent("""\
+            semantic_models:
+              - name: "$$$"
+                model: ref('orders')
+                measures:
+                  - name: revenue
+                    agg: sum
+                    expr: amount
+        """)
+        parsed = parse_dbt_yaml(yaml_str)
+        result = map_dbt_to_tessallite(parsed)
+        slug = result.bundle["models"][0]["model"]["slug"]
+        validate_bi_safe_slug(slug)
+        assert slug == "dbt_model"
 
 
 def test_supported_dbt_agg_stays_active():

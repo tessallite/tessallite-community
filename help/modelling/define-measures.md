@@ -23,7 +23,7 @@ Tessallite recognises three kinds. From the BI tool's point of view they all loo
 | **User-defined attribute (UDA) measure** | A modeler-authored expression plus an aggregation, e.g. `SUM(price * quantity * (1 + tax_rate))`. The expression is stored on the model and inlined into queries. | Use when the value is a calculation across columns that doesn't change between queries. |
 | **Variant measure** | A time-intelligence transformation of another measure — for example, the year-to-date of `revenue`, or the prior-year of `orders`. The SQL is generated per query because the partitioning depends on the dimensions in the grain. | Use when you want the same measure shifted across time without re-defining it. See [Configure Time Variants](configure-time-variants.md). |
 
-This page covers plain measures. UDA measures are configured under **User-Defined Attributes** in the Toolbelt. Variant measures are configured under **Time Variants** on a base measure.
+This page covers plain measures. User-defined attributes (UDAs) are **not** in the Toolbelt: you author them on the table itself — open a table on the canvas, click the **Edit** pencil, and use the **Attributes** tab. See [User-Defined Attributes](define-user-defined-attributes.md) for the full walkthrough. Variant measures are configured under **Time Variants** on a base measure.
 
 ---
 
@@ -89,7 +89,7 @@ An additive measure can be correctly re-aggregated from a coarser pre-aggregated
 
 Click the measure name in the Toolbelt Measures list. The Drawer opens with the current values. Change any field and click **Save**.
 
-> **Warning:** Renaming a measure changes the column identifier exposed to BI tools. Saved reports or dashboards that reference the old name will break. Coordinate with BI tool users before renaming a measure that is already in production use.
+> **Warning:** Renaming a measure updates model-owned calculated-measure, KPI, scratchpad, saved SQL query, same-model cross-model-recipe step/combine, and model alias-map references in the same transaction. Recipe steps for other models remain unchanged. A rename is rejected with the blocking object and JSON path if Tessallite cannot safely rewrite a stored name-based reference. Stable-ID consumers do not need rewriting. Quantile proof rows for that measure are invalidated so queries fail back to the source until the aggregate is refreshed or rebuilt. Deployed snapshots and external BI reports remain immutable, so reports or dashboards that reference the old name can still break; coordinate the rename and redeploy the model.
 
 ---
 

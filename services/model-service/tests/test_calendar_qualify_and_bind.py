@@ -122,6 +122,21 @@ class TestQualifyTableName:
         assert result == "tessallite-io.demo_data.calendar"
 
 
+class TestCalendarNameVariants:
+    def test_bigquery_three_part_name_matches_dataset_table_form(self):
+        from src.api.calendar import _calendar_name_variants
+
+        assert _calendar_name_variants("proj.dataset.dim_date") == {
+            "proj.dataset.dim_date",
+            "dataset.dim_date",
+        }
+
+    def test_two_part_name_has_no_project_variant(self):
+        from src.api.calendar import _calendar_name_variants
+
+        assert _calendar_name_variants("dataset.dim_date") == {"dataset.dim_date"}
+
+
 # ---------------------------------------------------------------------------
 # _verify_table_exists tests (bind guard)
 # ---------------------------------------------------------------------------
@@ -135,11 +150,16 @@ class TestVerifyTableExists:
     """
 
     @staticmethod
-    def _mock_router_client(*, status_code: int = 200, rows=None, raises=False):
-        """Build a patch target for httpx.AsyncClient used in calendar.py."""
+    def _mock_router_client(
+        *, status_code: int = 200, rows=None, detail=None, raises=False,
+    ):
+        """Build a patch target for the shared routed probe client."""
         resp = MagicMock()
         resp.status_code = status_code
-        resp.json.return_value = {"rows": rows or []}
+        resp.json.return_value = {
+            "rows": rows or [],
+            **({"detail": detail} if detail is not None else {}),
+        }
 
         client = MagicMock()
         if raises:
@@ -148,15 +168,23 @@ class TestVerifyTableExists:
             client.post = AsyncMock(return_value=resp)
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
-        return patch("src.api.calendar.httpx.AsyncClient", return_value=client)
+        return patch(
+            "shared.source_table_probe.httpx.AsyncClient", return_value=client,
+        )
 
     @pytest.mark.asyncio
-    async def test_table_not_found_raises_404(self):
+    async def test_bug_schema_drift_absent_table_probe_returns_confirmed_404(self):
         import uuid
         from src.api.calendar import _verify_table_exists
         conn, _ = _make_connection("postgresql")
 
-        with self._mock_router_client(status_code=502):
+        with self._mock_router_client(
+            status_code=404,
+            detail={
+                "code": "source_table_not_found",
+                "message": "The requested source table was not found.",
+            },
+        ):
             from fastapi import HTTPException
             with pytest.raises(HTTPException) as exc_info:
                 await _verify_table_exists(
@@ -167,7 +195,7 @@ class TestVerifyTableExists:
             assert "does not exist" in str(exc_info.value.detail)
 
     @pytest.mark.asyncio
-    async def test_router_unreachable_raises_404(self):
+    async def test_bug_schema_drift_router_unreachable_raises_503(self):
         import uuid
         from src.api.calendar import _verify_table_exists
         conn, _ = _make_connection("postgresql")
@@ -179,23 +207,36 @@ class TestVerifyTableExists:
                     "public.nonexistent", conn,
                     model_id=uuid.uuid4(), source_id=uuid.uuid4(), bearer="tok",
                 )
-            assert exc_info.value.status_code == 404
+            assert exc_info.value.status_code == 503
+            assert "source_table_probe_unavailable" in str(exc_info.value.detail)
 
     @pytest.mark.asyncio
-    async def test_empty_result_raises_404(self):
+    async def test_bug_schema_drift_source_probe_5xx_raises_503(self):
+        import uuid
+        from src.api.calendar import _verify_table_exists
+        conn, _ = _make_connection("postgresql")
+
+        with self._mock_router_client(status_code=502):
+            from fastapi import HTTPException
+            with pytest.raises(HTTPException) as exc_info:
+                await _verify_table_exists(
+                    "public.unreachable", conn,
+                    model_id=uuid.uuid4(), source_id=uuid.uuid4(), bearer="tok",
+                )
+            assert exc_info.value.status_code == 503
+            assert "source_table_probe_unavailable" in str(exc_info.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_bug_schema_drift_empty_existing_table_probe_passes(self):
         import uuid
         from src.api.calendar import _verify_table_exists
         conn, _ = _make_connection("postgresql")
 
         with self._mock_router_client(status_code=200, rows=[]):
-            from fastapi import HTTPException
-            with pytest.raises(HTTPException) as exc_info:
-                await _verify_table_exists(
-                    "public.empty_table", conn,
-                    model_id=uuid.uuid4(), source_id=uuid.uuid4(), bearer="tok",
-                )
-            assert exc_info.value.status_code == 404
-            assert "does not exist" in str(exc_info.value.detail)
+            await _verify_table_exists(
+                "public.empty_table", conn,
+                model_id=uuid.uuid4(), source_id=uuid.uuid4(), bearer="tok",
+            )
 
     @pytest.mark.asyncio
     async def test_table_found_passes(self):
@@ -208,6 +249,44 @@ class TestVerifyTableExists:
                 "public.calendar", conn,
                 model_id=uuid.uuid4(), source_id=uuid.uuid4(), bearer="tok",
             )
+
+
+class TestVerifyCalendarColumns:
+    """Calendar bind/update must reject column maps the source cannot resolve."""
+
+    @pytest.mark.asyncio
+    async def test_limit_zero_probe_accepts_empty_calendar_table(self):
+        import uuid
+        from src.api.calendar import _verify_calendar_columns
+
+        conn, _ = _make_connection("postgresql")
+
+        with TestVerifyTableExists._mock_router_client(status_code=200, rows=[]):
+            await _verify_calendar_columns(
+                "public.calendar", conn,
+                model_id=uuid.uuid4(), source_id=uuid.uuid4(), bearer="tok",
+                column_mappings={"date_column": "full_date", "year_column": "year"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_invalid_column_mapping_raises_400(self):
+        import uuid
+        from fastapi import HTTPException
+        from src.api.calendar import _verify_calendar_columns
+
+        conn, _ = _make_connection("bigquery")
+
+        with TestVerifyTableExists._mock_router_client(status_code=400, rows=[]):
+            with pytest.raises(HTTPException) as exc_info:
+                await _verify_calendar_columns(
+                    "inventory.dim_date", conn,
+                    model_id=uuid.uuid4(), source_id=uuid.uuid4(), bearer="tok",
+                    column_mappings={"date_column": "date_key"},
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "Calendar column mapping does not match source table" in str(exc_info.value.detail)
+        assert "date_key" in str(exc_info.value.detail)
 
 
 # ---------------------------------------------------------------------------

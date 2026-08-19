@@ -346,3 +346,25 @@ class TestSnapshotResponseStructure:
         assert resp.value == 100.0
         assert resp.status == 1
         assert resp.status_label == "On Track"
+
+
+# ---------------------------------------------------------------------------
+# Bug-6663: target_query_failed distinguishes query FAILURE from NO DATA
+# ---------------------------------------------------------------------------
+
+class TestTargetQueryFailedFlag:
+    """Bug-6663 guard: EvaluationContext.target_query_failed must exist and
+    default to False so callers can set it True on a target measure query
+    failure, distinguishing failure from no-data (target_value=None).
+    """
+
+    def test_target_query_failed_defaults_false(self):
+        from src.kpi_evaluator import EvaluationContext
+        ctx = EvaluationContext(kpi_id=uuid.uuid4(), kpi_name="test")
+        assert ctx.target_query_failed is False
+
+    def test_target_query_failed_can_be_set_true(self):
+        from src.kpi_evaluator import EvaluationContext
+        ctx = EvaluationContext(kpi_id=uuid.uuid4(), kpi_name="test")
+        ctx.target_query_failed = True
+        assert ctx.target_query_failed is True

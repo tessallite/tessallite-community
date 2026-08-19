@@ -1,0 +1,1 @@
+import{j as n}from"./react-vendor-DnqIm-AP.js";import{u as r,a2 as s}from"./index-CfYnQI4X.js";import{j as a}from"./mui-core-_A6hzG3g.js";function d(){const e=r();return s()?n.jsx(a,{severity:"warning","data-testid":"unsaved-deploy-warning",sx:{py:.25},children:e("modelSync.queryPanelWarning")}):null}export{d as U};

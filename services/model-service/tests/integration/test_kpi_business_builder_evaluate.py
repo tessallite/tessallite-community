@@ -8,7 +8,11 @@ All entity IDs are resolved dynamically by name — no hardcoded UUIDs.
 
 Run:
     cd tessallite/services/model-service
+    TESSALLITE_RUN_LIVE_INTEGRATION=1 \
     INTEGRATION_TEST_API_BASE=http://localhost:8001/api/v1 \
+    INTEGRATION_TEST_TENANT=acme-demo INTEGRATION_TEST_EMAIL=admin@acme-demo.com \
+    INTEGRATION_TEST_PASSWORD=acme-demo INTEGRATION_TEST_PROJECT=project1 \
+    INTEGRATION_TEST_MODEL=modelx INTEGRATION_TEST_EXCLUSIVE=1 \
       pytest tests/integration/test_kpi_business_builder_evaluate.py -v
 """
 from __future__ import annotations
@@ -18,18 +22,31 @@ import os
 import httpx
 import pytest
 
-from .conftest import API_BASE, TENANT_ID, EMAIL, PASSWORD, _measure_id, _dimension_id
-
-pytestmark = [pytest.mark.integration]
+from .conftest import (
+    API_BASE,
+    TENANT_ID,
+    EMAIL,
+    PASSWORD,
+    LIVE_INTEGRATION_ENABLED,
+    LIVE_INTEGRATION_SKIP_REASON,
+    _measure_id,
+    _dimension_id,
+)
+from .live_profile import environment_not_ready
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not LIVE_INTEGRATION_ENABLED, reason=LIVE_INTEGRATION_SKIP_REASON),
+]
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _require_kpi_model(_measures):
-    """Skip the whole KPI module when the active model lacks the KPI measures.
+    """Stop an explicit live run when the active model lacks KPI measures.
     These tests assume the dev acme-demo `modelx` (Revenue/net_sales/...); on the
-    demo bundle's `modely` they are absent, so skip cleanly (Bug-5453/5498)."""
+    demo bundle's `modely` they are absent, so the profile is not ready
+    (Bug-5453/5498)."""
     if "net_sales" not in {m.get("name") for m in _measures}:
-        pytest.skip(
+        environment_not_ready(
             "active model lacks KPI measures (net_sales/...) — needs the dev "
             "acme-demo modelx profile (Bug-5453/5498)"
         )
@@ -496,7 +513,7 @@ class TestCacheIsolation:
         )
         resp = httpx.get(persona_url, headers=headers, timeout=10.0)
         if resp.status_code != 200 or not resp.json():
-            pytest.skip("No personas configured in demo model")
+            environment_not_ready("No personas configured in demo model")
         persona_id = resp.json()[0]["id"]
         url_with_persona = f"{evaluate_url}?persona_id={persona_id}"
         resp2 = httpx.post(
@@ -596,15 +613,14 @@ class TestUATBusinessScenarios:
     ):
         """YoY growth value differs from the raw measure value.
 
-        The seed data covers ~1 year; the prior-year window for the
-        business builder's 12-month preset may not have data. When the
-        YoY value is null (prior period empty), skip the comparison —
-        the decomposed-SQL test above already validates the compile path.
+        Use ``this_year`` instead of ``last_12_months`` because the rolling
+        demo seed contains current-year and prior-year rows, while the prior
+        window for ``last_12_months`` can legitimately be empty.
         """
         bd_raw = _base_single_measure_bd(
             measure_revenue_id,
             time_window={
-                "preset": "last_12_months",
+                "preset": "this_year",
                 "dimension_id": dim_business_date_id,
             },
         )
@@ -620,7 +636,7 @@ class TestUATBusinessScenarios:
                 },
             },
             "time_window": {
-                "preset": "last_12_months",
+                "preset": "this_year",
                 "dimension_id": dim_business_date_id,
             },
             "filters": [],
@@ -628,8 +644,7 @@ class TestUATBusinessScenarios:
         r_raw = _evaluate(evaluate_url, headers, bd_raw)
         r_yoy = _evaluate(evaluate_url, headers, bd_yoy)
         assert r_raw["value"] is not None
-        if r_yoy["value"] is None:
-            pytest.skip("Prior-year window has no data in the seed dataset")
+        assert r_yoy["value"] is not None
         assert r_raw["value"] != r_yoy["value"]
 
     def test_not_in_filter_compiles_and_evaluates(

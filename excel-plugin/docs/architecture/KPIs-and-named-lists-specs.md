@@ -4,6 +4,16 @@
 **Audience:** Product, Front-End, Back-End, Data Platform, QA  
 **Status:** Draft for implementation planning  
 **Author:** Product/Architecture Specification  
+
+> **As-built namespace correction (F-025-02).** This draft uses an illustrative
+> `TESS.*` prefix for custom-function examples (`=TESS.KPIVALUE(...)`,
+> `=TESS.LIST(...)`, etc.). The shipped add-in publishes exactly ONE
+> custom-functions namespace — `TESSALLITE` — defined by the
+> `Functions.Namespace` resource in every manifest. Office never registered a
+> second `TESS` namespace, so every `TESS.*` example below is reachable in a
+> real workbook only as `TESSALLITE.*` (for example `=TESSALLITE.KPIVALUE(...)`).
+> Do not treat the `TESS.*` spelling as an advertised contract; use `TESSALLITE.*`.
+
 **Primary goal:** Allow users to create, reuse, preview, insert, and govern business-friendly **Named Lists** and **KPIs** that compile to MDX expressions, without forcing most users to understand MDX.
 
 ---

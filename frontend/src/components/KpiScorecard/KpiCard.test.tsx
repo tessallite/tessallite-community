@@ -31,6 +31,9 @@ function makeEval(overrides: Partial<KpiEvaluateResponse> = {}): KpiEvaluateResp
     trend: 1,
     trend_label: "Improving",
     trend_pct: 0.125, // API contract: a fraction (0.125 renders as +12.5%)
+    // F-017-02: direction-normalised percent (equals trend_pct for a
+    // higher-is-better KPI); the chip renders this so sign agrees with colour.
+    trend_pct_normalised: 0.125,
     formatted_value: "$125,000",
     formatted_target: "$100,000",
     formatted_variance: "+$25,000",
@@ -97,6 +100,45 @@ describe("KpiCard", () => {
   it("renders status label", () => {
     render(<KpiCard kpi={makeKpi()} evalData={makeEval()} loading={false} />);
     expect(screen.getByText("On Track")).toBeTruthy();
+  });
+
+  // F-017-02 (Bug-7988): a lower-is-better cost dropping 100 -> 80 improves.
+  // The backend emits trend=1 (improving), raw trend_pct=-0.2, and normalised
+  // trend_pct_normalised=+0.2. The chip MUST render the normalised "+20.0%" so
+  // its sign agrees with the improving (green) colour — never the raw "-20.0%".
+  it("renders direction-normalised trend percent so sign agrees with colour", () => {
+    render(
+      <KpiCard
+        kpi={makeKpi()}
+        evalData={makeEval({
+          trend: 1,
+          trend_label: "Improving",
+          trend_pct: -0.2,
+          trend_pct_normalised: 0.2,
+        })}
+        loading={false}
+      />,
+    );
+    // Improving percent is shown positive; the raw "-20.0%" must NOT be the chip.
+    expect(screen.getByText("+20.0%")).toBeTruthy();
+    expect(screen.queryByText("-20.0%")).toBeNull();
+  });
+
+  // F-017-02: legacy responses that predate the normalised field fall back to
+  // the raw percent so the chip still renders (older backend during rollout).
+  it("falls back to raw trend percent when normalised is null", () => {
+    render(
+      <KpiCard
+        kpi={makeKpi()}
+        evalData={makeEval({
+          trend: 1,
+          trend_pct: 0.08,
+          trend_pct_normalised: null,
+        })}
+        loading={false}
+      />,
+    );
+    expect(screen.getByText("+8.0%")).toBeTruthy();
   });
 
   // F-017-17: the backend numeric status is authoritative; the English label
@@ -339,5 +381,46 @@ describe("KpiCard", () => {
       />,
     );
     expect(screen.queryByText("kpiScorecard.degradedBadge")).toBeNull();
+  });
+
+  // Bug-8449 / Bug-8427: a KPI with no value BECAUSE row security denies the
+  // caller every row must say so, not render as an ordinary empty card. The
+  // live symptom was value:null / "N/A" / "Insufficient Data" with no hint that
+  // the cause was a governance policy rather than missing data.
+  it("shows a Restricted badge when row security denied every row", () => {
+    render(
+      <KpiCard
+        kpi={makeKpi()}
+        evalData={makeEval({
+          value: null,
+          formatted_value: "N/A",
+          row_security_restricted: true,
+        })}
+        loading={false}
+      />,
+    );
+    expect(screen.getByText("kpiScorecard.rowSecurityRestrictedBadge")).toBeTruthy();
+  });
+
+  it("does NOT show a Restricted badge for an ordinary no-data KPI", () => {
+    render(
+      <KpiCard
+        kpi={makeKpi()}
+        evalData={makeEval({ value: null, formatted_value: "N/A" })}
+        loading={false}
+      />,
+    );
+    expect(screen.queryByText("kpiScorecard.rowSecurityRestrictedBadge")).toBeNull();
+  });
+
+  it("does NOT show a Restricted badge when a real value came back", () => {
+    render(
+      <KpiCard
+        kpi={makeKpi()}
+        evalData={makeEval({ value: 852672.8, formatted_value: "852,672.80" })}
+        loading={false}
+      />,
+    );
+    expect(screen.queryByText("kpiScorecard.rowSecurityRestrictedBadge")).toBeNull();
   });
 });

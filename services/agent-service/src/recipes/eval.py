@@ -30,6 +30,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from shared.recipes.schema import (
+    CombineSchemaError,
+    collect_combine_references,
+)
+
 
 # ---------------------------------------------------------------------------
 # Numeric helpers (semantics preserved from the prior evaluator)
@@ -72,13 +77,36 @@ _BIN_OPS = {
     "pow": _safe_bin(lambda a, b: a ** b),
 }
 
+def _safe_compare(op):
+    """Bug-7365 -- wrap comparison operators with numeric coercion and null
+    propagation, matching the semantics of ``_safe_bin`` for arithmetic.
+
+    * Both operands are coerced numerically when possible (``"100" == 100``
+      is ``True``).
+    * Null operand returns ``None`` (SQL NULL semantics).
+    * Incompatible types after coercion (e.g. string vs number where
+      ``_coerce_numeric`` cannot convert) return ``None`` via the
+      ``TypeError`` catch. Two non-numeric strings compare lexicographically
+      (Python default).
+    """
+    def _wrapped(a, b):
+        a, b = _coerce_numeric(a), _coerce_numeric(b)
+        if a is None or b is None:
+            return None
+        try:
+            return op(a, b)
+        except TypeError:
+            return None
+    return _wrapped
+
+
 _COMPARE_OPS = {
-    "eq": lambda a, b: a == b,
-    "ne": lambda a, b: a != b,
-    "lt": lambda a, b: a < b,
-    "le": lambda a, b: a <= b,
-    "gt": lambda a, b: a > b,
-    "ge": lambda a, b: a >= b,
+    "eq": _safe_compare(lambda a, b: a == b),
+    "ne": _safe_compare(lambda a, b: a != b),
+    "lt": _safe_compare(lambda a, b: a < b),
+    "le": _safe_compare(lambda a, b: a <= b),
+    "gt": _safe_compare(lambda a, b: a > b),
+    "ge": _safe_compare(lambda a, b: a >= b),
 }
 
 
@@ -99,34 +127,44 @@ def _none_safe_fn(fn):
     return _wrapped
 
 
+def _none_safe_reduce(fn):
+    """Wrap a reducer (sum/min/max) so it operates over the *collection* of
+    arguments.
+
+    Bug-6330 — the tool spec advertises ``sum`` as "total across steps" with
+    ``1+`` scalar arguments (``sum(a, b, c)``), but Python's builtin ``sum``
+    takes a single *iterable*, so ``sum(100, 200)`` raised ``TypeError`` and the
+    old ``_none_safe_fn`` swallowed it to ``None`` — every scalar ``sum`` (and a
+    single-argument ``min``/``max``) silently evaluated to null. Passing the
+    coerced argument tuple as one iterable makes these operate as the
+    "reduce across the given values" operators the spec describes, for any arity
+    ``>= 1``. Any ``None`` argument still propagates to ``None`` (matching
+    ``_none_safe_fn`` / ``_safe_bin``), and numeric coercion mirrors the binary
+    operators so string-encoded measure values reduce numerically."""
+    def _wrapped(*args):
+        if any(a is None for a in args):
+            return None
+        vals = [_coerce_numeric(a) for a in args]
+        if any(v is None for v in vals):
+            return None
+        try:
+            return fn(vals)
+        except (TypeError, ValueError):
+            return None
+    return _wrapped
+
+
 _FUNCTIONS = {
     "round": _none_safe_fn(round),
     "abs": _none_safe_fn(abs),
-    "min": _none_safe_fn(min),
-    "max": _none_safe_fn(max),
-    "sum": _none_safe_fn(sum),
+    "min": _none_safe_reduce(min),
+    "max": _none_safe_reduce(max),
+    "sum": _none_safe_reduce(sum),
     "len": _none_safe_fn(len),
 }
 
 # Allowed op name -> (min_args, max_args | None). Single source of truth for
 # both shape validation and semantic validation.
-_OP_ARITY: dict[str, tuple[int, int | None]] = {
-    **{k: (2, 2) for k in _BIN_OPS},
-    **{k: (2, 2) for k in _COMPARE_OPS},
-    "not": (1, 1),
-    "neg": (1, 1),
-    "abs": (1, 1),
-    "len": (1, 1),
-    "round": (1, 2),
-    "min": (1, None),
-    "max": (1, None),
-    "sum": (1, None),
-    "and": (2, None),
-    "or": (2, None),
-    "if": (3, 3),
-}
-
-
 class CombineEvalError(ValueError):
     """The combine expression tree is malformed or references missing data."""
 
@@ -142,41 +180,10 @@ def check_node_shape(node: Any, *, path: str = "expression") -> None:
     reach the evaluator. Does not check that step/measure refs exist — that is
     ``validate_expression``'s job (it needs the step definitions).
     """
-    if not isinstance(node, dict):
-        raise ValueError(f"{path} must be an object, got {type(node).__name__}.")
-    keys = {"const", "ref", "op"} & set(node)
-    if len(keys) != 1:
-        raise ValueError(
-            f"{path} must have exactly one of 'const', 'ref', 'op'; got {sorted(node)}."
-        )
-    if "const" in node:
-        if not isinstance(node["const"], (int, float, str, bool)):
-            raise ValueError(f"{path}.const must be a number, string, or boolean.")
-        return
-    if "ref" in node:
-        ref = node["ref"]
-        if not isinstance(ref, dict):
-            raise ValueError(f"{path}.ref must be an object with 'step' and 'measure'.")
-        step, measure = ref.get("step"), ref.get("measure")
-        if not isinstance(step, str) or not step:
-            raise ValueError(f"{path}.ref.step must be a non-empty string.")
-        if not isinstance(measure, str) or not measure:
-            raise ValueError(f"{path}.ref.measure must be a non-empty string.")
-        return
-    op = node["op"]
-    if op not in _OP_ARITY:
-        raise ValueError(
-            f"{path}.op {op!r} is not allowed. Allowed: {', '.join(sorted(_OP_ARITY))}."
-        )
-    args = node.get("args")
-    if not isinstance(args, list):
-        raise ValueError(f"{path}.args must be a list.")
-    lo, hi = _OP_ARITY[op]
-    if len(args) < lo or (hi is not None and len(args) > hi):
-        bound = f"{lo}" if lo == hi else (f"at least {lo}" if hi is None else f"{lo}-{hi}")
-        raise ValueError(f"{path}.op {op!r} expects {bound} argument(s); got {len(args)}.")
-    for i, a in enumerate(args):
-        check_node_shape(a, path=f"{path}.args[{i}]")
+    try:
+        collect_combine_references(node, path=path)
+    except CombineSchemaError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -193,19 +200,14 @@ def validate_expression(node: Any, steps: list) -> list[str]:
     if node is None:
         return []
     step_map: dict[str, set[str]] = {s.name: set(s.measures) for s in steps}
-    errors: list[str] = []
     try:
-        check_node_shape(node)
-    except ValueError as exc:
+        references = collect_combine_references(node, path="expression")
+    except CombineSchemaError as exc:
         return [str(exc)]
-    _collect_ref_errors(node, step_map, errors)
-    return errors
-
-
-def _collect_ref_errors(node: dict, step_map: dict[str, set[str]], errors: list[str]) -> None:
-    if "ref" in node:
-        step = node["ref"]["step"]
-        measure = node["ref"]["measure"]
+    errors: list[str] = []
+    for reference in references:
+        step = reference.step
+        measure = reference.measure
         if step not in step_map:
             errors.append(
                 f"Step '{step}' not found. Available steps: "
@@ -216,10 +218,7 @@ def _collect_ref_errors(node: dict, step_map: dict[str, set[str]], errors: list[
                 f"Measure '{measure}' not found in step '{step}'. "
                 f"Available: {', '.join(sorted(step_map[step]))}."
             )
-        return
-    if "op" in node:
-        for a in node["args"]:
-            _collect_ref_errors(a, step_map, errors)
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +228,10 @@ def _collect_ref_errors(node: dict, step_map: dict[str, set[str]], errors: list[
 def evaluate_combine(node: Any, context: dict[str, Any]) -> Any:
     if node is None:
         raise CombineEvalError("Combine expression is empty.")
+    try:
+        collect_combine_references(node, path="expression")
+    except CombineSchemaError as exc:
+        raise CombineEvalError(str(exc)) from exc
     return _eval(node, context)
 
 

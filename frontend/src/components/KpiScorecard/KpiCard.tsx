@@ -11,6 +11,7 @@ import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import WarningIcon from "@mui/icons-material/Warning";
 import ErrorIcon from "@mui/icons-material/Error";
 import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
+import LockIcon from "@mui/icons-material/Lock";
 import TrendingUpIcon from "@mui/icons-material/TrendingUp";
 import TrendingDownIcon from "@mui/icons-material/TrendingDown";
 import TrendingFlatIcon from "@mui/icons-material/TrendingFlat";
@@ -255,6 +256,13 @@ export default function KpiCard({ kpi, evalData, loading }: Props) {
     evalData?.status_color ??
     (statusNum !== null ? STATUS_COLORS[statusNum] : ui.muted);
 
+  // F-017-02 (Bug-7988): the percent shown in the trend chip is the
+  // direction-normalised change so its sign agrees with the improving/declining
+  // colour. Fall back to the raw percent only for legacy responses that predate
+  // the normalised field (null when neither is available).
+  const trendChipPct =
+    evalData?.trend_pct_normalised ?? evalData?.trend_pct ?? null;
+
   // Bug-4255: a composite KPI is "degraded" when it scored from its working
   // inputs but at least one child KPI failed to evaluate. Surface a badge with
   // a tooltip naming the broken children so the failure is visible rather than
@@ -274,6 +282,12 @@ export default function KpiCard({ kpi, evalData, loading }: Props) {
           .join("; "),
       })
     : "";
+
+  // Bug-8449 / Bug-8427: the KPI produced no value because the model's
+  // row-level security denies this caller every row. Without this badge the
+  // card is indistinguishable from a genuinely empty slice, and a modeller
+  // spends their time debugging a measure that is perfectly correct.
+  const isRowSecurityRestricted = Boolean(evalData?.row_security_restricted);
 
   const presentationType = kpi.presentation_type ?? "";
   // Every presentation type now renders a visual (Bug-5343: traffic_light is a
@@ -432,6 +446,25 @@ export default function KpiCard({ kpi, evalData, loading }: Props) {
           </Box>
 
           <Stack direction="row" spacing={0.5} flexShrink={0}>
+            {isRowSecurityRestricted && (
+              <Tooltip title={t("kpiScorecard.rowSecurityRestrictedTooltip")}>
+                <Chip
+                  icon={<LockIcon sx={{ fontSize: 13 }} />}
+                  label={t("kpiScorecard.rowSecurityRestrictedBadge")}
+                  size="small"
+                  sx={{
+                    fontSize: 9,
+                    height: 22,
+                    bgcolor: ui.goldBg,
+                    color: ui.goldDark,
+                    fontWeight: 700,
+                    border: `1px solid ${ui.goldDark}30`,
+                    borderRadius: 1,
+                    "& .MuiChip-icon": { color: ui.goldDark },
+                  }}
+                />
+              </Tooltip>
+            )}
             {isDegraded && (
               <Tooltip title={degradedTooltip}>
                 <Chip
@@ -621,21 +654,49 @@ export default function KpiCard({ kpi, evalData, loading }: Props) {
               </Box>
             )}
 
-            {evalData.trend_pct !== null && evalData.trend_pct !== undefined && (
+            {trendChipPct !== null && (
               <Box sx={{ display: "flex", justifyContent: "center" }}>
-                <Chip
-                  size="small"
-                  label={`${evalData.trend_pct > 0 ? "+" : ""}${(evalData.trend_pct * 100).toFixed(1)}%`}
-                  sx={{
-                    fontSize: 10.5,
-                    fontWeight: 700,
-                    height: 22,
-                    borderRadius: 1,
-                    bgcolor: (evalData.trend ?? 0) >= 0 ? ui.greenBg : ui.redBg,
-                    color: (evalData.trend ?? 0) >= 0 ? ui.green : ui.red,
-                    ...TABULAR_NUMS,
-                  }}
-                />
+                <Tooltip
+                  // F-017-02: keep the raw movement discoverable as an explicitly
+                  // labelled detail, without ever showing it as the headline sign.
+                  title={
+                    evalData.trend_pct !== null && evalData.trend_pct !== undefined
+                      ? t("kpiScorecard.rawChangeDetail", {
+                          pct: `${evalData.trend_pct > 0 ? "+" : ""}${(evalData.trend_pct * 100).toFixed(1)}%`,
+                        })
+                      : ""
+                  }
+                >
+                  <Chip
+                    size="small"
+                    // F-017-02 (Bug-7988): render the DIRECTION-NORMALISED percent
+                    // so the sign agrees with the chip colour. A lower-is-better
+                    // cost falling 100 -> 80 shows "+20.0%" in green (improving),
+                    // never the raw "-20.0%" beside an improving colour.
+                    label={`${trendChipPct > 0 ? "+" : ""}${(trendChipPct * 100).toFixed(1)}%`}
+                    sx={{
+                      fontSize: 10.5,
+                      fontWeight: 700,
+                      height: 22,
+                      borderRadius: 1,
+                      // F-017-02 (Fable R1): use a NEUTRAL colour for the stable
+                      // band (trend === 0) so a small-negative normalised percent
+                      // inside the dead band does not show as red (wrong) or green
+                      // with a negative sign (contradictory). Improving = green,
+                      // declining = red, stable = gold/amber (same palette as the
+                      // status-0 "Near Target" chip).
+                      bgcolor:
+                        evalData.trend === 1 ? ui.greenBg
+                        : evalData.trend === -1 ? ui.redBg
+                        : ui.goldBg,
+                      color:
+                        evalData.trend === 1 ? ui.green
+                        : evalData.trend === -1 ? ui.red
+                        : ui.goldDark,
+                      ...TABULAR_NUMS,
+                    }}
+                  />
+                </Tooltip>
               </Box>
             )}
 

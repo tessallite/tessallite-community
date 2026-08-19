@@ -103,3 +103,46 @@ def test_like_requires_string():
     with pytest.raises(DrillPredicateError) as exc:
         compile_predicate({"column": "x", "op": "like", "value": 5})
     assert exc.value.error_code == "DrillThroughBadOperand"
+
+
+# ---------------------------------------------------------------------------
+# Bug-7285: compile_where_expression returns sqlglot AST nodes (not strings)
+# ---------------------------------------------------------------------------
+
+def test_compile_where_expression_returns_ast_node():
+    """Bug-7285: compile_where_expression must return a sqlglot expression
+    tree, not a rendered string. This ensures typed literal nodes survive
+    through to the downstream dialect transpiler."""
+    from sqlglot import expressions as exp
+    from src.drill.predicate import compile_where_expression
+
+    result = compile_where_expression([{"column": "x", "op": "eq", "value": 42}])
+    assert isinstance(result, exp.Expression)
+    # The expression can be rendered for any dialect — verify that
+    # the canonical postgres rendering matches compile_where.
+    assert result.sql(dialect="postgres") == compile_where([{"column": "x", "op": "eq", "value": 42}])
+
+
+def test_compile_where_expression_empty_returns_none():
+    """Bug-7285: empty specs produce None (not an empty string)."""
+    from src.drill.predicate import compile_where_expression
+
+    assert compile_where_expression([]) is None
+    assert compile_where_expression([{"column": None}]) is None
+
+
+def test_compile_where_expression_multi_predicate_and():
+    """Bug-7285: multiple predicates are AND-chained as sqlglot nodes."""
+    from sqlglot import expressions as exp
+    from src.drill.predicate import compile_where_expression
+
+    result = compile_where_expression([
+        {"column": "a", "op": "eq", "value": "x"},
+        {"column": "b", "op": "gt", "value": 3},
+    ])
+    assert isinstance(result, exp.And)
+    # The rendered output must match compile_where.
+    assert result.sql(dialect="postgres") == compile_where([
+        {"column": "a", "op": "eq", "value": "x"},
+        {"column": "b", "op": "gt", "value": 3},
+    ])

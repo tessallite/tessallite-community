@@ -56,6 +56,7 @@ export default function SyncColumnsButton({
           column_name: c.column_name,
           data_type: c.data_type,
           is_nullable: c.is_nullable,
+          is_primary_key: c.is_primary_key,
         })),
       );
     },

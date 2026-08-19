@@ -9,11 +9,25 @@ import {
   rowsToCsv,
   rowsToJson,
   rowsToText,
+  rowsToXlsx,
   selectableColumnNames,
   splitTopLevel,
   type AttributeRow,
   type ExportLabels,
 } from "./attributeRows";
+import ExcelJS from "exceljs";
+
+async function blobToArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
+  if (typeof blob.arrayBuffer === "function") {
+    return blob.arrayBuffer();
+  }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as ArrayBuffer);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsArrayBuffer(blob);
+  });
+}
 import type { TableAttribute, ModelTable } from "../../../api/types_domains/sources_schema";
 import type { Persona } from "../../../api/types_domains/drill_refresh";
 import type { Dimension, Measure } from "../../../api/types_domains/dimensions";
@@ -229,6 +243,55 @@ describe("export serializers", () => {
     const text = rowsToText(rows, labels);
     expect(text.split("\n")[0]).toContain("Attribute");
     expect(text).toContain("margin");
+  });
+
+  // Bug-7286: source-derived attribute text (names, glossary descriptions, UDA
+  // formulas) that begins with a spreadsheet formula trigger must be neutralised
+  // in the CSV and XLSX exports so it cannot execute when opened in a spreadsheet.
+  const injectionRows: AttributeRow[] = [
+    {
+      id: "x1",
+      index: 1,
+      name: "=cmd|'/C calc'!A0",
+      dataType: "varchar",
+      displayName: "@evil",
+      description: "+danger",
+      kind: "physical",
+      sourceTable: "-payload",
+      formula: "=WEBSERVICE(\"http://x\")",
+    },
+  ];
+
+  it("csv neutralises formula-leading attribute values", () => {
+    const csv = rowsToCsv(injectionRows, labels);
+    expect(csv).toContain("'=cmd|'/C calc'!A0");
+    expect(csv).toContain("'@evil");
+    expect(csv).toContain("'+danger");
+    expect(csv).toContain("'-payload");
+    expect(csv).toContain("'=WEBSERVICE");
+    // The plain integer index column stays numeric (no guard prefix).
+    expect(csv.split("\n")[1].startsWith("1,")).toBe(true);
+  });
+
+  it("xlsx writes formula-leading cells as literal text, not live formulas", async () => {
+    const blob = await rowsToXlsx(injectionRows, labels);
+    const buffer = await blobToArrayBuffer(blob);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet("Attributes")!;
+    // Row 1 is the header; row 2 is the data row.
+    const dataRow = ws.getRow(2);
+    // Attribute name column (2) must be the guarded literal text, and ExcelJS
+    // must NOT have parsed it into a formula object ({ formula, result }).
+    const nameCell = dataRow.getCell(2);
+    expect(typeof nameCell.value).toBe("string");
+    expect(nameCell.value).toBe("'=cmd|'/C calc'!A0");
+    const formulaCell = dataRow.getCell(8);
+    expect(typeof formulaCell.value).toBe("string");
+    expect(formulaCell.value).toBe("'=WEBSERVICE(\"http://x\")");
+    // The index column is emitted as its numeric string ("1") and is NOT
+    // guarded (no apostrophe prefix) because it is a plain number.
+    expect(dataRow.getCell(1).value).toBe("1");
   });
 });
 

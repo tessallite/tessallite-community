@@ -77,10 +77,65 @@ import { useT } from "../../i18n";
 /* ------------------------------------------------------------------ */
 /* Discovered table from the backend                                  */
 /* ------------------------------------------------------------------ */
-interface DiscoveredTable {
+export interface DiscoveredTable {
   schema: string;
   table: string;
   type: string;
+}
+
+export interface DiscoverTablesResponse {
+  tables: DiscoveredTable[];
+  truncated: boolean;
+}
+
+const TRUNCATION_SCHEMA = "__tessallite__";
+
+/** F-014-05 / G-014-02 / Bug-9290: truncation is a flag, never a selectable table.
+ *  A real table named `__truncated__` in a normal schema stays selectable.
+ *  `NOTICE` is not a catalogue table_type, so it cannot collide. */
+export function isTruncationMarker(row: Pick<DiscoveredTable, "schema" | "table" | "type">): boolean {
+  return row.schema === TRUNCATION_SCHEMA || row.type === "NOTICE";
+}
+
+export function selectableDiscoveredTables(rows: DiscoveredTable[]): DiscoveredTable[] {
+  return rows.filter((row) => !isTruncationMarker(row));
+}
+
+/** Accept both the structured `{tables, truncated}` payload and a legacy list. */
+export function normalizeDiscoverTablesResponse(
+  data: DiscoverTablesResponse | DiscoveredTable[] | undefined | null,
+): DiscoverTablesResponse {
+  if (!data) {
+    return { tables: [], truncated: false };
+  }
+  if (Array.isArray(data)) {
+    const truncated = data.some(isTruncationMarker);
+    return { tables: selectableDiscoveredTables(data), truncated };
+  }
+  const rawTables = Array.isArray(data.tables) ? data.tables : [];
+  // Bug-9291/9292: OR the sentinel scan into `truncated` exactly like the array
+  // branch and the backend `normalize_discover_payload`, so a `__tessallite__`
+  // sentinel row inside `tables` still flags truncation even when the explicit
+  // `truncated` field is absent/false.
+  const truncated = Boolean(data.truncated) || rawTables.some(isTruncationMarker);
+  return { tables: selectableDiscoveredTables(rawTables), truncated };
+}
+
+/** F-014-06 / Bug-8640: persist profiled nullability, never a hardcoded true. */
+export function classifiedColumnsToSyncPayload(
+  columns: Array<{
+    column_name: string;
+    data_type: string;
+    is_nullable: boolean;
+    is_primary_key?: boolean;
+  }>,
+) {
+  return columns.map((c) => ({
+    column_name: c.column_name,
+    data_type: c.data_type,
+    is_nullable: c.is_nullable,
+    is_primary_key: c.is_primary_key,
+  }));
 }
 
 function defaultSchemaValue(sourceType: string) {
@@ -281,7 +336,6 @@ function SourceTables({
         let tbl: { id: string } | undefined;
         try {
           tbl = await modelTablesApi.create(projectId, modelId, sourceId, {
-            source_id: sourceId,
             table_type: profiled.classification,
             physical_name: physName,
             display_name: profiled.table,
@@ -291,11 +345,7 @@ function SourceTables({
             projectId,
             modelId,
             tbl.id,
-            profiled.columns.map((c) => ({
-              column_name: c.column_name,
-              data_type: c.data_type,
-              is_nullable: true,
-            })),
+            classifiedColumnsToSyncPayload(profiled.columns),
           );
 
           for (const col of profiled.columns) {
@@ -384,7 +434,6 @@ function SourceTables({
         const tableName = parts.slice(1).join(".");
         const displayName = parts[parts.length - 1] || schema;
         const data: ModelTableCreate = {
-          source_id: sourceId,
           table_type: "unclassified",
           physical_name: physicalName,
           display_name: displayName,
@@ -538,7 +587,6 @@ function SourceTables({
       const aliasTrim = newAlias.trim();
       const displayTrim = newAliasDisplayName.trim();
       await modelTablesApi.create(projectId, modelId, sourceId, {
-        source_id: sourceId,
         table_type: t.table_type as "fact" | "dim_aggregate" | "dim_detail" | "unclassified",
         physical_name: t.physical_name,
         alias: aliasTrim || undefined,
@@ -627,8 +675,14 @@ function SourceTables({
   });
 
   // Show all discovered tables — dimension tables can be added multiple
-  // times with different aliases (dimension aliases).
-  const availableTables = discovery.data ?? [];
+  // times with different aliases (dimension aliases). Truncation markers
+  // are never selectable (F-014-05 / G-014-02).
+  const discoverPayload = useMemo(
+    () => normalizeDiscoverTablesResponse(discovery.data as DiscoverTablesResponse | DiscoveredTable[] | undefined),
+    [discovery.data],
+  );
+  const availableTables = discoverPayload.tables;
+  const catalogueTruncated = discoverPayload.truncated;
 
   return (
     <Box sx={{ mt: 0.5 }}>
@@ -1013,6 +1067,11 @@ function SourceTables({
                     if (err?.message) return err.message;
                     return t("sources.discoverError");
                   })()}
+                </Alert>
+              )}
+              {catalogueTruncated && (
+                <Alert severity="warning" sx={{ mb: 1 }}>
+                  {t("sources.catalogueTruncated")}
                 </Alert>
               )}
               {discovery.isSuccess && availableTables.length === 0 && (

@@ -20,6 +20,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from .result_fakes import FakeScalarResult
 
 from shared.middleware.internal_bypass import internal_request_headers
 from shared.schemas.pydantic_models import KPIEvaluateResponse
@@ -32,7 +33,9 @@ from .conftest import (
     make_mock_db,
 )
 
-pytestmark = pytest.mark.unit
+# F-017-12: shim caller_has_role to the token-role decision for these
+# mocked-db unit tests (see conftest.kpi_effective_role).
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("kpi_effective_role")]
 
 PREFIX = f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/kpis"
 
@@ -42,10 +45,18 @@ class _ScalarResult:
         self._items = items
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return list(self._items)
+
+    def first(self):
+        return self._items[0] if self._items else None
+
+    def scalar_one(self):
+        # Bug-7982 R6: evaluate_batch (service context) issues
+        # ``SELECT clock_timestamp()`` for the kpi_latest ordering marker.
+        return self._items[0] if self._items else None
 
 
 def _kpi(
@@ -113,15 +124,45 @@ def _kpi(
     )
 
 
-def _model() -> types.SimpleNamespace:
+_VERSION_ID = uuid.uuid4()
+
+
+def _kpi_snapshot_dict(kpi: types.SimpleNamespace) -> dict:
+    """Serialise a test KPI namespace into a snapshot dict for the deployed
+    version (UUIDs as strings, as the serialiser stores)."""
+    return {k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in vars(kpi).items()}
+
+
+def _version_with_kpis(kpi_list: list) -> types.SimpleNamespace:
+    """Build a mock ModelVersion namespace with a snapshot containing ``kpi_list``."""
+    return types.SimpleNamespace(
+        id=_VERSION_ID,
+        model_id=TEST_MODEL_ID,
+        snapshot_json={
+            "schema_version": "1.0",
+            "measures": [{"id": str(uuid.uuid4()), "name": "Revenue"}],
+            "kpis": [_kpi_snapshot_dict(k) for k in kpi_list],
+        },
+    )
+
+
+def _model(deployed: bool = False) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         id=TEST_MODEL_ID,
         slug="acme_sales",
         fiscal_year_start_month=None,
+        deployed_version_id=_VERSION_ID if deployed else None,
+        deploy_epoch=1 if deployed else 0,
+        data_epoch=0,
     )
 
 
-def _entity_db(model, kpi_query_results: list[list], get_kpis: list | None = None):
+def _entity_db(
+    model,
+    kpi_query_results: list[list],
+    get_kpis: list | None = None,
+    version: types.SimpleNamespace | None = None,
+):
     """Mock DB whose execute() routes by selected ORM entity.
 
     Measure selects return []; KPISnapshot selects return [] (no
@@ -129,15 +170,28 @@ def _entity_db(model, kpi_query_results: list[list], get_kpis: list | None = Non
     then one auto-load level per call). ``get_kpis`` lists KPIs that
     db.get() must resolve (the single-evaluate route loads the requested
     KPI via db.get, not via a select).
+
+    ``version`` — optional ModelVersion namespace for deployed-snapshot
+    resolution (``kpi_deploy_resolver`` calls ``db.get(ModelVersion, id)``).
     """
+    from shared.db.models import Model as ORMModel, ModelVersion as ORMVersion
+
     db = make_mock_db()
     kpi_responses = [list(r) for r in kpi_query_results]
     gettable = list(get_kpis or [])
     for batch in kpi_query_results:
         gettable.extend(batch)
+    all_model_kpis = []
+    seen_kpi_ids = set()
+    for candidate in gettable:
+        if candidate.id not in seen_kpi_ids:
+            all_model_kpis.append(candidate)
+            seen_kpi_ids.add(candidate.id)
 
     async def side_get(cls, obj_id, *a, **kw):
-        if obj_id == TEST_MODEL_ID:
+        if cls is ORMVersion and version is not None and obj_id == version.id:
+            return version
+        if cls is ORMModel or obj_id == TEST_MODEL_ID:
             return model
         for k in gettable:
             if k.id == obj_id:
@@ -145,12 +199,27 @@ def _entity_db(model, kpi_query_results: list[list], get_kpis: list | None = Non
         return None
 
     async def side_execute(stmt, *a, **kw):
+        # Bug-7982 R6: the service-context publish path issues
+        # ``SELECT clock_timestamp()`` for the kpi_latest ordering marker.
+        if "clock_timestamp" in str(stmt):
+            return _ScalarResult([NOW])
         entity = None
         descriptions = getattr(stmt, "column_descriptions", None)
         if descriptions:
             entity = descriptions[0].get("entity")
         name = getattr(entity, "__name__", "")
         if name == "KPI":
+            sql = str(stmt)
+            # Single-evaluate cache admission reads the full current model to
+            # fingerprint a target-aware dependency closure. Keep that query
+            # separate from the ordered dependency-load responses below.
+            where_clause = sql.partition("WHERE")[2]
+            if (
+                "kpis.name =" not in where_clause
+                and "kpis.id IN" not in where_clause
+                and "kpis.parent_kpi_id" not in where_clause
+            ):
+                return _ScalarResult(all_model_kpis)
             if kpi_responses:
                 return _ScalarResult(kpi_responses.pop(0))
             return _ScalarResult([])
@@ -195,7 +264,6 @@ async def test_composite_indicators_agree_single_vs_batch(client):
     Children score 50 and 25 with weights 3 and 1 (normalised 0.75/0.25):
     0.75*50 + 0.25*25 = 43.75; 43.75/50 = 0.875 -> Near Target (#F57C00).
     """
-    model = _model()
     parent = _kpi(
         name="health_score", kpi_type="composite",
         expression="literal(0)", target_value=50.0,
@@ -212,7 +280,8 @@ async def test_composite_indicators_agree_single_vs_batch(client):
         child_b.id: (25.0, 100.0),    # -> 25
     }
 
-    # Single /evaluate: measures select, children select, snapshots
+    # Single /evaluate: undeployed model (builder surface) — live draft path
+    model = _model(deployed=False)
     db_single = _entity_db(model, [[child_a, child_b]], get_kpis=[parent])
     with (
         patch("src.api.kpis.get_tenant_db", async_gen_from(db_single)),
@@ -226,8 +295,19 @@ async def test_composite_indicators_agree_single_vs_batch(client):
     assert single_resp.status_code == 200
     single = single_resp.json()
 
-    # /evaluate-batch with ONLY the parent requested (the Bug-1031 trap)
-    db_batch = _entity_db(model, [[parent], [child_a, child_b]])
+    # /evaluate-batch with ONLY the parent requested (the Bug-1031 trap).
+    # F-017-01: the publish path (kpi_latest) requires a DEPLOYED model, so
+    # provide a deployed model + a version snapshot containing all test KPIs.
+    # The extra leading KPI response pop (all_live for the resolver) is the
+    # first entry.
+    all_kpis = [parent, child_a, child_b]
+    model_batch = _model(deployed=True)
+    version = _version_with_kpis(all_kpis)
+    db_batch = _entity_db(
+        model_batch,
+        [all_kpis, [parent], [child_a, child_b]],
+        version=version,
+    )
     upsert_mock = AsyncMock()
     with (
         patch("src.api.kpis.get_tenant_db", async_gen_from(db_batch)),
@@ -417,12 +497,18 @@ async def test_batch_composite_depth_limit_fails_loud(client):
 async def test_evaluate_batch_service_context_publishes_kpi_latest(client):
     """A governed service-context evaluate-batch (verified internal marker, no
     persona) DOES publish to kpi_latest — the row that feeds the JDBC $KPIs
-    virtual table. This is the scheduler snapshot sweep's path."""
-    model = _model()
+    virtual table. This is the scheduler snapshot sweep's path.
+
+    F-017-01: the publish gate now requires a DEPLOYED model, so this test
+    provides one with a snapshot that pins the KPI definition."""
     kpi = _kpi(name="revenue_kpi", expression='measure("Revenue")', target_value=100.0)
+    model = _model(deployed=True)
+    version = _version_with_kpis([kpi])
     values = {kpi.id: (90.0, 100.0)}
 
-    db = _entity_db(model, [[kpi]])
+    # The resolver's all_live select is the first KPI pop; the requested load
+    # is the second.
+    db = _entity_db(model, [[kpi], [kpi]], version=version)
     upsert_mock = AsyncMock()
     with (
         patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
@@ -441,6 +527,52 @@ async def test_evaluate_batch_service_context_publishes_kpi_latest(client):
         )
     assert resp.status_code == 200
     upsert_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_evaluate_batch_clamps_future_marker_and_preserves_earlier_marker(client):
+    """Bug-7982 R6 (round-4 #2): drive the REAL evaluate_batch handler and prove
+    the round-2/round-3 kpis.py changes:
+      - a FUTURE body eval_started_at is CLAMPED to the server clock (else it
+        would wedge $KPIs for the whole epoch);
+      - an EARLIER (sweep-supplied) marker is PRESERVED (min(earlier, clock) =
+        earlier), so the sweep's own write shares this handler's marker (#7).
+    The mocked DB's clock_timestamp() returns NOW (2026-01-01)."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    kpi = _kpi(name="revenue_kpi", expression='measure("Revenue")', target_value=100.0)
+    version = _version_with_kpis([kpi])
+    values = {kpi.id: (90.0, 100.0)}
+
+    async def _run(marker_iso):
+        db = _entity_db(_model(deployed=True), [[kpi], [kpi]], version=version)
+        upsert_mock = AsyncMock()
+        with (
+            patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
+            patch("src.api.kpis.resolve_effective_persona",
+                  new_callable=AsyncMock, return_value=None),
+            patch("src.api.kpis._batch_get_measure_values",
+                  new_callable=AsyncMock, return_value={}),
+            patch("src.api.kpis._evaluate_single_kpi",
+                  side_effect=_fake_single_for(values)),
+            patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
+        ):
+            resp = await client.post(
+                f"{PREFIX}/evaluate-batch",
+                json={"kpi_ids": [str(kpi.id)], "eval_started_at": marker_iso},
+                headers=internal_request_headers(),
+            )
+        assert resp.status_code == 200
+        upsert_mock.assert_awaited_once()
+        return upsert_mock.call_args.kwargs["eval_started_at"]
+
+    # Future marker -> clamped to the server clock (NOW).
+    future = _dt(2099, 1, 1, tzinfo=_tz.utc)
+    assert await _run(future.isoformat()) == NOW, "future marker was not clamped to the server clock"
+
+    # Earlier (sweep) marker -> preserved (min(earlier, clock) == earlier).
+    earlier = _dt(2025, 6, 1, tzinfo=_tz.utc)
+    assert await _run(earlier.isoformat()) == earlier, "an earlier sweep marker must be preserved"
 
 
 @pytest.mark.asyncio
@@ -505,3 +637,81 @@ async def test_evaluate_batch_persona_scope_does_not_publish(client):
         )
     assert resp.status_code == 200
     upsert_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_evaluate_batch_captures_epoch_before_evaluation_not_after(client):
+    """opus5 completion-round finding 2.4: the epoch/version binding passed to
+    ``_upsert_kpi_latest_batch`` must be captured from ``Model`` at the TOP of
+    the request — before ``resolve_served_kpis`` / any per-KPI evaluation —
+    never re-derived after evaluation completes. Simulates a revert
+    committing WHILE evaluation is running by mutating ``model.deploy_epoch``
+    as a side effect wrapped around the REAL ``resolve_served_kpis`` (standing
+    in for "evaluation has started"), and asserts ``_upsert_kpi_latest_batch``
+    is still called with the PRE-mutation epoch.
+
+    Mutation check: moving the ``_eval_version_id_at_start`` /
+    ``_eval_epoch_at_start`` capture in ``evaluate_batch`` to AFTER
+    ``resolve_served_kpis`` (or later) makes this test FAIL — it would then
+    observe the mutated (post-revert) epoch, exactly reopening the
+    wrong-number stamp-timing bug this round fixed.
+    """
+    from src.kpi_deploy_resolver import resolve_served_kpis as _real_resolve_served_kpis
+
+    model = _model(deployed=True)
+    assert model.deploy_epoch == 1  # sanity: this is the epoch to prove was used
+    kpi = _kpi(name="revenue_kpi", expression='measure("Revenue")', target_value=100.0)
+    version = _version_with_kpis([kpi])
+    values = {kpi.id: (150.0, 100.0)}
+
+    db = _entity_db(model, [[kpi]], version=version)
+
+    async def _resolve_and_mutate(db_, model_, live_kpis):
+        result = await _real_resolve_served_kpis(db_, model_, live_kpis)
+        # Simulate a CONCURRENT revert committing WHILE evaluation is running.
+        model_.deploy_epoch = 99
+        return result
+
+    upsert_mock = AsyncMock()
+    with (
+        patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
+        patch("src.api.kpis.resolve_effective_persona",
+              new_callable=AsyncMock, return_value=None),
+        patch("src.api.kpis.resolve_served_kpis", side_effect=_resolve_and_mutate),
+        patch("src.api.kpis._batch_get_measure_values",
+              new_callable=AsyncMock, return_value={}),
+        patch("src.api.kpis._evaluate_single_kpi",
+              side_effect=_fake_single_for(values)),
+        patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
+    ):
+        resp = await client.post(
+            f"{PREFIX}/evaluate-batch",
+            json={"kpi_ids": [str(kpi.id)]},
+            headers=internal_request_headers(),
+        )
+    assert resp.status_code == 200, resp.text
+
+    # opus5 round-2 finding 4.3: prove the mid-flight mutation actually FIRED
+    # (i.e. evaluate_batch really did call the patched resolve_served_kpis).
+    # Without this, a future refactor that stops calling resolve_served_kpis
+    # (rename, extraction, restructuring the _batch_deployed branch) would
+    # silently skip the mutation entirely — model.deploy_epoch would stay 1,
+    # the eval_epoch assertion below would still pass, and this test would
+    # pass VACUOUSLY, no longer simulating the race it claims to guard.
+    assert model.deploy_epoch == 99, (
+        "the mid-evaluation mutation never fired (resolve_served_kpis was "
+        "not called as expected) — this test is no longer simulating the "
+        "concurrent-revert race and its eval_epoch assertion below would "
+        "pass vacuously"
+    )
+
+    upsert_mock.assert_awaited_once()
+    kwargs = upsert_mock.await_args.kwargs
+    assert kwargs["eval_epoch"] == 1, (
+        "the epoch passed to _upsert_kpi_latest_batch must be the epoch "
+        "captured BEFORE evaluation ran (1), not the value after a "
+        "concurrent revert mutated it mid-evaluation (99) — capturing late "
+        "instead of at evaluation start reopens the wrong-number "
+        "stamp-timing bug"
+    )
+    assert kwargs["eval_version_id"] == model.deployed_version_id

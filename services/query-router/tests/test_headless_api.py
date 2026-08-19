@@ -281,6 +281,44 @@ class TestHeadlessQuery:
         assert "query_id" in data
 
     @pytest.mark.asyncio
+    async def test_bug_8159_column_descriptors_returned(self, client):
+        """Bug-8159: the response carries typed ``column_descriptors`` — one
+        per output column, order-aligned with ``columns`` — instead of only
+        bare name strings. A measure column reports ``kind="measure"`` with its
+        aggregation; a dimension reports ``kind="dimension"`` with its
+        time-axis flag. Fails pre-fix because ``HeadlessColumnDescriptor`` and
+        the ``column_descriptors`` field did not exist."""
+        model = _make_model()
+        bound = _make_bound(model)
+        # bound: measure "revenue" (default_agg=sum), dimension "region".
+        mock_rows = [{"region": "US", "revenue": 1000}]
+        mock_columns = ["region", "revenue"]
+
+        with ExitStack() as stack:
+            _headless_patches(
+                stack, bound=bound, rows=mock_rows, columns=mock_columns,
+            )
+            resp = await client.post(
+                "/api/v1/headless/query",
+                json=_query_body(model),
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        # columns stays a bare list[str] for wire back-compat.
+        assert data["columns"] == ["region", "revenue"]
+        descriptors = data["column_descriptors"]
+        # One descriptor per column, in the same order.
+        assert [d["name"] for d in descriptors] == ["region", "revenue"]
+        by_name = {d["name"]: d for d in descriptors}
+        assert by_name["region"]["kind"] == "dimension"
+        assert by_name["region"]["is_time_dim"] is False
+        assert by_name["region"]["display_name"] == "Region"
+        assert by_name["revenue"]["kind"] == "measure"
+        assert by_name["revenue"]["aggregation"] == "sum"
+
+    @pytest.mark.asyncio
     async def test_query_id_differs_per_page(self, client):
         """F-027-15: query_id folds in limit/offset so two pages of the same
         semantic query get distinct ids (safe as a result-cache key)."""
@@ -332,6 +370,30 @@ class TestHeadlessQuery:
         assert kwargs["bound_query"].logical_query.protocol == "headless"
         assert kwargs["rows_returned"] == 1
         pipeline.audit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_query_tags_client_kind_headless(self, client):
+        """Bug-5813: the headless endpoint must pass client_kind='headless'
+        through to the observed pipeline so telemetry can distinguish
+        headless queries from other sources."""
+        model = _make_model()
+        bound = _make_bound(model)
+
+        with ExitStack() as stack:
+            pipeline = _headless_patches(
+                stack, bound=bound,
+                rows=[{"region": "US", "revenue": 1}], columns=["region", "revenue"],
+            )
+            resp = await client.post(
+                "/api/v1/headless/query",
+                json=_query_body(model),
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        pipeline.log_query.assert_awaited_once()
+        kwargs = pipeline.log_query.await_args.kwargs
+        assert kwargs["client_kind"] == "headless"
 
     @pytest.mark.asyncio
     async def test_source_route_writes_miss_log(self, client):
@@ -590,6 +652,33 @@ class TestHeadlessQuery:
         assert "project" in resp.json()["detail"].lower()
 
     @pytest.mark.asyncio
+    async def test_non_uuid_model_id_returns_400(self, client):
+        # Bug-6381: a malformed (non-UUID) model_id must return a clean 400 at
+        # the boundary, not a 500 from the downstream UUID parse in
+        # shared.auth.project_access._as_uuid. The guard fires before any DB
+        # work, so no pipeline patches are needed.
+        model = _make_model()
+        resp = await client.post(
+            "/api/v1/headless/query",
+            json=_query_body(model, model_id="not-a-uuid"),
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 400
+        assert "model_id" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_non_uuid_project_id_returns_400(self, client):
+        # Bug-6381: same guard for a malformed project_id.
+        model = _make_model()
+        resp = await client.post(
+            "/api/v1/headless/query",
+            json=_query_body(model, project_id="12345"),
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 400
+        assert "project_id" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
     async def test_query_nonexistent_measure_returns_422(self, client):
         from src.ir.logical_query import SemanticBindingError
 
@@ -645,7 +734,11 @@ class TestHeadlessQuery:
 
         assert resp.status_code == 200
         logical_query = mock_bind.call_args[0][0]
-        assert logical_query.limit == 10
+        # Bug-7998 / F-027-02: the endpoint fetches effective_limit + 1 rows
+        # internally to detect truncation, so the LogicalQuery LIMIT is 11
+        # for a requested limit of 10. The extra probe row is trimmed before
+        # the response (see the completeness tests below).
+        assert logical_query.limit == 11
         assert logical_query.offset == 20
 
     @pytest.mark.asyncio
@@ -692,6 +785,158 @@ class TestHeadlessQuery:
                 headers=_auth_headers(),
             )
         assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# F-027-01 / Bug-7997: strict request schema — unknown fields rejected
+# ---------------------------------------------------------------------------
+
+class TestHeadlessStrictSchema:
+    @pytest.mark.asyncio
+    async def test_misspelled_dimensions_field_rejected_422(self, client):
+        """Bug-7997: a misspelled optional field (``dimentions``) must be a
+        422 naming the field, NOT silently dropped into a grand-total query.
+        The live report saw ``dimentions`` return a one-row grand total 200."""
+        model = _make_model()
+        body = _query_body(model)
+        # Misspell the dimensions field; supply a valid dimensions too so the
+        # ONLY defect under test is the unknown extra field.
+        body["dimentions"] = ["country_code"]
+        resp = await client.post(
+            "/api/v1/headless/query",
+            json=body,
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 422
+        assert "dimentions" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_misspelled_persona_field_rejected_422(self, client):
+        model = _make_model()
+        body = _query_body(model)
+        body["persona"] = "some-id"  # correct field is persona_id
+        resp = await client.post(
+            "/api/v1/headless/query",
+            json=body,
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 422
+        assert "persona" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_unknown_filter_property_rejected_422(self, client):
+        """A misspelled property INSIDE a filter object is also rejected —
+        SemanticFilter is strict, so an ``operatr`` typo cannot silently fall
+        through to the default 'eq'."""
+        model = _make_model()
+        resp = await client.post(
+            "/api/v1/headless/query",
+            json=_query_body(
+                model,
+                filters=[{"dimension": "region", "operatr": "neq", "value": "US"}],
+            ),
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 422
+        assert "operatr" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_unknown_order_by_property_rejected_422(self, client):
+        model = _make_model()
+        resp = await client.post(
+            "/api/v1/headless/query",
+            json=_query_body(
+                model,
+                order_by=[{"field": "revenue", "dir": "desc"}],
+            ),
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# F-027-02 / Bug-7998: explicit completeness / truncation contract
+# ---------------------------------------------------------------------------
+
+class TestHeadlessCompleteness:
+    @pytest.mark.asyncio
+    async def test_complete_result_reports_complete_true(self, client):
+        """A result at or under the cap reports complete=true, has_more=false,
+        and the effective row_limit."""
+        model = _make_model()
+        bound = _make_bound(model)
+        rows = [{"region": "US", "revenue": 1}, {"region": "EU", "revenue": 2}]
+
+        with ExitStack() as stack:
+            _headless_patches(
+                stack, bound=bound, rows=rows, columns=["region", "revenue"],
+            )
+            resp = await client.post(
+                "/api/v1/headless/query",
+                json=_query_body(model, limit=10),
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["complete"] is True
+        assert data["has_more"] is False
+        assert data["row_limit"] == 10
+        assert data["page_row_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_capped_result_reports_complete_false_and_trims_probe(self, client):
+        """Bug-7998: when the source returns effective_limit + 1 rows (the
+        probe row), the response must report complete=false + has_more=true
+        and trim the page back to exactly the requested limit — a capped
+        extract is never presented as the whole dataset."""
+        model = _make_model()
+        bound = _make_bound(model)
+        # limit=3 -> probe_limit=4 -> source returns 4 rows.
+        rows = [{"region": r, "revenue": i} for i, r in enumerate(["US", "EU", "GB", "FR"])]
+
+        with ExitStack() as stack:
+            _headless_patches(
+                stack, bound=bound, rows=rows, columns=["region", "revenue"],
+            )
+            resp = await client.post(
+                "/api/v1/headless/query",
+                json=_query_body(model, limit=3),
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["has_more"] is True
+        assert data["complete"] is False
+        assert data["row_limit"] == 3
+        # Probe row trimmed: exactly the requested limit is returned.
+        assert data["page_row_count"] == 3
+        assert len(data["rows"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_probe_limit_is_effective_limit_plus_one(self, client):
+        """The LIMIT handed to the engine is effective_limit + 1 so the
+        extra row can be detected (the engine is not modified — only the
+        LogicalQuery.limit data field the handler already owns)."""
+        model = _make_model()
+        bound = _make_bound(model)
+
+        with ExitStack() as stack:
+            _headless_patches(stack, bound=bound)
+            mock_bind = AsyncMock(return_value=bound)
+            stack.enter_context(
+                patch("src.api.headless.bind_query_to_model", mock_bind)
+            )
+            resp = await client.post(
+                "/api/v1/headless/query",
+                json=_query_body(model, limit=100),
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        lq = mock_bind.call_args[0][0]
+        assert lq.limit == 101
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +1096,42 @@ class TestHeadlessMetadata:
         assert len(data) == 1
         assert data[0]["slug"] == "test-model"
         assert data[0]["display_name"] == "Test Model"
+        # Bug-5973: deployed field is present and True for deployed models.
+        assert data[0]["deployed"] is True
+
+    @pytest.mark.asyncio
+    async def test_list_models_excludes_undeployed(self, client):
+        """Bug-5973 / F-027-04: undeployed models must NOT appear in the
+        headless /models listing — querying them returns 409, so listing
+        them in a discovery endpoint is misleading for headless clients."""
+        deployed_model = _make_model()
+        undeployed_model = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            project_id=deployed_model.project_id,
+            slug="draft-model",
+            display_name="Draft Model",
+            description="Not deployed yet",
+            deployed_version_id=None,
+        )
+        db = _mock_tenant_db()
+        result_mock = MagicMock()
+        result_mock.scalars.return_value.all.return_value = [
+            deployed_model, undeployed_model,
+        ]
+        db.execute = AsyncMock(return_value=result_mock)
+
+        with patch("src.api.headless.get_tenant_db", _async_gen(db)):
+            resp = await client.get(
+                "/api/v1/headless/models",
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1, (
+            "Only deployed models should be returned"
+        )
+        assert data[0]["slug"] == "test-model"
 
     @pytest.mark.asyncio
     async def test_list_models_embed_empty_scope_lists_nothing(self, client):
@@ -915,12 +1196,23 @@ class TestHeadlessMetadata:
     @pytest.mark.asyncio
     async def test_list_measures(self, client):
         measures = [_make_measure("revenue"), _make_measure("cost")]
+        # Bug-7418 (GAP 2): mock an UNDEPLOYED model so the live-table
+        # fallback path fires (deployed models with unresolvable snapshots
+        # now fail closed with 409).
+        undeployed_model = _make_model()
+        undeployed_model.deployed_version_id = None
         db = _mock_tenant_db()
+        db.get = AsyncMock(return_value=undeployed_model)
         result_mock = MagicMock()
         result_mock.scalars.return_value.all.return_value = measures
         db.execute = AsyncMock(return_value=result_mock)
 
-        with patch("src.api.headless.get_tenant_db", _async_gen(db)), _no_persona():
+        with (
+            patch("src.api.headless.get_tenant_db", _async_gen(db)),
+            _no_persona(),
+            patch("src.api.headless.resolve_deployed_shape", AsyncMock(return_value=None)),
+            patch("src.api.headless.cls_blocked_measure_and_dimension_ids", AsyncMock(return_value=(set(), set()))),
+        ):
             resp = await client.get(
                 f"/api/v1/headless/models/{TEST_MODEL_ID}/measures",
                 headers=_auth_headers(),
@@ -944,17 +1236,19 @@ class TestHeadlessMetadata:
             included_measure_ids=[str(revenue.id)],
             included_dimension_ids=[],
         )
+        undeployed_model = _make_model()
+        undeployed_model.deployed_version_id = None
         db = _mock_tenant_db()
+        db.get = AsyncMock(return_value=undeployed_model)
         result_mock = MagicMock()
         result_mock.scalars.return_value.all.return_value = [revenue, cost]
         db.execute = AsyncMock(return_value=result_mock)
 
         with (
             patch("src.api.headless.get_tenant_db", _async_gen(db)),
-            patch(
-                "src.api.headless.resolve_execution_persona",
-                AsyncMock(return_value=persona),
-            ),
+            patch("src.api.headless.resolve_execution_persona", AsyncMock(return_value=persona)),
+            patch("src.api.headless.resolve_deployed_shape", AsyncMock(return_value=None)),
+            patch("src.api.headless.cls_blocked_measure_and_dimension_ids", AsyncMock(return_value=(set(), set()))),
         ):
             resp = await client.get(
                 f"/api/v1/headless/models/{TEST_MODEL_ID}/measures",
@@ -968,13 +1262,21 @@ class TestHeadlessMetadata:
     @pytest.mark.asyncio
     async def test_list_dimensions(self, client):
         dims = [_make_dimension("region"), _make_dimension("order_date", is_time_dim=True)]
+        undeployed_model = _make_model()
+        undeployed_model.deployed_version_id = None
         db = _mock_tenant_db()
+        db.get = AsyncMock(return_value=undeployed_model)
         result_mock = MagicMock()
         # Endpoint selects (Dimension, ModelColumn.data_type) rows.
         result_mock.all.return_value = [(d, "string") for d in dims]
         db.execute = AsyncMock(return_value=result_mock)
 
-        with patch("src.api.headless.get_tenant_db", _async_gen(db)), _no_persona():
+        with (
+            patch("src.api.headless.get_tenant_db", _async_gen(db)),
+            _no_persona(),
+            patch("src.api.headless.resolve_deployed_shape", AsyncMock(return_value=None)),
+            patch("src.api.headless.cls_blocked_measure_and_dimension_ids", AsyncMock(return_value=(set(), set()))),
+        ):
             resp = await client.get(
                 f"/api/v1/headless/models/{TEST_MODEL_ID}/dimensions",
                 headers=_auth_headers(),
@@ -998,7 +1300,10 @@ class TestHeadlessMetadata:
             included_measure_ids=[],
             included_dimension_ids=[str(region.id)],
         )
+        undeployed_model = _make_model()
+        undeployed_model.deployed_version_id = None
         db = _mock_tenant_db()
+        db.get = AsyncMock(return_value=undeployed_model)
         result_mock = MagicMock()
         # Endpoint selects (Dimension, ModelColumn.data_type) rows.
         result_mock.all.return_value = [(region, "string"), (salary_band, "string")]
@@ -1006,10 +1311,9 @@ class TestHeadlessMetadata:
 
         with (
             patch("src.api.headless.get_tenant_db", _async_gen(db)),
-            patch(
-                "src.api.headless.resolve_execution_persona",
-                AsyncMock(return_value=persona),
-            ),
+            patch("src.api.headless.resolve_execution_persona", AsyncMock(return_value=persona)),
+            patch("src.api.headless.resolve_deployed_shape", AsyncMock(return_value=None)),
+            patch("src.api.headless.cls_blocked_measure_and_dimension_ids", AsyncMock(return_value=(set(), set()))),
         ):
             resp = await client.get(
                 f"/api/v1/headless/models/{TEST_MODEL_ID}/dimensions",
@@ -1257,3 +1561,548 @@ class TestHeadlessRBACDenial:
                 headers=_auth_headers(),
             )
         assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Bug-7409: headless response carries route visibility
+# ---------------------------------------------------------------------------
+
+class TestHeadlessRouteVisibility:
+    @pytest.mark.asyncio
+    async def test_query_response_includes_route_trace(self, client):
+        """Bug-7409: the headless query response must include a ``route``
+        field with route_type, reason, aggregate_id, and pocket_id — a SAFE
+        route summary so headless callers can see how their query was served.
+
+        Bug-8061 / F-027-03: the route trace must NOT carry the rewritten
+        physical SQL — ordinary integration credentials must not learn
+        internal schema/table names or security predicates."""
+        model = _make_model()
+        bound = _make_bound(model)
+        decision = _make_decision(route_type="source")
+        # A physical rewrite that MUST NOT reach the response.
+        decision.rewritten_query = 'SELECT * FROM "trgt"."43c58412260b"'
+
+        with ExitStack() as stack:
+            _headless_patches(
+                stack, bound=bound, decision=decision,
+                rows=[{"region": "US", "revenue": 1}],
+                columns=["region", "revenue"],
+            )
+            resp = await client.post(
+                "/api/v1/headless/query",
+                json=_query_body(model),
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "route" in data
+        route = data["route"]
+        assert route["route_type"] == "source"
+        assert route["reason"] == "no aggregate matched"
+        assert route["aggregate_id"] is None
+        assert route["pocket_id"] is None
+        # F-027-03: physical SQL must be redacted from the headless surface.
+        assert "rewritten_query" not in route
+        assert "trgt" not in resp.text
+        assert "43c58412260b" not in resp.text
+
+    @pytest.mark.asyncio
+    async def test_aggregate_route_carries_aggregate_id(self, client):
+        """Bug-7409: when the route is an aggregate, the route trace
+        must carry the aggregate_id."""
+        model = _make_model()
+        bound = _make_bound(model)
+        decision = _make_decision(route_type="aggregate")
+        agg_id = str(uuid.uuid4())
+        decision.aggregate_id = agg_id
+
+        with ExitStack() as stack:
+            _headless_patches(
+                stack, bound=bound, decision=decision,
+                rows=[], columns=["region", "revenue"],
+            )
+            resp = await client.post(
+                "/api/v1/headless/query",
+                json=_query_body(model),
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        route = resp.json()["route"]
+        assert route["route_type"] == "aggregate"
+        assert route["aggregate_id"] == agg_id
+
+
+# ---------------------------------------------------------------------------
+# Bug-7418: discovery reads deployed snapshot (not live draft)
+# ---------------------------------------------------------------------------
+
+class TestHeadlessSnapshotDiscovery:
+    @pytest.mark.asyncio
+    async def test_list_measures_reads_deployed_snapshot(self, client):
+        """Bug-7418: when a model is deployed, list_measures must resolve
+        from the deployed snapshot, not the live DB tables. This ensures
+        discovery agrees with what the execution binder binds."""
+        from src.semantic import snapshot_resolver
+
+        model = _make_model()
+        snap_measure = _make_measure("snap_revenue")
+        deployed_shape = MagicMock()
+        deployed_shape.measures = [snap_measure]
+
+        db = _mock_tenant_db()
+        db.get = AsyncMock(return_value=model)
+
+        with (
+            patch("src.api.headless.get_tenant_db", _async_gen(db)),
+            _no_persona(),
+            patch(
+                "src.api.headless.resolve_deployed_shape",
+                AsyncMock(return_value=deployed_shape),
+            ),
+            patch(
+                "src.api.headless.cls_blocked_measure_and_dimension_ids",
+                AsyncMock(return_value=(set(), set())),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/v1/headless/models/{TEST_MODEL_ID}/measures",
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "snap_revenue"
+
+    @pytest.mark.asyncio
+    async def test_list_dimensions_reads_deployed_snapshot(self, client):
+        """Bug-7418: when a model is deployed, list_dimensions must resolve
+        from the deployed snapshot, not the live DB tables."""
+        dim = _make_dimension("snap_region")
+        deployed_shape = MagicMock()
+        deployed_shape.dimensions = [dim]
+        deployed_shape.columns_by_id = {
+            str(dim.source_column_id): {"data_type": "varchar"},
+        }
+
+        model = _make_model()
+        db = _mock_tenant_db()
+        db.get = AsyncMock(return_value=model)
+
+        with (
+            patch("src.api.headless.get_tenant_db", _async_gen(db)),
+            _no_persona(),
+            patch(
+                "src.api.headless.resolve_deployed_shape",
+                AsyncMock(return_value=deployed_shape),
+            ),
+            patch(
+                "src.api.headless.cls_blocked_measure_and_dimension_ids",
+                AsyncMock(return_value=(set(), set())),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/v1/headless/models/{TEST_MODEL_ID}/dimensions",
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "snap_region"
+        assert data[0]["data_type"] == "varchar"
+
+    @pytest.mark.asyncio
+    async def test_list_measures_falls_back_to_live_when_undeployed(self, client):
+        """Bug-7418: when a model is NOT deployed, list_measures falls back
+        to the live DB tables (resolve_deployed_shape returns None)."""
+        live_measure = _make_measure("live_cost")
+        model = _make_model()
+        model.deployed_version_id = None  # undeployed
+
+        db = _mock_tenant_db()
+        db.get = AsyncMock(return_value=model)
+        result_mock = MagicMock()
+        result_mock.scalars.return_value.all.return_value = [live_measure]
+        db.execute = AsyncMock(return_value=result_mock)
+
+        with (
+            patch("src.api.headless.get_tenant_db", _async_gen(db)),
+            _no_persona(),
+            patch(
+                "src.api.headless.resolve_deployed_shape",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "src.api.headless.cls_blocked_measure_and_dimension_ids",
+                AsyncMock(return_value=(set(), set())),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/v1/headless/models/{TEST_MODEL_ID}/measures",
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "live_cost"
+
+    @pytest.mark.asyncio
+    async def test_cls_closure_uses_snapshot_measures(self, client):
+        """Bug-7418 (GAP 1): the CLS blocked-ID computation must use the
+        snapshot-resolved measures AND dimensions, not live draft tables.
+        A post-deploy draft column change must not affect discovery's CLS
+        blocked set. Both kwargs must be snapshot-sourced on the deployed
+        path (even though list_measures only uses blocked_measures)."""
+        snap_measure = _make_measure("snap_revenue")
+        snap_dim = _make_dimension("snap_region")
+        model = _make_model()
+        deployed_shape = MagicMock()
+        deployed_shape.measures = [snap_measure]
+        deployed_shape.dimensions = [snap_dim]
+
+        db = _mock_tenant_db()
+        db.get = AsyncMock(return_value=model)
+
+        persona = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            included_measure_ids=[str(snap_measure.id)],
+            included_dimension_ids=[],
+        )
+
+        cls_mock = AsyncMock(return_value=(set(), set()))
+
+        with (
+            patch("src.api.headless.get_tenant_db", _async_gen(db)),
+            patch(
+                "src.api.headless.resolve_execution_persona",
+                AsyncMock(return_value=persona),
+            ),
+            patch(
+                "src.api.headless.resolve_deployed_shape",
+                AsyncMock(return_value=deployed_shape),
+            ),
+            patch(
+                "src.api.headless.cls_blocked_measure_and_dimension_ids",
+                cls_mock,
+            ),
+        ):
+            resp = await client.get(
+                f"/api/v1/headless/models/{TEST_MODEL_ID}/measures",
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        # The CLS function must have been called with BOTH snapshot kwargs
+        # so neither set falls back to live drafts on the deployed path.
+        cls_mock.assert_awaited_once()
+        call_kwargs = cls_mock.await_args.kwargs
+        assert call_kwargs["measures"] is not None
+        assert len(call_kwargs["measures"]) == 1
+        assert call_kwargs["measures"][0].name == "snap_revenue"
+        assert call_kwargs["dimensions"] is not None
+        assert len(call_kwargs["dimensions"]) == 1
+        assert call_kwargs["dimensions"][0].name == "snap_region"
+
+    @pytest.mark.asyncio
+    async def test_cls_closure_uses_snapshot_dimensions(self, client):
+        """Bug-7418 (GAP 1): the CLS blocked-ID computation for dimensions
+        must use snapshot-resolved dimensions AND measures, not live draft
+        tables. Both kwargs must be snapshot-sourced on the deployed path."""
+        snap_dim = _make_dimension("snap_region")
+        snap_measure = _make_measure("snap_revenue")
+        model = _make_model()
+        deployed_shape = MagicMock()
+        deployed_shape.dimensions = [snap_dim]
+        deployed_shape.measures = [snap_measure]
+        deployed_shape.columns_by_id = {
+            str(snap_dim.source_column_id): {"data_type": "varchar"},
+        }
+
+        db = _mock_tenant_db()
+        db.get = AsyncMock(return_value=model)
+
+        persona = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            included_measure_ids=[],
+            included_dimension_ids=[str(snap_dim.id)],
+        )
+
+        cls_mock = AsyncMock(return_value=(set(), set()))
+
+        with (
+            patch("src.api.headless.get_tenant_db", _async_gen(db)),
+            patch(
+                "src.api.headless.resolve_execution_persona",
+                AsyncMock(return_value=persona),
+            ),
+            patch(
+                "src.api.headless.resolve_deployed_shape",
+                AsyncMock(return_value=deployed_shape),
+            ),
+            patch(
+                "src.api.headless.cls_blocked_measure_and_dimension_ids",
+                cls_mock,
+            ),
+        ):
+            resp = await client.get(
+                f"/api/v1/headless/models/{TEST_MODEL_ID}/dimensions",
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 200
+        cls_mock.assert_awaited_once()
+        call_kwargs = cls_mock.await_args.kwargs
+        assert call_kwargs["dimensions"] is not None
+        assert len(call_kwargs["dimensions"]) == 1
+        assert call_kwargs["dimensions"][0].name == "snap_region"
+        # Both kwargs must be snapshot-sourced on the deployed path.
+        assert call_kwargs["measures"] is not None
+        assert len(call_kwargs["measures"]) == 1
+        assert call_kwargs["measures"][0].name == "snap_revenue"
+
+    @pytest.mark.asyncio
+    async def test_deployed_model_unresolvable_snapshot_fails_closed_measures(self, client):
+        """Bug-7418 (GAP 2): a deployed model with an unresolvable snapshot
+        must fail closed (409) on list_measures, not silently serve draft
+        metadata that may disagree with what execution binds."""
+        model = _make_model()
+        # deployed_version_id is set (truthy) but resolve_deployed_shape returns None
+        db = _mock_tenant_db()
+        db.get = AsyncMock(return_value=model)
+
+        with (
+            patch("src.api.headless.get_tenant_db", _async_gen(db)),
+            _no_persona(),
+            patch(
+                "src.api.headless.resolve_deployed_shape",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/v1/headless/models/{TEST_MODEL_ID}/measures",
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 409
+        assert "snapshot" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_deployed_model_unresolvable_snapshot_fails_closed_dimensions(self, client):
+        """Bug-7418 (GAP 2): a deployed model with an unresolvable snapshot
+        must fail closed (409) on list_dimensions, not silently serve draft
+        metadata that may disagree with what execution binds."""
+        model = _make_model()
+        db = _mock_tenant_db()
+        db.get = AsyncMock(return_value=model)
+
+        with (
+            patch("src.api.headless.get_tenant_db", _async_gen(db)),
+            _no_persona(),
+            patch(
+                "src.api.headless.resolve_deployed_shape",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/v1/headless/models/{TEST_MODEL_ID}/dimensions",
+                headers=_auth_headers(),
+            )
+
+        assert resp.status_code == 409
+        assert "snapshot" in resp.json()["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Bug-8453 / R6 finding 2 — the headless denial channel must be REVERTIBLE-PROOF
+#
+# The R5 fix (adding ``security_rules_applied`` to HeadlessQueryResponse and
+# populating it) shipped with zero coverage: reverting both lines left 236
+# headless tests passing. That is the same "producer added, nothing asserts it"
+# gap that let five earlier misses through in this lane. These tests live in
+# THIS file deliberately -- it owns the autouse ``_allow_project_access``
+# fixture that the route needs.
+#
+# The surface matters: /api/v1/headless/query is a customer-facing API whose
+# Bug-7998 contract states, in the same payload, that the result is complete.
+# A denial returning `rows: [], complete: true` with no denial channel tells an
+# API consumer authoritatively that the empty set IS the whole dataset.
+# ---------------------------------------------------------------------------
+
+_DENY_ALL_RULE = {"rule_id": "__deny_all__", "rule_name": "coverage deny-all"}
+_NARROWING_RULE = {"rule_id": "region-rule", "rule_name": "EMEA only"}
+
+
+def _decision_with_rules(rules):
+    decision = _make_decision()
+    decision.security_rules_applied = rules
+    return decision
+
+
+async def _run_headless(client, *, rules, rows=None, columns=None):
+    model = _make_model()
+    bound = _make_bound(model)
+    with ExitStack() as stack:
+        _headless_patches(
+            stack,
+            bound=bound,
+            decision=_decision_with_rules(rules),
+            rows=rows if rows is not None else [],
+            columns=columns if columns is not None else [],
+        )
+        resp = await client.post(
+            "/api/v1/headless/query",
+            json=_query_body(model),
+            headers=_auth_headers(),
+        )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+@pytest.mark.asyncio
+async def test_headless_publishes_the_deny_all_sentinel(client):
+    """The producer half. Without this field an API consumer cannot tell "your
+    row-security policy grants you no rows" from "there is no data" -- and the
+    ``complete`` flag in the same payload actively asserts the latter."""
+    body = await _run_headless(client, rules=[_DENY_ALL_RULE])
+    assert body["security_rules_applied"] == ["__deny_all__"], body
+    assert body["rows"] == []
+
+
+@pytest.mark.asyncio
+async def test_headless_publishes_a_narrowing_rule_without_the_sentinel(client):
+    """A narrowing rule returns CORRECT, caller-scoped rows. It must be
+    reported (so a consumer can disclose the scoping) but must NOT carry the
+    deny-all sentinel, or every row-restricted user's valid result would be
+    treated as a denial."""
+    body = await _run_headless(
+        client,
+        rules=[_NARROWING_RULE],
+        rows=[{"region": "EMEA", "revenue": 10}],
+        columns=["region", "revenue"],
+    )
+    assert body["security_rules_applied"] == ["region-rule"]
+    assert "__deny_all__" not in body["security_rules_applied"]
+    assert body["rows"] == [{"region": "EMEA", "revenue": 10}]
+
+
+@pytest.mark.asyncio
+async def test_headless_reports_no_rules_when_row_security_is_inactive(client):
+    """Regression guard the other way: an ordinary empty result must NOT look
+    like a denial, or every genuinely-empty slice would be mis-reported as a
+    permissions problem."""
+    body = await _run_headless(client, rules=[])
+    assert body["security_rules_applied"] == []
+
+
+@pytest.mark.asyncio
+async def test_headless_complete_stays_row_cap_only_under_a_denial(client):
+    """R6 finding 4 -- ONE field, ONE meaning, on every surface.
+
+    ``complete`` answers only "did the row cap withhold anything?". R5 briefly
+    overloaded it here to also mean "not denied", which made the same field
+    mean different things on headless and /plugin/execute and would force a
+    consumer to branch per surface for one property. The denial signal is
+    ``security_rules_applied``; ``complete`` must agree with ``has_more``.
+    """
+    body = await _run_headless(client, rules=[_DENY_ALL_RULE])
+    assert body["has_more"] is False
+    assert body["complete"] is True, (
+        "complete must remain the inverse of has_more; the denial is reported "
+        "by security_rules_applied, not by overloading the completeness flag"
+    )
+    assert body["security_rules_applied"] == ["__deny_all__"]
+
+
+# ---------------------------------------------------------------------------
+# Disclosure is decided by ENTITLEMENT, not by authentication method.
+#
+# Decision 2026-08-11, option C
+# (docs/questions/questions_disclosure-by-entitlement-not-auth-method.md): the
+# embed physical-detail withhold was REMOVED. It gated on the token TYPE, so
+# this route answered the same question differently depending on which door the
+# caller used. These tests previously asserted the withhold; they now pin the
+# replacement contract, which is the stronger property to guard because a
+# silently reintroduced token-type branch is exactly what would break it.
+#
+# This is an end-to-end wiring guard driving the real ASGI route with real
+# tokens and scanning the SERVED BODY, not a unit test of a helper.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_embed_and_tenant_sessions_receive_identical_route_detail(client):
+    """An embed principal and a tenant principal get the SAME physical detail.
+
+    Fails against the pre-decision code, where the embed body was stripped of
+    the aggregate/pocket ids and had its ``reason`` replaced by a sentinel
+    token while the tenant body kept both.
+    """
+    def _decision():
+        decision = _make_decision(route_type="aggregate")
+        decision.reason = (
+            "served from aggregate agg_sales_v3 in schema acme_aggregates "
+            "(grain region_code)"
+        )
+        decision.aggregate_id = "agg-uuid-1"
+        decision.pocket_id = "pkt-uuid-1"
+        return decision
+
+    bodies = {}
+    for label, headers in (
+        ("embed", _embed_headers(None)),
+        ("tenant", _auth_headers()),
+    ):
+        model = _make_model()
+        with ExitStack() as stack:
+            _headless_patches(
+                stack, bound=_make_bound(model), decision=_decision(),
+                rows=[{"region": "US", "revenue": 1}],
+                columns=["region", "revenue"],
+            )
+            resp = await client.post(
+                "/api/v1/headless/query",
+                json=_query_body(model),
+                headers=headers,
+            )
+        assert resp.status_code == 200, f"{label}: {resp.text}"
+        bodies[label] = resp.json()
+
+    assert bodies["embed"]["route"] == bodies["tenant"]["route"], (
+        "the route trace still differs by authentication method; disclosure "
+        "must be decided by entitlement, not by how the caller signed in"
+    )
+    # And it is the REAL detail both receive, not a jointly-stripped one.
+    for label, data in bodies.items():
+        assert data["route"]["aggregate_id"] == "agg-uuid-1", label
+        assert data["route"]["pocket_id"] == "pkt-uuid-1", label
+        assert "agg_sales_v3" in data["route"]["reason"], label
+        assert "acme_aggregates" in data["route"]["reason"], label
+        assert data["route"]["route_type"] == "aggregate", label
+    # Rows and the Bug-8453 denial channel are unaffected either way.
+    assert bodies["embed"]["rows"] == [{"region": "US", "revenue": 1}]
+    assert "security_rules_applied" in bodies["embed"]
+
+
+@pytest.mark.asyncio
+async def test_headless_route_trace_publishes_no_redaction_flag(client):
+    """``reason_redacted`` was removed with the control that was its only
+    writer. A permanently-false "was this withheld" flag is false assurance,
+    so the field must not come back as a decorative default."""
+    model = _make_model()
+    with ExitStack() as stack:
+        _headless_patches(
+            stack, bound=_make_bound(model), decision=_make_decision(),
+            rows=[], columns=["region"],
+        )
+        resp = await client.post(
+            "/api/v1/headless/query",
+            json=_query_body(model),
+            headers=_embed_headers(None),
+        )
+    assert resp.status_code == 200, resp.text
+    assert "reason_redacted" not in resp.json()["route"]

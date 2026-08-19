@@ -20,14 +20,17 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 
 from shared.audit.logger import audit
-from shared.db.models import Model, Project
+from shared.auth.identity import canonical_user_identity
+from shared.db.models import Model, Project, UserAccessBinding
 from shared.db.session import get_tenant_db
+from shared.physical_cleanup import attempt_scheduled_physical_cleanup
 from src.api._cascade_delete import delete_project_cascade
 from shared.schemas.pydantic_models import ProjectCreate, ProjectResponse, ProjectUpdate
 from src.auth.middleware import (
     CurrentEmbedUser,
     CurrentUser,
     forbid_embed_user,
+    forbid_service_user,
     get_current_user,
     require_tenant_admin,
 )
@@ -75,6 +78,22 @@ async def create_project(
             pocket_size_budget_bytes=body.pocket_size_budget_bytes,
         )
         db.add(project)
+        # F-021-04 (Wave C decision #9): create the creator's admin binding
+        # ATOMICALLY in the same transaction as the project. There is no
+        # zero-binding bootstrap-admin grant any more, so a project must never
+        # be persisted binding-less — otherwise every ordinary user (including
+        # the creator once their tenant-admin bypass is scoped away) would be
+        # denied. flush() assigns project.id before the binding references it.
+        await db.flush()
+        db.add(
+            UserAccessBinding(
+                user_identity=canonical_user_identity(current_user.user_id),
+                role="admin",
+                project_id=project.id,
+                model_id=None,
+                source="manual",
+            )
+        )
         await db.commit()
         await db.refresh(project)
         return ProjectResponse.model_validate(project)
@@ -82,7 +101,7 @@ async def create_project(
 
 @router.get("", response_model=list[ProjectResponse])
 async def list_projects(
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(forbid_service_user),
 ) -> list[ProjectResponse]:
     """List projects the authenticated user can see.
 
@@ -90,10 +109,11 @@ async def list_projects(
     action, so ``require_role`` can't scope it. Instead we apply
     ``filter_projects_by_user_access`` which pulls the user's
     UserAccessBindings and filters out projects they don't have a
-    binding on. Projects with zero bindings remain visible to
-    everyone (bootstrap rule — matches ``require_role``). This
-    scopes the XMLA catalog list and the Explorer project tree to
-    just the tenants / projects the caller can actually use.
+    binding on. F-021-04 (decision #9): a project with zero bindings
+    is visible to NO ordinary user (no zero-binding bootstrap grant);
+    human tenant/system admins still see every project. This scopes
+    the XMLA catalog list and the Explorer project tree to just the
+    tenants / projects the caller can actually use.
     """
     from src.auth.rbac import filter_projects_by_user_access
 
@@ -119,7 +139,10 @@ async def list_projects(
 
         project_ids = [p.id for p in projects]
         visible_ids = await filter_projects_by_user_access(
-            db, project_ids, current_user.user_id, role=current_user.role
+            db,
+            project_ids,
+            current_user.user_id,
+            current_user=current_user,
         )
         return [
             ProjectResponse.model_validate(p)
@@ -213,3 +236,4 @@ async def delete_project(
             target_name=project_name,
         )
         await db.commit()
+        await attempt_scheduled_physical_cleanup(db)

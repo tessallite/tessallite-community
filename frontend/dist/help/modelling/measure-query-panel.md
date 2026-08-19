@@ -2,7 +2,7 @@
 title: "Measure Query Panel"
 audience: modeller
 area: modelling
-updated: 2026-06-03
+updated: 2026-07-28
 ---
 
 ## Why this panel exists
@@ -11,7 +11,7 @@ A semantic layer lives or dies by the moment a modeller defines a new measure an
 
 The **Measure Query Panel** is Tessallite's answer to that moment. It is a minimal, opinionated pivot grid embedded directly inside Model Builder. One or more measures, up to two dimension axes, totals, a Route badge, and click-to-drill. It is not meant to replace a full BI canvas — it is meant to let a modeller answer "does this measure do what I think it does?" without leaving the app.
 
-The panel grew into a small working pivot: **multiple measures in one view**, **the same measure under several aggregate functions** (SUM, AVG, MAX side by side), a built-in **Record Count** column, **multi-row and multi-column dimension nesting**, **subtotals and grand totals with distinct shading**, **header-click sort**, **one-click variant addition** (YTD, PY, YoY without writing them), **slicers**, **inline format editing**, **Excel/CSV/JSON export**, **saveable and shareable views**, and a **Route badge** that tells you which engine served the query. All of these are scoped so the panel remains a sanity-check tool, not a dashboard-builder.
+The panel grew into a small working pivot: **multiple measures in one view**, **the same measure under several aggregate functions** (SUM, AVG, MAX side by side), a built-in **Record Count** column, **multi-row and multi-column dimension nesting**, **subtotals and grand totals with distinct shading**, **header-click sort**, **time-variant measures** (YTD, PY, YoY created via the Measures panel and queryable here like any other measure), **slicers**, **inline format editing**, **Excel/CSV/JSON export**, **saveable and shareable views**, and a **Route badge** that tells you which engine served the query. All of these are scoped so the panel remains a sanity-check tool, not a dashboard-builder.
 
 The setup area is a **single line of selectors** — Add Measure, Add Row, Add Column — with the chosen items listed as plain-text rows underneath. After a successful Run the setup collapses to a one-line summary, leaving the result grid the full height of the panel; an **Edit** control reopens it.
 
@@ -83,7 +83,7 @@ A view can show more than one measure column. Each click of **Add Measure** appe
 
 The same measure can appear more than once, each instance with its own aggregate function. Add `Revenue` three times and set the per-row dropdowns to **SUM**, **AVG** and **MAX**, and the grid shows three Revenue columns side by side — the total, the average and the largest — all from one Run. Each column header reads `Revenue (Sum)`, `Revenue (Average)`, `Revenue (Max)` so the function is never ambiguous.
 
-**Totals are aggregate-aware.** The panel computes subtotals and grand totals by summing the visible cells. Summing composes correctly for **SUM** and **COUNT**, so those columns roll up normally. It does **not** compose for **AVG**, **MIN**, **MAX** or **COUNT DISTINCT** — the average of subtotals is not the average of the whole — so those columns render an em-dash (—) in the total rows instead of a misleading number. This is correctness, not a missing feature: the client only has the displayed cells, not the underlying rows needed to recompute those functions.
+**Totals are aggregate-aware.** The panel computes additive **SUM** and **COUNT** totals from the displayed detail values. For **AVG**, **MIN**, **MAX**, **COUNT DISTINCT**, and other non-composable measures, it requests the required supplementary grouping grains so the displayed total is calculated at the correct grain. If a supplementary result is unavailable, the cell fails closed with an em-dash (—) instead of showing a misleading number.
 
 ## Record Count
 
@@ -105,36 +105,15 @@ See [Live vs Aggregate](../querying/live-vs-aggregate.md) for a full walkthrough
 
 ---
 
-## One-click variants (the variant button)
+## Time-variant measures in the pivot
 
-Next to the Measure dropdown and the format button sits a small icon button: a function symbol (f) with a tiny plus sign (+). This is the **Add time variant** button. It lets you create time-intelligence variants of the selected measure — YTD, prior year, trailing average, year-over-year growth — directly from the pivot context without switching to the Measures panel.
+Time-variant measures — YTD, prior year, trailing average, year-over-year growth, and more — are created in the **Measures panel**, not in the pivot itself. Once created, they appear in the pivot's **Add Measure** dropdown exactly like any other measure, with a small label next to their name indicating the variant kind (e.g. "(ytd)"). You select them, run the query, and they render as ordinary measure columns in the grid.
 
-### How it works
+### Creating a variant
 
-1. Select a measure in the Measure dropdown.
-2. Click the variant button (f+). A popover opens listing all 14 canonical variant kinds.
-3. Each variant shows one of three states:
-   - **Eligible**: displays the suggested name (e.g. `revenue_ytd`). Click to create the variant immediately.
-   - **Not eligible**: displays the specific reason in amber text — for example, "This measure has no associated time hierarchy." The popover includes a link to the Configure Time Variants help page.
-   - **Already added**: greyed out. The variant measure already exists in the catalog.
-4. For parametric variants (`trailing_n` and `moving_avg_n`), a number field appears where you enter the window size N. Defaults are 12 and 30 respectively.
-5. Clicking an eligible row creates a new measure in the catalog. The measure dropdown refreshes and the new variant can be selected for querying.
+Open the Toolbelt, go to **Measures**, open the base measure you want to derive from, tick the variant(s) you want under **Time variants**, and save. The Measures panel shows each variant kind's eligibility status inline: ineligible kinds are disabled and display the specific reason (for example, "This measure has no associated time hierarchy"), and variants that already exist are disabled with an "already added" label. For parametric variants (`trailing_n` and `moving_avg_n`), a number field lets you set the window size N.
 
-### Prerequisites
-
-The variant button works on any base measure, but eligibility depends on the model configuration. If no variants are eligible, the popover shows a summary alert explaining the first blocking prerequisite and a link to the help documentation.
-
-The full prerequisite chain is:
-
-- **Base measure exists** — variant rows are derived from an existing measure.
-- **Time hierarchy created** with levels that have the correct time units and allowed time calculations, on the same table as the measure's source column.
-- **Calendar type configured on the hierarchy** (for period-boundary variants only) — YTD, prior year, quarter-to-date, and year-over-year variants need a calendar type (standard, fiscal, hijri, or iso) set on the time hierarchy. A physical calendar table is not required.
-
-See [Configure Time Variants](configure-time-variants.md) for the full setup walkthrough and troubleshooting table.
-
-![The Measure Query Panel showing a row of time-variant chips expanded below the Measure dropdown, with a variant column added to the grid.](../assets/screencaps/measure-query-panel-variants.png)
-
-*Figure 2 — The variant popover. Each row shows a variant kind with its eligibility status and reason. Full description: [measure-query-panel-variants.txt](../assets/screencaps/measure-query-panel-variants.txt).*
+See [Configure Time Variants](configure-time-variants.md) for the full setup walkthrough, prerequisite chain, and troubleshooting table.
 
 ### What happens under the hood
 
@@ -194,6 +173,8 @@ Sort is client-side — the data in the grid is already present, and re-sorting 
 
 Sorting is stable across pagination within the grid view (for large result sets). The Route badge and slicers are unaffected by sort.
 
+Saving the view also saves the active sort. Reloading identifies the target by measure, aggregation, repeated-measure occurrence, and exact column tuple (or the grand-total column), so the same sort direction is restored even when a measure appears more than once. If that measure or column no longer exists, or the saved-sort version is unsupported, the panel shows a warning and clears the stale sort before the view can be saved again.
+
 ## Total and subtotal shading
 
 Subtotal rows and columns use a light brand-green tint; grand totals use a deeper tint of the same green. The two shades are distinct from each other and from the header, so when several total levels stack you can tell a region subtotal from the grand total without reading the labels.
@@ -208,7 +189,7 @@ The **Export** split-button offers Excel (XLSX), CSV, and JSON. The CSV and Exce
 
 ## Saving and sharing a view
 
-A pivot layout — its measures, dimensions, slicers, totals, and sort — can be saved as a **view** and reloaded later, so you do not have to rebuild a familiar cut every time.
+A pivot layout — its measures, dimensions, slicers, totals, and exact sort target and direction — can be saved as a **view** and reloaded later, so you do not have to rebuild a familiar cut every time.
 
 A saved view is **personal by default**: only you see it. To let everyone working on the model use it, open the view and choose **Share**. A shared view becomes visible to everyone with access to the model, but **only you, the owner, can edit or delete it** — a "Shared" badge and a "Shared by …" label make ownership clear so a teammate knows whose view it is. Choose **Make private** to pull it back to just yourself again.
 
@@ -226,7 +207,7 @@ Clicking a drillable row label swaps that row for its child level (Year becomes 
 
 ## Drill-through on calculated measures
 
-Calculated measures were previously not drillable from the panel. Since Phase 6, clicking a calculated-measure cell opens a **decomposed drill drawer** that fires one drill-through per referenced base measure and stacks the mini-panels — each paginating independently at 50 rows per page. See the [Drill-through](drill-through.md) page for the full description. The key point for the panel is that **every measure cell is clickable** — there is no longer an "oh, calculated measures don't drill" asterisk. The two exceptions are **Record Count** and scratchpad-expression columns, which have no single underlying measure to decompose and so are not clickable.
+Calculated measures were previously not drillable from the panel. Since Phase 6, clicking a calculated-measure cell opens a **decomposed drill drawer** that fires one drill-through per referenced base measure and stacks the mini-panels — each paginating independently at 50 rows per page. See the [Drill-through](drill-through.md) page for the full description. Ordinary cells and all six subtotal/grand-total cell shapes are clickable for standard and calculated measures. Total drills send only the row and column levels retained by that total, while preserving active slicers and the selected measure's exact aggregation. The two exceptions are **Record Count** and scratchpad-expression columns, which have no single underlying measure to decompose and so are not clickable.
 
 ---
 
@@ -262,7 +243,7 @@ The whole loop takes under two minutes. The measure is then safe to expose to a 
 | Subtotals + grand totals | Yes (Phase 6) | Alternate total functions (averages, medians of subtotals) deferred. |
 | Variants (YTD, YoY, etc.) | Yes (Phase 6, built on Phase 2 time intelligence) | Custom user-defined variant formulas deferred — use a calculated measure in the interim. |
 | Excel (XLSX) + CSV + JSON export | Yes | All three formats export every measure, the totals, and the current sort. |
-| Saved views | Yes | Save a pivot layout (measures, dimensions, slicers, totals) and reload it later, or copy a shareable link. |
+| Saved views | Yes | Save a pivot layout, including its stable sort target and direction, and reload it later, or copy a shareable link. |
 
 ---
 
@@ -273,8 +254,8 @@ The whole loop takes under two minutes. The measure is then safe to expose to a 
 | "Run" button greyed out | No measure selected | Pick a measure; dimensions alone are not a query |
 | Grid empty after Run | Slicer chips exclude every row | Check the chip row below the Route badge; remove the offending chip |
 | Cell values look right but totals look wrong | Subtotals off while dimension nesting on | Enable the subtotals toggle |
-| Variant button shows all items as "not eligible" | Missing prerequisite: no time hierarchy on the measure's table, or no calendar type on the hierarchy | Check the reason text in the popover. See [Configure Time Variants](configure-time-variants.md) for the full prerequisite chain. |
-| Period-boundary variants show as "not eligible" | The associated time hierarchy has no calendar type configured | Edit the hierarchy in the Hierarchies panel and set a calendar type (standard, fiscal, hijri, or iso). See [Configure Time Variants](configure-time-variants.md). |
+| All variant kinds disabled in the Measures panel | Missing prerequisite: no time hierarchy on the measure's table, or no calendar type on the hierarchy | Check the reason text next to each disabled kind. See [Configure Time Variants](configure-time-variants.md) for the full prerequisite chain. |
+| Period-boundary variants disabled in the Measures panel | The associated time hierarchy has no calendar type configured | Edit the hierarchy in the Hierarchies panel and set a calendar type (standard, fiscal, hijri, or iso). See [Configure Time Variants](configure-time-variants.md). |
 | Cell click on calculated measure errors | Very old frontend cache | Hard-refresh; Phase 6 shipped the decomposed drawer |
 | Row labels read "(null)" after drilling into a hierarchy | Old frontend cache (pre-fix the grid did not re-run after an in-grid drill) | Hard-refresh; the grid now re-runs the query automatically on each drill step |
 

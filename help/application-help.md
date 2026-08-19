@@ -29,7 +29,7 @@ Generated inventory of frontend source locations that point to Tessallite help p
 | `tessallite/frontend/src/components/Builder/Drawer.tsx` | 67 | `/help/modelling/parameterized-filters.html` |
 | `tessallite/frontend/src/components/Builder/Drawer.tsx` | 68 | `/help/modelling/data-quality-rules.html` |
 | `tessallite/frontend/src/components/Builder/Drawer.tsx` | 69 | `/help/modelling/data-tags.html` |
-| `tessallite/frontend/src/components/Builder/Drawer.tsx` | 70 | `/help/modelling/impact-analysis.html` |
+| `tessallite/frontend/src/components/Builder/Drawer.tsx` | 70 | `/help/modelling/usage-downstream-assets.html` |
 | `tessallite/frontend/src/components/Builder/Drawer.tsx` | 71 | `/help/modelling/schema-changes.html` |
 | `tessallite/frontend/src/components/Builder/Drawer.tsx` | 75 | `/help/modelling/configure-aggregates.html` |
 | `tessallite/frontend/src/components/Builder/Drawer.tsx` | 76 | `/help/modelling/run-a-refresh.html` |

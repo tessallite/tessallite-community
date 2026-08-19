@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Excel Formulas That Stay Live — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Analyst Guides</span> / <span>Excel Formulas That Stay Live</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">end user</span><span class="updated">Updated 2026-08-04</span></div>
+    <h1>Excel Formulas That Stay Live</h1>
+<h2>What this covers</h2>
+<p>Sometimes you do not want a whole PivotTable — you want one governed number in one cell. A board pack with revenue in a sentence. A commentary sheet where the figures update themselves. This page covers the three formula families that do that with Tessallite: the <code>TESSALLITE.*</code> functions from the Excel add-in, the classic <code>GETPIVOTDATA</code>, and the CUBE formulas for the advanced path — and when to reach for each.</p>
+<h2>The three families at a glance</h2>
+<div class="table-wrapper"><table><thead><tr><th>Family</th><th>Comes from</th><th>One-cell example</th><th>Best for</th></tr></thead><tbody>
+<tr><td><code>TESSALLITE.VALUE</code> / <code>.KPI</code> / <code>.MEMBERVALUE</code></td><td>The Tessallite Excel add-in</td><td><code>=TESSALLITE.VALUE("modelx","net_sales")</code></td><td>Hand-built report sheets, commentary cells, small schedules</td></tr>
+<tr><td><code>GETPIVOTDATA</code></td><td>Any XMLA PivotTable</td><td><code>=GETPIVOTDATA("net_sales",$A$3,"product_name","Widget")</code></td><td>Pulling a figure out of a PivotTable you already have</td></tr>
+<tr><td><code>CUBEVALUE</code> / <code>CUBEMEMBER</code></td><td>The add-in's CUBE formula wizard</td><td>generated for you</td><td>Large formula-driven grids over a live OLAP connection</td></tr>
+</tbody></table></div>
+<p>All three are live. None of them is a paste. Refresh the workbook and every one of them re-asks Tessallite the question.</p>
+<h2>TESSALLITE.VALUE — a governed number in a cell</h2>
+<p>The simplest of the three. With the add-in signed in and a model selected, type:</p>
+<pre><code>=TESSALLITE.VALUE("modelx", "net_sales")</code></pre>
+<p>The cell now holds net sales for the whole model — computed by Tessallite and respecting your security. The custom function returns the governed value; apply the Excel number format you want to the cell. Add filters as extra pairs of arguments when you want a slice:</p>
+<pre><code>=TESSALLITE.VALUE("modelx", "net_sales", "country_code", "US")</code></pre>
+<p>That is net sales for the US only, still one cell, still live.</p>
+<p>A few things worth knowing before you build a whole sheet of these:</p>
+<ul>
+<li><strong>Calls are batched.</strong> A sheet with fifty <code>TESSALLITE.VALUE</code> cells does not send fifty separate requests; calls made during the same recalculation are grouped together. The returned <code>VALUE</code> and <code>MEMBERVALUE</code> results are not held in a 60-second result cache.</li>
+<li><strong>KPI and named-list lookups use a 60-second cache.</strong> Click <strong>Refresh</strong> in the Report Builder footer to clear those caches and recalculate the workbook immediately.</li>
+<li><strong>The formula checks the model.</strong> If you open the workbook while the task pane has a different model selected, the cell tells you so in plain words instead of quietly returning a number from the wrong model. Switch the task pane back to <code>modelx</code> and refresh.</li>
+<li><strong>Switching persona changes the numbers.</strong> That is the security working as designed: a persona that cannot see a measure gets no value from it, in a formula exactly as in a PivotTable.</li>
+</ul>
+<blockquote><p><strong>A worked example — the self-updating sentence.</strong> In cell B2 Maya writes <code>="Net sales this period: "&amp;TEXT(TESSALLITE.VALUE("modelx","net_sales"),"#,##0")</code>. The sentence in the board pack now carries a real, current figure every time the workbook opens. Nobody re-keys it; nobody pastes the wrong week's number.</p></blockquote>
+<h2>TESSALLITE.KPI — the traffic light in a cell</h2>
+<pre><code>=TESSALLITE.KPI("modelx", "Net Sales", "value")
+=TESSALLITE.KPI("modelx", "Net Sales", "goal")
+=TESSALLITE.KPI("modelx", "Net Sales", "status")</code></pre>
+<p>Three properties: the headline number, the target, and the governed verdict. Status returns <code>1</code> (green), <code>0</code> (amber), or <code>-1</code> (red) — deliberately numeric, so Excel's <strong>Conditional Formatting &gt; Icon Sets</strong> can turn the cell into an actual traffic light with two clicks.</p>
+<p>This is the same verdict the KPI card shows in the add-in, the same one a PivotTable KPI folder shows, and the same one the Tessallite scorecard shows. One definition, four surfaces.</p>
+<h2>TESSALLITE.MEMBERVALUE — one measure, one member</h2>
+<pre><code>=TESSALLITE.MEMBERVALUE("modelx", "net_sales", "product_name", "Widget")</code></pre>
+<p>This reads like the filtered <code>TESSALLITE.VALUE</code> and that is close to true — it exists for small hand-built schedules where you want, say, five named products down column A and a measure beside each, without a PivotTable's structure. Point each row's formula at the member name in column A (for example <code>=TESSALLITE.MEMBERVALUE("modelx","net_sales","product_name",A4)</code>) and the schedule fills itself — and keeps filling itself on every refresh.</p>
+<h2>GETPIVOTDATA — borrow from a PivotTable you trust</h2>
+<p>If the number you want is already sitting in a PivotTable on another sheet, <code>GETPIVOTDATA</code> reaches in and takes it by name:</p>
+<pre><code>=GETPIVOTDATA("net_sales", $A$3, "product_name", "Widget")</code></pre>
+<p>The formula refers to the PivotTable (the <code>$A$3</code> corner) and the field names, not to a cell address — so when the PivotTable grows, shrinks, or re-sorts, the formula still finds the right value. Tessallite resolves it as a point query against the model, which means it stays correct through every refresh.</p>
+<p><strong>When this beats TESSALLITE.VALUE:</strong> when the PivotTable already applies the filters you want (a timeline, a Top 10, a slicer selection). The formula inherits all of that context for free, instead of you re-typing it as filter arguments.</p>
+<h2>CUBE formulas — the advanced path</h2>
+<p>The add-in's <strong>CUBE formula wizard</strong> generates native Excel OLAP formulas — <code>CUBEVALUE</code>, <code>CUBEMEMBER</code>, <code>CUBESET</code> — over a workbook connection named <code>Tessallite</code>. These shine for big formula-driven grids: a hundred members down the side, five measures across the top, every cell a live cube reference.</p>
+<p>Reach for them when a PivotTable's layout is too rigid and <code>TESSALLITE.*</code> cells would need too much hand-wiring. The wizard writes the formulas for you, so you never have to remember the syntax. One caveat from the add-in guide: local PivotTable inserts only accept additive standard measures — for calculated, time-variant, or semi-additive measures, the CUBE path (or an Insert Table) is the right tool, because Excel must not re-add a value that is only correct at its governed grain.</p>
+<h2>Which one when</h2>
+<ul>
+<li>Building a commentary sheet or board pack with a dozen figures? <strong><code>TESSALLITE.VALUE</code></strong> and <strong><code>TESSALLITE.KPI</code></strong>.</li>
+<li>The figure already exists in a PivotTable on another sheet? <strong><code>GETPIVOTDATA</code></strong>.</li>
+<li>A large grid of members by measures, all formula-driven? <strong>CUBE wizard</strong>.</li>
+<li>Need a whole table, not cells? That is a PivotTable or an add-in Insert Table — see <a href="build-your-first-excel-dashboard.html">Build Your First Excel Dashboard</a>.</li>
+</ul>
+<blockquote><p><strong>Common trap: the hard-coded "temporary" number.</strong> Someone types this week's revenue into a cell "just for the meeting", and eighteen months later the board is still reading it. Every formula on this page costs one minute once and is right forever. The paste is never cheaper in the end.</p></blockquote>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr></thead><tbody>
+<tr><td><code>TESSALLITE.*</code> cells show an error about the model</td><td>Task pane has a different model selected than the formula names</td><td>Select the model the formula names, then Refresh</td></tr>
+<tr><td>Functions return nothing at all</td><td>Add-in not signed in, or no model selected</td><td>Open the task pane, sign in, pick the model</td></tr>
+<tr><td>A KPI formula still shows its prior value</td><td>KPI evaluations can remain cached for up to 60 seconds, or the workbook has not recalculated</td><td>Click <strong>Refresh</strong> in the Report Builder footer for a full fresh pass</td></tr>
+<tr><td><code>GETPIVOTDATA</code> returns <code>#REF!</code></td><td>The PivotTable no longer shows the field the formula asks for</td><td>Re-add the field to the PivotTable, or adjust the formula</td></tr>
+<tr><td>A KPI name is not found</td><td>The KPI was renamed in the model</td><td>Update the formula to the new name — names are the contract</td></tr>
+</tbody></table></div>
+<h2>Related</h2>
+<ul>
+<li><a href="../integrations/excel-add-in.html">Tessallite Excel Add-in</a></li>
+<li><a href="../integrations/excel-pivottable-features.html">Excel PivotTable Features</a></li>
+<li><a href="build-your-first-excel-dashboard.html">Build Your First Excel Dashboard</a></li>
+<li><a href="../concepts/kpis.html">KPIs (Key Performance Indicators)</a></li>
+</ul>
+<nav class="page-nav"><a href="build-a-report-with-the-excel-add-in.html" class="page-nav-btn prev">&larr; Build a Report with the Excel Add-in</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="build-a-power-bi-report.html" class="page-nav-btn next">Build a Power BI Report &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

@@ -241,6 +241,27 @@ async def get_setting(
     return _default_for_key(key)
 
 
+async def get_setting_system_explicit(
+    key: str, system_session: AsyncSession
+) -> Any:
+    """Return the EXPLICITLY-stored system value for *key*, or ``None``.
+
+    Unlike :func:`get_setting`, this never substitutes the registry default:
+    an absent (or JSON-null) system row returns ``None``. Callers that own
+    additional lower tiers — an environment variable, then a hardcoded
+    constant — need to tell "operator stored nothing" apart from "operator
+    stored a value that happens to equal the default"; folding the default in
+    (as ``get_setting`` / ``system_snapshot_get`` do) collapses that
+    distinction and makes the lower tiers unreachable (Bug-8108 F3 / R2).
+    """
+    if not has_key(key, "system"):
+        return None
+    present, val = await _read_system(system_session, key)
+    if present and val is not None:
+        return coerce(val, _find_def_for_key(key))
+    return None
+
+
 async def get_settings_bulk(
     keys: list[str],
     *,

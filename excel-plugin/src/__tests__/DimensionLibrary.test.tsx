@@ -43,3 +43,33 @@ describe('DimensionLibrary compatibility guidance', () => {
     expect(onAddToRows).not.toHaveBeenCalled();
   });
 });
+
+describe('DimensionLibrary member-preview close + header (Bug-6713 / Bug-6712)', () => {
+  it('renders the member-preview close control as a real button wired to onCloseMemberPreview, and the header from the central string table', () => {
+    const onCloseMemberPreview = vi.fn();
+    render(
+      <DimensionLibrary
+        dimensions={DIMENSIONS}
+        searchQuery=""
+        onAddToRows={vi.fn()}
+        onAddToColumns={vi.fn()}
+        onAddToFilter={vi.fn()}
+        onPreviewMembers={vi.fn()}
+        expanded
+        onToggleExpanded={vi.fn()}
+        memberPreviewDimId="dim-product"
+        memberPreview={{ members: [{ key: 'A', name: 'Alpha' }] }}
+        membersPreviewLoading={false}
+        onCloseMemberPreview={onCloseMemberPreview}
+      />,
+    );
+
+    // Bug-6712: the header label comes from templates.library.dimensionsHeader.
+    expect(screen.getByText('Dimensions (1)')).toBeDefined();
+
+    // Bug-6713: the close control was a mouse-only span; it must be a real
+    // button (focusable, Enter/Space activatable) with an accessible name.
+    fireEvent.click(screen.getByRole('button', { name: 'Close member preview' }));
+    expect(onCloseMemberPreview).toHaveBeenCalledTimes(1);
+  });
+});

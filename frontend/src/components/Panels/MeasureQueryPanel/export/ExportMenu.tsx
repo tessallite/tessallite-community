@@ -60,6 +60,10 @@ export default function ExportMenu({
         showGrandTotals,
         emptyCellMode,
         rowKeyOrder,
+        labels: {
+          subtotalSuffix: t("pivotGrid.total"),
+          grandTotal: t("pivotGrid.grandTotal"),
+        },
       }),
     );
     close();
@@ -84,6 +88,11 @@ export default function ExportMenu({
       showGrandTotals,
       emptyCellMode,
       rowKeyOrder,
+      labels: {
+        worksheetName: t("pivotGrid.pivot"),
+        subtotalSuffix: t("pivotGrid.total"),
+        grandTotal: t("pivotGrid.grandTotal"),
+      },
     });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");

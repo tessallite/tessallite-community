@@ -3,6 +3,7 @@ Hierarchy CRUD, level CRUD, and reorder routes.
 """
 from __future__ import annotations
 
+import hashlib
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from uuid import UUID
@@ -13,6 +14,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 import sqlglot
 from sqlglot import exp
@@ -25,10 +27,16 @@ from shared.schemas.measure_formats import (
     is_valid_dimension_kind,
     is_valid_time_unit,
 )
+from shared.semantic.calendar_dialects import (
+    CALENDAR_COLUMN_SETS,
+    EXPRESSION_CAPABLE_CALENDAR_TYPES,
+    TABLE_BOUND_CALENDAR_TYPES,
+)
 from shared.semantic.calendar_types import (
     CALENDAR_TYPES,
     normalize_calendar_type,
 )
+from shared.semantic.graph_order import is_fact_table
 from shared.db.models import (
     CalendarTable,
     DataSource,
@@ -69,10 +77,11 @@ from shared.schemas.pydantic_models import (
     HierarchyUpdate,
     UnassignedDateColumn,
 )
+from src.api._model_lock import acquire_model_definition_lock
 from src.auth.middleware import CurrentUser, enforce_model_scope, get_current_user
 from src.auth.rbac import require_role
 from src.api._persona_scope import get_excluded_level_attribute_ids, parse_allowed_ids, resolve_effective_persona
-from shared.security import Principal, compile_row_security
+from shared.security import Principal, RowSecurityCompileError, compile_row_security
 
 from shared.connector_qualify import CONNECTOR_TO_SQLGLOT as _CONNECTOR_TO_SQLGLOT, transpile_preview_sql
 
@@ -81,6 +90,14 @@ from shared.connector_qualify import CONNECTOR_TO_SQLGLOT as _CONNECTOR_TO_SQLGL
 # Register missing sqlglot dialect generators (sqlglot 30.x gaps)
 # ---------------------------------------------------------------------------
 from shared.sqlglot_compat import register_bigquery_patches
+from shared.semantic.join_keyword import split_join_token
+
+# A calendar dimension-alias join runs owning-table -> calendar alias: many
+# rows to one calendar day. Derived ONCE through the shared classifier so the
+# orientation and the cardinality can never disagree, and so this write path
+# cannot re-introduce a cardinality token into ``Join.join_type``
+# (join-orientation contract, invariant 3).
+_CALENDAR_ALIAS_JOIN_TYPE, _CALENDAR_ALIAS_CARDINALITY = split_join_token("many_to_one")
 register_bigquery_patches()
 
 
@@ -139,6 +156,56 @@ DATE_HIERARCHY_TEMPLATES: dict[str, list[tuple[str, str]]] = {
     ],
     "y_w_d": [("year", "Year"), ("week", "Week"), ("day", "Day")],
     "y_m_w_d": [("year", "Year"), ("month", "Month"), ("week", "Week"), ("day", "Day")],
+}
+
+# Bug-7203/7204: calendar-type-specific hierarchy level templates.
+# Each entry maps a calendar type to its default hierarchy levels as a list of
+# (component, level_display_name) tuples.  For expression-capable types the
+# component drives the _date_component_expression UDA generator.  For
+# table-bound types the component names match the physical column names on the
+# calendar table (from CALENDAR_COLUMN_SETS in calendar_dialects.py), and levels
+# are built from those columns directly.
+#
+# These templates implement the spec in architecture_multi-calendar.md
+# "Hierarchy Pre-Population by Calendar Type".
+CALENDAR_HIERARCHY_TEMPLATES: dict[str, list[tuple[str, str]]] = {
+    "standard": [
+        ("year", "Year"), ("half_year", "Half-Year"), ("quarter", "Quarter"),
+        ("month", "Month"), ("week", "Week"), ("day", "Day"),
+    ],
+    "fiscal": [
+        ("year", "Fiscal Year"), ("half_year", "Fiscal Half"),
+        ("quarter", "Fiscal Quarter"), ("month", "Fiscal Period"), ("day", "Day"),
+    ],
+    "iso_week": [
+        ("year", "ISO Year"), ("week", "ISO Week"), ("day", "Day"),
+    ],
+    "thai_buddhist": [
+        ("year", "Thai Year"), ("quarter", "Quarter"),
+        ("month", "Month"), ("day", "Day"),
+    ],
+    "retail_445": [
+        ("retail_year", "Retail Year"), ("retail_quarter", "Retail Quarter"),
+        ("retail_period", "Retail Period"), ("retail_week", "Retail Week"),
+    ],
+    "hijri": [
+        ("hijri_year", "Hijri Year"), ("hijri_month", "Hijri Month"),
+        ("hijri_day", "Hijri Day"),
+    ],
+}
+
+# Bug-7204: for table-bound calendar types, map each hierarchy component to
+# the physical column name on the calendar table and a time_unit value.
+# These are used to build hierarchy levels from actual calendar table columns
+# rather than from EXTRACT-based UDA expressions.
+_TABLE_BOUND_COMPONENT_TO_COLUMN: dict[str, dict[str, str]] = {
+    "retail_year": {"column": "retail_year", "time_unit": "year"},
+    "retail_quarter": {"column": "retail_quarter", "time_unit": "quarter"},
+    "retail_period": {"column": "retail_period", "time_unit": "month"},
+    "retail_week": {"column": "retail_week", "time_unit": "week"},
+    "hijri_year": {"column": "hijri_year", "time_unit": "year"},
+    "hijri_month": {"column": "hijri_month", "time_unit": "month"},
+    "hijri_day": {"column": "hijri_day", "time_unit": "day"},
 }
 settings = get_settings()
 _logger = logging.getLogger(__name__)
@@ -316,6 +383,51 @@ def _slugify_name(raw: str) -> str:
     return out.strip("_") or "attribute"
 
 
+# Persisted name columns for auto-generated calendar aliases, hierarchies,
+# UDAs and dimensions are all varchar(255). Auto-generation derives these
+# from user-facing labels, so a pathological label (or a regression that lets
+# a name grow) must never raise asyncpg StringDataRightTruncationError on the
+# INSERT. This is a backstop only — the primary defence is deriving names from
+# stable base columns and never re-consuming generated calendar-internal
+# attributes (see _get_unassigned_date_cols).
+_NAME_COLUMN_LIMIT = 255
+
+
+def _clamp_to_limit(value: str | None, limit: int = _NAME_COLUMN_LIMIT) -> str | None:
+    """Clamp *value* to *limit* characters.
+
+    When truncation is required, a deterministic hash of the full value is
+    appended so distinct over-long inputs keep distinct clamped outputs
+    (uniqueness preserved for the model-scoped unique constraints on alias,
+    hierarchy name, UDA name and dimension name).
+
+    Bug-6706: the original 8-hex SHA-1 suffix gave only 32 bits of collision
+    resistance — brute-forceable and likely to collide on large models with
+    many auto-generated names. Upgraded to 16 hex chars of SHA-256 (64-bit
+    collision resistance), which is practical for model-scoped uniqueness
+    constraints and infeasible to brute-force.
+    """
+    if value is None or len(value) <= limit:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+    keep = limit - len(digest) - 1
+    if keep < 1:
+        return digest[:limit]
+    return f"{value[:keep]}_{digest}"
+
+
+def _calendar_hier_label(display_name: str | None, column_name: str) -> str:
+    """The clamped '<label> Calendar' name used for an auto-generated date
+    hierarchy and its calendar-alias display_name.
+
+    Single source of truth shared by both generators
+    (_auto_create_date_hierarchies_for_model and the batch-date endpoint) so
+    they persist byte-identical, varchar(255)-safe names and therefore
+    recognise each other's existing hierarchies instead of creating duplicates.
+    """
+    return _clamp_to_limit(f"{display_name or column_name} Calendar")
+
+
 async def _next_calendar_alias(db, model_id: UUID, col_name: str, used: set[str]) -> str:
     """Return '{col_slug}_calendar', auto-sequenced if already taken in model or used set."""
     existing = set(
@@ -323,7 +435,10 @@ async def _next_calendar_alias(db, model_id: UUID, col_name: str, used: set[str]
             await db.execute(select(ModelTable.alias).where(ModelTable.model_id == model_id))
         ).scalars().all()
     ) | used
-    base = f"{_slugify_name(col_name)}_calendar"
+    # Clamp the base leaving headroom for the "_<n>" uniqueness suffix so the
+    # persisted alias (varchar(255)) can never overflow even for a very long
+    # column name.
+    base = _clamp_to_limit(f"{_slugify_name(col_name)}_calendar", _NAME_COLUMN_LIMIT - 8)
     if base not in existing:
         return base
     n = 2
@@ -333,6 +448,12 @@ async def _next_calendar_alias(db, model_id: UUID, col_name: str, used: set[str]
 
 
 def _date_component_expression(source_expr: str, component: str) -> str:
+    """Gregorian (standard-calendar) level-key expression for a date component.
+
+    This is the calendar-AGNOSTIC baseline. For fiscal / ISO / Thai calendars
+    the period boundaries differ; ``_calendar_component_expression`` overlays
+    the calendar-specific math and delegates here for the standard cases.
+    """
     base = f"({source_expr})"
     if component == "year":
         return f"EXTRACT(YEAR FROM {base})"
@@ -351,6 +472,113 @@ def _date_component_expression(source_expr: str, component: str) -> str:
         field="template",
         code="D2",
     )
+
+
+def _calendar_component_expression(
+    source_expr: str,
+    component: str,
+    calendar_type: str | None = None,
+    fiscal_year_start_month: int | None = None,
+) -> str:
+    """Calendar-aware level-key expression for a generated date hierarchy.
+
+    F-016-01 (CRITICAL, wrong numbers): a generated ``Fiscal Year`` / ``ISO
+    Year`` / ``Thai Year`` level must bucket the SAME way as the calendar-table
+    column and the time-variant SQL, not a bare Gregorian ``EXTRACT(YEAR ...)``.
+    Previously every expression-capable calendar type shared the Gregorian
+    helper, so under an April fiscal calendar 2025-03-31 grouped as year 2025
+    while the calendar table's ``year_no`` (and every YTD/QTD variant) said
+    2024; ISO week-1 boundary days filed under the wrong year; Thai Year showed
+    2025 instead of 2568.
+
+    The expressions here are IDENTICAL in semantics to the canonical forms in
+    ``shared.semantic.calendar_dialects._emit_standard`` (calendar table) and
+    ``shared.semantic.time_variants_sql._extract_period`` (variant SQL) so all
+    three agree end to end:
+
+    * fiscal year (fys != 1):  CASE WHEN month >= fys THEN year ELSE year-1 END
+    * fiscal quarter (fys!=1):  FLOOR(MOD(month - fys + 12, 12) / 3) + 1
+    * fiscal half (fys != 1):   H1 for fiscal quarters 1-2, else H2
+    * fiscal period (F-016-18): MOD(month - fys + 12, 12) + 1  (1 = first
+                                fiscal month; for fys == 1 this is the calendar
+                                month, so standard behaviour is preserved)
+    * iso_week year:            EXTRACT(ISOYEAR FROM d)
+    * thai year:                EXTRACT(YEAR FROM d) + 543
+
+    The result is stored canonical PostgreSQL and transpiled to the source
+    dialect at execution time (SQL rule 1). Only expression-capable calendar
+    types reach this helper; table-bound types (retail_445, hijri) key their
+    hierarchy levels on physical calendar columns (see the ``column_id_map``
+    branch of ``_create_date_hierarchy_for_alias``).
+    """
+    cal = normalize_calendar_type(calendar_type) or "standard"
+    # F-016-01 (safety belt, mirrors time_variants_sql._extract_period): a
+    # table-bound calendar (retail_445, hijri) cannot have its hierarchy level
+    # keys computed from a Gregorian expression on the fact date — its retail /
+    # Hijri period boundaries live in the materialised calendar table's own
+    # columns. Reaching this helper with a table-bound type means the caller
+    # tried to build an expression-based date hierarchy for a type that requires
+    # a bound calendar table (e.g. the explicit generate-date endpoint with
+    # calendar_type=retail_445). Fail loud instead of silently emitting Gregorian
+    # (WRONG) keys; the correct path is calendar bind + auto-create, which keys
+    # levels on the physical calendar columns.
+    if cal in TABLE_BOUND_CALENDAR_TYPES:
+        raise _validation_error(
+            f"Calendar type '{cal}' is table-bound: its date-hierarchy level "
+            f"keys must come from the bound calendar table's period columns, not "
+            f"a Gregorian expression on the fact date. Bind the calendar and use "
+            f"calendar auto-create instead of an expression-based date hierarchy.",
+            field="calendar_type",
+            code="C1",
+        )
+    # Standard/Gregorian and the raw day level are calendar-agnostic — keep the
+    # baseline expression byte-identical so standard hierarchies never change.
+    if cal == "standard" or component == "day":
+        return _date_component_expression(source_expr, component)
+
+    base = f"({source_expr})"
+    fys = fiscal_year_start_month or 1
+
+    if component == "year":
+        if cal == "iso_week":
+            return f"EXTRACT(ISOYEAR FROM {base})"
+        if cal == "thai_buddhist":
+            return f"EXTRACT(YEAR FROM {base}) + 543"
+        if cal == "fiscal" and fys != 1:
+            return (
+                f"CASE WHEN EXTRACT(MONTH FROM {base}) >= {fys} "
+                f"THEN EXTRACT(YEAR FROM {base}) "
+                f"ELSE EXTRACT(YEAR FROM {base}) - 1 END"
+            )
+        return _date_component_expression(source_expr, component)
+
+    if component == "quarter":
+        if cal == "fiscal" and fys != 1:
+            return (
+                f"FLOOR(MOD(EXTRACT(MONTH FROM {base}) - {fys} + 12, 12) / 3) + 1"
+            )
+        return _date_component_expression(source_expr, component)
+
+    if component == "half_year":
+        if cal == "fiscal" and fys != 1:
+            fiscal_qtr = (
+                f"FLOOR(MOD(EXTRACT(MONTH FROM {base}) - {fys} + 12, 12) / 3) + 1"
+            )
+            return f"CASE WHEN {fiscal_qtr} <= 2 THEN 1 ELSE 2 END"
+        return _date_component_expression(source_expr, component)
+
+    if component == "month":
+        # F-016-18: under a fiscal calendar the hierarchy month level is the
+        # FISCAL PERIOD (1 = the first month of the fiscal year), so a drill on
+        # a fiscal hierarchy counts months the way the business does. For a
+        # non-fiscal calendar the month is the plain calendar month.
+        if cal == "fiscal":
+            return f"MOD(EXTRACT(MONTH FROM {base}) - {fys} + 12, 12) + 1"
+        return _date_component_expression(source_expr, component)
+
+    # week (ISO on Postgres for both standard and iso_week) and any other
+    # component fall back to the Gregorian baseline.
+    return _date_component_expression(source_expr, component)
 
 
 async def _find_reusable_uda_names(
@@ -611,7 +839,7 @@ async def _resolve_attribute(
         name = uda.name
         table_name = table.alias or table.display_name or table.physical_name
 
-    if require_dimension_table and table.table_type == "fact":
+    if require_dimension_table and is_fact_table(table):
         raise _validation_error(
             f"Attribute '{name}' belongs to a fact table. Hierarchy levels can only use dimension table attributes.",
             field="key_attribute_id",
@@ -736,6 +964,37 @@ async def _delete_unreferenced_generated_udas(
     return deletable
 
 
+def _calendar_instance_clause(model_id: UUID):
+    """SQL boolean: the enclosing query's ``ModelTable`` row is a calendar
+    instance in *model_id* — the single source of truth for "calendar-internal"
+    used by the unassigned-date scan, the assigned-join test and the
+    hierarchy-delete companion-alias collector (Bug-6683).
+
+    Three shapes qualify:
+      * marked alias (``calendar_table_id`` set) — normal auto-create output;
+      * calendar spine (``table_type == 'calendar'``) — the registered
+        calendar source table, whose backlink can be NULL when unbound;
+      * unmarked alias — batch-date against an UNBOUND spine creates
+        ``dim_detail`` aliases with ``calendar_table_id = NULL``; they are
+        identified by sharing a spine's SOURCE-SCOPED physical_name
+        (correlated EXISTS, so a same-named table in a different source does
+        NOT qualify).
+    """
+    spine = aliased(ModelTable)
+    return or_(
+        ModelTable.calendar_table_id.is_not(None),
+        ModelTable.table_type == "calendar",
+        select(spine.id)
+        .where(
+            spine.model_id == model_id,
+            spine.table_type == "calendar",
+            spine.source_id == ModelTable.source_id,
+            spine.physical_name == ModelTable.physical_name,
+        )
+        .exists(),
+    )
+
+
 async def _collect_companion_alias_table_ids(
     db, *, model_id: UUID, levels: list[HierarchyLevel]
 ) -> set[UUID]:
@@ -746,9 +1005,24 @@ async def _collect_companion_alias_table_ids(
     companion ``dim_detail`` alias ModelTable — one per fact date column — that
     carries a calendar date-key column + the level UDAs, joined many-to-one to
     the fact column (hierarchies.py ``_auto_create_date_hierarchies_for_model``
-    / ``batch-date``). A candidate alias has ``calendar_table_id`` set; the
-    fact/dimension tables a *user* hierarchy keys on never do, so they are
-    never collected here.
+    / ``batch-date``). Candidates are DEDICATED companion aliases only:
+    ``table_type == 'dim_detail'`` rows that are calendar instances per
+    ``_calendar_instance_clause`` — i.e. marked aliases (calendar_table_id
+    set) and UNMARKED aliases created by batch-date against an unbound
+    calendar (calendar_table_id NULL, spine physical_name match), which the
+    previous marker-only predicate leaked on delete, leaving the alias + join
+    behind so recreate cycles accumulated ``_2``-suffixed aliases (Bug-6683
+    external review).
+
+    Calendar SPINE registrations (``table_type == 'calendar'``) are explicitly
+    NOT candidates: a spine is the model's calendar registration, never a
+    per-fact-column companion, and deleting a user hierarchy that happens to
+    key on a spine-hosted UDA must not tear the registration down (Bug-6683
+    round-4 external review; this also tightens the pre-existing
+    collectability of bound spines under the old marker-only predicate). The
+    fact/dimension tables a *user* hierarchy keys on never match the clause,
+    so they are never collected here; the reference scan in
+    ``_delete_orphaned_companion_aliases`` remains the deletion safety net.
     """
     uda_ids = [
         lvl.key_attribute_id
@@ -762,7 +1036,8 @@ async def _collect_companion_alias_table_ids(
         .join(UserDefinedAttribute, UserDefinedAttribute.table_id == ModelTable.id)
         .where(
             ModelTable.model_id == model_id,
-            ModelTable.calendar_table_id.is_not(None),
+            ModelTable.table_type == "dim_detail",
+            _calendar_instance_clause(model_id),
             UserDefinedAttribute.id.in_(uda_ids),
         )
     )
@@ -1274,6 +1549,7 @@ async def create_hierarchy(
 ) -> HierarchyDetailResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         if not is_valid_dimension_kind(body.dimension_kind):
             raise _validation_error(
                 f"Unsupported dimension_kind '{body.dimension_kind}'.",
@@ -1314,7 +1590,7 @@ async def list_hierarchies(
     current_user: CurrentUser = Depends(get_current_user),
     _: None = require_role("viewer"),
 ) -> list[HierarchySummaryResponse]:
-    enforce_model_scope(current_user, str(model_id))
+    enforce_model_scope(current_user, str(model_id), project_id=str(project_id))
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
         persona = await resolve_effective_persona(
@@ -1388,7 +1664,7 @@ async def get_hierarchy(
     current_user: CurrentUser = Depends(get_current_user),
     _: None = require_role("viewer"),
 ) -> HierarchyDetailResponse:
-    enforce_model_scope(current_user, str(model_id))
+    enforce_model_scope(current_user, str(model_id), project_id=str(project_id))
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
         persona = await resolve_effective_persona(
@@ -1421,6 +1697,7 @@ async def update_hierarchy(
 ) -> HierarchyDetailResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         hierarchy = await _load_hierarchy_or_404(db, model_id, hierarchy_id)
         updates = body.model_dump(exclude_unset=True)
         if "type" in updates:
@@ -1477,6 +1754,7 @@ async def delete_hierarchy(
 
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         hierarchy = await _load_hierarchy_or_404(db, model_id, hierarchy_id)
 
         levels = await _levels_for_hierarchy(db, hierarchy_id)
@@ -1535,6 +1813,7 @@ async def create_hierarchy_level(
 ) -> HierarchyLevelResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         await _load_hierarchy_or_404(db, model_id, hierarchy_id)
         existing_levels = await _levels_for_hierarchy(db, hierarchy_id)
         if body.ordinal > len(existing_levels):
@@ -1636,7 +1915,7 @@ async def list_hierarchy_levels(
     current_user: CurrentUser = Depends(get_current_user),
     _: None = require_role("viewer"),
 ) -> list[HierarchyLevelResponse]:
-    enforce_model_scope(current_user, str(model_id))
+    enforce_model_scope(current_user, str(model_id), project_id=str(project_id))
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
         persona = await resolve_effective_persona(
@@ -1672,6 +1951,7 @@ async def reorder_hierarchy_levels(
 ) -> list[HierarchyLevelResponse]:
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         await _load_hierarchy_or_404(db, model_id, hierarchy_id)
         levels = await _levels_for_hierarchy(db, hierarchy_id)
         existing_ids = {lvl.id for lvl in levels}
@@ -1710,6 +1990,7 @@ async def update_hierarchy_level(
 ) -> HierarchyLevelResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         await _load_hierarchy_or_404(db, model_id, hierarchy_id)
         level = await _load_level_or_404(db, hierarchy_id=hierarchy_id, level_id=level_id)
         updates = body.model_dump(exclude_unset=True)
@@ -1840,6 +2121,7 @@ async def delete_hierarchy_level(
 ) -> None:
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         await _load_hierarchy_or_404(db, model_id, hierarchy_id)
         levels = await _levels_for_hierarchy(db, hierarchy_id)
         if len(levels) <= 2:
@@ -1882,6 +2164,7 @@ async def generate_date_hierarchy(
 ) -> HierarchyGeneratedResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         source_kind = _normalize_source(body.source_attribute_source, field="source_attribute_source")
         # Generated UDA expressions are stored canonical (PostgreSQL); the source
         # dialect is applied only at execution time. Resolve in postgres so the
@@ -1925,9 +2208,25 @@ async def generate_date_hierarchy(
 
         base_name = _slugify_name(source_sql.resolved.ref.name)
         canonical_col_expr = source_sql.expression
-        generated_names = [f"{base_name}_{component}" for component, _ in components]
+        # Clamp generated UDA/dimension names to varchar(255): base_name derives
+        # from a user attribute name that may itself be up to 255 chars, so
+        # "<base>_<component>" can overflow UserDefinedAttribute.name /
+        # Dimension.name and raise an unhandled StringDataRightTruncationError
+        # (the IntegrityError guard below does not catch DataError). Same #3
+        # backstop as _create_date_hierarchy_for_alias.
+        generated_names = [
+            _clamp_to_limit(f"{base_name}_{component}") for component, _ in components
+        ]
+        # F-016-01: apply the hierarchy's calendar type/fiscal start to the
+        # level-key expressions so a fiscal/ISO/Thai date hierarchy buckets the
+        # way its calendar counts, not Gregorian.
         gen_expressions = [
-            _date_component_expression(canonical_col_expr, component)
+            _calendar_component_expression(
+                canonical_col_expr,
+                component,
+                calendar_type=normalize_calendar_type(body.calendar_type),
+                fiscal_year_start_month=body.fiscal_year_start_month,
+            )
             for component, _ in components
         ]
         reusable = await _find_reusable_uda_names(
@@ -2007,7 +2306,7 @@ async def generate_date_hierarchy(
                         Dimension(
                             model_id=model_id,
                             name=gen_name,
-                            display_name=f"{level_name} ({body.name})",
+                            display_name=_clamp_to_limit(f"{level_name} ({body.name})"),
                             user_defined_attribute_id=uda.id,
                             is_time_dim=True,
                             time_grain=time_grain,
@@ -2050,6 +2349,7 @@ async def generate_segment_hierarchy(
 ) -> HierarchyGeneratedResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         source_kind = _normalize_source(body.source_attribute_source, field="source_attribute_source")
         # Stored canonical (PostgreSQL); source dialect applied at execution time.
         source_sql = await _resolve_sql_attribute(
@@ -2134,7 +2434,13 @@ async def generate_segment_hierarchy(
             }
 
         base_name = _slugify_name(source_sql.resolved.ref.name)
-        generated_names = [f"{base_name}_seg_{idx + 1}" for idx in range(len(level_names))]
+        # Clamp generated UDA/dimension names to varchar(255) (same #3 backstop
+        # as the date-generate path): base_name derives from a user attribute
+        # name of up to 255 chars, so "<base>_seg_<n>" can overflow
+        # UserDefinedAttribute.name / Dimension.name.
+        generated_names = [
+            _clamp_to_limit(f"{base_name}_seg_{idx + 1}") for idx in range(len(level_names))
+        ]
         reusable = await _find_reusable_uda_names(
             db,
             model_id=model_id,
@@ -2259,7 +2565,7 @@ async def preview_hierarchy(
     current_user: CurrentUser = Depends(get_current_user),
     _: None = require_role("viewer"),
 ) -> HierarchyPreviewResponse:
-    enforce_model_scope(current_user, str(model_id))
+    enforce_model_scope(current_user, str(model_id), project_id=str(project_id))
     bearer = _extract_bearer(request)
 
     async for db in get_tenant_db(current_user.tenant_id):
@@ -2279,11 +2585,36 @@ async def preview_hierarchy(
             if allowed_hier is not None and hierarchy.id not in allowed_hier:
                 raise HTTPException(status_code=404, detail="Hierarchy not found")
 
-        # Compile RLS predicate if persona doesn't bypass row security.
+        # Bug-7205: compile RLS predicate unconditionally for the requesting
+        # principal. RLS rules (role_predicate, user_mapping) fire for
+        # principals with or without personas. Skip ONLY when an explicit
+        # bypass_row_security persona is present.
         rls_where: str | None = None
-        if persona and not persona.bypass_row_security:
+        if persona is None or not persona.bypass_row_security:
             principal = Principal.from_current_user(current_user)
-            compiled = await compile_row_security(model_id, principal, db)
+            try:
+                compiled = await compile_row_security(model_id, principal, db)
+            except RowSecurityCompileError as exc:
+                # F-007-16 / Bug-9021: same typed 422 as /execute. Do not
+                # import query-router _sql_disclosure from model-service.
+                _logger.warning(
+                    "row-security rule failed to compile on hierarchy preview: "
+                    "%s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "message": (
+                            "A row-level security rule on this model is "
+                            "misconfigured and could not be compiled. The "
+                            "query was blocked (fail closed); ask a modeler "
+                            "to fix the rule's predicate."
+                        ),
+                        "error_type": "row_security_misconfigured",
+                    },
+                )
             if compiled is not None:
                 rls_where = compiled.sql_expression
 
@@ -2644,22 +2975,34 @@ async def _get_unassigned_date_cols(
     db,
     model_id: UUID,
 ) -> list[_UnassignedDateAttr]:
+    # A fact column already joined to ANY calendar instance (marked alias,
+    # spine, or unmarked alias — see _calendar_instance_clause) is assigned.
+    # The previous marker-only test (calendar_table_id IS NOT NULL) let a fact
+    # date column joined to an UNMARKED alias (batch-date against an unbound
+    # calendar) resurface as unassigned; the name-existence check hid this
+    # until the generated hierarchy was renamed (Bug-6683 external review).
     cal_join_subq = (
         select(Join.left_column_id)
         .join(ModelTable, ModelTable.id == Join.right_table_id)
         .where(
             Join.model_id == model_id,
-            ModelTable.calendar_table_id.is_not(None),
+            _calendar_instance_clause(model_id),
         )
         .scalar_subquery()
     )
 
-    # Physical columns with date/time types
+    # Physical columns with date/time types.
+    # Exclude columns that live on any calendar instance (the three shapes in
+    # _calendar_instance_clause). A calendar's own date columns are the date
+    # spine itself, never a fact date column that needs its own auto-calendar;
+    # re-consuming them is what compounded names past varchar(255) (Bug-6683).
+    # Excluding them keeps repeated auto-creates idempotent and bounded.
     phys_result = await db.execute(
         select(ModelColumn, ModelTable)
         .join(ModelTable, ModelTable.id == ModelColumn.model_table_id)
         .where(
             ModelTable.model_id == model_id,
+            ~_calendar_instance_clause(model_id),
             or_(
                 ModelColumn.data_type.ilike("%date%"),
                 ModelColumn.data_type.ilike("%time%"),
@@ -2676,12 +3019,34 @@ async def _get_unassigned_date_cols(
             table_id=tbl.id, table_alias=tbl.alias,
         ))
 
-    # UDAs with date/time output types
+    # UDAs with date/time output types.
+    #
+    # Bug-6683 root fix: NEVER treat a generated hierarchy-component UDA
+    # (``is_generated`` = True) as an unassigned date column. The date-hierarchy
+    # generator (``generate-date`` / ``_create_date_hierarchy_for_alias``) emits
+    # a date-typed ``*_day`` component UDA whose description is
+    # "Auto-generated for hierarchy '<name>' (day)". ``generate-date`` places it
+    # on the *fact* table (calendar_table_id IS NULL), so the calendar-alias
+    # exclusion below does not catch it. Consuming it made calendar auto-create
+    # wrap that description into a new "<...> Calendar" hierarchy, whose own
+    # generated day UDA was wrapped again on the next auto-create, compounding
+    # names ("Auto generated for hierarchy Auto generated for hierarchy ...")
+    # until the varchar(255) alias/display_name/name columns overflowed. A
+    # generated component UDA is an internal artifact of an EXISTING date
+    # hierarchy and must never seed its own auto-calendar, so excluding
+    # ``is_generated`` makes repeated auto-creates fully idempotent and
+    # bounded.
+    #
+    # The calendar-instance exclusion is retained as defence in depth: it also
+    # excludes any manually-authored (non-generated) date UDA that a user
+    # attaches to a calendar instance table.
     uda_result = await db.execute(
         select(UserDefinedAttribute, ModelTable)
         .join(ModelTable, ModelTable.id == UserDefinedAttribute.table_id)
         .where(
             UserDefinedAttribute.model_id == model_id,
+            UserDefinedAttribute.is_generated.is_(False),
+            ~_calendar_instance_clause(model_id),
             or_(
                 UserDefinedAttribute.output_data_type.ilike("%date%"),
                 UserDefinedAttribute.output_data_type.ilike("%time%"),
@@ -2718,8 +3083,24 @@ async def _auto_create_date_hierarchies_for_model(
 ) -> tuple[int, list[str], list[str]]:
     """Auto-create date hierarchies for all unassigned fact-table date columns.
 
-    Called after a calendar is created or bound. Returns (created_count, skipped_reasons).
+    Called after a calendar is created or bound. Returns
+    (created_count, skipped_reasons, created_hierarchy_names).
     Raises ValueError if calendar_model_table_id does not reference a valid calendar alias.
+
+    Bug-6722: for expression-capable calendar types (standard, fiscal,
+    iso_week, thai_buddhist), the hierarchy UDAs are placed directly on the
+    fact table, referencing the fact's own date column.  No calendar-alias
+    join is created because the period boundaries (year, quarter, month, day)
+    are computed via EXTRACT / CASE date arithmetic -- the physical calendar
+    table is not needed at query time.  This eliminates the class of
+    "calendar table column name mismatch" errors that occur when the
+    CalendarTable metadata (date_column) does not match the physical source
+    table's actual column names (e.g. BigQuery dim_date with ``full_date``
+    vs the Tessallite-standard ``date_key``).
+
+    Table-bound calendar types (retail_445, hijri) still create a
+    calendar-alias join because their period boundaries require data from
+    the materialised calendar table columns.
     """
     if grain not in DATE_HIERARCHY_TEMPLATES:
         raise ValueError(
@@ -2734,17 +3115,27 @@ async def _auto_create_date_hierarchies_for_model(
     if cal_info is None or not cal_info.date_column:
         raise ValueError("Calendar table has no date_column configured")
 
-    date_key_result = await db.execute(
-        select(ModelColumn)
-        .where(
-            ModelColumn.model_table_id == cal_mt.id,
-            ModelColumn.column_name == cal_info.date_column,
+    # Bug-6722: determine whether this calendar type can compute its period
+    # boundaries from date arithmetic alone (no physical calendar table join).
+    cal_type = normalize_calendar_type(cal_info.calendar_type) or "standard"
+    expr_capable = cal_type in EXPRESSION_CAPABLE_CALENDAR_TYPES
+
+    # For table-bound types we still need the calendar date-key column.
+    cal_date_key_col = None
+    if not expr_capable:
+        date_key_result = await db.execute(
+            select(ModelColumn)
+            .where(
+                ModelColumn.model_table_id == cal_mt.id,
+                ModelColumn.column_name == cal_info.date_column,
+            )
+            .limit(1)
         )
-        .limit(1)
-    )
-    cal_date_key_col = date_key_result.scalar_one_or_none()
-    if cal_date_key_col is None:
-        return 0, [f"Calendar date key column '{cal_info.date_column}' not found in calendar alias"]
+        cal_date_key_col = date_key_result.scalar_one_or_none()
+        if cal_date_key_col is None:
+            return 0, [
+                f"Calendar date key column '{cal_info.date_column}' not found in calendar alias"
+            ], []
 
     unassigned = await _get_unassigned_date_cols(db, model_id)
     created = 0
@@ -2764,7 +3155,13 @@ async def _auto_create_date_hierarchies_for_model(
                 continue
             join_col_id = attr.physical_column_id
 
-        hier_name = f"{attr.display_name or attr.column_name} Calendar"
+        # Derive the hierarchy/alias label from the base date column's stable
+        # user label (display_name, else column_name), clamped to varchar(255).
+        # Combined with the calendar-alias exclusion in
+        # _get_unassigned_date_cols, this keeps repeated auto-creates
+        # idempotent: a re-run resolves the same label, finds the existing
+        # hierarchy below, and skips instead of wrapping the name.
+        hier_name = _calendar_hier_label(attr.display_name, attr.column_name)
         existing = (
             await db.execute(
                 select(HierarchyDefinition.id)
@@ -2779,49 +3176,133 @@ async def _auto_create_date_hierarchies_for_model(
             skipped.append(f"{attr.column_name}: hierarchy already exists")
             continue
 
-        alias_alias = await _next_calendar_alias(db, model_id, attr.column_name, used_aliases)
-        used_aliases.add(alias_alias)
-        alias = ModelTable(
-            model_id=model_id,
-            source_id=cal_mt.source_id,
-            table_type="dim_detail",
-            physical_name=cal_mt.physical_name,
-            alias=alias_alias,
-            display_name=f"{attr.display_name or attr.column_name} Calendar",
-            calendar_table_id=cal_mt.calendar_table_id,
-        )
-        db.add(alias)
-        await db.flush()
+        if expr_capable:
+            # Bug-6722: expression-capable path -- UDAs on the fact table
+            # directly, referencing the fact date column.  No alias, no join.
+            fact_col_name = attr.column_name
+            fact_col_id = attr.id
+            if attr.is_uda and attr.physical_column_id is not None:
+                phys = await db.get(ModelColumn, attr.physical_column_id)
+                if phys is not None:
+                    fact_col_name = phys.column_name
+                    fact_col_id = phys.id
 
-        alias_date_key = ModelColumn(
-            model_table_id=alias.id,
-            column_name=cal_date_key_col.column_name,
-            display_name=cal_date_key_col.display_name or cal_date_key_col.column_name,
-            data_type=cal_date_key_col.data_type,
-            is_nullable=cal_date_key_col.is_nullable,
-            is_hidden=False,
-        )
-        db.add(alias_date_key)
-        await db.flush()
+            # Bug-7203: propagate calendar_type and fiscal_year_start_month
+            await _create_date_hierarchy_for_alias(
+                db,
+                model_id=model_id,
+                table_id=attr.table_id,
+                date_key_col_id=fact_col_id,
+                date_key_col_name=fact_col_name,
+                grain=grain,
+                name=hier_name,
+                calendar_type=cal_type,
+                fiscal_year_start_month=cal_info.fiscal_year_start_month,
+            )
+        else:
+            # Bug-7204: Table-bound path (retail_445, hijri) -- calendar alias
+            # + join. Copy ALL period columns (not just date_key) so the
+            # hierarchy can reference them.
+            alias_alias = await _next_calendar_alias(db, model_id, attr.column_name, used_aliases)
+            used_aliases.add(alias_alias)
+            alias = ModelTable(
+                model_id=model_id,
+                source_id=cal_mt.source_id,
+                table_type="dim_detail",
+                physical_name=cal_mt.physical_name,
+                alias=alias_alias,
+                display_name=hier_name,
+                calendar_table_id=cal_mt.calendar_table_id,
+            )
+            db.add(alias)
+            await db.flush()
 
-        await _create_date_hierarchy_for_alias(
-            db,
-            model_id=model_id,
-            table_id=alias.id,
-            date_key_col_id=alias_date_key.id,
-            date_key_col_name=alias_date_key.column_name,
-            grain=grain,
-            name=hier_name,
-        )
+            # Create date_key column on the alias
+            alias_date_key = ModelColumn(
+                model_table_id=alias.id,
+                column_name=cal_date_key_col.column_name,
+                display_name=cal_date_key_col.display_name or cal_date_key_col.column_name,
+                data_type=cal_date_key_col.data_type,
+                is_nullable=cal_date_key_col.is_nullable,
+                is_hidden=False,
+            )
+            db.add(alias_date_key)
+            await db.flush()
 
-        db.add(Join(
-            model_id=model_id,
-            left_table_id=attr.table_id,
-            right_table_id=alias.id,
-            join_type="many_to_one",
-            left_column_id=join_col_id,
-            right_column_id=alias_date_key.id,
-        ))
+            # Bug-7204: copy all period columns from the calendar to the alias
+            # and build a column_id_map for the hierarchy level builder.
+            # Use the CalendarTable's configured column names (year_column,
+            # quarter_column, etc.) which reflect the actual physical names
+            # rather than the hardcoded defaults -- this handles bound
+            # calendars whose columns may have custom names.
+            column_id_map: dict[str, UUID] = {}
+            cal_columns = CALENDAR_COLUMN_SETS.get(cal_type, {})
+            for slot, default_col_name in cal_columns.items():
+                if slot == "date_column":
+                    continue  # already created above
+                # Use the configured column name from CalendarTable if
+                # available, falling back to the default for the type.
+                phys_col_name = getattr(cal_info, slot, None) or default_col_name
+                # Find the source column on the spine calendar alias
+                src_col_result = await db.execute(
+                    select(ModelColumn)
+                    .where(
+                        ModelColumn.model_table_id == cal_mt.id,
+                        ModelColumn.column_name == phys_col_name,
+                    )
+                    .limit(1)
+                )
+                src_col = src_col_result.scalar_one_or_none()
+                if src_col is None:
+                    continue
+                # Create a copy on the companion alias
+                alias_col = ModelColumn(
+                    model_table_id=alias.id,
+                    column_name=src_col.column_name,
+                    display_name=src_col.display_name or src_col.column_name,
+                    data_type=src_col.data_type,
+                    is_nullable=src_col.is_nullable,
+                    is_hidden=False,
+                )
+                db.add(alias_col)
+                await db.flush()
+                # Map by DEFAULT column name (used as component in template)
+                # so the hierarchy template can find it
+                column_id_map[default_col_name] = alias_col.id
+
+            # Bug-7203/7204: pass calendar metadata and column map
+            await _create_date_hierarchy_for_alias(
+                db,
+                model_id=model_id,
+                table_id=alias.id,
+                date_key_col_id=alias_date_key.id,
+                date_key_col_name=alias_date_key.column_name,
+                grain=grain,
+                name=hier_name,
+                calendar_type=cal_type,
+                fiscal_year_start_month=cal_info.fiscal_year_start_month,
+                column_id_map=column_id_map if column_id_map else None,
+            )
+
+            db.add(Join(
+                model_id=model_id,
+                left_table_id=attr.table_id,
+                right_table_id=alias.id,
+                # Orientation and cardinality are SEPARATE fields
+                # (join-orientation contract, invariant 3). This edge is
+                # owning-table -> calendar alias, i.e. many rows to one
+                # calendar day, and the orientation that preserves the many
+                # side (the owning table, which is also the anchor-ward one)
+                # is a LEFT join — the same rows the legacy ``many_to_one``
+                # token rendered. Parking the cardinality in ``join_type``, as
+                # this did, made every calendar-alias model permanently
+                # unprovable to the pocket row-population proof.
+                join_type=_CALENDAR_ALIAS_JOIN_TYPE,
+                cardinality=_CALENDAR_ALIAS_CARDINALITY,
+                left_column_id=join_col_id,
+                right_column_id=alias_date_key.id,
+            ))
+
         created_names.append(attr.display_name or attr.column_name)
         created += 1
 
@@ -2837,8 +3318,44 @@ async def _create_date_hierarchy_for_alias(
     date_key_col_name: str,
     grain: str,
     name: str,
+    calendar_type: str | None = None,
+    fiscal_year_start_month: int | None = None,
+    column_id_map: dict[str, UUID] | None = None,
 ) -> HierarchyDefinition:
-    components = DATE_HIERARCHY_TEMPLATES[grain]
+    """Create a date hierarchy with UDA levels on a table.
+
+    Bug-7203: ``calendar_type`` and ``fiscal_year_start_month`` are propagated
+    onto the generated HierarchyDefinition so the query-time path
+    (_resolve_hierarchy_calendar_rules) and time-variant SQL use the correct
+    calendar boundaries rather than defaulting to Gregorian.
+
+    Bug-7204: for table-bound calendar types (retail_445, hijri), when
+    ``column_id_map`` is provided, hierarchy levels are keyed on the physical
+    calendar table columns (e.g. retail_year, retail_quarter) instead of
+    EXTRACT-based UDA expressions. ``column_id_map`` maps component names
+    (e.g. 'retail_year') to the ModelColumn.id on the alias.
+
+    Parameters
+    ----------
+    calendar_type:
+        The calendar type (standard, fiscal, iso_week, retail_445, hijri,
+        thai_buddhist). When set, selects the calendar-specific hierarchy
+        template from CALENDAR_HIERARCHY_TEMPLATES instead of the grain-based
+        DATE_HIERARCHY_TEMPLATES.
+    fiscal_year_start_month:
+        Fiscal year start month (1-12). Propagated to the hierarchy for
+        query-time fiscal offset computation.
+    column_id_map:
+        For table-bound types: maps component name to a ModelColumn.id on
+        the calendar alias. When provided, levels reference these physical
+        columns directly instead of creating UDA expressions.
+    """
+    # Bug-7203: use calendar-type-specific template when available
+    if calendar_type and calendar_type in CALENDAR_HIERARCHY_TEMPLATES:
+        components = CALENDAR_HIERARCHY_TEMPLATES[calendar_type]
+    else:
+        components = DATE_HIERARCHY_TEMPLATES[grain]
+
     # Stored canonical (PostgreSQL); source dialect applied at execution time.
     expr = quote_identifier("postgresql", date_key_col_name)
 
@@ -2852,12 +3369,74 @@ async def _create_date_hierarchy_for_alias(
             "source_attribute_id": str(date_key_col_id),
             "source_attribute_source": "physical_column",
         },
+        calendar_type=calendar_type,
+        fiscal_year_start_month=fiscal_year_start_month,
     )
     db.add(hierarchy)
     await db.flush()
 
-    generated_names = [f"{_slugify_name(name)}_{component}" for component, _ in components]
-    gen_expressions = [_date_component_expression(expr, component) for component, _ in components]
+    # Bug-7204: for table-bound types with column_id_map, build levels directly
+    # from physical calendar columns instead of UDA expressions.
+    if column_id_map:
+        for ordinal, (component, level_name) in enumerate(components):
+            col_id = column_id_map.get(component)
+            if col_id is None:
+                continue  # column not available on alias; skip this level
+
+            meta = _TABLE_BOUND_COMPONENT_TO_COLUMN.get(component, {})
+            time_unit = meta.get("time_unit")
+
+            db.add(
+                HierarchyLevel(
+                    hierarchy_id=hierarchy.id,
+                    name=level_name,
+                    ordinal=ordinal,
+                    key_attribute_id=col_id,
+                    key_attribute_source="physical_column",
+                    description=None,
+                    time_unit=time_unit,
+                    allowed_time_calcs=list(_DEFAULT_TIME_CALCS),
+                )
+            )
+
+            # Create a dimension for this level if one does not exist.
+            gen_name = _clamp_to_limit(f"{_slugify_name(name)}_{component}")
+            existing_dim = (
+                await db.execute(
+                    select(Dimension).where(
+                        Dimension.model_id == model_id,
+                        Dimension.name == gen_name,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing_dim is None:
+                db.add(
+                    Dimension(
+                        model_id=model_id,
+                        name=gen_name,
+                        display_name=_clamp_to_limit(f"{level_name} ({name})"),
+                        source_column_id=col_id,
+                        is_time_dim=True,
+                        time_grain=time_unit,
+                        description=f"Auto-generated for hierarchy '{name}' ({component})",
+                    )
+                )
+
+        await db.flush()
+        return hierarchy
+
+    # Expression-capable path: create UDA expressions for each level.
+    generated_names = [
+        _clamp_to_limit(f"{_slugify_name(name)}_{component}") for component, _ in components
+    ]
+    # F-016-01: fiscal/ISO/Thai level keys use calendar-correct period math,
+    # matching the calendar table columns and the time-variant SQL.
+    gen_expressions = [
+        _calendar_component_expression(
+            expr, component, calendar_type, fiscal_year_start_month
+        )
+        for component, _ in components
+    ]
     reusable = await _find_reusable_uda_names(
         db, model_id=model_id, table_id=table_id,
         name_expr_pairs=list(zip(generated_names, gen_expressions)),
@@ -2907,7 +3486,7 @@ async def _create_date_hierarchy_for_alias(
                 Dimension(
                     model_id=model_id,
                     name=gen_name,
-                    display_name=f"{level_name} ({name})",
+                    display_name=_clamp_to_limit(f"{level_name} ({name})"),
                     user_defined_attribute_id=uda.id,
                     is_time_dim=True,
                     time_grain=time_grain,
@@ -2933,7 +3512,7 @@ async def list_unassigned_date_columns(
     model_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
 ) -> list[UnassignedDateColumn]:
-    enforce_model_scope(current_user, str(model_id))
+    enforce_model_scope(current_user, str(model_id), project_id=str(project_id))
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
         rows = await _get_unassigned_date_cols(db, model_id)
@@ -2965,6 +3544,7 @@ async def batch_create_date_hierarchies(
 ) -> HierarchyBatchDateResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
 
         grain = (body.grain or "").strip().lower()
         if grain not in DATE_HIERARCHY_TEMPLATES:
@@ -2978,51 +3558,64 @@ async def batch_create_date_hierarchies(
         if cal_mt is None or cal_mt.model_id != model_id:
             raise _not_found("Calendar model table not found")
 
+        # Bug-6722: determine expression-capable vs table-bound.
+        batch_expr_capable = False
+        batch_cal_type = "standard"
+        cal_info_batch: CalendarTable | None = None
+        if cal_mt.calendar_table_id is not None:
+            cal_info_batch = await db.get(CalendarTable, cal_mt.calendar_table_id)
+            if cal_info_batch is not None:
+                batch_cal_type = normalize_calendar_type(
+                    getattr(cal_info_batch, "calendar_type", None)
+                ) or "standard"
+                batch_expr_capable = batch_cal_type in EXPRESSION_CAPABLE_CALENDAR_TYPES
+
         cal_date_key_col: ModelColumn | None = None
 
-        if cal_mt.calendar_table_id is not None:
-            cal_info = await db.get(CalendarTable, cal_mt.calendar_table_id)
-            if cal_info is not None and cal_info.date_column:
+        # Table-bound types still need the calendar date-key column for the
+        # alias join.
+        if not batch_expr_capable:
+            if cal_info_batch is not None and cal_info_batch.date_column:
                 date_key_result = await db.execute(
                     select(ModelColumn)
                     .where(
                         ModelColumn.model_table_id == cal_mt.id,
-                        ModelColumn.column_name == cal_info.date_column,
+                        ModelColumn.column_name == cal_info_batch.date_column,
                     )
                     .limit(1)
                 )
                 cal_date_key_col = date_key_result.scalar_one_or_none()
 
-        if cal_date_key_col is None and cal_mt.table_type == "calendar":
-            by_name = await db.execute(
-                select(ModelColumn)
-                .where(
-                    ModelColumn.model_table_id == cal_mt.id,
-                    ModelColumn.column_name == "date_key",
+            if cal_date_key_col is None and cal_mt.table_type == "calendar":
+                by_name = await db.execute(
+                    select(ModelColumn)
+                    .where(
+                        ModelColumn.model_table_id == cal_mt.id,
+                        ModelColumn.column_name == "date_key",
+                    )
+                    .limit(1)
                 )
-                .limit(1)
-            )
-            cal_date_key_col = by_name.scalar_one_or_none()
+                cal_date_key_col = by_name.scalar_one_or_none()
 
-        if cal_date_key_col is None and cal_mt.table_type == "calendar":
-            by_type = await db.execute(
-                select(ModelColumn)
-                .where(
-                    ModelColumn.model_table_id == cal_mt.id,
-                    ModelColumn.data_type.ilike("%date%"),
+            if cal_date_key_col is None and cal_mt.table_type == "calendar":
+                by_type = await db.execute(
+                    select(ModelColumn)
+                    .where(
+                        ModelColumn.model_table_id == cal_mt.id,
+                        ModelColumn.data_type.ilike("%date%"),
+                    )
+                    .order_by(ModelColumn.column_name)
+                    .limit(1)
                 )
-                .order_by(ModelColumn.column_name)
-                .limit(1)
-            )
-            cal_date_key_col = by_type.scalar_one_or_none()
+                cal_date_key_col = by_type.scalar_one_or_none()
 
-        if cal_date_key_col is None:
-            raise _validation_error(
-                "Could not determine the date key column. "
-                "Ensure the calendar table has a column named 'date_key' or a DATE-typed column.",
-                field="calendar_table_id",
-                code="D3",
-            )
+            if cal_date_key_col is None:
+                raise _validation_error(
+                    "Could not determine the date key column. "
+                    "Ensure the calendar table has a column named 'date_key' or a DATE-typed column.",
+                    field="calendar_table_id",
+                    code="D3",
+                )
 
         unassigned = await _get_unassigned_date_cols(db, model_id)
 
@@ -3055,7 +3648,13 @@ async def batch_create_date_hierarchies(
                     continue
                 join_col_id = attr.physical_column_id
 
-            hier_name = f"{attr.display_name or attr.column_name} Calendar"
+            # Same clamped label as _auto_create_date_hierarchies_for_model.
+            # Without it a column display name >= ~247 chars overflows
+            # HierarchyDefinition.name / ModelTable.display_name on the FIRST
+            # run, and the existence check below would not recognise the
+            # clamped name the auto-create path persists. Both consumers share
+            # _calendar_hier_label so their names stay byte-identical.
+            hier_name = _calendar_hier_label(attr.display_name, attr.column_name)
             existing = await db.execute(
                 select(HierarchyDefinition.id)
                 .where(
@@ -3071,52 +3670,125 @@ async def batch_create_date_hierarchies(
                 ))
                 continue
 
-            alias_alias = await _next_calendar_alias(db, model_id, attr.column_name, used_aliases)
-            used_aliases.add(alias_alias)
-            alias = ModelTable(
-                model_id=model_id,
-                source_id=cal_mt.source_id,
-                table_type="dim_detail",
-                physical_name=cal_mt.physical_name,
-                alias=alias_alias,
-                display_name=f"{attr.display_name or attr.column_name} Calendar",
-                calendar_table_id=cal_mt.calendar_table_id,
-            )
-            db.add(alias)
-            await db.flush()
+            if batch_expr_capable:
+                # Bug-6722: expression-capable path -- UDAs on the fact table
+                # directly, referencing the fact date column.  No alias, no join.
+                fact_col_name = attr.column_name
+                fact_col_id = attr.id
+                if attr.is_uda and attr.physical_column_id is not None:
+                    phys = await db.get(ModelColumn, attr.physical_column_id)
+                    if phys is not None:
+                        fact_col_name = phys.column_name
+                        fact_col_id = phys.id
 
-            alias_date_key = ModelColumn(
-                model_table_id=alias.id,
-                column_name=cal_date_key_col.column_name,
-                display_name=cal_date_key_col.display_name or cal_date_key_col.column_name,
-                data_type=cal_date_key_col.data_type,
-                is_nullable=cal_date_key_col.is_nullable,
-                is_hidden=False,
-            )
-            db.add(alias_date_key)
-            await db.flush()
+                # Bug-7203: propagate calendar_type and fiscal_year_start_month
+                await _create_date_hierarchy_for_alias(
+                    db,
+                    model_id=model_id,
+                    table_id=attr.table_id,
+                    date_key_col_id=fact_col_id,
+                    date_key_col_name=fact_col_name,
+                    grain=grain,
+                    name=hier_name,
+                    calendar_type=batch_cal_type,
+                    fiscal_year_start_month=(
+                        cal_info_batch.fiscal_year_start_month
+                        if cal_info_batch else None
+                    ),
+                )
+                created_hierarchies += 1
+            else:
+                # Bug-7204: Table-bound path (retail_445, hijri) -- calendar
+                # alias + join. Copy ALL period columns.
+                alias_alias = await _next_calendar_alias(db, model_id, attr.column_name, used_aliases)
+                used_aliases.add(alias_alias)
+                alias = ModelTable(
+                    model_id=model_id,
+                    source_id=cal_mt.source_id,
+                    table_type="dim_detail",
+                    physical_name=cal_mt.physical_name,
+                    alias=alias_alias,
+                    display_name=hier_name,
+                    calendar_table_id=cal_mt.calendar_table_id,
+                )
+                db.add(alias)
+                await db.flush()
 
-            hierarchy = await _create_date_hierarchy_for_alias(
-                db,
-                model_id=model_id,
-                table_id=alias.id,
-                date_key_col_id=alias_date_key.id,
-                date_key_col_name=alias_date_key.column_name,
-                grain=grain,
-                name=hier_name,
-            )
+                alias_date_key = ModelColumn(
+                    model_table_id=alias.id,
+                    column_name=cal_date_key_col.column_name,
+                    display_name=cal_date_key_col.display_name or cal_date_key_col.column_name,
+                    data_type=cal_date_key_col.data_type,
+                    is_nullable=cal_date_key_col.is_nullable,
+                    is_hidden=False,
+                )
+                db.add(alias_date_key)
+                await db.flush()
 
-            db.add(Join(
-                model_id=model_id,
-                left_table_id=attr.table_id,
-                right_table_id=alias.id,
-                join_type="many_to_one",
-                left_column_id=join_col_id,
-                right_column_id=alias_date_key.id,
-            ))
+                # Bug-7204: copy all period columns and build column_id_map.
+                # Use CalendarTable's configured column names when available.
+                batch_column_id_map: dict[str, UUID] = {}
+                batch_cal_columns = CALENDAR_COLUMN_SETS.get(batch_cal_type, {})
+                for slot, default_col_name in batch_cal_columns.items():
+                    if slot == "date_column":
+                        continue
+                    phys_col_name = (
+                        getattr(cal_info_batch, slot, None) or default_col_name
+                    )
+                    src_col_result = await db.execute(
+                        select(ModelColumn)
+                        .where(
+                            ModelColumn.model_table_id == cal_mt.id,
+                            ModelColumn.column_name == phys_col_name,
+                        )
+                        .limit(1)
+                    )
+                    src_col = src_col_result.scalar_one_or_none()
+                    if src_col is None:
+                        continue
+                    alias_col = ModelColumn(
+                        model_table_id=alias.id,
+                        column_name=src_col.column_name,
+                        display_name=src_col.display_name or src_col.column_name,
+                        data_type=src_col.data_type,
+                        is_nullable=src_col.is_nullable,
+                        is_hidden=False,
+                    )
+                    db.add(alias_col)
+                    await db.flush()
+                    batch_column_id_map[default_col_name] = alias_col.id
 
-            created_aliases += 1
-            created_hierarchies += 1
+                # Bug-7203/7204: pass calendar metadata and column map
+                hierarchy = await _create_date_hierarchy_for_alias(
+                    db,
+                    model_id=model_id,
+                    table_id=alias.id,
+                    date_key_col_id=alias_date_key.id,
+                    date_key_col_name=alias_date_key.column_name,
+                    grain=grain,
+                    name=hier_name,
+                    calendar_type=batch_cal_type,
+                    fiscal_year_start_month=(
+                        cal_info_batch.fiscal_year_start_month
+                        if cal_info_batch else None
+                    ),
+                    column_id_map=batch_column_id_map if batch_column_id_map else None,
+                )
+
+                db.add(Join(
+                    model_id=model_id,
+                    left_table_id=attr.table_id,
+                    right_table_id=alias.id,
+                    # See the single-alias path above: orientation and
+                    # cardinality are separate fields (invariant 3).
+                    join_type=_CALENDAR_ALIAS_JOIN_TYPE,
+                    cardinality=_CALENDAR_ALIAS_CARDINALITY,
+                    left_column_id=join_col_id,
+                    right_column_id=alias_date_key.id,
+                ))
+
+                created_aliases += 1
+                created_hierarchies += 1
 
         await db.commit()
 

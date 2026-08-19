@@ -136,9 +136,14 @@ def compile_predicate(spec: dict[str, Any]) -> exp.Expression | None:
     )
 
 
-def compile_where(specs: Sequence[dict[str, Any]]) -> str:
-    """Compile a list of filter/grouping-level specs into a canonical SQL
-    ``WHERE`` clause (without the leading ``WHERE``). Empty list → "".
+def compile_where_expression(specs: Sequence[dict[str, Any]]) -> exp.Expression | None:
+    """Bug-7285: compile filter specs into a sqlglot boolean expression tree.
+
+    Returns the combined AND-chained sqlglot expression node (not a string)
+    so callers can embed it directly into a sqlglot AST and render the whole
+    query once at the correct target dialect, instead of rendering predicates
+    to a postgres string that gets re-parsed.  Returns ``None`` for an empty
+    list.
     """
     nodes: list[exp.Expression] = []
     for spec in specs:
@@ -146,10 +151,20 @@ def compile_where(specs: Sequence[dict[str, Any]]) -> str:
         if node is not None:
             nodes.append(node)
     if not nodes:
-        return ""
+        return None
     combined: exp.Expression = nodes[0]
     for node in nodes[1:]:
         combined = exp.And(this=combined, expression=node)
+    return combined
+
+
+def compile_where(specs: Sequence[dict[str, Any]]) -> str:
+    """Compile a list of filter/grouping-level specs into a canonical SQL
+    ``WHERE`` clause (without the leading ``WHERE``). Empty list → "".
+    """
+    combined = compile_where_expression(specs)
+    if combined is None:
+        return ""
     # Render canonical (postgres) SQL; downstream rewriter transpiles.
     return combined.sql(dialect="postgres")
 

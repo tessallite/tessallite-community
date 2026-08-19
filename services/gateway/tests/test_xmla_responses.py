@@ -96,33 +96,40 @@ TEST_DISCOVER_DIMS = [
 ]
 
 
-def test_measuregroups_only_default():
-    """All measures belong to a single 'default' measure group."""
+def test_measuregroups_single_cube_named_group():
+    """Bug-6889: all measures belong to a single measure group named after the
+    cube — Excel shows the group caption over the measures, and a literal
+    'default' read as a meaningless folder."""
     rows = mdschema._rows_measuregroups(TEST_CATALOG, TEST_MEASURES)
     assert len(rows) == 1
-    assert rows[0]["MEASUREGROUP_NAME"] == "default"
+    assert rows[0]["MEASUREGROUP_NAME"] == TEST_CATALOG
+    assert rows[0]["MEASUREGROUP_CAPTION"] == TEST_CATALOG
 
 
-def test_measures_all_default_group():
-    """All measures belong to the default group."""
+def test_measures_all_in_cube_named_group():
+    """All measures reference the cube-named group (must match
+    MDSCHEMA_MEASUREGROUPS or Excel drops the association)."""
     rows = mdschema._rows_measures(TEST_CATALOG, TEST_MEASURES)
     by_name = {r["MEASURE_NAME"]: r for r in rows}
-    assert by_name["Sales"]["MEASUREGROUP_NAME"] == "default"
-    assert by_name["Count"]["MEASUREGROUP_NAME"] == "default"
+    assert by_name["Sales"]["MEASUREGROUP_NAME"] == TEST_CATALOG
+    assert by_name["Count"]["MEASUREGROUP_NAME"] == TEST_CATALOG
 
 
-def test_measuregroup_dimensions_all_default():
-    """All dimensions belong to the default group."""
+def test_measuregroup_dimensions_all_cube_named_group():
+    """All dimensions belong to the cube-named group."""
     rows = mdschema._rows_measuregroup_dimensions(
         TEST_CATALOG, TEST_DISCOVER_DIMS, TEST_MEASURES,
     )
-    assert all(r["MEASUREGROUP_NAME"] == "default" for r in rows)
+    assert all(r["MEASUREGROUP_NAME"] == TEST_CATALOG for r in rows)
 
-    date_rows = [r for r in rows if r["DIMENSION_UNIQUE_NAME"] == "[Date Hierarchy]"]
+    # Bug-6891: hierarchies collapse into one [Hierarchies] group row.
+    date_rows = [r for r in rows if r["DIMENSION_UNIQUE_NAME"] == "[Hierarchies]"]
     assert len(date_rows) == 1
 
-    product_rows = [r for r in rows if r["DIMENSION_UNIQUE_NAME"] == "[Product]"]
-    assert all(r["MEASUREGROUP_NAME"] == "default" for r in product_rows)
+    # Bug-6603: the standalone "Product" attribute is grouped under [Dimensions].
+    product_rows = [r for r in rows if r["DIMENSION_UNIQUE_NAME"] == "[Dimensions]"]
+    assert len(product_rows) == 1
+    assert all(r["MEASUREGROUP_NAME"] == TEST_CATALOG for r in product_rows)
 
 
 def test_full_discover_response_with_hierarchy_defs():
@@ -135,7 +142,8 @@ def test_full_discover_response_with_hierarchy_defs():
         dimensions=TEST_DISCOVER_DIMS,
         hierarchy_defs=TEST_HIERARCHY_DEFS,
     )
-    assert "default" in xml
+    # Bug-6889: the emitted measure group is named after the cube.
+    assert TEST_CATALOG in xml
 
 
 if __name__ == "__main__":

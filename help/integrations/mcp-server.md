@@ -159,7 +159,8 @@ docker run --rm \
 
 - The MCP server authenticates using standard JWT login credentials.
 - All queries respect persona-based security and row-level filters.
-- Query results are capped at `TESSALLITE_ROW_LIMIT` rows.
+- Query results are capped at `TESSALLITE_ROW_LIMIT` rows. When a query matches more rows than the cap, `execute_query` says so explicitly ("RESULT TRUNCATED …") so the assistant never presents a capped extract as the complete answer — narrow the query or raise `TESSALLITE_ROW_LIMIT` for the full result.
+- `list_models` returns each model's `model_id` (and `project_id`) so the assistant can call `describe_model`, `execute_query`, `list_aggregates`, and `trigger_refresh`, which all require a model id.
 - All queries are logged in the query log via the query router.
 
 Use a service account with appropriate permissions rather than a personal admin account in production.

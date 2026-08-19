@@ -13,6 +13,8 @@ from src.planning.measure_metadata import MeasureRoleMetadata
 from src.tools.spec import (
     CompoundQueryToolCall,
     CreateAggregateToolCall,
+    EvaluateKpiToolCall,
+    PreviewNamedSetToolCall,
     QueryToolCall,
     ToolCall,
 )
@@ -281,6 +283,19 @@ def validate_tool_call_against_bundle(call: ToolCall, bundle: Any) -> list[PlanV
                         repairable=False,
                     ))
         return issues_agg
+    # Bug-7347 -- validate allow-list at the pre-execution gate for
+    # EvaluateKpi and PreviewNamedSet.
+    if isinstance(call, (EvaluateKpiToolCall, PreviewNamedSetToolCall)):
+        tool_name = (
+            "evaluate_kpi" if isinstance(call, EvaluateKpiToolCall)
+            else "preview_named_set"
+        )
+        issues_kpi: list[PlanValidationIssue] = []
+        _idx, idx_issues = _model_index_for(
+            call.model_id, indexes, allowed, tool_name,
+        )
+        issues_kpi.extend(idx_issues)
+        return issues_kpi
     return []
 
 

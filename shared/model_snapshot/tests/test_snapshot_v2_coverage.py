@@ -41,10 +41,25 @@ def _u() -> str:
 
 
 def test_schema_version_is_current():
-    # Bumped to v3 by F-013-06 (added the six previously-missing model-scoped
-    # config families). The v2 families this module exercises still travel; the
-    # constant just moved forward.
-    assert SNAPSHOT_SCHEMA_VERSION == 3
+    # v3 (F-013-06) added the six model-scoped config families; v4 (Bug-7359,
+    # derived-grain §5.3) added attribute_relationships; v5 (Bug-8615, join
+    # population governance G1) added joins[].population_participation. The v2
+    # families this module exercises still travel; the constant just moved
+    # forward.
+    assert SNAPSHOT_SCHEMA_VERSION == 5
+
+
+def test_collect_pks_remaps_attribute_relationships():
+    """v4: a dimension attribute relationship's flat id is PK-remapped on
+    cross-tenant import (its dimension/column references are rewritten by the
+    generic UUID pass)."""
+    snap = {
+        "model": {"id": _u()},
+        "attribute_relationships": [{"id": _u()}, {"id": _u()}],
+    }
+    pk_map = _collect_pks(snap)
+    # 1 model + 2 relationships = 3
+    assert len(pk_map) == 3
 
 
 def test_collect_pks_remaps_v2_flat_families():

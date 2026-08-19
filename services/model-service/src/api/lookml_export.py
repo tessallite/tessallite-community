@@ -15,6 +15,7 @@ from shared.db.models import ModelVersion
 from shared.db.session import get_tenant_db
 from src.api.import_export import _ensure_model_access
 from src.auth.middleware import CurrentUser, forbid_embed_user
+from src.auth.rbac import require_role
 
 router = APIRouter(tags=["lookml-export"])
 
@@ -33,7 +34,13 @@ class LookMLExportRequest(BaseModel):
         return connection
 
 
-@router.post("/projects/{project_id}/models/{model_id}/export/lookml")
+@router.post(
+    "/projects/{project_id}/models/{model_id}/export/lookml",
+    # Model-DEFINITION (LookML) export requires a modeler+ binding (user
+    # decision 2026-08-19: only the credential-bearing PROJECT export is
+    # admin-gated). Bootstrap-free via the binding-only require_role (F-021-04).
+    dependencies=[require_role("modeler")],
+)
 async def export_model_lookml(
     project_id: UUID,
     model_id: UUID,

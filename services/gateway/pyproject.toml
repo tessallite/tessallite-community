@@ -3,7 +3,7 @@ name = "gateway"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.111.0",
+    "fastapi==0.136.1",
     "uvicorn[standard]>=0.29.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
@@ -14,7 +14,7 @@ dependencies = [
     "ldap3>=2.9.1",
     "lxml>=5.2.0",
     "defusedxml>=0.7.1",
-    "sqlglot>=23.0.0",
+    "sqlglot>=30.8.0,<31.0.0",
     "slowapi>=0.1.9",
     "pyhive>=0.7.0",
     "thrift>=0.16.0",
@@ -42,4 +42,6 @@ markers = [
     "unit: Unit tests",
     "integration: Integration tests requiring mocked DB",
     "e2e: End-to-end tests requiring running services",
+    "no_session_passthrough: opt out of the default JDBC session-revalidation pass-through (G2)",
+    "no_named_set_stub: opt out of the default Execute-time named-set fetch stub",
 ]

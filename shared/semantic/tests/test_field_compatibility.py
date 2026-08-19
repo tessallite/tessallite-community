@@ -7,6 +7,7 @@ from shared.semantic.field_compatibility import (
     AGGREGATE_GRAIN_MISMATCH,
     AMBIGUOUS_JOIN_PATH,
     HIDDEN_FIELD_UNAVAILABLE,
+    MANY_TO_MANY_UNSUPPORTED,
     MEASURE_DEPENDENCY_UNREACHABLE,
     NO_JOIN_PATH,
     PERSONA_FIELD_UNAVAILABLE,
@@ -37,6 +38,11 @@ class _Join:
     left_table_id: UUID
     right_table_id: UUID
     join_type: str = "many_to_one"
+    # Join orientation and cardinality are SEPARATE fields (join-orientation
+    # contract, invariant 3). Without this the fixture could not express the
+    # shape the Joins panel, ``JoinCreate`` and the YAML importer now write,
+    # which is exactly why the many-to-many guard's regression went unseen.
+    cardinality: str | None = None
 
 
 @dataclass
@@ -320,3 +326,59 @@ def test_additive_measure_with_aggregate_does_not_emit_grain_mismatch():
         fixture["teacher_dim"].id
     ]
     assert issue.code == NO_JOIN_PATH
+
+
+# ---------------------------------------------------------------------------
+# Bug-8653 — the many-to-many guard must read the CARDINALITY field
+# ---------------------------------------------------------------------------
+
+
+def test_many_to_many_declared_in_cardinality_is_still_unsupported():
+    """The orientation/cardinality split moved the many-to-many declaration
+    out of ``join_type``.
+
+    The Joins panel selector, ``JoinCreate`` and the YAML importer (via
+    ``split_join_token``) all now write ``join_type="left"/"inner"`` plus
+    ``cardinality="many_to_many"``. A guard still reading the raw
+    ``join_type`` classifies that path as safe and offers the pair as
+    compatible; querying it fans out and double-counts with no warning.
+    """
+    for join_type in ("left", "inner"):
+        fixture = _base_model()
+        join = fixture["joins"][0]
+        join.join_type = join_type
+        join.cardinality = "many_to_many"
+        result = _evaluate(
+            fixture, selected_dimension_ids=[fixture["school_dim"].id]
+        )
+        entry = result.measures[fixture["measure"].id]
+        assert fixture["school_dim"].id not in entry.compatible_dimension_ids, (
+            f"join_type={join_type!r} + cardinality='many_to_many' was offered "
+            "as compatible; the fan-out guard is reading the wrong field"
+        )
+        assert entry.incompatible_dimensions[fixture["school_dim"].id].code == (
+            MANY_TO_MANY_UNSUPPORTED
+        )
+
+
+def test_many_to_many_in_a_legacy_join_type_token_is_still_caught():
+    """Invariant 4: a row written before the split keeps being caught."""
+    fixture = _base_model()
+    fixture["joins"][0].join_type = "many_to_many"
+    result = _evaluate(fixture, selected_dimension_ids=[fixture["school_dim"].id])
+    entry = result.measures[fixture["measure"].id]
+    assert entry.incompatible_dimensions[fixture["school_dim"].id].code == (
+        MANY_TO_MANY_UNSUPPORTED
+    )
+
+
+def test_a_non_fanning_declared_cardinality_stays_compatible():
+    """Guard the guard: the check must not reject every declared cardinality,
+    only many-to-many. Without this the two tests above would still pass if
+    the guard were changed to refuse any declared fan-out at all."""
+    fixture = _base_model()
+    fixture["joins"][0].join_type = "left"
+    fixture["joins"][0].cardinality = "many_to_one"
+    result = _evaluate(fixture, selected_dimension_ids=[fixture["school_dim"].id])
+    entry = result.measures[fixture["measure"].id]
+    assert fixture["school_dim"].id in entry.compatible_dimension_ids

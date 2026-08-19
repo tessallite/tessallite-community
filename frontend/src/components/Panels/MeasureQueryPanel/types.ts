@@ -14,8 +14,17 @@ export type CellCoord = {
 };
 
 export type PivotModel = {
+  // Technical dimension names (``dimension.name``). These are the keys the
+  // flat result set is keyed by, so they drive data lookup and drill mapping.
   rowCols: string[];
   colCols: string[];
+  // Business display names (``display_name || name``) in the same order as
+  // ``rowCols``. Row-dimension headers and exports render these so users see
+  // friendly labels, not internal identifiers (Bug-6285). Never use them for
+  // result lookup — only for display. (There is no ``colLabels``: the column
+  // axis renders member values, not the column-dimension name, so it has no
+  // display-label surface.)
+  rowLabels: string[];
   rowKeys: string[][];
   colKeys: string[][];
   byKey: Map<string, CellCoord>;

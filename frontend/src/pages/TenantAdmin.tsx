@@ -49,8 +49,12 @@ import UnpublishedIcon from "@mui/icons-material/UnpublishedOutlined";
 import UploadIcon from "@mui/icons-material/FileUploadOutlined";
 import ProjectConfigDrawer from "../components/Settings/ProjectConfigDrawer";
 import EffectiveAccessPreview from "../components/Settings/EffectiveAccessPreview";
+import GitSettingsPanel from "../components/Admin/GitSettingsPanel";
+import SsoSettingsPanel from "../components/Admin/SsoSettingsPanel";
+import EmbedTokensPanel from "../components/Admin/EmbedTokensPanel";
 import SecurityAuditPanel from "../components/Admin/SecurityAuditPanel";
 import { useConfirm } from "../components/Confirm";
+import { grantAccessWithSupersede } from "../components/Admin/grantAccessWithSupersede";
 import HelpIconButton from "../components/HelpIconButton";
 import { useT } from "../i18n";
 import {
@@ -61,6 +65,7 @@ import {
   webhooksApi,
 } from "../api/client";
 import api from "../api/client";
+import { meetsPasswordPolicy, showsPasswordPolicyError } from "../auth/passwordPolicy";
 import { agentApi } from "../api/agentApi";
 import type {
   AccessRole,
@@ -79,9 +84,9 @@ type DrawerKind =
   | { kind: "reset-password"; user: User }
   | null;
 
-type DetailTab = "models" | "users-access" | "security-audit";
+type DetailTab = "models" | "users-access" | "security-audit" | "git" | "sso" | "embed-tokens";
 
-const ACCESS_ROLES: AccessRole[] = ["admin", "modeler", "viewer"];
+const ACCESS_ROLES: AccessRole[] = ["admin", "modeler", "viewer", "model_viewer"];
 const USER_ROLES: LocalUserRole[] = ["member", "tenant_admin", "model_technical"];
 
 export default function TenantAdmin() {
@@ -278,6 +283,9 @@ export default function TenantAdmin() {
                   <Tab value="models" label={t("tenantAdmin.tabModels")} />
                   <Tab value="users-access" label={t("tenantAdmin.tabUsersAccess")} />
                   <Tab value="security-audit" label={t("tenantAdmin.tabSecurityAudit")} />
+                  <Tab value="sso" label={t("tenantAdmin.tabSso")} />
+                  <Tab value="embed-tokens" label={t("tenantAdmin.tabEmbedTokens")} />
+                  <Tab value="git" label={t("git.sectionTitle")} />
                 </Tabs>
                 <Divider />
                 <Box sx={{ flex: 1, overflow: "auto", p: 2 }}>
@@ -309,6 +317,12 @@ export default function TenantAdmin() {
                     />
                   ) : detailTab === "security-audit" ? (
                     <SecurityAuditPanel />
+                  ) : detailTab === "sso" ? (
+                    <SsoSettingsPanel />
+                  ) : detailTab === "embed-tokens" ? (
+                    <EmbedTokensPanel />
+                  ) : detailTab === "git" ? (
+                    <GitSettingsPanel />
                   ) : (
                     <UsersAccessSection
                       project={selectedProject}
@@ -836,6 +850,7 @@ function EditDrawer({
   onSaved: () => void;
 }) {
   const t = useT();
+  const confirm = useConfirm();
   const [projSlug, setProjSlug] = useState("");
   const [projName, setProjName] = useState("");
   const [modelSlug, setModelSlug] = useState("");
@@ -872,20 +887,26 @@ function EditDrawer({
     }
   }, [drawer, setError]);
 
+  // Bug-8184: same two endpoints as the users & access panel
+  // (createTenantUser / resetTenantUserPassword), so the same rule is stated
+  // here rather than left to a 422.
+  const passwordOk = meetsPasswordPolicy(password);
+  const passwordInvalid = showsPasswordPolicyError(password);
+
   const formValid = (() => {
     if (drawer?.kind === "project") return projSlug.trim() !== "" && projName.trim() !== "";
     if (drawer?.kind === "model") return modelSlug.trim() !== "" && modelName.trim() !== "";
     if (drawer?.kind === "user") {
       const baseValid = email.trim() !== "" && username.trim() !== "";
-      return drawer.user ? baseValid : baseValid && password.length > 0;
+      return drawer.user ? baseValid : baseValid && passwordOk;
     }
     if (drawer?.kind === "grant") return grantUser !== "";
-    if (drawer?.kind === "reset-password") return password.length > 0;
+    if (drawer?.kind === "reset-password") return passwordOk;
     return false;
   })();
 
   const save = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (): Promise<"saved" | "cancelled"> => {
       const tenantId = safeLocalGet("tenant_id", "");
       if (drawer?.kind === "project") {
         if (drawer.project) {
@@ -925,18 +946,34 @@ function EditDrawer({
           });
         }
       } else if (drawer?.kind === "grant") {
-        await accessApi.grant(drawer.project.id, {
-          user_identity: grantUser,
-          role: grantRole,
-          model_id: grantModelId === "" ? null : grantModelId,
-        });
+        // Bug-8101: Modeller-supersedes-Model-viewer confirmation before grant.
+        // On cancel nothing changes and the drawer stays open.
+        const outcome = await grantAccessWithSupersede(
+          drawer.project.id,
+          {
+            user_identity: grantUser,
+            role: grantRole,
+            model_id: grantModelId === "" ? null : grantModelId,
+          },
+          confirm,
+          {
+            title: t("tenantAdmin.supersedeTitle"),
+            message: t("tenantAdmin.supersedeMessage"),
+            confirmLabel: t("tenantAdmin.supersedeConfirm"),
+          },
+        );
+        if (outcome === "cancelled") return "cancelled";
       } else if (drawer?.kind === "reset-password") {
         await authApi.resetTenantUserPassword(tenantId, drawer.user.id, {
           password,
         });
       }
+      return "saved";
     },
-    onSuccess: onSaved,
+    onSuccess: (outcome) => {
+      if (outcome === "cancelled") return;
+      onSaved();
+    },
     onError: (err: unknown) => {
       const detail = (err as { response?: { data?: { detail?: string } } })
         ?.response?.data?.detail;
@@ -998,6 +1035,8 @@ function EditDrawer({
                 size="small"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
+                error={passwordInvalid}
+                helperText={t("errors.form.passwordComplexity")}
                 InputProps={{ startAdornment: <KeyIcon sx={{ fontSize: 16, mr: 1, color: "text.secondary" }} /> }}
               />
             )}
@@ -1060,6 +1099,8 @@ function EditDrawer({
               size="small"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              error={passwordInvalid}
+              helperText={t("errors.form.passwordComplexity")}
             />
           </Stack>
         )}

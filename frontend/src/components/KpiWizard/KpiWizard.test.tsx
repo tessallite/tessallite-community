@@ -22,6 +22,16 @@ vi.mock("../../api/client", () => ({
   },
 }));
 
+// Bug-5517: KpiPreviewCard debounces a live evaluate-adhoc call behind a real
+// 600ms setTimeout.  Under full-suite parallel load that timer can fire after
+// test cleanup, triggering a setState-after-unmount warning and intermittent
+// flakes.  No test in this file asserts preview output, so we stub it to a
+// no-op — same pattern as KpisPanel.test.tsx (Bug-5486).
+vi.mock("./KpiPreviewCard", () => ({
+  __esModule: true,
+  default: () => null,
+}));
+
 import KpiWizard from "./KpiWizard";
 
 const TI_VALIDATION = {

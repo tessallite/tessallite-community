@@ -2,7 +2,7 @@
 title: "Credentials and the .env File"
 audience: system-admin
 area: system-admin
-updated: 2026-04-18
+updated: 2026-06-24
 ---
 
 # Credentials and the .env file
@@ -11,12 +11,28 @@ updated: 2026-04-18
 
 ## Why credentials are not in the UI
 
-By design, no credential is ever stored in the database-backed settings tables. Source database passwords, LLM API keys, the Fernet encryption key, the JWT signing key, and the bootstrap administrator password all live in `.env` on the host. The UI surfaces them in the System Configuration page's read-only Environment tab — masked — so an operator can verify what is in effect without exposing any secret.
+By design, bootstrap secrets stay out of ordinary database-backed settings tables. Source database passwords and LLM API keys are encrypted in the database with the Fernet key; the Fernet encryption key, JWT signing key, and bootstrap administrator password live in `.env` on the host. The UI surfaces environment values in the System Configuration page's read-only Environment tab — masked — so an operator can verify what is in effect without exposing any secret.
+
+For Community Edition, `.env` is created by `install.sh` in the signed release bundle. After install, you manage the licence entirely from the browser on the **System Admin → License & edition** screen — see below.
 
 This separation keeps two important properties true:
 
 - Database snapshots, audit logs, and replication streams never contain a plaintext credential.
-- Rotating a credential is a host-level operation (edit `.env`, restart) that does not require touching the database.
+- Rotating a bootstrap credential is a host-level operation (edit `.env`, restart) that does not require touching the database.
+
+## Installing or replacing a licence
+
+![System Admin License & edition page showing the License manager card.](../assets/screencaps/license-manager.png)
+
+The Licence Manager card is for system administrators only. It shows the current edition, whether enforcement is enabled, and whether a licence is installed.
+
+To get a licence, use the **Get a license** button on the Edition & capacity card — it opens the registration page at tessallite.io where you obtain your signed `license.json`.
+
+To install or replace it, use the **Upload license file** button on the Licence Manager card:
+
+- Choose your signed `license.json`. Tessallite verifies it (signature and expiry) before applying it; a rejected, expired, or wrongly signed licence is refused and the current licence is untouched.
+- A valid licence is **stored in the platform database** and applied immediately — no restart.
+- Because the licence lives in the database rather than a file, this works on **every** deployment, including read-only/serverless hosts such as Cloud Run. You do not need to configure a verification key or a writable licence file; the public verification key is built in.
 
 ## Required variables
 
@@ -27,6 +43,8 @@ This separation keeps two important properties true:
 | `POSTGRES_PASSWORD` | System database password. Used in the constructed DSN unless `SYSTEM_DATABASE_URL` is set explicitly. |
 | `SYSTEM_ADMIN_EMAIL` | Login email for the bootstrap system administrator. Default `admin@tessallite.local`. |
 | `SYSTEM_ADMIN_PASSWORD` | Password for the bootstrap system administrator. |
+| `LICENSE_FILE_HOST` | Legacy/bootstrap host path to a signed licence file, normally `./license.json` in the bundle directory. The active uploaded licence is stored in the platform database. |
+| `LICENSE_PUBLIC_KEYS` | Optional public verification key override. Normal installs use the built-in Tessallite public key. |
 
 ## Optional but recommended
 
@@ -39,6 +57,7 @@ This separation keeps two important properties true:
 | `CORS_ORIGINS` | Comma-separated CORS allow-list. Set to override the default loopback list entirely. |
 | `CORS_LAN_IP` | Optional LAN IP that gets prepended to the default CORS list (handy for testing the SPA from another machine on the same network without overriding the whole list). |
 | `CREDENTIAL_ENCRYPTION_KEY_PREVIOUS` | Comma-separated list of *old* encryption keys, set **only during a key-rotation window**. While set, the platform encrypts new values with `CREDENTIAL_ENCRYPTION_KEY` and can still decrypt anything that was written under a listed previous key. Leave it unset in normal running; add the old key here when you start a rotation, and remove it once the rotation is complete. |
+| `LICENSE_ENFORCEMENT_ENABLED` | Leave `true` for normal installs. When `false`, the stack starts unactivated and create operations remain disabled by edition policy. |
 
 ## LLM provider keys
 
@@ -77,9 +96,10 @@ The non-secret routing fields — provider base URLs, model-name suggestions, th
 | Source DB passwords (per project_connection) | `project_connections.encrypted_credentials` — encrypted with `CREDENTIAL_ENCRYPTION_KEY` |
 | LLM API keys (per llm_provider_config) | `llm_provider_configs.encrypted_api_key` — encrypted with the same key |
 | JWT signing key, Fernet key, system admin password | `.env` only |
+| Signed licence document | Uploaded from **System Admin → License & edition**, stored in `system_settings` as `license.document`; downloaded `license.json` files are operator records |
 | JWT lifetime, rate limits, scheduler cadences, etc. | `system_settings` table (editable from the UI) |
 
-> **Never commit `.env` to source control.** The repository's `.gitignore` excludes it; `.env.example` is the safe template to commit.
+> **Never commit `.env` or `license.json` to source control.** `.env.example` is the safe template to commit. Back up `.env` securely with the installation, and keep downloaded licence files in a secure operator archive.
 
 ## Related
 

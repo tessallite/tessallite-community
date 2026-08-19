@@ -41,6 +41,28 @@ def _quote_member(dim: str, hier: str, key: str) -> str:
     )
 
 
+def _coerce_member_key(member: object, ordinal: int) -> str:
+    if isinstance(member, dict):
+        if "key" not in member or member.get("key") in (None, ""):
+            raise CompilationError(
+                f"fixedMembers member {ordinal} requires a non-empty 'key'"
+            )
+        key = member["key"]
+    else:
+        key = member
+
+    if isinstance(key, bool) or not isinstance(key, (str, int, float)):
+        raise CompilationError(
+            f"fixedMembers member {ordinal} key must be a string or number"
+        )
+    text = str(key)
+    if not text:
+        raise CompilationError(
+            f"fixedMembers member {ordinal} requires a non-empty key"
+        )
+    return text
+
+
 def _compile_fixed_members(defn: dict, _meta: dict) -> str:
     members = defn.get("members", [])
     if not members:
@@ -51,7 +73,10 @@ def _compile_fixed_members(defn: dict, _meta: dict) -> str:
     if not dim:
         raise CompilationError("fixedMembers requires a 'dimension' field")
 
-    member_refs = [_quote_member(dim, hier, m.get("key", m) if isinstance(m, dict) else m) for m in members]
+    member_refs = [
+        _quote_member(dim, hier, _coerce_member_key(m, i + 1))
+        for i, m in enumerate(members)
+    ]
     return "{ " + ", ".join(member_refs) + " }"
 
 

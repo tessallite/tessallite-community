@@ -61,6 +61,10 @@ export interface CrowsFootEdgeData {
   targetSide?: string;
   sourceRatio?: number;
   targetRatio?: number;
+  /** Read-only share-link mode (Bug-7636). When true, the edge suppresses
+   *  waypoint, anchor, and pathing mutations so viewers cannot accidentally
+   *  persist layout changes through the edge's own DOM handlers. */
+  readOnly?: boolean;
   onWaypointsChange?: (wps: Pt[]) => void;
   onWaypointReset?: () => void;
   onPathingChange?: (p: "orthogonal" | "straight") => void;
@@ -619,10 +623,12 @@ function CrowsFootEdge({
   }, [dragMode, screenToFlowPosition, isOrtho, psx, psy, ptx, pty]);
 
   // ---- Double-click edge to reset waypoints ----
+  const edgeReadOnly = data?.readOnly ?? false;
   const onDblClick = useCallback((e: ReactMouseEvent) => {
     e.stopPropagation();
+    if (edgeReadOnly) return;
     if (data?.onWaypointReset) data.onWaypointReset();
-  }, [data]);
+  }, [data, edgeReadOnly]);
 
   // ---- Visual properties ----
   const baseStroke     = (style.stroke as string) ?? "#90a4ae";
@@ -695,9 +701,10 @@ function CrowsFootEdge({
         </g>
       ))}
 
-      {/* Source anchor */}
+      {/* Source anchor -- hidden in readOnly mode to prevent layout mutations (Bug-7636) */}
+      {!edgeReadOnly && (
       <g
-        style={{ cursor: "grab", pointerEvents: "all", opacity: selected || dragMode?.type === "source" ? 1 : 0 }}
+        style={{ cursor: "grab", pointerEvents: selected ? "all" : "none", opacity: selected || dragMode?.type === "source" ? 1 : 0 }}
         onMouseDown={onSrcDown}
       >
         <circle cx={sx} cy={sy} r={16} fill="transparent" />
@@ -708,10 +715,12 @@ function CrowsFootEdge({
           stroke={stroke} strokeWidth={2}
         />
       </g>
+      )}
 
-      {/* Target anchor */}
+      {/* Target anchor -- hidden in readOnly mode to prevent layout mutations (Bug-7636) */}
+      {!edgeReadOnly && (
       <g
-        style={{ cursor: "grab", pointerEvents: "all", opacity: selected || dragMode?.type === "target" ? 1 : 0 }}
+        style={{ cursor: "grab", pointerEvents: selected ? "all" : "none", opacity: selected || dragMode?.type === "target" ? 1 : 0 }}
         onMouseDown={onTgtDown}
       >
         <circle cx={tx} cy={ty} r={16} fill="transparent" />
@@ -722,6 +731,7 @@ function CrowsFootEdge({
           stroke={stroke} strokeWidth={2}
         />
       </g>
+      )}
     </g>
   );
 }

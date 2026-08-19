@@ -43,7 +43,7 @@ vi.mock("./client", () => ({
   },
   aggregatesApi: {},
   aiOptimizerApi: {
-    listRuns: vi.fn((_tenantId?: string, _modelId?: string) =>
+    listRuns: vi.fn((_modelId?: string) =>
       Promise.resolve([{ id: "run-1", status: "completed" }]),
     ),
   },
@@ -60,6 +60,39 @@ vi.mock("./client", () => ({
   modelTablesApi: {},
   optimizerApiClient: {},
   personasApi: {},
+  namedQueriesApi: {
+    list: vi.fn(() =>
+      Promise.resolve([
+        {
+          id: "nq-1",
+          model_id: "m-1",
+          name: "top_cities",
+          display_name: null,
+          description: null,
+          display_folder: null,
+          definition_sql: "SELECT city_name FROM modely",
+          output_columns: null,
+          shape: "projection",
+          row_cap: null,
+          column_cap: null,
+          certification_status: "draft",
+          created_by: null,
+          artifact: null,
+          refresh_policy: null,
+          created_at: "2026-01-01",
+          updated_at: "2026-01-01",
+        },
+      ]),
+    ),
+  },
+  projectSettingsApi: {
+    list: vi.fn(() =>
+      Promise.resolve([
+        { key: "named_query.max_rows", effective_value: 100000 },
+        { key: "named_query.max_columns", effective_value: 200 },
+      ]),
+    ),
+  },
   pocketsApi: {},
   rowSecurityApi: {},
   tableAttributesApi: {},
@@ -77,6 +110,8 @@ import {
   useSources,
   useFieldCompatibility,
   useAIOptimizerRuns,
+  useNamedQueries,
+  useNamedQueryCaps,
 } from "./hooks";
 import { aiOptimizerApi, fieldCompatibilityApi } from "./client";
 
@@ -240,6 +275,8 @@ describe("React Query hooks", () => {
   // F-030-06: a caller that lacks a tenant id in scope (ModelHealthPanel passes
   // "") must still surface AI optimiser runs by falling back to the persisted
   // auth-context tenant id, instead of silently disabling the query.
+  // Bug-6558: tenant_id is resolved from the JWT server-side; the API call
+  // only sends model_id.
   describe("useAIOptimizerRuns", () => {
     afterEach(() => {
       window.localStorage.clear();
@@ -252,7 +289,7 @@ describe("React Query hooks", () => {
       });
       await waitFor(() => expect(result.current.isSuccess).toBe(true));
       expect(result.current.data).toHaveLength(1);
-      expect(aiOptimizerApi.listRuns).toHaveBeenCalledWith("acme", "m-1");
+      expect(aiOptimizerApi.listRuns).toHaveBeenCalledWith("m-1");
     });
 
     it("falls back to the persisted tenant id when the caller passes an empty string", async () => {
@@ -262,7 +299,7 @@ describe("React Query hooks", () => {
       });
       await waitFor(() => expect(result.current.isSuccess).toBe(true));
       expect(result.current.data).toHaveLength(1);
-      expect(aiOptimizerApi.listRuns).toHaveBeenCalledWith("acme", "m-1");
+      expect(aiOptimizerApi.listRuns).toHaveBeenCalledWith("m-1");
     });
 
     it("stays disabled when neither the caller nor localStorage has a tenant id", () => {
@@ -270,6 +307,43 @@ describe("React Query hooks", () => {
         wrapper: createWrapper(),
       });
       expect(result.current.fetchStatus).toBe("idle");
+    });
+  });
+
+  describe("useNamedQueries", () => {
+    it("fetches the Named Query list", async () => {
+      const { result } = renderHook(() => useNamedQueries("p-1", "m-1"), {
+        wrapper: createWrapper(),
+      });
+      await waitFor(() => expect(result.current.data).toHaveLength(1));
+      expect(result.current.data[0].name).toBe("top_cities");
+    });
+
+    it("memoises the joined data and the wrapper object (Bug-100 ref stability)", async () => {
+      const { result, rerender } = renderHook(() => useNamedQueries("p-1", "m-1"), {
+        wrapper: createWrapper(),
+      });
+      await waitFor(() => expect(result.current.data).toHaveLength(1));
+
+      const dataRef = result.current.data;
+      const wrapperRef = result.current;
+      rerender();
+
+      // Neither the data array nor the wrapper object is re-created on a
+      // no-op render — consumers keying useMemo on them stay stable.
+      expect(result.current.data).toBe(dataRef);
+      expect(result.current).toBe(wrapperRef);
+    });
+  });
+
+  describe("useNamedQueryCaps", () => {
+    it("derives the effective system caps from project settings", async () => {
+      const { result } = renderHook(() => useNamedQueryCaps("p-1"), {
+        wrapper: createWrapper(),
+      });
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+      expect(result.current.maxRows).toBe(100000);
+      expect(result.current.maxColumns).toBe(200);
     });
   });
 });

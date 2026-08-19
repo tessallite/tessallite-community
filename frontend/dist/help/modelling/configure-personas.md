@@ -54,7 +54,7 @@ Every query — from the gateway, the plugin execution endpoint, or internal RES
 1. **Resolve the persona.** For gateway queries, the catalog name determines the persona. For the Excel plugin, the `persona_id` field in the request body is used. Embedded users always use the persona set in their token. The server determines the effective persona — the client sends a request, but the server decides.
 2. **Check the allow lists.** For each measure in the bound query, confirm its ID is in `included_measure_ids` (or the list is empty). Same for each dimension and hierarchy. The **first** object that falls outside is rejected with the object kind and name in the error detail.
 3. **Merge default filters.** Each `(dimension_path, value)` pair in `default_filters` is added to the query's `WHERE` — unless the caller has already authored their own filter on that dimension, in which case the user's filter wins.
-4. **Proceed to row security.** The persona step does not touch the generated SQL beyond adding filters. Row-security then wraps the plan as usual, and the aggregate/pocket fast paths remain available if neither layer blocks them.
+4. **Proceed to row security.** The persona step does not touch the generated SQL beyond adding filters. Row security then adds its own filter to each table scan in the plan, and the aggregate/pocket fast paths remain available to any candidate that can be proved to carry that filter (see [Configure Row Security](configure-row-security.md), step 4).
 
 The gate runs the same logic for every read path — REST, XMLA, JDBC, Excel plugin, MCP — so swapping tool is not a way around it.
 
@@ -155,18 +155,18 @@ When both layers are configured:
 
 1. **Persona runs first.** If it denies the object, the query returns 403 before row security is touched.
 2. **Persona default filters are added.** These become part of the user's WHERE.
-3. **Row security wraps the plan.** The wrap intersects with the persona defaults — the caller sees rows that satisfy **both**.
-4. **Fast paths are disabled only if row security fires.** A persona that only trims the catalogue and adds a default filter does **not** disable aggregates or pockets; a row-security rule does.
+3. **Row security adds its filter to every table scan.** It is added inside each scan, not as an outer wrapper around the finished query, so it always applies before any `LIMIT`. It intersects with the persona defaults — the caller sees rows that satisfy **both**.
+4. **Fast paths still run, but under proof.** A persona that only trims the catalogue and adds a default filter leaves aggregates and pockets fully available. When a row-security rule fires, they are not switched off either — each candidate has to prove it can carry the same filter the source scan would carry (see [Configure Row Security](configure-row-security.md), step 4). One that can is used with the filter injected; one that cannot falls back to source.
 
-In practice: personas are cheap, row security is expensive. Use a persona first to trim the catalogue; add row security only when row-level filtering is also needed.
+In practice: personas are cheap, row security is stricter. Use a persona first to trim the catalogue; add row security only when row-level filtering is also needed — and expect a filtered audience to lose the fast path whenever the security column is not materialised in the aggregate's grain or the pocket's copy.
 
 ### Bypass row security (Phase 8.C.1)
 
 A persona carries a **Bypass row security** flag. When enabled:
 
-- The Router **skips the row-security wrap** for any query bound to this persona.
+- The Router **skips row-security filtering entirely** for any query bound to this persona — no rule is compiled and no predicate is injected.
 - The allow list and audience-role gating **still run**. Per-connection binding still applies.
-- Aggregate and pocket fast paths are **re-enabled** (they are normally disabled whenever a row-security rule fires).
+- Aggregate and pocket fast paths become available **unconditionally**, because with no security predicate to carry there is nothing left to prove. Without bypass they are still available, but only for the candidates that pass the safety proof.
 - Every bypassed execution is tagged with `persona_bypass_row_security=true` in the structured request log for audit. There is no dedicated audit table; existing request logs are the audit surface.
 
 Use this only for internal dashboards that are already scoped through persona allow lists and that need the performance of the aggregate/pocket layer. A red warning appears in the editor while bypass is on, and saving with bypass newly enabled requires an explicit confirmation.

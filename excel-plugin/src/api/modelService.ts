@@ -89,12 +89,39 @@ export async function getHierarchyDetail(
   }));
 }
 
-export async function getKpis(projectId: string, modelId: string): Promise<Kpi[]> {
-  return apiClient.get<Kpi[]>(`/api/v1/projects/${projectId}/models/${modelId}/kpis`);
+/**
+ * Query string for a CONSUMPTION-surface read (Bug-8710).
+ *
+ * The Excel add-in is an end-user BI transport, not an authoring surface. The
+ * deployed model snapshot is the single serving authority for a definition:
+ * "the deployed snapshot is the contract; the live state is editor-only"
+ * (F-013-01, architecture_model-versioning-and-deploy.md), stated operationally
+ * for these routes by F-017-05 — BI catalogue surfaces send `deployed_only`,
+ * and only the model builder omits it.
+ *
+ * Without it the pane advertised definitions nobody had deployed, and the CUBE
+ * formula it then inserted was resolved by the GATEWAY, which serves the
+ * deployed snapshot — so the draft the pane showed produced a permanent #N/A.
+ * A modeller who wants to see drafts uses the model builder.
+ */
+function consumptionQuery(personaId?: string): string {
+  const params = new URLSearchParams({ deployed_only: 'true' });
+  if (personaId) params.set('persona_id', personaId);
+  return `?${params.toString()}`;
 }
 
-export async function evaluateKpi(projectId: string, modelId: string, kpiId: string): Promise<KpiEvaluateResponse> {
-  return apiClient.post<KpiEvaluateResponse>(`/api/v1/projects/${projectId}/models/${modelId}/kpis/${kpiId}/evaluate`);
+export async function getKpis(projectId: string, modelId: string, personaId?: string): Promise<Kpi[]> {
+  return apiClient.get<Kpi[]>(
+    `/api/v1/projects/${projectId}/models/${modelId}/kpis${consumptionQuery(personaId)}`,
+  );
+}
+
+export async function evaluateKpi(projectId: string, modelId: string, kpiId: string, personaId?: string): Promise<KpiEvaluateResponse> {
+  // Bug-6361: thread the active persona so the single-KPI evaluation (Report
+  // Builder KPI cards) returns the same value the batch path and the rest of the
+  // pane show, instead of the default-persona value (cross-surface mismatch).
+  const params = personaId ? `?persona_id=${encodeURIComponent(personaId)}` : '';
+  return apiClient.post<KpiEvaluateResponse>(`/api/v1/projects/${projectId}/models/${modelId}/kpis/${kpiId}/evaluate${params}`);
 }
 
 /**
@@ -122,12 +149,25 @@ export async function evaluateKpiBatch(
   return resp.results ?? [];
 }
 
-export async function getNamedSets(projectId: string, modelId: string): Promise<NamedSet[]> {
-  return apiClient.get<NamedSet[]>(`/api/v1/projects/${projectId}/models/${modelId}/named-sets`);
+export async function getNamedSets(projectId: string, modelId: string, personaId?: string): Promise<NamedSet[]> {
+  return apiClient.get<NamedSet[]>(
+    `/api/v1/projects/${projectId}/models/${modelId}/named-sets${consumptionQuery(personaId)}`,
+  );
 }
 
-export async function previewNamedSet(projectId: string, modelId: string, setId: string): Promise<NamedSetPreviewResponse> {
-  return apiClient.post<NamedSetPreviewResponse>(`/api/v1/projects/${projectId}/models/${modelId}/named-sets/${setId}/preview`);
+/**
+ * Bug-8712: preview returns the MEMBERS that are written into worksheet cells,
+ * so an unpinned read changes the numbers in someone's spreadsheet the moment a
+ * modeller edits an expression — no Deploy required. `deployed_only` on this
+ * route means "compute from the deployed definition", not merely "filter": the
+ * flag had to be added to the endpoint, because the list route's flag resolves
+ * a definition and this route builds its query from the row's own
+ * builder_definition/expression.
+ */
+export async function previewNamedSet(projectId: string, modelId: string, setId: string, personaId?: string): Promise<NamedSetPreviewResponse> {
+  return apiClient.post<NamedSetPreviewResponse>(
+    `/api/v1/projects/${projectId}/models/${modelId}/named-sets/${setId}/preview${consumptionQuery(personaId)}`,
+  );
 }
 
 export async function getPersonas(projectId: string, modelId: string): Promise<Persona[]> {

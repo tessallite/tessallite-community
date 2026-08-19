@@ -123,6 +123,24 @@ def test_coerce_boolean_from_string():
     assert _coerce("boolean", True, "@p") is True
 
 
+def test_coerce_boolean_accepts_full_closed_token_set():
+    for token in ("true", "1", "yes", "TRUE", "Yes", " true "):
+        assert _coerce("boolean", token, "@p") is True
+    for token in ("false", "0", "no", "FALSE", "No", " false "):
+        assert _coerce("boolean", token, "@p") is False
+
+
+def test_coerce_boolean_rejects_unrecognised_string():
+    """Bug-5890: a typo or unrecognised value must raise, not silently
+    become False."""
+    with pytest.raises(ValueError, match="expects a boolean"):
+        _coerce("boolean", "maybe", "@p")
+    with pytest.raises(ValueError, match="expects a boolean"):
+        _coerce("boolean", "random", "@p")
+    with pytest.raises(ValueError, match="expects a boolean"):
+        _coerce("boolean", "", "@p")
+
+
 def test_coerce_multi_value_splits_csv():
     assert _coerce("multi_value", "a, b ,c", "@p") == ["a", "b", "c"]
     assert _coerce("multi_value", ["x", "y"], "@p") == ["x", "y"]
@@ -134,8 +152,107 @@ def test_coerce_date_range_requires_from_to():
 
 
 def test_coerce_date_range_invalid_raises():
-    with pytest.raises(ValueError, match="date_range object"):
+    # A bare string with no recognised separator is not a date_range.
+    with pytest.raises(ValueError, match="expects a date_range"):
         _coerce("date_range", "not-a-range", "@p")
+
+
+def test_coerce_date_range_from_comma_string():
+    # Bug-6413: a JDBC session variable arrives as a string; a two-date pair
+    # separated by a comma must resolve to the {from,to} object.
+    assert _coerce("date_range", "2024-01-01,2024-12-31", "@p") == {
+        "from": "2024-01-01",
+        "to": "2024-12-31",
+    }
+
+
+def test_coerce_date_range_from_dotdot_string():
+    assert _coerce("date_range", "2024-01-01..2024-12-31", "@p") == {
+        "from": "2024-01-01",
+        "to": "2024-12-31",
+    }
+
+
+def test_coerce_date_range_from_json_string():
+    assert _coerce(
+        "date_range", '{"from": "2024-01-01", "to": "2024-12-31"}', "@p"
+    ) == {"from": "2024-01-01", "to": "2024-12-31"}
+
+
+def test_coerce_date_range_single_date_string_rejected():
+    # A single date is not a range (no second bound) -> fail clearly.
+    with pytest.raises(ValueError, match="expects a date_range"):
+        _coerce("date_range", "2024-01-01", "@p")
+
+
+def test_coerce_date_range_three_parts_rejected():
+    with pytest.raises(ValueError, match="expects a date_range"):
+        _coerce("date_range", "2024-01-01,2024-06-01,2024-12-31", "@p")
+
+
+# F-029-02: date_range bounds must be ISO-8601 dates, ordered, and only from/to.
+
+
+def test_coerce_date_range_non_iso_string_bounds_rejected():
+    # 'banana,pear' has the right SHAPE but non-date bounds; without ISO
+    # validation this became BETWEEN 'banana' AND 'pear' — a source error or
+    # silently-wrong empty result presented as success.
+    with pytest.raises(ValueError, match="not a valid ISO-8601 date"):
+        _coerce("date_range", "banana,pear", "@p")
+
+
+def test_coerce_date_range_non_string_bounds_rejected():
+    with pytest.raises(ValueError, match="must be an ISO-8601 date string"):
+        _coerce("date_range", {"from": 1, "to": 2}, "@p")
+
+
+def test_coerce_date_range_inverted_rejected():
+    with pytest.raises(ValueError, match="inverted"):
+        _coerce("date_range", {"from": "2024-12-31", "to": "2024-01-01"}, "@p")
+
+
+def test_coerce_date_range_extra_keys_rejected():
+    with pytest.raises(ValueError, match="unexpected key"):
+        _coerce(
+            "date_range",
+            {"from": "2024-01-01", "to": "2024-12-31", "tz": "UTC"},
+            "@p",
+        )
+
+
+def test_coerce_date_range_missing_bound_rejected():
+    with pytest.raises(ValueError, match="requires both 'from' and 'to'"):
+        _coerce("date_range", {"from": "2024-01-01"}, "@p")
+
+
+def test_coerce_date_range_accepts_iso_datetime_bounds():
+    rng = {"from": "2024-01-01T00:00:00", "to": "2024-12-31T23:59:59"}
+    assert _coerce("date_range", rng, "@p") == rng
+
+
+# F-029-16 VERIFY (not a fix): a parameterized equality/IN filter must still be
+# aggregate-matchable. Binding runs BEFORE parse (routes.py), so the matcher
+# never sees a placeholder — it sees a plain literal predicate. This asserts the
+# bound SQL is byte-identical to the equivalent hand-written literal query, which
+# is what the matcher would receive; the matcher's route decision is a pure
+# function of that SQL, so identical input => identical route. No matcher change
+# is warranted (the sensitive-component guard holds).
+
+
+def test_f029_16_parameterized_equality_is_byte_identical_to_literal():
+    param_sql = "SELECT region, SUM(sales) FROM t WHERE region = @region GROUP BY region"
+    literal_sql = "SELECT region, SUM(sales) FROM t WHERE region = 'EMEA' GROUP BY region"
+    assert substitute_parameters(param_sql, {"@region": "EMEA"}) == literal_sql
+
+
+def test_f029_16_parameterized_in_list_is_byte_identical_to_literal():
+    param_sql = "SELECT region, SUM(sales) FROM t WHERE region IN (@regions) GROUP BY region"
+    literal_sql = (
+        "SELECT region, SUM(sales) FROM t WHERE region IN ('EMEA', 'APAC') GROUP BY region"
+    )
+    assert (
+        substitute_parameters(param_sql, {"@regions": ["EMEA", "APAC"]}) == literal_sql
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +325,37 @@ async def test_resolve_falls_back_to_default():
         "m1", session_vars={}, persona_filters={}, db=db
     )
     assert resolved == {"@region": "GLOBAL"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_session_var_matches_case_insensitively():
+    # Bug-6411: a mixed-case model parameter (@RegionCode) must be settable
+    # over JDBC. The gateway folds ``SET app.RegionCode`` to ``app.regioncode``
+    # (Postgres GUC semantics); before the fix the exact-case lookup
+    # ``app.RegionCode`` never matched and the value silently fell back to the
+    # default.
+    db = _FakeDB([_FakeParam("@RegionCode", "string", default_value="GLOBAL")])
+    resolved = await resolve_parameters(
+        "m1",
+        session_vars={"app.regioncode": "APAC"},
+        persona_filters={},
+        db=db,
+    )
+    assert resolved == {"@RegionCode": "APAC"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_date_range_from_session_var_string():
+    # Bug-6413: a date_range parameter set over JDBC arrives as a string and
+    # must resolve to the {from,to} object.
+    db = _FakeDB([_FakeParam("@window", "date_range", default_value=None)])
+    resolved = await resolve_parameters(
+        "m1",
+        session_vars={"app.window": "2024-01-01,2024-12-31"},
+        persona_filters={},
+        db=db,
+    )
+    assert resolved == {"@window": {"from": "2024-01-01", "to": "2024-12-31"}}
 
 
 @pytest.mark.asyncio
@@ -365,6 +513,35 @@ async def test_apply_parameters_skips_resolution_when_at_only_in_literal():
 
 
 @pytest.mark.asyncio
+async def test_apply_parameters_unreferenced_required_param_does_not_block():
+    """Bug-6410: a required parameter (no default / session / persona value)
+    that the query does not reference must NOT block an otherwise-valid
+    parameterised query. Only the referenced ``@seg`` is bound; the unused
+    required ``@region`` is skipped rather than raising ParameterError."""
+    db = _FakeApplyDB([
+        _FakeParam("@region", "string", default_value=None),   # required, unused
+        _FakeParam("@seg", "string", default_value="RETAIL"),  # referenced
+    ])
+    sql = "WHERE seg = @seg"
+    out = await apply_parameters(
+        model_id="m1", sql=sql, session_vars={}, persona_filters={}, db=db,
+    )
+    assert out == "WHERE seg = 'RETAIL'"
+
+
+@pytest.mark.asyncio
+async def test_apply_parameters_referenced_required_param_still_raises():
+    """Guard against over-correction: a required parameter the query DOES
+    reference must still fail loudly when it cannot be resolved."""
+    db = _FakeApplyDB([_FakeParam("@region", "string", default_value=None)])
+    with pytest.raises(ParameterError, match="Required parameter '@region'"):
+        await apply_parameters(
+            model_id="m1", sql="WHERE region = @region",
+            session_vars={}, persona_filters={}, db=db,
+        )
+
+
+@pytest.mark.asyncio
 async def test_apply_parameters_resolves_real_placeholder_with_literal_at():
     """Bug-5313 regression: when the SQL has BOTH a real @param placeholder
     AND an ``@`` inside a string literal, the real placeholder must still
@@ -492,3 +669,284 @@ async def test_allowed_values_persona_filter_also_enforced():
         await resolve_parameters(
             "m1", session_vars={}, persona_filters={"@region": "APAC"}, db=db
         )
+
+
+# ---------------------------------------------------------------------------
+# Bug-7660: persona parameter override key shape contract
+# The resolver expects persona_filters keyed by ``@name`` (matching the
+# declared parameter name). The Persona ORM ``default_filters`` are keyed
+# by bare dimension name (e.g. ``"Region"``). The route-level
+# ``_bind_query_parameters`` must re-key to ``@``-prefixed form before
+# passing into the resolver; a bare key never matches a ``@``-prefixed
+# parameter.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persona_override_bare_key_does_not_match():
+    """Bug-7660 contract: the resolver matches persona filters by ``@name``
+    only. A bare-name key (the shape stored in Persona.default_filters)
+    does NOT match, so the caller must re-key. This test documents the
+    contract: without re-keying, the persona override is silently ignored
+    and the model default is used instead."""
+    db = _FakeDB([_FakeParam("@region", "string", default_value="GLOBAL")])
+    resolved = await resolve_parameters(
+        "m1",
+        session_vars={},
+        persona_filters={"region": "EMEA"},  # bare key, no @
+        db=db,
+    )
+    # The bare key does NOT match @region -> falls back to default.
+    assert resolved == {"@region": "GLOBAL"}
+
+
+@pytest.mark.asyncio
+async def test_persona_override_at_prefixed_key_matches():
+    """Bug-7660 regression: after the route-level re-key, the resolver
+    receives ``@``-prefixed keys and resolves persona overrides correctly."""
+    db = _FakeDB([_FakeParam("@region", "string", default_value="GLOBAL")])
+    resolved = await resolve_parameters(
+        "m1",
+        session_vars={},
+        persona_filters={"@region": "EMEA"},  # correctly @-prefixed
+        db=db,
+    )
+    assert resolved == {"@region": "EMEA"}
+
+
+# ---------------------------------------------------------------------------
+# Bug-7663: case-insensitive placeholder matching + unknown placeholder error
+# Placeholder names in the query may differ in casing from the declared
+# parameter name (e.g. ``@regioncode`` vs ``@RegionCode``). Matching must
+# be case-insensitive, consistent with session-variable handling (Bug-6411).
+# Unknown placeholders must raise a clear ParameterError instead of silently
+# surviving into the parser.
+# ---------------------------------------------------------------------------
+
+
+def test_substitute_case_insensitive_binding():
+    """Bug-7663: ``@regioncode`` in the query binds to resolved ``@RegionCode``."""
+    sql = "SELECT * FROM t WHERE region = @regioncode"
+    out = substitute_parameters(sql, {"@RegionCode": "EMEA"})
+    assert out == "SELECT * FROM t WHERE region = 'EMEA'"
+
+
+def test_substitute_mixed_case_multiple_placeholders():
+    """Bug-7663: multiple placeholders with case variation all bind correctly."""
+    sql = "WHERE region = @REGION AND seg = @Seg"
+    out = substitute_parameters(sql, {"@region": "EMEA", "@seg": "RETAIL"})
+    assert out == "WHERE region = 'EMEA' AND seg = 'RETAIL'"
+
+
+def test_substitute_unknown_placeholder_raises_when_declared_names_provided():
+    """Bug-7663: an unknown placeholder raises a clear ParameterError when
+    declared_names is provided, instead of silently surviving into the parser."""
+    with pytest.raises(ParameterError, match="Unknown parameter placeholder"):
+        substitute_parameters(
+            "WHERE x = @typo",
+            {"@known": "v"},
+            declared_names={"@known"},
+        )
+
+
+def test_substitute_unknown_placeholder_lists_declared_names():
+    """Bug-7663: the error message lists the declared parameters."""
+    with pytest.raises(ParameterError, match="@region"):
+        substitute_parameters(
+            "WHERE x = @regiom",
+            {"@region": "EMEA"},
+            declared_names={"@region"},
+        )
+
+
+def test_substitute_unknown_placeholder_still_silent_without_declared_names():
+    """Backward compatibility: without declared_names, unknown tokens are
+    left untouched (original behavior for direct callers)."""
+    out = substitute_parameters("WHERE x = @unknown", {"@known": "v"})
+    assert out == "WHERE x = @unknown"
+
+
+@pytest.mark.asyncio
+async def test_resolve_case_insensitive_referenced_names():
+    """Bug-7663: referenced_names from query spans use query casing; the
+    resolver must match case-insensitively against declared param names."""
+    db = _FakeDB([_FakeParam("@RegionCode", "string", default_value="GLOBAL")])
+    # The query uses ``@regioncode`` (all lower), declared is ``@RegionCode``.
+    resolved = await resolve_parameters(
+        "m1",
+        session_vars={},
+        persona_filters={},
+        db=db,
+        referenced_names={"@regioncode"},  # query casing
+    )
+    assert resolved == {"@RegionCode": "GLOBAL"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_persona_filter_case_insensitive():
+    """Bug-7663: persona filters keyed with different casing still match."""
+    db = _FakeDB([_FakeParam("@RegionCode", "string", default_value="GLOBAL")])
+    resolved = await resolve_parameters(
+        "m1",
+        session_vars={},
+        persona_filters={"@regioncode": "EMEA"},
+        db=db,
+    )
+    assert resolved == {"@RegionCode": "EMEA"}
+
+
+@pytest.mark.asyncio
+async def test_apply_parameters_case_insensitive_binding():
+    """Bug-7663 end-to-end: ``@regioncode`` in query binds to declared
+    ``@RegionCode`` through the full apply_parameters pipeline."""
+    db = _FakeApplyDB([_FakeParam("@RegionCode", "string", default_value="GLOBAL")])
+    out = await apply_parameters(
+        model_id="m1", sql="WHERE region = @regioncode",
+        session_vars={}, persona_filters={}, db=db,
+    )
+    assert out == "WHERE region = 'GLOBAL'"
+
+
+@pytest.mark.asyncio
+async def test_apply_parameters_unknown_placeholder_raises():
+    """Bug-7663: an unrecognised placeholder in the pipeline raises a clear
+    ParameterError instead of reaching the parser as a raw ``@token``."""
+    db = _FakeApplyDB([_FakeParam("@region", "string", default_value="EMEA")])
+    with pytest.raises(ParameterError, match="Unknown parameter placeholder"):
+        await apply_parameters(
+            model_id="m1", sql="WHERE x = @regiom AND y = @region",
+            session_vars={}, persona_filters={}, db=db,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bug-8068 — lossless JDBC multi-value encoding.
+#
+# Wrong-rows guard. Every JDBC session variable arrives as a string, and the
+# only multi-value encoding was "split on every comma", so a filter on the real
+# member "New York, NY" silently became the two members "New York" and "NY".
+# A JSON-array form now round-trips any member; the legacy comma list is
+# untouched for values that contain no commas.
+# ---------------------------------------------------------------------------
+
+from src.params.resolver import _render  # noqa: E402
+
+
+def test_multi_value_json_array_preserves_embedded_commas():
+    """The reported defect: one business value must stay ONE filter member."""
+    assert _coerce("multi_value", '["New York, NY","Paris"]', "@cities") == [
+        "New York, NY", "Paris",
+    ]
+    # And it must render as two literals, not three.
+    assert _render(["New York, NY", "Paris"], "postgres") == "'New York, NY', 'Paris'"
+
+
+def test_multi_value_legacy_comma_form_is_unchanged():
+    """Backward compatibility: a non-JSON string still comma-splits exactly as
+    before, so existing SET app.<name> session variables keep working."""
+    assert _coerce("multi_value", "EMEA,APAC", "@r") == ["EMEA", "APAC"]
+    assert _coerce("multi_value", "a, b ,c", "@r") == ["a", "b", "c"]
+
+
+def test_multi_value_json_array_round_trips_awkward_members():
+    """Quotes, whitespace, Unicode and an empty string must survive intact —
+    these are the members a delimiter convention cannot represent."""
+    raw = '["O\'Brien & Co, Ltd", "  padded  ", "Zürich", "", "a\\"b"]'
+    assert _coerce("multi_value", raw, "@m") == [
+        "O'Brien & Co, Ltd", "  padded  ", "Zürich", "", 'a"b',
+    ]
+
+
+def test_multi_value_json_numbers_normalise_to_strings():
+    """Both wire forms must resolve identically: ["10"] and [10] filter the
+    same, matching the legacy split's string element type and the string
+    element type allowed_values enforcement uses."""
+    assert _coerce("multi_value", '[10, 20]', "@ids") == ["10", "20"]
+    assert _coerce("multi_value", "10,20", "@ids") == ["10", "20"]
+
+
+def test_multi_value_rejects_non_scalar_members():
+    """A nested array/object/bool/null is not a filter member. Passing one
+    through rendered str(obj) as a SQL literal — a member matching nothing."""
+    for raw in ('[{"a": 1}]', '[["x"]]', "[true]", "[null]"):
+        with pytest.raises(ParameterError, match="must be strings or numbers"):
+            _coerce("multi_value", raw, "@m")
+    # Same validation on the persona/list channel, not only the JDBC string one.
+    with pytest.raises(ParameterError, match="must be strings or numbers"):
+        _coerce("multi_value", [{"a": 1}], "@m")
+
+
+def test_multi_value_malformed_json_array_fails_loudly():
+    """Any array delimiter commits the wire value to strict JSON parsing.
+
+    A truncated opening or closing delimiter must not fall back to the legacy
+    comma splitter and silently turn one embedded-comma member into two.
+    """
+    for raw in (
+        '["New York, NY", Paris]',
+        '["New York, NY", "Paris"',
+        '"New York, NY", "Paris"]',
+    ):
+        with pytest.raises(ParameterError, match="not valid JSON"):
+            _coerce("multi_value", raw, "@m")
+
+
+@pytest.mark.asyncio
+async def test_jdbc_partial_json_array_is_rejected_end_to_end():
+    """Malformed structured session input must fail at parameter resolution
+    instead of producing corrupted SQL members."""
+    db = _FakeApplyDB([_FakeParam("@cities", "multi_value", default_value=None)])
+
+    with pytest.raises(ParameterError, match="not valid JSON"):
+        await apply_parameters(
+            model_id="m1", sql="WHERE city IN (@cities)",
+            session_vars={"app.cities": '["New York, NY", "Paris"'},
+            persona_filters={}, db=db,
+        )
+
+
+def test_multi_value_empty_is_rejected_at_both_boundaries():
+    """Bug-7665: an empty multi_value used to render ``IN ()`` — a syntax error
+    surfaced as an unrelated database message."""
+    with pytest.raises(ParameterError, match="at least one value"):
+        _coerce("multi_value", "[]", "@m")
+    with pytest.raises(ParameterError, match="at least one value"):
+        _coerce("multi_value", [], "@m")
+    with pytest.raises(ParameterError, match="no valid SQL"):
+        _render([], "postgres")
+
+
+def test_boolean_rejects_non_string_non_bool():
+    """Bug-7439: the fallback used Python truthiness, so 2 -> True and [] ->
+    False. A malformed persona default then silently inverted a row filter."""
+    for bad in (2, 0, [], {}, None, 1.5):
+        with pytest.raises(ParameterError, match="expects a boolean"):
+            _coerce("boolean", bad, "@flag")
+    # Real booleans and the documented string tokens still work.
+    assert _coerce("boolean", True, "@flag") is True
+    assert _coerce("boolean", "no", "@flag") is False
+
+
+@pytest.mark.asyncio
+async def test_jdbc_session_var_json_array_binds_as_one_member_end_to_end():
+    """End-to-end through apply_parameters on the real JDBC channel: the
+    gateway forwards ``SET app.cities = '["New York, NY","Paris"]'`` verbatim as
+    a string, and the bound SQL must contain exactly two literals."""
+    db = _FakeApplyDB([_FakeParam("@cities", "multi_value", default_value=None)])
+    out = await apply_parameters(
+        model_id="m1", sql="WHERE city IN (@cities)",
+        session_vars={"app.cities": '["New York, NY","Paris"]'},
+        persona_filters={}, db=db,
+    )
+    assert out == "WHERE city IN ('New York, NY', 'Paris')"
+
+
+@pytest.mark.asyncio
+async def test_jdbc_session_var_legacy_comma_form_still_binds():
+    db = _FakeApplyDB([_FakeParam("@cities", "multi_value", default_value=None)])
+    out = await apply_parameters(
+        model_id="m1", sql="WHERE city IN (@cities)",
+        session_vars={"app.cities": "Paris,Berlin"},
+        persona_filters={}, db=db,
+    )
+    assert out == "WHERE city IN ('Paris', 'Berlin')"

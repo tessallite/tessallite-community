@@ -49,6 +49,7 @@ class _FakeMeasure:
     source_column_id: Optional[UUID] = None
     user_defined_attribute_id: Optional[UUID] = None
     expression: Optional[str] = None
+    measure_type: str = "standard"
     is_invalid: bool = False
     invalid_reason: Optional[str] = None
 
@@ -58,6 +59,8 @@ class _FakeTable:
     id: UUID
     physical_name: str
     table_type: str = "dim_aggregate"
+    display_name: Optional[str] = None
+    alias: Optional[str] = None
 
 
 @dataclass
@@ -101,7 +104,7 @@ def _mock_db(dims, tables, columns, joins, measures, agg_cols):
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def test_valid_aggregate_returns_none():
@@ -253,6 +256,82 @@ def test_validate_measure_unreachable_table():
 
 def test_validate_measure_expression_only_is_valid():
     fact = _FakeTable(uuid4(), "demo.fact", "fact")
+    base_a = _FakeMeasure(uuid4(), "a", source_column_id=uuid4())
+    base_b = _FakeMeasure(uuid4(), "b", source_column_id=uuid4())
     structure = _structure(fact, [], [], [fact.id])
-    m = _FakeMeasure(uuid4(), "computed", expression="SUM(a) - SUM(b)")
+    # Populate measures_by_name so the expression references resolve
+    structure.measures_by_name["a"] = base_a
+    structure.measures_by_name["b"] = base_b
+    m = _FakeMeasure(uuid4(), "computed",
+                     expression='measure("a") - measure("b")',
+                     measure_type="calculated")
     assert validate_measure(m, structure) is None
+
+
+# ---------------------------------------------------------------------------
+# Bug-7903 (Fable R2 #2): structural revalidation must NOT resurrect a
+# REFRESH-owned invalid aggregate to active.
+# ---------------------------------------------------------------------------
+
+def test_revalidate_does_not_resurrect_refresh_owned_invalid():
+    """A structurally-VALID aggregate whose invalid state is REFRESH-owned (its
+    durable refresh_prior_status is set by the refresh pending-guard) must stay
+    invalid — flipping it to active would serve incomplete/understated data over a
+    physical table the failed refresh left in doubt. Only a purely STRUCTURAL
+    invalid self-heals to active."""
+    from unittest.mock import patch
+    from shared.semantic import model_validator as mv
+
+    mid = uuid4()
+
+    # Two invalid aggregates that both pass the structural check now:
+    #  - refresh-owned (durable prior set) -> must STAY invalid
+    #  - purely structural (no durable prior) -> self-heals to active
+    refresh_owned = _FakeAgg(uuid4(), mid, grain=[], status="invalid")
+    refresh_owned.refresh_prior_status = "active"
+    structural = _FakeAgg(uuid4(), mid, grain=[], status="invalid")
+    structural.refresh_prior_status = None
+
+    async def _body():
+        db = AsyncMock()
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = [refresh_owned, structural]
+        db.execute = AsyncMock(return_value=result)
+        # validate_aggregate passes (structurally valid) for both.
+        with patch.object(mv, "validate_aggregate", new=AsyncMock(return_value=None)):
+            currently_invalid, newly_valid = await mv._revalidate_aggregates_with_structure(
+                mid, db, structure=None,
+            )
+        return currently_invalid, newly_valid
+
+    currently_invalid, newly_valid = asyncio.run(_body())
+
+    # Refresh-owned invalid was NOT resurrected.
+    assert refresh_owned.status == "invalid"
+    assert refresh_owned.id not in newly_valid
+    # Purely-structural invalid self-healed to active.
+    assert structural.status == "active"
+    assert structural.id in newly_valid
+
+
+def test_revalidate_reactivates_disabled_refresh_owned_only_via_refresh():
+    """A refresh-owned invalid whose durable prior is "disabled" must also stay
+    invalid here (the refresh engine restores it to disabled, not the validator)."""
+    from unittest.mock import patch
+    from shared.semantic import model_validator as mv
+
+    mid = uuid4()
+    agg = _FakeAgg(uuid4(), mid, grain=[], status="invalid")
+    agg.refresh_prior_status = "disabled"
+
+    async def _body():
+        db = AsyncMock()
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = [agg]
+        db.execute = AsyncMock(return_value=result)
+        with patch.object(mv, "validate_aggregate", new=AsyncMock(return_value=None)):
+            return await mv._revalidate_aggregates_with_structure(mid, db, structure=None)
+
+    _ci, newly_valid = asyncio.run(_body())
+    assert agg.status == "invalid"
+    assert agg.id not in newly_valid

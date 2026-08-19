@@ -3,26 +3,59 @@
   "allowCustomDataForDataTypeAny": false,
   "functions": [
     {
+      "id": "VALUE",
+      "name": "VALUE",
+      "description": "Returns the value of a Tessallite measure, optionally filtered by dimension members.",
+      "helpUrl": "https://cloud.tessallite.io/help/integrations/excel-add-in.html",
+      "parameters": [
+        { "name": "model", "description": "The model slug or name.", "type": "string", "dimensionality": "scalar" },
+        { "name": "measure", "description": "The measure name.", "type": "string", "dimensionality": "scalar" },
+        { "name": "filterColumn1", "description": "Optional filter dimension name.", "type": "string", "dimensionality": "scalar", "optional": true },
+        { "name": "filterValue1", "description": "Optional filter dimension value.", "type": "string", "dimensionality": "scalar", "optional": true },
+        { "name": "filterColumn2", "description": "Optional second filter dimension name.", "type": "string", "dimensionality": "scalar", "optional": true },
+        { "name": "filterValue2", "description": "Optional second filter dimension value.", "type": "string", "dimensionality": "scalar", "optional": true },
+        { "name": "filterColumn3", "description": "Optional third filter dimension name.", "type": "string", "dimensionality": "scalar", "optional": true },
+        { "name": "filterValue3", "description": "Optional third filter dimension value.", "type": "string", "dimensionality": "scalar", "optional": true },
+        { "name": "filterColumn4", "description": "Optional fourth filter dimension name.", "type": "string", "dimensionality": "scalar", "optional": true },
+        { "name": "filterValue4", "description": "Optional fourth filter dimension value.", "type": "string", "dimensionality": "scalar", "optional": true }
+      ],
+      "result": { "type": "any", "dimensionality": "scalar" }
+    },
+    {
+      "id": "KPI",
+      "name": "KPI",
+      "description": "Returns a KPI property (value, goal, or status) by name.",
+      "helpUrl": "https://cloud.tessallite.io/help/concepts/kpis.html",
+      "parameters": [
+        { "name": "model", "description": "The model slug or name.", "type": "string", "dimensionality": "scalar" },
+        { "name": "kpiName", "description": "The KPI name.", "type": "string", "dimensionality": "scalar" },
+        { "name": "property", "description": "The KPI property: \"value\", \"goal\", or \"status\".", "type": "string", "dimensionality": "scalar" }
+      ],
+      "result": { "type": "any", "dimensionality": "scalar" }
+    },
+    {
+      "id": "MEMBERVALUE",
+      "name": "MEMBERVALUE",
+      "description": "Returns the value of a measure for a specific dimension member.",
+      "helpUrl": "https://cloud.tessallite.io/help/integrations/excel-add-in.html",
+      "parameters": [
+        { "name": "model", "description": "The model slug or name.", "type": "string", "dimensionality": "scalar" },
+        { "name": "measure", "description": "The measure name.", "type": "string", "dimensionality": "scalar" },
+        { "name": "dimension", "description": "The dimension name.", "type": "string", "dimensionality": "scalar" },
+        { "name": "member", "description": "The dimension member value.", "type": "string", "dimensionality": "scalar" }
+      ],
+      "result": { "type": "any", "dimensionality": "scalar" }
+    },
+    {
       "id": "LISTBYID",
       "name": "LISTBYID",
       "description": "Returns the members of a Tessallite named set as a spilled array.",
       "helpUrl": "https://cloud.tessallite.io/help/integrations/excel-add-in.html",
       "parameters": [
-        {
-          "name": "named_set_id",
-          "description": "The ID of the named set (e.g. the UUID shown in the Tessallite panel).",
-          "type": "string",
-          "dimensionality": "scalar"
-        }
+        { "name": "named_set_id", "description": "The ID of the named set.", "type": "string", "dimensionality": "scalar" }
       ],
-      "result": {
-        "type": "string",
-        "dimensionality": "matrix"
-      },
-      "options": {
-        "stream": true,
-        "cancelable": true
-      }
+      "result": { "type": "string", "dimensionality": "matrix" },
+      "options": { "stream": true, "cancelable": true }
     },
     {
       "id": "KPIVALUE",
@@ -30,17 +63,9 @@
       "description": "Returns the current value of a Tessallite KPI.",
       "helpUrl": "https://cloud.tessallite.io/help/concepts/kpis.html",
       "parameters": [
-        {
-          "name": "kpi_id",
-          "description": "The ID of the KPI.",
-          "type": "string",
-          "dimensionality": "scalar"
-        }
+        { "name": "kpi_id", "description": "The ID of the KPI.", "type": "string", "dimensionality": "scalar" }
       ],
-      "result": {
-        "type": "any",
-        "dimensionality": "scalar"
-      }
+      "result": { "type": "any", "dimensionality": "scalar" }
     },
     {
       "id": "KPIGOAL",
@@ -48,17 +73,9 @@
       "description": "Returns the goal (target) value of a Tessallite KPI.",
       "helpUrl": "https://cloud.tessallite.io/help/concepts/kpis.html",
       "parameters": [
-        {
-          "name": "kpi_id",
-          "description": "The ID of the KPI.",
-          "type": "string",
-          "dimensionality": "scalar"
-        }
+        { "name": "kpi_id", "description": "The ID of the KPI.", "type": "string", "dimensionality": "scalar" }
       ],
-      "result": {
-        "type": "any",
-        "dimensionality": "scalar"
-      }
+      "result": { "type": "any", "dimensionality": "scalar" }
     },
     {
       "id": "KPISTATUS",
@@ -66,17 +83,16 @@
       "description": "Returns the status code of a Tessallite KPI (1 = Good, 0 = Warning, -1 = Poor).",
       "helpUrl": "https://cloud.tessallite.io/help/concepts/kpis.html",
       "parameters": [
-        {
-          "name": "kpi_id",
-          "description": "The ID of the KPI.",
-          "type": "string",
-          "dimensionality": "scalar"
-        }
+        { "name": "kpi_id", "description": "The ID of the KPI.", "type": "string", "dimensionality": "scalar" }
       ],
-      "result": {
-        "type": "any",
-        "dimensionality": "scalar"
-      }
+      "result": { "type": "any", "dimensionality": "scalar" }
+    },
+    {
+      "id": "DIAG",
+      "name": "DIAG",
+      "description": "Diagnostic: returns the runtime and storage state as text.",
+      "parameters": [],
+      "result": { "type": "string", "dimensionality": "scalar" }
     }
   ]
 }

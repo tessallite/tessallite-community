@@ -2,7 +2,7 @@
 title: "Query Panel"
 audience: modeller
 area: modelling
-updated: 2026-05-15
+updated: 2026-08-11
 ---
 
 ## What this covers
@@ -48,6 +48,39 @@ Because the list is shared, *changing* or *deleting* a saved query is governed:
 - A Viewer who did not create a query cannot change or delete it — the panel shows the server's message ("Only the query owner or a modeler can modify this saved query") rather than failing silently.
 
 Deleting always asks you to **confirm first**, because a delete cannot be undone and the query is shared with everyone on the model.
+
+---
+
+## Scratchpad measures
+
+The **Scratchpad** panel, next to the Query panel in the Toolbelt, holds your own private calculations. A scratchpad measure is just a name and a SQL expression — `SUM(amount) / COUNT(DISTINCT customer_id)`, say — that you can then drop into the Measure Query Panel like any other measure. Nobody else sees your scratchpad measures, and they are not part of the deployed model, so this is the safe place to try an idea out before proposing it as a real measure.
+
+### What happens when you click Save
+
+Before the measure is stored, Tessallite runs your expression past the model to check that everything it mentions actually exists. Three things can happen:
+
+| What you see | What it means | What to do |
+|---|---|---|
+| The measure appears in the list | The expression checked out against the model | Nothing — go and use it |
+| A message naming something in your expression, e.g. *unknown column `custmer_id`* | A real verdict: the expression refers to something the model does not have | Fix the expression. Saving again without changing it will fail the same way |
+| *"Your measure was not saved because the query validator could not be reached... Try saving again in a moment."* | Nothing is wrong with your expression — the service that does the checking was momentarily unavailable and could not look at it | Wait a few seconds and click **Save** again |
+
+That third case is worth understanding, because it looks like a failure but it is not a judgement on your work.
+
+### Why Tessallite refuses instead of saving it anyway
+
+It would be easy for Tessallite to shrug and save your measure unchecked. It deliberately does not, and the reason is what happens next if it did.
+
+An expression that does not really work does not announce itself. It does not produce an error in the pivot. It produces a **column full of blanks** — and a column of blanks looks like a genuine answer ("there were no sales in that region"). You would not know to doubt it, because there is nothing on screen to doubt. That is the single worst outcome in a reporting tool: a wrong number wearing the costume of a right one.
+
+Compare the two costs honestly:
+
+- **Save it unchecked:** you are inconvenienced by nothing today, and possibly misled next month, permanently and silently.
+- **Refuse to save it:** you are inconvenienced for a few seconds today, you can see exactly why, and you fix it by clicking again.
+
+The second is a much better trade, so that is the one Tessallite makes. Note that only *saving a new measure* is affected — the outage does not touch measures you saved earlier, and it does not stop anyone querying or reporting. Nothing is broken for people reading your dashboards; you simply cannot add a new scratchpad measure until the checker is back.
+
+If the message keeps appearing for more than a couple of minutes, it is not your model — tell your administrator that the query service is unreachable.
 
 ---
 

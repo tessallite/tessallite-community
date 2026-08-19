@@ -75,6 +75,7 @@ async function request<T>(
   const res = await fetch(`${baseUrl}${path}`, {
     method,
     headers,
+    credentials: 'omit',
     body: body ? JSON.stringify(body) : undefined,
   });
   const durationMs = Date.now() - startMs;
@@ -134,10 +135,14 @@ export async function streamRequest(
   path: string,
   body: unknown,
   signal?: AbortSignal,
+  extraHeaders?: Record<string, string>,
 ): Promise<Response> {
   const jwt = await getJwt();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    // Bug-6596: callers may forward per-request headers (e.g. the Bug-6521
+    // Idempotency-Key) without losing the JWT auth this helper injects.
+    ...(extraHeaders ?? {}),
   };
   if (jwt) {
     headers['Authorization'] = `Bearer ${jwt}`;
@@ -146,6 +151,7 @@ export async function streamRequest(
   const res = await fetch(`${baseUrl}${path}`, {
     method: 'POST',
     headers,
+    credentials: 'omit',
     body: JSON.stringify(body),
     signal,
   });
@@ -176,6 +182,14 @@ export function formatApiError(err: ApiError): string {
       return 'Permission denied. Your account does not have access to this resource.';
     case 404:
       return 'The requested resource was not found. It may have been removed or is not yet deployed.';
+    case 409:
+      // Bug-8712 — DEPLOYED_SNAPSHOT_INVALID. The add-in reads the model's
+      // PUBLISHED definitions; when the published version cannot be read there
+      // is nothing it is allowed to serve. Fail closed with a plain instruction
+      // and never fall back to the live draft (Bug-8384 made this deliberate).
+      // The raw server detail is deliberately not shown — it names internal
+      // snapshot state and gives the user nothing to act on.
+      return 'The published version of this model is unavailable. Ask a modeller to deploy the model again, then refresh.';
     case 422:
       return `Validation error: ${err.message}`;
     case 429:

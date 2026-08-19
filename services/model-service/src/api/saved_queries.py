@@ -23,6 +23,26 @@ router = APIRouter(
 )
 
 
+async def _can_edit(
+    db,
+    current_user: CurrentUser,
+    project_id: UUID,
+    model_id: UUID,
+    *,
+    is_owner: bool,
+) -> bool:
+    """Bug-5983: mirrors ``_require_owner_or_modeler`` as a boolean check so
+    the response contract can tell the frontend whether edit/delete controls
+    are actually usable, not just whether the caller happens to be the
+    owner. ``is_owner`` short-circuits the role lookup for the common case.
+    """
+    if is_owner:
+        return True
+    return await caller_has_role(
+        db, current_user, project_id, "modeler", model_id=model_id
+    )
+
+
 async def _require_owner_or_modeler(
     db,
     current_user: CurrentUser,
@@ -69,7 +89,21 @@ async def list_saved_queries(
             .limit(limit)
             .offset(offset)
         )
-        return [SavedQueryResponse.model_validate(q) for q in result.scalars().all()]
+        caller_identity = current_user.email or current_user.user_id
+        rows = result.scalars().all()
+        # Bug-5983: the modeler-role mutation grant is model-wide (not
+        # per-row), so resolve it once per request rather than once per
+        # saved query.
+        is_modeler_plus = await caller_has_role(
+            db, current_user, project_id, "modeler", model_id=model_id
+        )
+        responses = []
+        for q in rows:
+            resp = SavedQueryResponse.model_validate(q)
+            resp.is_owner = q.created_by == caller_identity
+            resp.can_edit = resp.is_owner or is_modeler_plus
+            responses.append(resp)
+        return responses
 
 
 @router.get("/{query_id}", response_model=SavedQueryResponse)
@@ -85,7 +119,13 @@ async def get_saved_query(
         q = await db.get(SavedQuery, query_id)
         if q is None or q.model_id != model_id:
             raise HTTPException(status_code=404, detail="Saved query not found")
-        return SavedQueryResponse.model_validate(q)
+        resp = SavedQueryResponse.model_validate(q)
+        caller_identity = current_user.email or current_user.user_id
+        resp.is_owner = q.created_by == caller_identity
+        resp.can_edit = await _can_edit(
+            db, current_user, project_id, model_id, is_owner=resp.is_owner
+        )
+        return resp
 
 
 @router.post(
@@ -113,7 +153,10 @@ async def create_saved_query(
         db.add(q)
         await db.commit()
         await db.refresh(q)
-        return SavedQueryResponse.model_validate(q)
+        resp = SavedQueryResponse.model_validate(q)
+        resp.is_owner = True
+        resp.can_edit = True
+        return resp
 
 
 @router.patch(
@@ -139,7 +182,13 @@ async def update_saved_query(
             setattr(q, key, val)
         await db.commit()
         await db.refresh(q)
-        return SavedQueryResponse.model_validate(q)
+        resp = SavedQueryResponse.model_validate(q)
+        caller_identity = current_user.email or current_user.user_id
+        resp.is_owner = q.created_by == caller_identity
+        # The mutation above already passed the owner-or-modeler gate, so the
+        # caller can always edit the query they just successfully updated.
+        resp.can_edit = True
+        return resp
 
 
 @router.delete(

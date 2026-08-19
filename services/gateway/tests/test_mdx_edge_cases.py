@@ -25,8 +25,10 @@ from src.dax.mdx_validators import (
 from src.dax.xmla_server import (
     _extract_topn_spec,
     _extract_filter_spec,
-    _extract_label_filter_specs,
+    _translate_label_filter_calls,
     _label_filter_to_sql,
+    _RANGE_PREFIX,
+    _RANGE_SEP,
 )
 
 
@@ -1363,7 +1365,7 @@ class TestGetPivotData:
 # ---------------------------------------------------------------------------
 
 class TestLabelFilterExtraction:
-    """Tests for _extract_label_filter_specs — Begins With, Contains, Ends With."""
+    """Tests for _translate_label_filter_calls — Begins With, Contains, Ends With."""
 
     _DIM_NAMES = {"country_name", "region"}
     _HIER_MAP = {"geography": {"country": "country_name"}}
@@ -1374,8 +1376,9 @@ class TestLabelFilterExtraction:
             'Filter([Geography].[Geography].Members, '
             'Left([Geography].CurrentMember.Name, 3) = "Uni")'
         )
-        specs = _extract_label_filter_specs(
+        specs = _translate_label_filter_calls(
             axis, self._DIM_NAMES, self._HIER_MAP, self._DEFAULT_MAP,
+            quote_fn=lambda n: f'"{n}"',
         )
         assert len(specs) == 1
         assert specs[0].operation == "begins_with"
@@ -1387,8 +1390,9 @@ class TestLabelFilterExtraction:
             'Filter([Geography].[Geography].Members, '
             'Left([Geography].CurrentMember.Name, 5) <> "China")'
         )
-        specs = _extract_label_filter_specs(
+        specs = _translate_label_filter_calls(
             axis, self._DIM_NAMES, self._HIER_MAP, self._DEFAULT_MAP,
+            quote_fn=lambda n: f'"{n}"',
         )
         assert len(specs) == 1
         assert specs[0].operation == "begins_with"
@@ -1399,8 +1403,9 @@ class TestLabelFilterExtraction:
             'Filter([Geography].[Geography].Members, '
             'InStr([Geography].CurrentMember.Name, "land") > 0)'
         )
-        specs = _extract_label_filter_specs(
+        specs = _translate_label_filter_calls(
             axis, self._DIM_NAMES, self._HIER_MAP, self._DEFAULT_MAP,
+            quote_fn=lambda n: f'"{n}"',
         )
         assert len(specs) == 1
         assert specs[0].operation == "contains"
@@ -1412,8 +1417,9 @@ class TestLabelFilterExtraction:
             'Filter([Geography].[Geography].Members, '
             'InStr([Geography].CurrentMember.Name, "land") = 0)'
         )
-        specs = _extract_label_filter_specs(
+        specs = _translate_label_filter_calls(
             axis, self._DIM_NAMES, self._HIER_MAP, self._DEFAULT_MAP,
+            quote_fn=lambda n: f'"{n}"',
         )
         assert len(specs) == 1
         assert specs[0].operation == "contains"
@@ -1424,8 +1430,9 @@ class TestLabelFilterExtraction:
             'Filter([Geography].[Geography].Members, '
             'Right([Geography].CurrentMember.Name, 2) = "ia")'
         )
-        specs = _extract_label_filter_specs(
+        specs = _translate_label_filter_calls(
             axis, self._DIM_NAMES, self._HIER_MAP, self._DEFAULT_MAP,
+            quote_fn=lambda n: f'"{n}"',
         )
         assert len(specs) == 1
         assert specs[0].operation == "ends_with"
@@ -1437,8 +1444,9 @@ class TestLabelFilterExtraction:
             'Filter([Geography].[Geography].Members, '
             'Right([Geography].CurrentMember.Name, 2) <> "ia")'
         )
-        specs = _extract_label_filter_specs(
+        specs = _translate_label_filter_calls(
             axis, self._DIM_NAMES, self._HIER_MAP, self._DEFAULT_MAP,
+            quote_fn=lambda n: f'"{n}"',
         )
         assert len(specs) == 1
         assert specs[0].operation == "ends_with"
@@ -1448,8 +1456,9 @@ class TestLabelFilterExtraction:
         axis = (
             'Filter([Geography].Members, [Measures].[Sales] > 1000)'
         )
-        specs = _extract_label_filter_specs(
+        specs = _translate_label_filter_calls(
             axis, self._DIM_NAMES, self._HIER_MAP, self._DEFAULT_MAP,
+            quote_fn=lambda n: f'"{n}"',
         )
         assert len(specs) == 0
 
@@ -1458,8 +1467,9 @@ class TestLabelFilterExtraction:
             'Filter([Geography].[Geography].Members, '
             'LEFT([Geography].CurrentMember.Name, 3) = "Uni")'
         )
-        specs = _extract_label_filter_specs(
+        specs = _translate_label_filter_calls(
             axis, self._DIM_NAMES, self._HIER_MAP, self._DEFAULT_MAP,
+            quote_fn=lambda n: f'"{n}"',
         )
         assert len(specs) == 1
 
@@ -1468,8 +1478,9 @@ class TestLabelFilterExtraction:
             'Filter([Geography].[Geography].Members, '
             'InStr([Geography].[Geography].CurrentMember.Name, "US") > 0)'
         )
-        specs = _extract_label_filter_specs(
+        specs = _translate_label_filter_calls(
             axis, self._DIM_NAMES, self._HIER_MAP, self._DEFAULT_MAP,
+            quote_fn=lambda n: f'"{n}"',
         )
         assert len(specs) == 1
         assert specs[0].dim_ref == "country_name"
@@ -1636,14 +1647,14 @@ class TestPathQualifiedUnameRoundTrip:
         filters = self._extract(
             "{[Date].[Cal].[Month].&[2025]&[4]:[Date].[Cal].[Month].&[2025]&[6]}"
         )
-        assert filters["business_date_month"] == ["__BETWEEN__4__6"]
+        assert filters["business_date_month"] == [f"{_RANGE_PREFIX}4{_RANGE_SEP}6"]
         assert filters["business_date_year"] == ["2025"]
 
     def test_single_key_range_behaviour_unchanged(self):
         filters = self._extract(
             "{[Date].[Cal].[Month].&[202501]:[Date].[Cal].[Month].&[202503]}"
         )
-        assert filters == {"business_date_month": ["__BETWEEN__202501__202503"]}
+        assert filters == {"business_date_month": [f"{_RANGE_PREFIX}202501{_RANGE_SEP}202503"]}
 
     def test_multi_select_composite_unames_within_one_ancestor(self):
         """Excel keep-only of two months of the same year."""

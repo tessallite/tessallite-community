@@ -16,6 +16,7 @@ import {
   cubeImportApi,
 } from "../../../api/importExportApi";
 import { useT } from "../../../i18n";
+import ImportWarningAlerts from "../ImportWarningAlerts";
 
 type Props = { projectId: string };
 
@@ -23,12 +24,20 @@ export default function CubeImportPanel({ projectId }: Props) {
   const t = useT();
   const [file, setFile] = useState<File | null>(null);
   const [result, setResult] = useState<CubeImportResponse | null>(null);
+  // F-020-03 / G-020-03: preview the loss/warning report before models exist.
+  const [preview, setPreview] = useState<CubeImportResponse | null>(null);
   const queryClient = useQueryClient();
+
+  const previewMut = useMutation({
+    mutationFn: (f: File) => cubeImportApi.importCube(projectId, f, true),
+    onSuccess: (data) => setPreview(data),
+  });
 
   const importMut = useMutation({
     mutationFn: (f: File) => cubeImportApi.importCube(projectId, f),
     onSuccess: (data) => {
       setResult(data);
+      setPreview(null);
       queryClient.invalidateQueries({ queryKey: ["models"] });
     },
   });
@@ -53,18 +62,7 @@ export default function CubeImportPanel({ projectId }: Props) {
             </List>
           </>
         )}
-        {result.warnings.length > 0 && (
-          <Alert severity="warning" sx={{ mt: 1 }}>
-            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
-              {t("importDialog.warningsCount", { count: String(result.warnings.length) })}
-            </Typography>
-            {result.warnings.map((w, i) => (
-              <Typography key={i} variant="body2" sx={{ mb: 0.5 }}>
-                {w}
-              </Typography>
-            ))}
-          </Alert>
-        )}
+        <ImportWarningAlerts warnings={result.warnings} t={t} />
       </Box>
     );
   }
@@ -84,19 +82,56 @@ export default function CubeImportPanel({ projectId }: Props) {
             onChange={(e) => {
               setFile(e.target.files?.[0] ?? null);
               setResult(null);
+              setPreview(null);
             }}
           />
         </Button>
       </Box>
-      {importMut.isError && (
+      {(previewMut.isError || importMut.isError) && (
         <Alert severity="error">
-          {(importMut.error as Error)?.message || t("importDialog.importError")}
+          {((previewMut.error || importMut.error) as Error)?.message ||
+            t("importDialog.importError")}
         </Alert>
       )}
-      <Box display="flex" justifyContent="flex-end" pt={1}>
+      {preview && (
+        <Box>
+          <Alert severity="info" sx={{ mb: 1 }}>
+            {t("importDialog.previewSummary", {
+              parsed: String(preview.models_parsed),
+            })}
+          </Alert>
+          {preview.model_names.length > 0 && (
+            <>
+              <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+                {t("importDialog.modelsFound")}
+              </Typography>
+              <List dense disablePadding>
+                {preview.model_names.map((name) => (
+                  <ListItem key={name} disableGutters sx={{ py: 0 }}>
+                    <ListItemText primary={name} />
+                  </ListItem>
+                ))}
+              </List>
+            </>
+          )}
+          <ImportWarningAlerts warnings={preview.warnings} t={t} />
+        </Box>
+      )}
+      <Box display="flex" justifyContent="flex-end" gap={1} pt={1}>
+        <Button
+          variant="outlined"
+          disabled={!file || previewMut.isPending}
+          onClick={() => file && previewMut.mutate(file)}
+        >
+          {previewMut.isPending ? (
+            <CircularProgress size={18} color="inherit" />
+          ) : (
+            t("importDialog.previewButton")
+          )}
+        </Button>
         <Button
           variant="contained"
-          disabled={!file || importMut.isPending}
+          disabled={!file || !preview || importMut.isPending}
           onClick={() => file && importMut.mutate(file)}
         >
           {importMut.isPending ? (

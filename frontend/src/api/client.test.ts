@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { isNonContentModelWrite } from "./client";
+import { buildPivotViewConfig, isNonContentModelWrite, parsePivotSort, parsePivotViewSortConfig } from "./client";
 
 describe("client CSRF and auth helpers", () => {
   beforeEach(() => {
@@ -114,5 +114,50 @@ describe("client CSRF and auth helpers", () => {
       expect(isNonContentModelWrite("PATCH", false, "not json")).toBe(false);
       expect(isNonContentModelWrite("PATCH", false, undefined)).toBe(false);
     });
+  });
+});
+
+describe("saved pivot sort config (Bug-8069)", () => {
+  it("round-trips a descending repeated-measure exact-column sort across save, load, and reopen", () => {
+    const sort = {
+      measure: { measureId: "revenue", aggregation: "AVG", occurrence: 1 },
+      target: { kind: "column" as const, columnKey: ["2026", "Q1"] },
+      direction: "desc" as const,
+    };
+    const config = buildPivotViewConfig({ measureSelections: [] }, sort);
+    expect(config.configVersion).toBe(2);
+    const reopened = JSON.parse(JSON.stringify(config));
+    expect(parsePivotViewSortConfig(reopened)).toEqual({ sort, issue: null });
+  });
+
+  it("round-trips an ascending grand-total sort", () => {
+    const sort = {
+      measure: { measureId: "profit", aggregation: "SUM", occurrence: 0 },
+      target: { kind: "grand" as const },
+      direction: "asc" as const,
+    };
+    expect(parsePivotViewSortConfig(buildPivotViewConfig({}, sort))).toEqual({ sort, issue: null });
+  });
+
+  it("rejects malformed descriptors and unsupported saved-view versions", () => {
+    const sort = {
+      measure: { measureId: "profit", aggregation: "SUM", occurrence: 0 },
+      target: { kind: "grand" as const },
+      direction: "asc" as const,
+    };
+    expect(parsePivotSort({ ...sort, direction: "sideways" })).toBeNull();
+    expect(parsePivotSort({ ...sort, measure: { ...sort.measure, occurrence: -1 } })).toBeNull();
+    expect(parsePivotSort({ ...sort, target: { kind: "column", columnKey: ["ok", 2] } })).toBeNull();
+    expect(parsePivotViewSortConfig({ configVersion: 2, sort: { ...sort, direction: "sideways" } }))
+      .toEqual({ sort: null, issue: "invalid-sort" });
+    expect(parsePivotViewSortConfig({ configVersion: 3, sort }))
+      .toEqual({ sort: null, issue: "unsupported-version" });
+    expect(parsePivotViewSortConfig({ sort }))
+      .toEqual({ sort: null, issue: "unsupported-version" });
+  });
+
+  it("keeps legacy no-sort configs quiet", () => {
+    expect(parsePivotViewSortConfig({ measureSelections: [] }))
+      .toEqual({ sort: null, issue: null });
   });
 });

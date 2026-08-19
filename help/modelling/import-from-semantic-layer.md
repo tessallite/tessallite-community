@@ -36,6 +36,8 @@ All three importers produce the same Tessallite bundle format. The table below s
 | Format strings | Not available | Preserved from metric format field | Preserved from measure format field |
 | Personas | Default "Everyone" created | Default "Everyone" created | Default "Everyone" created; private cubes skipped |
 
+Cube imports also skip private dimensions and private measures. Each skipped private member is reported in the import warnings with its name and type; it is never silently omitted.
+
 ---
 
 ## What needs manual setup after import
@@ -118,4 +120,4 @@ Besides YAML files, Tessallite can pull table and column metadata straight from 
 
 ---
 
-<- [Export and Import a Project](export-and-import-a-project.md) | [Home](../index.md) | [Impact Analysis ->](impact-analysis.md)
+<- [Export and Import a Project](export-and-import-a-project.md) | [Home](../index.md) | [Usage & Downstream Assets ->](usage-downstream-assets.md)

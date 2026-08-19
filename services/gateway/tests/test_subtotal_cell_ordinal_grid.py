@@ -352,7 +352,11 @@ def _discover_members(dname, level_names, members_by_level):
         restrictions={},
         member_data=member_data,
     )
-    return [r for r in rows if r.get("DIMENSION_UNIQUE_NAME") == f"[{dname}]"]
+    # Bug-6891: hierarchies group under [Hierarchies]; select by hierarchy grammar.
+    return [
+        r for r in rows
+        if str(r.get("HIERARCHY_UNIQUE_NAME", "")).startswith(f"[{dname}].")
+    ]
 
 
 def test_discover_member_unames_match_execute_for_subtotal_hierarchy():

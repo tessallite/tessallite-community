@@ -98,6 +98,15 @@ SLA_CHECK_ERRORS = Counter(
     ["tenant"],
 )
 
+# Bug-8121: durable evidence gap monitor. Incremented every time the RLS-bypass
+# audit write fails. The bypass itself proceeds (non-blocking for the query path)
+# but the counter lets operators detect when the durable audit trail is
+# incomplete and alert on it.
+RLS_BYPASS_AUDIT_FAILURES = Counter(
+    "tessallite_rls_bypass_audit_failures_total",
+    "RLS bypass audit writes that failed (bypass proceeded, but durable evidence is missing)",
+)
+
 
 # ---------------------------------------------------------------------------
 # Middleware
@@ -108,14 +117,22 @@ _SKIP_PATHS = frozenset({"/metrics", "/health", "/readiness", "/liveness"})
 
 
 def _route_template(request: Request) -> str:
-    """Return the matched route template path, or the concrete path if no route
-    matched (404s). Collapses entity UUIDs into ``{param}`` placeholders so the
-    Prometheus path label has bounded cardinality (F-030-15)."""
+    """Return the matched route template path, or a fixed constant if no route
+    matched (404s).  Collapses entity UUIDs into ``{param}`` placeholders so the
+    Prometheus path label has bounded cardinality (F-030-15).
+
+    Bug-7675: the previous fallback returned ``request.url.path`` verbatim for
+    unmatched routes, re-opening the unbounded-cardinality vector the F-030-15
+    fix was meant to close.  An unauthenticated scanner issuing
+    ``GET /<random-uuid>`` in a loop creates one permanent label set per path
+    per replica -- slow memory growth and ballooning ``/metrics`` payloads.
+    Now unmatched paths are collapsed to a single ``__unmatched__`` constant.
+    """
     route = request.scope.get("route")
     template = getattr(route, "path", None)
     if template:
         return template
-    return request.url.path
+    return "__unmatched__"
 
 
 class PrometheusMiddleware(BaseHTTPMiddleware):
@@ -131,30 +148,43 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
 
         method = request.method
         start = time.perf_counter()
-        response = await call_next(request)
-        duration = time.perf_counter() - start
+        # Bug-8163: REQUEST_COUNT / REQUEST_LATENCY were only recorded on the
+        # normal return path (after ``call_next`` returned). An uncaught
+        # exception propagating out of ``call_next`` — the exact condition
+        # operators most need telemetry for — skipped both metrics entirely,
+        # making error rate and latency look healthier than reality during a
+        # real outage. ``status`` defaults to "500" (an escaped exception
+        # always surfaces to the client as a server error via Starlette's
+        # ServerErrorMiddleware) and the ``finally`` block records both
+        # metrics on every exit path — success or exception — before the
+        # exception is re-raised unchanged.
+        status_code = "500"
+        try:
+            response = await call_next(request)
+            status_code = str(response.status_code)
+            return response
+        finally:
+            duration = time.perf_counter() - start
 
-        # F-030-15: label with the matched route *template*
-        # (e.g. "/api/v1/projects/{project_id}/models/{model_id}/metrics") rather
-        # than the concrete request path. The concrete path embeds project/model/
-        # alert UUIDs, so every distinct entity created a new permanent label set
-        # — unbounded cardinality, a slow per-replica memory leak, and a ballooning
-        # scrape. The template collapses all entities of a route to one series.
-        path = _route_template(request)
+            # F-030-15: label with the matched route *template*
+            # (e.g. "/api/v1/projects/{project_id}/models/{model_id}/metrics") rather
+            # than the concrete request path. The concrete path embeds project/model/
+            # alert UUIDs, so every distinct entity created a new permanent label set
+            # — unbounded cardinality, a slow per-replica memory leak, and a ballooning
+            # scrape. The template collapses all entities of a route to one series.
+            path = _route_template(request)
 
-        REQUEST_COUNT.labels(
-            service=self._service,
-            method=method,
-            path=path,
-            status=str(response.status_code),
-        ).inc()
-        REQUEST_LATENCY.labels(
-            service=self._service,
-            method=method,
-            path=path,
-        ).observe(duration)
-
-        return response
+            REQUEST_COUNT.labels(
+                service=self._service,
+                method=method,
+                path=path,
+                status=status_code,
+            ).inc()
+            REQUEST_LATENCY.labels(
+                service=self._service,
+                method=method,
+                path=path,
+            ).observe(duration)
 
 
 # F-030-15: optional static-token guard for the /metrics scrape endpoint. The

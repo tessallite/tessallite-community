@@ -25,7 +25,8 @@ These must be set in `.env` (Community/local) or stored as Secret Manager secret
 | `CREDENTIAL_ENCRYPTION_KEY` | Yes | — | Fernet key (base64, 32 bytes) used to encrypt source database credentials at rest. Generate with: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 | `JWT_SECRET_KEY` | Yes | — | Secret used to sign user session tokens. Minimum 32 characters. |
 | `SYSTEM_ADMIN_EMAIL` | No | `admin@tessallite.local` | Email address of the system-level administrator. |
-| `SYSTEM_ADMIN_PASSWORD` | Yes | — | Password for the system administrator. |
+| `SYSTEM_ADMIN_PASSWORD` | Yes | — | Password for the system administrator. Production deployments require a minimum of 12 characters, with at least one uppercase letter, one lowercase letter, and one digit; the installers enforce this and set `ENFORCE_SECRET_STRENGTH=true`. |
+| `ENFORCE_SECRET_STRENGTH` | No | `false` | When `true`, a `SYSTEM_ADMIN_PASSWORD` that does not meet the strength floor is a fatal startup error. The production installers set this to `true`. Leave it `false` (or unset) for dev/test/CI/demo, where a short bootstrap password only logs a warning and starts normally. |
 | `LICENSE_FILE_HOST` | No | `./license.json` | Legacy/bootstrap host path to a signed local licence file. The License Manager upload stores the active licence in the platform database. |
 | `LICENSE_PUBLIC_KEYS` | No | built-in key | Optional public verification key override. Normal installs use the built-in Tessallite public key. |
 | `LICENSE_ENFORCEMENT_ENABLED` | No | `true` | Requires a valid signed licence at startup. Leave enabled for normal Community installs. |
@@ -105,4 +106,4 @@ Never commit credential values to source control. In Community installs, keep `.
 
 ---
 
-← [Deploy on Kubernetes](deploy-kubernetes.md) | [Home](../index.md) | [System Configuration →](system-configuration.md)
+← [Create a Tenant](create-a-tenant.md) | [Home](../index.md) | [System Configuration →](system-configuration.md)

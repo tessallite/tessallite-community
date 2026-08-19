@@ -1,6 +1,7 @@
-import { Box, Typography, Collapse } from '@mui/material';
+import { Box, Typography, Collapse, IconButton } from '@mui/material';
 import { ExpandMore, ExpandLess } from '@mui/icons-material';
 import { tokens } from '../../theme';
+import { strings, templates } from '../../i18n/strings';
 import HierarchyCard from './HierarchyCard';
 import type { Hierarchy, HierarchyLevel } from '../../types/tessallite';
 
@@ -31,10 +32,19 @@ export default function HierarchyLibrary({
         onClick={() => { if (hasItems) onToggle(); }}
       >
         <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-          Hierarchies ({hierarchies?.length ?? 0})
+          {templates.library.hierarchiesHeader(hierarchies?.length ?? 0)}
         </Typography>
+        {/* Bug-6710: keyboard path to expand/collapse (header Box is mouse-only). */}
         {hasItems && (
-          expanded ? <ExpandLess sx={{ fontSize: 16, color: tokens.colorTextSecondary }} /> : <ExpandMore sx={{ fontSize: 16, color: tokens.colorTextSecondary }} />
+          <IconButton
+            size="small"
+            onClick={(e) => { e.stopPropagation(); onToggle(); }}
+            aria-expanded={expanded}
+            aria-label={templates.library.toggleSectionAria(expanded, strings.library.hierarchiesSection)}
+            sx={{ width: 24, height: 24, color: tokens.colorTextSecondary }}
+          >
+            {expanded ? <ExpandLess sx={{ fontSize: 16 }} /> : <ExpandMore sx={{ fontSize: 16 }} />}
+          </IconButton>
         )}
       </Box>
       <Collapse in={expanded}>

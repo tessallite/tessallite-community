@@ -75,7 +75,7 @@ POSTGRES_PASSWORD=$(openssl rand -hex 24)
 CREDENTIAL_ENCRYPTION_KEY=$(python3 -c &quot;from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())&quot;)
 JWT_SECRET_KEY=$(python3 -c &quot;import secrets; print(secrets.token_urlsafe(48))&quot;)
 SYSTEM_ADMIN_EMAIL=admin@tessallite.local
-SYSTEM_ADMIN_PASSWORD=$(openssl rand -base64 18)
+SYSTEM_ADMIN_PASSWORD=$(openssl rand -base64 18)Aa1
 EOF
   chmod 600 &quot;$SECRETS_ENV&quot;
   echo &quot;Wrote $SECRETS_ENV (chmod 600). Review it, then run: $0 install&quot;
@@ -184,7 +184,7 @@ kind delete cluster --name tessallite-test     # clean up
 </ul>
 <h2>Related</h2>
 <ul><li><a href="deploy-gcp.html">Deploy on GCP</a></li><li><a href="deploy-local.html">Deploy Locally</a></li><li><a href="configure-environment-variables.html">Configure Environment Variables</a></li><li><a href="teardown.html">Teardown</a></li></ul>
-<nav class="page-nav"><a href="deploy-gcp.html" class="page-nav-btn prev">&larr; Deploy on GCP</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="configure-environment-variables.html" class="page-nav-btn next">Configure Environment Variables &rarr;</a></nav>
+<nav class="page-nav"><a href="deploy-gcp.html" class="page-nav-btn prev">&larr; Deploy on GCP</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="create-a-tenant.html" class="page-nav-btn next">Create a Tenant &rarr;</a></nav>
   </main>
   <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
 </body>

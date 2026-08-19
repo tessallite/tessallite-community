@@ -101,7 +101,7 @@ def test_build_shape_hydrates_measures_and_hidden_columns():
 
 @pytest.mark.asyncio
 async def test_resolve_deployed_shape_returns_none_when_no_pointer():
-    model = types.SimpleNamespace(id=uuid.uuid4(), deployed_version_id=None)
+    model = types.SimpleNamespace(id=uuid.uuid4(), deployed_version_id=None, deploy_epoch=0)
     assert await resolve_deployed_shape(model, AsyncMock()) is None
 
 
@@ -110,7 +110,7 @@ async def test_resolve_deployed_shape_caches_per_version():
     snapshot_resolver.invalidate()
     model_id = uuid.uuid4()
     version_id = uuid.uuid4()
-    model = types.SimpleNamespace(id=model_id, deployed_version_id=version_id)
+    model = types.SimpleNamespace(id=model_id, deployed_version_id=version_id, deploy_epoch=1)
     version = types.SimpleNamespace(
         snapshot_json={
             "measures": [
@@ -130,10 +130,162 @@ async def test_resolve_deployed_shape_caches_per_version():
     assert first is second  # cached, only one db.get
     assert db.get.await_count == 1
 
-    # Deploying a new version changes the key → fresh resolution.
+    # Deploying a new version changes the key -> fresh resolution.
     model.deployed_version_id = uuid.uuid4()
     await resolve_deployed_shape(model, db)
     assert db.get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_deploy_epoch_bump_invalidates_deployed_shape_cache():
+    """Bug-7140: a deploy_epoch bump must produce a different cache key so
+    that undeploy/revert deterministically invalidates the cached shape
+    across all replicas without an explicit eviction call."""
+    snapshot_resolver.invalidate()
+    model_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    model = types.SimpleNamespace(
+        id=model_id, deployed_version_id=version_id, deploy_epoch=1,
+    )
+    version = types.SimpleNamespace(
+        snapshot_json={
+            "measures": [
+                {"id": str(uuid.uuid4()), "name": "revenue", "default_agg": "sum",
+                 "measure_type": "standard", "data_type": "numeric", "is_additive": True}
+            ],
+            "dimensions": [],
+            "columns": [],
+            "hierarchies": [],
+        }
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=version)
+
+    first = await resolve_deployed_shape(model, db)
+    assert first is not None
+    assert db.get.await_count == 1
+
+    # Same model_id, same deployed_version_id, same epoch -> cache hit.
+    second = await resolve_deployed_shape(model, db)
+    assert second is first
+    assert db.get.await_count == 1
+
+    # Bump deploy_epoch (simulates revert-to-same-version) -> cache miss.
+    model.deploy_epoch = 2
+    third = await resolve_deployed_shape(model, db)
+    assert third is not first  # fresh resolution, different object
+    assert db.get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_deploy_epoch_bump_invalidates_live_metadata_cache():
+    """Bug-7140: a deploy_epoch bump must also invalidate the live-metadata
+    bundle cache (the fallback path for models with empty snapshots)."""
+    snapshot_resolver.invalidate_live_metadata()
+    model_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    model = types.SimpleNamespace(
+        id=model_id, deployed_version_id=version_id, deploy_epoch=1,
+    )
+    db = AsyncMock()
+    db.expunge = lambda obj: None
+
+    calls = {"n": 0}
+
+    async def _loader():
+        calls["n"] += 1
+        return LiveMetadataBundle(
+            measures=[], dimensions=[], hierarchy_levels=[],
+            hidden_column_ids=set(),
+            physical_columns_visible={"a"}, physical_columns_all={"a", "b"},
+        )
+
+    first = await resolve_live_metadata_bundle(model, db, loader=_loader)
+    assert calls["n"] == 1
+
+    # Same epoch -> cache hit.
+    second = await resolve_live_metadata_bundle(model, db, loader=_loader)
+    assert second is first
+    assert calls["n"] == 1
+
+    # Bump epoch -> cache miss, fresh load.
+    model.deploy_epoch = 2
+    third = await resolve_live_metadata_bundle(model, db, loader=_loader)
+    assert third is not first
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_deploy_epoch_missing_defaults_to_zero():
+    """Models without the deploy_epoch attribute (pre-migration rows) must
+    still cache correctly, defaulting epoch to 0."""
+    snapshot_resolver.invalidate()
+    model_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    # No deploy_epoch attribute at all.
+    model = types.SimpleNamespace(id=model_id, deployed_version_id=version_id)
+    version = types.SimpleNamespace(
+        snapshot_json={
+            "measures": [
+                {"id": str(uuid.uuid4()), "name": "revenue", "default_agg": "sum",
+                 "measure_type": "standard", "data_type": "numeric", "is_additive": True}
+            ],
+            "dimensions": [],
+            "columns": [],
+            "hierarchies": [],
+        }
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=version)
+
+    first = await resolve_deployed_shape(model, db)
+    assert first is not None
+    # Same model without epoch -> cache hit (both default to 0).
+    second = await resolve_deployed_shape(model, db)
+    assert second is first
+    assert db.get.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_deployed_shape_accepts_hierarchy_only_snapshot():
+    snapshot_resolver.invalidate()
+    model_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    level_id = uuid.uuid4()
+    key_column_id = uuid.uuid4()
+    model = types.SimpleNamespace(id=model_id, deployed_version_id=version_id, deploy_epoch=1)
+    version = types.SimpleNamespace(
+        snapshot_json={
+            "measures": [],
+            "dimensions": [],
+            "columns": [],
+            "hierarchies": [
+                {
+                    "id": str(uuid.uuid4()),
+                    "name": "Geo",
+                    "dimension_kind": "standard",
+                    "levels": [
+                        {
+                            "id": str(level_id),
+                            "name": "Country",
+                            "ordinal": 0,
+                            "key_attribute_source": "physical_column",
+                            "key_attribute_id": str(key_column_id),
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=version)
+
+    shape = await resolve_deployed_shape(model, db)
+
+    assert shape is not None
+    levels = hierarchy_level_dimensions_from_snapshot(shape)
+    assert {level.name for level in levels} == {"Geo.Country", "Country"}
+    assert levels[0].source_column_id == key_column_id
 
 
 @pytest.mark.asyncio
@@ -143,7 +295,7 @@ async def test_resolve_live_metadata_bundle_caches_per_version():
     snapshot_resolver.invalidate_live_metadata()
     model_id = uuid.uuid4()
     version_id = uuid.uuid4()
-    model = types.SimpleNamespace(id=model_id, deployed_version_id=version_id)
+    model = types.SimpleNamespace(id=model_id, deployed_version_id=version_id, deploy_epoch=1)
     db = AsyncMock()
     db.expunge = lambda obj: None  # sync no-op (real AsyncSession.expunge is sync)
 
@@ -164,7 +316,7 @@ async def test_resolve_live_metadata_bundle_caches_per_version():
     assert first.physical_columns_visible == {"a"}
     assert first.physical_columns_all == {"a", "b"}
 
-    # Re-deploy → new version id → fresh load (no stale bundle).
+    # Re-deploy -> new version id -> fresh load (no stale bundle).
     model.deployed_version_id = uuid.uuid4()
     await resolve_live_metadata_bundle(model, db, loader=_loader)
     assert calls["n"] == 2
@@ -175,7 +327,7 @@ async def test_resolve_live_metadata_bundle_none_without_deploy_pointer():
     # No deploy pointer → not cached (binder gate normally precludes this,
     # but the function must not key a cache on a None version).
     snapshot_resolver.invalidate_live_metadata()
-    model = types.SimpleNamespace(id=uuid.uuid4(), deployed_version_id=None)
+    model = types.SimpleNamespace(id=uuid.uuid4(), deployed_version_id=None, deploy_epoch=0)
 
     async def _loader():  # pragma: no cover - must not be called
         raise AssertionError("loader must not run without a deploy pointer")

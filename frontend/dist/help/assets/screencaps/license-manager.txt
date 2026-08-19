@@ -1,0 +1,1 @@
+Screenshot of the System Admin License & edition page. The left card shows the current edition and capacity limits. The right License manager card shows edition, enforcement state, license installed status, and an Upload license file button. The hint below the button says the signed license.json is verified, stored, and applied immediately with no restart. Dimensions: 1719x817px.

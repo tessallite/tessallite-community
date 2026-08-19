@@ -18,6 +18,7 @@ _SQLGLOT_DIALECT_MAP: dict[str, str] = {
     "hadoop_spark": "spark",
     "redshift": "redshift",
     "snowflake": "snowflake",
+    "sqlserver": "tsql",
 }
 
 _SAFE_FALLBACK: dict[str, str] = {
@@ -26,6 +27,7 @@ _SAFE_FALLBACK: dict[str, str] = {
     "redshift": "VARCHAR(MAX)",
     "snowflake": "VARCHAR",
     "spark": "STRING",
+    "tsql": "NVARCHAR(MAX)",
 }
 
 _AGG_RESULT_TYPE: dict[str, dict[str, str]] = {
@@ -120,7 +122,26 @@ def aggregate_result_type(stat_type: str, target_dialect: str) -> str:
     return types.get(stat_type, types.get("sum", "NUMERIC"))
 
 
-def grain_column_type(target_dialect: str) -> str:
-    """Default type for grain (dimension) columns on the target."""
+def grain_column_type(
+    target_dialect: str,
+    source_type: str | None = None,
+    source_dialect: str | None = None,
+) -> str:
+    """Return the target type for a grain (dimension) column.
+
+    When *source_type* and *source_dialect* are provided the function
+    transpiles the source type to the target dialect via ``map_column_type``
+    so that numeric / date grain columns retain their native types on the
+    aggregate table.  This prevents the type mismatch that Bug-6147 exposed:
+    the query-router renders type-faithful filter literals (e.g. unquoted
+    integers for an INTEGER source column) but the old code typed every
+    cross-DB grain column as TEXT, causing ``operator does not exist: text >=
+    integer`` failures at execution time.
+
+    Falls back to the safe TEXT/STRING/VARCHAR default only when the source
+    type is unknown or transpilation fails.
+    """
+    if source_type and source_dialect:
+        return map_column_type(source_type, source_dialect, target_dialect)
     tgt = _SQLGLOT_DIALECT_MAP.get(target_dialect, target_dialect)
     return _SAFE_FALLBACK.get(tgt, "TEXT")

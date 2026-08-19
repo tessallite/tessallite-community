@@ -4,6 +4,7 @@ import {
   Alert,
   Box,
   Button,
+  Chip,
   CircularProgress,
   Divider,
   Drawer,
@@ -33,15 +34,18 @@ import { useConfirm } from "../Confirm";
 import { useT } from "../../i18n";
 import EffectiveAccessPreview from "../Settings/EffectiveAccessPreview";
 import { accessApi, authApi, modelsApi } from "../../api/client";
+import { grantAccessWithSupersede } from "./grantAccessWithSupersede";
+import { meetsPasswordPolicy, showsPasswordPolicyError } from "../../auth/passwordPolicy";
 import type {
   AccessRole,
   LocalUserRole,
   Model,
+  RoleSource,
   User,
   UserAccessBinding,
 } from "../../api/types";
 
-const ACCESS_ROLES: AccessRole[] = ["admin", "modeler", "viewer"];
+const ACCESS_ROLES: AccessRole[] = ["admin", "modeler", "viewer", "model_viewer"];
 const USER_ROLES: LocalUserRole[] = ["member", "tenant_admin", "model_technical"];
 
 type DrawerKind =
@@ -52,6 +56,28 @@ type DrawerKind =
 
 function roleKey(role: string): string {
   return `users.role${role.charAt(0).toUpperCase() + role.slice(1).replace(/_([a-z])/g, (_, c: string) => c.toUpperCase())}`;
+}
+
+// Bug-6642: show the provenance of a user's role so an operator can distinguish
+// an SSO-elevated admin (auto-revocable via group mapping) from a manually-set
+// one. `role_source` is optional on the API type; treat anything other than the
+// explicit "sso" value as manual.
+function RoleSourceBadge({ source }: { source?: RoleSource }) {
+  const t = useT();
+  const isSso = source === "sso";
+  const tooltip = isSso
+    ? t("users.roleSourceSsoTooltip")
+    : t("users.roleSourceManualTooltip");
+  return (
+    <Tooltip title={tooltip}>
+      <Chip
+        size="small"
+        variant="outlined"
+        color={isSso ? "info" : "default"}
+        label={isSso ? t("users.roleSourceSso") : t("users.roleSourceManual")}
+      />
+    </Tooltip>
+  );
 }
 
 export default function UsersAccessPanel({
@@ -225,6 +251,9 @@ function UsersTable({
                 {t("users.roleHeader")}
               </TableCell>
               <TableCell sx={{ fontSize: 12, color: "text.secondary" }}>
+                {t("users.sourceHeader")}
+              </TableCell>
+              <TableCell sx={{ fontSize: 12, color: "text.secondary" }}>
                 {t("users.activeHeader")}
               </TableCell>
               <TableCell
@@ -241,6 +270,9 @@ function UsersTable({
                   {u.username}
                 </TableCell>
                 <TableCell sx={{ fontSize: 13, py: 0.5 }}>{t(roleKey(u.role))}</TableCell>
+                <TableCell sx={{ py: 0.5 }}>
+                  <RoleSourceBadge source={u.role_source} />
+                </TableCell>
                 <TableCell sx={{ fontSize: 13, py: 0.5 }}>
                   {u.is_active ? t("users.activeLabel") : t("users.inactiveLabel")}
                 </TableCell>
@@ -388,6 +420,7 @@ function EditDrawer({
   onSaved: () => void;
 }) {
   const t = useT();
+  const confirm = useConfirm();
   const tenantId = safeLocalGet("tenant_id", "");
   const [email, setEmail] = useState("");
   const [username, setUsername] = useState("");
@@ -413,18 +446,24 @@ function EditDrawer({
     }
   }, [drawer, setError]);
 
+  // Bug-8184: the server refuses a password that misses the complexity rule,
+  // so refuse it here too rather than letting the admin submit and read the
+  // rule out of a 422.
+  const passwordOk = meetsPasswordPolicy(password);
+  const passwordInvalid = showsPasswordPolicyError(password);
+
   const formValid = (() => {
     if (drawer?.kind === "user") {
       const baseValid = email.trim() !== "" && username.trim() !== "";
-      return drawer.user ? baseValid : baseValid && password.length > 0;
+      return drawer.user ? baseValid : baseValid && passwordOk;
     }
     if (drawer?.kind === "grant") return grantUser !== "";
-    if (drawer?.kind === "reset-password") return password.length > 0;
+    if (drawer?.kind === "reset-password") return passwordOk;
     return false;
   })();
 
   const save = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (): Promise<"saved" | "cancelled"> => {
       if (drawer?.kind === "user") {
         if (drawer.user) {
           await authApi.updateTenantUser(tenantId, drawer.user.id, {
@@ -441,18 +480,34 @@ function EditDrawer({
           });
         }
       } else if (drawer?.kind === "grant") {
-        await accessApi.grant(projectId, {
-          user_identity: grantUser,
-          role: grantRole,
-          model_id: grantModelId === "" ? null : grantModelId,
-        });
+        // Bug-8101: run the Modeller-supersedes-Model-viewer confirmation
+        // before granting. On cancel, nothing changes and the drawer stays.
+        const outcome = await grantAccessWithSupersede(
+          projectId,
+          {
+            user_identity: grantUser,
+            role: grantRole,
+            model_id: grantModelId === "" ? null : grantModelId,
+          },
+          confirm,
+          {
+            title: t("users.supersedeTitle"),
+            message: t("users.supersedeMessage"),
+            confirmLabel: t("users.supersedeConfirm"),
+          },
+        );
+        if (outcome === "cancelled") return "cancelled";
       } else if (drawer?.kind === "reset-password") {
         await authApi.resetTenantUserPassword(tenantId, drawer.user.id, {
           password,
         });
       }
+      return "saved";
     },
-    onSuccess: onSaved,
+    onSuccess: (outcome) => {
+      if (outcome === "cancelled") return;
+      onSaved();
+    },
     onError: (err: unknown) => {
       const detail = (err as { response?: { data?: { detail?: string } } })
         ?.response?.data?.detail;
@@ -511,6 +566,8 @@ function EditDrawer({
                 size="small"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
+                error={passwordInvalid}
+                helperText={t("errors.form.passwordComplexity")}
                 InputProps={{
                   startAdornment: (
                     <KeyIcon
@@ -563,7 +620,7 @@ function EditDrawer({
               >
                 {ACCESS_ROLES.map((r) => (
                   <MenuItem key={r} value={r}>
-                    {t(`users.role${r.charAt(0).toUpperCase() + r.slice(1)}`)}
+                    {t(roleKey(r))}
                   </MenuItem>
                 ))}
               </Select>
@@ -597,6 +654,8 @@ function EditDrawer({
               size="small"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              error={passwordInvalid}
+              helperText={t("errors.form.passwordComplexity")}
             />
           </Stack>
         )}

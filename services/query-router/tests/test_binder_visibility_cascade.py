@@ -33,6 +33,8 @@ def _query(**overrides) -> LogicalQuery:
 
 
 async def test_business_view_hides_dims_and_measures_with_hidden_source_column():
+    from src.semantic.snapshot_resolver import DeployedShape
+
     model = types.SimpleNamespace(id="model-1", slug="m", deployed_version_id="v1")
     visible_col_id = "col-visible"
     hidden_col_id = "col-hidden"
@@ -45,30 +47,20 @@ async def test_business_view_hides_dims_and_measures_with_hidden_source_column()
     hidden_measure = types.SimpleNamespace(
         name="debug_cost", default_agg="sum", is_additive=True, source_column_id=hidden_col_id
     )
+    shape = DeployedShape(
+        measures=[visible_measure, hidden_measure],
+        dimensions=[visible_dim, hidden_dim],
+        hidden_column_ids={hidden_col_id},
+        physical_columns_all={"region", "internal_code"},
+        physical_columns_visible={"region"},
+        hierarchy_rows=[],
+    )
     db = AsyncMock()
 
     with (
         patch("src.semantic.binder._load_model", new=AsyncMock(return_value=model)),
-        patch(
-            "src.semantic.binder._load_measures",
-            new=AsyncMock(return_value=[visible_measure, hidden_measure]),
-        ),
-        patch(
-            "src.semantic.binder._load_dimensions",
-            new=AsyncMock(return_value=[visible_dim, hidden_dim]),
-        ),
-        patch(
-            "src.semantic.binder._load_hierarchy_level_dimensions",
-            new=AsyncMock(return_value=[]),
-        ),
-        patch(
-            "src.semantic.binder._load_hidden_column_ids",
-            new=AsyncMock(return_value={hidden_col_id}),
-        ),
-        patch(
-            "src.semantic.binder._load_physical_column_names",
-            new=AsyncMock(return_value={"region"}),
-        ),
+        patch("src.semantic.binder.resolve_deployed_shape",
+              new=AsyncMock(return_value=shape)),
     ):
         bound = await bind_query_to_model(_query(), db, include_hidden=False)
 
@@ -79,33 +71,25 @@ async def test_business_view_hides_dims_and_measures_with_hidden_source_column()
 
 
 async def test_technical_view_keeps_hidden_objects():
+    from src.semantic.snapshot_resolver import DeployedShape
+
     model = types.SimpleNamespace(id="model-1", slug="m", deployed_version_id="v1")
     visible_dim = types.SimpleNamespace(name="Region", source_column_id="col-visible")
     hidden_dim = types.SimpleNamespace(name="internal_code", source_column_id="col-hidden")
+    shape = DeployedShape(
+        measures=[],
+        dimensions=[visible_dim, hidden_dim],
+        hidden_column_ids={"col-hidden"},
+        physical_columns_all={"region", "internal_code"},
+        physical_columns_visible={"region"},
+        hierarchy_rows=[],
+    )
     db = AsyncMock()
 
     with (
         patch("src.semantic.binder._load_model", new=AsyncMock(return_value=model)),
-        patch("src.semantic.binder._load_measures", new=AsyncMock(return_value=[])),
-        patch(
-            "src.semantic.binder._load_dimensions",
-            new=AsyncMock(return_value=[visible_dim, hidden_dim]),
-        ),
-        patch(
-            "src.semantic.binder._load_hierarchy_level_dimensions",
-            new=AsyncMock(return_value=[]),
-        ),
-        # Should not be called when include_hidden=True — test will still
-        # pass if it is, because the patched coroutine returns an empty
-        # set. The assertion below covers the semantic result.
-        patch(
-            "src.semantic.binder._load_hidden_column_ids",
-            new=AsyncMock(return_value={"col-hidden"}),
-        ),
-        patch(
-            "src.semantic.binder._load_physical_column_names",
-            new=AsyncMock(return_value={"region", "internal_code"}),
-        ),
+        patch("src.semantic.binder.resolve_deployed_shape",
+              new=AsyncMock(return_value=shape)),
     ):
         bound = await bind_query_to_model(_query(), db, include_hidden=True)
 

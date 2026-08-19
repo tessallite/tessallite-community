@@ -25,21 +25,22 @@ Detailed operations reference for a local Docker Compose deployment. For Communi
 ## Starting and stopping
 
 ```bash
-# In the signed Community bundle directory
+# Community bundle — first install and later upgrades
 ./install.sh
 
-# Start all services in the background
-docker compose up -d
+# Developer source checkout (this repo) — never a bare compose up
+cd deploy/local && bash deploy.sh     # Linux / macOS
+cd deploy\local && deploy.bat         # Windows
 
-# Check service status
-docker compose ps
-
-# Stream logs for a specific service
-docker compose logs -f query-router
-
-# Stop all services (data volumes preserved)
-docker compose down
+# After the stack exists, day-2 commands from the bundle / compose project:
+docker compose --env-file .env ps
+docker compose --env-file .env logs -f query-router
+docker compose --env-file .env down    # volumes preserved
 ```
+
+Do not run `docker compose up -d` from `tessallite/infra/` as a substitute for
+`deploy/local/deploy.sh` or Community `install.sh`. Those scripts generate
+`.env`, run migrations, and start services in the migrate-then-serve order.
 
 ---
 
@@ -59,7 +60,7 @@ The HTTPS certificate for `localhost:3443` is created during deployment (the cer
 
 ## Persistent data
 
-Tessallite uses one named volume: `tessallite_pgdata` — stores workspace metadata, model definitions, aggregate build history, and the query miss log.
+Tessallite uses one named volume: `postgres_data` (Community Compose and the local developer stack). It stores workspace metadata, model definitions, aggregate build history, and the query miss log. Some older help pages said `tessallite_pgdata`; that name is not the Compose volume.
 
 This volume persists across `docker compose down` and `docker compose up` cycles. To delete it and all Tessallite data, use `docker compose down -v`. See the Teardown article for details.
 
@@ -92,7 +93,7 @@ To replace a licence after the stack is running, open **System Admin → License
 | `CREDENTIAL_ENCRYPTION_KEY` | Yes | — | Fernet key for encrypting source database credentials. Generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 | `JWT_SECRET_KEY` | Yes | — | Signs user session tokens. Minimum 32 characters. |
 | `SYSTEM_ADMIN_EMAIL` | No | `admin@tessallite.local` | System admin login email. |
-| `SYSTEM_ADMIN_PASSWORD` | Yes | — | System admin password. |
+| `SYSTEM_ADMIN_PASSWORD` | Yes | — | System admin password. Minimum 12 characters, with at least one uppercase letter, one lowercase letter, and one digit. |
 | `LICENSE_FILE_HOST` | No | `./license.json` | Legacy/bootstrap host path to a signed local licence file. The License Manager upload stores the active licence in the platform database. |
 | `LICENSE_PUBLIC_KEYS` | No | built-in key | Optional public verification key override. Normal installs use the built-in Tessallite public key. |
 | `JDBC_PORT` | No | `5433` | Host port for the JDBC listener. |

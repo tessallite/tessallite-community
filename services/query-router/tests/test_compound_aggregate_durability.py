@@ -27,6 +27,8 @@ from __future__ import annotations
 import types
 
 import pytest
+
+from conftest import attach_fixture_deployed_shape
 import sqlglot
 from sqlglot import exp
 
@@ -148,7 +150,7 @@ async def test_compound_ratio_renders_single_projection():
     fee = _meas("m-fee", "fee_amount", "c-fee")
     base = _meas("m-base", "base_amount", "c-base")
     sql = await _build_source_sql(
-        _bound("SELECT SUM(fee_amount) / SUM(base_amount) FROM tx", [fee, base]),
+        await attach_fixture_deployed_shape(_bound("SELECT SUM(fee_amount) / SUM(base_amount) FROM tx", [fee, base]), _db([fee, base])),
         _db([fee, base]), target_dialect="postgres",
     )
 
@@ -167,10 +169,7 @@ async def test_cast_over_compound_aggregate_preserved():
     fee = _meas("m-fee", "fee_amount", "c-fee")
     base = _meas("m-base", "base_amount", "c-base")
     sql = await _build_source_sql(
-        _bound(
-            "SELECT CAST(SUM(fee_amount) / SUM(base_amount) AS NUMERIC(18,4)) FROM tx",
-            [fee, base],
-        ),
+        await attach_fixture_deployed_shape(_bound( "SELECT CAST(SUM(fee_amount) / SUM(base_amount) AS NUMERIC(18,4)) FROM tx", [fee, base], ), _db([fee, base])),
         _db([fee, base]), target_dialect="postgres",
     )
 
@@ -198,7 +197,7 @@ async def test_scalar_wrapper_over_single_aggregate_preserved(raw_sql, wrapper_t
     base = _meas("m-base", "base_amount", "c-base")
     measures = [fee] if "fee_amount" in raw_sql else [base]
     sql = await _build_source_sql(
-        _bound(raw_sql, measures), _db([fee, base]), target_dialect="postgres",
+        await attach_fixture_deployed_shape(_bound(raw_sql, measures), _db([fee, base])), _db([fee, base]), target_dialect="postgres",
     )
 
     assert _projection_count(sql) == 1, f"unexpected extra columns: {sql}"
@@ -214,7 +213,7 @@ async def test_compound_ratio_via_public_rewrite_for_source_entry():
     fee = _meas("m-fee", "fee_amount", "c-fee")
     base = _meas("m-base", "base_amount", "c-base")
     sql = await rewrite_for_source(
-        _bound("SELECT SUM(fee_amount) / SUM(base_amount) FROM tx", [fee, base]),
+        await attach_fixture_deployed_shape(_bound("SELECT SUM(fee_amount) / SUM(base_amount) FROM tx", [fee, base]), _db([fee, base])),
         _db([fee, base]), target_dialect="postgres",
     )
     assert _projection_count(sql) == 1, f"component columns leaked: {sql}"

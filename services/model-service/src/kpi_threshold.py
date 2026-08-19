@@ -140,12 +140,27 @@ def _compute_ratio(
     Returns None if the computation is undefined (e.g., division by zero).
     """
     if evaluation_type == "absolute_variance":
-        return abs(value - target)
+        # F-017-01 / F-103-06: variance must be DIRECTION-AWARE. A *favourable*
+        # variance (beating the goal) is good; only closer-is-better treats a
+        # deviation in either direction as bad. Returning an unsigned deviation
+        # for a directional KPI painted a cost KPI that beat budget by 20% the
+        # same red as one 20% over budget. Signed favourable variance (positive =
+        # beating) mirrors ``kpi_formatter.format_variance`` so the RAG colour and
+        # the signed variance number can never disagree on the same card.
+        if direction == "lower_is_better":
+            return target - value            # + when the actual is under target
+        if direction == "closer_is_better":
+            return abs(value - target)       # any deviation is bad (unsigned)
+        return value - target                # higher_is_better: + when exceeding
 
     if evaluation_type == "percentage_variance":
         if target == 0:
             return None
-        return abs(value - target) / abs(target)
+        if direction == "lower_is_better":
+            return (target - value) / abs(target)
+        if direction == "closer_is_better":
+            return abs(value - target) / abs(target)
+        return (value - target) / abs(target)
 
     # percentage_of_target is the default
     if direction == "higher_is_better":
@@ -157,8 +172,26 @@ def _compute_ratio(
         if value == 0 and target == 0:
             # Both zero: perfect score (e.g. zero errors against zero-error target)
             return 1.0
-        if value == 0:
-            return None
+        if value <= 0 and target > 0:
+            # Bug-5688 / Bug-7223: value<=0 with lower_is_better means at or
+            # below zero of the bad thing being measured (e.g. zero errors,
+            # negative cost = credit).  This is the best possible outcome
+            # regardless of the target, not "no data".  target/value is either
+            # undefined (value=0) or NEGATIVE (value<0), which would flip the
+            # ratio's sign and misclassify a best-case outcome as worst-band.
+            # Return a large finite ratio that will always land in the best
+            # (highest) band.  1e6 is safely finite (passes the isinf guard)
+            # and exceeds any reasonable band boundary.
+            return 1e6
+        if value <= 0 and target <= 0:
+            # Bug-7223 R1: both negative — lower is still better, so a value
+            # further below zero beats a target further below zero.  Use
+            # value/target: when value is more negative than target (better),
+            # value/target > 1 (best band); when value is less negative
+            # (worse), value/target < 1 (lower bands).  Guard div-by-zero.
+            if target == 0:
+                return None
+            return value / target
         return target / value
 
     if direction == "closer_is_better":
@@ -297,6 +330,7 @@ def evaluate_threshold(
     bands: Optional[list[dict]] = None,
     historical_values: Optional[list[float]] = None,
     peer_values: Optional[list[float]] = None,
+    colorblind: bool = False,
 ) -> ThresholdResult:
     """Evaluate a KPI value against threshold bands.
 
@@ -338,8 +372,12 @@ def evaluate_threshold(
         return NO_DATA_RESULT
 
     # Use default bands if none provided
+    # Bug-7240: when colorblind mode is active, use the colorblind-safe
+    # preset so the rendered band colours actually change.
     if not bands:
-        bands_list = _get_default_bands(direction, evaluation_type)
+        bands_list = _get_default_bands(
+            direction, evaluation_type, target=target, colorblind=colorblind
+        )
     else:
         bands_list = [
             Band(
@@ -358,19 +396,34 @@ def evaluate_threshold(
         ratio = value
     elif evaluation_type == "z_score":
         ratio = _compute_z_score(value, historical_values or [])
-        # For lower_is_better, a negative z-score means below mean (good).
-        # Negate so that "good" maps to higher ratio matching standard bands.
-        if ratio is not None and direction == "lower_is_better":
-            ratio = -ratio
+        if ratio is not None:
+            if direction == "lower_is_better":
+                # For lower_is_better, a negative z-score means below mean (good).
+                # Negate so that "good" maps to higher ratio matching standard bands.
+                ratio = -ratio
+            elif direction == "closer_is_better":
+                # Bug-7224: for closer_is_better, deviation in EITHER direction
+                # is bad.  A far outlier (|z| large) should classify as worst,
+                # not best.  Use -abs(z) so that values near the mean (z~0)
+                # score highest and far outliers score lowest.
+                ratio = -abs(ratio)
     elif evaluation_type == "percentile_rank":
         ratio = _compute_percentile_rank(value, peer_values or [])
-        # F-017-03: _compute_percentile_rank always treats a high value as a
-        # high (good) rank. For lower_is_better (e.g. a cost KPI ranked against
-        # peers) a low value is good, so invert the percentile to the
-        # complement (100 - p) — mirrors the z_score negation above so standard
-        # bands classify a low-cost leader as "good".
-        if ratio is not None and direction == "lower_is_better":
-            ratio = 100.0 - ratio
+        if ratio is not None:
+            if direction == "lower_is_better":
+                # F-017-03: _compute_percentile_rank always treats a high value as a
+                # high (good) rank. For lower_is_better (e.g. a cost KPI ranked against
+                # peers) a low value is good, so invert the percentile to the
+                # complement (100 - p) — mirrors the z_score negation above so standard
+                # bands classify a low-cost leader as "good".
+                ratio = 100.0 - ratio
+            elif direction == "closer_is_better":
+                # Bug-7224: for closer_is_better, rank by closeness to the
+                # median (50th percentile).  Deviation from the median in
+                # either direction is worse.  Transform so that the 50th
+                # percentile scores highest (100) and the extremes score
+                # lowest (0).  Linearly maps: p=50 -> 100, p=0 -> 0, p=100 -> 0.
+                ratio = (1.0 - abs(ratio - 50.0) / 50.0) * 100.0
     else:
         ratio = _compute_ratio(value, target, direction, evaluation_type)  # type: ignore[arg-type]
 
@@ -422,6 +475,8 @@ def evaluate_threshold(
 def _get_default_bands(
     direction: str,
     evaluation_type: str,
+    target: Optional[float] = None,
+    colorblind: bool = False,
 ) -> list[Band]:
     """Return default bands based on direction and evaluation type.
 
@@ -429,23 +484,68 @@ def _get_default_bands(
     higher ratio = better performance, the standard "low-is-bad /
     high-is-good" band order works for every direction.
 
-    Variance evaluation types use the ``centred`` preset because they
-    measure absolute deviation, not a directional ratio.
+    Variance evaluation types use direction-specific presets: a directional
+    (higher/lower) variance is signed favourable (positive = beating), so the
+    favourable-ordered ``variance_directional`` preset applies; closer-is-better
+    variance is unsigned deviation (0 = best), so the deviation-ordered
+    ``variance`` preset applies. Absolute-variance bands are further scaled into
+    the measure's own units from ``|target|`` (F-017-01 / F-103-06).
     """
     if evaluation_type in ("absolute_variance", "percentage_variance"):
-        # F-017-02: variance ratios are raw deviation (0 = perfect), so bands
-        # are authored best-first and increase with badness. The "centred"
-        # preset is calibrated for the closeness ratio (1 - deviation, where
-        # higher = better) and inverts the meaning here — value-on-target
-        # (deviation 0) classified as red. Use the deviation-ordered preset.
-        return get_preset_bands("variance")
+        # F-017-01 / F-103-06: signed favourable variance (higher/lower) needs
+        # favourable-ordered bands (missing = red, at/above target = green);
+        # closer-is-better keeps the deviation-ordered "variance" preset
+        # (0 = perfect green, badness increasing upward).
+        if direction in ("higher_is_better", "lower_is_better"):
+            preset = get_preset_bands("variance_directional", colorblind=colorblind)
+        else:
+            preset = get_preset_bands("variance", colorblind=colorblind)
+        if evaluation_type == "absolute_variance":
+            # The preset boundaries are authored on a fraction-of-target scale
+            # (e.g. 0.20 = 20% of target). absolute_variance ratios are in the
+            # measure's raw units, so scale the finite boundaries by |target|.
+            # Without this a currency deviation of 20,000 is compared against a
+            # 0.20 band edge and every currency KPI paints red (the F-017-01 bug).
+            scale = abs(target) if target not in (None, 0) else 1.0
+            preset = [
+                Band(
+                    label=b.label,
+                    color=b.color,
+                    min=None if b.min is None else b.min * scale,
+                    max=None if b.max is None else b.max * scale,
+                )
+                for b in preset
+            ]
+        return preset
+
+    if evaluation_type == "z_score":
+        # Bug-6249: a z-score ranges roughly -3..+3 centred on 0, not around
+        # 1.0. The standard 0.80/1.00 band scale mis-classifies every z-score
+        # (a value one stddev above the mean lands in "Off Target"). Use a
+        # sigma-scaled preset. _compute_z_score already negates for
+        # lower_is_better, so higher ratio = better here for every direction.
+        # Bug-7224 R1: closer_is_better uses -abs(z) which outputs (-inf, 0].
+        # The standard z_score preset (On Track >= 1.0) is unreachable, so use
+        # a dedicated closer-deviation preset calibrated for that range.
+        if direction == "closer_is_better":
+            return get_preset_bands("z_score_closer", colorblind=colorblind)
+        return get_preset_bands("z_score", colorblind=colorblind)
+
+    if evaluation_type == "percentile_rank":
+        # Bug-6249: a percentile rank ranges 0..100. On the 0.80/1.00 scale
+        # every rank >= 1 lands in "On Track", so the badge is meaningless.
+        # _compute_percentile_rank (and the lower_is_better complement) keeps
+        # higher = better, so a 0..100 preset with 25/50 breakpoints applies.
+        # Bug-7224 R1: closer_is_better uses closeness-to-median transform
+        # which outputs [0, 100], so the standard percentile_rank preset works.
+        return get_preset_bands("percentile_rank", colorblind=colorblind)
 
     if direction == "closer_is_better":
-        return get_preset_bands("centred")
+        return get_preset_bands("centred", colorblind=colorblind)
 
     # higher_is_better and lower_is_better both use the same bands
     # because _compute_ratio already inverts the ratio for lower_is_better.
-    return get_preset_bands("standard_3_band")
+    return get_preset_bands("standard_3_band", colorblind=colorblind)
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +585,41 @@ BAND_PRESETS: dict[str, list[Band]] = {
         Band(label="Near Target", color="#F57C00", min=0.10, max=0.20),
         Band(label="Off Target",  color="#D32F2F", min=0.20, max=None),
     ],
+    # F-017-01 / F-103-06: directional (higher/lower) variance is SIGNED
+    # favourable — positive = beating the goal. Bands are favourable-ordered
+    # around zero: missing by more than 20% is red, missing up to 20% is amber,
+    # at or above target (variance >= 0) is green. For absolute_variance the
+    # finite boundaries are scaled by |target| in _get_default_bands.
+    "variance_directional": [
+        Band(label="Off Target",  color="#D32F2F", min=None, max=-0.20),
+        Band(label="Near Target", color="#F57C00", min=-0.20, max=0.0),
+        Band(label="On Track",    color="#388E3C", min=0.0,   max=None),
+    ],
+    # Bug-6249: sigma-scaled preset for z_score. Ratio is a z-score (higher =
+    # better after direction normalisation). Below one stddev under the mean is
+    # off target; the mean band is amber; at or above one stddev over is good.
+    "z_score": [
+        Band(label="Off Target",  color="#D32F2F", min=None, max=-1.0),
+        Band(label="Near Target", color="#F57C00", min=-1.0, max=1.0),
+        Band(label="On Track",    color="#388E3C", min=1.0, max=None),
+    ],
+    # Bug-6249: 0..100 preset for percentile_rank (higher = better after the
+    # lower_is_better complement). Below the 25th percentile is off target,
+    # 25th-50th is amber, at or above the median is on track.
+    "percentile_rank": [
+        Band(label="Off Target",  color="#D32F2F", min=None, max=25.0),
+        Band(label="Near Target", color="#F57C00", min=25.0, max=50.0),
+        Band(label="On Track",    color="#388E3C", min=50.0, max=None),
+    ],
+    # Bug-7224 R1: closer_is_better + z_score preset. The -abs(z) transform
+    # outputs (-inf, 0] where 0 is best (value at the mean). Within half a
+    # sigma is on track; between 0.5 and 1.0 sigma deviation is amber; beyond
+    # 1.0 sigma is off target.
+    "z_score_closer": [
+        Band(label="Off Target",  color="#D32F2F", min=None, max=-1.0),
+        Band(label="Near Target", color="#F57C00", min=-1.0, max=-0.5),
+        Band(label="On Track",    color="#388E3C", min=-0.5, max=None),
+    ],
 }
 
 # Colour-blind-safe palette (blue / orange / gray).
@@ -515,6 +650,31 @@ BAND_PRESETS_COLORBLIND: dict[str, list[Band]] = {
         Band(label="On Track",    color="#1565C0", min=None, max=0.10),
         Band(label="Near Target", color="#E65100", min=0.10, max=0.20),
         Band(label="Off Target",  color="#757575", min=0.20, max=None),
+    ],
+    # F-017-01 / F-103-06: colour-blind variant of the directional variance
+    # preset. Same boundaries as the standard palette; only colours differ.
+    "variance_directional": [
+        Band(label="Off Target",  color="#757575", min=None, max=-0.20),
+        Band(label="Near Target", color="#E65100", min=-0.20, max=0.0),
+        Band(label="On Track",    color="#1565C0", min=0.0,   max=None),
+    ],
+    # Bug-6249: colour-blind variants of the z_score / percentile_rank presets.
+    # Same boundaries as the standard palette; only colours differ.
+    "z_score": [
+        Band(label="Off Target",  color="#757575", min=None, max=-1.0),
+        Band(label="Near Target", color="#E65100", min=-1.0, max=1.0),
+        Band(label="On Track",    color="#1565C0", min=1.0, max=None),
+    ],
+    "percentile_rank": [
+        Band(label="Off Target",  color="#757575", min=None, max=25.0),
+        Band(label="Near Target", color="#E65100", min=25.0, max=50.0),
+        Band(label="On Track",    color="#1565C0", min=50.0, max=None),
+    ],
+    # Bug-7224 R1: colour-blind variant of the z_score_closer preset.
+    "z_score_closer": [
+        Band(label="Off Target",  color="#757575", min=None, max=-1.0),
+        Band(label="Near Target", color="#E65100", min=-1.0, max=-0.5),
+        Band(label="On Track",    color="#1565C0", min=-0.5, max=None),
     ],
 }
 

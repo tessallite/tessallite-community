@@ -23,6 +23,15 @@ export type ModelEditorState = {
   // Currently deployed version_number, or null when undeployed
   deployedVersion: number | null;
   lastDeployedAt: string | null;
+  // F-026-02: monotonic content-revision counter. Every content write bumps
+  // `currentRevision`; `savedRevision` records the value at the last save.
+  // `isDirty` is derived as `currentRevision !== savedRevision`, so undoing a
+  // content edit back to the saved baseline (which sets `currentRevision` back
+  // to the pre-edit value via setRevision) clears dirty — a plain "any write
+  // happened" latch could not express this. An out-of-band write bumps the
+  // revision with no history entry to reconcile it, so it correctly stays dirty.
+  currentRevision: number;
+  savedRevision: number;
 };
 
 type Actions = {
@@ -39,7 +48,24 @@ type Actions = {
     deployedVersion?: number | null;
     lastDeployedAt?: string | null;
   }): void;
+  /** F-026-02: undo/redo set the revision directly to the value the model had
+   *  at that history position, reconciling dirty against the saved baseline
+   *  without counting the inverse write as a new forward edit. */
+  setRevision(revision: number): void;
 };
+
+// F-026-02: while undo/redo is replaying an inverse/forward API write, the
+// response interceptor must NOT bump `currentRevision` — the history hook sets
+// the revision directly to the reconciled value. The guard lives in a
+// dependency-free module (historyApplyGuard.ts) so api/client.ts can import it
+// synchronously without pulling in this store module (which would create a
+// store -> client -> store import cycle). Re-exported here for callers that
+// already depend on the store.
+export {
+  beginHistoryApply,
+  endHistoryApply,
+  isApplyingHistory,
+} from "./historyApplyGuard";
 
 const initial: ModelEditorState = {
   modelId: null,
@@ -47,29 +73,50 @@ const initial: ModelEditorState = {
   lastSavedVersion: null,
   deployedVersion: null,
   lastDeployedAt: null,
+  currentRevision: 0,
+  savedRevision: 0,
 };
 
 export const useModelEditorStore = create<ModelEditorState & Actions>(
   (set) => ({
     ...initial,
     setModel: ({ modelId, lastSavedVersion, deployedVersion, lastDeployedAt }) =>
-      set((state) => ({
-        modelId,
-        // Only clear the dirty flag when the open model actually changes
-        // (first load or switching models). The Model Builder re-runs this
-        // on every model refetch to refresh the version pointers; a
-        // background refetch of the *same* model must not wipe edits the
-        // user has made since the last save, so preserve isDirty then.
-        isDirty: state.modelId === modelId ? state.isDirty : false,
-        lastSavedVersion,
-        deployedVersion,
-        lastDeployedAt,
-      })),
+      set((state) => {
+        const sameModel = state.modelId === modelId;
+        // On a genuine model change, reset the revision baseline to clean; a
+        // background refetch of the same model preserves the edit revisions so
+        // in-session edits (and their dirty state) survive.
+        return {
+          modelId,
+          // Only clear the dirty flag when the open model actually changes
+          // (first load or switching models). The Model Builder re-runs this
+          // on every model refetch to refresh the version pointers; a
+          // background refetch of the *same* model must not wipe edits the
+          // user has made since the last save, so preserve isDirty then.
+          isDirty: sameModel ? state.isDirty : false,
+          currentRevision: sameModel ? state.currentRevision : 0,
+          savedRevision: sameModel ? state.savedRevision : 0,
+          lastSavedVersion,
+          deployedVersion,
+          lastDeployedAt,
+        };
+      }),
     clearModel: () => set(initial),
-    markDirty: () => set({ isDirty: true }),
+    markDirty: () =>
+      set((state) => {
+        const currentRevision = state.currentRevision + 1;
+        return { currentRevision, isDirty: currentRevision !== state.savedRevision };
+      }),
+    setRevision: (revision) =>
+      set((state) => ({
+        currentRevision: revision,
+        isDirty: revision !== state.savedRevision,
+      })),
     markClean: (args) =>
       set((state) => ({
         isDirty: false,
+        // The current content is now the saved baseline.
+        savedRevision: state.currentRevision,
         lastSavedVersion:
           args?.lastSavedVersion !== undefined
             ? args.lastSavedVersion

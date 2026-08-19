@@ -67,7 +67,7 @@ async def get_field_compatibility(
     The route enforces the same model viewer and persona gates used by the
     dimension and measure metadata routes before suggestions are formatted.
     """
-    enforce_model_scope(current_user, str(model_id))
+    enforce_model_scope(current_user, str(model_id), project_id=str(project_id))
     selected_measure_ids = _parse_query_ids(measure_ids, "measure_ids")
     selected_dimension_ids = _parse_query_ids(dimension_ids, "dimension_ids")
 

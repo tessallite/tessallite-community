@@ -83,6 +83,12 @@ class EvaluationContext:
     unit_label: Optional[str] = None
     null_display_value: str = "N/A"
 
+    # Bug-6663: distinguish a target measure query FAILURE from legitimate
+    # NO-DATA (target_value=None). When True the post-score pipeline surfaces
+    # "Target query failed" instead of silently proceeding as if there is no
+    # target, which would hide broken target queries.
+    target_query_failed: bool = False
+
 
 
 @dataclass
@@ -111,9 +117,16 @@ class EvaluationResult:
     status: Optional[int] = None
     status_label: Optional[str] = None
     status_color: Optional[str] = None
+    # Bug-5922: authoritative visual scale fields — must be present on every
+    # evaluation path (SQL and Python fallback) so gauge/bullet/RAG visuals
+    # render the same scale the backend threshold used for band matching.
+    status_position: Optional[float] = None
+    status_bands: Optional[list[dict]] = None
     trend: Optional[int] = None
     trend_label: Optional[str] = None
     trend_pct: Optional[float] = None
+    # Bug-7238: direction-normalised percentage — positive means improving.
+    trend_pct_normalised: Optional[float] = None
     formatted_value: Optional[str] = None
     formatted_target: Optional[str] = None
     formatted_variance: Optional[str] = None
@@ -329,7 +342,17 @@ async def _resolve_target(
         return await _resolve_expression_value(ctx.target_expression, provider)
 
     if ctx.target_type == "prior_period":
-        # Deferred to Phase 3 (time intelligence via query-router)
+        # Bug-6251 (F-017-04): the wizard emits the prior-period target as a
+        # ``prior_period(measure(...), "grain")`` call stored in target_expression.
+        # Resolve it through the expression evaluator, which dispatches the
+        # prior_period node to the provider's time-intelligence hook — the same
+        # decomposed query-router machinery (_evaluate_ti_decomposed) the SQL
+        # path uses. Previously this returned None ("Deferred to Phase 3"), so a
+        # prior_period target was accepted end to end but silently inert on the
+        # Python-fallback evaluation path. Without a TI hook the node still
+        # evaluates to None (never a silently-wrong current-period value).
+        if ctx.target_expression:
+            return await _resolve_expression_value(ctx.target_expression, provider)
         return None
 
     return ctx.target_value
@@ -401,6 +424,27 @@ async def evaluate_kpi(
     status: Optional[int] = None
     status_label: Optional[str] = None
     status_color: Optional[str] = None
+    # Bug-5922: carry the authoritative visual scale through the Python
+    # fallback path so gauge/bullet/RAG visuals agree with the badge.
+    status_position: Optional[float] = None
+    status_bands: Optional[list[dict]] = None
+
+    # Bug-6250: the configured evaluation_type lives only in presentation_meta.
+    # Resolve it once and thread it through BOTH the custom-band and the
+    # default-band branches so the Python fallback agrees with the primary
+    # (query-router) path. Previously the default-band branch dropped it and
+    # silently scored every KPI as percentage_of_target, mis-classifying
+    # z_score / percentile_rank / variance KPIs that carry no custom bands.
+    evaluation_type = "percentage_of_target"
+    if ctx.presentation_meta:
+        evaluation_type = (
+            ctx.presentation_meta.get("evaluation_type") or "percentage_of_target"
+        )
+    # These evaluation types classify without a target value; evaluate_threshold
+    # enforces the same set, so mirror it here rather than gating on target.
+    _targetless_types = ("z_score", "percentile_rank", "absolute_value")
+    _pm_hist = ctx.presentation_meta.get("historical_values") if ctx.presentation_meta else None
+    _pm_peers = ctx.presentation_meta.get("peer_values") if ctx.presentation_meta else None
 
     if ctx.presentation_meta and ctx.presentation_meta.get("bands"):
         # v2 threshold evaluation with custom bands
@@ -408,22 +452,36 @@ async def evaluate_kpi(
             value=value,
             target=target,
             direction=ctx.direction,
-            evaluation_type=ctx.presentation_meta.get("evaluation_type", "percentage_of_target"),
+            evaluation_type=evaluation_type,
             bands=ctx.presentation_meta.get("bands"),
+            historical_values=_pm_hist,
+            peer_values=_pm_peers,
         )
         status = threshold_result.status
         status_label = threshold_result.status_label
         status_color = threshold_result.status_color
-    elif value is not None and target is not None:
-        # Default threshold evaluation
+    elif value is not None and (target is not None or evaluation_type in _targetless_types):
+        # Default threshold evaluation — honour the configured evaluation_type.
         threshold_result = evaluate_threshold(
             value=value,
             target=target,
             direction=ctx.direction,
+            evaluation_type=evaluation_type,
+            historical_values=_pm_hist,
+            peer_values=_pm_peers,
         )
         status = threshold_result.status
         status_label = threshold_result.status_label
         status_color = threshold_result.status_color
+
+    # Bug-5922: extract the authoritative visual scale from ThresholdResult.
+    if threshold_result is not None:
+        status_position = threshold_result.ratio
+        if threshold_result.bands_used:
+            status_bands = [
+                {"label": b.label, "color": b.color, "min": b.min, "max": b.max}
+                for b in threshold_result.bands_used
+            ]
 
     # --- Step 12: Evaluate trend ---
     trend_result: Optional[TrendResult] = None
@@ -441,6 +499,7 @@ async def evaluate_kpi(
     trend_int = trend_result.trend
     trend_label_str = trend_result.trend_label
     trend_pct = trend_result.trend_pct
+    trend_pct_normalised = trend_result.trend_pct_normalised  # Bug-7238
 
     # --- Step 13: Format output ---
     formatted = format_value(
@@ -472,9 +531,13 @@ async def evaluate_kpi(
         status=status,
         status_label=status_label,
         status_color=status_color,
+        # Bug-5922: include authoritative visual scale fields.
+        status_position=status_position,
+        status_bands=status_bands,
         trend=trend_int,
         trend_label=trend_label_str,
         trend_pct=trend_pct,
+        trend_pct_normalised=trend_pct_normalised,  # Bug-7238
         formatted_value=formatted.display,
         formatted_target=formatted_target_obj.display,
         formatted_variance=abs_variance_str,

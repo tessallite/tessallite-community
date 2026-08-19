@@ -272,11 +272,19 @@ def build_format_hints(
 def aggregate_date_ranges(
     step_summaries: list[dict],
 ) -> dict[str, tuple[str, str]]:
-    """Collect date ranges across multiple compound step result sets."""
+    """Collect date ranges across multiple compound step result sets.
+
+    R10 (compound scope) / Bug-5350 parity — prefer the step's FULL row set
+    (``all_rows``, provided by the compound/recipe producers) over the capped
+    ``sample_rows``: the stated range must be the data's real min/max, not the
+    boundaries of the first 25 sorted rows, because ``_GUARD_DATE_RANGE``
+    orders the narrator to state it as exact. Falls back to ``sample_rows``
+    for older callers.
+    """
     per_col: dict[str, list[tuple]] = {}
     for step in step_summaries:
         cols = step.get("columns", [])
-        rows = step.get("sample_rows", [])
+        rows = step.get("all_rows") or step.get("sample_rows", [])
         if not rows or not cols:
             continue
         for col, (mn, mx) in extract_date_ranges(rows, cols).items():

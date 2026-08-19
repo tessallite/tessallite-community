@@ -42,7 +42,7 @@
 <p>``<code>bash gcloud iam service-accounts delete SERVICE_ACCOUNT_EMAIL </code>``</p>
 <ol><li>Delete secrets from Secret Manager if used:</li></ol>
 <p>``<code>bash gcloud secrets delete tessallite-db-pass gcloud secrets delete tessallite-session-secret </code>``</p>
-<ol><li>Optionally drop aggregate tables from your data source. Connect to your data warehouse and drop them manually.</li></ol>
+<ol><li>Optionally drop aggregate tables from your data source. Connect to the target source and drop them manually.</li></ol>
 <blockquote><strong>Warning:</strong> Deleting the Cloud SQL instance is irreversible. Back up the database before proceeding if you may need the model definitions or workspace configuration later.</blockquote>
 <h2>Related</h2>
 <ul><li><a href="upgrade.html">Upgrade</a></li><li><a href="deploy-local.html">Deploy Locally</a></li><li><a href="deploy-gcp.html">Deploy on GCP</a></li></ul>

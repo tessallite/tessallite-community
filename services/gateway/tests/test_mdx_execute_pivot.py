@@ -874,6 +874,189 @@ def test_execute_response_contains_drilldown_members_and_values():
     assert '<Caption>Amount</Caption>' in xml
 
 
+def test_execute_measure_caption_uses_display_name_bug6657():
+    """F-002-05 / Bug-6657: the Execute measure axis caption must equal the
+    field-list MEASURE_CAPTION (display_name), not the internal measure name.
+
+    F-002-01 / F-103-01 / Bug-9232: Caption rewrite must not nil the cell.
+    CellData looks up the UName internal name (``[Measures].[net_sales]``),
+    so a non-nil numeric Value (10) is required alongside the friendly caption.
+    """
+    mdx = """
+    SELECT {[Measures].[net_sales]} ON COLUMNS,
+           {[Geography].[Geography].[(All)].Members} ON ROWS
+    FROM [demo]
+    """
+    measures_meta = [{"name": "net_sales", "display_name": "Net Sales",
+                      "default_agg": "sum"}]
+    dimensions_meta = [{"name": "Geography"}]
+    columns = ["Geography", "net_sales"]
+    rows = [{"Geography": "France", "net_sales": 10}]
+
+    xml = build_real_execute_response(
+        mdx=mdx, catalog="demo", columns=columns, rows=rows,
+        measures_meta=measures_meta, dimensions_meta=dimensions_meta,
+    )
+    # Pivot header shows the friendly caption; the internal name is only the UName.
+    assert "<Caption>Net Sales</Caption>" in xml
+    assert "[Measures].[net_sales]" in xml  # UName keeps the internal name
+    assert "<Caption>net_sales</Caption>" not in xml
+    assert 'xsi:nil="true"' not in xml
+    assert '<Value xsi:type="xsd:double">10.0</Value>' in xml
+
+
+def test_execute_cell_lookup_uses_uname_not_display_caption_f002_01():
+    """F-002-01 / F-103-01: live-shaped display_name with a space (``base amount``)
+    must not become the CellData lookup key. Result column is ``base_amount``.
+    """
+    mdx = """
+    SELECT {[Measures].[base_amount]} ON COLUMNS
+    FROM [modely]
+    """
+    measures_meta = [{"name": "base_amount", "display_name": "base amount",
+                      "default_agg": "sum"}]
+    xml = build_real_execute_response(
+        mdx=mdx, catalog="modely",
+        columns=["base_amount"],
+        rows=[{"base_amount": 10}],
+        measures_meta=measures_meta, dimensions_meta=[],
+    )
+    assert "<Caption>base amount</Caption>" in xml
+    assert "[Measures].[base_amount]" in xml
+    assert "<Caption>base_amount</Caption>" not in xml
+    assert 'xsi:nil="true"' not in xml
+    assert '<Value xsi:type="xsd:double">10.0</Value>' in xml
+
+
+def test_execute_measure_dim_crossjoin_on_columns_emits_cells_bug9246():
+    """Bug-9246 / F-002-01 / XLC-01: measure × flat dim CrossJoin on COLUMNS
+    must emit Axis0 tuples and numeric cells, not empty ``<Tuples></Tuples>``
+    plus ``xsi:nil``.
+
+    Pre-fix, ``_build_existing_axis_tuples`` looked up ``row.get("Measures")``
+    (always None) and returned ``[]``; Axis0 rendered empty and CellData
+    missed the Gender keys. Caption→UName cell lookup (Bug-6657) stays.
+    """
+    import re
+    mdx = """
+    SELECT NON EMPTY CrossJoin({[Measures].[base_amount]}, {[Gender].[Gender].[(All)].Members}) ON COLUMNS FROM [modely]
+    """
+    xml = build_real_execute_response(
+        mdx=mdx, catalog="modely",
+        columns=["Gender", "base_amount"],
+        rows=[
+            {"Gender": "F", "base_amount": 100.0},
+            {"Gender": "M", "base_amount": 200.0},
+        ],
+        measures_meta=[{"name": "base_amount", "display_name": "base amount",
+                        "default_agg": "sum"}],
+        dimensions_meta=[{"name": "Gender"}],
+    )
+
+    axis0 = re.search(r'<Axis name="Axis0">(.*?)</Axis>', xml, re.DOTALL)
+    assert axis0 is not None, "Axis0 missing from response"
+    assert "<Tuples></Tuples>" not in axis0.group(1)
+    tuples = re.findall(r'<Tuple>(.*?)</Tuple>', axis0.group(1), re.DOTALL)
+    caption_sets = {
+        frozenset(re.findall(r'<Caption>([^<]*)</Caption>', t))
+        for t in tuples
+    }
+    # CrossJoin({Measures}, {Gender}) emits (measure, gender); equivalent
+    # (gender, measure) order is also accepted.
+    assert frozenset({"F", "base amount"}) in caption_sets
+    assert frozenset({"M", "base amount"}) in caption_sets
+    assert len(tuples) == 2
+
+    assert 'xsi:nil="true"' not in xml
+    assert xml.count('xsi:type="xsd:double"') == 2
+    assert '<Value xsi:type="xsd:double">100.0</Value>' in xml
+    assert '<Value xsi:type="xsd:double">200.0</Value>' in xml
+    # Bug-6657 caption contract: axis label is display_name, UName is internal.
+    assert "[Measures].[base_amount]" in xml
+    assert "<Caption>base_amount</Caption>" not in xml
+
+
+def test_execute_measure_dim_crossjoin_on_rows_emits_cells_bug9246_mirror():
+    """Bug-9246 mirror: measure x flat dim CrossJoin on ROWS must emit Axis1
+    tuples and numeric cells (direct-caller coverage of the None fallback on
+    the row axis)."""
+    import re
+    mdx = """
+    SELECT NON EMPTY CrossJoin({[Measures].[base_amount]}, {[Gender].[Gender].[(All)].Members}) ON ROWS FROM [modely]
+    """
+    xml = build_real_execute_response(
+        mdx=mdx, catalog="modely",
+        columns=["Gender", "base_amount"],
+        rows=[{"Gender": "F", "base_amount": 100.0},
+              {"Gender": "M", "base_amount": 200.0}],
+        measures_meta=[{"name": "base_amount", "display_name": "base amount",
+                        "default_agg": "sum"}],
+        dimensions_meta=[{"name": "Gender"}],
+    )
+    axis1 = re.search(r'<Axis name="Axis1">(.*?)</Axis>', xml, re.DOTALL)
+    assert axis1 is not None, "Axis1 missing from response"
+    assert "<Tuples></Tuples>" not in axis1.group(1)
+    assert len(re.findall(r'<Tuple>', axis1.group(1))) == 2
+    assert 'xsi:nil="true"' not in xml
+    assert '<Value xsi:type="xsd:double">100.0</Value>' in xml
+    assert '<Value xsi:type="xsd:double">200.0</Value>' in xml
+
+
+def test_execute_member_caption_uses_display_column_bug6659():
+    """F-002-05 / Bug-6659 CONSUMER contract: when result rows carry a projected
+    ``<dim>__caption`` companion column, the Execute member axis must emit
+    Caption=<display value> and UName=<key>. This tests the CONSUMER side of
+    Bug-6659; the PRODUCER side (projecting the caption column through the XMLA
+    Execute raw-SQL path) is a separate query-router change and is inert in the
+    deployed system (no seeded dimension sets ``display_column_name``). The test
+    hand-seeds the companion column to pin the consumer contract.
+    must emit Caption=<display value> while the UName keeps the key."""
+    mdx = """
+    SELECT {[Measures].[Amount]} ON COLUMNS,
+           {[Geography].[Geography].[(All)].Members} ON ROWS
+    FROM [demo]
+    """
+    measures_meta = [{"name": "Amount", "default_agg": "sum"}]
+    # Geography declares a display column distinct from its key.
+    dimensions_meta = [{"name": "Geography",
+                        "display_column_name": "country_name"}]
+    columns = ["Geography", "Geography__caption", "Amount"]
+    rows = [
+        {"Geography": "FR", "Geography__caption": "France", "Amount": 10},
+        {"Geography": "DE", "Geography__caption": "Germany", "Amount": 20},
+    ]
+
+    xml = build_real_execute_response(
+        mdx=mdx, catalog="demo", columns=columns, rows=rows,
+        measures_meta=measures_meta, dimensions_meta=dimensions_meta,
+    )
+    # Captions are the friendly display values; UName keeps the raw key.
+    assert "<Caption>France</Caption>" in xml
+    assert "<Caption>Germany</Caption>" in xml
+    assert "[Geography].[FR]" in xml
+    assert "[Geography].[DE]" in xml
+    # The raw keys must NOT appear as captions.
+    assert "<Caption>FR</Caption>" not in xml
+    assert "<Caption>DE</Caption>" not in xml
+
+
+def test_execute_member_caption_absent_falls_back_to_key():
+    """F-002-05: with no display column the caption stays the key (no regression)."""
+    mdx = """
+    SELECT {[Measures].[Amount]} ON COLUMNS,
+           {[Geography].[Geography].[(All)].Members} ON ROWS
+    FROM [demo]
+    """
+    xml = build_real_execute_response(
+        mdx=mdx, catalog="demo",
+        columns=["Geography", "Amount"],
+        rows=[{"Geography": "France", "Amount": 10}],
+        measures_meta=[{"name": "Amount", "default_agg": "sum"}],
+        dimensions_meta=[{"name": "Geography"}],
+    )
+    assert "<Caption>France</Caption>" in xml
+
+
 def test_execute_response_for_excel_keeps_shape_with_enriched_metadata():
     """
     Regression guard for Bug-XMLA-001:
@@ -1281,7 +1464,7 @@ def test_mdschema_levels_supports_multi_level_hierarchy_metadata():
         },
     )
 
-    level_unames = [row["LEVEL_UNIQUE_NAME"] for row in rows if row["DIMENSION_UNIQUE_NAME"] == "[geo_hierarchy]"]
+    level_unames = [row["LEVEL_UNIQUE_NAME"] for row in rows if row["HIERARCHY_UNIQUE_NAME"] == "[geo_hierarchy].[geo_hierarchy]"]
     assert "[geo_hierarchy].[geo_hierarchy].[(All)]" in level_unames
     assert "[geo_hierarchy].[geo_hierarchy].[Region]" in level_unames
     assert "[geo_hierarchy].[geo_hierarchy].[Country]" in level_unames
@@ -2670,6 +2853,54 @@ class TestMixedShapeFlatColumnDim:
         assert cells[6] == 15.0   # Grand total   x Web
         assert cells[7] == 20.0   # Grand total   x Store
 
+    def test_mixed_shape_measure_caption_uses_display_name_f002_01_bug6657(self):
+        """F-002-01 / Bug-6657 mixed-shape: when display_name is set, Axis0
+        shows the friendly caption while cells still look up Amount (10.0/20.0).
+        Existing mixed-shape tests omit display_name and still expect Caption
+        ``Amount``; this sibling pins the caption+value contract together.
+        """
+        mdx = """SELECT CrossJoin({[channel].[channel].[channel].Members}, {[Measures].[Amount]}) ON COLUMNS,
+        CrossJoin([Geography].[Geo].MEMBERS, [Product].[Prod].MEMBERS) ON ROWS
+        FROM [demo]"""
+        h_geo = self._make_hier("Geo", "Geography", "Geo",
+                                [("Country", 0, "country")], axis=1)
+        h_prod = self._make_hier("Prod", "Product", "Prod",
+                                 [("Category", 0, "category")], axis=1)
+        xml = build_real_execute_response(
+            mdx=mdx,
+            catalog="demo",
+            columns=["country", "category", "channel", "Amount"],
+            rows=self._merged_rows(),
+            measures_meta=[{"name": "Amount", "display_name": "base amount",
+                            "default_agg": "sum"}],
+            dimensions_meta=[
+                {"name": "country"}, {"name": "category"}, {"name": "channel"},
+            ],
+            client_app_name="Excel",
+            subtotal_hierarchies=[h_geo, h_prod],
+        )
+        assert "<Caption>base amount</Caption>" in xml
+        assert "[Measures].[Amount]" in xml
+        axes, cells = self._parse(xml)
+        measure_captions = {
+            cap for tup in axes.get("Axis0", []) for cap in tup
+            if cap not in ("Web", "Store")
+        }
+        assert "base amount" in measure_captions
+        assert "Amount" not in measure_captions
+        assert cells[0] == 10.0
+        assert cells[1] == 20.0
+        assert '<Value xsi:type="xsd:double">10.0</Value>' in xml
+        assert '<Value xsi:type="xsd:double">20.0</Value>' in xml
+        # Populated ordinals 0 and 1 must not be nil cells.
+        import re as _re
+        for ordinal in (0, 1):
+            cell_xml = _re.search(
+                rf'<Cell CellOrdinal="{ordinal}">(.*?)</Cell>', xml, _re.DOTALL
+            )
+            assert cell_xml is not None, f"missing CellOrdinal {ordinal}"
+            assert 'xsi:nil="true"' not in cell_xml.group(1)
+
 
 # ---------------------------------------------------------------------------
 # B8 round 2 (deep-review Finding 5) — duplicate per-row tuple keys must not
@@ -2871,6 +3102,22 @@ def test_format_cell_value_patterns():
     assert _format_cell_value(0.5, "0.0%") == "50.0%"
     assert _format_cell_value(1234.5, "$#,##0.00") == "$1,234.50"
     assert _format_cell_value(42.0, "0") == "42"
+
+
+def test_format_cell_value_bug6070_suffix_currency_preserved():
+    # Bug-6070: suffix-currency patterns previously dropped the symbol (only a
+    # leading $/€/£ was recognised). Both prefix and suffix currency literals of
+    # any symbol must survive, and suffix text must not pollute the decimal count.
+    assert _format_cell_value(1234.5, "#,##0.00 €") == "1,234.50 €"
+    assert _format_cell_value(1234.5, "#,##0.00 kr") == "1,234.50 kr"
+    assert _format_cell_value(1235.0, "#,##0 zł") == "1,235 zł"
+    assert _format_cell_value(1234.5, "€#,##0.00") == "€1,234.50"
+    assert _format_cell_value(1234.5, '#,##0.00" kr"') == "1,234.50 kr"
+    # Regression: bare prefix $ and plain patterns still behave.
+    assert _format_cell_value(1234.5, "$#,##0.00") == "$1,234.50"
+    assert _format_cell_value(1234.567, "#,##0.00") == "1,234.57"
+    # Leading-dot fraction (no integer placeholder) keeps its decimals.
+    assert _format_cell_value(5.0, ".00") == "5.00"
 
 
 def test_format_cell_value_none_when_no_or_general_format():
@@ -3932,3 +4179,42 @@ class TestChildrenMatrix:
         assert "<Caption>North</Caption>" in xml
         assert "<Caption>South</Caption>" in xml
         assert "<Fault" not in xml
+
+
+def test_cubeinfo_lastdataupdate_uses_model_refresh_time():
+    """F-002-10: CubeInfo LastDataUpdate must reflect the model's real data
+    refresh time (trust_meta.last_refreshed_at), not the static system config
+    stamp, so Excel / Power BI do not treat stale pivots as fresh."""
+    xml = build_real_execute_response(
+        mdx="SELECT {[Measures].[Amount]} ON COLUMNS, "
+            "[Geography].[Geography].Members ON ROWS FROM [demo]",
+        catalog="demo",
+        columns=["Geography", "Amount"],
+        rows=[{"Geography": "France", "Amount": 10}],
+        measures_meta=[{"name": "Amount", "default_agg": "sum"}],
+        dimensions_meta=[{"name": "Geography"}],
+        last_data_update="2026-07-01T08:30:00",
+    )
+    # The refresh time flows into LastDataUpdate (T retained for xs:dateTime).
+    assert "<LastDataUpdate" in xml
+    assert "2026-07-01T08:30:00</LastDataUpdate>" in xml
+
+
+def test_cubeinfo_lastdataupdate_normalizes_fractional_and_zulu():
+    from src.dax.mdx_execute import _normalize_cube_timestamp
+    assert _normalize_cube_timestamp("2026-07-01T08:30:00.123456Z") == "2026-07-01T08:30:00"
+    assert _normalize_cube_timestamp("2026-07-01T08:30:00Z") == "2026-07-01T08:30:00"
+    assert _normalize_cube_timestamp("") == ""
+    assert _normalize_cube_timestamp(None) == ""
+
+
+def test_cubeinfo_lastdataupdate_strips_numeric_utc_offset():
+    """R1 finding 4: a TIMESTAMPTZ .isoformat() with zero microseconds yields a
+    numeric offset (e.g. +00:00); it must be stripped, and the date's own
+    hyphens must be preserved."""
+    from src.dax.mdx_execute import _normalize_cube_timestamp
+    assert _normalize_cube_timestamp("2026-07-01T08:30:00+00:00") == "2026-07-01T08:30:00"
+    assert _normalize_cube_timestamp("2026-07-01T08:30:00-05:00") == "2026-07-01T08:30:00"
+    assert _normalize_cube_timestamp("2026-07-01T08:30:00.5+0000") == "2026-07-01T08:30:00"
+    # A bare date/time with a space is normalised to T for xs:dateTime compliance.
+    assert _normalize_cube_timestamp("2026-07-01 08:30:00") == "2026-07-01T08:30:00"

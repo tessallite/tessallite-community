@@ -21,7 +21,13 @@ from sqlglot import exp
 
 from shared.aggregate_stats import stat_type_for_sqlglot_key
 from shared.pocket.fingerprint import fingerprint_shape
-from src.ir.logical_query import LogicalFilter, LogicalQuery, SelectExpression
+from src.ir.logical_query import (
+    ExpressionOccurrence,
+    LogicalFilter,
+    LogicalQuery,
+    SelectExpression,
+    UnsupportedSQL,
+)
 from src.registry import (
     get_aggregate_func,
     get_scalar_func,
@@ -41,13 +47,34 @@ _DIALECT_ALIASES: dict[str, str] = {
     "spark": "spark",
     "spark_sql": "spark",
     "hadoop_spark": "spark",
+    "mssql": "tsql",          # Bug-6956 (Fable R1): common SQL Server alias
+    "sqlserver": "tsql",      # Bug-6956 (Fable R1): connector name for SQL Server
 }
+
+# Bug-6956: allowlist of sqlglot dialect names accepted by this stack.
+# Unknown dialects previously passed through to sqlglot unchanged, causing a
+# ValueError (or silently producing incorrect AST behaviour).  Validate early
+# and fall back to "postgres" with a warning rather than crashing mid-parse.
+_KNOWN_DIALECTS: frozenset[str] = frozenset({
+    "postgres", "bigquery", "spark", "redshift", "snowflake", "tsql",
+    "mysql", "hive", "trino", "presto", "duckdb", "clickhouse",
+    "databricks", "sqlite", "oracle", "teradata", "athena",
+    "starrocks", "doris", "drill", "druid", "materialize",
+})
 
 
 def _normalize_dialect(dialect: str | None) -> str:
     if not dialect:
         return "postgres"
-    return _DIALECT_ALIASES.get(dialect.lower(), dialect.lower())
+    resolved = _DIALECT_ALIASES.get(dialect.lower(), dialect.lower())
+    if resolved not in _KNOWN_DIALECTS:
+        logger.warning(
+            "Bug-6956: unknown SQL dialect %r (resolved as %r); "
+            "falling back to 'postgres'",
+            dialect, resolved,
+        )
+        return "postgres"
+    return resolved
 
 
 class GroupByError(ValueError):
@@ -70,10 +97,11 @@ def parse_sql_to_ir(
     """Parse SQL into a LogicalQuery IR.
 
     ``input_dialect`` is the SQL flavour the producer wrote, in either the
-    API/wire form (``"postgresql"``, ``"jdbc"``, ``"bigquery"``, ``"spark"``)
-    or sqlglot's canonical name (``"postgres"``, ``"bigquery"``…). Unknown
-    values pass through to sqlglot unchanged. Defaults to Postgres — the
-    canonical internal dialect for this stack.
+    API/wire form (``"postgresql"``, ``"jdbc"``, ``"bigquery"``, ``"spark"``,
+    ``"mssql"``, ``"sqlserver"``) or sqlglot's canonical name (``"postgres"``,
+    ``"bigquery"``...). Unknown values fall back to ``"postgres"`` with a
+    warning (Bug-6956). Defaults to Postgres -- the canonical internal dialect
+    for this stack.
     """
     dialect = _normalize_dialect(input_dialect)
 
@@ -86,17 +114,24 @@ def parse_sql_to_ir(
     # sqlglot's parser silently recovers from by dropping tokens.  The
     # friendlier messages run first; the generic "Malformed SQL" fallback
     # below catches anything else the tokens-dropped path produces.
+    # XMLA/DAX clients send syntactic quirks (consecutive commas, stray
+    # semicolons) that are not meaning-changing, so the pre-scan stays
+    # JDBC-only. The sqlglot_errors check below catches meaning-changing
+    # recoveries (Bug-7916) on ALL protocols.
     if protocol == "jdbc":
         for w in raw_syntax_warnings:
             raise SyntaxErrorInSQL(w)
 
     tree, sqlglot_errors = _parse_with_errors(raw_sql, dialect=dialect)
 
-    # Strict syntax enforcement for JDBC: any remaining sqlglot parse
-    # error (token dropped during recovery) means real Postgres would
-    # have rejected the input — raise rather than silently routing a
-    # rewritten query.  XMLA/DAX callers keep the recoverable behaviour.
-    if protocol == "jdbc" and sqlglot_errors:
+    # Bug-7916 / Codex gate: strict syntax enforcement for ALL protocols.
+    # Any remaining sqlglot parse error (token dropped during recovery)
+    # means real Postgres would have rejected the input.  A recovered
+    # tree can have altered semantics (WHERE x = 1 !! -> WHERE x = NOT 1)
+    # and must never be silently routed on any protocol.  Previously only
+    # JDBC escalated; XMLA/DAX retained the permissive behaviour and
+    # could execute a meaning-changed tree.
+    if sqlglot_errors:
         first = sqlglot_errors[0]
         raise SyntaxErrorInSQL(f"Malformed SQL: {first}")
 
@@ -132,9 +167,9 @@ def parse_sql_to_ir(
                 select_node = source.this
                 select_star = _has_select_star(select_node)
 
-    measures, dimensions, grain, select_expressions, bare_true = _extract_columns(select_node)
+    measures, dimensions, grain, select_expressions, bare_true, alias_to_col = _extract_columns(select_node)
     filters = _extract_filters(select_node)
-    order_by, has_unresolvable_order = _extract_order_by(select_node)
+    order_by, has_unresolvable_order, order_by_alias_names = _extract_order_by(select_node)
     limit = _extract_limit(select_node)
     offset = _extract_offset(select_node)
 
@@ -151,14 +186,68 @@ def parse_sql_to_ir(
             _distinct_on = True
 
     # Detect function-based GROUP BY (DATE_TRUNC, EXTRACT, etc.)
+    # Bug-7359: also extract recognized time-period grains (DATE_TRUNC)
+    # so the binder/matcher can evaluate aggregate eligibility.
     has_function_grain = False
+    _time_period_grains: list[tuple[str, str]] = []
+    _has_unrecognized_function_grain = False
     _group = select_node.args.get("group") if select_node else None
     if _group:
+        _select_items = select_node.expressions or []
         for _gexpr in _group.expressions:
             _ginner = _gexpr.this if isinstance(_gexpr, exp.Alias) else _gexpr
-            if not isinstance(_ginner, (exp.Column, exp.Literal)):
+            # Unwrap transparent Paren wrappers so GROUP BY (region) / GROUP BY (1)
+            # are treated exactly as their unparenthesised forms. (Cast is left
+            # as-is here: GROUP BY x::text remains function grain, unchanged.)
+            while isinstance(_ginner, exp.Paren):
+                _ginner = _ginner.this
+            if isinstance(_ginner, exp.Literal):
+                # Positional GROUP BY (Bug-6082 / F-003-16): a positional ref
+                # to a bare-column SELECT item resolves to real grain (not
+                # function grain); a ref to an expression/aggregate item — or
+                # an out-of-range/non-integer literal — is function grain.
+                _resolved_pos = _resolve_positional_select_column(_ginner, _select_items)
+                if _resolved_pos is None:
+                    # Check if the positional ref points to a DATE_TRUNC / EXTRACT
+                    # select item (F-003-08).
+                    _pos_tp = _resolve_positional_time_period(_ginner, _select_items)
+                    if _pos_tp is not None:
+                        has_function_grain = True
+                        _time_period_grains.append(_pos_tp)
+                    else:
+                        has_function_grain = True
+                        _has_unrecognized_function_grain = True
+                        break
+                continue
+            if isinstance(_ginner, exp.Column):
+                continue
+            # Bug-7359: recognize DATE_TRUNC(<unit>, <column>) as a time-period
+            # grain expression.  The full DATE_TRUNC identity (unit + column)
+            # preserves year boundaries: DATE_TRUNC('month', d) yields
+            # 2025-01-01 for Jan 2025 and 2026-01-01 for Jan 2026 — these are
+            # distinct date values that are NEVER merged.
+            _tp = _recognize_time_period_grain(_ginner)
+            if _tp is not None:
                 has_function_grain = True
+                _time_period_grains.append(_tp)
+            else:
+                has_function_grain = True
+                _has_unrecognized_function_grain = True
                 break
+    # If ANY group-by item is an unrecognized function expression, clear
+    # the time_period_grains — we cannot partially accelerate. All or nothing.
+    if _has_unrecognized_function_grain:
+        _time_period_grains = []
+
+    # F3 guard: reject if the raw SQL contains a 3-arg DATE_TRUNC (timezone
+    # form).  sqlglot silently drops the 3rd arg, so the AST check in
+    # _recognize_date_trunc_grain cannot detect it.  A raw-SQL scan catches
+    # it before the aggregate route serves wrong timezone buckets.  This is
+    # conservative (false positives are safe — the query falls to source
+    # passthrough, which is correct).
+    if _time_period_grains:
+        if _has_three_arg_date_trunc(raw_sql):
+            _time_period_grains = []
 
     # Detect complex SQL constructs that the source rewriter cannot safely
     # reconstruct: CTEs, derived tables (FROM subquery), window functions,
@@ -171,17 +260,47 @@ def parse_sql_to_ir(
 
     cte_aliases = _extract_cte_aliases(tree)
 
-    # Extract tables from the original tree (not the unwrapped select_node)
-    # so subquery tables are captured.
-    from_tables = _extract_from_tables(tree if isinstance(tree, exp.Select) else select_node)
+    # Extract tables from the FULL parse tree so that set-operation branches
+    # (UNION, INTERSECT, EXCEPT) beyond the first are captured for the
+    # binder's FROM-table allow-list (Bug-6958: previously only the first
+    # branch's tables were extracted because ``tree`` was narrowed to
+    # ``select_node`` for non-Select top-level nodes).
+    from_tables = _extract_from_tables(tree)
 
     # Compute ungrouped bare columns for strict GROUP BY enforcement.
     # Only TRULY bare SELECT columns (case 4 in _extract_columns) count —
     # columns referenced inside expressions (CASE, EXTRACT, CAST, arithmetic)
     # are not bare in the PostgreSQL sense and may match a matching GROUP BY
     # expression instead of needing to be in GROUP BY as a column.
-    grain_set = set(grain)
-    ungrouped_bare = [c for c in bare_true if c not in grain_set]
+    # Fold GROUP BY grain to PostgreSQL semantics before the strict gate so
+    # valid queries are not falsely rejected:
+    #   Bug-6084 — GROUP BY may reference a SELECT output-column ALIAS
+    #     (``SELECT region AS r … GROUP BY r``); resolve the alias to the
+    #     underlying column so the aliased bare column reads as grouped.
+    #   Bug-6085 — unquoted identifiers fold to lower-case, so
+    #     ``SELECT Region … GROUP BY region`` groups correctly; compare
+    #     case-insensitively.
+    # Bias to leniency: PostgreSQL is the final arbiter downstream, so a false
+    # negative here is harmless (PG rejects a genuinely-invalid query) whereas
+    # a false positive rejects a query PG accepts.
+    # PostgreSQL ambiguity rule: when a GROUP BY name matches BOTH an output
+    # alias and an input column, the INPUT COLUMN wins. So an alias that
+    # collides with a real (bare) column name must NOT resolve to its aliased
+    # column here — otherwise ``SELECT a AS b, b, SUM(x) ... GROUP BY b`` would
+    # falsely treat the ungrouped column ``a`` as grouped (PG rejects it).
+    # F-2: reuse the single bare-column-only alias map produced by
+    # ``_extract_columns`` (aggregate/expression aliases are excluded there), so
+    # the strict GROUP BY gate and the grain normalization agree on which
+    # aliases are group-by-bindable.
+    _alias_to_col = alias_to_col
+    grain_folded = set()
+    for _g in grain:
+        _gl = _g.lower()
+        grain_folded.add(_gl)
+        # GROUP BY on an output alias groups by that alias's underlying column.
+        if _gl in _alias_to_col:
+            grain_folded.add(_alias_to_col[_gl].lower())
+    ungrouped_bare = [c for c in bare_true if c.lower() not in grain_folded]
 
     # Strict GROUP BY enforcement for SQL (JDBC) callers only.  XMLA/DAX
     # have no explicit GROUP BY — grouping is inferred from the axis /
@@ -215,8 +334,17 @@ def parse_sql_to_ir(
             measures=measures, grain=grain, select_bare=ungrouped_bare,
         )
     )
+    # Derived-grain routing (spec §5.1, Phase 1): capture non-column expression
+    # occurrences and fold their canonical fingerprints into the query shape so a
+    # DATE_TRUNC('month', …) query no longer collides with an EXTRACT(month …) one
+    # on the expression-blind ``has_function_grain`` boolean (spec I11). For an
+    # ordinary query this list is empty, and ``_compute_fingerprint`` then omits
+    # the derived-expression key entirely — the hash is byte-identical to before.
+    expression_occurrences = _extract_expression_occurrences(select_node, dialect)
+    expr_fingerprints = _occurrence_fingerprints(expression_occurrences)
     fingerprint = _compute_fingerprint(
         measures, dimensions, grain, filters, having_columns=having_columns,
+        expr_fingerprints=expr_fingerprints,
     )
 
     return LogicalQuery(
@@ -239,6 +367,7 @@ def parse_sql_to_ir(
         having_columns=having_columns,
         has_unresolvable_where=has_unresolvable_where,
         has_unresolvable_order=has_unresolvable_order,
+        order_by_alias_names=order_by_alias_names,
         has_distinct=has_distinct,
         has_function_grain=has_function_grain,
         has_complex_sql=has_complex_sql,
@@ -246,6 +375,8 @@ def parse_sql_to_ir(
         has_window_aggregate=has_window_aggregate,
         cte_aliases=cte_aliases,
         input_dialect=dialect,
+        expression_occurrences=expression_occurrences,
+        time_period_grains=_time_period_grains,
     )
 
 
@@ -297,7 +428,9 @@ def _composable_aggregate(
         col_name: str | None = None
         if isinstance(this, exp.Distinct):
             exprs = this.expressions
-            ok = bool(exprs) and isinstance(exprs[0], exp.Column)
+            # Bug-6093: multi-column COUNT(DISTINCT a, b) counts distinct tuples
+            # and cannot be served by a single stat column — not composable.
+            ok = len(exprs) == 1 and isinstance(exprs[0], exp.Column)
             if ok:
                 col_name = exprs[0].name
         elif isinstance(this, exp.Column):
@@ -322,6 +455,125 @@ def _composable_aggregate(
     return True, funcs, pairs
 
 
+def recognize_ordered_set_percentile(
+    node: exp.Expression,
+) -> dict | None:
+    """Recognise the ONE safe ordered-set percentile shape the router can serve.
+
+    Bug-6969/5891 (spec §4.1). Returns a descriptor for exactly
+
+        PERCENTILE_CONT(<literal fraction>) WITHIN GROUP (ORDER BY <single column> [ASC|DESC])
+        PERCENTILE_DISC(<literal fraction>) WITHIN GROUP (ORDER BY <single column> [ASC|DESC])
+
+    and None for anything else (multi-column ORDER BY, an expression order key,
+    a non-literal fraction, an unrecognised shape) — those stay complex SQL and
+    route to source (fail closed). This is the shared recogniser used by BOTH
+    ``_extract_columns`` (to emit a routable pNN SelectExpression) and
+    ``_detect_complex_sql`` (to NOT flag the recognised shape complex), so the
+    two can never disagree — the historical F-003-07 dead-code trap (parser
+    routes it, complex-SQL gate then discards it) is closed because a single
+    predicate governs both.
+
+    Descriptor keys: ``stat_suffix`` (pNN or None when the fraction is not a
+    canonical column suffix — still recognised, but the matcher will find no
+    pNN column and route to source), ``column``, ``method`` (continuous |
+    discrete), ``direction`` (asc | desc), ``fraction_text`` (EXACT decimal
+    text, never a float). ``stat_suffix`` drives the existing (measure, pNN)
+    column-lookup machinery; ``method``/``direction``/``fraction_text`` feed the
+    binder's QuantileRequest inventory and the coverage proof.
+    """
+    if not isinstance(node, exp.WithinGroup):
+        return None
+    fn = node.this
+    if isinstance(fn, exp.PercentileCont):
+        method = "continuous"
+    elif isinstance(fn, exp.PercentileDisc):
+        method = "discrete"
+    else:
+        return None
+    # Fraction must be a numeric literal (never a parameter/expression — a
+    # late-bound fraction cannot select coverage before the proof, §4.1).
+    frac = getattr(fn, "this", None)
+    if not isinstance(frac, exp.Literal) or frac.is_string:
+        return None
+    fraction_text = str(frac.this)
+    # ORDER BY must be a single bare column.
+    order = node.args.get("expression")
+    if not isinstance(order, exp.Order):
+        return None
+    ordered = list(order.expressions)
+    if len(ordered) != 1:
+        return None
+    o = ordered[0]
+    col = getattr(o, "this", None)
+    if not isinstance(col, exp.Column):
+        return None
+    direction = "desc" if o.args.get("desc") else "asc"
+    # SERVING suffix: the pNN column the rewriter will read. Materialised
+    # columns store the ASCENDING percentile (built as PERCENTILE_CONT(0.9) ->
+    # col__p90). So the column that serves a request is the ASCENDING-fraction
+    # column, NOT the authored fraction (Fable R1 CRITICAL): a
+    # ``CONT(0.9) DESC`` request equals ascending p10 and must read ``col__p10``,
+    # never ``col__p90`` (over [1,100] p90=90.1 but the correct DESC-0.9 = p10 =
+    # 10.9). For CONTINUOUS the ascending fraction is 1-p under DESC (positionally
+    # symmetric). For DISCRETE there is NO ascending equivalent, so the serving
+    # suffix stays the raw fraction and the coverage proof requires
+    # direction-identical coverage (a DESC discrete only serves from a
+    # DESC-built column, matched by physical-column identity below).
+    stat_suffix = _serving_suffix(method, fraction_text, direction)
+    return {
+        "stat_suffix": stat_suffix,
+        "column": _col_name(col),
+        "method": method,
+        "direction": direction,
+        "fraction_text": fraction_text,
+    }
+
+
+def _serving_suffix(method: str, fraction_text: str, direction: str) -> str | None:
+    """The pNN column suffix the rewriter reads for this request.
+
+    CONTINUOUS: direction-normalised to the ASCENDING fraction the column stores
+    (``CONT(0.9) DESC`` -> ascending 0.1 -> ``p10``). DISCRETE: the raw fraction
+    (no ascending equivalent); a DESC discrete request is only ever served from
+    direction-matched coverage, enforced downstream by physical-column identity.
+    Returns None for a non-canonical fraction (no column) -> source.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        frac = Decimal(fraction_text.strip())
+    except (InvalidOperation, AttributeError):
+        return None
+    if method == "continuous" and direction == "desc":
+        frac = Decimal(1) - frac
+    return _fraction_text_to_suffix(str(frac))
+
+
+def _fraction_text_to_suffix(fraction_text: str) -> str | None:
+    """Map an EXACT decimal fraction string (e.g. '0.9') to a canonical pNN
+    suffix ('p90'), or None when it is not a whole-percentile canonical value.
+
+    Uses exact ``Decimal`` arithmetic (never a float) so '0.3333333333' does not
+    round into a pNN suffix (§16.14). A non-canonical fraction returns None: the
+    shape is still recognised and bound, but no pNN column exists to serve it,
+    so it routes to source.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        frac = Decimal(fraction_text.strip())
+    except (InvalidOperation, AttributeError):
+        return None
+    scaled = frac * 100
+    if scaled != scaled.to_integral_value():
+        return None
+    pct = int(scaled)
+    from shared.aggregate_quantiles import QUANTILE_PERCENTILES, quantile_suffix
+
+    return quantile_suffix(pct) if pct in QUANTILE_PERCENTILES else None
+
+
 def _detect_percentile(node: exp.Expression) -> tuple[str | None, str | None]:
     """Map a ``MEDIAN(col)`` projection to a materialised quantile column.
 
@@ -329,15 +581,12 @@ def _detect_percentile(node: exp.Expression) -> tuple[str | None, str | None]:
     ``col__p50`` column at exact grain (gated in the matcher; percentiles are
     not re-aggregatable).
 
-    F-003-07: ``PERCENTILE_CONT/DISC(frac) WITHIN GROUP (ORDER BY col)`` is
-    deliberately NOT routed here. ``_detect_complex_sql`` flags every
-    ``WITHIN GROUP`` ordered-set aggregate as complex SQL, so it always routes
-    through passthrough-with-table-substitution — which is the contract the
-    query-shape catalog records for shape #86 ("ordered-set aggregate /
-    WITHIN GROUP -> source passthrough"). Classifying it as a routable pNN
-    here produced a select-expression the binder then discarded (complex SQL
-    empties resolved measures), i.e. dead, self-contradicting machinery.
-    Aggregate acceleration of percentiles is reached via ``MEDIAN`` (p50).
+    Bug-6969/5891: the explicit ordered-set form
+    ``PERCENTILE_CONT/DISC(frac) WITHIN GROUP (ORDER BY col)`` is now recognised
+    separately by ``recognize_ordered_set_percentile`` (which also feeds the
+    binder's QuantileRequest inventory), so it is NOT handled here. This helper
+    stays MEDIAN-only; the ordered-set caller in ``_extract_columns`` runs the
+    shared recogniser explicitly.
     """
     if isinstance(node, exp.Median):
         this = getattr(node, "this", None)
@@ -346,12 +595,286 @@ def _detect_percentile(node: exp.Expression) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _extract_columns(select_node: exp.Select | None) -> tuple[list[str], list[str], list[str], list[SelectExpression], list[str]]:
+def _resolve_positional_select_column(
+    literal: exp.Literal, select_items: list[exp.Expression]
+) -> str | None:
+    """Resolve a positional reference (``GROUP BY 1`` / ``ORDER BY 1``) to the
+    bare column name of the matching SELECT item.
+
+    Returns the column name when the 1-based position points at a bare-column
+    SELECT item (optionally aliased); returns ``None`` when the literal is not
+    an integer, is out of range, or points at an expression/aggregate item —
+    in which case the caller treats it as function grain / unresolvable, never
+    as a bare-column grain. Mirrors the positional-resolution ``_extract_order_by``
+    already performs, so GROUP BY and ORDER BY treat ``n`` identically."""
+    if not literal.is_int:
+        return None
+    pos = int(literal.this) - 1
+    if 0 <= pos < len(select_items):
+        item = select_items[pos]
+        inner = item.this if isinstance(item, exp.Alias) else item
+        # Unwrap transparent Paren SELECT items (``SELECT (region)``) so the
+        # positional ref resolves to the underlying bare column, mirroring how
+        # an explicit ``GROUP BY region`` already groups it.
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        if isinstance(inner, exp.Column):
+            return _col_name(inner)
+    return None
+
+
+_DATE_TRUNC_UNITS = frozenset({
+    "microsecond", "microseconds", "millisecond", "milliseconds",
+    "second", "seconds", "minute", "minutes",
+    "hour", "hours", "day", "days",
+    "week", "weeks", "month", "months",
+    "quarter", "quarters", "year", "years",
+    "decade", "decades", "century", "centuries",
+    "millennium", "millennia",
+})
+
+# Units that are safe for aggregate routing across ALL supported dialects
+# (PG + BigQuery).  BigQuery DATE_TRUNC supports: DAY, WEEK, ISOWEEK,
+# MONTH, QUARTER, YEAR, ISOYEAR.  Sub-day units (hour/minute/second/...)
+# are only supported by BigQuery's TIMESTAMP_TRUNC (not DATE_TRUNC), and
+# DECADE/CENTURY/MILLENNIUM are PG-only.  Non-routable units are still
+# recognized as function grain (has_function_grain=True) but NOT as
+# routable time-period grains, so the query falls to source passthrough
+# (correct on all dialects).
+_DATE_TRUNC_ROUTABLE_UNITS = frozenset({
+    "day", "week", "month", "quarter", "year",
+})
+
+# F-003-08 / G-003-03: EXTRACT units that are aggregate-matchable. Stored in
+# time_period_grains as ('extract_month', col) so fingerprints stay distinct
+# from DATE_TRUNC('month', col) (spec I11). Arbitrary EXTRACT (DOW, WEEK, …)
+# stays unrecognized function grain → source.
+_EXTRACT_ROUTABLE_UNITS = frozenset({"month", "year", "quarter"})
+_EXTRACT_UNIT_PREFIX = "extract_"
+
+
+def _has_three_arg_date_trunc(raw_sql: str) -> bool:
+    """Return True if raw_sql contains a DATE_TRUNC call with 3+ arguments.
+
+    F3 guard: sqlglot silently drops the 3rd timezone argument from
+    ``DATE_TRUNC('day', ts, 'America/New_York')``, so the AST-level
+    recognizer cannot detect it.  This function scans the raw SQL for
+    ``DATE_TRUNC(`` and counts top-level commas inside the call to detect
+    the 3-arg form.  Conservative: false positives (e.g. a 3-arg call
+    inside a string literal) are safe -- the query falls to source.
+    """
+    import re
+    for m in re.finditer(r"DATE_TRUNC\s*\(", raw_sql, re.IGNORECASE):
+        start = m.end()  # position right after the '('
+        depth = 1
+        commas = 0
+        i = start
+        while i < len(raw_sql) and depth > 0:
+            ch = raw_sql[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 1:
+                commas += 1
+            elif ch == "'" and depth == 1:
+                # Skip string literals to avoid counting commas inside them
+                i += 1
+                while i < len(raw_sql) and raw_sql[i] != "'":
+                    if raw_sql[i] == "'" and i + 1 < len(raw_sql) and raw_sql[i + 1] == "'":
+                        i += 2  # escaped quote
+                        continue
+                    i += 1
+            i += 1
+        if commas >= 2:
+            return True
+    return False
+
+
+def _recognize_date_trunc_grain(
+    node: exp.Expression,
+) -> tuple[str, str] | None:
+    """Recognize DATE_TRUNC(<unit>, <bare_column>) as a time-period grain.
+
+    Bug-7359 (re-implementation): returns (unit, column_name) when the node is
+    a DATE_TRUNC call with a time unit and a bare column argument.  Returns
+    None for any other shape (nested expressions, EXTRACT, UPPER, etc.).
+
+    F3 guard (timezone form): sqlglot silently drops the third timezone
+    argument from DATE_TRUNC('day', ts, 'America/New_York'), parsing it
+    as a 2-arg TimestampTrunc.  If accepted, the aggregate rewrite would
+    truncate in the wrong timezone (shifting rows across day/month
+    boundaries = wrong numbers).  Rejected by checking the node's zone
+    arg and by counting commas in the raw SQL as a defence-in-depth
+    against future sqlglot parse changes.
+
+    sqlglot parses ``DATE_TRUNC('month', col)`` differently per dialect:
+    - Postgres dialect: ``exp.TimestampTrunc`` with ``args["unit"]`` as a
+      ``Var`` node and ``args["this"]`` as the Column.
+    - Some dialects: ``exp.DateTrunc`` with similar structure.
+    - Fallback: generic ``Func`` with ``key="date_trunc"``.
+
+    All three are handled.  The unit may be a ``Var`` (``MONTH``), a
+    string ``Literal`` (``'month'``), or an ``Identifier``.
+
+    The FULL DATE_TRUNC identity (unit + underlying column) preserves year
+    boundaries: DATE_TRUNC('month', order_date) on 2025-01-15 yields 2025-01-01
+    and on 2026-01-15 yields 2026-01-01 -- distinct date values that are NEVER
+    merged.  This avoids the fatal flaw of the prior name-heuristic approach
+    that bucketed Jan-2025 and Jan-2026 together.
+    """
+    func_key = getattr(node, "key", "").lower() if hasattr(node, "key") else ""
+    # Recognize DateTrunc, TimestampTrunc, and generic date_trunc Func.
+    _is_trunc = (
+        isinstance(node, exp.DateTrunc)
+        or isinstance(node, getattr(exp, "TimestampTrunc", type(None)))
+        or func_key in ("date_trunc", "timestamptrunc")
+    )
+    if not _is_trunc:
+        return None
+
+    # Extract the unit and column arguments.
+    unit_str: str | None = None
+    col_node: exp.Expression | None = None
+
+    # All three node types store the date expression in .this and the
+    # time unit in .args["unit"] (Var/Literal).  DateTrunc may also
+    # store the unit in .this with the column in .expression when no
+    # explicit "unit" arg exists.
+    unit_node = node.args.get("unit")
+    if unit_node is not None:
+        col_node = node.this
+    else:
+        # Fallback: first arg is unit, second is column
+        unit_node = node.this
+        col_node = node.expression
+
+    if unit_node is not None:
+        if isinstance(unit_node, exp.Literal) and unit_node.is_string:
+            unit_str = unit_node.this.lower()
+        elif isinstance(unit_node, exp.Var):
+            unit_str = unit_node.name.lower()
+        elif isinstance(unit_node, exp.Identifier):
+            unit_str = unit_node.name.lower()
+
+    if unit_str is None or unit_str not in _DATE_TRUNC_UNITS:
+        return None
+    # Normalize plural units to singular before the routable check.
+    _unit_normalized = unit_str
+    if _unit_normalized.endswith("s") and _unit_normalized[:-1] in _DATE_TRUNC_UNITS:
+        _unit_normalized = _unit_normalized[:-1]
+    # Only units safe across all supported dialects (PG + BigQuery) are
+    # routable.  PG-only units (DECADE/CENTURY/MILLENNIUM) are still
+    # recognized as function grain (has_function_grain=True) but NOT as
+    # routable time-period grains, so they route to source passthrough.
+    if _unit_normalized not in _DATE_TRUNC_ROUTABLE_UNITS:
+        return None
+    if col_node is None or not isinstance(col_node, exp.Column):
+        return None
+
+    # F3 guard: reject 3-arg timezone form DATE_TRUNC('day', col, 'tz').
+    # sqlglot silently drops the 3rd arg, so check the node's zone arg
+    # (present in some sqlglot versions) AND count commas in the raw SQL
+    # as defence-in-depth.
+    if node.args.get("zone") is not None:
+        return None
+    # Raw-SQL comma count: DATE_TRUNC('unit', col) has 1 comma;
+    # DATE_TRUNC('unit', col, 'tz') has 2 commas.  Use the node's own
+    # SQL rendering (which includes the unit and column but may drop the
+    # timezone) as a conservative check — if the ORIGINAL text has more
+    # args than the rendered version, reject.
+    try:
+        _raw = node.sql(dialect="postgres")
+        # Strip nested parens/function calls to count only top-level commas
+        _depth = 0
+        _commas = 0
+        for _ch in _raw:
+            if _ch == "(":
+                _depth += 1
+            elif _ch == ")":
+                _depth -= 1
+            elif _ch == "," and _depth == 1:
+                _commas += 1
+        # 2-arg form has 1 top-level comma; 3+ args => reject
+        if _commas > 1:
+            return None
+    except Exception:
+        pass  # If rendering fails, proceed with the AST-only check
+
+    col_name = _col_name(col_node)
+    if not col_name:
+        return None
+
+    return (_unit_normalized, col_name)
+
+
+def _recognize_extract_grain(
+    node: exp.Expression,
+) -> tuple[str, str] | None:
+    """Recognize EXTRACT(month|year|quarter FROM bare_column) as a time-period grain.
+
+    F-003-08 / G-003-03: sqlglot parses ``EXTRACT(month FROM col)`` as
+    ``exp.Extract(this=Var(MONTH), expression=Column)``. Stored as
+    ``('extract_month', col)`` so the rewriter emits EXTRACT, not DATE_TRUNC
+    (EXTRACT(month) collapses years; DATE_TRUNC('month') does not).
+    """
+    if not isinstance(node, exp.Extract):
+        return None
+    unit_node = node.this
+    col_node = node.expression
+    unit_str: str | None = None
+    if isinstance(unit_node, exp.Var):
+        unit_str = (unit_node.name or unit_node.this or "").lower()
+    elif isinstance(unit_node, exp.Literal) and unit_node.is_string:
+        unit_str = str(unit_node.this).lower()
+    elif isinstance(unit_node, exp.Identifier):
+        unit_str = (unit_node.name or "").lower()
+    if not unit_str or unit_str not in _EXTRACT_ROUTABLE_UNITS:
+        return None
+    if col_node is None or not isinstance(col_node, exp.Column):
+        return None
+    col_name = _col_name(col_node)
+    if not col_name:
+        return None
+    return (f"{_EXTRACT_UNIT_PREFIX}{unit_str}", col_name)
+
+
+def _recognize_time_period_grain(
+    node: exp.Expression,
+) -> tuple[str, str] | None:
+    """DATE_TRUNC or EXTRACT(month|year|quarter FROM col) → (unit, column)."""
+    return _recognize_date_trunc_grain(node) or _recognize_extract_grain(node)
+
+
+def _resolve_positional_time_period(
+    literal: exp.Literal, select_items: list[exp.Expression],
+) -> tuple[str, str] | None:
+    """Resolve a positional GROUP BY ref to a DATE_TRUNC / EXTRACT SELECT item."""
+    if not literal.is_int:
+        return None
+    pos = int(literal.this) - 1
+    if 0 <= pos < len(select_items):
+        item = select_items[pos]
+        inner = item.this if isinstance(item, exp.Alias) else item
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        return _recognize_time_period_grain(inner)
+    return None
+
+
+def _resolve_positional_date_trunc(
+    literal: exp.Literal, select_items: list[exp.Expression],
+) -> tuple[str, str] | None:
+    """Backward-compatible alias for ``_resolve_positional_time_period``."""
+    return _resolve_positional_time_period(literal, select_items)
+
+
+def _extract_columns(select_node: exp.Select | None) -> tuple[list[str], list[str], list[str], list[SelectExpression], list[str], dict[str, str]]:
     """
     Distinguish measure columns (wrapped in aggregate functions) from
     dimension columns (bare columns or expressions in GROUP BY).
 
-    Returns: (measures, dimensions, grain, select_expressions, bare_true)
+    Returns: (measures, dimensions, grain, select_expressions, bare_true, alias_to_col)
     - measures: column names inside aggregate calls (SUM, COUNT, AVG, MAX, MIN, COUNT DISTINCT)
     - grain: column names in GROUP BY (Cast-unwrapped)
     - dimensions: grain + any bare SELECT columns not in an aggregate
@@ -360,11 +883,23 @@ def _extract_columns(select_node: exp.Select | None) -> tuple[list[str], list[st
       top level, not wrapped in any expression).  Used for PG-style strict
       GROUP BY enforcement — expressions like CASE/EXTRACT/CAST don't count
       as bare even though they reference columns.
+    - alias_to_col: GROUP-BY output-alias -> underlying column, built from
+      BARE-COLUMN select items ONLY (F-2). An aggregate/expression alias is not
+      a valid GROUP BY target, so it is deliberately absent.
     """
     measures = []
     select_bare = []
     bare_true = []
     select_expressions = []
+    # F-2 (Fable sensitive-worktree review): the GROUP-BY output-alias
+    # normalization (Bug-6084) must apply ONLY to aliases over a BARE column
+    # (``region AS r``). An alias over an aggregate or expression
+    # (``SUM(amount) AS total``, ``UPPER(region) AS r``) is NOT group-by-bindable
+    # in PostgreSQL, so it must NOT resolve to its inner column — doing so let an
+    # invalid ``GROUP BY <aggregate-alias>`` bind the measure column as a
+    # dimension and execute garbage grouping instead of the correct 422. Record
+    # (alias -> column) pairs from the bare-column branch (case 4) only.
+    bare_alias_pairs: dict[str, str] = {}
 
     if select_node:
         for expr in select_node.expressions:
@@ -387,9 +922,46 @@ def _extract_columns(select_node: exp.Select | None) -> tuple[list[str], list[st
             while isinstance(inner, exp.Paren):
                 inner = inner.this
 
+            # Ordered-set percentile: PERCENTILE_CONT/DISC(frac) WITHIN GROUP
+            # (ORDER BY col [ASC|DESC]) -> routable pNN column (Bug-6969/5891).
+            # Must run BEFORE the WITHIN GROUP unwrap below. The recogniser
+            # returns None for any unsupported shape (multi-column/expression
+            # order key, non-literal fraction), which stays complex -> source.
+            # A recognised shape with a non-canonical fraction (stat_suffix None,
+            # e.g. p33) is still bound as continuous/discrete but has no pNN
+            # column, so the matcher routes it to source — never a wrong serve.
+            _qos = recognize_ordered_set_percentile(inner)
+            if _qos and _qos.get("column"):
+                _q_meta = {
+                    "method": _qos["method"],
+                    "direction": _qos["direction"],
+                    "fraction_text": _qos["fraction_text"],
+                    # source_syntax distinguishes the explicit ordered-set form
+                    # (new, gated behind quantile_routing.proof_mode=enforce) from
+                    # MEDIAN (pre-existing p50 serving). When the feature is off,
+                    # the matcher keeps serving MEDIAN via the existing path but
+                    # routes ordered-set percentiles to source (no unproven new
+                    # serve), so this push is a strict no-regression when disabled.
+                    "source_syntax": "ordered_set",
+                }
+                measures.append(_qos["column"])
+                select_expressions.append(SelectExpression(
+                    raw_text=raw_text, alias=alias_name,
+                    classification="analytical",
+                    # stat_suffix drives the existing (measure, pNN) column
+                    # lookup; when None (non-canonical fraction) fall back to a
+                    # sentinel so the matcher cannot match a pNN column.
+                    agg_function=(_qos.get("stat_suffix") or "__quantile_unmapped__"),
+                    inner_column=_qos["column"], inner_literal=None,
+                    quantile_meta=_q_meta,
+                ))
+                continue
+
             # Median / percentile -> materialised quantile column (pNN). Must run
             # BEFORE the WITHIN GROUP unwrap below (which discards the ORDER BY
-            # column). Routed exact-grain only (gated in the matcher).
+            # column). Routed exact-grain only (gated in the matcher). MEDIAN is
+            # canonically continuous p50 ASC (Bug-6969: carry that as quantile_meta
+            # so the binder inventories it identically to PERCENTILE_CONT(0.5)).
             _q_suffix, _q_col = _detect_percentile(inner)
             if _q_suffix and _q_col:
                 measures.append(_q_col)
@@ -397,6 +969,12 @@ def _extract_columns(select_node: exp.Select | None) -> tuple[list[str], list[st
                     raw_text=raw_text, alias=alias_name,
                     classification="analytical", agg_function=_q_suffix,
                     inner_column=_q_col, inner_literal=None,
+                    quantile_meta={
+                        "method": "continuous",
+                        "direction": "asc",
+                        "fraction_text": "0.5",
+                        "source_syntax": "median",
+                    },
                 ))
                 continue
 
@@ -448,7 +1026,13 @@ def _extract_columns(select_node: exp.Select | None) -> tuple[list[str], list[st
                 
                 if isinstance(inner_this, exp.Distinct):
                     exprs = inner_this.expressions
-                    if exprs and isinstance(exprs[0], exp.Column):
+                    # Bug-6093: COUNT(DISTINCT a, b) counts distinct (a, b)
+                    # TUPLES — no single stat column can serve it. Only a
+                    # single-column distinct is aggregate-routable; a
+                    # multi-column distinct must fall through to the
+                    # passthrough branch below and force a source read rather
+                    # than collapse to the first column and serve a wrong number.
+                    if len(exprs) == 1 and isinstance(exprs[0], exp.Column):
                         col = exprs[0]
                 elif isinstance(inner_this, exp.Column):
                     col = inner_this
@@ -567,6 +1151,11 @@ def _extract_columns(select_node: exp.Select | None) -> tuple[list[str], list[st
                 col_name = _col_name(inner)
                 select_bare.append(col_name)
                 bare_true.append(col_name)
+                if alias_name:
+                    # Only a bare-column alias is a valid GROUP BY output-alias
+                    # target (F-2). The ambiguity filter (alias colliding with a
+                    # real bare column) is applied after the loop.
+                    bare_alias_pairs[alias_name.lower()] = col_name
                 select_expressions.append(SelectExpression(
                     raw_text=raw_text, alias=alias_name,
                     classification="passthrough", agg_function=None,
@@ -626,20 +1215,105 @@ def _extract_columns(select_node: exp.Select | None) -> tuple[list[str], list[st
 
     # GROUP BY defines the grain (accessed directly from the Select node
     # to avoid recursing into subqueries in the FROM clause).
+    #
+    # Bug-6084: PostgreSQL allows GROUP BY to reference a SELECT output alias
+    # (SELECT region AS r ... GROUP BY r). The source rewriter groups by
+    # resolved dimension names, so normalize an unambiguous output alias to
+    # the underlying column here. Preserve PostgreSQL's ambiguity rule: if the
+    # GROUP BY name also matches a real input column selected bare, it means
+    # the input column, not the output alias.
+    # F-2: build the GROUP-BY alias map from BARE-COLUMN select items only
+    # (``bare_alias_pairs``), never from aggregate/expression aliases. Apply the
+    # PostgreSQL ambiguity rule: an alias that collides with a real bare-selected
+    # column name means the INPUT column, not the alias, so it must not resolve.
+    bare_true_folded = {c.lower() for c in bare_true}
+    # Bug-6859 [DOCUMENTED DIVERGENCE]: the ambiguity rule checks
+    # ``alias not in bare_true_folded`` — i.e. against bare-SELECTED columns
+    # only, not all table columns. PostgreSQL checks against all INPUT columns
+    # (table + subquery columns). The divergence is contrived: it requires a
+    # non-selected table column that collides with a SELECT alias, and the
+    # binder + PostgreSQL's own disambiguation catch truly ambiguous references
+    # downstream. Accepted — no code change needed.
+    #
+    # Bug-6838 [DOCUMENTED DIVERGENCE]: the case-fold comparison
+    # (``alias != col.lower()`` and ``alias not in bare_true_folded``)
+    # deliberately ignores quoted-identifier case sensitivity. PostgreSQL
+    # treats ``"Region"`` and ``"region"`` as different columns, so a quoted
+    # mismatch GROUP BY should fail. Our leniency lets it pass the gate,
+    # but the mismatch fails loud at the source (PG rejects the query with
+    # a genuine GROUP BY violation). Accepted as fail-loud downstream.
+    alias_to_col = {
+        alias: col
+        for alias, col in bare_alias_pairs.items()
+        if col
+        and alias != col.lower()
+        and alias not in bare_true_folded
+    }
+    # Bug-6858: collect aliases of aggregate / expression select items so the
+    # GROUP BY loop can reject ``GROUP BY <agg-alias>`` loudly instead of
+    # silently treating the alias as a dimension name and executing garbage
+    # grouping.  An alias is aggregate/expression when its SelectExpression
+    # has an agg_function, is classified as "analytical", or is a composable
+    # aggregate expression (e.g. SUM(a)/SUM(b) AS ratio — classification
+    # stays "passthrough" but composable=True).
+    #
+    # [DOCUMENTED DIVERGENCE]: if a query has both an input column and an
+    # aggregate alias with the same name (e.g. ``SELECT total, SUM(amount)
+    # AS total ... GROUP BY total``), PostgreSQL resolves ``GROUP BY total``
+    # to the INPUT column, not the alias. Our guard rejects unconditionally,
+    # which is stricter (fail-loud). This edge case requires a column name
+    # that collides with an aggregate alias — contrived enough to accept.
+    _agg_expr_aliases: set[str] = set()
+    for se in select_expressions:
+        if se.alias and (
+            se.agg_function
+            or se.classification == "analytical"
+            or se.composable
+        ):
+            _agg_expr_aliases.add(se.alias.lower())
     grain = []
     group = select_node.args.get("group") if select_node else None
     if group:
         for expr in group.expressions:
             inner = expr.this if isinstance(expr, exp.Alias) else expr
+            # Unwrap transparent Paren wrappers: GROUP BY (region) / GROUP BY (1)
+            # must group exactly as the unparenthesised form does.
+            while isinstance(inner, exp.Paren):
+                inner = inner.this
             # Unwrap Cast: GROUP BY success_flag::text should still add
             # success_flag to the grain so SELECT success_flag matches.
             if isinstance(inner, exp.Cast):
                 inner = inner.this
+                while isinstance(inner, exp.Paren):
+                    inner = inner.this
             if isinstance(inner, exp.Column):
-                grain.append(_col_name(inner))
+                name = _col_name(inner)
+                # Bug-6858: reject GROUP BY on an aggregate/expression alias
+                # (e.g. ``SELECT SUM(amount) AS total … GROUP BY total``).
+                # PostgreSQL rejects this with "aggregate functions are not
+                # allowed in GROUP BY"; we must fail loud here too, otherwise
+                # the alias name leaks through as a dimension and the query
+                # executes with garbage grouping.
+                if name.lower() in _agg_expr_aliases:
+                    raise GroupByError(
+                        f'column "{name}" is an aggregate or expression alias '
+                        f"and cannot appear in GROUP BY"
+                    )
+                grain.append(alias_to_col.get(name.lower(), name))
             elif isinstance(inner, exp.Literal):
-                # Positional GROUP BY (e.g. GROUP BY 1,2) — skip
-                pass
+                # Positional GROUP BY (e.g. GROUP BY 1,2): resolve the position
+                # against the SELECT list exactly as ORDER BY positional refs
+                # are resolved (Bug-6082 / F-003-16). A positional reference to
+                # a bare-column SELECT item adds that column to the grain so the
+                # source rewriter renders GROUP BY and the strict gate sees the
+                # column as grouped. A reference to an expression/aggregate item
+                # is function grain (handled via has_function_grain in
+                # parse_sql_to_ir) and contributes no bare-column grain here.
+                resolved = _resolve_positional_select_column(
+                    inner, select_node.expressions or []
+                )
+                if resolved is not None:
+                    grain.append(resolved)
             # Function-based GROUP BY (DATE_TRUNC, EXTRACT, etc.) — detected
             # separately via has_function_grain in parse_sql_to_ir.
 
@@ -664,7 +1338,7 @@ def _extract_columns(select_node: exp.Select | None) -> tuple[list[str], list[st
         if col not in grain_set:
             dimensions.append(col)
 
-    return _dedup(measures), _dedup(dimensions), _dedup(grain), select_expressions, _dedup(bare_true)
+    return _dedup(measures), _dedup(dimensions), _dedup(grain), select_expressions, _dedup(bare_true), alias_to_col
 
 
 _COMPARISON_OPS: tuple[tuple[type, str, str], ...] = (
@@ -694,13 +1368,26 @@ def _flatten_top_level_and(node: exp.Expression | None) -> list[exp.Expression]:
     return [node]
 
 
+def _unwrap_not_inner(node: exp.Expression) -> exp.Expression:
+    """Inner expression of ``NOT …``, unwrapping a single layer of parens.
+
+    sqlglot 30.8 emits ``Not(In)`` for ``col NOT IN (…)`` and
+    ``Not(Paren(In))`` for ``NOT (col IN (…))``.
+    """
+    inner = node.this
+    while isinstance(inner, exp.Paren):
+        inner = inner.this
+    return inner
+
+
 def _conjunct_to_filter(node: exp.Expression) -> LogicalFilter | None:
     """Translate a single top-level conjunct into a ``LogicalFilter`` if
     and only if it is faithfully representable. Anything that isn't —
     function calls, arithmetic, subqueries, column-vs-column,
-    ``OR``/``EXISTS``/``NOT`` other than ``IS NOT NULL`` — returns None
-    so the rewriter's raw-WHERE preservation path takes over instead of
-    a phantom filter contaminating routing decisions."""
+    ``OR``/``EXISTS``/``NOT`` other than ``IS NOT NULL`` / extractable
+    ``NOT IN`` — returns None so the rewriter's raw-WHERE preservation
+    path takes over instead of a phantom filter contaminating routing
+    decisions."""
     for cls, op_lhs, op_rhs in _COMPARISON_OPS:
         if isinstance(node, cls):
             if not _comparison_is_extractable(node):
@@ -713,9 +1400,12 @@ def _conjunct_to_filter(node: exp.Expression) -> LogicalFilter | None:
     if isinstance(node, exp.In):
         if not _in_is_extractable(node):
             return None
+        # F-003-01 / F-004-01 / F-102-04: honour In.negate if a dialect
+        # ever emits it (sqlglot 30.8 uses Not(In) instead).
+        operator = "not_in" if _in_is_negated(node) else "in"
         return LogicalFilter(
             _col_name(node.this),
-            "in",
+            operator,
             [_literal_value(v) for v in node.expressions],
         )
 
@@ -745,10 +1435,24 @@ def _conjunct_to_filter(node: exp.Expression) -> LogicalFilter | None:
             _col_name(node.this), operator, _literal_value(node.expression)
         )
 
-    if isinstance(node, exp.Not) and isinstance(node.this, exp.Is):
-        is_node = node.this
-        if _is_null_check_extractable(is_node):
-            return LogicalFilter(_col_name(is_node.this), "is_not_null", None)
+    if isinstance(node, exp.Not):
+        inner = _unwrap_not_inner(node)
+        if isinstance(inner, exp.In):
+            # F-003-01 / F-004-01 / F-005-01 / F-102-04 / G-003 / G-004 / G-005:
+            # sqlglot 30.8 parses ``col NOT IN (lits)`` as ``Not(In)``. Extract
+            # ``not_in`` iff the IN is a bare column over literals. Subquery
+            # ``NOT IN (SELECT …)`` has empty In.expressions → not extractable.
+            if not _in_is_extractable(inner):
+                return None
+            return LogicalFilter(
+                _col_name(inner.this),
+                "not_in",
+                [_literal_value(v) for v in inner.expressions],
+            )
+        if isinstance(inner, exp.Is):
+            if _is_null_check_extractable(inner):
+                return LogicalFilter(_col_name(inner.this), "is_not_null", None)
+            return None
         return None
 
     if isinstance(node, exp.Is):
@@ -793,92 +1497,332 @@ def _extract_filters(select_node: exp.Select | None) -> list[LogicalFilter]:
 
 def _extract_order_by(
     select_node: exp.Select | None,
-) -> tuple[list[tuple[str, str]], bool]:
+) -> tuple[list[tuple[str, str]], bool, set[str]]:
     """Extract ORDER BY as ``(field_name, "asc"|"desc")`` rows.
 
-    Returns ``(order_by, has_unresolvable_order)``. Only faithfully
-    representable items are translated:
-
-    - a bare ``exp.Column`` (optionally table-qualified) with its direction;
-    - a positional integer literal that resolves to a bare-column SELECT item.
-
-    Anything else — a function call (``LOWER(region)``), arithmetic
-    (``SUM(amount)/COUNT(*)``), a ``CASE`` expression, an aggregate, or a
-    positional reference to a non-bare SELECT item — is NOT translated. Its
-    presence sets ``has_unresolvable_order`` and no phantom bare-column sort
-    is fabricated.
-
-    Bug-102 discipline (mirrors ``_extract_filters``): the previous
-    implementation used recursive ``ordered.find(exp.Column)`` /
-    ``ordered.find(exp.Literal)``, which fabricated a bare-column sort from
-    inside any complex sort key — e.g. ``ORDER BY LOWER(region) DESC`` became
-    ``("region", "desc")`` and ``ORDER BY SUM(amount)/COUNT(*) DESC`` became
-    ``("amount", "desc")``. Combined with ``LIMIT`` the rewriter then sorted by
-    the bare column and returned DIFFERENT rows — a silent wrong result. Strict
-    per-item extraction with an unresolvable flag defuses it: the rewriter
-    preserves the raw ORDER BY when the flag is set."""
+    Returns ``(order_by, has_unresolvable_order, order_by_alias_names)``.
+    F-003-11: a SELECT alias of a non-column (aggregate / expression) is
+    recorded in ``order_by_alias_names`` so the aggregate rewriter ORDER BYs
+    the output alias. A name that is BOTH an aggregate alias and a bare
+    SELECT column is unresolvable (do not shadow grain).
+    """
     if not select_node:
-        return [], False
+        return [], False, set()
     order = select_node.args.get("order")
     if not order:
-        return [], False
+        return [], False, set()
     select_items = select_node.expressions or []
+    expr_aliases: set[str] = set()
+    bare_select_names: set[str] = set()
+    for item in select_items:
+        if isinstance(item, exp.Alias):
+            alias = item.alias or ""
+            inner = item.this
+            while isinstance(inner, exp.Paren):
+                inner = inner.this
+            if isinstance(inner, exp.Column):
+                if alias:
+                    bare_select_names.add(alias)
+                col = _col_name(inner)
+                if col:
+                    bare_select_names.add(col)
+            elif alias:
+                expr_aliases.add(alias)
+        elif isinstance(item, exp.Column):
+            col = _col_name(item)
+            if col:
+                bare_select_names.add(col)
+
+    def _in_names(name: str, names: set[str]) -> bool:
+        nl = name.lower()
+        return any(n.lower() == nl for n in names)
+
     result: list[tuple[str, str]] = []
     unresolvable = False
+    alias_names: set[str] = set()
     for ordered in order.expressions:
         direction = "desc" if ordered.args.get("desc") else "asc"
         key = ordered.this
-        # Bare column (optionally qualified): ORDER BY region [DESC]
-        if isinstance(key, exp.Column):
-            result.append((_col_name(key), direction))
+        if isinstance(key, (exp.Column, exp.Identifier)):
+            name = _col_name(key) if isinstance(key, exp.Column) else (key.name or "")
+            if not name:
+                unresolvable = True
+                continue
+            if _in_names(name, expr_aliases) and _in_names(name, bare_select_names):
+                unresolvable = True
+                continue
+            if _in_names(name, expr_aliases):
+                result.append((name, direction))
+                alias_names.add(name)
+                continue
+            result.append((name, direction))
             continue
-        # Positional reference: ORDER BY 2 — resolve only to a bare-column
-        # SELECT item; a positional reference to an expression item is itself
-        # an expression sort and must be preserved verbatim.
         if isinstance(key, exp.Literal) and key.is_int:
             pos = int(key.this) - 1
             if 0 <= pos < len(select_items):
                 item = select_items[pos]
                 inner = item.this if isinstance(item, exp.Alias) else item
+                while isinstance(inner, exp.Paren):
+                    inner = inner.this
                 if isinstance(inner, exp.Column):
                     result.append((_col_name(inner), direction))
                     continue
-            # positional ref to a non-bare item (or out of range)
+                if isinstance(item, exp.Alias) and item.alias:
+                    result.append((item.alias, direction))
+                    alias_names.add(item.alias)
+                    continue
             unresolvable = True
             continue
-        # Any other sort key (function, arithmetic, CASE, aggregate, subquery)
-        # is not representable as a bare-column sort.
         unresolvable = True
-    return result, unresolvable
+    return result, unresolvable, alias_names
 
 
 def _extract_limit(select_node: exp.Select | None) -> int | None:
     if not select_node:
         return None
     limit = select_node.args.get("limit")
-    if limit and limit.expression:
-        try:
-            return int(limit.expression.this)
-        except (ValueError, AttributeError):
-            pass
+    if limit is None:
+        return None
+    # ANSI ``FETCH FIRST/NEXT n ROWS ONLY`` (Bug-6083 / F-003-17): sqlglot
+    # parses this into an ``exp.Fetch`` node under ``args["limit"]`` — the row
+    # count is in ``args["count"]`` and ``limit.expression`` is absent, so the
+    # plain ``Limit`` path below would silently return None and hand back an
+    # UNBOUNDED result where the user asked for n rows. ``FETCH FIRST n ROWS
+    # ONLY`` is exactly ``LIMIT n``; map it. ``WITH TIES`` and ``PERCENT``
+    # change the row semantics (they can return more/fewer than n rows) and
+    # are not representable as a plain LIMIT — reject them loudly rather than
+    # emitting a wrong bound.
+    if isinstance(limit, exp.Fetch):
+        options = limit.args.get("limit_options")
+        with_ties = bool(getattr(options, "args", {}).get("with_ties")) if options else bool(limit.args.get("with_ties"))
+        percent = bool(getattr(options, "args", {}).get("percent")) if options else bool(limit.args.get("percent"))
+        if with_ties or percent:
+            variant = "WITH TIES" if with_ties else "PERCENT"
+            raise UnsupportedSQL(
+                f"FETCH FIRST ... {variant} is not supported; use FETCH FIRST n "
+                f"ROWS ONLY or LIMIT n"
+            )
+        count = limit.args.get("count")
+        # ``FETCH FIRST ROW ONLY`` (no explicit count) means one row — the
+        # ANSI/Postgres default; sqlglot leaves ``count`` absent.
+        if count is None:
+            return 1
+        # The count must be a plain integer literal. A decimal (``2.5``), a bind
+        # parameter (``$1``), or an arithmetic expression is NOT representable as
+        # a plain ``LIMIT n`` — fail CLOSED with a typed error rather than
+        # silently returning None (unbounded rows) or raising an uncaught
+        # TypeError (500). (Bug-6083 hardening.)
+        if isinstance(count, exp.Literal) and not count.is_string and str(count.this).isdigit():
+            return int(count.this)
+        raise UnsupportedSQL(
+            "FETCH FIRST/NEXT requires a literal integer row count; use "
+            "FETCH FIRST n ROWS ONLY or LIMIT n"
+        )
+    if limit.expression is not None:
+        expr = limit.expression
+        # A plain integer literal is the only form representable as ``LIMIT n``.
+        if (
+            isinstance(expr, exp.Literal)
+            and not expr.is_string
+            and str(expr.this).isdigit()
+        ):
+            return int(expr.this)
+        # ``LIMIT ALL`` (Postgres) is an explicit request for unbounded rows;
+        # sqlglot parses ``ALL`` as a bare column reference. Treat as no limit.
+        if isinstance(expr, exp.Column) and (expr.name or "").upper() == "ALL":
+            return None
+        # ``LIMIT NULL`` (Postgres) is also an explicit request for no limit.
+        if isinstance(expr, exp.Null):
+            return None
+        # Bug-6569: a decimal (``2.5``), quoted string, bind parameter (``$1``),
+        # or arithmetic expression is NOT representable as a plain ``LIMIT n``.
+        # The old ``int(limit.expression.this)`` silently returned None for a
+        # decimal (ValueError swallowed -> UNBOUNDED where the user asked to
+        # cap rows) and raised an uncaught TypeError (500) for a parameter /
+        # ALL. Fail CLOSED with a typed error, mirroring the FETCH branch
+        # above (Bug-6083 hardening).
+        raise UnsupportedSQL(
+            "LIMIT requires a literal integer row count; use LIMIT n "
+            "(or LIMIT ALL for no limit)"
+        )
     return None
 
 
 def _extract_offset(select_node: exp.Select | None) -> int | None:
+    """Extract a literal integer OFFSET from the SELECT node.
+
+    Bug-6661: mirrors the LIMIT branch's fail-closed hardening. A non-integer
+    OFFSET (decimal ``2.5``, bind parameter ``$1``, expression) must raise
+    ``UnsupportedSQL`` instead of silently returning None (no offset) —
+    ``LIMIT 100 OFFSET 2.5`` would otherwise execute with NO offset.
+    """
     if not select_node:
         return None
     offset = select_node.args.get("offset")
-    if offset and offset.expression:
-        try:
-            return int(offset.expression.this)
-        except (ValueError, AttributeError):
-            pass
-    return None
+    if not offset:
+        return None
+    expr = getattr(offset, "expression", None)
+    if expr is None:
+        return None
+    # A plain integer literal is the only form representable as OFFSET n.
+    if (
+        isinstance(expr, exp.Literal)
+        and not expr.is_string
+        and str(expr.this).isdigit()
+    ):
+        return int(expr.this)
+    # Bug-6661: anything else (decimal, parameter, expression, string) is
+    # not representable as a plain OFFSET n — fail closed, matching LIMIT.
+    raise UnsupportedSQL(
+        "OFFSET requires a literal integer; use OFFSET n"
+    )
+
+
+def _extract_expression_occurrences(
+    select_node: exp.Select | None, dialect: str,
+) -> list[ExpressionOccurrence]:
+    """Capture non-column expression occurrences for derived-grain routing.
+
+    Spec §5.1 / §11.2 / §18: capture the AST nodes for GROUP BY, relevant SELECT,
+    WHERE, HAVING, and ORDER roles DURING the parser's traversal — never re-parse
+    GROUP BY from ``raw_query`` later in the matcher. This is purely additive and
+    diagnostic in Phase 1: it does not change ``has_function_grain`` or any route.
+    For an ordinary query (no non-column expressions in these roles) it returns an
+    empty list, so the query fingerprint and every downstream consumer are
+    byte-identical to pre-feature behaviour.
+
+    Only shape is captured here (raw SQL text + sqlglot dump + role + alias). The
+    binder later binds each occurrence's lineage against the deployed snapshot and
+    canonicalises it; the parser must not depend on the semantic model.
+    """
+    if select_node is None:
+        return []
+
+    occurrences: list[ExpressionOccurrence] = []
+    counter = 0
+
+    def _add(node: exp.Expression, role: str, alias: str | None) -> None:
+        nonlocal counter
+        # A bare column or a transparent paren-wrapped bare column is ordinary
+        # grain, not a derived expression — skip it. A positional literal in
+        # GROUP BY is resolved elsewhere; skip literals here too.
+        inner = node.this if isinstance(node, exp.Alias) else node
+        while isinstance(inner, exp.Paren):
+            inner = inner.this
+        if inner is None or isinstance(inner, (exp.Column, exp.Literal, exp.Star)):
+            return
+        # A derived GROUP-KEY candidate is a pure scalar expression over row
+        # columns. Any expression that CONTAINS an aggregate anywhere in its
+        # subtree (e.g. the composable ``SUM(rev) / SUM(cost)`` or a
+        # ``CASE WHEN SUM(b)=0 …`` SELECT item) is a measure / composable
+        # aggregate handled by the existing measure path, NOT a derived group
+        # key. Capturing it here would perturb the query fingerprint of an
+        # ordinary aggregate-routable query and break the byte-identical additive
+        # path (spec I10). Skip any aggregate-bearing expression.
+        if inner.find(exp.AggFunc) is not None:
+            return
+        counter += 1
+        occurrences.append(
+            ExpressionOccurrence(
+                occurrence_id=f"occ{counter}",
+                role=role,
+                raw_sql=inner.sql(dialect=dialect),
+                input_dialect=dialect,
+                ast_json=inner.dump(),
+                output_alias=alias,
+            )
+        )
+
+    _select_items = select_node.expressions or []
+
+    # Build a SELECT output-alias -> expression map so a GROUP BY / ORDER BY that
+    # references a derived SELECT expression BY ALIAS (``SELECT DATE_TRUNC(...) AS
+    # m … GROUP BY m``) or BY ORDINAL (``… GROUP BY 1``) still records the
+    # expression under its GROUP_KEY / ORDER_KEY role. Without this, an aliased or
+    # positional reference would be a bare Column / Literal at the GROUP/ORDER
+    # node and be skipped, leaving the proof stages blind to the expression's
+    # actual role (spec §5.1 / §14.4: "GROUP BY expression … referenced by
+    # alias/ordinal").
+    _alias_to_select_expr: dict[str, exp.Expression] = {}
+    for sitem in _select_items:
+        if isinstance(sitem, exp.Alias):
+            _alias_to_select_expr[sitem.alias_or_name.lower()] = sitem.this
+
+    def _resolve_reference(node: exp.Expression) -> exp.Expression:
+        """Resolve a bare-column alias ref or a positional ordinal to the
+        underlying SELECT expression; otherwise return the node unchanged."""
+        probe = node.this if isinstance(node, exp.Alias) else node
+        while isinstance(probe, exp.Paren):
+            probe = probe.this
+        if isinstance(probe, exp.Column) and not probe.table:
+            target = _alias_to_select_expr.get(probe.name.lower())
+            if target is not None:
+                return target
+        if isinstance(probe, exp.Literal) and probe.is_int:
+            pos = int(probe.this) - 1
+            if 0 <= pos < len(_select_items):
+                item = _select_items[pos]
+                return item.this if isinstance(item, exp.Alias) else item
+        return node
+
+    # GROUP BY expressions (the primary derived-grain source).
+    _group = select_node.args.get("group")
+    if _group:
+        for gexpr in _group.expressions:
+            _add(_resolve_reference(gexpr), "GROUP_KEY", None)
+
+    # SELECT expressions that are non-column scalar expressions (not aggregates).
+    for sexpr in _select_items:
+        alias = sexpr.alias_or_name if isinstance(sexpr, exp.Alias) else None
+        inner = sexpr.this if isinstance(sexpr, exp.Alias) else sexpr
+        # Skip plain aggregate SELECT items — they are measures, handled by the
+        # existing measure path, not derived group keys.
+        if isinstance(inner, exp.AggFunc):
+            continue
+        _add(sexpr, "SELECT", alias)
+
+    # ORDER BY keys, resolving alias/ordinal references to the SELECT expression.
+    # (WHERE_LEFT/WHERE_RIGHT and HAVING_KEY predicate capture are deliberately
+    # deferred to the phase that introduces derived-predicate movement — spec
+    # §8.5; those roles are declared in EXPRESSION_ROLES but the parser does not
+    # yet emit them, so nothing depends on partial capture here.)
+    _order = select_node.args.get("order")
+    if _order is not None:
+        for oexpr in _order.expressions:
+            key = oexpr.this if isinstance(oexpr, exp.Ordered) else oexpr
+            _add(_resolve_reference(key), "ORDER_KEY", None)
+
+    return occurrences
+
+
+def _occurrence_fingerprints(
+    occurrences: list[ExpressionOccurrence],
+) -> list[str]:
+    """Role-tagged canonical expression fingerprints for the query-shape hash.
+
+    Spec I11: two queries differing only in their inline expression must hash
+    distinctly. Each entry is ``<role>:<canonical-fingerprint>`` so an expression
+    in different roles does not collide — e.g. ``SELECT UPPER(region)`` and
+    ``… ORDER BY UPPER(region)`` produce different shapes because projection vs
+    sort semantics differ (spec §10.1: the shape fingerprint includes projection
+    roles and derived predicate shapes). Occurrence order is preserved (position
+    carries meaning). An expression that fails to canonicalise contributes its
+    raw text so it still perturbs the shape rather than silently colliding.
+    """
+    from shared.semantic.derived_expression import canonicalise_sql
+
+    fps: list[str] = []
+    for occ in occurrences:
+        ce = canonicalise_sql(occ.raw_sql, input_dialect=occ.input_dialect)
+        core = ce.fingerprint if ce is not None else f"raw:{occ.raw_sql}"
+        fps.append(f"{occ.role}:{core}")
+    return fps
 
 
 def _compute_fingerprint(
     measures: list[str], dimensions: list[str], grain: list[str],
     filters: list[LogicalFilter], having_columns: list[str] | None = None,
+    expr_fingerprints: list[str] | None = None,
 ) -> str:
     return fingerprint_shape(
         measures=measures,
@@ -886,6 +1830,7 @@ def _compute_fingerprint(
         grain=grain,
         filter_cols=[f.dimension_name for f in filters],
         having_cols=having_columns or [],
+        expr_fingerprints=expr_fingerprints,
     )
 
 
@@ -997,13 +1942,25 @@ def _parse_with_errors(
 
     ``sqlglot.parse_one`` discards the Parser instance, so we drive the
     dialect's parser directly to keep access to ``parser.errors``.
-    JDBC callers escalate any error to a hard failure; XMLA/DAX retain
-    the permissive behaviour.
+    JDBC callers escalate any error to a hard failure via the
+    ``sqlglot_errors`` check at the call site. XMLA/DAX callers also
+    escalate errors (Bug-7916 / Codex gate) so a recovered
+    meaning-changed tree is never silently routed.
     """
     sg_dialect = sqlglot.Dialect.get_or_raise(dialect)
     tokens = sg_dialect.tokenizer_class().tokenize(raw_sql)
     parser = sg_dialect.parser(error_level=sqlglot.ErrorLevel.WARN)
     trees = parser.parse(tokens, sql=raw_sql)
+    # Bug-7916 / Codex gate R2: reject multi-statement input. A single
+    # gateway query must be exactly one statement; silently taking trees[0]
+    # and dropping the rest is meaning-changing truncation.
+    _valid_trees = [t for t in (trees or []) if t is not None]
+    if len(_valid_trees) > 1:
+        raise SyntaxErrorInSQL(
+            "Multi-statement SQL is not supported: only a single SELECT "
+            "statement is allowed per query. Separate statements with "
+            "individual query calls."
+        )
     tree = trees[0] if trees else None
     if tree is None:
         # Fall back to parse_one so the existing error message format is
@@ -1169,9 +2126,40 @@ def _detect_complex_sql(tree: exp.Expression) -> bool:
     for node in select_node.find_all(exp.Filter):
         return True
 
-    # WITHIN GROUP: PERCENTILE_CONT(...) WITHIN GROUP (ORDER BY ...)
+    # WITHIN GROUP: PERCENTILE_CONT(...) WITHIN GROUP (ORDER BY ...).
+    # Bug-6969/5891: the ONE safe ordered-set percentile shape
+    # (PERCENTILE_CONT/DISC(literal) WITHIN GROUP (ORDER BY single-column)) is
+    # routable and must NOT be flagged complex, or the binder would clear the
+    # resolved measures and the pNN column could never be reached (the exact
+    # F-003-07 dead-code trap). Every OTHER WITHIN GROUP shape (multi-column or
+    # expression order key, non-literal fraction, other ordered-set aggregate)
+    # is still complex -> source. One shared recogniser governs both this gate
+    # and the SELECT-item classifier so they can never disagree.
+    #
+    # Fable R1 MEDIUM (I1 single-inventory): the exemption is restricted to a
+    # WITHIN GROUP that is a DIRECT SELECT-list projection — the only position
+    # the binder's QuantileRequest inventory covers. A recognised ordered-set
+    # percentile in HAVING, ORDER BY, or nested inside a larger expression
+    # (``PERCENTILE_CONT(...)/100``) stays COMPLEX -> source, so it can never be
+    # served from an artifact without being inventoried (which would violate the
+    # exact-grain obligation). This keeps the "if any quantile occurrence cannot
+    # be inventoried, disable artifact routing for the whole query" rule true by
+    # construction rather than relying on downstream gates.
+    _select_projection_within_groups: set[int] = set()
+    for _sexpr in select_node.expressions:
+        _proj = _sexpr.this if isinstance(_sexpr, exp.Alias) else _sexpr
+        while isinstance(_proj, exp.Paren):
+            _proj = _proj.this
+        if isinstance(_proj, exp.WithinGroup):
+            _select_projection_within_groups.add(id(_proj))
     for node in select_node.find_all(exp.WithinGroup):
-        return True
+        # A SELECT-projection ordered-set percentile is exempt only if it is the
+        # safe shape; any WITHIN GROUP elsewhere (HAVING/ORDER/nested) is complex.
+        if id(node) in _select_projection_within_groups:
+            if recognize_ordered_set_percentile(node) is None:
+                return True
+        else:
+            return True
 
     # GROUPING SETS / ROLLUP / CUBE
     group = select_node.args.get("group")
@@ -1309,6 +2297,16 @@ def _between_is_extractable(node: exp.Between) -> bool:
     return _is_safe_literal(low) and _is_safe_literal(high)
 
 
+def _in_is_negated(node: exp.In) -> bool:
+    """True when an ``In`` node itself carries ``negate=True``.
+
+    F-003-01: sqlglot 30.8 emits ``Not(In)`` for ``NOT IN`` (handled in
+    ``_conjunct_to_filter``). Some dialects / versions may instead set
+    ``In.negate``. Reading that flag keeps polarity correct either way.
+    """
+    return bool(node.args.get("negate") or getattr(node, "negate", False))
+
+
 def _like_is_negated(node: exp.Like) -> bool:
     """True when a ``Like`` node represents ``NOT LIKE``.
 
@@ -1330,104 +2328,50 @@ def _is_null_check_extractable(node: exp.Is) -> bool:
 
 
 def _has_unresolvable_where(select_node: exp.Select | None) -> bool:
-    """Return True when *any* predicate in WHERE is something the IR's
+    """Return True when *any* top-level WHERE conjunct is something the IR's
     ``LogicalFilter`` cannot faithfully represent.
 
-    The filter extractor in this module is permissive: it pattern-matches
-    on the simple ``column op literal`` shape and silently drops anything
-    else. That lossy behaviour is acceptable only when the rewriter has
-    been told to preserve the raw WHERE through column-name substitution
-    instead. This predicate audit decides which path the rewriter takes.
+    The filter extractor in this module is permissive: ``_extract_filters``
+    walks the top-level AND'd conjuncts and translates each via
+    ``_conjunct_to_filter``, silently dropping any conjunct that returns None.
+    That lossy behaviour is safe ONLY when the rewriter has been told to
+    preserve the raw WHERE instead. This audit decides which path the
+    rewriter takes.
 
-    The audit must catch every case where the extractor would drop or
-    misread a predicate — see Bug-102 for the reason this exists. Any
-    new WHERE shape added to ``_extract_filters`` must also be reflected
-    here, otherwise we ship another silent drop.
+    Design (Bug-6081 / F-003-15): the audit FAILS CLOSED against the exact
+    same decision function the extractor uses — a conjunct is unresolvable
+    iff ``_conjunct_to_filter`` cannot represent it. There is a single source
+    of truth, so a new WHERE shape can never be extractable-but-unflagged (a
+    bare boolean column ``WHERE is_active``, ``WHERE FALSE``, or a boolean
+    literal) or flagged-but-extracted. This replaces the previous
+    enumerated-blacklist walk, whose omission of bare Column/Boolean/Literal
+    conjuncts shipped a silent predicate drop (the third instance of the
+    Bug-102/Bug-5110/Bug-5333 class).
+
+    Note the audit operates on the SAME top-level conjuncts as extraction, so
+    it neither descends into an extractable comparison's operands nor into OR
+    subtrees: an OR (or any non-AND top-level node) is itself one conjunct and
+    is faithfully unrepresentable, so it is flagged as a whole.
     """
     if not select_node:
         return False
     where = select_node.args.get("where")
     if not where:
         return False
+    body = where.this if isinstance(where, exp.Where) else where
 
-    unhandled_summary: list[str] = []
+    unresolvable: list[str] = []
+    for conjunct in _flatten_top_level_and(body):
+        if _conjunct_to_filter(conjunct) is None:
+            reason = type(conjunct).__name__.lower()
+            if reason not in unresolvable:
+                unresolvable.append(reason)
 
-    def _flag(reason: str) -> None:
-        if reason not in unhandled_summary:
-            unhandled_summary.append(reason)
-
-    for node in where.find_all(exp.Expression):
-        # Skip pure structural nodes — only predicates and direct
-        # operands need auditing.
-        if isinstance(node, (exp.Where, exp.And, exp.Paren)):
-            continue
-        if isinstance(node, exp.Exists):
-            _flag("exists")
-            continue
-        if isinstance(node, exp.Or):
-            _flag("or")
-            continue
-        if isinstance(node, exp.Not):
-            inner = node.this
-            if isinstance(inner, exp.Exists):
-                _flag("not-exists")
-                continue
-            if isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null):
-                # NOT IS NULL = IS NOT NULL — handled by extractor.
-                continue
-            # Every other NOT (e.g. NOT (col = 'x'), NOT BETWEEN, NOT LIKE,
-            # NOT IN) is unsafe: the extractor descends into the inner
-            # comparison and emits it with the OPPOSITE polarity.
-            _flag("not")
-            continue
-        if isinstance(node, exp.Subquery):
-            _flag("subquery")
-            continue
-        if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
-            if not _comparison_is_extractable(node):
-                _flag(type(node).__name__.lower())
-            continue
-        if isinstance(node, exp.In):
-            if not _in_is_extractable(node):
-                _flag("in")
-            continue
-        if isinstance(node, exp.Between):
-            if not _between_is_extractable(node):
-                _flag("between")
-            continue
-        if isinstance(node, exp.Like) and not isinstance(node, exp.ILike):
-            # Bug-5326 (F-P4ac-01): a negated ``Like`` (``negate=True``, i.e.
-            # ``NOT LIKE``) IS faithfully extractable now — the extractor emits a
-            # ``not_like`` LogicalFilter, so polarity survives without raw-WHERE
-            # preservation. Only flag the shapes the extractor genuinely can't
-            # represent (wrapped column / non-literal pattern). ILIKE
-            # (case-insensitive, either polarity) is NOT a ``Like`` subclass and
-            # is handled by the catch-all below — it stays unresolvable so the
-            # raw WHERE is preserved verbatim (keeping case-insensitivity).
-            if not _like_is_extractable(node):
-                _flag("like")
-            continue
-        if isinstance(node, exp.Is):
-            if not _is_null_check_extractable(node):
-                _flag("is")
-            continue
-        # Predicates the extractor doesn't try to handle at all:
-        # IS DISTINCT FROM, SIMILAR TO, REGEXP_LIKE, ANY/ALL, GLOB, ILIKE
-        # (sqlglot maps ILIKE to its own node), comparison-as-bool, etc.
-        for cls_name in (
-            "ILike", "Glob", "SimilarTo", "RegexpLike", "RegexpILike",
-            "Any", "All", "Distance",
-        ):
-            cls = getattr(exp, cls_name, None)
-            if cls is not None and isinstance(node, cls):
-                _flag(cls_name.lower())
-                break
-
-    if unhandled_summary:
+    if unresolvable:
         logger.warning(
-            "WHERE predicate(s) not representable as LogicalFilter — "
-            "routing through raw-WHERE preservation. Reasons: %s",
-            ",".join(sorted(unhandled_summary)),
+            "WHERE conjunct(s) not representable as LogicalFilter — "
+            "routing through raw-WHERE preservation. Shapes: %s",
+            ",".join(sorted(unresolvable)),
         )
         return True
     return False
@@ -1444,15 +2388,20 @@ def _extract_cte_aliases(tree: exp.Expression) -> list[str]:
     return aliases
 
 
-def _extract_from_tables(select_node: exp.Select | None) -> list[str]:
+def _extract_from_tables(node: exp.Expression | None) -> list[str]:
     """Extract table names from FROM, JOIN, and subquery clauses.
-    Scans the entire query tree to capture cross-model references in
-    EXISTS, IN (SELECT ...), and scalar subqueries."""
+
+    Accepts the FULL parse tree (which may be a ``Union`` / ``Intersect``
+    / ``Except`` for set-operation queries) so that tables in ALL branches
+    are captured for the binder's allow-list (Bug-6958).  Also scans
+    subqueries (EXISTS, IN, scalar) within each branch.
+    """
     tables: list[str] = []
-    if not select_node:
+    if not node:
         return tables
-    # Scan all Table nodes in the entire AST (including subqueries).
-    for t in select_node.find_all(exp.Table):
+    # Scan all Table nodes in the entire AST (including subqueries and
+    # all set-operation branches).
+    for t in node.find_all(exp.Table):
         if t.name and t.name not in tables:
             tables.append(t.name)
     return tables

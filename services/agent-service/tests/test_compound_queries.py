@@ -509,6 +509,7 @@ from src.pipeline import (
     _plan_dict,
     _prepare_compound_alignment,
     _run_compound_query_branch,
+    _run_recipe_branch,
     TurnOutcome,
 )
 
@@ -580,11 +581,15 @@ def test_plan_dict_compound_query_carries_dimension_exprs_when_grained():
 # _run_compound_query_branch
 # ---------------------------------------------------------------------------
 
-def _make_query_execution(rows, columns):
+def _make_query_execution(rows, columns, truncated=False):
+    # truncated is set explicitly: a bare MagicMock auto-attribute is truthy,
+    # which would silently flip computed["steps_truncated"] to True in every
+    # test (R10 producer contract) and mask the untruncated default path.
     return MagicMock(
         rows=rows,
         columns=columns,
         rows_returned=len(rows),
+        truncated=truncated,
         sql="SELECT ...",
         routed_sql="SELECT ...",
         route_type="source",
@@ -815,6 +820,190 @@ async def test_compound_branch_step_execution_failure(compound_call):
 
 
 # ---------------------------------------------------------------------------
+# R10 producer/consumer contract — the compound branch must emit the exact
+# computed keys the narration prompt consumes (narrate._build_compound_
+# narrate_prompt reads steps_truncated, result_total_rows, result_rows).
+# A key rename or cap change on either side must fail HERE, not silently
+# drop the partial-view disclosure. Tier: T1 (producer/consumer contract).
+# ---------------------------------------------------------------------------
+
+def _multirow_compound_call():
+    return CompoundQueryToolCall(
+        steps=[
+            CompoundStep("part", _ALLOW_LISTED_MODEL, ["v"], ["month_no"],
+                         [], [], [], 100),
+            CompoundStep("total", _ALLOW_LISTED_MODEL, ["v"], ["month_no"],
+                         [], [], [], 100),
+        ],
+        expression=_pct(_ref("part", "v"), _ref("total", "v")),
+        result_label="Share (%)",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step_truncated", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_compound_branch_computed_carries_disclosure_contract(
+    step_truncated, streaming
+):
+    cfg = MagicMock()
+    cfg.project_id = uuid.uuid4()
+    cfg.max_compound_steps = 5
+    cfg.max_query_complexity = 0
+    cfg.chart_type_selector = "none"
+    cfg.chart_color_palette = "default"
+    cfg.chart_size = "md"
+    cfg.chart_max_rows = 500
+    cfg.include_data_table = True
+    cfg.agent_output_format = "plain"
+    cfg.judge_mode = "async" if streaming else "sync"
+
+    adapter = AsyncMock()
+    adapter.last_usage = {"input_tokens": 1, "output_tokens": 1}
+    bundle = MagicMock()
+    bundle.narration_system = "sys"
+    bundle.prior_questions = []
+    bundle.allow_list_model_ids = [uuid.UUID(_ALLOW_LISTED_MODEL)]
+
+    # 30 aligned per-dimension rows -> multi-row result larger than the
+    # 25-row narrator cap.
+    rows_part = [{"month_no": i, "v": float(i + 1)} for i in range(30)]
+    rows_total = [{"month_no": i, "v": 100.0} for i in range(30)]
+    exec_part = _make_query_execution(
+        rows_part, ["month_no", "v"], truncated=step_truncated
+    )
+    exec_total = _make_query_execution(rows_total, ["month_no", "v"])
+
+    captured: dict = {}
+
+    async def _capture_narrate(adapter_, system_, user_message_,
+                               step_summaries_, computed_, *args, **kwargs):
+        captured["computed"] = computed_
+        captured["step_summaries"] = step_summaries_
+        captured["streaming"] = streaming
+        return "narrated"
+
+    narrate_target = (
+        "src.pipeline.narrate_compound_answer_stream"
+        if streaming
+        else "src.pipeline.narrate_compound_answer"
+    )
+    publisher = AsyncMock() if streaming else None
+    with patch("src.pipeline.execute_query", new_callable=AsyncMock) as mock_exec, \
+         patch(narrate_target, new=_capture_narrate), \
+         patch("src.pipeline.apply_output_guardrails") as mock_guard:
+        mock_exec.side_effect = [exec_part, exec_total]
+        mock_guard.return_value = MagicMock(text="narrated", actions=[])
+        outcome = await _run_compound_query_branch(
+            db=AsyncMock(),
+            cfg=cfg,
+            adapter=adapter,
+            bundle=bundle,
+            user_message="share by month?",
+            call=_multirow_compound_call(),
+            jwt_token="tok",
+            publisher=publisher,
+            usage_totals={"input": 0, "output": 0},
+            prompt_messages=None,
+            llm_raw_response=None,
+        )
+
+    assert outcome.status == "ok"
+    assert captured["streaming"] is streaming
+    computed = captured["computed"]
+    # Contract keys narrate consumes — exact names, real values:
+    assert computed["is_multi_row"] is True
+    assert computed["steps_truncated"] is step_truncated
+    assert computed["result_total_rows"] == 30       # TRUE total, pre-cap
+    assert len(computed["result_rows"]) == 25        # narrator view capped
+    # step summaries carry the full rows for date-range aggregation only
+    for summary in captured["step_summaries"]:
+        assert len(summary["all_rows"]) == 30
+        assert len(summary["sample_rows"]) == 25
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step_truncated", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_recipe_branch_computed_carries_disclosure_contract(
+    step_truncated, streaming
+):
+    """R10 producer/consumer contract, recipe parity: _run_recipe_branch must
+    emit the same computed["steps_truncated"] and step-summary all_rows /
+    sample_rows keys the narration prompt consumes. Tier: T1."""
+    from src.tools.spec import RunRecipeToolCall
+
+    cfg = MagicMock()
+    cfg.project_id = uuid.uuid4()
+    cfg.agent_output_format = "plain"
+    cfg.judge_mode = "async" if streaming else "sync"
+
+    adapter = AsyncMock()
+    adapter.last_usage = {"input_tokens": 1, "output_tokens": 1}
+    bundle = MagicMock()
+    bundle.narration_system = "sys"
+    bundle.prior_questions = []
+
+    rows = [{"month_no": i, "v": float(i + 1)} for i in range(30)]
+    step_exec = _make_query_execution(rows, ["month_no", "v"],
+                                      truncated=step_truncated)
+    recipe_step = MagicMock(execution=step_exec, first_row=rows[0])
+    recipe_step.name = "sales"  # MagicMock(name=...) sets the mock name, not .name
+    recipe_exec = MagicMock(
+        steps=[recipe_step],
+        recipe_id=uuid.uuid4(),
+        recipe_name="Monthly share",
+        parameters_resolved={},
+        combine_expression={"const": 1},
+        combine_value=11.1,
+    )
+
+    captured: dict = {}
+
+    async def _capture_narrate(adapter_, system_, user_message_,
+                               step_summaries_, computed_, *args, **kwargs):
+        captured["computed"] = computed_
+        captured["step_summaries"] = step_summaries_
+        captured["streaming"] = streaming
+        return "narrated"
+
+    narrate_target = (
+        "src.pipeline.narrate_compound_answer_stream"
+        if streaming
+        else "src.pipeline.narrate_compound_answer"
+    )
+    publisher = AsyncMock() if streaming else None
+    with patch("src.pipeline.execute_recipe", new_callable=AsyncMock) as mock_exec, \
+         patch(narrate_target, new=_capture_narrate), \
+         patch("src.pipeline.apply_output_guardrails") as mock_guard:
+        mock_exec.return_value = recipe_exec
+        mock_guard.return_value = MagicMock(text="narrated", actions=[])
+        outcome = await _run_recipe_branch(
+            db=AsyncMock(),
+            cfg=cfg,
+            adapter=adapter,
+            bundle=bundle,
+            user_message="run the share recipe",
+            call=RunRecipeToolCall(recipe_id=str(uuid.uuid4()), parameters={}),
+            jwt_token="tok",
+            publisher=publisher,
+            usage_totals={"input": 0, "output": 0},
+            prompt_messages=None,
+            llm_raw_response=None,
+        )
+
+    assert outcome.status == "ok"
+    assert captured["streaming"] is streaming
+    computed = captured["computed"]
+    assert computed["is_multi_row"] is False
+    assert computed["steps_truncated"] is step_truncated
+    # step summaries: full rows for date-range aggregation, capped narrator view
+    for summary in captured["step_summaries"]:
+        assert len(summary["all_rows"]) == 30
+        assert len(summary["sample_rows"]) == 25
+
+
+# ---------------------------------------------------------------------------
 # Prompt / tool spec includes compound_query
 # ---------------------------------------------------------------------------
 
@@ -907,7 +1096,7 @@ async def test_compound_branch_thought_summary_populated(compound_call):
     async def _on_thinking(token: str) -> None:
         thinking_parts.append(token)
 
-    async def _thinking_complete(system, user, on_thinking=None):
+    async def _thinking_complete(system, user, on_thinking=None, response_json=False):
         if on_thinking:
             await on_thinking(thought_text)
         return narration_text

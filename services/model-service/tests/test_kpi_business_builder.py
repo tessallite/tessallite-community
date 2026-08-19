@@ -466,6 +466,165 @@ class TestFilters:
         result = compile_business_definition(defn, MEASURES, ALL_DIMS)
         assert "BETWEEN" in result.filter_predicates[0]
 
+    def test_like_filter_wraps_value_as_contains_pattern(self):
+        # Bug-5925: the Business Builder summary describes "like" as
+        # "contains" — the compiled SQL must actually implement contains
+        # semantics (wrap in %...%), not an exact-match LIKE.
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "like", "values": ["Acme"]}],
+        )
+        result = compile_business_definition(defn, MEASURES, ALL_DIMS)
+        assert "LIKE '%Acme%'" in result.filter_predicates[0]
+        assert "NOT LIKE" not in result.filter_predicates[0]
+
+    def test_not_like_filter_wraps_value_as_contains_pattern(self):
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "not_like", "values": ["Test"]}],
+        )
+        result = compile_business_definition(defn, MEASURES, ALL_DIMS)
+        assert "NOT LIKE '%Test%'" in result.filter_predicates[0]
+
+    def test_like_filter_escapes_wildcard_characters_in_value(self):
+        # A literal % or _ typed by the user must not be misread as a
+        # LIKE wildcard once wrapped.
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "like", "values": ["50%_off"]}],
+        )
+        result = compile_business_definition(defn, MEASURES, ALL_DIMS)
+        assert "LIKE '%50\\%\\_off%'" in result.filter_predicates[0]
+
+    def test_like_filter_escapes_single_quote_in_value(self):
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "like", "values": ["O'Brien"]}],
+        )
+        result = compile_business_definition(defn, MEASURES, ALL_DIMS)
+        assert "LIKE '%O''Brien%'" in result.filter_predicates[0]
+
+    # Bug-6253: column-type-aware literal typing. Numeric columns must emit a
+    # bare token so strictly-typed connectors accept the comparison; string
+    # columns (and non-numeric literals) stay quoted.
+
+    def test_numeric_column_emits_bare_literal(self):
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "eq", "values": ["100"]}],
+        )
+        result = compile_business_definition(
+            defn, MEASURES, ALL_DIMS, dimension_data_types={did: "integer"}
+        )
+        pred = result.filter_predicates[0]
+        assert "= 100" in pred
+        assert "'100'" not in pred
+
+    def test_string_column_keeps_quoted_literal(self):
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "eq", "values": ["100"]}],
+        )
+        result = compile_business_definition(
+            defn, MEASURES, ALL_DIMS, dimension_data_types={did: "varchar"}
+        )
+        assert "'100'" in result.filter_predicates[0]
+
+    def test_numeric_column_non_numeric_value_stays_quoted(self):
+        # Fail-safe: a non-numeric value against a numeric column must never
+        # be emitted as a bare token (injection surface).
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "eq", "values": ["10 OR 1=1"]}],
+        )
+        result = compile_business_definition(
+            defn, MEASURES, ALL_DIMS, dimension_data_types={did: "numeric"}
+        )
+        assert "'10 OR 1=1'" in result.filter_predicates[0]
+
+    def test_numeric_in_filter_emits_bare_tokens(self):
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "in", "values": ["1", "2", "3"]}],
+        )
+        result = compile_business_definition(
+            defn, MEASURES, ALL_DIMS, dimension_data_types={did: "bigint"}
+        )
+        pred = result.filter_predicates[0]
+        assert "IN (1, 2, 3)" in pred
+
+    def test_numeric_column_huge_int_does_not_crash(self):
+        # Codex R1 finding: math.isfinite(10**400) raises OverflowError. A huge
+        # integer value must render fail-safe (bare digit string, never a 500).
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        big = 10 ** 400
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "eq", "values": [big]}],
+        )
+        result = compile_business_definition(
+            defn, MEASURES, ALL_DIMS, dimension_data_types={did: "numeric"}
+        )
+        assert str(big) in result.filter_predicates[0]
+
+    def test_numeric_column_exponent_float_falls_back_to_quoted(self):
+        # A native float in scientific form (1e-07) must not emit a bare
+        # exponent token — the strict grammar rejects it, so it is quoted.
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "eq", "values": [1e-07]}],
+        )
+        result = compile_business_definition(
+            defn, MEASURES, ALL_DIMS, dimension_data_types={did: "numeric"}
+        )
+        pred = result.filter_predicates[0]
+        assert "'1e-07'" in pred
+
+    def test_numeric_column_plain_float_emits_bare(self):
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "eq", "values": [100.5]}],
+        )
+        result = compile_business_definition(
+            defn, MEASURES, ALL_DIMS, dimension_data_types={did: "numeric"}
+        )
+        pred = result.filter_predicates[0]
+        assert "= 100.5" in pred
+        assert "'100.5'" not in pred
+
+    def test_no_types_defaults_to_quoted(self):
+        # Backward compatible: without dimension_data_types every literal is
+        # quoted, exactly as before Bug-6253.
+        mid = list(MEASURES.keys())[0]
+        did = list(DIMS.keys())[0]
+        defn = _base_def(
+            {"type": "single_measure", "measure_id": mid},
+            filters=[{"dimension_id": did, "operator": "eq", "values": ["100"]}],
+        )
+        result = compile_business_definition(defn, MEASURES, ALL_DIMS)
+        assert "'100'" in result.filter_predicates[0]
+
     def test_parameter_filter_uses_default(self):
         mid = list(MEASURES.keys())[0]
         did = list(DIMS.keys())[0]
@@ -596,16 +755,22 @@ class TestSummary:
         assert "country is one of DE, FR, UK" in result.summary
 
     def test_summary_advanced_operators_humanized(self):
-        """L-001: advanced operators (like, not_like, between, top_n, bottom_n)
-        must display human-readable labels, not raw tokens."""
+        """L-001: advanced operators (like, not_like, between)
+        must display human-readable labels, not raw tokens.
+
+        Bug-5924: top_n/bottom_n were removed from the public filter
+        contract (FILTER_OPERATORS, BusinessFilterOp) — the compiler
+        always rejected them at validation time ("requires measure-based
+        ranking", never implemented) while this test asserted summary
+        text as if they worked. Cases for those two operators are removed
+        rather than left asserting behaviour the API no longer accepts.
+        """
         mid = list(MEASURES.keys())[0]
         did = list(DIMS.keys())[0]
         cases = [
             ("like", ["Acme"], "country contains Acme"),
             ("not_like", ["Test"], "country does not contain Test"),
             ("between", ["10", "20"], "country between 10, 20"),
-            ("top_n", ["5"], "country top 5"),
-            ("bottom_n", ["3"], "country bottom 3"),
         ]
         for op, vals, expected_fragment in cases:
             defn = _base_def(

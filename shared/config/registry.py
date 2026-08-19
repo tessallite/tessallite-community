@@ -202,6 +202,132 @@ def _validate_locale(value: Any) -> None:
         raise ValueError("locale must be a non-empty string (e.g. 'en-US')")
 
 
+def _validate_derived_routing_mode(value: Any) -> None:
+    # Spec §15.1: off | shadow | serve. Default off. No "trust declared" mode.
+    allowed = {"off", "shadow", "serve"}
+    if value not in allowed:
+        raise ValueError(
+            f"derived expression routing mode must be one of {sorted(allowed)}, got {value!r}"
+        )
+
+
+def _validate_quantile_proof_mode(value: Any) -> None:
+    # Spec §15: off | shadow | enforce. Default off — the pNN aggregate serving
+    # feature is inert until a tenant/model explicitly enables it after coverage
+    # backfill and live known-answer gates. ``off`` = quantile queries behave
+    # exactly as before the feature landed (MEDIAN via the existing path,
+    # non-median pNN to source); ``enforce`` = coverage-gated pNN serving.
+    # ``shadow`` is RESERVED: the shadow evaluator (compute+log proofs while
+    # source still executes, spec §15 step 3) is NOT yet implemented, so shadow
+    # currently behaves identically to ``off``. It is accepted so the setting
+    # vocabulary matches the spec, but an operator MUST NOT read a quiet shadow
+    # run as enforce-readiness until the evaluator lands (Fable R2 MEDIUM-2).
+    allowed = {"off", "shadow", "enforce"}
+    if value not in allowed:
+        raise ValueError(
+            f"quantile proof mode must be one of {sorted(allowed)}, got {value!r}"
+        )
+
+
+def _validate_population_reason_mode(value: Any) -> None:
+    # Bug-8789: legacy | split. Default legacy — the single
+    # ``join_population_mismatch`` code every existing log pipeline and
+    # optimizer dashboard already consumes. ``split`` opts into the two
+    # sub-codes (``population_plan_mismatch`` / ``population_unprovable_model``).
+    allowed = {"legacy", "split"}
+    if value not in allowed:
+        raise ValueError(
+            f"population mismatch reason mode must be one of {sorted(allowed)}, got {value!r}"
+        )
+
+
+def _validate_derived_auto_build_mode(value: Any) -> None:
+    # Spec §15.1: off | approval | automatic. Default off.
+    allowed = {"off", "approval", "automatic"}
+    if value not in allowed:
+        raise ValueError(
+            f"derived expression auto-build mode must be one of {sorted(allowed)}, got {value!r}"
+        )
+
+
+def _validate_judge_context_mode(value: Any) -> None:
+    # R2 (F2): distilled | full. Default distilled (spec section 7 escape
+    # hatch). 'distilled' strips non-evidential planner boilerplate from the
+    # judge evidence pack; 'full' reverts to the verbatim planner system prompt.
+    allowed = {"distilled", "full"}
+    if value not in allowed:
+        raise ValueError(
+            f"judge context mode must be one of {sorted(allowed)}, got {value!r}"
+        )
+
+
+#: Bug-8615 (join population governance, phase G1). The row-effect fraction at
+#: or below which a non-neutral, undeclared join is only a WARNING; above it the
+#: model rolls up to BLOCKED. 1% is the governance plan's stated threshold.
+#: Declared here — the registry is the single source of truth for every knob —
+#: and re-exported by ``shared.semantic.join_population_validator`` as
+#: ``DEFAULT_ROW_EFFECT_WARNING_THRESHOLD`` so the classifier never carries a
+#: magic number. Not imported FROM that module: it imports this one.
+JOIN_POPULATION_ROW_EFFECT_THRESHOLD_DEFAULT: float = 0.01
+
+#: Wall-clock budget for classifying ONE model's joins at deploy. Deploy is a
+#: synchronous request and a wide model can declare dozens of joins at 2-3
+#: aggregate statements each, so an unbounded pass would let a merely-slow
+#: source hold a deploy open for joins x 3 x the source statement timeout.
+#: Once spent, the remaining joins record an unmeasured verdict (the rollup then
+#: reports evaluated=false) instead of the deploy stalling. 0 disables the bound.
+JOIN_POPULATION_PROBE_BUDGET_SECONDS_DEFAULT: float = 60.0
+
+
+def _validate_join_population_mode(value: Any) -> None:
+    # on | off. Default on. Off does not touch the source: it still clears the
+    # previous verdicts and records a conservative unmeasured one per join, so
+    # the model's join population status reads UNEVALUATED rather than stale.
+    # Never blocks a deploy either way (phase G1 is warn-only).
+    allowed = {"on", "off"}
+    if value not in allowed:
+        raise ValueError(
+            f"join population validation mode must be one of {sorted(allowed)}, got {value!r}"
+        )
+
+
+def _validate_join_population_threshold(value: Any) -> None:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"join population row-effect threshold must be a number, got {value!r}"
+        ) from None
+    if not (0.0 <= ratio <= 1.0):
+        raise ValueError(
+            "join population row-effect threshold is a fraction of rows and must "
+            f"be between 0 and 1, got {ratio!r}"
+        )
+
+
+def _validate_join_population_budget(value: Any) -> None:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"join population probe budget must be a number of seconds, got {value!r}"
+        ) from None
+    if seconds < 0:
+        raise ValueError(
+            f"join population probe budget cannot be negative, got {seconds!r}"
+        )
+
+
+def _validate_attribute_verification_mode(value: Any) -> None:
+    # Spec §15.1: on | off. Default on. Disabling makes all data-verified edges
+    # UNAVAILABLE (fail-closed source route); it never preserves old trust.
+    allowed = {"on", "off"}
+    if value not in allowed:
+        raise ValueError(
+            f"attribute relationship verification mode must be one of {sorted(allowed)}, got {value!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # UI groups — the human-friendly top-level panels on the Configuration page.
 # ---------------------------------------------------------------------------
@@ -219,13 +345,14 @@ _GRP_POCKET = "Pocket tables"
 _GRP_PREDICTIVE = "Predictive aggregates"
 _GRP_LIMITS = "Per-model limits"
 _GRP_VERSIONS = "Model versions"
+_GRP_DERIVED = "Derived-grain routing"
 # Agent settings ui_groups removed: agent fields persist on
 # ProjectAgentConfig and are edited via the project-drawer agent tabs
 # directly (not through the registry).
 
 
 # ---------------------------------------------------------------------------
-# SYSTEM — operator-only · 24 surfaced editable + 1 read-only env mirror
+# SYSTEM — operator-only · 25 surfaced editable + 1 read-only env mirror
 # Plus 2 internal AI-timeout knobs kept for operational tuning (surfaced=False).
 # ---------------------------------------------------------------------------
 
@@ -336,6 +463,96 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
         ui_help="Daily time (UTC) when excess KPI snapshots are purged.",
     ),
     SettingDef(
+        key="scheduler.kpi_snapshot_eval_timeout_seconds",
+        level="system", type="int", default=30,
+        section="Scheduling", restart_required=True,
+        description=(
+            "Per-model HTTP timeout (seconds) for the KPI snapshot sweep's "
+            "evaluate-batch call to the model-service. Must stay well below the "
+            "service token lifetime so a slow model can never outlive its token."
+        ),
+        validator=_validate_positive_int,
+        label="KPI snapshot evaluate timeout (s)",
+        ui_group=_GRP_SCHEDULER, ui_control="number", unit="seconds",
+        surfaced=False,
+    ),
+    SettingDef(
+        key="scheduler.ai_run_dispatch_minute",
+        level="system", type="str", default="*",
+        section="Scheduling", restart_required=True,
+        description=(
+            "Bug-8034: cron minute specification for the durable AI advisor "
+            "dispatch sweep, which starts advisor runs accepted as 'queued'. "
+            "'*' means every minute."
+        ),
+        label="AI advisor dispatch sweep minute",
+        ui_group=_GRP_SCHEDULER, ui_control="text",
+        surfaced=False,
+    ),
+    SettingDef(
+        key="scheduler.ai_run_dispatch_timeout_seconds",
+        level="system", type="int", default=15,
+        section="Scheduling", restart_required=False,
+        description=(
+            "Bug-8034: HTTP timeout (seconds) for the dispatch sweep's call to "
+            "the optimizer's internal execute route. The call only starts the "
+            "run; it does not wait for the advisor to finish."
+        ),
+        validator=_validate_positive_int,
+        label="AI advisor dispatch timeout (s)",
+        ui_group=_GRP_SCHEDULER, ui_control="number", unit="seconds",
+        surfaced=False,
+    ),
+    SettingDef(
+        key="scheduler.ai_run_dispatch_max_age_seconds",
+        level="system", type="int", default=3600,
+        section="Scheduling", restart_required=False,
+        description=(
+            "Bug-8034: a queued AI advisor run that has still not been "
+            "dispatched this many seconds after acceptance is marked failed "
+            "instead of being retried forever."
+        ),
+        validator=_validate_positive_int,
+        label="AI advisor dispatch max queue age (s)",
+        ui_group=_GRP_SCHEDULER, ui_control="number", unit="seconds",
+        surfaced=False,
+    ),
+    SettingDef(
+        key="optimizer.ai_run_claim_grace_seconds",
+        level="system", type="int", default=120,
+        section="Scheduling", restart_required=False,
+        description=(
+            "Bug-8034 / review F-559-02: how long a freshly dispatcher-claimed "
+            "AI advisor run is protected from the optimizer's orphan janitor. "
+            "The janitor treats a free per-model lock as proof of a dead "
+            "executor, but a run claimed seconds ago has not reached its lock "
+            "yet. During a rolling deploy the starting optimizer would "
+            "otherwise terminal-fail a run the scheduler just legitimately "
+            "claimed. Raise it only if hand-offs are slower than this."
+        ),
+        validator=_validate_positive_int,
+        label="AI advisor claim grace (s)",
+        ui_group=_GRP_AI_SCHED, ui_control="number", unit="seconds",
+        surfaced=False,
+    ),
+    SettingDef(
+        key="optimizer.ai_run_janitor_interval_seconds",
+        level="system", type="int", default=300,
+        section="Scheduling", restart_required=True,
+        description=(
+            "Bug-8034 / review F-559-01-R2: how often the optimizer re-runs its "
+            "orphan-run janitor. The janitor also ran at startup only, so a run "
+            "claimed just before its dispatcher died was skipped by the claim "
+            "grace and then never revisited — it stayed 'running' forever and "
+            "blocked every later run of that model. Must be shorter than the "
+            "delay operators will accept before a dead claim is reconciled."
+        ),
+        validator=_validate_positive_int,
+        label="AI advisor orphan janitor interval (s)",
+        ui_group=_GRP_AI_SCHED, ui_control="number", unit="seconds",
+        surfaced=False,
+    ),
+    SettingDef(
         key="scheduler.agent_retention_hour",
         level="system", type="int", default=6,
         section="Scheduling", restart_required=True,
@@ -352,7 +569,7 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
     SettingDef(
         key="scheduler.agent_purge_grace_days",
         level="system", type="int", default=30,
-        section="Scheduling", restart_required=False,
+        section="Scheduling", restart_required=True,
         description=(
             "Days a soft-deleted agent conversation is retained before the "
             "retention sweep hard-purges it. 0 = never auto-purge (default 30)."
@@ -365,6 +582,46 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
             "project retention window), it is kept this many extra days so it "
             "can still be recovered, then permanently deleted to reclaim "
             "storage. Set to 0 to keep soft-deleted conversations indefinitely."
+        ),
+    ),
+    SettingDef(
+        key="scheduler.webhook_delivery_retention_days",
+        level="system", type="int", default=30,
+        section="Scheduling", restart_required=True,
+        description=(
+            "Bug-6316: days a terminal webhook delivery row (delivered or "
+            "dead-lettered) is retained before the retention sweep purges it. "
+            "0 = never auto-purge. In-flight (pending) deliveries are never "
+            "purged regardless of age."
+        ),
+        validator=_validate_non_negative_int,
+        label="Webhook delivery retention period",
+        ui_group=_GRP_SCHEDULER, ui_control="number", unit="days",
+        ui_help=(
+            "Delivered and dead-lettered webhook delivery records are kept this "
+            "many days so their history can be inspected, then permanently "
+            "deleted to reclaim storage. Set to 0 to keep them indefinitely. "
+            "Pending (not-yet-delivered) records are never purged."
+        ),
+    ),
+    SettingDef(
+        key="scheduler.notification_delivery_retention_days",
+        level="system", type="int", default=30,
+        section="Scheduling", restart_required=True,
+        description=(
+            "Bug-8385: days an email/Slack notification delivery record is "
+            "retained before the retention sweep purges it. 0 = never "
+            "auto-purge. Every record is a terminal outcome (sent, or failed "
+            "including a misconfiguration skip), so none is in flight."
+        ),
+        validator=_validate_non_negative_int,
+        label="Notification delivery retention period",
+        ui_group=_GRP_SCHEDULER, ui_control="number", unit="days",
+        ui_help=(
+            "Records of email and Slack notification attempts are kept this "
+            "many days so a channel that has been failing can be inspected, "
+            "then permanently deleted to reclaim storage. Set to 0 to keep "
+            "them indefinitely."
         ),
     ),
     SettingDef(
@@ -436,6 +693,17 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
         surfaced=False,
     ),
     SettingDef(
+        key="gateway.login_retry_attempts",
+        level="system", type="int", default=1,
+        section="Gateway timeouts",
+        description="Extra retry attempts for gateway login relays after a transport timeout (Cloud Run cold start).",
+        validator=_validate_non_negative_int,
+        label="Login retry attempts",
+        ui_group=_GRP_NETWORK, ui_control="number", unit="attempts",
+        ui_help="How many times the gateway retries a credential login after a downstream timeout before failing the request.",
+        surfaced=False,
+    ),
+    SettingDef(
         key="gateway.subtotal_grain_max_concurrency",
         level="system", type="int", default=4,
         section="Gateway timeouts",
@@ -451,6 +719,33 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
             "Upper bound on concurrent subtotal/re-query SQL calls per XMLA "
             "Execute. Lower values protect the source DB; higher values speed "
             "deep pivots."
+        ),
+        surfaced=False,
+    ),
+    # Bug-7043: CLS catalogue staleness TTL. After CLS configuration changes
+    # a JDBC connection's cached catalogue may list columns the persona no
+    # longer has access to (or omit newly-allowed columns). This TTL controls
+    # how often the gateway re-fetches model metadata to refresh the catalogue.
+    # Default 0 = re-validate on every catalogue query (fail-closed for CLS
+    # tightening). Higher values reduce model-service load at the cost of a
+    # longer stale-catalogue window. Value is in seconds.
+    SettingDef(
+        key="gateway.catalogue_cls_ttl",
+        level="system", type="int", default=0,
+        section="Gateway security",
+        description=(
+            "Maximum age (seconds) of the JDBC catalogue before re-fetching "
+            "model metadata to pick up CLS changes. 0 = re-validate on every "
+            "catalogue query (most secure)."
+        ),
+        validator=_validate_non_negative_int,
+        label="Catalogue CLS refresh TTL",
+        ui_group=_GRP_NETWORK, ui_control="number", unit="seconds",
+        ui_help=(
+            "How long a JDBC connection may serve cached catalogue metadata "
+            "before re-checking persona column restrictions. Set to 0 for "
+            "immediate CLS enforcement in the field list; increase to reduce "
+            "model-service load for tenants that rarely change CLS."
         ),
         surfaced=False,
     ),
@@ -492,7 +787,7 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
     SettingDef(
         key="ai.run_min_timeout",
         level="system", type="int", default=300,
-        section="AI",
+        section="AI", restart_required=True,
         description="Minimum timeout for AI optimizer runs.",
         validator=_validate_positive_int,
         label="AI run minimum timeout",
@@ -503,7 +798,7 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
     SettingDef(
         key="ai.run_timeout_multiplier",
         level="system", type="float", default=5.0,
-        section="AI",
+        section="AI", restart_required=True,
         description="Multiplier applied to LLM timeout to derive AI run timeout.",
         label="AI run timeout multiplier",
         ui_group=_GRP_NETWORK, ui_control="number",
@@ -591,24 +886,196 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
         ui_help="Number of rows per streaming batch sent to clients.",
     ),
 
+    # Derived-grain aggregate routing (spec §15.1). Defaults are the safe
+    # fully-off state: no derived-expression proof reaches matcher/rewrite, and
+    # ordinary source/aggregate routing is byte-identical to pre-feature. These
+    # are operational gates staged on per the spec's rollout order, so they are
+    # not surfaced on the primary System UI until serving stages are certified.
+    # DEPRECATED as a serve gate (spec architecture_derived-grain-operational-
+    # serving.md §A). Serving is now governed by the operational kill-switch
+    # ``query.derived_expression_serving_enabled`` (default ON) AND per-relationship
+    # health — NOT by a stored "serve" value. This key is retained ONLY for the
+    # cheap shadow/observe capability (``shadow`` builds proofs + compares without
+    # serving); ``serve`` is no longer read as a precondition anywhere.
+    SettingDef(
+        key="query.derived_expression_routing_mode",
+        level="system", type="str", default="off",
+        section="Derived-grain routing",
+        description=(
+            "DEPRECATED / currently inert — serving is governed by "
+            "'derived_expression_serving_enabled' (kill-switch) + relationship "
+            "health, and no runtime path reads this key anymore. Retained only as "
+            "a placeholder for a future shadow/observe capability (the shadow "
+            "evaluator is not wired). 'serve' is no longer a precondition. "
+            "Default off."
+        ),
+        validator=_validate_derived_routing_mode,
+        label="Derived expression shadow mode (deprecated serve gate)",
+        ui_group=_GRP_DERIVED, ui_control="select",
+        ui_choices=["off", "shadow", "serve"],
+        ui_help=(
+            "Legacy observe-only control. Serving is now controlled by the "
+            "'Derived relabel serving enabled' kill-switch and continuous "
+            "relationship health, not by this setting."
+        ),
+        surfaced=True,
+    ),
+    # Operational serving kill-switch (spec: architecture_derived-grain-operational-
+    # serving.md §A). This is the master enable for derived-grain relabel serving.
+    # It DEFAULTS TO ENABLED and is an operator safety valve, NOT a turn-on gate:
+    # a served relabel additionally requires the relationship to be CURRENTLY healthy
+    # (VERIFIED artifact-local evidence bound to the active run — the router trust
+    # predicate). Setting this OFF disables ALL relabel serving instantly (queries
+    # fall back to ordinary aggregate / source routing, byte-identical). The manual
+    # ``derived_expression_routing_mode == serve`` precondition is REMOVED; this
+    # replaces it as the single system-level control.
+    SettingDef(
+        key="query.derived_expression_serving_enabled",
+        level="system", type="bool", default=True,
+        section="Derived-grain routing",
+        description=(
+            "Master enable (kill-switch) for derived-grain relabel serving. "
+            "Default ON. A relabel serves only when this is ON AND the "
+            "relationship is currently healthy (continuously re-verified by the "
+            "sweep). Turn OFF to disable all relabel serving immediately."
+        ),
+        label="Derived relabel serving enabled",
+        ui_group=_GRP_DERIVED, ui_control="switch",
+        ui_help=(
+            "When on, verified dimension attribute relationships are served from "
+            "aggregates whenever the periodic health sweep currently confirms the "
+            "1:1 mapping holds on the served data. Turn off as an instant safety "
+            "valve to route every such query the ordinary way."
+        ),
+    ),
+    SettingDef(
+        key="query.derived_expression_shadow_sample_rate",
+        level="system", type="float", default=0.0,
+        section="Derived-grain routing",
+        description=(
+            "Fraction (0..1) of eligible queries for which shadow mode runs the "
+            "bounded source-vs-artifact comparison. 0 disables comparison even "
+            "in shadow mode. Default 0."
+        ),
+        validator=_validate_ratio,
+        label="Derived shadow sample rate",
+        ui_group=_GRP_DERIVED, ui_control="slider", unit="ratio (0-1)",
+        ui_help=(
+            "How often, in shadow mode, the derived proof result is compared "
+            "against the authoritative source result. Higher values give more "
+            "coverage at more cost."
+        ),
+        surfaced=False,
+    ),
+    SettingDef(
+        key="query.derived_expression_registry_version",
+        level="system", type="str", default="v0",
+        section="Derived-grain routing",
+        description=(
+            "Version tag of the function-semantics registry "
+            "(derived_expression_semantics.json) in force. Participates in every "
+            "derived proof's compatibility hash; a change quarantines / rebuilds "
+            "affected artifact-owned derived keys before serving (spec §12, §17)."
+        ),
+        label="Derived registry version",
+        ui_group=_GRP_DERIVED, ui_control="text",
+        surfaced=False,
+    ),
+    SettingDef(
+        key="model.attribute_relationship_verifier_version",
+        level="system", type="str", default="v0",
+        section="Derived-grain routing",
+        description=(
+            "Version tag of the shared attribute-relationship verifier. Bound "
+            "into every verification evidence row; the router trust predicate "
+            "rejects evidence written by a non-accepted verifier version "
+            "(spec §7.6.4)."
+        ),
+        label="Attribute verifier version",
+        ui_group=_GRP_DERIVED, ui_control="text",
+        surfaced=False,
+    ),
+    # Bug-8615 phase G1. SYSTEM level on purpose: the threshold is the platform's
+    # governance policy, not a per-model dial a modeller could raise to 1.0 to
+    # silence their own BLOCKED finding. Same shape as the verifier version above
+    # — a ``model.``-prefixed key that lives at system scope.
+    SettingDef(
+        key="model.join_population_row_effect_threshold",
+        level="system", type="float",
+        default=JOIN_POPULATION_ROW_EFFECT_THRESHOLD_DEFAULT,
+        section="Aggregates",
+        description=(
+            "Row-effect fraction at or below which a non-neutral, UNDECLARED "
+            "join is reported as WARNING rather than BLOCKED. 0.01 = 1% of rows. "
+            "Warn-only: BLOCKED is surfaced but never prevents a deploy in this "
+            "phase."
+        ),
+        validator=_validate_join_population_threshold,
+        label="Join population warning threshold",
+        ui_group=_GRP_AGG, ui_control="number", unit="fraction of rows",
+        ui_help=(
+            "How much row loss or duplication a join may cause before an "
+            "undeclared join is escalated from a warning to a blocking finding. "
+            "0.01 means one percent of rows."
+        ),
+        surfaced=False,
+    ),
+    SettingDef(
+        key="model.join_population_probe_budget_seconds",
+        level="system", type="float",
+        default=JOIN_POPULATION_PROBE_BUDGET_SECONDS_DEFAULT,
+        section="Aggregates",
+        description=(
+            "Wall-clock budget for classifying ONE model's joins at deploy. "
+            "Deploy is a synchronous request; once this is spent the remaining "
+            "joins are recorded as unmeasured (the model's status reports "
+            "evaluated=false) rather than holding the deploy open. 0 disables "
+            "the bound."
+        ),
+        validator=_validate_join_population_budget,
+        label="Join population probe budget",
+        ui_group=_GRP_AGG, ui_control="number", unit="seconds",
+        ui_help=(
+            "How long the deploy-time join check may spend querying the source "
+            "for one model before it stops and reports the rest as unchecked."
+        ),
+        surfaced=False,
+    ),
+
     # Rate limiting
     SettingDef(
         key="rate_limit.enabled",
-        level="system", type="bool", default=True,
+        level="system", type="bool", default=False,
         section="Rate limiting",
         description="Whether per-tenant rate limiting is active.",
         label="Enforce tenant query rate limits",
         ui_group=_GRP_RATE, ui_control="switch",
         ui_help="When on, each tenant is limited to the requests-per-minute ceiling below. Excess requests receive HTTP 429. Takes effect without a restart.",
     ),
+    # Per-tenant HTTP-ingress bucket for the blanket TenantRateLimitMiddleware.
+    # Placement decision (docs/architecture/architecture_rate-limit-placement.md,
+    # user 2026-08-14): this middleware is attached on the GATEWAY ONLY — where
+    # BI-client user queries enter — and no longer on the model-service /
+    # agent-service operational API. Default reconciled 600 -> 120: the 600 was
+    # a prior compromise to stop the model builder's operational-DB metadata
+    # fan-out (one /tables/{id}/attributes call per table) from 429-ing on
+    # model-open — the wrong axis, now moot because the operational API is no
+    # longer throttled. 120 aligns with the gateway's dedicated per-query ceiling
+    # (gateway.query_rate_limit_per_minute, also 120): well above a single BI
+    # client's legitimate burst, but a bounded per-tenant abuse backstop.
     SettingDef(
         key="rate_limit.per_minute",
-        level="system", type="int", default=60,
+        level="system", type="int", default=120,
         section="Rate limiting",
-        description="Maximum requests per tenant per minute.",
+        description=(
+            "Maximum HTTP requests per tenant per minute on the gateway user-query "
+            "bucket. The blanket per-tenant limiter is attached on the gateway only "
+            "(where BI-client queries enter), not on the operational/metadata API."
+        ),
         validator=_validate_positive_int,
         label="Requests per tenant per minute",
         ui_group=_GRP_RATE, ui_control="number", unit="requests / minute",
+        ui_help="Per-tenant ceiling for user-facing requests entering the gateway. Excess requests receive HTTP 429. Governs the gateway user-query surface only; operational/metadata reads (model CRUD, builder loads) are not throttled by this limit. Actual JDBC/XMLA queries are additionally bounded by the dedicated gateway query rate limit.",
     ),
     SettingDef(
         key="rate_limit.login_per_minute",
@@ -629,6 +1096,137 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
         label="Retry-After delay",
         ui_group=_GRP_RATE, ui_control="number", unit="seconds",
         ui_help="Value returned to clients telling them how long to wait after a rate-limit rejection.",
+    ),
+    # Bug-7231: ad-hoc KPI evaluation runs a live source query on every wizard
+    # preview keystroke — expensive and unsaved. This per-USER ceiling caps that
+    # storm independently of the coarse per-tenant ingress limit above. 0
+    # disables the cap. Enforced via the bounded/shared action-quota engine.
+    SettingDef(
+        key="rate_limit.adhoc_kpi_per_minute",
+        level="system", type="int", default=30,
+        section="Rate limiting",
+        description="Maximum ad-hoc KPI preview evaluations per user per minute (0 disables).",
+        validator=_validate_non_negative_int,
+        label="Ad-hoc KPI previews per user per minute",
+        ui_group=_GRP_RATE, ui_control="number", unit="previews / minute",
+        ui_help="Caps the live KPI wizard preview per user. Each preview runs a real query against the source, so an unbounded preview loop can storm the source database. 0 turns the cap off.",
+    ),
+
+    # Bug-6324: notification test-send abuse controls. "Send a test alert" is
+    # a modeler-level action that puts arbitrary recipient addresses behind the
+    # PLATFORM's verified SMTP identity. Unbounded, that is an open relay: a
+    # single compromised modeler account can burn the sending reputation every
+    # tenant depends on. These ceilings are per project and per hour.
+    SettingDef(
+        key="notifications.test_send_per_hour",
+        level="system", type="int", default=10,
+        section="Rate limiting",
+        description=(
+            "Maximum notification test-sends per project per hour. 0 disables "
+            "test-sends entirely."
+        ),
+        validator=_validate_non_negative_int,
+        label="Notification test-sends per project per hour",
+        ui_group=_GRP_RATE, ui_control="number", unit="sends / hour",
+        ui_help=(
+            "Test alerts are delivered through the platform's own SMTP sender. "
+            "This ceiling stops one project from using it as an open relay and "
+            "damaging deliverability for every tenant. Set to 0 to switch test "
+            "sends off."
+        ),
+    ),
+    SettingDef(
+        key="notifications.test_send_per_hour_tenant",
+        level="system", type="int", default=30,
+        section="Rate limiting",
+        description=(
+            "Maximum notification test-sends per TENANT per hour. 0 disables "
+            "the tenant ceiling (the per-project one still applies)."
+        ),
+        validator=_validate_non_negative_int,
+        label="Notification test-sends per tenant per hour",
+        ui_group=_GRP_RATE, ui_control="number", unit="sends / hour",
+        ui_help=(
+            "A per-project ceiling alone does not bound the harm: an admin who "
+            "can create projects can multiply it. This bounds the tenant."
+        ),
+    ),
+    SettingDef(
+        key="notifications.test_send_per_hour_platform",
+        level="system", type="int", default=200,
+        section="Rate limiting",
+        description=(
+            "Maximum notification test-sends across the WHOLE platform per "
+            "hour. 0 disables the platform ceiling."
+        ),
+        validator=_validate_non_negative_int,
+        label="Notification test-sends per platform per hour",
+        ui_group=_GRP_RATE, ui_control="number", unit="sends / hour",
+        ui_help=(
+            "The damage being bounded -- SMTP sender reputation -- is shared by "
+            "every tenant, so the last ceiling has to be platform-wide. Note "
+            "that with the default in-memory limiter store these counts are "
+            "per replica; point RATE_LIMIT_STORAGE_URI at a shared store to "
+            "enforce one ceiling across all of them."
+        ),
+    ),
+    SettingDef(
+        key="notifications.test_max_recipients",
+        level="system", type="int", default=5,
+        section="Rate limiting",
+        description="Maximum recipient addresses accepted in one test-send.",
+        validator=_validate_positive_int,
+        label="Recipients per notification test-send",
+        ui_group=_GRP_RATE, ui_control="number", unit="recipients",
+    ),
+    SettingDef(
+        key="notifications.recipient_domain_allowlist",
+        level="system", type="str", default="",
+        section="Rate limiting",
+        description=(
+            "Comma-separated email domains that notification test-sends may "
+            "target. Empty means any domain is accepted."
+        ),
+        label="Allowed notification recipient domains",
+        ui_group=_GRP_RATE, ui_control="text",
+        ui_help=(
+            "Leave empty unless you want to confine test alerts to your own "
+            "domains (e.g. example.com,corp.example.com). Matching is on the "
+            "part after the @, case-insensitive, and includes subdomains."
+        ),
+    ),
+
+    # Bug-7745: gateway query byte ceiling + rate limit (DoS / exfiltration defence)
+    SettingDef(
+        key="gateway.query_byte_ceiling",
+        level="system", type="int", default=50 * 1024 * 1024,
+        section="Gateway security",
+        description="Maximum response payload bytes per query on the public gateway path. 0 disables.",
+        validator=_validate_non_negative_int,
+        label="Query byte ceiling",
+        ui_group=_GRP_SECURITY, ui_control="number", unit="bytes",
+        ui_help="Hard cap on the response payload size (bytes) for a single query through the gateway. Queries whose response exceeds this ceiling are rejected fail-closed. 0 disables the ceiling.",
+    ),
+    SettingDef(
+        key="gateway.query_rate_limit_per_minute",
+        level="system", type="int", default=120,
+        section="Gateway security",
+        description="Maximum queries per tenant per minute through the JDBC/XMLA gateway. 0 disables.",
+        validator=_validate_non_negative_int,
+        label="Gateway query rate limit",
+        ui_group=_GRP_RATE, ui_control="number", unit="queries / minute",
+        ui_help="Per-tenant sliding-window rate limit for queries arriving through the JDBC and XMLA gateway endpoints. Excess queries are rejected. 0 disables. Per-replica: effective limit is N x configured under multi-replica scale-out.",
+    ),
+    # Bug-8108: JDBC extended-protocol portal row-buffer cap
+    SettingDef(
+        key="gateway.jdbc_portal_row_buffer_cap",
+        level="system", type="int", default=50_000,
+        section="Gateway security",
+        description="Maximum rows a single JDBC extended-protocol portal buffers in gateway memory before Describe/Execute pages it out. 0 disables.",
+        validator=_validate_non_negative_int,
+        label="JDBC portal row buffer cap",
+        ui_group=_GRP_SECURITY, ui_control="number", unit="rows",
+        ui_help="Hard cap on the number of rows a single JDBC Bind/Describe/Execute portal will hold in gateway memory. PortalSuspended only bounds how many rows are sent per Execute call, not how much is buffered before that. A result set larger than this cap is rejected fail-closed with SQLSTATE 54000. 0 disables the cap.",
     ),
 
     # Bootstrap (read-only display, sourced from .env)
@@ -729,6 +1327,49 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
         surfaced=False,
     ),
     SettingDef(
+        key="llm.anthropic_thinking_budget",
+        level="system", type="int", default=4000,
+        section="LLM (legacy)",
+        description=(
+            "Default Anthropic extended-thinking budget in tokens (R6/F15). "
+            "Independent of max_tokens so lowering the output cap never "
+            "degrades planner reasoning. Per-row LLMProviderConfig.config "
+            "may override via 'thinking_budget'. Clamped below max_tokens only "
+            "to satisfy the API's budget_tokens < max_tokens constraint."
+        ),
+        validator=_validate_positive_int,
+        surfaced=False,
+    ),
+    SettingDef(
+        key="llm.prompt_cache_enabled",
+        level="system", type="bool", default=True,
+        section="LLM", restart_required=True,
+        description=(
+            "R1 (F1) — master switch for Anthropic prompt-cache breakpoints on "
+            "the stable planner/judge system prefix. The cache marker never "
+            "changes the rendered prompt text (byte-identical with or without "
+            "it), so this is a cost/latency lever, not a correctness one. "
+            "Default ON. Turn OFF as an operator safety valve if a misplaced "
+            "breakpoint is billing at full price; queries behave identically "
+            "either way. Surfaced so the valve is flippable through the system "
+            "settings API without a deploy (the write API rejects non-surfaced "
+            "keys); consuming services read it from their startup snapshot, so "
+            "a flip takes effect on the next agent-service restart "
+            "(restart_required). No System Configuration UI tab renders the "
+            "'LLM' group yet — flip via the settings API (see the "
+            "configuration reference)."
+        ),
+        label="LLM prompt caching",
+        ui_group="LLM", ui_control="switch",
+        ui_help=(
+            "When on, the stable part of the AI agent's prompt is served from "
+            "the provider's cache on repeat calls, cutting cost and latency. "
+            "Answers are identical either way. Turn off only as a safety "
+            "valve if provider billing looks wrong. Takes effect after the "
+            "agent service restarts."
+        ),
+    ),
+    SettingDef(
         key="llm.model_name_suggestions",
         level="system", type="dict",
         default={
@@ -805,6 +1446,49 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
         surfaced=False,
     ),
     SettingDef(
+        key="pocket.serve_overdue_grace_hours",
+        level="system", type="int", default=6,
+        section="Pocket tables",
+        description=(
+            "Bug-5148/Bug-8338: serve-time staleness safety for pocket tables. "
+            "A pocket is labelled fresh only by the refresh sweep; if the "
+            "scheduler is scaled-to-zero or behind, a fresh-labelled pocket can "
+            "serve outdated numbers. At serve time the router refuses a "
+            "schedule-policy pocket that has gone more than this many hours past "
+            "its first missed scheduled refresh, falling back to the source "
+            "(correct numbers). Sized above the hourly sweep cadence so a "
+            "just-fired-but-not-yet-swept pocket still serves. Set 0 to refuse "
+            "the instant a scheduled refresh is missed. Manual and event pockets "
+            "have no cron cadence and are unaffected."
+        ),
+        # 0 is a valid strictest setting (refuse the instant a scheduled fire is
+        # missed); the serve-time gate honors it, so allow it here.
+        validator=_validate_non_negative_int,
+        surfaced=True,
+    ),
+    SettingDef(
+        key="aggregate.serve_overdue_grace_hours",
+        level="system", type="int", default=6,
+        section="Aggregates",
+        description=(
+            "Bug-5148/Bug-8338: serve-time staleness safety for aggregates. An "
+            "aggregate is labelled active/fresh only by the refresh sweep; if the "
+            "scheduler is scaled-to-zero or behind, a fresh-labelled aggregate can "
+            "serve outdated numbers. At serve time the router refuses a schedule-"
+            "policy aggregate that has gone more than this many hours past its "
+            "first missed scheduled refresh, falling back to the source (correct "
+            "numbers). Sized above the hourly sweep cadence so a just-fired-but-"
+            "not-yet-swept aggregate still serves; lower it (0 = refuse the "
+            "instant a scheduled refresh is missed) to fail over to source sooner "
+            "when refreshes stall. Manual-policy aggregates have no cadence and "
+            "are unaffected."
+        ),
+        # 0 is a valid strictest setting (refuse the instant a scheduled fire is
+        # missed); the serve-time gate honors it, so allow it here.
+        validator=_validate_non_negative_int,
+        surfaced=True,
+    ),
+    SettingDef(
         key="pocket.invalidating_recovery_hours",
         level="system", type="int", default=6,
         section="Pocket tables (legacy)",
@@ -836,9 +1520,96 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
         surfaced=True,
     ),
     SettingDef(
+        key="named_query.max_rows",
+        level="system", type="int", default=100_000,
+        section="Limits",
+        description=(
+            "Maximum rows a materialised Named Query result table may hold. "
+            "Enforced at refresh against the ACTUAL materialised cardinality: "
+            "an oversized result is dropped and the artifact marked failed "
+            "(ROW_CAP_EXCEEDED) — reject, never truncate. A per-Named-Query "
+            "``row_cap`` override applies when present."
+        ),
+        validator=_validate_positive_int,
+        label="Named Query max rows",
+        ui_group=_GRP_LIMITS, ui_control="number", unit="rows",
+        ui_help="A materialised Named Query that exceeds this row count is dropped and marked failed instead of being served.",
+        surfaced=True,
+    ),
+    SettingDef(
+        key="named_query.max_columns",
+        level="system", type="int", default=200,
+        section="Limits",
+        description=(
+            "Maximum output columns a Named Query definition may project. "
+            "Enforced at create/validate time against the bound select list — "
+            "reject, never truncate. A per-Named-Query ``column_cap`` override "
+            "applies when present."
+        ),
+        validator=_validate_positive_int,
+        label="Named Query max columns",
+        ui_group=_GRP_LIMITS, ui_control="number", unit="columns",
+        ui_help="A Named Query definition whose projection exceeds this width is rejected at authoring time.",
+        surfaced=True,
+    ),
+    SettingDef(
+        key="named_query.serve_overdue_grace_hours",
+        level="system", type="int", default=6,
+        section="Named queries",
+        description=(
+            "Serve-time staleness safety for materialised Named Queries, same "
+            "contract as 'pocket.serve_overdue_grace_hours': the router "
+            "refuses a schedule-policy Named Query that has gone more than "
+            "this many hours past its first missed scheduled refresh, falling "
+            "back to live source execution (correct numbers). Set 0 to refuse "
+            "the instant a scheduled refresh is missed. Manual-policy Named "
+            "Queries have no cadence and are unaffected."
+        ),
+        validator=_validate_non_negative_int,
+        label="Named Query overdue grace",
+        ui_group=_GRP_LIMITS, ui_control="number", unit="hours",
+        ui_help="How long a materialised Named Query keeps serving after a missed scheduled refresh before the router falls back to live source execution.",
+        surfaced=True,
+    ),
+    SettingDef(
+        key="named_query.invalidating_recovery_hours",
+        level="system", type="int", default=6,
+        section="Named queries",
+        description=(
+            "Stuck-refresh recovery: a crash/timeout mid-materialisation "
+            "strands a Named Query artifact in 'invalidating' (never served, "
+            "and skipped by refreshes). A manual refresh re-picks an "
+            "'invalidating' artifact once it has been stuck longer than this "
+            "many hours, so it recovers without operator intervention."
+        ),
+        validator=_validate_positive_int,
+        label="Named Query invalidating recovery",
+        ui_group=_GRP_LIMITS, ui_control="number", unit="hours",
+        ui_help="How long an 'invalidating' Named Query is left alone before a new manual refresh is allowed to re-pick it.",
+        surfaced=True,
+    ),
+    SettingDef(
+        key="quantile_routing.proof_mode",
+        level="system", type="str", default="off",
+        section="Quantile routing",
+        description="Bug-6969/5891, spec §15: master mode for proof-carrying pNN "
+                    "(percentile) aggregate serving. 'off' (default) = quantile "
+                    "queries route exactly as before the feature (MEDIAN via the "
+                    "existing path, non-median percentiles to source); 'shadow' is "
+                    "RESERVED and currently behaves as 'off' (the shadow evaluator "
+                    "is not yet implemented — do not treat a quiet shadow run as "
+                    "enforce-readiness); 'enforce' = a proven pNN aggregate column "
+                    "is served. Model rows override via "
+                    "'quantile_routing.model_proof_mode'.",
+        validator=_validate_quantile_proof_mode,
+        surfaced=False,
+    ),
+
+
+    SettingDef(
         key="predictive.evaluation_window_days",
         level="system", type="int", default=7,
-        section="Predictive (legacy)",
+        section="Predictive (legacy)", restart_required=True,
         description="System fallback for the predictive feedback evaluation window. Per-model row overrides.",
         validator=_validate_positive_int,
         surfaced=False,
@@ -846,7 +1617,7 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
     SettingDef(
         key="predictive.validation_min_hits",
         level="system", type="int", default=3,
-        section="Predictive (legacy)",
+        section="Predictive (legacy)", restart_required=True,
         description="System fallback for the predictive validation hit threshold. Per-model row overrides.",
         validator=_validate_positive_int,
         surfaced=False,
@@ -854,7 +1625,7 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
     SettingDef(
         key="predictive.unused_retire_days",
         level="system", type="int", default=14,
-        section="Predictive (legacy)",
+        section="Predictive (legacy)", restart_required=True,
         description="System fallback for the predictive unused retire age. Per-model row overrides.",
         validator=_validate_positive_int,
         surfaced=False,
@@ -967,6 +1738,47 @@ def _validate_version_retention_count(value: Any) -> None:
 
 
 _TENANT_SETTINGS: list[SettingDef] = [
+    # Bug-8789: controls the miss-reason VOCABULARY the aggregate row-population
+    # proof reports. "legacy" (default) emits the single opaque
+    # join_population_mismatch, exactly as every existing deployment, log
+    # pipeline and dashboard expects. "split" emits the two sub-codes:
+    # population_plan_mismatch (BUILD — a narrower aggregate could serve) and
+    # population_unprovable_model (INELIGIBLE — a model-level fault no
+    # aggregate can fix).
+    #
+    # A STRING TOKEN, not a bool, and tenant-level, not system-level. Both are
+    # deliberate and both were defects in the original implementation:
+    #   * system-level could not be resolved at all from the query-router,
+    #     which holds only a tenant session (``get_setting`` skips the system
+    #     branch unless a system session is supplied, so the flag was
+    #     permanently stuck at its default in production);
+    #   * a bool goes through ``coerce`` -> ``bool(value)``, so ANY non-null
+    #     stored value flips it on. A token compared against an exact literal
+    #     fails safe on anything it does not recognise — the same pattern
+    #     ``quantile_routing.proof_mode`` uses for the same reason.
+    SettingDef(
+        key="query.population_mismatch_reason_mode",
+        level="tenant", type="str", default="legacy",
+        section="Aggregates",
+        description=(
+            "Miss-reason vocabulary for aggregate row-population refusals: "
+            "'legacy' (one join_population_mismatch code) or 'split' "
+            "(buildable vs terminal sub-codes)."
+        ),
+        label="Population mismatch reason mode",
+        ui_group=_GRP_AGG, ui_control="select",
+        ui_choices=["legacy", "split"],
+        validator=_validate_population_reason_mode,
+        ui_help=(
+            "When 'legacy' (default) the router logs one join_population_mismatch for "
+            "every population refusal. When 'split', the router emits "
+            "population_plan_mismatch (a narrower aggregate could fix it) or "
+            "population_unprovable_model (no aggregate can serve — a cyclic join "
+            "component or unresolvable anchor). Any unrecognised value is treated "
+            "as 'legacy'."
+        ),
+        surfaced=False,
+    ),
     SettingDef(
         key="audit.log_level",
         level="tenant", type="str", default="info",
@@ -1076,11 +1888,11 @@ _TENANT_SETTINGS: list[SettingDef] = [
 
 
 # ---------------------------------------------------------------------------
-# PROJECT — empty registry. Per-project agent fields live on
+# PROJECT — mostly empty. Per-project agent fields live on
 # ProjectAgentConfig (edited via the drawer's bespoke agent tabs); per-project
 # connections and LLM bundles live on ProjectConnection and LLMProviderConfig
-# (edited via the Connections and LLM Configurations tabs). The registry is
-# only used here for system-level operator settings.
+# (edited via the Connections and LLM Configurations tabs). Only project-level
+# *primitive* settings without a dedicated table behind them live here.
 # ---------------------------------------------------------------------------
 
 _PROJECT_SETTINGS: list[SettingDef] = [
@@ -1094,6 +1906,26 @@ _PROJECT_SETTINGS: list[SettingDef] = [
         description="Internal placeholder; not surfaced.",
         surfaced=False,
         label="(placeholder)",
+    ),
+    SettingDef(
+        key="agent.judge_context_mode",
+        level="project", type="str", default="distilled",
+        section="Agent judge",
+        description=(
+            "R2 (F2) — PER-PROJECT escape hatch for the judge evidence pack "
+            "(spec section 7). 'distilled' (default) sends the judge a "
+            "distilled evidence pack that keeps ALL evidential context (model "
+            "layer, glossary/alias, retrieved grounding cards, plan, rows, "
+            "rubric, history) but strips non-evidential planner boilerplate "
+            "(TASK examples, OUTPUT FORMAT schemas, expression rules). 'full' "
+            "reverts THIS project's judge to receiving the entire planner "
+            "system prompt verbatim — a deploy-free revert if a judge-quality "
+            "regression is observed in the project's judge-block-rate KPI. "
+            "Distillation never judges on LESS: on any assembly failure it "
+            "falls back to full."
+        ),
+        validator=_validate_judge_context_mode,
+        surfaced=False,
     ),
 ]
 
@@ -1268,6 +2100,78 @@ _MODEL_SETTINGS: list[SettingDef] = [
         ),
     ),
 
+    # Derived-grain aggregate routing (spec §15.1) — per-model gates.
+    SettingDef(
+        key="optimizer.derived_expression_auto_build",
+        level="model", type="str", default="off",
+        section="AI optimizer",
+        description=(
+            "Whether the optimizer may create artifact-owned derived-expression "
+            "keys for hot unmodelled expressions on this model. 'off' = never; "
+            "'approval' = suggest, require modeller/operator approval before "
+            "build; 'automatic' = build unattended (later opt-in). Default off."
+        ),
+        validator=_validate_derived_auto_build_mode,
+        label="Derived expression auto-build",
+        ui_group=_GRP_AI_SCHED, ui_control="select",
+        ui_choices=["off", "approval", "automatic"],
+        ui_help=(
+            "Controls whether the optimizer can build accelerator aggregates for "
+            "repeated inline expressions (e.g. DATE_TRUNC) it observes on this "
+            "model. Approval mode requires you to confirm each build."
+        ),
+        surfaced=False,
+    ),
+    SettingDef(
+        key="model.attribute_relationship_verification",
+        level="model", type="str", default="on",
+        section="Aggregates",
+        description=(
+            "Whether declared dimension key-to-detail relationships are "
+            "data-verified at deploy/build/refresh for this model. 'on' = verify "
+            "and gate serving on verified evidence (default); 'off' = do not "
+            "verify, which makes ALL data-verified attribute edges unavailable "
+            "(source route) — it never preserves prior trust (spec §15.1)."
+        ),
+        validator=_validate_attribute_verification_mode,
+        label="Attribute relationship verification",
+        ui_group=_GRP_AGG, ui_control="select",
+        ui_choices=["on", "off"],
+        ui_help=(
+            "Verifies that a declared 1:1 or many-to-1 relationship between a "
+            "dimension key and a detail column actually holds in the data before "
+            "any aggregate is allowed to substitute the detail. Turning this off "
+            "disables that acceleration; it does not weaken results."
+        ),
+        surfaced=False,
+    ),
+
+    # Join population governance (Bug-8615, phase G1) — deploy-time only.
+    SettingDef(
+        key="model.join_population_validation",
+        level="model", type="str", default="on",
+        section="Aggregates",
+        description=(
+            "Whether each of this model's joins is classified at DEPLOY time as "
+            "neutral / filtering / multiplying against the real source data. "
+            "'on' = measure and record the per-join verdict and the model's "
+            "OK/WARNING/BLOCKED rollup (default); 'off' = do not touch the "
+            "source, which clears the previous verdicts and leaves the model's "
+            "join population status UNEVALUATED rather than stale. Warn-only "
+            "either way — this never blocks a deploy."
+        ),
+        validator=_validate_join_population_mode,
+        label="Join population validation",
+        ui_group=_GRP_AGG, ui_control="select",
+        ui_choices=["on", "off"],
+        ui_help=(
+            "Checks, when you deploy, whether any join in this model drops or "
+            "duplicates rows. It reports what it finds; it never changes results "
+            "and never stops a deployment."
+        ),
+        surfaced=False,
+    ),
+
     # Pocket tables (7)
     SettingDef(
         key="pocket.model_enabled",
@@ -1286,6 +2190,17 @@ _MODEL_SETTINGS: list[SettingDef] = [
         label="Auto-create pocket tables",
         ui_group=_GRP_POCKET, ui_control="switch",
         ui_help="When on, the optimizer may create new pocket tables on this model on its own.",
+    ),
+    SettingDef(
+        key="quantile_routing.model_proof_mode",
+        level="model", type="str", default="off",
+        section="Quantile routing",
+        description="Per-model override for proof-carrying pNN aggregate serving "
+                    "(off | shadow | enforce). Defaults off so the feature is inert "
+                    "until this model's quantile coverage is backfilled and gated. "
+                    "See the system 'quantile_routing.proof_mode' key.",
+        validator=_validate_quantile_proof_mode,
+        surfaced=False,
     ),
     SettingDef(
         key="pocket.max_rows",
@@ -1410,6 +2325,31 @@ _MODEL_SETTINGS: list[SettingDef] = [
         label="Requests per minute (model override)",
         ui_group=_GRP_LIMITS, ui_control="number", unit="requests / minute",
         ui_help="Override the system-wide rate-limit ceiling for this model. Default = no model-level limit.",
+    ),
+
+    # Derived-grain relationship health sweep cadence (spec: architecture_derived-
+    # grain-operational-serving.md §C). How often the scheduler re-proves each
+    # declared attribute relationship's 1:1 mapping over the served (aggregate)
+    # data for this model. A lower value re-checks health more often (fresher
+    # serving decisions, more query load); a higher value re-checks less often.
+    # Falls back to this registry default when unset for the model.
+    SettingDef(
+        key="optimizer.derived_relationship_sweep_interval_hours",
+        level="model", type="int", default=24,
+        section="Derived-grain routing",
+        description=(
+            "How often (in hours) the relationship health sweep re-proves each "
+            "declared attribute relationship's 1:1 mapping over the served data "
+            "for this model. Default 24."
+        ),
+        validator=_validate_positive_int,
+        label="Relationship health sweep interval",
+        ui_group=_GRP_DERIVED, ui_control="number", unit="hours",
+        ui_help=(
+            "The periodic sweep re-checks whether each key-to-detail relationship "
+            "still maps 1:1 on the built aggregate. Set how often that runs for "
+            "this model. Lower is fresher but costs more query load."
+        ),
     ),
 ]
 

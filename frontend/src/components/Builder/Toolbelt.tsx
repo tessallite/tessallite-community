@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { safeLocalGet } from "../../utils/safeLocalStorage";
+import { safeLocalGet, safeLocalSet } from "../../utils/safeLocalStorage";
 import { Box, ButtonBase, IconButton, Tooltip, Typography } from "@mui/material";
 import TableChartIcon from "@mui/icons-material/TableChart";
 import LinkIcon from "@mui/icons-material/Link";
@@ -17,6 +17,7 @@ import MenuBookIcon from "@mui/icons-material/MenuBook";
 import SyncProblemIcon from "@mui/icons-material/SyncProblem";
 import ScheduleIcon from "@mui/icons-material/Schedule";
 import TuneIcon from "@mui/icons-material/Tune";
+import DeviceHubIcon from "@mui/icons-material/DeviceHub";
 import FactCheckIcon from "@mui/icons-material/FactCheck";
 import NotificationsIcon from "@mui/icons-material/Notifications";
 import TrackChangesIcon from "@mui/icons-material/TrackChanges";
@@ -51,6 +52,7 @@ const TOOLS: ToolItem[] = [
   { panel: "row-security", labelKey: "panels.rowSecurity", icon: <LockIcon fontSize="small" /> },
   { panel: "lineage", labelKey: "panels.lineage", icon: <TimelineIcon fontSize="small" /> },
   { panel: "impact", labelKey: "panels.impact", icon: <TrackChangesIcon fontSize="small" /> },
+  { panel: "impact-analysis", labelKey: "panels.impactAnalysis", icon: <DeviceHubIcon fontSize="small" /> },
   { panel: "endpoints", labelKey: "panels.endpoints", icon: <ApiIcon fontSize="small" /> },
   { panel: "saved-queries", labelKey: "panels.savedQueries", icon: <BookmarkIcon fontSize="small" /> },
   { panel: "glossary", labelKey: "panels.glossary", icon: <MenuBookIcon fontSize="small" /> },
@@ -76,6 +78,7 @@ export default function Toolbelt() {
   const closePanel        = useBuilderStore((s) => s.closePanel);
   const isConnectingMode  = useBuilderStore((s) => s.isConnectingMode);
   const setConnectingMode = useBuilderStore((s) => s.setConnectingMode);
+  const readOnly          = useBuilderStore((s) => s.readOnly);
   const t = useT();
   const [expanded, setExpanded] = useState(
     () => safeLocalGet(STORAGE_KEY, "false") === "true",
@@ -84,7 +87,7 @@ export default function Toolbelt() {
   function toggleExpanded() {
     setExpanded((prev) => {
       const next = !prev;
-      localStorage.setItem(STORAGE_KEY, String(next));
+      safeLocalSet(STORAGE_KEY, String(next));
       return next;
     });
   }
@@ -96,6 +99,10 @@ export default function Toolbelt() {
         setConnectingMode(false);
         closePanel();
       } else {
+        // F-026-09: a read-only session cannot draw joins — the canvas makes
+        // the connection handles inert, so entering connecting mode would tell
+        // a viewer to connect two tables and then refuse silently.
+        if (readOnly) return;
         setConnectingMode(true);
         openPanel("joins");
       }
@@ -116,7 +123,11 @@ export default function Toolbelt() {
     const label = t(tool.labelKey);
     const isActive = activePanel === tool.panel;
     // Dim all tools when connection mode is on; Joins stays highlighted.
-    const disabled = isConnectingMode && tool.panel !== "joins";
+    // F-026-09: the Joins tool is also disabled in a read-only session (it is
+    // the only tool that starts a write — other panels stay open for viewing).
+    const disabled =
+      (isConnectingMode && tool.panel !== "joins") ||
+      (readOnly && tool.panel === "joins");
     const connectActive = isConnectingMode && tool.panel === "joins";
 
     return (
@@ -199,37 +210,42 @@ export default function Toolbelt() {
         borderRight: 1,
         borderColor: "divider",
         bgcolor: "grey.50",
-        width: expanded ? 168 : 40,
+        width: expanded ? 168 : 48,
         transition: "width 200ms ease",
         overflow: "hidden",
         flexShrink: 0,
       }}
     >
       <Box
+        data-testid="toolbelt-scroll"
         sx={{
           display: "flex",
           flexDirection: "column",
           gap: 0.25,
-          overflowY: expanded ? "auto" : "hidden",
+          // Bug-7407: the tool list can exceed the viewport height in either
+          // collapsed or expanded state, so the scroll path must stay enabled
+          // unconditionally (never gated on `expanded`). A persistently thin
+          // scrollbar keeps the "more tools below" affordance discoverable
+          // instead of hiding it until hover, which made lower tools look
+          // clipped and unreachable on short viewports.
+          overflowY: "auto",
           flexGrow: 1,
+          minHeight: 0,
           pb: 0.5,
-          scrollbarWidth: "none",
-          "&:hover": {
-            scrollbarWidth: "thin",
-            scrollbarColor: "rgba(0,0,0,0.22) transparent",
-          },
+          scrollbarWidth: "thin",
+          scrollbarColor: "rgba(0,0,0,0.18) transparent",
           "&::-webkit-scrollbar": {
-            width: 0,
-          },
-          "&::-webkit-scrollbar-thumb": {
-            backgroundColor: "transparent",
-          },
-          "&:hover::-webkit-scrollbar": {
             width: 5,
           },
-          "&:hover::-webkit-scrollbar-thumb": {
-            backgroundColor: "rgba(0,0,0,0.25)",
+          "&::-webkit-scrollbar-thumb": {
+            backgroundColor: "rgba(0,0,0,0.18)",
             borderRadius: 3,
+          },
+          "&:hover": {
+            scrollbarColor: "rgba(0,0,0,0.3) transparent",
+          },
+          "&:hover::-webkit-scrollbar-thumb": {
+            backgroundColor: "rgba(0,0,0,0.3)",
           },
         }}
       >

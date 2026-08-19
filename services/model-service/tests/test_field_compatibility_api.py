@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from .result_fakes import FakeScalarResult
 
 from src.auth.middleware import CurrentEmbedUser, CurrentUser, get_current_user
 from src.main import app
@@ -24,7 +25,7 @@ class _ScalarResult:
         self._items = items
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return self._items
@@ -171,7 +172,6 @@ async def test_field_compatibility_endpoint_returns_business_messages():
             base_url="http://testserver",
         ) as client:
             with (
-                patch("src.auth.rbac._audit_bootstrap_admin_grant", AsyncMock()),
                 patch(
                     "src.api.field_compatibility.get_tenant_db",
                     lambda tenant_id: _yield_db(db),
@@ -239,7 +239,6 @@ async def test_field_compatibility_endpoint_uses_deployed_snapshot_not_live_draf
             base_url="http://testserver",
         ) as client:
             with (
-                patch("src.auth.rbac._audit_bootstrap_admin_grant", AsyncMock()),
                 patch(
                     "src.api.field_compatibility.get_tenant_db",
                     lambda tenant_id: _yield_db(db),
@@ -280,7 +279,6 @@ async def test_field_compatibility_endpoint_include_hidden_does_not_reveal_for_p
             base_url="http://testserver",
         ) as client:
             with (
-                patch("src.auth.rbac._audit_bootstrap_admin_grant", AsyncMock()),
                 patch(
                     "src.api.field_compatibility.get_tenant_db",
                     lambda tenant_id: _yield_db(db),
@@ -344,7 +342,6 @@ async def test_field_compatibility_endpoint_hidden_persona_must_opt_in_to_hidden
                 base_url="http://testserver",
             ) as client:
                 with (
-                    patch("src.auth.rbac._audit_bootstrap_admin_grant", AsyncMock()),
                     patch(
                         "src.api.field_compatibility.get_tenant_db",
                         lambda tenant_id: _yield_db(db),

@@ -66,6 +66,16 @@ def do_run_migrations(connection):
     else:
         schema = "public"
 
+    # Serialize the whole migration transaction per schema. The admin API can
+    # launch Alembic from multiple replicas, and neither CREATE SCHEMA IF NOT
+    # EXISTS nor Alembic's version-row update is concurrency-safe by itself.
+    connection.execute(
+        sqlalchemy.text(
+            "SELECT pg_advisory_xact_lock(hashtextextended(:lock_name, 0))"
+        ),
+        {"lock_name": f"tessallite:alembic:{schema}"},
+    )
+
     # Ensure the target schema exists before Alembic tries to use it.
     # Double-quote the identifier so slugs containing hyphens (allowed by
     # TenantCreate's slug pattern ^[a-z0-9_-]+$) survive the DDL. The
@@ -75,14 +85,32 @@ def do_run_migrations(connection):
     connection.execute(sqlalchemy.text(f"CREATE SCHEMA IF NOT EXISTS {quoted_schema}"))
     connection.execute(sqlalchemy.text(f"SET search_path TO {quoted_schema}, public"))
 
-    context.configure(
-        connection=connection,
-        target_metadata=get_target_metadata(),
-        include_schemas=True,
-        version_table_schema=schema,
-    )
-    with context.begin_transaction():
-        context.run_migrations()
+    # Bug-8748: migrations write snapshot-owned tables (model_settings, joins,
+    # model_versions) outside any query-router request scope, so they never
+    # carry the LOCK_STATEMENT_TAG that the runtime model-write guard expects.
+    # The guard therefore false-positives on every such write: an ERROR per
+    # statement in ``warn`` mode, and a hard ModelWriteWithoutLockError that
+    # aborts the entire chain in ``strict`` mode (reproduced on a clean
+    # database: tenant@head dies on 0106's ``UPDATE model_settings``).
+    #
+    # Exempting is correct rather than merely convenient: the per-schema
+    # advisory lock taken above already serialises this transaction against
+    # every other migration runner, and a migration legitimately rewrites this
+    # state wholesale — which is exactly the case the guard's own module
+    # docstring lists as a valid non-holder ("migrations, seeding, restore
+    # tooling"). The exemption is scoped to this connection and unwound on
+    # exit, so it cannot leak to runtime sessions.
+    from shared.db.model_write_lock_guard import connection_write_exempt
+
+    with connection_write_exempt(connection, "alembic migration"):
+        context.configure(
+            connection=connection,
+            target_metadata=get_target_metadata(),
+            include_schemas=True,
+            version_table_schema=schema,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
 
 
 async def run_migrations_online() -> None:

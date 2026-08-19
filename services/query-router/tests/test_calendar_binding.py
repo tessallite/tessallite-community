@@ -121,12 +121,15 @@ class TestResolveCalendarBinding:
 
     @pytest.mark.asyncio
     async def test_raises_when_measures_disagree_on_calendar(self):
+        # Two legacy aliases that resolve to DIFFERENT calendars.
+        alias_a = _alias_table(calendar_table_id="cal-A")
+        alias_b = _alias_table(calendar_table_id="cal-B")
         measures = [_measure("alias-A"), _measure("alias-B")]
         db = AsyncMock()
+        db.get.side_effect = [alias_a, alias_b]
 
         with pytest.raises(SemanticBindingError):
             await _resolve_calendar_binding(db, measures)
-        db.get.assert_not_called()
 
 
 class TestResolvedCalendarIdPath:
@@ -142,14 +145,70 @@ class TestResolvedCalendarIdPath:
 
     @pytest.mark.asyncio
     async def test_resolved_calendar_id_takes_precedence_over_legacy(self):
+        # Bug-6711: when a measure carries both resolved_calendar_id and
+        # calendar_model_table_id, the legacy alias is still resolved to
+        # check for calendar disagreement. If the legacy alias is stale
+        # (no calendar_table_id), the new-style pin is authoritative.
         calendar = _calendar()
+        alias = _alias_table(calendar_table_id=None)  # stale legacy alias
         measures = [_measure("alias-legacy", resolved_calendar_id="cal-direct")]
         db = AsyncMock()
-        db.get.side_effect = [calendar]
+        # Two db.get calls: (1) ModelTable lookup for legacy alias,
+        # (2) CalendarTable lookup for the resolved_calendar_id.
+        db.get.side_effect = [alias, calendar]
 
         result = await _resolve_calendar_binding(db, measures)
         assert result is calendar
-        assert db.get.call_count == 1
+        assert db.get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_resolved_and_legacy_disagree_raises(self):
+        # Bug-6711 core scenario: a measure has resolved_calendar_id="cal-A"
+        # and a legacy alias that resolves to calendar_table_id="cal-B".
+        # The two pins disagree, so we must raise SemanticBindingError.
+        alias = _alias_table(calendar_table_id="cal-B")
+        measures = [_measure("alias-legacy", resolved_calendar_id="cal-A")]
+        db = AsyncMock()
+        db.get.side_effect = [alias]
+
+        with pytest.raises(SemanticBindingError):
+            await _resolve_calendar_binding(db, measures)
+
+    @pytest.mark.asyncio
+    async def test_two_legacy_aliases_same_calendar_no_raise(self):
+        # Two distinct ModelTable alias IDs pointing at the SAME
+        # CalendarTable should NOT raise -- this is a valid product
+        # scenario (two dimension aliases of one calendar).
+        calendar = _calendar()
+        alias1 = _alias_table(calendar_table_id="cal-shared")
+        alias2 = _alias_table(calendar_table_id="cal-shared")
+        measures = [
+            _measure("alias-1", resolved_calendar_id=None),
+            _measure("alias-2", resolved_calendar_id=None),
+        ]
+        db = AsyncMock()
+        # db.get calls: (1) alias-1 ModelTable, (2) alias-2 ModelTable,
+        # (3) CalendarTable lookup for "cal-shared"
+        db.get.side_effect = [alias1, alias2, calendar]
+
+        result = await _resolve_calendar_binding(db, measures)
+        assert result is calendar
+
+    @pytest.mark.asyncio
+    async def test_two_legacy_aliases_different_calendars_raises(self):
+        # Two distinct ModelTable alias IDs pointing at DIFFERENT
+        # CalendarTables should raise SemanticBindingError.
+        alias1 = _alias_table(calendar_table_id="cal-A")
+        alias2 = _alias_table(calendar_table_id="cal-B")
+        measures = [
+            _measure("alias-1", resolved_calendar_id=None),
+            _measure("alias-2", resolved_calendar_id=None),
+        ]
+        db = AsyncMock()
+        db.get.side_effect = [alias1, alias2]
+
+        with pytest.raises(SemanticBindingError):
+            await _resolve_calendar_binding(db, measures)
 
     @pytest.mark.asyncio
     async def test_fallback_to_legacy_when_resolved_calendar_id_is_none(self):
@@ -178,6 +237,20 @@ def _result(row):
     return r
 
 
+def _undeployed_model():
+    """A model with no deploy pointer.
+
+    ``_resolve_hierarchy_calendar_rules`` now gates on deployment authority
+    (F-016-02): DEPLOYED -> pinned snapshot, UNDEPLOYED -> live rows. These
+    tests exercise the LIVE (authoring) resolution, so ``db.get(Model, ...)``
+    must yield an undeployed model. A bare ``AsyncMock`` would return a truthy
+    mock ``deployed_version_id`` and be misclassified as deployed.
+    """
+    return types.SimpleNamespace(
+        id="model-1", deployed_version_id=None, deploy_epoch=0
+    )
+
+
 class TestResolveHierarchyCalendarRulesByHierarchyId:
     """F-016-03: generated date hierarchies key levels on UDAs, so the virtual
     time dimension has source_column_id=None but carries hierarchy_id. Rules
@@ -188,6 +261,7 @@ class TestResolveHierarchyCalendarRulesByHierarchyId:
         # The production-default config: UDA-keyed generated hierarchy.
         time_dim = _time_dim(hierarchy_id="hier-1", source_column_id=None)
         db = AsyncMock()
+        db.get.return_value = _undeployed_model()
         db.execute.return_value = _result(("fiscal", 4))
 
         cal_type, fy = await _resolve_hierarchy_calendar_rules(db, time_dim, "model-1")
@@ -200,6 +274,7 @@ class TestResolveHierarchyCalendarRulesByHierarchyId:
     async def test_normalises_legacy_iso_to_iso_week(self):
         time_dim = _time_dim(hierarchy_id="hier-iso", source_column_id=None)
         db = AsyncMock()
+        db.get.return_value = _undeployed_model()
         db.execute.return_value = _result(("iso", None))
 
         cal_type, fy = await _resolve_hierarchy_calendar_rules(db, time_dim, "model-1")
@@ -209,6 +284,7 @@ class TestResolveHierarchyCalendarRulesByHierarchyId:
     async def test_standard_when_hierarchy_missing_and_no_column(self):
         time_dim = _time_dim(hierarchy_id="ghost", source_column_id=None)
         db = AsyncMock()
+        db.get.return_value = _undeployed_model()
         # First query (by hierarchy id) returns no row; no source column to
         # fall back on.
         db.execute.return_value = _result(None)

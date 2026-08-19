@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Build a Report with the Excel Add-in — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Analyst Guides</span> / <span>Build a Report with the Excel Add-in</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">end user</span><span class="updated">Updated 2026-08-04</span></div>
+    <h1>Build a Report with the Excel Add-in</h1>
+<h2>What this covers</h2>
+<p>The Tessallite Excel add-in is a task pane that lives inside Excel and builds reports from governed measures and dimensions — no workbook connection to configure, no SQL to write. This page walks through a full reporting session with it: signing in, assembling a sales table by dragging fields, filtering it, asking the built-in agent a question, inserting a chart and a KPI card, drilling to the rows behind a number, and refreshing everything the next day.</p>
+<h2>Before you start</h2>
+<ul>
+<li>The add-in must be installed. If you cannot see the Tessallite task pane in Excel, follow the install steps in <a href="../integrations/excel-add-in.html">Tessallite Excel Add-in</a> — your administrator hands you the manifest or a catalogue link.</li>
+<li>The walkthrough uses the demo workspace (<code>acme-demo</code>) and the <code>modelx</code> model, as with every page in this section.</li>
+<li>You need your Tessallite sign-in — the same email and password you use for the web app.</li>
+</ul>
+<h2>The session we are following</h2>
+<p>Maya (from the dashboard walkthrough) has a new request: a quick regional sales summary for tomorrow's ops call, plus a straight answer to "which channel grew fastest last month?", plus the three KPIs on one sheet. She does not want to build a PivotTable for this — she wants to drag a few fields, ask one question, and be done. That is exactly what the add-in is for.</p>
+<h2>Step 1 — Sign in and pick the model</h2>
+<ol>
+<li>Open Excel, find the Tessallite ribbon button (usually on <strong>Home</strong> or <strong>Insert</strong>), and click it. The task pane opens on the right.</li>
+<li>Sign in with your tenant slug (<code>acme-demo</code>), email, and password.</li>
+<li>At the top of the pane, choose the <strong><code>modelx</code></strong> model. The measure, dimension, and hierarchy libraries fill in — with only the objects you are allowed to see. If your list looks shorter than a colleague's, that is your persona doing its job, not a missing feature.</li>
+</ol>
+<h2>Step 2 — Drag a report together in Report Builder</h2>
+<p>The <strong>Report Builder</strong> tab is where tables get assembled.</p>
+<ol>
+<li>Drag <strong><code>region_code</code></strong> into the <strong>Rows</strong> zone.</li>
+<li>Drag <strong><code>net_sales</code></strong> and <strong><code>gross_margin</code></strong> into the <strong>Values</strong> zone.</li>
+<li>Click <strong>Run</strong>.</li>
+</ol>
+<p>A grouped table lands on the sheet: one row per region, net sales and gross margin beside each, with friendly headers. Underneath, the add-in asked Tessallite for exactly that grouping — and Tessallite routed the question to a pre-computed summary if one covers it, so the answer comes back fast even over a hundred thousand rows.</p>
+<h3>Tighten it with a filter</h3>
+<p>Drag <strong><code>channel_code</code></strong> into the <strong>Filters</strong> zone, then click the little filter chip that appears. The editor offers operators that read like plain English:</p>
+<ul>
+<li><strong>Equals</strong> <code>online</code> — just the online channel. Type several values with commas to match any of them.</li>
+<li><strong>Contains</strong> <code>VI</code> — would keep both "VISA" and "VIP".</li>
+<li><strong>Greater Than / Less Than</strong> — one value, number or date.</li>
+<li><strong>Date Range</strong> — two dates, in either order; the add-in swaps them if you type them backwards and tells you it did.</li>
+</ul>
+<p>The small label under the value box says what kind of value the column expects, and if the model cannot accept a filter, the add-in explains why in plain words rather than showing an error code.</p>
+<blockquote><p><strong>Tip: named lists as filters.</strong> If your modeller saved a named list — "Focus Products", say — you can drag it into a zone two ways. A plain drag writes the list's members as they are right now (a snapshot). <strong>Insert as formulas</strong> writes a live <code>CUBESET</code> that re-evaluates on every refresh. For anything that changes over time — a dynamic Top N, a filtered list — choose the formula version so next month's members flow in by themselves.</p></blockquote>
+<h2>Step 3 — Ask the question out loud</h2>
+<p>The <strong>Ask Tessallite</strong> panel is the conversational agent, inside Excel.</p>
+<ol>
+<li>Type: <em>which channel grew fastest last month?</em></li>
+<li>The answer streams back as it is generated — a sentence, the supporting query, and a judge verdict on the answer's quality.</li>
+<li>Click the <strong>insert</strong> action to drop the answer text, the result table, or a chart straight onto the sheet.</li>
+</ol>
+<p>The agent plays by the same rules as everything else: it honours the model's glossary (so "channel" means what the model says it means), your row security, and your persona. It cannot show you data you are not permitted to see, no matter how the question is phrased.</p>
+<h2>Step 4 — KPI cards and a chart</h2>
+<p>Switch to the <strong>KPIs</strong> tab. Every KPI on the model — Net Sales, Revenue, Gross Margin % — appears as a live card with its current value, status, and trend.</p>
+<p>Each card has two buttons:</p>
+<ul>
+<li><strong>Insert Table</strong> — a mini-table at the active cell: name, value, goal, status, trend.</li>
+<li><strong>Insert Chart</strong> — a column chart of current value against target.</li>
+</ul>
+<p>Three clicks and Maya's KPI strip is on the sheet, with the same governed verdicts the scorecard shows. For a chart of the regional table instead, the Report Builder's insert actions can drop a chart of the query result next to it.</p>
+<h2>Step 5 — Drill through to the rows behind a number</h2>
+<p>The ops call will ask "what is inside this 412,000 for North?" Maya is ready:</p>
+<ol>
+<li>Select the region's net sales cell in the inserted result.</li>
+<li>Open the <strong>Drill-through</strong> panel.</li>
+<li>Pick the detail columns to include from the drill-path picker — the model's curated set, so the choice list is tidy.</li>
+<li>The contributing fact rows land on the sheet.</li>
+</ol>
+<p>The detail always reconciles to the cell it came from, and it respects row security and persona scope — if some rows are not yours to see, they are not in the list, and the visible total still matches the visible detail.</p>
+<h2>Step 6 — Tomorrow: refresh, do not rebuild</h2>
+<p>Save the workbook. Next morning:</p>
+<ul>
+<li><strong>Refresh</strong> (in the Report Builder footer) re-runs everything Tessallite inserted and recalculates every <code>TESSALLITE.*</code> formula.</li>
+<li><strong>Refresh sheet data</strong> re-runs just the inserted tables on the active sheet — handy when one sheet matters and the rest can wait.</li>
+</ul>
+<p>Two courtesies the refresh extends, worth knowing about:</p>
+<ul>
+<li><strong>It never overwrites your own work.</strong> If a table needs to grow and the cells below it hold your notes, the refresh leaves the table exactly as it was and tells you which one and why, under <strong>Show details</strong>. Clear the space and refresh again.</li>
+<li><strong>The attribution line follows.</strong> Each inserted table carries a small grey "Source: Tessallite …" line with the refresh time, which moves with the table — so a circulated workbook always says when its numbers were fetched.</li>
+</ul>
+<blockquote><p><strong>A cell can look empty and not be empty.</strong> A formula like <code>=IF(B1&gt;0,B1,"")</code> shows nothing on screen when the condition is false, but the formula is still there, and deleting it loses work you would have to rebuild. The add-in checks for the formula, not just for what the cell displays — so if you insert over a block like that, you get the "this will overwrite existing content" question even though the area looks blank. Say yes only if you meant to replace it.</p></blockquote>
+<blockquote><p><strong>Common trap: sharing the hidden backing sheet.</strong> Local PivotTables the add-in inserts are built over a hidden <code>_tsl_data_*</code> backing sheet. Hidden is not secured: anyone who can edit the workbook can unhide it. If the row-level detail should stay private, do not share the workbook — share the report another way.</p></blockquote>
+<h2>Add-in or PivotTable? A quick rule of thumb</h2>
+<div class="table-wrapper"><table><thead><tr><th>You want...</th><th>Reach for</th></tr></thead><tbody>
+<tr><td>Guidance, the agent, persona switching, one-click KPI cards</td><td>The add-in</td></tr>
+<tr><td>Slicers, timelines, Show Values As, double-click drill-through in a classic grid</td><td>A native XMLA PivotTable</td></tr>
+<tr><td>A single governed number inside a sentence or a hand-built schedule</td><td><code>TESSALLITE.VALUE</code> formulas (see <a href="excel-formulas-that-stay-live.html">Excel Formulas That Stay Live</a>)</td></tr>
+</tbody></table></div>
+<p>They coexist happily in one workbook, and they never disagree — same model, same security, same numbers.</p>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr></thead><tbody>
+<tr><td>No Tessallite button in the ribbon</td><td>Add-in not installed</td><td>Follow the install steps in <a href="../integrations/excel-add-in.html">Tessallite Excel Add-in</a></td></tr>
+<tr><td>Task pane opens but will not sign in</td><td>Wrong tenant slug or password</td><td>The slug is case-sensitive; check all three fields</td></tr>
+<tr><td>A table was skipped on refresh</td><td>Something of yours sits in the cells it needs, or its structure changed in the model</td><td>Open <strong>Show details</strong> for the exact reason; clear the cells or re-insert the table</td></tr>
+<tr><td>The agent's answer names the wrong thing</td><td>The model glossary does not cover that term yet</td><td>Ask the modeller to add the alias; see <a href="../agent/glossary-alias-map.html">Author the glossary alias map</a></td></tr>
+<tr><td>Fewer measures than expected in the library</td><td>Persona or column-level security</td><td>Working as designed — ask your administrator if you need wider access</td></tr>
+</tbody></table></div>
+<h2>Related</h2>
+<ul>
+<li><a href="../integrations/excel-add-in.html">Tessallite Excel Add-in</a></li>
+<li><a href="build-your-first-excel-dashboard.html">Build Your First Excel Dashboard</a></li>
+<li><a href="excel-formulas-that-stay-live.html">Excel Formulas That Stay Live</a></li>
+<li><a href="../agent/agent-chat.html">Agent Chat</a></li>
+</ul>
+<nav class="page-nav"><a href="build-your-first-excel-dashboard.html" class="page-nav-btn prev">&larr; Build Your First Excel Dashboard</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="excel-formulas-that-stay-live.html" class="page-nav-btn next">Excel Formulas That Stay Live &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

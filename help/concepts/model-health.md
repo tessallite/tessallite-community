@@ -2,7 +2,7 @@
 title: "Model Health"
 audience: modeller
 area: concepts
-updated: 2026-04-17
+updated: 2026-08-02
 ---
 
 ![Model Builder — Health tab.](../assets/screencaps/model-health-tab.png)
@@ -66,6 +66,12 @@ A source table's schema has changed since the model was last synced. Tessallite 
 To resolve: open the Model Builder and run a schema sync from the table's context menu. After syncing, review dimensions and joins that reference the changed table — any that reference a removed column will appear as additional errors.
 
 Running a schema sync only refreshes the available column list. You must manually update any dimension, measure, or join definitions that reference columns that no longer exist.
+
+### What Re-check covers
+
+**Re-check model** reruns structural validation and combines it with unresolved hierarchy issues, failed pockets, and unacknowledged schema-drift events already recorded by the Scheduler. The panel displays these recorded-signal counts and the latest recorded drift time.
+
+Re-check does not connect to the live source. A source change that occurred after the latest scheduled drift scan will not appear until that scan runs; the result explicitly says that live source introspection was not performed.
 
 ### Aggregate refresh overdue
 

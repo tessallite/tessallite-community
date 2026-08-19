@@ -83,4 +83,4 @@ The slug is set when the System Admin creates the workspace. It cannot be modifi
 
 ---
 
-← [Connect Excel via XMLA](../getting-started/connect-excel.md) | [Home](../index.md) | [Projects and Models →](projects-and-models.md)
+← [Why Your Numbers Match](../analyst-guides/why-your-numbers-match.md) | [Home](../index.md) | [Projects and Models →](projects-and-models.md)

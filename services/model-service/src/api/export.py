@@ -5,9 +5,9 @@ from __future__ import annotations
 
 from uuid import UUID
 
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 
 from shared.db.models import (
     AggregateDefinition,
@@ -24,6 +24,8 @@ from shared.db.models import (
     Model,
     UserDefinedAttribute,
 )
+from shared.audit.logger import audit_required
+from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
 from shared.db.session import get_tenant_db
 from datetime import datetime, timezone
 
@@ -44,13 +46,21 @@ from shared.schemas.pydantic_models import (
 )
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
+from src.api._model_lock import acquire_model_definition_lock
 
 router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}", tags=["export"]
 )
 
 
-@router.get("/export", response_model=ModelExportResponse)
+@router.get(
+    "/export",
+    response_model=ModelExportResponse,
+    # Model-DEFINITION export requires a modeler+ binding (user decision
+    # 2026-08-19: only the credential-bearing PROJECT export is admin-gated).
+    # Bootstrap-free via the binding-only require_role (F-021-04).
+    dependencies=[require_role("modeler")],
+)
 async def export_model(
     project_id: UUID,
     model_id: UUID,
@@ -160,7 +170,7 @@ async def export_model(
                 )
             )
 
-        return ModelExportResponse(
+        response = ModelExportResponse(
             exported_at=datetime.now(timezone.utc),
             model=ModelResponse.model_validate(model),
             sources=[DataSourceResponse.model_validate(s) for s in sources],
@@ -171,6 +181,37 @@ async def export_model(
             aggregates=[AggregateDefinitionResponse.model_validate(a) for a in aggregates],
             hierarchies=hierarchy_items,
         )
+
+        # F-022-01/F-022-02: exporting a full model definition is a sensitive
+        # data-egress action a compliance officer must be able to reconstruct
+        # (who exported which model, and when). Fail closed so an export whose
+        # evidence cannot be persisted is refused rather than silently
+        # leaving the source without a record.
+        await audit_required(
+            db, action="model.export", severity="warn",
+            actor_email=current_user.email,
+            target_type="model", target_id=model.id,
+            target_name=model.display_name,
+            detail={
+                "project_id": str(project_id),
+                "counts": {
+                    "sources": len(sources),
+                    "targets": len(targets),
+                    "dimensions": len(dimensions),
+                    "measures": len(measures),
+                    "joins": len(joins),
+                    "aggregates": len(aggregates),
+                    "hierarchies": len(hierarchy_items),
+                },
+            },
+        )
+        await db.commit()
+        await emit_webhook(current_user.tenant_id, "model.export", {
+            "model_id": str(model.id),
+            "project_id": str(project_id),
+            "actor": current_user.email,
+        })
+        return response
 
 
 async def _attribute_in_model(
@@ -208,6 +249,12 @@ async def import_model_hierarchies(
         model = await db.get(Model, model_id)
         if model is None or model.project_id != project_id:
             raise HTTPException(status_code=404, detail="Model not found")
+        # Bug-7982 finding 7 then 3: auth (404) before lock; this endpoint
+        # delete-and-reinserts HierarchyDefinition/HierarchyLevel, which are
+        # snapshot-owned (truncate-reinserted on revert) — the same class the
+        # locked hierarchies.py endpoints already cover; this was a SECOND,
+        # unlocked writer of the same tables.
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
 
         warnings: list[str] = []
         imported_hierarchies = 0
@@ -295,12 +342,18 @@ async def import_model_hierarchies(
         except HTTPException:
             await db.rollback()
             raise
-        except IntegrityError as exc:
-            await db.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail=f"Hierarchy import failed due to a constraint conflict: {exc.orig}",
-            )
+        except Exception as exc:
+            # Bug-6559: lazy import of IntegrityError to avoid import-time
+            # coupling with sqlalchemy.exc under partial installs.
+            from sqlalchemy.exc import IntegrityError
+
+            if isinstance(exc, IntegrityError):
+                await db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Hierarchy import failed due to a constraint conflict: {exc.orig}",
+                )
+            raise
 
         return ModelImportResponse(
             imported_hierarchies=imported_hierarchies,

@@ -29,14 +29,23 @@ For tenant endpoint (/xmla/{tenant}):
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
+import copy
+import functools
 import gzip
 import logging
 import os
 import re
+# threading import removed: Bug-6937 — the inflight-task registry is
+# guarded by asyncio.Lock (correct for single-threaded event loop),
+# not threading.Lock (wrong primitive for asyncio concurrency).
 import uuid
 import zlib
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
+from urllib.parse import unquote
 from defusedxml import DefusedXmlException, ElementTree as ET
 
 from fastapi import APIRouter, Request, Response
@@ -44,29 +53,59 @@ from fastapi import APIRouter, Request, Response
 from shared.config.bootstrap import system_snapshot_get
 from shared.config.settings import get_settings as _get_settings
 from shared.connector_qualify import quote_identifier as _qi
+from shared.connector_qualify import quote_literal as _ql
 from shared.semantic.hierarchy_resolver import resolve_hierarchy_dimension_map as _build_hierarchy_dimension_map
-from src.auth.base import verify_jwt_token
+from src.auth.base import validate_session_upstream, verify_jwt_token
+from src.dax import member_cache
 from src.dax import session_store
+from src.dax.cube_model import (
+    STANDALONE_GROUP_NAME,
+    build_cube_dimensions,
+    filter_cube_dimensions_by_persona,
+    is_standalone_attribute,
+)
 from src.dax.adapter import XmlaAdapter
 from src.dax.constants import SERVER_NAME
 from src.dax.dax_parser import translate_dax, find_kpi_member_functions
 from src.dax.drillthrough_handler import handle_drillthrough
+from src.dax.kpi_persona_filter import (
+    filter_kpis_for_persona,
+    _kpi_lineage_measure_ids as kpi_lineage_measure_ids,
+    _measure_name_to_id as kpi_persona_measure_name_to_id,
+)
 from src.dax.mdx_validators import (
     check_unsupported_mdx_constructs as _check_unsupported_mdx_constructs,
 )
-from src.dax.mdschema import build_discover_response
+from src.dax.mdschema import (
+    _escape_mdx_bracket as _escape_mdx_bracket_name,
+    build_discover_response,
+    kpi_goal_static_value,
+    kpi_goal_support_measure_name,
+    kpi_goal_synthetic_measures,
+    kpi_status_needs_support_measure,
+    kpi_status_support_measure_name,
+    kpi_status_synthetic_measures,
+)
 from src.dax.member_uname import (
     KEY_PATH,
     KEYS_OR_CAPTION,
+    first_bracket_body,
     parse_member_keys,
     parse_member_uname,
 )
 from src.dax.mdx_execute import (
     build_real_execute_response,
-    resolve_kpi_property_expr,
 )
-from src.dax.ts_mdx_parser import parse_mdx as parse_mdx_statement
+from src.dax.ts_mdx_parser import (
+    MDXParserUnavailableError,
+    ParsedMDX,
+    parse_mdx as parse_mdx_statement,
+)
 from src.router_client import (
+    GatewayQueryRateLimitExceeded,
+    QueryByteCeilingExceeded,
+    QueryRouterError,
+    evaluate_kpi_governed,
     execute_query,
     get_model_dimensions,
     get_model_hierarchies,
@@ -74,8 +113,11 @@ from src.router_client import (
     get_model_kpis,
     get_model_measures,
     get_model_named_sets,
+    get_model_parameters,
     get_model_personas,
     get_model_snapshot,
+    get_model_version_snapshot,
+    get_deployed_named_queries,
     get_dimension_members,
     list_all_models_for_tenant,
     list_models_for_tenant,
@@ -83,6 +125,30 @@ from src.router_client import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _discovery_httpx():
+    """``httpx`` module, imported lazily (this file's convention for it)."""
+    import httpx as _httpx
+
+    return _httpx
+
+
+def _deployed_snapshot_fault_message(catalog: str) -> str:
+    """One wording for the Bug-8384 DEPLOYED_SNAPSHOT_INVALID fault.
+
+    Shared by the Discover and Execute handlers so the two BI surfaces cannot
+    describe the same broken state differently. Deliberately does not enumerate
+    which metadata family failed — the same 409 is reachable from the named-set
+    and KPI fetches on three different request types, and the actionable half is
+    the same in every case.
+    """
+    return (
+        "DEPLOYED_SNAPSHOT_INVALID: the deployed model snapshot for catalog "
+        f"'{catalog}' is missing or malformed, so this model cannot be served. "
+        "Redeploy the model."
+    )
+
 
 _SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 _XMLA_NS = "urn:schemas-microsoft-com:xml-analysis"
@@ -101,18 +167,100 @@ _accept_encoding: contextvars.ContextVar[str] = contextvars.ContextVar(
 # header overhead can make tiny payloads larger, and the CPU is wasted.
 _COMPRESS_MIN_BYTES = 512
 
+# Bug-6950: configurable XMLA request-body size cap (bytes).
+_XMLA_MAX_REQUEST_BYTES = int(
+    os.environ.get("XMLA_MAX_REQUEST_BYTES", str(10 * 1024 * 1024))
+)
+_XMLA_TRUST_LOOKUP_TIMEOUT_SECONDS = float(
+    os.environ.get("XMLA_TRUST_LOOKUP_TIMEOUT_SECONDS", "0.5")
+)
+
+# Bug-8048: name of the Tessallite DRILLTHROUGH keyset-pagination extension.
+# Used for BOTH the inbound Execute PropertyList entry and the outbound
+# continuation element, so request and response never drift apart. The XMLA
+# spec allows provider-specific properties; clients that do not know this one
+# never send it and therefore never receive it back.
+_DRILLTHROUGH_CURSOR_PROPERTY = "DrillthroughCursor"
+
+# Bug-6945: collision-safe sentinel for timeline range filters.
+# The previous ``__BETWEEN__<start>__<end>`` encoding used ``__`` as both
+# prefix and separator, so member keys containing ``__`` (e.g. ``FY__2024``)
+# were misparsed by ``bv.split("__")``.  A null byte cannot appear in
+# XML/SOAP member-key strings, making ``\x00`` a collision-proof delimiter.
+_RANGE_PREFIX = "\x00BETWEEN\x00"
+_RANGE_SEP = "\x00"
+
+# Bug-5888: registry of in-flight Execute tasks keyed by XMLA SessionId,
+# mirroring the JDBC CancelRequest pattern (`jdbc/server.py:_inflight_tasks`,
+# Bug-5188). A <Cancel> command carries the same SessionId as the Execute it
+# targets (Excel/Power BI reuse one session across requests), so a Cancel on
+# that session can look up and cancel the real in-flight query-router call
+# instead of returning an unconditional, untruthful empty-success response.
+# Only the most recently started task per session is tracked; concurrent
+# multi-statement Execute on a single session is not a supported XMLA usage
+# pattern for our BI clients, so this is a proportionate simplification.
+_xmla_inflight_tasks: dict[str, asyncio.Task] = {}
+# Bug-6937 (CF-002-DS-F00201): the previous ``threading.Lock`` was the wrong
+# synchronisation primitive — it guards an ``asyncio.Task`` dict mutated only
+# by coroutines on the single-threaded event loop. ``threading.Lock`` is
+# semantically incorrect here (it serialises OS threads, not coroutine
+# scheduling points) and can mask concurrency bugs.  ``asyncio.Lock``
+# serialises at the coroutine-scheduling level, matching the execution model.
+_xmla_inflight_lock = asyncio.Lock()
+
+
+def _parse_accept_encoding(accept_encoding: str) -> dict[str, float]:
+    """Parse an ``Accept-Encoding`` header into ``{coding: qvalue}`` (RFC 7231 §5.3).
+
+    Bug-6951: previously the picker used a bare ``"gzip" in header`` substring
+    test, which ignored quality weights entirely — so a client sending
+    ``gzip;q=0`` (an explicit REFUSAL of gzip) was still served gzip because the
+    substring ``gzip`` was present. Each coding may carry a ``;q=<weight>``
+    (0.0-1.0; absent means 1.0); ``q=0`` means "not acceptable". A ``*`` token
+    sets the default weight for codings not otherwise named.
+    """
+    weights: dict[str, float] = {}
+    for part in (accept_encoding or "").split(","):
+        token = part.strip().lower()
+        if not token:
+            continue
+        coding, _, params = token.partition(";")
+        coding = coding.strip()
+        if not coding:
+            continue
+        q = 1.0
+        for param in params.split(";"):
+            param = param.strip()
+            if param.startswith("q="):
+                try:
+                    q = float(param[2:])
+                except ValueError:
+                    q = 1.0
+                break
+        # Clamp to the RFC range; malformed high/low values fold to bounds.
+        weights[coding] = min(1.0, max(0.0, q))
+    return weights
+
 
 def _pick_content_encoding(accept_encoding: str) -> str:
     """Return the response Content-Encoding to use for a client Accept-Encoding.
 
-    Honors gzip and deflate (the two encodings MSOLAP/Power BI advertise);
-    prefers gzip. Returns "" when the client advertised neither (identity).
-    A bare ``identity`` or empty header yields no compression.
+    Honors gzip and deflate (the two encodings MSOLAP/Power BI advertise),
+    respecting the ``Accept-Encoding`` quality weights (Bug-6951): a coding with
+    ``q=0`` is refused, and among acceptable codings the higher q wins (gzip
+    breaks a tie, matching the historical preference). Returns "" when neither
+    gzip nor deflate is acceptable (identity) — including when the client sent
+    ``gzip;q=0`` / ``deflate;q=0`` or only ``identity``.
     """
-    ae = (accept_encoding or "").lower()
-    if "gzip" in ae:
+    weights = _parse_accept_encoding(accept_encoding)
+    # A wildcard sets the default weight for any coding not explicitly listed.
+    star_q = weights.get("*")
+    gzip_q = weights.get("gzip", star_q if star_q is not None else 0.0)
+    deflate_q = weights.get("deflate", star_q if star_q is not None else 0.0)
+    # Prefer gzip on a tie; only pick a coding that is actually acceptable (q>0).
+    if gzip_q > 0 and gzip_q >= deflate_q:
         return "gzip"
-    if "deflate" in ae:
+    if deflate_q > 0:
         return "deflate"
     return ""
 
@@ -158,6 +306,7 @@ async def _resolve_tenant_from_catalog(xml_root: ET.Element, username: str, jwt_
 @router.api_route("/xmla", methods=["GET", "POST"])
 @router.api_route("/xmla/", methods=["GET", "POST"])
 @router.api_route("/xmla/msmdpump.dll", methods=["GET", "POST"])
+@router.api_route("/msmdpump.dll", methods=["GET", "POST"])
 async def xmla_server_endpoint(request: Request) -> Response:
     """
     XMLA-over-HTTP server endpoint (SSAS-style for Excel).
@@ -175,7 +324,21 @@ async def xmla_server_endpoint(request: Request) -> Response:
     username = getattr(request.state, "username", "")
     jwt_token = getattr(request.state, "jwt_token", "")
 
+    # Bug-6950: reject oversized XMLA request bodies before buffering.
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > _XMLA_MAX_REQUEST_BYTES:
+        return Response(
+            status_code=413,
+            content="Request body too large",
+            media_type="text/plain",
+        )
     body_bytes = await request.body()
+    if len(body_bytes) > _XMLA_MAX_REQUEST_BYTES:
+        return Response(
+            status_code=413,
+            content="Request body too large",
+            media_type="text/plain",
+        )
     body_bytes = XmlaAdapter.normalize_inbound(body_bytes)
 
     # Phase F9 of the code-review remediation: do NOT log the raw SOAP body
@@ -218,6 +381,15 @@ async def xmla_server_endpoint(request: Request) -> Response:
     try:
         verify_jwt_token(jwt_token)
     except Exception:
+        return _soap_fault("Authentication required.", "Client", status_code=401)
+
+    # Bug-7322 (gateway consumer half): validate that the session has not
+    # been revoked (deactivated user, role demotion, stale token_version).
+    try:
+        await validate_session_upstream(jwt_token)
+    except ValueError:
+        if session_id:
+            await session_store.delete(session_id)
         return _soap_fault("Authentication required.", "Client", status_code=401)
 
     catalog_name = await _resolve_tenant_from_catalog(root, username, jwt_token)
@@ -463,21 +635,205 @@ async def _build_catalogs_all_tenants(
 # XMLA tenant endpoint (Power BI / API style)
 # ---------------------------------------------------------------------------
 
+# Mirrors TenantCreate's slug pattern (^[a-z0-9_-]+$). A malformed path
+# segment (e.g. "acme-demo," from a copy-paste with a trailing comma) used to
+# half-work — cross-tenant auth succeeded and discovery answered — which hid
+# the typo from the BI client instead of surfacing it (Bug-5534 diagnosis).
+_TENANT_SLUG_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
 @router.api_route("/xmla/{tenant_slug}", methods=["GET", "POST"])
 async def xmla_tenant_endpoint(tenant_slug: str, request: Request) -> Response:
     """
     XMLA-over-HTTP endpoint with tenant in path (Power BI / API style).
     Kept for backwards compatibility with Power BI and direct API users.
     """
+    if not _TENANT_SLUG_RE.fullmatch(tenant_slug):
+        logger.warning(
+            "xmla tenant endpoint called with malformed tenant slug %r", tenant_slug
+        )
+        return Response(
+            status_code=404,
+            content=(
+                f"Unknown workspace path segment {tenant_slug!r}. Use the "
+                "workspace slug only, e.g. /api/v1/xmla/acme-demo"
+            ),
+            media_type="text/plain",
+        )
+
+    # Bug-6948 (CF-002-GPT-F00201): handle authenticated GET probes
+    # consistently with the server endpoint (/xmla).  MSOLAP and Power BI
+    # issue a GET to discover whether the endpoint is live before sending
+    # XMLA POST traffic.  The server endpoint returns 200; the tenant
+    # endpoint must do the same.  Middleware has already verified auth.
+    if request.method == "GET":
+        return Response(status_code=200, media_type="text/plain")
+
     username = getattr(request.state, "username", "")
     jwt_token = getattr(request.state, "jwt_token", "")
     # Bug-5436b: record the client's Accept-Encoding for response compression.
     _accept_encoding.set(request.headers.get("accept-encoding", ""))
+    # Bug-6950: reject oversized XMLA request bodies.
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > _XMLA_MAX_REQUEST_BYTES:
+        return Response(
+            status_code=413,
+            content="Request body too large",
+            media_type="text/plain",
+        )
     body_bytes = await request.body()
+    if len(body_bytes) > _XMLA_MAX_REQUEST_BYTES:
+        return Response(
+            status_code=413,
+            content="Request body too large",
+            media_type="text/plain",
+        )
     body_bytes = XmlaAdapter.normalize_inbound(body_bytes)
 
     logger.debug("xmla tenant resolved: tenant=%r user=%r", tenant_slug, username)
     return await _handle_xmla_request(tenant_slug, username, jwt_token, body_bytes, request)
+
+
+# Bug-5534 (remaining Power BI Desktop half): the PBI data-source dialog can
+# nest the WHOLE gateway URL after the base path, so the request line becomes
+#   POST /api/v1/xmlahttps%3A//sql.cloud.tessallite.io%3A8080/api/v1/xmla
+# (verbatim from the live GCP gateway log, 2026-06-25). Note there is no
+# separator between ``xmla`` and ``https`` — the appended text is glued to the
+# base path — so neither ``/xmla`` nor ``/xmla/{tenant_slug}`` matches it and
+# FastAPI answered a bare 404 "Not Found". The user sees a connection failure
+# with nothing pointing at the URL they typed, which is why this half of
+# Bug-5534 stayed open through several rounds of live diagnosis.
+#
+# This route recognises the shape and answers with the SAME actionable 404 the
+# malformed-slug guard above returns. It deliberately does NOT silently
+# dispatch the request to a tenant guessed out of the appended text: the
+# recorded Bug-5534 decision (see ``_TENANT_SLUG_RE``) is that a malformed
+# XMLA URL must be surfaced, because the earlier half-working behaviour hid
+# the typo from the BI client instead of getting it corrected. Recovering here
+# would leave a broken connection string in place to fail again elsewhere.
+_XMLA_APPENDED_URL_HINT_RE = re.compile(r"https?://", re.IGNORECASE)
+# ``scheme://user:password@host`` — a pasted connection URL can carry embedded
+# credentials, so the userinfo is stripped before the path is logged OR echoed.
+# Greedy up to the LAST ``@`` before the next path separator: a decoded
+# userinfo can itself contain an ``@`` (``admin@acme-demo.com:pw@host``), and a
+# lazy match would leave the password behind.
+#
+# The scheme alternation accepts percent-encoded separators (``https%3A//``,
+# ``https%3A%2F%2F``) because that is the shape Power BI Desktop actually
+# appended in the live Bug-5534 log, and because this pattern is applied to the
+# RAW path first — see ``_safe_malformed_path``.
+_URL_USERINFO_RE = re.compile(
+    r"(https?(?::|%3A)(?:/|%2F){2})[^/\s]*@", re.IGNORECASE,
+)
+# Last-resort net: everything from the scheme to the LAST ``@`` in the string.
+# Only used when the precise pattern above provably left a userinfo behind (see
+# ``_residual_userinfo``), because it can also swallow a ``@`` that belongs to
+# the path. Losing diagnostic detail is always preferable to echoing a secret.
+_URL_ANY_USERINFO_RE = re.compile(r"(https?://).*@", re.IGNORECASE)
+_REDACTION = "[REDACTED]@"
+# Route segment this catch-all is mounted on, used to recover the raw appended
+# tail from the ASGI ``raw_path``.
+_XMLA_ROUTE_SEGMENT = "/xmla"
+# Cap on how much of a malformed path is repeated back, so a pasted blob does
+# not become an unbounded log line or response body.
+_MALFORMED_PATH_ECHO_LIMIT = 120
+
+
+def _residual_userinfo(text: str) -> bool:
+    """True when a ``scheme://...@`` userinfo survived redaction unredacted.
+
+    Compares the whole userinfo against the marker rather than testing a
+    suffix: a password crafted to END in ``[REDACTED]`` would otherwise pass
+    the check and leave the rest of the credential in place. Any ``@`` between
+    the scheme and the host that is not exactly the marker is treated as an
+    unredacted userinfo — including a benign ``@`` in the path, which is then
+    over-redacted. Losing a host name from a 404 message is always cheaper
+    than echoing a secret.
+    """
+    m = _URL_ANY_USERINFO_RE.search(text)
+    if not m:
+        return False
+    return m.group(0)[len(m.group(1)):] != _REDACTION
+
+
+def _raw_appended_path(request: Request, decoded_fallback: str) -> str:
+    """The still percent-encoded appended path, taken off the ASGI scope.
+
+    ``raw_path`` is optional in the ASGI spec, so the decoded path parameter
+    remains the fallback; ``_safe_malformed_path`` stays safe on either input.
+    """
+    raw = request.scope.get("raw_path")
+    if not isinstance(raw, (bytes, bytearray)):
+        return decoded_fallback
+    text = raw.decode("latin-1", "replace")
+    idx = text.find(_XMLA_ROUTE_SEGMENT)
+    if idx < 0:
+        return decoded_fallback
+    return text[idx + len(_XMLA_ROUTE_SEGMENT):]
+
+
+def _safe_malformed_path(raw_path: str) -> str:
+    """Redact embedded credentials and cap the length of a path we echo.
+
+    Takes the RAW, still percent-encoded path. sol review F-CR-03: redacting
+    after decoding is unsound, because decoding destroys the authority boundary
+    the pattern relies on — ``pw%2Ftail@host`` becomes ``pw/tail@host`` and
+    ``[^/\\s]*@`` then stops at the decoded ``/`` before it ever reaches the
+    ``@``, substituting nothing and echoing the password verbatim. Percent-
+    encoded whitespace failed identically. In the encoded form a ``/`` or a
+    space inside the userinfo is necessarily escaped, so the first literal
+    ``/`` really is the path separator and the match is correct.
+
+    Three passes, each strictly a net under the previous one:
+    1. the precise pattern on the raw path (the sound case);
+    2. the same pattern after decoding, for a credential only revealed by
+       decoding (an escaped scheme with an otherwise clean userinfo) — the
+       substitution is idempotent, so this can never un-redact;
+    3. the blunt scheme-to-last-``@`` pattern, only if a userinfo demonstrably
+       survived — which is possible when ``raw_path`` is unavailable and the
+       decoded credential contains a delimiter.
+    """
+    redacted = _URL_USERINFO_RE.sub(rf"\1{_REDACTION}", raw_path)
+    redacted = _URL_USERINFO_RE.sub(rf"\1{_REDACTION}", unquote(redacted))
+    if _residual_userinfo(redacted):
+        redacted = _URL_ANY_USERINFO_RE.sub(rf"\1{_REDACTION}", redacted)
+    if len(redacted) > _MALFORMED_PATH_ECHO_LIMIT:
+        redacted = redacted[:_MALFORMED_PATH_ECHO_LIMIT] + "..."
+    return redacted
+
+
+@router.api_route("/xmla{appended_path:path}", methods=["GET", "POST"])
+async def xmla_malformed_path_endpoint(appended_path: str, request: Request) -> Response:
+    """Explain a malformed XMLA URL instead of returning a bare 404.
+
+    Only reached when no concrete XMLA route matched, because every concrete
+    route (``/xmla``, ``/xmla/``, ``/xmla/msmdpump.dll``, ``/xmla/{tenant}``)
+    is registered ahead of this one and Starlette matches in registration
+    order.
+    """
+    # The hint check runs on the decoded path (an escaped ``https%3A//`` is
+    # still an appended URL); the echoed path is redacted from the RAW path,
+    # because decoding first would hide the credential boundary (F-CR-03).
+    looks_appended = bool(_XMLA_APPENDED_URL_HINT_RE.search(unquote(appended_path)))
+    safe_path = _safe_malformed_path(_raw_appended_path(request, appended_path))
+    logger.warning(
+        "xmla malformed path: path=%r url_appended=%s", safe_path, looks_appended,
+    )
+    detail = (
+        "A full URL appears to have been appended to the XMLA endpoint. "
+        if looks_appended else ""
+    )
+    return Response(
+        status_code=404,
+        content=(
+            f"Malformed XMLA endpoint path {safe_path!r}. {detail}"
+            "Use the server URL on its own — /api/v1/xmla for Excel (pick the "
+            "workspace as the catalog), or /api/v1/xmla/<workspace> for Power "
+            "BI Desktop, e.g. /api/v1/xmla/acme-demo. Do not paste the whole "
+            "address a second time into the server field."
+        ),
+        media_type="text/plain",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +877,15 @@ async def _handle_xmla_request(tenant_slug: str, username: str, jwt_token: str, 
     except Exception:
         return _soap_fault("Authentication required.", "Client", status_code=401)
 
+    # Bug-7322 (gateway consumer half): validate that the session has not
+    # been revoked (deactivated user, role demotion, stale token_version).
+    try:
+        await validate_session_upstream(jwt_token)
+    except ValueError:
+        if session_id:
+            await session_store.delete(session_id)
+        return _soap_fault("Authentication required.", "Client", status_code=401)
+
     # Success: store session if established (store token as plain string).
     if session_id:
         existed = await session_store.contains(session_id)
@@ -549,8 +914,18 @@ async def _handle_xmla_request(tenant_slug: str, username: str, jwt_token: str, 
         if local_name == "Execute":
             return await _handle_execute(method_el, tenant_slug, jwt_token, session_id)
     except Exception as exc:
-        # Propagation of 401 from downstream services
-        if "401" in str(exc):
+        # Bug-6651: propagation of 401 from downstream services.
+        # Previously used `"401" in str(exc)` which matched ANY error
+        # whose text happened to contain "401" (e.g. "invoice #401
+        # failed"). Now uses typed status inspection on httpx
+        # HTTPStatusError and QueryRouterError.
+        import httpx as _httpx
+        from src.router_client import QueryRouterError as _QRE
+        _is_downstream_401 = (
+            (isinstance(exc, _httpx.HTTPStatusError) and exc.response.status_code == 401)
+            or (isinstance(exc, _QRE) and exc.status_code == 401)
+        )
+        if _is_downstream_401:
             logger.warning("xmla downstream 401: %s", exc)
             return Response(
                 status_code=401,
@@ -574,6 +949,31 @@ def _normalize_restrictions(restrictions: dict[str, list[str]]) -> dict[str, lis
     return out
 
 
+def _member_page_limit() -> int:
+    """Bounded first-page size for a whole-level member enumeration (Bug-6602).
+
+    ``MEMBER_DISCOVERY_LIMIT`` (default 100000, Bug-5436a) is a *completeness*
+    cap for filter dropdowns, not a page size: materialising 100k members into
+    a synchronous SOAP rowset is tens of MB that Excel parses on its UI thread
+    (the freeze in Fable diagnostic §3). For a browse gesture (select/expand a
+    dimension) we emit at most a bounded first page instead. Configurable via
+    ``XMLA_MEMBER_PAGE_LIMIT`` and never larger than ``MEMBER_DISCOVERY_LIMIT``.
+    TREE_OP children / specific-member drills are already parent-bounded and are
+    not subject to this page cap.
+    """
+    discovery_cap = int(_get_settings().MEMBER_DISCOVERY_LIMIT)
+    raw = os.environ.get("XMLA_MEMBER_PAGE_LIMIT", "").strip()
+    page = 10000
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed > 0:
+                page = parsed
+        except ValueError:
+            pass
+    return max(1, min(page, discovery_cap))
+
+
 def _hier_level_names(dimension: dict[str, Any]) -> list[str]:
     levels = dimension.get("levels") or []
     if not levels:
@@ -588,36 +988,16 @@ def _build_discover_dimensions(
     raw_dimensions: list[dict[str, Any]],
     hierarchy_defs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    by_name: dict[str, dict[str, Any]] = {}
-    ordered_names: list[str] = []
+    """Map model metadata to the ordered XMLA cube-dimension list (Bug-6603).
 
-    for item in raw_dimensions:
-        name = str(item.get("name", "")).strip()
-        if not name:
-            continue
-        enriched = dict(item)
-        enriched.setdefault("source", "dimension")
-        by_name[name] = enriched
-        ordered_names.append(name)
-
-    for hierarchy in hierarchy_defs:
-        name = str(hierarchy.get("name", "")).strip()
-        if not name:
-            continue
-        levels = hierarchy.get("levels") or []
-        enriched = {
-            "name": name,
-            "source": "hierarchy",
-            "hierarchy_id": str(hierarchy.get("id", "")),
-            "levels": levels,
-        }
-        if name in by_name:
-            by_name[name] = enriched
-        else:
-            by_name[name] = enriched
-            ordered_names.append(name)
-
-    return [by_name[name] for name in ordered_names if name in by_name]
+    Delegates to ``cube_model.build_cube_dimensions`` — the single source of the
+    cube shape — which (unlike the previous inline merge) preserves each
+    hierarchy's id / caption / time typing and marks flat dimensions as
+    attribute hierarchies. Every ``mdschema._rows_*`` builder and the member
+    discovery path consume this one list, so DISCOVER emits a consistent
+    dimension -> hierarchy -> level graph.
+    """
+    return build_cube_dimensions(raw_dimensions, hierarchy_defs)
 
 
 def _extract_member_name(member_unique_name: str | None) -> str | None:
@@ -780,6 +1160,14 @@ async def _load_hierarchy_member_data(
         if idx is not None and idx >= 0:
             expand_level = idx
 
+    # Bug-6602: a whole-level enumeration (no parent_key -> a browse of the
+    # entire level, the case that streams a multi-MB payload) is bounded to a
+    # first page; TREE_OP drills (parent_key set) are already parent-bounded and
+    # keep the full completeness cap so no child is lost.
+    if parent_key is None:
+        sample_size = _member_page_limit()
+    else:
+        sample_size = _get_settings().MEMBER_DISCOVERY_LIMIT
     try:
         preview = await get_hierarchy_preview(
             model_id=model_id,
@@ -790,7 +1178,7 @@ async def _load_hierarchy_member_data(
             # Bug-5436a: discovery member cap is configurable (was a silent 1000);
             # truncation is logged below so large hierarchies never lose members
             # without a trace.
-            sample_size=_get_settings().MEMBER_DISCOVERY_LIMIT,
+            sample_size=sample_size,
             expand_level=expand_level,
             parent_key=parent_key,
             persona_id=persona_id,
@@ -812,25 +1200,47 @@ async def _load_hierarchy_member_data(
     preview_members = preview.get("members") or []
     # Bug-5436a: never truncate member discovery silently — warn if the result
     # filled the cap (the client's filter dropdown is then incomplete).
-    _limit = _get_settings().MEMBER_DISCOVERY_LIMIT
+    # Bug-6602: the effective cap is the ``sample_size`` actually requested
+    # (the bounded page for a whole-level browse, the full completeness cap for
+    # a drill), so the warning reports the true truncation point.
+    _limit = sample_size
     if len(preview_members) >= _limit:
         logger.warning(
             "Member discovery hit the cap (%d) for model=%s hierarchy=%s level=%s — "
-            "result may be truncated; raise MEMBER_DISCOVERY_LIMIT if this dimension "
-            "is legitimately larger.",
+            "result may be truncated; raise XMLA_MEMBER_PAGE_LIMIT / "
+            "MEMBER_DISCOVERY_LIMIT if this dimension is legitimately larger.",
             _limit, model_id, hierarchy_id, expand_level,
         )
-    members_by_level[str(expand_level)] = [
+    preview_rows = [
         _to_preview_member_row(member, idx)
         for idx, member in enumerate(preview_members)
     ]
+    # F-2: the model-service preview REMOVES levels whose key attribute is
+    # excluded by the persona and indexes the served level into that FILTERED
+    # list, so the level it actually returns can differ from ``expand_level``
+    # (computed here against this hierarchy's UNFILTERED level list — the two
+    # sides diverge for a privileged caller whose auto-resolved persona differs
+    # from the catalog persona, e.g. an admin browsing a persona-variant
+    # catalog). Label the returned members by the level the PREVIEW reports
+    # (matched by level name against this hierarchy's levels) so Month members
+    # are never filed under the Quarter level. Falls back to ``expand_level``
+    # when the preview reports no recognised level name, so the common,
+    # non-skewed path is unchanged (there the served level == ``expand_level``).
+    served_level = expand_level
+    if preview_rows:
+        _level_index = {str(n): i for i, n in enumerate(level_names)}
+        served_name = str(preview_rows[0].get("level") or "")
+        mapped = _level_index.get(served_name)
+        if mapped is not None:
+            served_level = mapped
+    members_by_level[str(served_level)] = preview_rows
     if sibling_mode:
         # Bug-5431: siblings sit at the filter member's level sharing its parent;
         # stamp the canonical ancestor path (parent path + own key) so the matcher
         # resolves each sibling's identity correctly.
         _, _, _, _sfp = parse_member_uname(member_filter)
         if len(_sfp) >= 1:
-            for _row in members_by_level.get(str(expand_level), []):
+            for _row in members_by_level.get(str(served_level), []):
                 _row["key_path"] = list(_sfp[:-1]) + [_row.get("key") or _row.get("name")]
     root_members = members_by_level.get("0", [])
     return {
@@ -863,22 +1273,153 @@ async def _load_discover_member_data(
     norm = _normalize_restrictions(restrictions)
     dim_filter = (norm.get("DIMENSION_UNIQUE_NAME") or [None])[0]
     hier_filter = (norm.get("HIERARCHY_UNIQUE_NAME") or [None])[0]
-    dims_to_fetch = dimensions
+    member_filter = (norm.get("MEMBER_UNIQUE_NAME") or [None])[0]
+    level_filter = (norm.get("LEVEL_UNIQUE_NAME") or [None])[0]
+    tree_op = (norm.get("TREE_OP") or [None])[0]
+
+    # Bug-6602: restriction-aware narrowing. Previously ``dims_to_fetch`` was
+    # narrowed ONLY by DIMENSION/HIERARCHY_UNIQUE_NAME, so an Excel expand --
+    # which restricts by MEMBER_UNIQUE_NAME (+TREE_OP) or LEVEL_UNIQUE_NAME
+    # alone -- fanned a full source scan out to EVERY dimension in the model.
+    # A member/level restriction identifies exactly one owning dimension via the
+    # ``[Dim].[Hier]`` prefix, so derive it here and fetch only that dimension.
+    # ``first_bracket_body`` is bracket-aware (handles dimension names that carry
+    # a literal ``.`` or an escaped ``]]``) -- a plain ``split(".")`` would
+    # mis-parse a dotted name and return zero members for that dimension.
+    target_dim_name: str | None = None
     if dim_filter:
-        dname = dim_filter.strip("[]")
-        dims_to_fetch = [d for d in dimensions if d.get("name") == dname]
+        target_dim_name = first_bracket_body(dim_filter)
     elif hier_filter:
-        dname = hier_filter.split(".")[0].strip("[]")
-        dims_to_fetch = [d for d in dimensions if d.get("name") == dname]
+        target_dim_name = first_bracket_body(hier_filter)
+    else:
+        ref = member_filter or level_filter
+        if ref:
+            hier_bracket, _lvl, grammar, _kp = parse_member_uname(ref)
+            if hier_bracket and grammar != "invalid":
+                target_dim_name = first_bracket_body(hier_bracket)
+
+    # Bug-6603: the standalone-attribute field-list group node [Dimensions] is a
+    # containing dimension, not a real Tessallite dimension, so a DIMENSION_UNIQUE_NAME
+    # restriction of [Dimensions] must NOT narrow to a (non-existent) dimension named
+    # "Dimensions" — that would fetch zero members. Fall back to per-hierarchy /
+    # per-member narrowing; absent a finer ref, scope to the STANDALONE dims of the
+    # group (not every dimension) so the Bug-6602 fan-out bound is preserved.
+    group_browse = False
+    if target_dim_name == STANDALONE_GROUP_NAME:
+        target_dim_name = None
+        group_browse = True
+        ref = member_filter or level_filter or hier_filter
+        if ref:
+            hier_bracket, _lvl, grammar, _kp = parse_member_uname(ref)
+            if hier_bracket and grammar != "invalid":
+                target_dim_name = first_bracket_body(hier_bracket)
+            elif hier_filter:
+                target_dim_name = first_bracket_body(hier_filter)
+            if target_dim_name is not None:
+                group_browse = False
+
+    if target_dim_name is not None:
+        dims_to_fetch = [d for d in dimensions if d.get("name") == target_dim_name]
+    elif group_browse:
+        # Exactly the members of the [Dimensions] group — the standalone flat
+        # attributes, matching the group node's DIMENSION_UNIQUE_NAME.
+        dims_to_fetch = [d for d in dimensions if is_standalone_attribute(d)]
+    elif dim_filter or hier_filter or member_filter or level_filter:
+        # Bug-6802: a restriction WAS supplied but resolved to no owning
+        # dimension — e.g. LEVEL_UNIQUE_NAME=[Measures] (a legitimate MSOLAP
+        # probe that `parse_member_uname` classifies "invalid" because it is not
+        # [Dim].[Hier]...), or any restriction the grammar cannot parse. The
+        # old fallthrough fanned a full DISTINCT source scan out to EVERY
+        # dimension (N scans) for a request that identified NO real dimension.
+        # Fail NARROW: a restriction that names no Tessallite dimension owns no
+        # members, so fetch none. Only the genuinely restriction-less browse
+        # below fans out to the whole cube.
+        logger.debug(
+            "Member discovery restriction resolved to no owning dimension "
+            "(dim=%r hier=%r member=%r level=%r) for model=%s; returning no "
+            "members instead of fanning out to every dimension (Bug-6802).",
+            dim_filter, hier_filter, member_filter, level_filter, model_id,
+        )
+        dims_to_fetch = []
+    else:
+        dims_to_fetch = dimensions
+
+    page_limit = _member_page_limit()
+    # Bug-6602: the per-caller fingerprint scopes the member cache to the
+    # security context that actually filters the members. Member discovery
+    # compiles ROW-LEVEL SECURITY from the caller's Principal (not the persona),
+    # so users sharing a persona (incl. every business-base user) get different
+    # filtered lists; keying on persona alone would leak one user's rows to
+    # another. The persona still keys allow-list/persona scoping separately.
+    principal_key = member_cache.principal_fingerprint(jwt_token)
+
+    # Bug-6602: distinguish a specific-member lookup (Excel validating/resolving
+    # one selected member) from a whole-level browse. Only a browse can stream a
+    # multi-MB payload and is subject to the first-page cap; a specific-member
+    # request must NOT be capped, or a flat member beyond the page boundary would
+    # silently vanish from the pivot. (Flat dims have no parent pushdown, so the
+    # whole level is fetched and re-filtered downstream to the one member.)
+    is_specific_member = False
+    if member_filter:
+        _mhb, _mlv, _mgr, _mkp = parse_member_uname(member_filter)
+        is_specific_member = _mgr in ("key", "caption")
+    apply_flat_cap = not is_specific_member
+
+    def _cap_flat(result: dict[str, Any], *, log: bool, dname: str) -> dict[str, Any]:
+        """Bound a whole-level flat enumeration to the first page (browse only)."""
+        if not isinstance(result, dict):
+            return result
+        members = result.get("members")
+        if isinstance(members, list) and len(members) > page_limit:
+            if log:
+                logger.warning(
+                    "Member discovery for model=%s dimension=%s returned %d "
+                    "members; emitting the bounded first page of %d "
+                    "(raise XMLA_MEMBER_PAGE_LIMIT if a full browse list is "
+                    "required for this dimension).",
+                    model_id, dname, len(members), page_limit,
+                )
+            return {**result, "members": members[:page_limit]}
+        return result
 
     tasks = []
     dim_names = []
+    dim_is_hier: list[bool] = []
+    cache_keys: list[str] = []
+    member_data: dict[str, dict[str, Any]] = {}
     for d in dims_to_fetch:
         dname = d.get("name", "")
         if not dname:
             continue
+        is_hier = d.get("source") == "hierarchy"
+        # Bug-6602: the cache key is scoped by persona AND per-caller principal
+        # (security contexts). Flat dimensions enumerate the whole level
+        # irrespective of the member/level restriction, so the cached value is
+        # the FULL level (constant shape) and the browse page cap is applied
+        # AFTER the cache read; hierarchy dimensions vary by member/level/tree-op.
+        if is_hier:
+            restriction_shape = f"{member_filter or ''}|{level_filter or ''}|{tree_op or ''}"
+        else:
+            restriction_shape = ""
+        ckey = member_cache.member_key(
+            model_id=model_id,
+            persona_id=persona_id,
+            principal_key=principal_key,
+            dimension_name=dname,
+            source_type="hierarchy" if is_hier else "flat",
+            restriction_shape=restriction_shape,
+        )
+        cached = member_cache.get_member_data(ckey)
+        if cached is not None:
+            if not is_hier and apply_flat_cap:
+                member_data[dname] = _cap_flat(cached, log=False, dname=dname)
+            else:
+                member_data[dname] = cached
+            continue
         dim_names.append(dname)
-        if d.get("source") == "hierarchy":
+        dim_is_hier.append(is_hier)
+        cache_keys.append(ckey)
+        if is_hier:
             # Bug-5424: persona_id is now threaded through to
             # get_hierarchy_preview so the model-service applies both
             # hierarchy/level visibility and row-level security
@@ -901,14 +1442,363 @@ async def _load_discover_member_data(
             ))
 
     if not tasks:
-        return {}
+        return member_data
 
-    member_data: dict[str, dict[str, Any]] = {}
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    for dname, result in zip(dim_names, results):
-        if isinstance(result, dict):
+    for dname, is_hier, ckey, result in zip(dim_names, dim_is_hier, cache_keys, results):
+        if not isinstance(result, dict):
+            continue
+        # Cache the FULL (uncapped) flat level so a browse and a specific-member
+        # lookup share one entry; the browse page cap is a per-request
+        # presentation step applied below.
+        member_cache.put_member_data(ckey, result)
+        if not is_hier and apply_flat_cap:
+            member_data[dname] = _cap_flat(result, log=True, dname=dname)
+        else:
             member_data[dname] = result
     return member_data
+
+
+async def _restore_empty_axis_members(
+    *,
+    dax_statement: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    dimensions_meta: list[dict[str, Any]],
+    measures_meta: list[dict[str, Any]],
+    dim_names: set[str],
+    hierarchy_level_dim_map: dict[str, dict[str, str]],
+    hierarchy_default_dim_map: dict[str, str],
+    model_id: str,
+    tenant_slug: str,
+    jwt_token: str,
+    persona_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Bug-6658 (F-002-04): restore zero-fact axis members when NON EMPTY is absent.
+
+    SSAS's "Show items with no data" renders every member of an axis level, even
+    ones with no facts, unless NON EMPTY prunes them. The fact-driven GROUP BY the
+    translator emits only returns members present in facts, so a plain (no
+    NON EMPTY) axis previously rendered identically to a NON EMPTY one — silently
+    dropping zero-activity members.
+
+    This fetches the member domain for each axis dimension whose axis omits
+    NON EMPTY and unions the ABSENT members into ``rows`` with empty (NULL) measure
+    cells, so the member appears with blank cells. NON EMPTY thereby becomes an
+    explicit pruning operation (keep the fact-driven behaviour) rather than the
+    only behaviour.
+
+    Scope guard: applies only when the whole pivot uses at most ONE flat axis
+    dimension per axis (the common "products/periods with no activity" case). A
+    multi-dimension axis would need the FULL member cross-product, which can
+    explode; that case is left fact-driven (a documented limitation) rather than
+    risk an unbounded result. Only the axis (row/col) dimensions are considered;
+    slicer/WHERE dims are unaffected.
+    """
+    if not rows and not columns:
+        return rows
+    if not model_id:
+        return rows
+
+    col_expr = _mdx_axis_expr(dax_statement, 0)
+    row_expr = _mdx_axis_expr(dax_statement, 1)
+
+    # Resolve the axis dim columns present in the result, per axis.
+    def _axis_dims(expr: str) -> list[str]:
+        return _mdx_extract_dimensions(
+            expr, dim_names=dim_names,
+            hierarchy_level_dim_map=hierarchy_level_dim_map,
+            hierarchy_default_dim_map=hierarchy_default_dim_map,
+        )
+
+    col_dims = [d for d in _axis_dims(col_expr) if d in columns]
+    row_dims = [d for d in _axis_dims(row_expr) if d in columns]
+
+    measure_names = {str(m.get("name") or "") for m in measures_meta if m.get("name")}
+    result_measures = [c for c in columns if c in measure_names]
+
+    # Fable R1 F3: an explicit enumerated member set on an axis (e.g.
+    # ``{[Product].&[A],[Product].&[B]}`` ON ROWS) restricts the level to exactly
+    # those members. Restoration must NOT add back filtered-out members, so exclude
+    # dims whose axis carries an explicit member filter.
+    axis_text = _mdx_axis_expr(dax_statement, 0) + " " + _mdx_axis_expr(dax_statement, 1)
+    axis_member_filters = _mdx_extract_axis_member_filters(
+        axis_text, dim_names,
+        hierarchy_level_dim_map=hierarchy_level_dim_map,
+        hierarchy_default_dim_map=hierarchy_default_dim_map,
+    )
+    filtered_dims = set(axis_member_filters.keys())
+
+    # Only the dims on an axis that OMITS NON EMPTY and has no explicit member
+    # filter are eligible for restoration.
+    eligible: list[str] = []
+    if col_dims and not _mdx_axis_has_non_empty(dax_statement, 0):
+        eligible.extend(d for d in col_dims if d not in filtered_dims)
+    if row_dims and not _mdx_axis_has_non_empty(dax_statement, 1):
+        eligible.extend(d for d in row_dims if d not in filtered_dims)
+    if not eligible:
+        return rows
+
+    # Scope guard: at most one flat dim per eligible axis. A multi-dim axis needs
+    # the member cross-product, which we do not synthesise here (fail-safe: leave
+    # fact-driven, never emit an unbounded/incorrect axis).
+    elig_col = [d for d in eligible if d in col_dims]
+    elig_row = [d for d in eligible if d in row_dims]
+    if len(elig_col) > 1 or len(elig_row) > 1:
+        logger.debug(
+            "Bug-6658: multi-dimension axis omits NON EMPTY; leaving fact-driven "
+            "(empty-member restoration is scoped to single flat axis dims)."
+        )
+        return rows
+
+    # Fable R1 F4: to avoid injecting a phantom "(blank)" member on the OTHER
+    # axis (build_real_execute_response normalises None -> "(blank)" for all dim
+    # cols), restored rows are synthesised against each EXISTING other-axis member
+    # rather than setting other dims to None. For a measures-only other axis (no
+    # dims), one empty-cell row per restored member suffices.
+    other_dims_map: dict[str, list] = {}
+    for dim in eligible:
+        others = [d for d in (col_dims + row_dims) if d != dim and d in columns]
+        if others:
+            # Collect distinct tuples of the other-axis dims present in fact rows.
+            seen: dict[str, list] = {}
+            for r in rows:
+                key = str(r.get(others[0], "")) if len(others) == 1 else str(tuple(str(r.get(o, "")) for o in others))
+                if key not in seen:
+                    seen[key] = [r.get(o) for o in others]
+            other_dims_map[dim] = list(seen.values())
+        else:
+            other_dims_map[dim] = [[]]  # one empty row per restored member
+
+    added: list[dict[str, Any]] = []
+    for dim in eligible:
+        present = {str(r.get(dim)) for r in rows if r.get(dim) is not None}
+        others = [d for d in (col_dims + row_dims) if d != dim and d in columns]
+        try:
+            member_payload = await get_dimension_members(
+                model_id, dim, tenant_slug, jwt_token, persona_id=persona_id,
+            )
+        except Exception as exc:  # best-effort: a fetch failure keeps fact rows
+            logger.warning(
+                "Bug-6658: member-domain fetch for %s failed: %s", dim, exc,
+            )
+            continue
+        for m in member_payload.get("members", []):
+            key = m.get("key_value")
+            if key is None:
+                key = m.get("key")
+            if key is None:
+                continue
+            if str(key) in present:
+                continue
+            # Synthesise one empty-cell row per existing other-axis member so the
+            # restored member appears with blank cells without injecting a phantom
+            # "(blank)" member on the other axis.
+            for other_vals in other_dims_map.get(dim, [[]]):
+                new_row: dict[str, Any] = {}
+                for c in columns:
+                    new_row[c] = None
+                new_row[dim] = key
+                for meas in result_measures:
+                    new_row[meas] = None
+                for i, o in enumerate(others):
+                    if i < len(other_vals):
+                        new_row[o] = other_vals[i]
+                added.append(new_row)
+            present.add(str(key))
+
+    if not added:
+        return rows
+    return list(rows) + added
+
+
+async def _load_model_metadata_cached(
+    *,
+    model_id: str,
+    project_id: str,
+    tenant_slug: str,
+    jwt_token: str,
+    persona_id: str | None = None,
+    deployed_version_id: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch ``(measures, dimensions, hierarchy_defs)`` for a model, short-TTL
+    cached and shared by every XMLA metadata consumer (Bug-6602).
+
+    Excel / Power BI / "Analyze in Excel" burst dozens of Discover AND
+    Execute/DMV requests during connect; each otherwise re-fetched measures +
+    dimensions + hierarchies-WITH-DETAILS (one HTTP call PER hierarchy — the
+    N+1). The cache is keyed by (tenant, model, PRINCIPAL fingerprint,
+    persona_id): the model-service list endpoints auto-resolve the caller's
+    persona from the JWT and apply persona allow-list + CLS
+    restricted-column trimming BEFORE responding
+    (``resolve_effective_persona`` / Bug-6141), so the lists are
+    caller-DEPENDENT — an admin-primed unfiltered snapshot must never be served
+    to a restricted viewer, nor a viewer-primed trimmed snapshot to an admin
+    (Bug-6602 / Fable F-1). The per-caller fingerprint isolates security
+    contexts while a single caller's connect burst still de-duplicates (same
+    JWT), preserving the N+1 elimination. The gateway applies its own
+    catalog-persona allow-list + ``is_hidden`` trimming AFTER this returns. Deep
+    copies are returned (and stored) so a caller's in-place edit — including
+    nested ``levels`` lists on hierarchy defs — can never poison the snapshot.
+
+    Bug-6628: ``persona_id`` is forwarded to the model-service metadata
+    endpoints (same shape as the Bug-6263 named-sets fix). Without it,
+    ``resolve_effective_persona`` 403s for multi-persona users ('multiple
+    personas — select one') and the metadata swallowed into empty lists
+    makes Excel show an empty model. persona_id is included in the cache
+    key so different persona views for the same principal are not mixed.
+
+    Bug-7959: ``deployed_version_id`` pins ``effective_description`` to the
+    deployed snapshot.  The live model-service routes compute
+    effective_description from the CURRENT glossary state (pre-deploy edits
+    leak); the serialiser now bakes the approved glossary definitions into
+    the dimension/measure snapshot rows at deploy time.  When a
+    deployed_version_id is available, this function fetches the deployed
+    snapshot and overlays its ``effective_description`` values onto the live
+    metadata — so XMLA and JDBC both serve the same deployment-pinned
+    descriptions.
+
+    Exception-safe: like the original inline fetch, a failure part-way keeps
+    what already succeeded (e.g. measures + dimensions when only the hierarchy
+    fetch fails) rather than discarding all three. Only a COMPLETE fetch is
+    cached, so a transient upstream failure is never frozen into the cache for
+    the TTL (and a partially-degraded hierarchy-detail fetch that raises is not
+    cached either); the next request re-tries. Callers receive whatever was
+    fetched and never need their own try/except.
+
+    Bug-6628 fail-loud: an ``httpx.HTTPStatusError`` with status 403 is NOT
+    swallowed — it is re-raised so the caller surfaces a proper XMLA fault
+    instead of silently degrading to an empty catalogue. Other exceptions
+    are still caught (partial preservation).
+    """
+    import httpx as _httpx  # local import to avoid top-level dep
+
+    # F-1: scope the cache to the calling principal — the model-service filters
+    # the lists by the JWT-auto-resolved persona/CLS, so a shared (tenant, model)
+    # entry would leak one persona's visible NAMES to another within the TTL.
+    # Bug-6628: persona_id is part of the key so connecting to modelx_business
+    # and modelx_technical within one session gets separate cached snapshots.
+    principal_key = member_cache.principal_fingerprint(jwt_token)
+    persona_suffix = str(persona_id) if persona_id else ""
+    meta_key = member_cache.metadata_key(
+        tenant_slug=tenant_slug, model_id=model_id,
+        principal_key=f"{principal_key}\x01{persona_suffix}",
+    )
+    cached = member_cache.get_metadata(meta_key)
+    if cached is not None:
+        _m, _d, _h = cached
+        return copy.deepcopy(_m), copy.deepcopy(_d), copy.deepcopy(_h)
+    measures: list[dict[str, Any]] = []
+    raw_dimensions: list[dict[str, Any]] = []
+    hierarchy_defs: list[dict[str, Any]] = []
+    complete = False
+    try:
+        measures = await get_model_measures(
+            model_id, tenant_slug, jwt_token, project_id=project_id,
+            persona_id=persona_id,
+        )
+        raw_dimensions = await get_model_dimensions(
+            model_id, tenant_slug, jwt_token, project_id=project_id,
+            persona_id=persona_id,
+        )
+        hierarchy_defs = await get_model_hierarchies(
+            model_id, tenant_slug, jwt_token, project_id=project_id,
+            include_details=True, persona_id=persona_id,
+        )
+        complete = True
+    except _httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 403:
+            # Bug-6628: a 403 from the model-service means the user has
+            # multiple personas and none was specified. Re-raise so the
+            # caller can surface a proper XMLA fault (fail LOUD) instead
+            # of silently returning an empty catalogue.
+            logger.warning(
+                "Metadata fetch 403 (model %s, persona_id=%s): %s — "
+                "re-raising for XMLA fault.",
+                model_id, persona_id, exc,
+            )
+            raise
+        logger.warning("Failed to fetch model metadata: %s", exc)
+    except Exception as exc:
+        logger.warning("Failed to fetch model metadata: %s", exc)
+
+    # Bug-7959: overlay deployed snapshot effective_description onto live
+    # metadata so XMLA serves the same deployment-pinned descriptions as
+    # JDBC.  If the deployed snapshot is unavailable or has no
+    # effective_description fields (pre-fix snapshot), the live values are
+    # kept — matching the additive-field fallback contract.
+    if deployed_version_id and (measures or raw_dimensions):
+        try:
+            deployed_snap = await get_model_version_snapshot(
+                model_id, deployed_version_id, tenant_slug, jwt_token,
+                project_id=project_id,
+            )
+            _overlay_deployed_effective_descriptions(
+                measures, raw_dimensions, deployed_snap,
+            )
+        except Exception as _snap_exc:
+            # Non-fatal: if the snapshot overlay fails, XMLA degrades to
+            # live effective_description rather than failing the request.
+            logger.warning(
+                "Bug-7959: deployed snapshot overlay failed for model %s "
+                "(version %s): %s — falling back to live descriptions.",
+                model_id, deployed_version_id, _snap_exc,
+            )
+
+    if complete:
+        member_cache.put_metadata(
+            meta_key,
+            (
+                copy.deepcopy(measures),
+                copy.deepcopy(raw_dimensions),
+                copy.deepcopy(hierarchy_defs),
+            ),
+        )
+    return measures, raw_dimensions, hierarchy_defs
+
+
+def _overlay_deployed_effective_descriptions(
+    measures: list[dict[str, Any]],
+    dimensions: list[dict[str, Any]],
+    deployed_snapshot: dict[str, Any],
+) -> None:
+    """Replace live ``effective_description`` with the deployed snapshot value.
+
+    Bug-7959: the live model-service routes compute effective_description from
+    the CURRENT glossary state, which means a glossary edit appears in XMLA
+    metadata BEFORE a deploy.  The serialiser now bakes the approved glossary
+    definitions into dimension/measure snapshot rows at deploy time.  This
+    helper overlays those deployed values onto the live metadata so XMLA
+    serves the same pinned descriptions as JDBC.
+
+    Fallback: if the deployed snapshot lacks ``effective_description`` (pre-fix
+    snapshot format), the live value is kept.  This ensures backward
+    compatibility with snapshots created before Bug-7959 was fixed.
+    """
+    if not deployed_snapshot:
+        return
+
+    # Build id -> effective_description lookups from the deployed snapshot.
+    snap_dims = {
+        str(d.get("id") or ""): d.get("effective_description")
+        for d in (deployed_snapshot.get("dimensions") or [])
+    }
+    snap_meas = {
+        str(m.get("id") or ""): m.get("effective_description")
+        for m in (deployed_snapshot.get("measures") or [])
+    }
+
+    for dim in dimensions:
+        dim_id = str(dim.get("id") or "")
+        pinned = snap_dims.get(dim_id)
+        if pinned is not None:
+            dim["effective_description"] = pinned
+
+    for meas in measures:
+        meas_id = str(meas.get("id") or "")
+        pinned = snap_meas.get(meas_id)
+        if pinned is not None:
+            meas["effective_description"] = pinned
 
 
 async def _handle_discover(
@@ -927,7 +1817,7 @@ async def _handle_discover(
     logger.debug("xmla discover: type=%r catalog=%r", request_type, catalog)
 
     # Resolve model + persona from the catalog name.
-    model_id, project_id, persona = await _resolve_model_id(
+    model_id, project_id, persona, deployed_version_id = await _resolve_model_id(
         catalog, tenant_slug, jwt_token,
     )
     is_technical_view = _persona_includes_hidden(persona)
@@ -969,24 +1859,69 @@ async def _handle_discover(
             status_code=404,
         )
 
+    # Bug-6628: extract persona_id before the metadata cache call so the
+    # model-service receives the resolved persona and does not trip
+    # resolve_effective_persona's "select one" 403 for multi-persona users.
+    # Previously persona_id was extracted only after the metadata fetch, so
+    # the metadata call went without persona_id.
+    persona_id = str(persona["id"]) if persona and persona.get("id") else None
+
+    # Bug-9178 remediation: Named Queries carry no per-object persona allow-list
+    # AND the deployed snapshot does not record which dimensions a Named Query
+    # projects, so the catalogue cannot prove a given NQ is within a restricted
+    # persona's dimension scope (unlike named sets, which persona-scope by
+    # referenced-dimension id per Bug-5963). Until per-NQ dimension provenance
+    # exists, NQs are advertised ONLY on catalogue surfaces where the persona
+    # narrows NO dimensions (full-visibility); on a surface where the persona
+    # hides at least one dimension they are suppressed, so a restricted persona
+    # can never enumerate a Named Query that might reference a hidden dimension.
+    # Set True below iff filter_cube_dimensions_by_persona actually drops a dim.
+    _nq_persona_narrows_dimensions = False
+
     measures: list[dict[str, Any]] = []
     raw_dimensions: list[dict[str, Any]] = []
     hierarchy_defs: list[dict[str, Any]] = []
     discover_dimensions: list[dict[str, Any]] = []
     if model_id:
+        # Bug-6602 / F-1: the metadata is short-TTL cached per (tenant, model,
+        # PRINCIPAL, persona_id) — NOT (tenant, model) alone. The model-service
+        # list endpoints apply persona/CLS trimming before responding, so the
+        # snapshot is caller-dependent and must never be shared across principals
+        # or persona views. The gateway's catalog-persona allow-list + is_hidden
+        # trimming is applied BELOW, after this read. Kills the per-Discover
+        # hierarchy-detail N+1 for a single caller's connect burst.
         try:
-            measures = await get_model_measures(
-                model_id, tenant_slug, jwt_token, project_id=project_id,
+            measures, raw_dimensions, hierarchy_defs = await _load_model_metadata_cached(
+                model_id=model_id, project_id=project_id,
+                tenant_slug=tenant_slug, jwt_token=jwt_token,
+                persona_id=persona_id,
+                deployed_version_id=deployed_version_id,
             )
-            raw_dimensions = await get_model_dimensions(
-                model_id, tenant_slug, jwt_token, project_id=project_id,
-            )
-            hierarchy_defs = await get_model_hierarchies(
-                model_id, tenant_slug, jwt_token, project_id=project_id, include_details=True,
-            )
+        except Exception as _meta_exc:
+            # Bug-6628: a 403 from the model-service (multi-persona user
+            # without persona_id) must surface as a clear XMLA fault.
+            import httpx as _httpx
+            if (
+                isinstance(_meta_exc, _httpx.HTTPStatusError)
+                and _meta_exc.response.status_code == 403
+            ):
+                return _soap_fault(
+                    "This user account has multiple personas. "
+                    "Connect to a persona-specific catalog "
+                    f"(e.g. '{catalog}_business' or '{catalog}_technical') "
+                    "instead of the base catalog.",
+                    "Client",
+                    status_code=403,
+                )
+            raise
+        try:
             discover_dimensions = _build_discover_dimensions(raw_dimensions, hierarchy_defs)
-        except Exception as exc:
-            logger.warning("Failed to fetch model metadata: %s", exc)
+        except Exception:
+            # build_cube_dimensions is pure dict work, so a failure here is a
+            # real bug — log loud (with traceback) rather than silently degrade.
+            # The attribute-dimension fallback below still yields a usable (if
+            # hierarchy-less) catalogue instead of faulting the whole Discover.
+            logger.exception("Failed to build discover dimensions")
     if not discover_dimensions:
         discover_dimensions = list(raw_dimensions)
 
@@ -1024,16 +1959,33 @@ async def _handle_discover(
         discover_dimensions = [d for d in discover_dimensions if not d.get("is_hidden")]
 
     if persona:
-        measures, raw_dimensions, _ = _apply_persona_allow_lists(
+        # Only the persona-scoped ``measures`` is consumed downstream; the
+        # dimension surface served to clients is ``discover_dimensions``
+        # (filtered source-aware just below), so the narrowed raw-dimension
+        # list is intentionally discarded here.
+        measures, _, _ = _apply_persona_allow_lists(
             persona,
             measures=measures,
             dimensions=raw_dimensions,
         )
-        _, discover_dimensions, _ = _apply_persona_allow_lists(
-            persona,
-            measures=[],
-            dimensions=discover_dimensions,
+        # Bug-6603: the discover list mixes attribute dimensions and hierarchy
+        # dimensions, so it must be scoped source-aware — attribute dims by
+        # included_dimension_ids, hierarchies by included_hierarchy_ids.
+        # Filtering the whole list by included_dimension_ids alone (the old
+        # behaviour) silently deleted every hierarchy from a persona that
+        # populated only that list (Fable symptom 2, finding b).
+        _nq_dims_before_persona = {
+            str(d.get("name") or "") for d in discover_dimensions
+        }
+        discover_dimensions = filter_cube_dimensions_by_persona(
+            discover_dimensions, persona,
         )
+        # Bug-9178 remediation: this persona narrowed the visible dimension set,
+        # so it is a restricted surface — Named Queries are suppressed below.
+        if {
+            str(d.get("name") or "") for d in discover_dimensions
+        } != _nq_dims_before_persona:
+            _nq_persona_narrows_dimensions = True
 
     # Phase 5 of the semantic-layer plan: append synthetic trust-signal
     # measures so Excel users can drag freshness / source / owner straight
@@ -1071,10 +2023,8 @@ async def _handle_discover(
             logger.warning("Failed to list tenant models: %s", exc)
 
     restrictions = _parse_restrictions(method_el)
-    # Bug-5189: extract persona_id so member enumeration is scoped to the
-    # resolved persona. A restricted persona must not be able to enumerate
-    # dimension members it should not see.
-    persona_id = str(persona["id"]) if persona and persona.get("id") else None
+    # Bug-5189 / Bug-6628: persona_id extracted above (before the metadata
+    # cache call) so member enumeration is scoped to the resolved persona.
     member_data = {}
     if model_id and request_type.upper() == "MDSCHEMA_MEMBERS":
         member_data = await _load_discover_member_data(
@@ -1089,18 +2039,126 @@ async def _handle_discover(
 
     named_sets: list[dict[str, Any]] = []
     kpis_list: list[dict[str, Any]] = []
-    if model_id and request_type.upper() in ("MDSCHEMA_SETS", "MDSCHEMA_KPIS"):
+    named_queries: list[dict[str, Any]] = []
+    # Bug-6888: MDSCHEMA_MEASURES also needs the KPI list so the synthetic
+    # goal support measures ([Measures].[<KPI> Goal] for static targets) are
+    # present as (hidden) measure rows — Excel resolves the member advertised
+    # in MDSCHEMA_KPIS against the measures rowset.
+    if model_id and request_type.upper() in (
+        "MDSCHEMA_SETS", "MDSCHEMA_KPIS", "MDSCHEMA_MEASURES",
+    ):
         try:
             if request_type.upper() == "MDSCHEMA_SETS":
+                # Bug-6263: forward the persona resolved from the catalog name
+                # so MDSCHEMA_SETS is persona-filtered consistently with the
+                # measure/dimension/KPI surfaces (not empty for multi-persona
+                # viewers, not over-broad on persona-variant catalogs).
                 named_sets = await get_model_named_sets(
                     model_id, tenant_slug, jwt_token, project_id=project_id,
+                    persona_id=persona_id,
                 )
             else:
                 kpis_list = await get_model_kpis(
                     model_id, tenant_slug, jwt_token, project_id=project_id,
                 )
+                # Bug-7227: filter KPIs BY LINEAGE for a measure-restricted
+                # persona (was Bug-5587, which blanked the ENTIRE list — a
+                # persona restricted to some measures then saw ZERO KPIs). A KPI
+                # is advertised iff every measure in its transitive lineage is in
+                # the persona allow-list; fail closed on unverifiable lineage.
+                # Same policy the query-router $KPIs data path uses
+                # (_kpi_allowed_by_persona), applied here to the XMLA catalogue.
+                if persona and kpis_list:
+                    allow_m = {
+                        str(x)
+                        for x in (persona.get("included_measure_ids") or [])
+                    }
+                    if allow_m:
+                        kpis_list = filter_kpis_for_persona(
+                            kpis_list, measures, allow_m,
+                        )
+        except _discovery_httpx().HTTPStatusError as exc:
+            # Bug-8384: a 409 DEPLOYED_SNAPSHOT_INVALID means the model's
+            # deployed serving authority is genuinely broken, not that a
+            # transient fetch blipped. Swallowing it renders an EMPTY set/KPI
+            # catalogue in Excel with no error — indistinguishable from "this
+            # model has no named sets", which is the same deceptive-empty
+            # failure Bug-7254 rejected on the Execute path (which re-raises for
+            # exactly this reason). Fail loud so discovery and Execute agree.
+            # Return a SOAP Fault, not a bare re-raise: an unhandled exception
+            # leaves the route as an unformatted HTTP 500, which Excel shows as a
+            # generic "connection lost" carrying none of the diagnosis. Loud is
+            # only useful if it is also readable.
+            if getattr(exc.response, "status_code", None) == 409:
+                logger.error(
+                    "Deployed snapshot is invalid for model %s; failing %s "
+                    "rather than advertising an empty catalogue (Bug-8384): %s",
+                    model_id, request_type, exc,
+                )
+                return _soap_fault(
+                    _deployed_snapshot_fault_message(catalog), "Server",
+                )
+            logger.warning("Failed to load named_sets/kpis: %s", exc)
         except Exception as exc:
             logger.warning("Failed to load named_sets/kpis: %s", exc)
+
+    if kpis_list and request_type.upper() == "MDSCHEMA_MEASURES":
+        # Bug-6888: append hidden goal support measures for static-target KPIs.
+        # Bug-8288: append hidden governed-status support measures so the
+        # [Measures].[<caption> Status] member advertised in MDSCHEMA_KPIS exists
+        # as a resolvable measure a native pivot can bind.
+        measures = (
+            list(measures)
+            + kpi_goal_synthetic_measures(kpis_list, measures)
+            + kpi_status_synthetic_measures(kpis_list, measures)
+        )
+
+    # Bug-9178: advertise deployed Named Queries as first-class ``@name``
+    # tables in the DBSCHEMA_TABLES / DBSCHEMA_COLUMNS rowsets — the same
+    # relation shape the JDBC catalogue registers, so Excel / Power BI table
+    # enumeration can see and reference a Named Query. Definitions come from
+    # the DEPLOYED snapshot only (invariant 7): an undeployed draft never
+    # enters the catalogue.
+    #
+    # Bug-9178 PERSONA remediation: advertise Named Queries ONLY on catalogue
+    # surfaces where the persona narrows no dimensions
+    # (``_nq_persona_narrows_dimensions`` False). A restricted persona could
+    # otherwise enumerate a Named Query — and its column list — that projects a
+    # dimension outside its scope, defeating the persona dimension-scope
+    # boundary every sibling BI surface enforces (measures / dimensions / KPIs /
+    # hierarchies / named sets, Bug-6628/6263/5963/6800). Data rows stay
+    # RLS/CLS-protected at query time regardless; this closes the CATALOGUE
+    # (structure) leak. Full-visibility surfaces (persona=None or a persona that
+    # hides nothing) still see every deployed Named Query. Per-NQ dimension-
+    # scope filtering (so restricted personas see the NQs they ARE entitled to)
+    # is tracked as a follow-up once the snapshot records NQ dimension refs.
+    #
+    # Bug-8384 parity: a 409 DEPLOYED_SNAPSHOT_INVALID fails LOUD as a SOAP
+    # fault instead of rendering a deceptive empty table list — same policy
+    # as the named-set / KPI fetches above.
+    if (
+        not _nq_persona_narrows_dimensions
+        and model_id and deployed_version_id
+        and request_type.upper() in ("DBSCHEMA_TABLES", "DBSCHEMA_COLUMNS")
+    ):
+        try:
+            named_queries = await get_deployed_named_queries(
+                model_id, deployed_version_id, tenant_slug, jwt_token,
+                project_id=project_id,
+            )
+        except _discovery_httpx().HTTPStatusError as exc:
+            if getattr(exc.response, "status_code", None) == 409:
+                logger.error(
+                    "Deployed snapshot is invalid for model %s; failing %s "
+                    "rather than advertising an empty Named Query table list "
+                    "(Bug-8384): %s", model_id, request_type, exc,
+                )
+                return _soap_fault(
+                    _deployed_snapshot_fault_message(catalog), "Server",
+                )
+            logger.warning("Failed to load named_queries: %s", exc)
+        except Exception as exc:
+            logger.warning("Failed to load named_queries: %s", exc)
 
     xml_body = build_discover_response(
         request_type=request_type,
@@ -1117,6 +2175,7 @@ async def _handle_discover(
         hierarchy_defs=hierarchy_defs,
         named_sets=named_sets,
         kpis=kpis_list,
+        named_queries=named_queries,
     )
 
     full_response = (
@@ -1172,23 +2231,21 @@ async def _handle_tmschema_dmv(
     dimensions: list[dict[str, Any]] = []
     hierarchy_defs: list[dict[str, Any]] = []
 
-    model_id, project_id, persona = await _resolve_model_id(
+    model_id, project_id, persona, _dmv_dvid = await _resolve_model_id(
         catalog, tenant_slug, jwt_token,
     )
+    # Bug-6628: thread persona_id into metadata fetches.
+    _dmv_persona_id = str(persona["id"]) if persona and persona.get("id") else None
     if model_id:
-        try:
-            measures = await get_model_measures(
-                model_id, tenant_slug, jwt_token, project_id=project_id,
-            )
-            dimensions = await get_model_dimensions(
-                model_id, tenant_slug, jwt_token, project_id=project_id,
-            )
-            hierarchy_defs = await get_model_hierarchies(
-                model_id, tenant_slug, jwt_token, project_id=project_id,
-                include_details=True,
-            )
-        except Exception as exc:
-            logger.warning("TMSCHEMA DMV metadata fetch failed: %s", exc)
+        # Bug-6602: share the short-TTL metadata cache so a Power BI /
+        # "Analyze in Excel" DMV burst does not re-run the hierarchy-detail
+        # N+1 on every request. The helper is exception-safe (partial-preserving).
+        measures, dimensions, hierarchy_defs = await _load_model_metadata_cached(
+            model_id=model_id, project_id=project_id,
+            tenant_slug=tenant_slug, jwt_token=jwt_token,
+            persona_id=_dmv_persona_id,
+            deployed_version_id=_dmv_dvid,
+        )
 
     # Persona / hidden scoping for the TMSCHEMA DMV (Bug-5493).
     #
@@ -1235,8 +2292,9 @@ async def _handle_tmschema_dmv(
         # calculated measures, which reference columns only inside free-text DSL).
         restricted_column_names: set[str] = set()
         names_resolved = True
+        cls_snapshot: dict[str, Any] | None = None
         if persona.get("restricted_column_ids") and model_id:
-            restricted_column_names, names_resolved = (
+            restricted_column_names, names_resolved, cls_snapshot = (
                 await _resolve_restricted_column_names(
                     persona, model_id, tenant_slug, jwt_token, project_id,
                 )
@@ -1247,6 +2305,7 @@ async def _handle_tmschema_dmv(
             dimensions=dimensions,
             restricted_column_names=restricted_column_names,
             names_resolved=names_resolved,
+            snapshot=cls_snapshot,
         )
 
     col_defs, rows = build_tmschema_rowset(
@@ -1259,22 +2318,109 @@ async def _handle_tmschema_dmv(
     )
 
 
+_LEADING_MDX_COMMENT_RE = re.compile(
+    r"^\s*(?://[^\n]*|--[^\n]*|/\*.*?\*/)", re.DOTALL,
+)
+
+
+def _strip_leading_mdx_comments(text: str) -> str:
+    """Remove leading whitespace + line/block comments from a statement.
+
+    Used only to CLASSIFY a statement (DAX vs MDX) — SSAS/BI tools can prefix a
+    statement with a ``//``, ``--`` or ``/* */`` comment, and the DAX detector
+    (``^EVALUATE``/``DEFINE``) must see past it (WC3-U2). Mid-statement comments
+    are untouched (the grammar handles those as extras).
+    """
+    s = text or ""
+    while True:
+        m = _LEADING_MDX_COMMENT_RE.match(s)
+        if not m or m.end() == 0:
+            break
+        s = s[m.end():]
+    return s.lstrip()
+
+
+def _parse_mdx_for_execute(statement: str) -> ParsedMDX:
+    """Parse MDX for Execute — the structured parser is the ADMISSION AUTHORITY.
+
+    Wave C #3: the gateway FAILS CLOSED (raises ``ValueError`` → SOAP client fault)
+    when, for ANY MDX statement class (normal SELECT, WITH MEMBER/SET, DRILLTHROUGH):
+
+      * the structured MDX parser dependency is UNAVAILABLE — no structured proof
+        the statement is well-formed; or
+      * the structured parse reports a syntax/ERROR/MISSING node (``has_error``) —
+        a malformed statement, or a construct outside the grammar's supported set.
+
+    The regex/SQL translator runs ONLY after a clean structured parse: a malformed
+    MDX statement can never reach execution via a fallback interpretation.
+
+    The MDX grammar was fixed (Wave C, Bug-9443) so ``has_error`` is a RELIABLE
+    signal: comments, ``Filter``/``Left``/``CurrentMember`` predicates, subselect
+    FROM-clauses, and ``Generate``/``Ascendants`` inside WITH MEMBER/SET now parse
+    cleanly, so the gate no longer rejects valid Excel/Power BI queries.
+
+    Exemptions:
+      * DAX (``EVALUATE`` / ``DEFINE``) is not MDX — the MDX grammar cannot parse
+        it, so its ``has_error`` is meaningless here. The DAX translator
+        (``_statement_to_sql`` → ``_dax_to_sql``) is its authority and raises its
+        own client faults; DAX is admitted past the has_error gate.
+      * Genuine non-MDX surfaces (empty connection handshakes, supported
+        ``$SYSTEM.TMSCHEMA_*`` DMVs) are intercepted by the caller BEFORE this gate.
+    """
+    try:
+        parsed = parse_mdx_statement(statement)
+    except MDXParserUnavailableError as exc:
+        raise ValueError(
+            "XMLA Execute requires the structured MDX parser, but its "
+            "dependencies are not available. The statement was refused rather "
+            "than interpreted by a fallback translator. Install tree_sitter and "
+            "ensure the MDX grammar can be built."
+        ) from exc
+
+    if re.match(r"^\s*(EVALUATE|DEFINE)\b",
+                _strip_leading_mdx_comments(statement), re.IGNORECASE):
+        # DAX, not MDX — admit past the MDX has_error gate; the DAX translator is
+        # the authority and raises its own client faults. Leading comments are
+        # stripped first so ``// x\nEVALUATE ...`` is still recognised as DAX
+        # (WC3-U2).
+        return parsed
+    if parsed.has_error:
+        raise ValueError(
+            "The MDX statement could not be parsed by the structured MDX parser "
+            "(syntax error or unsupported construct) and was refused. It was not "
+            "interpreted by a fallback translator."
+        )
+    return parsed
+
+
 async def _handle_execute(
     method_el: ET.Element,
     tenant_slug: str,
     jwt_token: str,
     session_id: str = "",
 ) -> Response:
-    # Bug-5436b: an XMLA Execute whose Command is <Cancel> asks the server to
-    # abort an in-flight command on a connection/session/SPID. Tessallite holds
-    # no long-running cancellable server-side cursor — every Execute runs to
-    # completion synchronously through the query-router — so the conformant
-    # response is an empty-success ExecuteResponse acknowledging the request.
-    # This must run BEFORE statement extraction: a Cancel command carries no
-    # <Statement>, so it would otherwise fall into the empty-handshake path and
-    # (harmlessly but incorrectly) be treated as a connection probe.
+    # Bug-5888 (fixes Bug-5436b's false-success gap): an XMLA Execute whose
+    # Command is <Cancel> asks the server to abort an in-flight command on a
+    # connection/session/SPID. Tessallite does not hold a server-side cursor,
+    # but the in-flight query-router call for that session IS a real
+    # cancellable asyncio task (registered in `_xmla_inflight_tasks` by the
+    # Execute path below). Cancel now actually cancels it when one exists,
+    # instead of unconditionally claiming success. This must run BEFORE
+    # statement extraction: a Cancel command carries no <Statement>, so it
+    # would otherwise fall into the empty-handshake path and (harmlessly but
+    # incorrectly) be treated as a connection probe.
     if _is_cancel_command(method_el):
-        logger.debug("xmla cancel command acknowledged (session=%r)", session_id)
+        cancelled = False
+        async with _xmla_inflight_lock:
+            task = _xmla_inflight_tasks.get(session_id) if session_id else None
+        if task is not None and not task.done():
+            task.cancel()
+            cancelled = True
+        logger.info(
+            "xmla cancel command (session=%r): %s",
+            session_id,
+            "cancelled in-flight query" if cancelled else "no matching in-flight query",
+        )
         return _soap_response(
             '<tns:ExecuteResponse>'
             '<return>'
@@ -1316,7 +2462,7 @@ async def _handle_execute(
             dax_statement, catalog, tenant_slug, jwt_token, session_id,
         )
 
-    model_id, _project_id, persona = await _resolve_model_id(
+    model_id, _project_id, persona, _exec_dvid = await _resolve_model_id(
         catalog, tenant_slug, jwt_token,
     )
     is_technical_view = _persona_includes_hidden(persona)
@@ -1329,22 +2475,32 @@ async def _handle_execute(
             "Client",
         )
 
-    # Fetch model metadata for classifying result columns
-    measures_meta: list[dict[str, Any]] = []
-    dimensions_meta: list[dict[str, Any]] = []
-    hierarchy_defs: list[dict[str, Any]] = []
+    # Fetch model metadata for classifying result columns (Bug-6602: shared
+    # short-TTL cache — an Execute burst reuses the Discover metadata instead of
+    # re-running the hierarchy-detail N+1).
+    # Bug-6628: thread persona_id so multi-persona users get correct metadata.
     try:
-        measures_meta = await get_model_measures(model_id, tenant_slug, jwt_token, project_id=_project_id)
-        dimensions_meta = await get_model_dimensions(model_id, tenant_slug, jwt_token, project_id=_project_id)
-        hierarchy_defs = await get_model_hierarchies(
-            model_id=model_id,
-            tenant_slug=tenant_slug,
-            jwt_token=jwt_token,
-            project_id=_project_id,
-            include_details=True,
+        measures_meta, dimensions_meta, hierarchy_defs = await _load_model_metadata_cached(
+            model_id=model_id, project_id=_project_id,
+            tenant_slug=tenant_slug, jwt_token=jwt_token,
+            persona_id=persona_id,
+            deployed_version_id=_exec_dvid,
         )
-    except Exception as exc:
-        logger.warning("Failed to fetch model metadata for Execute: %s", exc)
+    except Exception as _exec_meta_exc:
+        import httpx as _httpx
+        if (
+            isinstance(_exec_meta_exc, _httpx.HTTPStatusError)
+            and _exec_meta_exc.response.status_code == 403
+        ):
+            return _soap_fault(
+                "This user account has multiple personas. "
+                "Connect to a persona-specific catalog "
+                f"(e.g. '{catalog}_business' or '{catalog}_technical') "
+                "instead of the base catalog.",
+                "Client",
+                status_code=403,
+            )
+        raise
 
     # Bug-5499: fetch saved named sets and inline their expressions into the
     # MDX statement BEFORE any axis extraction, SQL translation, or response
@@ -1354,11 +2510,41 @@ async def _handle_execute(
     # measure reference — so the axis renders empty.
     execute_named_sets: list[dict[str, Any]] = []
     try:
+        # Bug-6263: scope Execute-time inlining to the resolved persona so a
+        # restricted persona never has a set built on a dimension it cannot see
+        # inlined into its query, and so multi-persona viewers keep working
+        # inlining (the unscoped call tripped a "please select one" 403 that
+        # left every set un-inlined). persona_id is resolved from the catalog
+        # name above.
         execute_named_sets = await get_model_named_sets(
             model_id, tenant_slug, jwt_token, project_id=_project_id,
+            persona_id=persona_id,
         )
     except Exception as exc:
-        logger.debug("Named sets not available for Execute inlining: %s", exc)
+        # Bug-7254: fail CLOSED on a named-set fetch failure. The previous
+        # behavior silently swallowed the error (DEBUG log only) and proceeded
+        # with no set inlining; any query referencing a named set then returned
+        # empty axes that looked like "no data" -- a silent fail-open that
+        # confused users into thinking the data was missing. Re-raising makes
+        # the fetch failure visible as a query error (the BI client shows a
+        # server error, not a deceptive empty result). Models with NO named
+        # sets return an empty list (not an error), so this only fires on
+        # actual API/network failures.
+        logger.error(
+            "Named-set fetch failed for Execute; failing the query to avoid "
+            "returning misleading empty axes (Bug-7254): %s", exc,
+        )
+        # Bug-8384: sending ``deployed_only=true`` made 409
+        # DEPLOYED_SNAPSHOT_INVALID a reachable outcome on THIS call, where it
+        # previously could not occur. A bare re-raise leaves the route as an
+        # unformatted HTTP 500 (``dispatch_xmla`` only converts a downstream
+        # 401), so Excel shows a generic "connection lost" carrying none of the
+        # diagnosis — while a fresh Discover against the SAME broken model
+        # returns a clear fault. Return the same readable fault here so the two
+        # surfaces agree instead of contradicting each other.
+        if getattr(getattr(exc, "response", None), "status_code", None) == 409:
+            return _soap_fault(_deployed_snapshot_fault_message(catalog), "Server")
+        raise
     if execute_named_sets:
         dax_statement = _inline_named_sets(dax_statement, execute_named_sets)
         logger.debug(
@@ -1375,10 +2561,76 @@ async def _handle_execute(
     # MDX DRILLTHROUGH — route through the semantic drill-through pipeline
     # instead of the normal MDX→SQL translation. Excel sends DRILLTHROUGH
     # on double-click; the response is a flat Rowset, not MDDataSet.
-    parsed_mdx = parse_mdx_statement(dax_statement)
-    if parsed_mdx.is_drillthrough:
+    # Wave C #3: the structured MDX parser is the ADMISSION AUTHORITY. A syntax
+    # error / unsupported construct (has_error) or an unavailable parser fails
+    # closed here as a SOAP client fault — a malformed statement never reaches the
+    # regex translator via a "fallback interpretation". Normal SELECT now follows
+    # the same law DRILLTHROUGH and WITH MEMBER/SET already do.
+    try:
+        parsed_mdx = _parse_mdx_for_execute(dax_statement)
+    except ValueError as exc:
+        return _soap_fault(str(exc), "Client")
+
+    # Wave C #11: XMLA <Parameters> → model session_vars (app.<name>). Parse the
+    # scalar parameter block, reject any duplicate / malformed / table-valued /
+    # expression-valued / UNDECLARED parameter as a SOAP client fault, and map each
+    # declared parameter to app.<name>. The mapping is passed into EVERY query this
+    # Execute generates (detail, subtotal, grand-total, secondary-grain) through
+    # the single ``_execute_query`` wrapper below, so a new sub-query branch cannot
+    # silently omit it. User values are NEVER substituted into the MDX text; they
+    # only scope the existing row-security / default-filter resolver.
+    #
+    # B1 (decision #11 gap): this MUST run BEFORE the DRILLTHROUGH branch below.
+    # A DRILLTHROUGH Execute is result-bearing exactly like a SELECT, so its detail
+    # query has to be scoped by the same declared parameters, and a malformed /
+    # duplicate / undeclared / table-valued <Parameters> on a DRILLTHROUGH must
+    # FAULT here — never be silently ignored. ``_param_session_vars`` is threaded
+    # into ``handle_drillthrough`` so the drill path and the MDX path share one
+    # parameter contract.
+    try:
+        _xmla_params = _parse_xmla_parameters(method_el)
+    except ValueError as exc:
+        return _soap_fault(str(exc), "Client")
+    _param_session_vars: dict[str, str] | None = None
+    if _xmla_params:
         try:
-            xml_body, dt_warnings = await handle_drillthrough(
+            _declared_params = await get_model_parameters(
+                model_id, tenant_slug, jwt_token, project_id=_project_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "XMLA parameter validation could not load declared model "
+                "parameters: %s", exc,
+            )
+            return _soap_fault(
+                "Could not validate the supplied XMLA parameters against the model.",
+                "Server",
+            )
+        _declared_names = {
+            str(p.get("name", "")).lstrip("@").strip().lower()
+            for p in _declared_params if isinstance(p, dict)
+        }
+        _undeclared = sorted(n for n in _xmla_params if n not in _declared_names)
+        if _undeclared:
+            return _soap_fault(
+                "Unknown model parameter(s): " + ", ".join(_undeclared)
+                + ". Only parameters declared on the model may be supplied.",
+                "Client",
+            )
+        _param_session_vars = {f"app.{n}": v for n, v in _xmla_params.items()}
+
+    if parsed_mdx.is_drillthrough:
+        # Bug-8048: DRILLTHROUGH pagination is an OPT-IN Tessallite extension.
+        # A client that wants stable pages sends the ``DrillthroughCursor``
+        # Execute property — empty on the first page, then the token from the
+        # previous response. Only such a client gets the continuation element
+        # back, so Excel/Power BI (which never send the property) see a byte-
+        # identical ExecuteResponse and no unknown sibling element that a
+        # strict MSOLAP parser could reject.
+        wants_cursor = _DRILLTHROUGH_CURSOR_PROPERTY in properties
+        cursor = properties.get(_DRILLTHROUGH_CURSOR_PROPERTY) or None
+        try:
+            drill = await handle_drillthrough(
                 parsed=parsed_mdx,
                 tenant_slug=tenant_slug,
                 jwt_token=jwt_token,
@@ -1386,6 +2638,8 @@ async def _handle_execute(
                 dimensions_meta=dimensions_meta,
                 hierarchy_defs=hierarchy_defs,
                 persona_id=persona_id,
+                cursor=cursor,
+                session_vars=_param_session_vars,
             )
         except ValueError as exc:
             logger.warning("DRILLTHROUGH failed: %s", exc)
@@ -1395,17 +2649,42 @@ async def _handle_execute(
             return _soap_fault(str(exc), "Server")
 
         messages_xml = ""
-        if dt_warnings:
+        if drill.warnings:
             msgs = "".join(
                 f'<Warning><Description>{_escape_xml(w)}</Description></Warning>'
-                for w in dt_warnings
+                for w in drill.warnings
             )
             messages_xml = f"<Messages>{msgs}</Messages>"
 
+        # The token is opaque: the client echoes it back verbatim as the next
+        # request's ``DrillthroughCursor`` property. Absent element == no more
+        # pages.
+        cursor_xml = ""
+        if wants_cursor and drill.next_cursor:
+            cursor_xml = (
+                f"<tns:{_DRILLTHROUGH_CURSOR_PROPERTY}>"
+                f"{_escape_xml(drill.next_cursor)}"
+                f"</tns:{_DRILLTHROUGH_CURSOR_PROPERTY}>"
+            )
+
         return _soap_response(
-            f'<tns:ExecuteResponse>{xml_body}{messages_xml}</tns:ExecuteResponse>',
+            f'<tns:ExecuteResponse>'
+            f'{drill.xml_body}{messages_xml}{cursor_xml}'
+            f'</tns:ExecuteResponse>',
             session_id=session_id,
         )
+
+    # Wave C #11 parameter parsing + validation now runs ABOVE the DRILLTHROUGH
+    # branch (see the block after ``_parse_mdx_for_execute``) so both the drill
+    # path and the MDX path share one parameter contract. ``_param_session_vars``
+    # is already resolved here.
+    async def _execute_query(**kwargs):
+        # Wave C #11: the SINGLE funnel for every query this Execute generates. The
+        # XMLA parameter -> session_vars mapping is injected here so no sub-query
+        # branch (detail / subtotal / grand-total / secondary-grain) can omit it.
+        if _param_session_vars and not kwargs.get("session_vars"):
+            kwargs["session_vars"] = _param_session_vars
+        return await execute_query(**kwargs)
 
     # Phase 5 of the semantic-layer plan: intercept MDX that only touches
     # the synthetic Info measures so the executor can return the real
@@ -1443,6 +2722,13 @@ async def _handle_execute(
     # KPI's published value/goal/status/trend rather than falling through to a
     # default measure and faulting. Returns None when no KPI function is present.
     try:
+        # Bug-5587: pass persona measure allow-list so Execute path
+        # refuses KPI member functions for restricted personas,
+        # consistent with the Discover MDSCHEMA_KPIS filter.
+        _persona_allow_m: set[str] | None = None
+        if persona:
+            _raw_ids = persona.get("included_measure_ids") or []
+            _persona_allow_m = {str(x) for x in _raw_ids} or None
         kpi_cell = await _maybe_resolve_kpi_members(
             statement=dax_statement,
             model_id=model_id,
@@ -1457,6 +2743,7 @@ async def _handle_execute(
             model_slug=catalog or "",
             persona_id=persona_id,
             is_technical_view=is_technical_view,
+            persona_included_measure_ids=_persona_allow_m,
         )
     except ValueError as exc:
         logger.warning("KPI member resolution failed: %s", exc)
@@ -1505,6 +2792,263 @@ async def _handle_execute(
         col_expr, row_expr, hierarchy_defs, hierarchy_level_dim_map,
     )
 
+    # Bug-6888: resolve static-KPI goal support members ([Measures].[<KPI> Goal])
+    # to their constant values. They are not SQL columns — drop them from SQL
+    # resolution (constant_measure_names) and post-join the constants after the
+    # rows return, mirroring the Info-measure contract.
+    # Bug-8288 review R3 F1/F2: the KPI goal/status const blocks MUST resolve
+    # against the SAME measure + KPI surface the Discover MDSCHEMA path advertises,
+    # or Execute and the catalogue diverge (Bug-6702 / Bug-7227 parity). A
+    # non-technical view hides is_hidden measures (so a hidden-backed KPI is withheld
+    # from MDSCHEMA and must not be served here either — via a hand-written member),
+    # and a measure-restricted persona sees only lineage-allowed KPIs. Both const
+    # blocks below use this surface set for their visibility/collision checks and
+    # persona-filter the loaded KPI list, exactly as Discover does.
+    _kpi_surface_measures = (
+        measures_meta if is_technical_view
+        else [m for m in measures_meta if not m.get("is_hidden")]
+    )
+
+    def _persona_filter_kpis(_kpis: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if _persona_allow_m and _kpis:
+            return filter_kpis_for_persona(_kpis, _kpi_surface_measures, _persona_allow_m)
+        return _kpis
+
+    kpi_goal_consts: dict[str, str] = {}
+    if model_id and "Goal]" in dax_statement:
+        try:
+            _kpis_for_goals = await get_model_kpis(
+                model_id, tenant_slug, jwt_token, project_id=_project_id,
+            )
+        except Exception as exc:
+            logger.warning("Failed to load KPIs for goal member resolution: %s", exc)
+            _kpis_for_goals = []
+        # Bug-7227 parity: withhold a persona-excluded KPI's goal, same as Discover.
+        _kpis_for_goals = _persona_filter_kpis(_kpis_for_goals)
+        _mm_by_id = {str(m.get("id", "")): m for m in measures_meta}
+        # Bug-6942 + Bug-6702 parity: collision check against the SURFACE-VISIBLE
+        # measures so a hidden real measure does not diverge Execute from Discover.
+        _real_measure_lower = {
+            (m.get("name") or "").lower()
+            for m in _kpi_surface_measures if m.get("name")
+        }
+        _seen_goal_supports: set[str] = set()
+        for _kpi in _kpis_for_goals:
+            _support = kpi_goal_support_measure_name(_kpi)
+            # Bug-8288 review finding 2 (pre-existing Bug-6888 seam): match the FULL
+            # advertised member unique name, not a bare ``[<support>]`` token. A bare
+            # token also matches a same-named DIMENSION/hierarchy/member on an axis
+            # (e.g. a dimension "aa Goal" next to a KPI "aa"), and the post-join then
+            # OVERWRITES that dimension column on every row -> silently wrong numbers.
+            # The unique name Excel binds is exactly ``[Measures].[<escaped support>]``.
+            _goal_member = f"[Measures].[{_escape_mdx_bracket_name(_support)}]"
+            if _support and _goal_member in dax_statement:
+                # Bug-6942: skip constant substitution when the support name
+                # collides with a real measure -- the real measure's aggregated
+                # value must not be replaced with the KPI's static target.
+                if _support.lower() in _real_measure_lower:
+                    continue
+                # Review R2 finding 1 (goal parity with the status path): two KPIs
+                # sharing a caption produce the same goal support member. Refuse
+                # loudly rather than silently serving the last KPI's target for both.
+                if _support in _seen_goal_supports:
+                    return _soap_fault(
+                        f"KPI goal member '{_support}' is ambiguous: more than one "
+                        "KPI resolves to this goal member. Rename the KPIs so their "
+                        "captions are unique.",
+                        "Client",
+                    )
+                _goal_val = kpi_goal_static_value(_kpi, _mm_by_id)
+                if _goal_val:
+                    _seen_goal_supports.add(_support)
+                    kpi_goal_consts[_support] = _goal_val
+
+    # Bug-8288: resolve synthetic governed-status support members
+    # ([Measures].[<KPI> Status]) to the governed −1/0/1 RAG verdict. A native
+    # Excel pivot "Status" checkbox binds this member directly (no KPIStatus()
+    # token), so it would otherwise resolve the raw value member through the SQL
+    # path. Like the goal constants, the member is NOT a SQL column: drop it from
+    # SQL resolution (constant_measure_names) and post-join the governed verdict
+    # after the rows return. The governed authority is model-wide — the single
+    # /evaluate route takes no runtime slice — so a status member requested WITH a
+    # dimension breakdown / slicer cannot be governed-sliced. Refuse it with a
+    # clear client fault rather than repeat one model-wide verdict across every
+    # slice (which would be silently wrong). A sliced governed status needs
+    # model-service /evaluate slice support (Bug-8287, cross-service).
+    kpi_status_consts: dict[str, int | None] = {}
+    if model_id and "Status]" in dax_statement:
+        try:
+            _kpis_for_status = await get_model_kpis(
+                model_id, tenant_slug, jwt_token, project_id=_project_id,
+            )
+        except Exception as exc:
+            logger.warning("Failed to load KPIs for status member resolution: %s", exc)
+            _kpis_for_status = []
+        # Bug-7227 parity: withhold a persona-excluded KPI's status, as Discover does.
+        _kpis_for_status = _persona_filter_kpis(_kpis_for_status)
+        # Bug-6702 parity: collision check against the SURFACE-VISIBLE measures.
+        _real_measure_lower_s = {
+            (m.get("name") or "").lower()
+            for m in _kpi_surface_measures if m.get("name")
+        }
+        _status_members: list[tuple[str, dict[str, Any]]] = []
+        _seen_status_supports: set[str] = set()
+        for _kpi in _kpis_for_status:
+            _support = kpi_status_support_measure_name(_kpi)
+            if not _support:
+                continue
+            # Bug-8288 review finding 1/3: match the FULL advertised member unique
+            # name (``[Measures].[<escaped support>]``, exactly what MDSCHEMA_KPIS
+            # advertises and Excel binds), NOT a bare ``[<support>]`` token. A bare
+            # token also matches a same-named DIMENSION on an axis (e.g. a dimension
+            # "aa Status" next to a KPI "aa"), which would spuriously trip the
+            # dimension-breakdown fail-loud and deny an innocent pivot.
+            _status_member = f"[Measures].[{_escape_mdx_bracket_name(_support)}]"
+            if _status_member not in dax_statement:
+                continue
+            # Bug-6942 parity: never hijack a real measure of the same name.
+            if _support.lower() in _real_measure_lower_s:
+                continue
+            # Bug-6702 parity: resolve the value against the SURFACE-VISIBLE set so a
+            # hidden-backed KPI (withheld from MDSCHEMA on a non-technical view) is
+            # not served here either — it fails need-support and falls through.
+            if not kpi_status_needs_support_measure(_kpi, _kpi_surface_measures):
+                continue
+            # Review finding 4: two KPIs sharing a caption produce the same support
+            # member. Refuse loudly rather than silently letting one verdict win.
+            if _support in _seen_status_supports:
+                return _soap_fault(
+                    f"KPI status member '{_support}' is ambiguous: more than one "
+                    "KPI resolves to this status member. Rename the KPIs so their "
+                    "captions are unique.",
+                    "Client",
+                )
+            _seen_status_supports.add(_support)
+            _status_members.append((_support, _kpi))
+        if _status_members:
+            # Governed KPI status is model-wide; refuse a dimension breakdown or
+            # slicer rather than serving one verdict across many slices.
+            _status_axis_dims = _mdx_extract_dimensions(
+                col_expr + " " + row_expr,
+                dim_names=dim_names,
+                hierarchy_level_dim_map=hierarchy_level_dim_map,
+                hierarchy_default_dim_map=hierarchy_default_dim_map,
+            )
+            _status_where = _mdx_where_expr(dax_statement)
+            _status_where_filters = _mdx_extract_where_filters(
+                _status_where, dim_names,
+                hierarchy_level_dim_map=hierarchy_level_dim_map,
+                hierarchy_default_dim_map=hierarchy_default_dim_map,
+            ) if _status_where else {}
+            if _status_axis_dims or _status_where_filters:
+                _rep = _status_members[0][0]
+                return _soap_fault(
+                    f"KPI status member '{_rep}' was requested with a dimension "
+                    "breakdown or slicer. The governed KPI status is evaluated "
+                    "model-wide and cannot be sliced by a dimension; query the KPI "
+                    "status without a dimension breakdown, or use the underlying "
+                    "measure.",
+                    "Client",
+                )
+            for _support, _kpi in _status_members:
+                _kpi_id = str(_kpi.get("id") or "")
+                if not _kpi_id:
+                    return _soap_fault(
+                        f"KPI status member '{_support}' cannot be evaluated: the "
+                        "KPI has no id for the governed evaluation authority.",
+                        "Client",
+                    )
+                try:
+                    _ev = await evaluate_kpi_governed(
+                        kpi_id=_kpi_id,
+                        model_id=model_id,
+                        project_id=_project_id,
+                        tenant_slug=tenant_slug,
+                        jwt_token=jwt_token,
+                        persona_id=persona_id,
+                    )
+                except ValueError as exc:
+                    logger.warning("KPI status member resolution failed: %s", exc)
+                    return _soap_fault(str(exc), "Client")
+                except Exception as exc:
+                    # R4 finding 2: a transport failure (model-service down /
+                    # timeout) must degrade to a SOAP Server fault, the same as the
+                    # KPI member-function path — not escape as a raw HTTP 500.
+                    logger.error("KPI status member resolution error: %s", exc)
+                    return _soap_fault(str(exc), "Server")
+                _st = _ev.get("status")
+                kpi_status_consts[_support] = int(_st) if _st is not None else None
+
+    # Bug-8288 review R2 finding 2+3: when the statement references ONLY constant
+    # members (KPI goal/status support members) and no axis dimension, every measure
+    # has been dropped from SQL resolution -> _mdx_to_sql would expand to ALL model
+    # measures (a needless full scan, and a spurious "LAST_NON_EMPTY requires a
+    # DATE/TIME grain" fault on models carrying an LNE measure). Short-circuit to a
+    # single synthetic grand-total cell — the same pattern as the info-measure and
+    # KPI member-function paths — instead of inventing a measure set. This also
+    # guarantees the goal + status columns are both populated on the single cell
+    # even when no real measure (and thus no router row) is present.
+    if kpi_goal_consts or kpi_status_consts:
+        _const_supports = set(kpi_goal_consts) | set(kpi_status_consts)
+        # Bug-8751 consumer alignment (deep-review R2 finding 6): the FIFTH
+        # derivation of the SQL measure set. Using the raw axis extraction here
+        # counted a WITH-declared calc member as a real measure, so the
+        # short-circuit did not fire and _mdx_to_sql fell through to its
+        # all-model-measures expansion — the exact needless full scan (and
+        # spurious LNE-grain fault) this block exists to prevent. Same helper as
+        # the other four consumers; it already drops the constants.
+        _non_const_measures = _sql_measure_set(
+            dax_statement,
+            col_expr + " " + row_expr + " " + _mdx_where_expr(dax_statement),
+            constant_measure_names=_const_supports,
+        )
+        _consts_only_axis_dims = _mdx_extract_dimensions(
+            col_expr + " " + row_expr,
+            dim_names=dim_names,
+            hierarchy_level_dim_map=hierarchy_level_dim_map,
+            hierarchy_default_dim_map=hierarchy_default_dim_map,
+        )
+        if not _non_const_measures and not _consts_only_axis_dims:
+            # Preserve the MDX axis order of the members for the response.
+            def _member_pos(_s: str) -> int:
+                _m = f"[Measures].[{_escape_mdx_bracket_name(_s)}]"
+                _idx = dax_statement.find(_m)
+                return _idx if _idx >= 0 else 1 << 30
+            _cc_columns = sorted(_const_supports, key=_member_pos)
+            _cc_row: dict[str, Any] = {}
+            for _s in _cc_columns:
+                if _s in kpi_status_consts:
+                    _cc_row[_s] = kpi_status_consts[_s]
+                else:
+                    _graw = kpi_goal_consts[_s]
+                    try:
+                        _cc_row[_s] = float(_graw)
+                    except (TypeError, ValueError):
+                        _cc_row[_s] = _graw
+            _cc_measures = list(measures_meta) + [
+                {"name": _s, "display_name": _s, "default_agg": "max",
+                 "is_hidden": False}
+                for _s in _cc_columns
+            ]
+            try:
+                xml_body = build_real_execute_response(
+                    mdx=dax_statement,
+                    catalog=catalog or tenant_slug,
+                    columns=_cc_columns,
+                    rows=[_cc_row],
+                    measures_meta=_cc_measures,
+                    dimensions_meta=dimensions_meta,
+                    axis_format=properties.get("AxisFormat", ""),
+                    client_app_name=properties.get("SspropInitAppName", ""),
+                )
+            except ValueError as exc:
+                logger.warning("Execute response build failed: %s", exc)
+                return _soap_fault(str(exc), "Client")
+            return _soap_response(
+                f'<tns:ExecuteResponse>{xml_body}</tns:ExecuteResponse>',
+                session_id=session_id,
+            )
+
     # Translate Execute statement (MDX or DAX) -> SQL for query-router execution.
     try:
         sql, protocol = _statement_to_sql(
@@ -1514,14 +3058,26 @@ async def _handle_execute(
             hierarchy_meta=hierarchy_defs,
             model_slug=catalog or "",
             subtotal_hierarchies=subtotal_hierarchies,
+            constant_measure_names=set(kpi_goal_consts) | set(kpi_status_consts),
         )
     except ValueError as exc:
         logger.warning("Execute translation failed: %s", exc)
         return _soap_fault(str(exc), "Client")
     logger.info("[XMLA-EXEC] stmt=%r -> SQL=%r protocol=%s", dax_statement[:200], sql[:200], protocol)
 
-    try:
-        result = await execute_query(
+    # Bug-5888: run the router call as a task registered under this session's
+    # SessionId so a same-session <Cancel> can actually cancel it (see the
+    # registry docstring above and the Cancel handling near the top of this
+    # function). Sessionless requests (session_id == "") are not trackable
+    # and simply run un-cancellable, as before.
+    cancel_key = session_id or None
+    # Bug-8285: ask the router to project friendly member captions for any axis
+    # dimension that declares a distinct display column, so the Execute axis can
+    # render display names instead of raw keys (the consumer,
+    # _normalize_member_captions, reads the returned <dim>__caption column).
+    _caption_dims = _caption_dimension_names(dimensions_meta)
+    inflight = asyncio.ensure_future(
+        _execute_query(
             model_id=model_id,
             sql=sql,
             tenant_slug=tenant_slug,
@@ -1529,10 +3085,42 @@ async def _handle_execute(
             protocol=protocol,
             include_hidden=is_technical_view,
             persona_id=persona_id,
+            caption_dimensions=_caption_dims or None,
         )
+    )
+    if cancel_key:
+        async with _xmla_inflight_lock:
+            _xmla_inflight_tasks[cancel_key] = inflight
+    try:
+        result = await inflight
+    except asyncio.CancelledError:
+        logger.info(
+            "XMLA Execute cancelled by client Cancel request (session=%r)",
+            session_id,
+        )
+        return _soap_fault("Query cancelled by client request.", "Client")
+    except (QueryByteCeilingExceeded, GatewayQueryRateLimitExceeded) as exc:
+        logger.warning("Bug-7745: gateway resource limit: %s", exc)
+        return _soap_fault(str(exc), "Client")
+    except QueryRouterError as exc:
+        # Wave C #5: a 403 from the query-router execute path is an ACCESS DENIAL
+        # (persona / CLS / RLS), including a query that references a CLS-blocked
+        # column. Surface it as an XMLA access-denied SOAP CLIENT fault, not a
+        # generic Server fault — the uniform CLS contract across surfaces (REST
+        # 403 / JDBC 42501 / XMLA access-denied). Never a partial/redacted result.
+        if exc.status_code == 403:
+            logger.info("XMLA Execute access denied (403): %s", exc.detail)
+            return _soap_fault(exc.detail, "Client", status_code=403)
+        logger.error("Query execution failed: %s", exc)
+        return _soap_fault(str(exc), "Server")
     except Exception as exc:
         logger.error("Query execution failed: %s", exc)
         return _soap_fault(str(exc), "Server")
+    finally:
+        if cancel_key:
+            async with _xmla_inflight_lock:
+                if _xmla_inflight_tasks.get(cancel_key) is inflight:
+                    _xmla_inflight_tasks.pop(cancel_key, None)
 
     columns = result.get("columns", [])
     rows = result.get("rows", [])
@@ -1548,8 +3136,16 @@ async def _handle_execute(
         for m in measures_meta
         if m.get("name")
     }
-    flat_mdx_measures = _mdx_extract_measures(
-        col_expr + " " + row_expr + " " + _mdx_where_expr(dax_statement)
+    # Bug-8751 review finding 1: derive the measure set through the SAME helper
+    # ``_mdx_to_sql`` used. A LAST_NON_EMPTY measure referenced only from the
+    # WITH prelude makes ``_mdx_to_sql`` append a HIDDEN time grain to the GROUP
+    # BY; if this consumer computes a narrower (axis-only) set it decides there
+    # is no LNE measure, never collapses that grain back out, and the pivot
+    # renders NO cells at all with a 200 and no fault.
+    flat_mdx_measures = _sql_measure_set(
+        dax_statement,
+        col_expr + " " + row_expr + " " + _mdx_where_expr(dax_statement),
+        constant_measure_names=set(kpi_goal_consts) | set(kpi_status_consts),
     )
     flat_lne_measures = _lne_measures_for_mdx(
         flat_mdx_measures, measures_meta, flat_measure_canonical,
@@ -1568,7 +3164,36 @@ async def _handle_execute(
         measures_meta=measures_meta,
     )
 
+    # Bug-6658 (F-002-04): "Show items with no data". SSAS renders every member
+    # of an axis level — including members with zero facts — when NON EMPTY is
+    # ABSENT. The fact-driven GROUP BY only returns members present in facts, so
+    # without this the pivot silently drops zero-activity members (a planner
+    # cannot see a product/period/entity with no activity). When an axis omits
+    # NON EMPTY, fetch the member domain and union the absent members in with
+    # empty (NULL) cells, making NON EMPTY an explicit PRUNING operation rather
+    # than the only behaviour. Scoped to plain flat pivots (no subtotal
+    # hierarchies) so the cost and cross-product stay bounded.
+    if not subtotal_hierarchies:
+        rows = await _restore_empty_axis_members(
+            dax_statement=dax_statement,
+            columns=columns,
+            rows=rows,
+            dimensions_meta=dimensions_meta,
+            measures_meta=measures_meta,
+            dim_names=dim_names,
+            hierarchy_level_dim_map=hierarchy_level_dim_map,
+            hierarchy_default_dim_map=hierarchy_default_dim_map,
+            model_id=model_id,
+            tenant_slug=tenant_slug,
+            jwt_token=jwt_token,
+            persona_id=persona_id,
+        )
+
     subtotal_info = None
+    # Bug-6946: collect names of grain queries that fail so a SOAP <Warning>
+    # can surface the degrade to the client instead of silently omitting
+    # subtotal/grand-total rows.
+    _failed_grain_labels: list[str] = []
     if subtotal_hierarchies and rows:
         subtotal_info = subtotal_hierarchies[0] if len(subtotal_hierarchies) == 1 else None
 
@@ -1579,7 +3204,14 @@ async def _handle_execute(
             hierarchy_default_dim_map=hierarchy_default_dim_map,
         )
         all_text = col_expr + " " + row_expr + " " + _mdx_where_expr(dax_statement)
-        mdx_measures = _mdx_extract_measures(all_text)
+        # Same shared derivation as the detail SQL (Bug-8751 review finding 1):
+        # the GRAIN queries must project the same measure columns the detail
+        # query does, or the merged result carries a measure at detail grain that
+        # the subtotal rows are missing.
+        mdx_measures = _sql_measure_set(
+            dax_statement, all_text,
+            constant_measure_names=set(kpi_goal_consts) | set(kpi_status_consts),
+        )
         where_filters = _mdx_extract_where_filters(
             _mdx_where_expr(dax_statement), dim_names,
             hierarchy_level_dim_map=hierarchy_level_dim_map,
@@ -1602,14 +3234,32 @@ async def _handle_execute(
                 if v not in existing:
                     existing.append(v)
             where_filters[dim] = existing
+        # Bug-5548: an enumerated member set on the axis must restrict the
+        # subtotal/grand-total GRAIN queries too, otherwise filtered detail rows
+        # would sit beneath an unfiltered subtotal (the Bug-1050 class of fault).
+        # Mirrors the detail-SQL merge in _mdx_to_sql; a bare .Members expansion
+        # adds nothing.
+        _grain_axis_filters = _mdx_extract_axis_member_filters(
+            col_expr + " " + row_expr, dim_names,
+            hierarchy_level_dim_map=hierarchy_level_dim_map,
+            hierarchy_default_dim_map=hierarchy_default_dim_map,
+        )
+        for dim, vals in _grain_axis_filters.items():
+            existing = where_filters.get(dim, [])
+            for v in vals:
+                if v not in existing:
+                    existing.append(v)
+            where_filters[dim] = existing
         measure_canonical: dict[str, str] = {}
         for m in measures_meta:
             mname = m.get("name", "")
             if mname:
                 measure_canonical[mname.lower()] = mname
 
+        _subtotal_dim_types = _dim_type_map_from_meta(dimensions_meta)
         where_sql = _build_where_sql_clauses(
-            where_filters, lambda n: f'"{n}"',
+            where_filters, lambda n: _qi("postgresql", n),
+            dim_type_map=_subtotal_dim_types,
         )
         # F-002-02: the subtotal / grand-total GRAIN queries must honour the
         # same label filters (Begins/Ends-With, Contains) the detail SQL path
@@ -1618,14 +3268,62 @@ async def _handle_execute(
         # Subselect slicers are already merged above (Bug-1050); label filters
         # live in the axis expressions, not the WHERE clause, so extract them
         # from col_expr + row_expr here.
-        _subtotal_label_specs = _extract_label_filter_specs(
+        # Bug-8925/Bug-8926: the SAME translator as the detail-SQL path, so a
+        # label-filter shape supported by one path can never be silently ignored
+        # by another. The rendered clause is reused verbatim.
+        _subtotal_label_filters = _translate_label_filter_calls(
             col_expr + " " + row_expr,
             dim_names,
             hierarchy_level_dim_map=hierarchy_level_dim_map,
             hierarchy_default_dim_map=hierarchy_default_dim_map,
+            quote_fn=lambda n: _qi("postgresql", n),
         )
-        for _lf in _subtotal_label_specs:
-            where_sql.append(_label_filter_to_sql(_lf, lambda n: f'"{n}"'))
+        for _lf in _subtotal_label_filters:
+            where_sql.append(_lf.sql_clause)
+
+        # F-002-01: a Top-N (TopCount/BottomCount) pivot applies its ranking as an
+        # ``ORDER BY <measure> ... LIMIT N`` on the DETAIL query only. The subtotal
+        # / grand-total grain queries below are built from ``where_sql`` and would
+        # otherwise aggregate every member, so a Top-5 pivot showing five rows can
+        # print a grand total that includes the hidden sixth-and-later members — a
+        # silently wrong board-pack number. Resolve the ranked member set ONCE from
+        # the detail result (already limited to the survivors) and constrain every
+        # grain query to exactly those surviving detail-grain member tuples, so the
+        # visible members and every subtotal / grand total agree.
+        _topn_axis_text = col_expr + " " + row_expr
+        _subtotal_topn = _extract_topn_spec(_topn_axis_text)
+        if _subtotal_topn is not None:
+            # Constrain by the FULL detail grain: the detail query's LIMIT N was
+            # applied to the hierarchy-EXPANDED grain (all levels), so the
+            # surviving member set is the set of distinct dimension-column tuples
+            # actually present in the detail result. Derive the grain columns from
+            # the result columns (every dimension column the rows carry), not from
+            # the un-expanded axis dims, so a Top-N over an expanded hierarchy is
+            # constrained at the same grain the survivors were ranked at.
+            _topn_grain_cols = [c for c in columns if c in dim_names]
+            _topn_pred = _topn_member_predicate(
+                detail_rows=rows,
+                grain_dim_cols=_topn_grain_cols,
+                quote_fn=lambda n: _qi("postgresql", n),
+                dim_type_map=_subtotal_dim_types,
+            )
+            if _topn_pred is not None:
+                where_sql.append(_topn_pred)
+            elif _topn_grain_cols:
+                # Fail loud rather than emit unconstrained subtotals: a Top-N pivot
+                # whose surviving member set cannot be resolved from the detail
+                # result must not silently fall back to an all-member grand total.
+                logger.warning(
+                    "[XMLA-TOPN] could not resolve Top-N member set for grain "
+                    "cols=%s (rows=%d); subtotals would be unconstrained",
+                    _topn_grain_cols, len(rows),
+                )
+                return _soap_fault(
+                    "Top-N pivot subtotals could not be constrained to the "
+                    "ranked member set; refusing to return a grand total that "
+                    "may include hidden members.",
+                    "Server",
+                )
 
         lne_measures = [
             m.get("name", "") for m in measures_meta
@@ -1650,7 +3348,7 @@ async def _handle_execute(
                 if not sq.sql:
                     continue
                 try:
-                    sr = await execute_query(
+                    sr = await _execute_query(
                         model_id=model_id,
                         sql=sq.sql,
                         tenant_slug=tenant_slug,
@@ -1664,8 +3362,11 @@ async def _handle_execute(
                         columns=sr.get("columns", []),
                         rows=sr.get("rows", []),
                     ))
+                except (QueryByteCeilingExceeded, GatewayQueryRateLimitExceeded):
+                    raise  # Bug-7745: resource limits must propagate fail-closed
                 except Exception as exc:
                     logger.warning("Subtotal query failed (grain=%s): %s", sq.level_name, exc)
+                    _failed_grain_labels.append(sq.level_name)
 
             lne_overrides = {}
             if lne_measures:
@@ -1713,7 +3414,7 @@ async def _handle_execute(
                 if not sq.sql:
                     return None
                 try:
-                    sr = await execute_query(
+                    sr = await _execute_query(
                         model_id=model_id,
                         sql=sq.sql,
                         tenant_slug=tenant_slug,
@@ -1727,11 +3428,14 @@ async def _handle_execute(
                         columns=sr.get("columns", []),
                         rows=sr.get("rows", []),
                     )
+                except (QueryByteCeilingExceeded, GatewayQueryRateLimitExceeded):
+                    raise  # Bug-7745: resource limits must propagate fail-closed
                 except Exception as exc:
                     logger.warning(
                         "Multi-subtotal query failed (grain=%s): %s",
                         sq.level_name, exc,
                     )
+                    _failed_grain_labels.append(sq.level_name)
                     return None
 
             grain_results = await _gather_bounded(
@@ -1803,6 +3507,43 @@ async def _handle_execute(
     # result row so the column is populated (the info-only case is still
     # short-circuited above by _maybe_resolve_info_measures).
     info_refs = _referenced_info_measures(dax_statement)
+
+    # Bug-8381 [silent wrong numbers]: EVERY post-joined constant below is
+    # written by keying a row column on a NAME. If the router already returned a
+    # column of that name, the write DESTROYS it on every row. One guard, run
+    # once, before any of the three writers (info measures, KPI goal, KPI
+    # status) touches ``rows`` -- so it sees the router's columns and not our
+    # own additions, and so a new constant writer added later inherits it.
+    #
+    # ``columns`` is the authoritative answer to "what did this query actually
+    # project?": it needs no re-derivation of the axis/slicer dimension set and
+    # it covers every column source, not just the ones a detector knows to look
+    # for. The earlier collision guards compare only against MEASURE names, and
+    # a support member is deliberately dropped from SQL resolution, so any
+    # same-named column coming back from the router belongs to something else --
+    # a dimension, an attribute, a caption. There is no correct value to put in
+    # one column for both, so refuse rather than overwrite.
+    def _const_column_collision(const_name: str) -> str | None:
+        target = const_name.strip().lower()
+        for existing in columns:
+            if str(existing).strip().lower() == target:
+                return str(existing)
+        return None
+
+    for _const_name in (
+        list(info_refs) + list(kpi_goal_consts) + list(kpi_status_consts)
+    ):
+        _clash = _const_column_collision(_const_name)
+        if _clash is not None:
+            return _soap_fault(
+                f"Constant member '{_const_name}' collides with the column "
+                f"'{_clash}' this query already returns (a dimension or "
+                "attribute of the same name). The constant would overwrite that "
+                "column on every row. Rename the KPI or the dimension, or query "
+                "them separately.",
+                "Client",
+            )
+
     if info_refs:
         info_vals = await _fetch_trust_values(model_id, tenant_slug, jwt_token)
         for internal in info_refs:
@@ -1816,10 +3557,80 @@ async def _handle_execute(
             if m.get("name") in info_refs
         ]
 
+    # Bug-6888: post-join static KPI goal constants (same contract as the info
+    # measures above — the member was dropped from SQL resolution and its
+    # constant value fills the column on every row).
+    if kpi_goal_consts:
+        for _support, _goal_raw in kpi_goal_consts.items():
+            try:
+                _goal_val: Any = float(_goal_raw)
+            except (TypeError, ValueError):
+                _goal_val = _goal_raw
+            if _support not in columns:
+                columns = list(columns) + [_support]
+            for r in rows:
+                r[_support] = _goal_val
+        measures_meta = measures_meta + [
+            {
+                "name": _support,
+                "display_name": _support,
+                "default_agg": "max",
+                "is_hidden": False,
+            }
+            for _support in kpi_goal_consts
+        ]
+
+    # Bug-8288: post-join governed KPI status constants (same contract as the goal
+    # constants above — the synthetic status member was dropped from SQL resolution
+    # and its governed −1/0/1 verdict fills the column on every row of the single-
+    # cell result). No-data / no-target yields None, which stays blank rather than
+    # reading as a 0 verdict.
+    if kpi_status_consts:
+        # A status-only single-cell query (Excel "Status" ticked, no real measure)
+        # drops every measure to a constant, so the router may return no rows. The
+        # governed status is model-wide (independent of pivot facts) and there is no
+        # dimension breakdown here (refused above), so a single synthetic cell is
+        # the correct grand-total shape.
+        if not rows:
+            rows = [{}]
+        for _support, _st_val in kpi_status_consts.items():
+            # Bug-8381: the collision guard above already refused any support
+            # name the router returned a column for, so this append can never
+            # shadow a real column. The ``not in`` check remains only to stop
+            # two CONSTANT writers that happen to share a name (the guard runs
+            # once, before all three, so it cannot see our own appends) from
+            # adding the column twice.
+            if _support not in columns:
+                columns = list(columns) + [_support]
+            for r in rows:
+                r[_support] = _st_val
+        measures_meta = measures_meta + [
+            {
+                "name": _support,
+                "display_name": _support,
+                "default_agg": "max",
+                "is_hidden": False,
+            }
+            for _support in kpi_status_consts
+        ]
+
     catalog_name = catalog or tenant_slug
 
     # Pre-compute re-query results for non-composable aggregations (Bug-575)
     requery_results: dict[tuple, Any] | None = None
+    denom_requery_results: dict[tuple, Any] | None = None
+    # F-002-03: a re-query is REQUIRED to render its cell correctly. If it fails
+    # for any reason other than a resource limit, we must fail the Execute rather
+    # than let the evaluator paint a swallowed ``None`` as legitimate no-data
+    # (which shows a blank cell that looks like a real zero/absent value while
+    # the leaf rows look fine — a silent wrong-number defect). This list collects
+    # the (calc, measure) of every failed required re-query; a non-empty list
+    # raises a client fault below.
+    _rq_failures: list[str] = []
+    # R1 finding 1: True once re-query specs are planned, so a block-level
+    # exception (which leaves _rq_failures empty) still fails closed instead of
+    # rendering a blank/mis-aggregated cell.
+    _rq_planned = False
     try:
         # F-002-08: reuse the parse computed at the top of _handle_execute
         # rather than parsing the same statement a second time.
@@ -1828,6 +3639,8 @@ async def _handle_execute(
                 parse_calc_members as _parse_cm,
                 plan_aggregate_requeried as _plan_rq,
                 build_requery_sql as _build_rq_sql,
+                plan_denominator_requeried as _plan_denom_rq,
+                build_denominator_requery_sql as _build_denom_rq_sql,
             )
             dim_names_set = {(d.get("name") or "") for d in (dimensions_meta or [])}
             _dim_cols = [c for c in columns if c in dim_names_set]
@@ -1837,9 +3650,72 @@ async def _handle_execute(
                 + _mdx_axis_expr(dax_statement, 1) + " "
                 + _mdx_where_expr(dax_statement)
             )
-            _rq_queried = set(_mdx_extract_measures(_rq_axis_text))
+            # Bug-8751 consumer alignment (deep-review R2 finding 1): this is the
+            # FOURTH derivation of "which measures does this statement need", and
+            # it gates the custom-group re-query
+            # (``plan_aggregate_requeried(queried_measures=...)`` ->
+            # ``measure_names & queried_measures``). Before Bug-8751 every
+            # projected measure appeared on an axis, so the axis text was a valid
+            # proxy; now a calc member's NON-ADDITIVE input measure can be
+            # referenced only from the WITH prelude. Deriving this set from the
+            # axis alone then plans NO re-query for it, ``_eval_aggregate_set``
+            # writes ``None`` into the custom-group row, and the group cell
+            # renders blank in Excel with a 200 and no warning. Same shared helper
+            # as the other three consumers.
+            _rq_queried = set(_sql_measure_set(
+                dax_statement, _rq_axis_text,
+                constant_measure_names=set(kpi_goal_consts) | set(kpi_status_consts),
+            ))
+            # R3 adversarial finding F3: mark planned BEFORE invoking either
+            # planner whenever any calc member could require a re-query
+            # (aggregate custom group, or % of Grand Total / Parent over a
+            # potentially non-additive measure). A raise inside EITHER planner
+            # then still fails closed via the block-level except reading
+            # _rq_planned — closing the denom-only fail-open where the aggregate
+            # planner returned empty and the denom planner raised.
+            if any(
+                c.calc_type in (
+                    "aggregate_set", "pct_grand_total", "pct_parent",
+                    "pct_row_total", "pct_col_total", "pct_axis_total",
+                )
+                for c in _cms
+            ):
+                _rq_planned = True
+            # Bug-8206: row/col axis dim split for % of Row/Column Total denominator
+            # re-queries. A dim is on the column axis if its bracketed name appears
+            # in the ON COLUMNS expr, on the row axis if in ON ROWS.
+            _rq_col_axis_expr = _mdx_axis_expr(dax_statement, 0)
+            _rq_row_axis_expr = _mdx_axis_expr(dax_statement, 1)
+            _rq_row_axis_dims: list[str] = []
+            _rq_col_axis_dims: list[str] = []
+            for _dc in _dim_cols:
+                # Opus R1 F4: escape ``]`` in dim names (``]]`` in MDX brackets)
+                # to match the evaluator's ``_axis_dim_split`` exactly.
+                _tok = f"[{_dc.replace(']', ']]')}]"
+                _in_col = _tok in _rq_col_axis_expr
+                _in_row = _tok in _rq_row_axis_expr
+                if _in_col and not _in_row:
+                    _rq_col_axis_dims.append(_dc)
+                elif _in_row and not _in_col:
+                    _rq_row_axis_dims.append(_dc)
             specs = _plan_rq(_cms, measures_meta, catalog or "", _dim_cols, rows, queried_measures=_rq_queried or None)
-            if specs:
+            # F-002-04: denominator re-queries for non-additive % of Grand Total /
+            # Parent members (sum-of-averages is mathematically wrong).
+            # Bug-8206: same for non-additive % of Row/Column Total.
+            denom_specs = _plan_denom_rq(
+                _cms, measures_meta, catalog or "", _dim_cols, rows,
+                row_axis_dims=_rq_row_axis_dims,
+                col_axis_dims=_rq_col_axis_dims,
+            )
+            # Bug-8327: the partition pins the planners just built carry POST-alias
+            # axis identifiers; translate them alias->source before the re-query
+            # SQL is built, so an aliased pivot's re-query binds (mirrors the
+            # Bug-8283 survivor-predicate translation below).
+            _translate_requery_partition_identifiers(
+                agg_specs=specs, denom_specs=denom_specs, axis_aliases=axis_aliases,
+            )
+            if specs or denom_specs:
+                _rq_planned = True
 
                 # Bug-582/587: include MDX WHERE + subselect slicer filters
                 _rq_where_expr = _mdx_where_expr(dax_statement)
@@ -1859,8 +3735,39 @@ async def _handle_execute(
                         if v not in existing:
                             existing.append(v)
                     _rq_where_filters[dim] = existing
+                # Bug-8272: an enumerated member set on ROWS/COLUMNS
+                # (e.g. ``{[Product].&[A],[Product].&[B]}``) restricts the main
+                # detail SQL (Bug-5548) and the subtotal/grain queries
+                # (Bug-5548 grain merge) to exactly those members, but the
+                # calc-member DENOMINATOR / aggregate-set re-queries were built
+                # only from the WHERE/subselect/label slicers above — never the
+                # axis member set. A keep-only axis selection therefore made the
+                # denominator (% of Grand/Parent/Row/Column Total) aggregate over
+                # the FULL unfiltered level, silently returning a wrong ratio
+                # (the numerator is over the two kept members, the denominator
+                # over all members). Merge the enumerated axis members in here
+                # with the SAME pattern as the main-SQL / grain paths so every
+                # re-query family (pct_grand_total / pct_parent denom AND the
+                # aggregate_set custom-group total) is scoped to the kept members.
+                # A bare ``.Members`` / ``.Children`` / ``.AllMembers`` expansion
+                # adds nothing (exclude_level_expansions), so a full-level pivot
+                # is unaffected.
+                _rq_axis_member_filters = _mdx_extract_axis_member_filters(
+                    _mdx_axis_expr(dax_statement, 0) + " "
+                    + _mdx_axis_expr(dax_statement, 1),
+                    dim_names,
+                    hierarchy_level_dim_map=hierarchy_level_dim_map,
+                    hierarchy_default_dim_map=hierarchy_default_dim_map,
+                )
+                for dim, vals in _rq_axis_member_filters.items():
+                    existing = _rq_where_filters.get(dim, [])
+                    for v in vals:
+                        if v not in existing:
+                            existing.append(v)
+                    _rq_where_filters[dim] = existing
                 _rq_where_sql = _build_where_sql_clauses(
-                    _rq_where_filters, lambda n: f'"{n}"',
+                    _rq_where_filters, lambda n: _qi("postgresql", n),
+                    dim_type_map=_dim_type_map_from_meta(dimensions_meta),
                 ) if _rq_where_filters else []
 
                 # Bug-5191: propagate label filters (Begins/Ends-With,
@@ -1870,27 +3777,118 @@ async def _handle_execute(
                 # but never forwarded here, causing re-queries to ignore
                 # the active label filter and return unfiltered
                 # aggregates.
-                _rq_label_specs = _extract_label_filter_specs(
+                # Bug-8925/Bug-8926: "identically" is now structural — this is
+                # the SAME translator the detail-SQL path used, producing the
+                # same rendered clause. A second, differently-shaped extraction
+                # here is what would let the main query gain a supported variant
+                # the re-query silently drops.
+                _rq_label_filters = _translate_label_filter_calls(
                     _mdx_axis_expr(dax_statement, 0) + " "
                     + _mdx_axis_expr(dax_statement, 1),
                     dim_names,
                     hierarchy_level_dim_map=hierarchy_level_dim_map,
                     hierarchy_default_dim_map=hierarchy_default_dim_map,
+                    quote_fn=lambda n: _qi("postgresql", n),
                 )
-                for _lf in _rq_label_specs:
-                    _rq_where_sql.append(
-                        _label_filter_to_sql(_lf, lambda n: f'"{n}"')
+                for _lf in _rq_label_filters:
+                    _rq_where_sql.append(_lf.sql_clause)
+
+                # Bug-8283: a calculated-member denominator/aggregate re-query on
+                # a Top-N (TopCount/BottomCount) pivot MUST be constrained to the
+                # surviving ranked member set, exactly as the subtotal/grand-total
+                # GRAIN queries are (F-002-01, ~2596). The detail SQL applies the
+                # Top-N as ``ORDER BY <measure> ... LIMIT N`` on the detail query
+                # only; the re-query denominator is built independently from the
+                # WHERE/subselect/label slicers above and would otherwise aggregate
+                # ALL members, over-counting the denominator over hidden members.
+                #
+                # This re-query path only fires for a NON-ADDITIVE base measure
+                # (avg / count_distinct / min / max — ``plan_denominator_requeried``
+                # skips additive sum/count, whose grand total is the sum of the
+                # already-displayed survivor cells and is therefore correct without
+                # this fix) and for the aggregate_set custom-group total. Concrete
+                # wrong number for an AVG-Sales "% of Grand Total": a Top-5 pivot
+                # showing {100,90,80,70,60} (hidden 6th=50) re-aggregates the
+                # denominator from fact grain; unconstrained it averages all six
+                # (avg 75 over 6) instead of the five survivors — a silently wrong
+                # board-pack percentage. (The 100/400=25% vs 100/450=22.2%
+                # illustration is the additive analogue of the same over-count.)
+                # Every denominator kind that re-queries (pct_grand_total,
+                # pct_parent, pct_axis_total) AND the aggregate_set custom-group
+                # total flow through ``specs`` / ``denom_specs`` and receive
+                # ``_rq_where_sql`` below, so appending the ranked member-set
+                # predicate here scopes them all to the surviving members. This
+                # block runs whether or not the pivot also has a subtotal hierarchy
+                # — a flat Top-N pivot with a Show-Values-As member never enters the
+                # subtotal block that resolves the grain predicate, so it must be
+                # resolved here independently.
+                _rq_topn_spec = _extract_topn_spec(
+                    _mdx_axis_expr(dax_statement, 0) + " "
+                    + _mdx_axis_expr(dax_statement, 1)
+                )
+                if _rq_topn_spec is not None and rows:
+                    # Constrain by the FULL detail grain actually present in the
+                    # result rows (mirrors the grain-query path at ~2615): the
+                    # surviving member set is the distinct tuples of dimension
+                    # columns carried by the detail rows. The derivation (detail-
+                    # only filter + post-alias grain cols + source-name translation
+                    # + predicate build) is a PURE function so it can be pinned by a
+                    # revert-guarding unit test on merged/aliased inputs.
+                    _rq_topn_pred, _rq_topn_grain_cols = (
+                        _topn_requery_survivor_predicate(
+                            rows=rows,
+                            columns=columns,
+                            dim_names_set=dim_names_set,
+                            axis_aliases=axis_aliases,
+                            dimensions_meta=dimensions_meta,
+                        )
                     )
+                    if _rq_topn_pred is not None:
+                        _rq_where_sql.append(_rq_topn_pred)
+                    elif _rq_topn_grain_cols:
+                        # Fail loud rather than emit an all-member denominator: a
+                        # Top-N pivot whose surviving member set cannot be resolved
+                        # from the detail result must not silently produce a
+                        # denominator over every member (a wrong board-pack %).
+                        logger.warning(
+                            "[XMLA-TOPN] could not resolve Top-N member set for "
+                            "calc-member re-query denominator (grain cols=%s, "
+                            "rows=%d); denominator would be unconstrained",
+                            _rq_topn_grain_cols, len(rows),
+                        )
+                        return _soap_fault(
+                            "Top-N pivot calculated-member denominator could not "
+                            "be constrained to the ranked member set; refusing to "
+                            "return a percentage computed over hidden members.",
+                            "Server",
+                        )
 
                 for sp in specs:
                     sp.extra_where = _rq_where_sql
+                for sp in denom_specs:
+                    # The denominator re-query is scoped to the same MDX WHERE /
+                    # subselect / label slicer as the main query so the total is
+                    # over exactly the rows the pivot shows. Its own partition
+                    # filters (parent-dim pins) are appended by the SQL builder.
+                    sp.extra_where = list(_rq_where_sql)
 
                 requery_results = {}
+                denom_requery_results = {}
 
-                async def _exec_requery(sp):
-                    rq_sql = _build_rq_sql(sp)
+                # F-002-03: sentinel distinguishing a re-query FAILURE (fail
+                # closed) from a legitimately empty result (value stays None but
+                # is not a failure). ``_FAIL`` is only ever produced by a caught
+                # non-resource exception on a required re-query.
+                _FAIL = object()
+
+                async def _exec_one(build_sql, calc_name, measure_name, part_key):
+                    # R1 finding 1: build the SQL INSIDE the try so a builder
+                    # exception is captured by the _FAIL sentinel too, instead of
+                    # escaping to the block-level swallow (which would render a
+                    # blank/wrong cell with _rq_failures empty).
                     try:
-                        rq_result = await execute_query(
+                        rq_sql = build_sql()
+                        rq_result = await _execute_query(
                             sql=rq_sql, model_id=model_id or "",
                             tenant_slug=tenant_slug, jwt_token=jwt_token,
                             protocol="jdbc",
@@ -1899,22 +3897,97 @@ async def _handle_execute(
                         )
                         rq_rows = rq_result.get("rows", [])
                         if rq_rows:
-                            return (sp.calc_name, sp.measure_name, sp.partition_key), rq_rows[0].get(sp.measure_name)
+                            return (calc_name, measure_name, part_key), rq_rows[0].get(measure_name)
+                        # Empty result: a real (non-error) absence.
+                        return (calc_name, measure_name, part_key), None
+                    except (QueryByteCeilingExceeded, GatewayQueryRateLimitExceeded):
+                        # Bug-7745: resource limits fail closed. R1 finding 1:
+                        # do NOT re-raise — a raise escapes _gather_bounded to the
+                        # block-level swallow, leaving _rq_failures empty and the
+                        # Execute rendering anyway. Return _FAIL so it faults.
+                        logger.warning(
+                            "Re-query for %s/%s hit a resource limit; failing closed.",
+                            calc_name, measure_name,
+                        )
+                        return (calc_name, measure_name, part_key), _FAIL
                     except Exception as exc:
-                        logger.warning("Re-query for %s/%s failed: %s", sp.calc_name, sp.measure_name, exc)
-                    return (sp.calc_name, sp.measure_name, sp.partition_key), None
+                        # F-002-03: a required re-query failed. Record the fault
+                        # so the Execute fails closed instead of rendering blank.
+                        logger.warning(
+                            "Re-query for %s/%s failed: %s", calc_name, measure_name, exc,
+                        )
+                        return (calc_name, measure_name, part_key), _FAIL
+
+                async def _exec_requery(sp):
+                    return await _exec_one(
+                        lambda: _build_rq_sql(sp), sp.calc_name, sp.measure_name, sp.partition_key,
+                    )
+
+                async def _exec_denom_requery(sp):
+                    return await _exec_one(
+                        lambda: _build_denom_rq_sql(sp), sp.calc_name, sp.measure_name, sp.partition_key,
+                    )
 
                 rq_results_list = await _gather_bounded(
-                    [lambda sp=sp: _exec_requery(sp) for sp in specs],
+                    [lambda sp=sp: _exec_requery(sp) for sp in specs]
+                    + [lambda sp=sp: _exec_denom_requery(sp) for sp in denom_specs],
                     _subtotal_grain_concurrency(),
                 )
+                _denom_keys = {
+                    (sp.calc_name, sp.measure_name, sp.partition_key)
+                    for sp in denom_specs
+                }
                 for key, val in rq_results_list:
-                    if val is not None:
+                    if val is _FAIL:
+                        _rq_failures.append(f"{key[0]}/{key[1]}")
+                        continue
+                    if val is None:
+                        continue
+                    if key in _denom_keys:
+                        # Re-key to (calc_name, partition_key) for the evaluator.
+                        denom_requery_results[(key[0], key[2])] = val
+                    else:
                         requery_results[key] = val
                 if not requery_results:
                     requery_results = None
+                if not denom_requery_results:
+                    denom_requery_results = None
     except Exception as exc:
+        # R1 finding 1: a re-query was planned (calc members present) but the
+        # pre-computation block raised. This is NOT a safe no-op — the required
+        # aggregate/denominator values are missing, so rendering anyway would
+        # emit a blank aggregate cell (F-002-03) or a sum-of-cells non-additive
+        # denominator (F-002-04). Fail closed.
         logger.warning("Re-query pre-computation failed: %s", exc)
+        if _rq_planned:
+            return _soap_fault(
+                "Calculated-member re-query pre-computation failed; refusing to "
+                "return a result with a silently blank or mis-aggregated cell. "
+                "Please retry.",
+                "Server",
+            )
+
+    # F-002-03: fail the Execute closed when a required re-query failed, rather
+    # than letting the evaluator render a swallowed None as legitimate no-data.
+    if _rq_failures:
+        return _soap_fault(
+            "A calculated-member re-query failed for "
+            f"{', '.join(sorted(set(_rq_failures)))}; refusing to return a result "
+            "with a silently blank aggregate cell. Please retry.",
+            "Server",
+        )
+
+    # F-002-10: the CubeInfo LastDataUpdate must reflect the model's real data
+    # refresh time (trust_meta.last_refreshed_at), not a static system config
+    # stamp, so Excel / Power BI do not treat stale (aggregate-served) pivots as
+    # fresh. A trust-lookup failure degrades to the system stamp (best effort).
+    _last_data_update = ""
+    try:
+        if model_id:
+            _trust_vals = await _fetch_trust_values(model_id, tenant_slug, jwt_token)
+            _last_data_update = _trust_vals.get("_info_last_refreshed", "") or ""
+    except Exception as exc:
+        logger.warning("CubeInfo last-refresh lookup failed: %s", exc)
 
     # Use MDDataSet format (required by MSOLAP/Excel for Execute responses)
     try:
@@ -1931,6 +4004,8 @@ async def _handle_execute(
             requery_results=requery_results,
             subtotal_hierarchies=subtotal_hierarchies if subtotal_hierarchies and len(subtotal_hierarchies) > 1 else None,
             hierarchy_defs=hierarchy_defs,
+            denom_requery_results=denom_requery_results,
+            last_data_update=_last_data_update,
         )
     except ValueError as exc:
         logger.warning("Execute response build failed: %s", exc)
@@ -1947,8 +4022,23 @@ async def _handle_execute(
     else:
         logger.debug("xmla execute response: columns=%r rows=%d", columns, len(rows))
 
+    # Bug-6946: surface failed subtotal/grand-total grain queries as a SOAP
+    # <Warning> so the client sees that some aggregation levels are missing,
+    # rather than rendering silently incomplete totals.
+    _all_warnings = [
+        "Subtotal grain query failed for level: " + lbl
+        for lbl in _failed_grain_labels
+    ]
+    _grain_messages_xml = ""
+    if _all_warnings:
+        _grain_msgs = "".join(
+            f'<Warning><Description>{_escape_xml(w)}</Description></Warning>'
+            for w in _all_warnings
+        )
+        _grain_messages_xml = f"<Messages>{_grain_msgs}</Messages>"
+
     return _soap_response(
-        f'<tns:ExecuteResponse>{xml_body}</tns:ExecuteResponse>',
+        f'<tns:ExecuteResponse>{xml_body}{_grain_messages_xml}</tns:ExecuteResponse>',
         session_id=session_id,
     )
 
@@ -1961,9 +4051,10 @@ async def _resolve_model_id(
     catalog: str,
     tenant_slug: str,
     jwt_token: str,
-) -> tuple[Optional[str], str, Optional[dict[str, Any]]]:
+) -> tuple[Optional[str], str, Optional[dict[str, Any]], Optional[str]]:
     """
-    Resolve a catalog name to a ``(model_id, project_id, persona)`` tuple.
+    Resolve a catalog name to a ``(model_id, project_id, persona,
+    deployed_version_id)`` tuple.
 
     The catalog name is one of:
     - ``<uuid>`` — direct model id (persona is always None).
@@ -1972,10 +4063,13 @@ async def _resolve_model_id(
       full dict fetched from model-service (id, slug, name,
       included_*_ids, includes_hidden_columns, ...).
 
-    Returns ``(None, "", None)`` when the catalog cannot be matched.
+    Bug-7959: ``deployed_version_id`` is returned so callers can pin
+    catalogue metadata (effective descriptions) to the deployed snapshot.
+
+    Returns ``(None, "", None, None)`` when the catalog cannot be matched.
     """
     if not catalog:
-        return None, "", None
+        return None, "", None, None
 
     is_uuid = bool(re.match(
         r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -1987,15 +4081,19 @@ async def _resolve_model_id(
         models = await list_all_models_for_tenant(tenant_slug, jwt_token)
     except Exception as exc:
         logger.warning("Model lookup failed for catalog '%s': %s", catalog, exc)
-        return None, "", None
+        return None, "", None, None
+
+    def _dvid(model: dict) -> Optional[str]:
+        vid = model.get("deployed_version_id")
+        return str(vid) if vid else None
 
     if is_uuid:
         # Validate the UUID matches a *deployed* model (list_all_models_for_tenant
         # filters undeployed). If it doesn't appear in the deployed list, refuse.
         for model in models:
             if str(model["id"]).lower() == catalog.lower():
-                return catalog, str(model.get("project_id", "")), None
-        return None, "", None
+                return catalog, str(model.get("project_id", "")), None, _dvid(model)
+        return None, "", None, None
 
     lc = catalog.lower()
 
@@ -2005,7 +4103,7 @@ async def _resolve_model_id(
         slug = (model.get("slug") or "").lower()
         name = (model.get("display_name") or "").lower()
         if slug == lc or name == lc:
-            return str(model["id"]), str(model.get("project_id", "")), None
+            return str(model["id"]), str(model.get("project_id", "")), None, _dvid(model)
 
     # Try <model-slug>_<persona-slug>. Find the longest model slug that
     # is a prefix of the catalog with an underscore delimiter, then
@@ -2033,9 +4131,9 @@ async def _resolve_model_id(
             personas = []
         for persona in personas:
             if (persona.get("slug") or "").lower() == persona_suffix:
-                return mid, pid, persona
+                return mid, pid, persona, _dvid(model)
 
-    return None, "", None
+    return None, "", None, None
 
 
 def _persona_includes_hidden(persona: Optional[dict[str, Any]]) -> bool:
@@ -2089,13 +4187,19 @@ async def _resolve_restricted_column_names(
     tenant_slug: str,
     jwt_token: str,
     project_id: str,
-) -> tuple[set[str], bool]:
+) -> tuple[set[str], bool, dict[str, Any] | None]:
     """Resolve a persona's ``restricted_column_ids`` to the corresponding source
     column NAMES via the model snapshot (Bug-5493). Names feed the CLS column-
     disclosure guard so a restricted column name referenced inside a measure's
     DAX expression can be detected and blanked.
 
-    Returns ``(names, resolved)``. ``resolved`` is False whenever resolution is
+    Returns ``(names, resolved, snapshot)`` — the snapshot dict is passed through
+    to the CLS guard (F-008-04) so the XMLA/Excel catalogue applies the SAME
+    transitive restricted-column closure as the JDBC catalogue and the runtime
+    serving gate (variant/UDA/transitive-calc channels, not only direct
+    columns). ``snapshot`` is ``None`` when the fetch failed (the guard then
+    falls back to the direct-membership + name-scan rules, still fail-closed via
+    ``names_resolved``). ``resolved`` is False whenever resolution is
     not provably complete, so the caller can FAIL CLOSED (blank all expressions)
     rather than skip the expression scan and risk leaking a restricted column name
     through an unscanned expression. ``resolved`` is False when:
@@ -2108,7 +4212,7 @@ async def _resolve_restricted_column_names(
     """
     restricted_ids = {str(x) for x in (persona.get("restricted_column_ids") or [])}
     if not restricted_ids:
-        return set(), True
+        return set(), True, None
     try:
         snapshot = await get_model_snapshot(
             model_id, tenant_slug, jwt_token, project_id=project_id,
@@ -2117,7 +4221,7 @@ async def _resolve_restricted_column_names(
         logger.warning(
             "TMSCHEMA CLS column-name resolution failed (snapshot fetch): %s", exc,
         )
-        return set(), False
+        return set(), False, None
     names: set[str] = set()
     resolved_ids: set[str] = set()
     for col in snapshot.get("columns") or []:
@@ -2133,7 +4237,7 @@ async def _resolve_restricted_column_names(
     # If any restricted id did not resolve to a non-blank name, the name set is
     # incomplete — fail closed so the caller blanks every surviving expression.
     resolved = resolved_ids >= restricted_ids
-    return names, resolved
+    return names, resolved, snapshot
 
 
 def _expression_references_name(expression: str, name: str) -> bool:
@@ -2155,6 +4259,7 @@ def _apply_cls_column_guard(
     dimensions: list[dict[str, Any]],
     restricted_column_names: set[str] | None = None,
     names_resolved: bool = True,
+    snapshot: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Enforce CLS / persona column restrictions on the TMSCHEMA projection
     (Bug-5493). ``restricted_column_ids`` is the same persona allow-list machinery
@@ -2162,9 +4267,14 @@ def _apply_cls_column_guard(
 
     Two ACCESS rules, both honouring the persona's restricted source columns:
 
-      1. EXCLUSION — a measure or dimension whose own ``source_column_id`` is a
-         restricted source column is dropped entirely so neither its name nor its
-         DAX expression reaches the client. Mirrors the catalogue-metadata path.
+      1. EXCLUSION — a measure or dimension that reaches a restricted source
+         column is dropped entirely so neither its name nor its DAX expression
+         reaches the client. F-008-04: when ``snapshot`` is supplied this uses
+         the SHARED transitive closure (``catalogue_cls.object_hidden_by_cls``),
+         so a variant of a restricted base, a UDA-backed object, or a transitive
+         calc chain is excluded too — matching the JDBC catalogue and the
+         runtime serving gate. Without a snapshot it falls back to direct
+         ``source_column_id`` membership.
 
       2. EXPRESSION BLANKING (column-disclosure guard) — for an INCLUDED measure
          whose DAX ``expression`` text references a restricted column NAME, the
@@ -2202,7 +4312,45 @@ def _apply_cls_column_guard(
     # Fail-closed trigger: restricted columns exist but their names are unknown.
     blank_all = not names_resolved
 
+    # F-008-04: apply the SHARED transitive closure over the STRUCTURAL channels
+    # (direct source/display column, variant-of chain, UDA refs, calc-DIMENSION
+    # expression) so the XMLA/Excel catalogue hides variant/UDA/transitive
+    # objects exactly like the JDBC catalogue and the runtime serving gate — not
+    # only objects bound DIRECTLY to a restricted source column.
+    #
+    # DAX ``expression`` on a calculated MEASURE is deliberately NOT fed to the
+    # closure: the shared calc-measure branch parses the SEMANTIC calc grammar
+    # (``measure("name")`` refs), not TMSCHEMA DAX (``SUM(salary)``), so passing
+    # DAX there would fail-closed-drop a calc measure that Rule 2 handles more
+    # precisely by BLANKING its expression (Bug-5493 keep-name-blank-DAX
+    # contract). The closure sees each object with ``measure_type``/``expression``
+    # masked; the variant/UDA/direct channels still fire, and Rule 2 below blanks
+    # any surviving DAX that names a restricted column.
+    def _structural_view(obj: dict[str, Any]) -> dict[str, Any]:
+        # Mask the DAX-expression / calc-measure fields so the closure uses only
+        # the structural channels (see the note above).
+        return {
+            k: v for k, v in obj.items()
+            if k not in ("measure_type", "expression")
+        }
+
+    _cls_ctx = None
+    if snapshot is not None:
+        from src.catalogue_cls import build_closure_context
+        # Structural-masked measures so variant-base resolution inside the
+        # context never re-parses DAX as a semantic calc expression.
+        _cls_ctx = build_closure_context(
+            measures=[_structural_view(m) for m in measures],
+            snapshot=snapshot,
+            restricted_column_ids=restricted_column_ids,
+        )
+
     def _is_restricted(obj: dict[str, Any]) -> bool:
+        if _cls_ctx is not None:
+            from src.catalogue_cls import object_hidden_by_cls
+            return object_hidden_by_cls(
+                _structural_view(obj), restricted_column_ids, _cls_ctx,
+            )
         col_id = obj.get("source_column_id")
         return col_id is not None and str(col_id) in restricted_column_ids
 
@@ -2246,7 +4394,16 @@ async def _fetch_trust_values(
     `[Measures].[Owner]`.
     """
     try:
-        models = await list_all_models_for_tenant(tenant_slug, jwt_token)
+        models = await asyncio.wait_for(
+            list_all_models_for_tenant(tenant_slug, jwt_token),
+            timeout=_XMLA_TRUST_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Timed out after %.3fs listing models for trust lookup",
+            _XMLA_TRUST_LOOKUP_TIMEOUT_SECONDS,
+        )
+        return {}
     except Exception as exc:
         logger.warning("Failed to list models for trust lookup: %s", exc)
         return {}
@@ -2349,6 +4506,7 @@ async def _maybe_resolve_kpi_members(
     model_slug: str,
     persona_id: str | None,
     is_technical_view: bool,
+    persona_included_measure_ids: set[str] | None = None,
 ) -> Optional[tuple[list[str], list[dict[str, Any]]]]:
     """Resolve KPI member functions (KPIValue/KPIGoal/KPIStatus/KPITrend).
 
@@ -2367,9 +4525,34 @@ async def _maybe_resolve_kpi_members(
     if not found:
         return None
 
+    # Bug-6702 (Codex R2 finding 2): the Discover path trims is_hidden measures
+    # BEFORE `_rows_kpis` builds the catalogue (xmla_server `_handle_discover`),
+    # so a KPI whose value resolves to a hidden measure advertises KPI_VALUE=""
+    # for a non-technical catalog. This Execute path received the RAW cached
+    # measure list, so the same KPI's KPIValue()/KPIStatus() still resolved and
+    # ran the hidden backing measure — catalogue and Execute disagreed. Apply the
+    # SAME visibility rule here (a technical-view catalog keeps hidden measures
+    # on both surfaces) so the two surfaces resolve KPIs against the same set:
+    # a hidden-backed KPI now fails loud in Execute exactly where the catalogue
+    # advertises no value member.
+    if not is_technical_view:
+        measures_meta = [m for m in measures_meta if not m.get("is_hidden")]
+
     kpis = await get_model_kpis(
         model_id, tenant_slug, jwt_token, project_id=project_id,
     )
+    # Bug-7227: filter KPIs BY LINEAGE for a measure-restricted persona (was
+    # Bug-5587, which blanked ALL KPIs so a KPIValue()/KPIStatus() cell for an
+    # ALLOWED KPI faulted). Keep exactly the KPIs whose transitive measure
+    # lineage is inside the allow-list — the SAME set the Discover MDSCHEMA_KPIS
+    # surface advertises — so the catalogue and Execute agree. Fail closed on
+    # unverifiable lineage. `measures_meta` here is the persona-scoped executable
+    # measure set, so a KPI over a non-allowed measure fails lineage resolution
+    # and is withheld.
+    if persona_included_measure_ids:
+        kpis = filter_kpis_for_persona(
+            kpis, measures_meta, persona_included_measure_ids,
+        )
     kpi_by_caption: dict[str, dict[str, Any]] = {}
     for k in kpis:
         cap = (k.get("display_name") or k.get("name") or "").strip().lower()
@@ -2380,57 +4563,116 @@ async def _maybe_resolve_kpi_members(
             kpi_by_caption.setdefault(nm, k)
 
     # Dimension slicer filters that accompany the KPI (KPI function stripped).
+    # Bug-6608 (un-gated): a slicer cannot be forwarded to the single-KPI governed
+    # ``/evaluate`` route — fail loud BEFORE the loop rather than silently returning
+    # an unfiltered governed number that contradicts the requested slice (Opus R1
+    # finding 3: hoist for clarity; statement-invariant check).
     where_expr = _mdx_where_expr(statement)
     where_filters = _mdx_extract_where_filters(
         where_expr, dim_names,
         hierarchy_level_dim_map=hierarchy_level_dim_map,
         hierarchy_default_dim_map=hierarchy_default_dim_map,
     ) if where_expr else {}
-
-    def _q(name: str) -> str:
-        return _qi("postgresql", name)
-
-    where_sql = _build_where_sql_clauses(where_filters, _q)
-
-    measure_agg: dict[str, str] = {}
-    for m in measures_meta:
-        nm = m.get("name", "")
-        if nm:
-            measure_agg[nm] = (m.get("default_agg") or "sum").upper()
-
-    async def _measure_cell(measure_name: str) -> float | None:
-        agg = measure_agg.get(measure_name, "SUM")
-        qc = _q(measure_name)
-        if agg == "COUNT_DISTINCT":
-            sel = f"COUNT(DISTINCT {qc}) AS {qc}"
-        elif agg == "COUNT":
-            sel = f"COUNT({qc}) AS {qc}"
-        elif agg == "LAST_NON_EMPTY":
-            sel = f"SUM({qc}) AS {qc}"
-        else:
-            sel = f"{agg}({qc}) AS {qc}"
-        sql = f"SELECT {sel} FROM {_q(model_slug or 'model_table')}"
-        if where_sql:
-            sql += f" WHERE {' AND '.join(where_sql)}"
-        result = await execute_query(
-            model_id=model_id, sql=sql, tenant_slug=tenant_slug,
-            jwt_token=jwt_token, protocol="jdbc",
-            include_hidden=is_technical_view, persona_id=persona_id,
+    if where_filters:
+        # Extract a representative KPI caption for the error (the first matched).
+        _rep_caption = found[0][2] if found else "unknown"
+        raise ValueError(
+            f"KPI '{_rep_caption}' was requested with a dimension slicer, which the "
+            "governed KPI evaluation path does not apply. Query the KPI without "
+            "an accompanying dimension member, or use the underlying measure."
         )
-        rows = result.get("rows", [])
-        if not rows:
-            return None
-        raw = rows[0].get(measure_name)
-        if raw is None:
-            return None
-        try:
-            return float(raw)
-        except (ValueError, TypeError):
-            return None
 
     columns: list[str] = []
     row: dict[str, Any] = {}
-    measure_map_by_id = {str(m.get("id", "")): m for m in measures_meta}
+
+    # Bug-6608 (un-gated 2026-07-21): every KPI member function resolves through
+    # the SINGLE governed model-service ``/evaluate`` authority — the SAME pipeline
+    # the SPA scorecard and the Excel custom function consume — so all surfaces
+    # return one result. This fixes:
+    #   * F-025-01 — KPIStatus now returns the governed −1/0/1 RAG verdict
+    #     (``kpi_threshold.evaluate_threshold``), identical to the scorecard and the
+    #     Excel custom function, instead of the raw value the Bug-6608 by-design
+    #     decision served. The report-builder traffic-light iconSet (calibrated for
+    #     the −1/0/1 domain, useExcel.ts ``kpiIconCriteria``) now colours correctly.
+    #   * G-002-01 — composite / ratio value expressions and expression / prior-period
+    #     goals resolve (the pipeline compiles the DSL), where the gateway's own
+    #     single-measure ``_measure_cell`` resolution could not.
+    # A per-KPI evaluation is cached within this call so KPIValue+KPIGoal+KPIStatus
+    # for one KPI hit ``/evaluate`` once.
+    eval_cache: dict[str, dict[str, Any]] = {}
+
+    # Bug-6702 visibility gate (preserved): `measures_meta` is already trimmed of
+    # is_hidden measures on a non-technical view (above). A KPI whose transitive
+    # measure lineage references a measure NOT in this trimmed set is hidden-backed
+    # on THIS surface — the Discover catalogue advertises no value member for it, so
+    # the Execute path must fail loud here too rather than resolving the hidden
+    # backing measure through the governed authority (which applies persona scope
+    # but not the gateway's technical-view visibility rule). This keeps the
+    # catalogue and Execute surfaces aligned exactly as before, while still letting
+    # a composite KPI whose lineage measures ARE all visible resolve (G-002-01).
+    _visible_measure_ids = {str(m.get("id")) for m in measures_meta if m.get("id")}
+    _measure_name_to_id = kpi_persona_measure_name_to_id(measures_meta)
+    _kpi_by_name: dict[str, dict[str, Any]] = {}
+    _children_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for _k in kpis:
+        _nm = _k.get("name")
+        if _nm:
+            _kpi_by_name.setdefault(str(_nm), _k)
+            _kpi_by_name.setdefault(str(_nm).lower(), _k)
+        _pid = _k.get("parent_kpi_id")
+        if _pid is not None and str(_pid).strip():
+            _children_by_parent.setdefault(str(_pid), []).append(_k)
+
+    def _kpi_is_surface_visible(kpi: dict[str, Any]) -> bool:
+        lineage_ids, fully_resolved = kpi_lineage_measure_ids(
+            kpi, _kpi_by_name, _measure_name_to_id, _children_by_parent,
+        )
+        # Fail closed on unverifiable lineage, and withhold when any lineage
+        # measure is trimmed from this surface's executable set. An empty
+        # verified lineage (no measure references at all) is also withheld:
+        # the catalogue advertises KPI_VALUE="" for such a KPI, so Execute
+        # must agree rather than proceeding to a governed call the catalogue
+        # does not promise (Opus R1 finding 1 -- alignment).
+        if not fully_resolved:
+            return False
+        return bool(lineage_ids) and all(
+            mid in _visible_measure_ids for mid in lineage_ids
+        )
+
+    async def _governed_eval(kpi: dict[str, Any], caption: str) -> dict[str, Any]:
+        kpi_id = str(kpi.get("id") or "")
+        if not kpi_id:
+            raise ValueError(
+                f"KPI '{caption}' has no id and cannot be evaluated through the "
+                "governed KPI authority."
+            )
+        if not _kpi_is_surface_visible(kpi):
+            raise ValueError(
+                f"KPI '{caption}' has no resolvable value measure on this surface "
+                "(a measure in its lineage is hidden / not available); the "
+                "catalogue advertises no value member for it."
+            )
+        cached = eval_cache.get(kpi_id)
+        if cached is not None:
+            return cached
+        result = await evaluate_kpi_governed(
+            kpi_id=kpi_id,
+            model_id=model_id,
+            project_id=project_id,
+            tenant_slug=tenant_slug,
+            jwt_token=jwt_token,
+            persona_id=persona_id,
+        )
+        eval_cache[kpi_id] = result
+        return result
+
+    def _num(v: Any) -> float | None:
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
 
     for matched_text, fn, caption in found:
         kpi = kpi_by_caption.get((caption or "").strip().lower())
@@ -2440,111 +4682,39 @@ async def _maybe_resolve_kpi_members(
                 f"KPI '{caption}' is not a deployed KPI in this model."
             )
 
-        value_m = measure_map_by_id.get(str(kpi.get("value_measure_id", "")), {})
-        value_measure_name = value_m.get("name", "") if value_m else ""
-
-        async def _goal_scalar() -> float | None:
-            goal_expr = resolve_kpi_property_expr(kpi, "KPIGoal", measures_meta)
-            if goal_expr is None:
-                return None
-            text = str(goal_expr).strip()
-            if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
-                return float(text)
-            gref = re.match(r"\[Measures\]\.\[(.+)\]$", text)
-            if gref:
-                return await _measure_cell(gref.group(1))
-            # F-P4b1-04: an expression-typed goal (target_type="expression")
-            # resolves to a DAX-ish expression the scalarizer cannot evaluate
-            # (only literals and bare measures are supported). Returning blank
-            # here silently hid the limitation and also blanked KPIStatus.
-            # Fail loud instead so the caller sees an explicit, named error.
-            raise ValueError(
-                f"KPI '{caption}' has an expression-typed goal "
-                f"({text!r}) that cannot be evaluated through the XMLA live "
-                "path. Only static literal goals and bare-measure goals are "
-                "supported; expression-typed KPI goals are not yet supported "
-                "(logged as a future enhancement)."
-            )
+        ev = await _governed_eval(kpi, caption)
 
         if fn == "KPIValue":
-            expr = resolve_kpi_property_expr(kpi, fn, measures_meta)
-            mref = re.match(r"\[Measures\]\.\[(.+)\]$", expr or "")
-            if not mref:
-                raise ValueError(
-                    f"KPI '{caption}' value is not a queryable measure."
-                )
-            row[col_name] = await _measure_cell(mref.group(1))
+            # No-data / NULL value stays blank (None) rather than reading as 0.
+            row[col_name] = _num(ev.get("value"))
         elif fn == "KPIGoal":
-            row[col_name] = await _goal_scalar()
+            # ``target`` is the v2 field; ``goal`` is the v1-compat alias.
+            goal = ev.get("target")
+            if goal is None:
+                goal = ev.get("goal")
+            row[col_name] = _num(goal)
         elif fn == "KPIStatus":
-            row[col_name] = await _compute_kpi_status(
-                kpi, value_measure_name, _measure_cell, await _goal_scalar(),
-            )
+            # Governed −1/0/1 RAG verdict (None → blank for no-data). This is the
+            # SAME integer the scorecard and the Excel custom function return, so the
+            # traffic-light iconSet the report builder applies renders the correct
+            # colour. A KPI with no target / no data yields status None → blank.
+            status = ev.get("status")
+            row[col_name] = int(status) if status is not None else None
         elif fn == "KPITrend":
-            # F-P4b1-05: KPITrend surfaces the published literal trend_expression
-            # when present, else 0. Data-driven trend (period-over-period delta
-            # using trend_period / trend_threshold) is NOT computed here — this
-            # literal/0 behaviour is intentional, not a bug; data-driven trend is
-            # logged as a future enhancement (execution_future-features.md).
-            trend = kpi.get("trend_expression") or None
-            row[col_name] = trend if trend else 0
+            # Governed period-over-period trend classification (−1/0/1). Falls back
+            # to a modeller-authored literal ``trend_expression`` only when the
+            # pipeline produced no trend (e.g. no time binding).
+            trend = ev.get("trend")
+            if trend is not None:
+                row[col_name] = int(trend)
+            else:
+                literal = kpi.get("trend_expression") or None
+                row[col_name] = literal if literal else 0
         else:
             raise ValueError(f"Unsupported KPI member function: {fn}")
         columns.append(col_name)
 
     return columns, [row]
-
-
-async def _compute_kpi_status(
-    kpi: dict[str, Any],
-    value_measure_name: str,
-    measure_cell,
-    goal: float | None,
-) -> int | None:
-    """Compute a KPI status (-1/0/1) from the value cell, goal, and direction.
-
-    F-P4b1-02: honour a published ``status_expression`` with the SAME precedence
-    as ``resolve_kpi_property_expr`` (which returns it first). The live path
-    previously ignored it and always re-derived the default ±10% band, so a KPI
-    with a custom status expression returned the wrong status to Excel.
-
-    A published ``status_expression`` that is a bare numeric literal (e.g. a
-    pinned status) is used directly. An arbitrary CASE/MDX status expression
-    cannot be safely evaluated by this numeric live path (it requires the
-    MDX→SQL pipeline), so it FAILS LOUD rather than silently falling back to the
-    default-band status — matching the resolver's preference while never
-    returning a silently-wrong value.
-    """
-    status_expr = (kpi.get("status_expression") or "").strip()
-    if status_expr:
-        if re.fullmatch(r"-?\d+(?:\.\d+)?", status_expr):
-            return int(float(status_expr))
-        raise ValueError(
-            f"KPI '{kpi.get('name', '')}' publishes a status_expression "
-            f"({status_expr!r}) that is not a numeric literal. Evaluating an "
-            "expression-based KPI status through the XMLA live path is not "
-            "supported; define a static status band or remove the "
-            "status_expression."
-        )
-
-    if not value_measure_name or goal is None:
-        return None
-    value = await measure_cell(value_measure_name)
-    if value is None:
-        return None
-
-    direction = kpi.get("direction") or "higher_is_better"
-    if direction == "lower_is_better":
-        if value <= goal:
-            return 1
-        if value <= goal * 1.1:
-            return 0
-        return -1
-    if value >= goal:
-        return 1
-    if value >= goal * 0.9:
-        return 0
-    return -1
 
 
 def _build_trust_info_measures() -> list[dict[str, Any]]:
@@ -2589,6 +4759,28 @@ def _build_trust_info_measures() -> list[dict[str, Any]]:
 # MDX → SQL translation
 # ---------------------------------------------------------------------------
 
+def _caption_dimension_names(
+    dimensions_meta: list[dict[str, Any]] | None,
+) -> list[str]:
+    """Bug-8285: dimension names that declare a distinct DISPLAY column.
+
+    These are the dimensions the query-router must project a friendly
+    ``<dim>__caption`` companion column for (via ExecuteRequest.caption_dimensions).
+    The trigger condition mirrors the consumer's exactly
+    (``mdx_execute.build_real_execute_response`` builds ``dim_caption_col_map``
+    from the same ``display_column_name`` distinct-from-name test) so producer and
+    consumer agree on which members get captions. Returns the pre-alias SOURCE
+    dimension names, matching the names the router binds against.
+    """
+    names: list[str] = []
+    for d in dimensions_meta or []:
+        name = d.get("name") or ""
+        disp = (d.get("display_column_name") or "").strip()
+        if name and disp and disp != name:
+            names.append(name)
+    return names
+
+
 def _statement_to_sql(
     statement: str,
     measures_meta: list[dict[str, Any]],
@@ -2596,8 +4788,9 @@ def _statement_to_sql(
     hierarchy_meta: list[dict[str, Any]] | None = None,
     model_slug: str = "",
     subtotal_hierarchies: list | None = None,
+    constant_measure_names: set[str] | None = None,
 ) -> tuple[str, str]:
-    text = (statement or "").strip()
+    text = _strip_leading_mdx_comments((statement or "").strip())
     if re.match(r"^EVALUATE\b", text, re.IGNORECASE):
         return _dax_to_sql(
             text,
@@ -2613,6 +4806,7 @@ def _statement_to_sql(
         hierarchy_meta=hierarchy_meta,
         model_slug=model_slug,
         subtotal_hierarchies=subtotal_hierarchies,
+        constant_measure_names=constant_measure_names,
     )
 
 
@@ -2706,8 +4900,14 @@ def _sql_literal(value: Any, *, is_string: bool | None = None) -> str:
     # typing and compares zero-padded codes / boolean-looking strings against
     # the wrong literal. Only fall back to text-shape inference when the parser
     # did not record the literal kind (regex fallback parser).
+    # Bug-6634: route every STRING literal branch through the shared
+    # connector_qualify.quote_literal helper instead of hand-rolling ''-doubling.
+    # The XMLA channel emits canonical PostgreSQL SQL that is transpiled per
+    # connector downstream, so quote for "postgresql" here; the shared helper is
+    # the single audited place for literal escaping (defense-in-depth, and it
+    # keeps this consistent with every other SQL-generation site).
     if is_string:
-        return "'" + text.replace("'", "''") + "'"
+        return _ql("postgresql", text)
     if is_string is False:
         # Parser saw an unquoted (numeric/boolean) literal — emit it verbatim
         # when it is a clean numeric, else quote defensively.
@@ -2716,7 +4916,7 @@ def _sql_literal(value: Any, *, is_string: bool | None = None) -> str:
         lowered = text.lower()
         if lowered in {"true", "false"}:
             return lowered.upper()
-        return "'" + text.replace("'", "''") + "'"
+        return _ql("postgresql", text)
     # is_string is None — unknown provenance (regex fallback parser): infer
     # from the text shape (legacy behaviour).
     if re.fullmatch(r"-?\d+", text):
@@ -2726,7 +4926,7 @@ def _sql_literal(value: Any, *, is_string: bool | None = None) -> str:
     lowered = text.lower()
     if lowered in {"true", "false"}:
         return lowered.upper()
-    return "'" + text.replace("'", "''") + "'"
+    return _ql("postgresql", text)
 
 
 def _dax_to_sql(
@@ -2772,6 +4972,22 @@ def _dax_to_sql(
             model_slug=model_slug,
         )
 
+    # Bug-5886 (F-002-01): TREATAS filters are recognised by the parser but
+    # silently dropped from the executed WHERE clause -- a valid-looking
+    # result that ignores the requested filter is a wrong-number defect, not
+    # a warning. Fail loud (SOAP fault) instead of executing an unfiltered
+    # query. This is intentionally narrow: it only fires for the TREATAS
+    # semantic-loss warning, not for the unrelated "partial parse" warning.
+    treatas_warnings = [
+        w for w in parsed.warnings if w.startswith("TREATAS ignored")
+    ]
+    if treatas_warnings:
+        raise ValueError(
+            "DAX TREATAS() is not supported by this gateway and was not "
+            "applied to the query; refusing to return unfiltered results. "
+            f"{treatas_warnings[0]}"
+        )
+
     # Resolve time-variant hints: TOTALYTD([Revenue], ...) → Revenue_ytd
     if parsed.time_variant_hints:
         for base_name, variant_kind in parsed.time_variant_hints.items():
@@ -2786,10 +5002,18 @@ def _dax_to_sql(
                     variant_kind, base_name, variant_name,
                 )
             else:
-                logger.warning(
-                    "DAX time-variant %s(%s) has no matching variant measure "
-                    "in the model; using base measure instead.",
-                    variant_kind, base_name,
+                # Bug-5887 (F-002-02): a missing time-intelligence variant
+                # used to fall back to the base (non-time-filtered) measure,
+                # a silent wrong-number defect (e.g. YTD returns the base
+                # period's total). Fail loud instead: the client asked for a
+                # specific time-intelligence calculation the model cannot
+                # provide, so surface a client-visible fault rather than a
+                # plausible-looking wrong answer.
+                raise ValueError(
+                    f"DAX time-intelligence function {variant_kind}({base_name}) "
+                    "requires a matching time-variant measure that is not "
+                    "defined on this model; refusing to fall back to the "
+                    "base measure."
                 )
 
     resolved_dims: list[str] = []
@@ -2938,31 +5162,299 @@ async def _gather_bounded(coro_factories: list, limit: int) -> list:
     return await asyncio.gather(*[_run(f) for f in coro_factories])
 
 
+# Bug-5558: plain integer/decimal literal regex matching the Bug-5538 pattern
+# in query-router conditions.py. Tight: no exponent, no leading ``+``, no
+# surrounding whitespace, ASCII digits only.
+_NUMERIC_LITERAL_RE = re.compile(r"^-?(\d+(\.\d+)?|\.\d+)\Z", re.ASCII)
+_INTEGER_LITERAL_RE = re.compile(r"^-?\d+\Z", re.ASCII)
+_INTEGER_TYPE_RE = re.compile(
+    r"^(u?int(eger)?\d*|bigint|smallint|tinyint|byteint|long)\Z",
+    re.ASCII,
+)
+
+
+def _dim_type_map_from_meta(
+    dimensions_meta: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Build a {dim_name: data_type} map from dimension metadata.
+
+    Used by ``_build_where_sql_clauses`` to render type-aware WHERE literals
+    (Bug-5558). Missing or None data_type entries are omitted so callers
+    get an empty dict when no type info is available.
+    """
+    result: dict[str, str] = {}
+    for d in dimensions_meta:
+        name = d.get("name")
+        dt = d.get("data_type")
+        if name and dt:
+            result[name] = dt
+    return result
+
+
+def _is_integer_type(col_type: str | None) -> bool:
+    """Return True for connector-native integer type spellings."""
+    if not col_type:
+        return False
+    normalized = str(col_type).strip().lower()
+    if "(" in normalized:
+        normalized = normalized.split("(", 1)[0].strip()
+    return bool(_INTEGER_TYPE_RE.match(normalized))
+
+
+def _where_literal(value: str, col_type: str | None) -> str:
+    """Render a WHERE clause literal, emitting bare numerics for numeric columns.
+
+    Bug-5558: BigQuery integer dimensions fail when a slicer value like
+    ``2024`` is rendered as ``'2024'`` (STRING) against an INT64 column.
+    When the dimension's ``data_type`` indicates a numeric family AND the
+    value passes the strict numeric-literal validator, it is emitted bare.
+    All other values (or unknown/text column types) use the safe
+    single-quoted form with internal quote escaping.
+    """
+    from shared.type_family import is_numeric as _is_numeric_type
+    if col_type and _is_numeric_type(col_type) and _NUMERIC_LITERAL_RE.match(value):
+        if _is_integer_type(col_type) and not _INTEGER_LITERAL_RE.match(value):
+            raise ValueError(
+                f"Invalid integer slicer literal {value!r} for {col_type} column"
+            )
+        return value
+    # Bug-6074: render the string literal through the sanctioned dialect-correct
+    # helper instead of hand-rolled ``''`` doubling. The gateway emits canonical
+    # PostgreSQL SQL (the query-router re-parses as postgres and transpiles to
+    # the source), so ``postgresql`` is the correct literal dialect here; the
+    # helper keeps a client value (incl. a trailing backslash) contained on every
+    # downstream dialect and removes the last hand-escaped path feeding the
+    # calc-member re-query WHERE clause.
+    return _ql("postgresql", value)
+
+
 def _build_where_sql_clauses(
     where_filters: dict[str, list[str]],
     quote_fn: Callable[[str], str],
+    dim_type_map: dict[str, str] | None = None,
 ) -> list[str]:
-    """Convert MDX-extracted where_filters into SQL WHERE clause parts."""
+    """Convert MDX-extracted where_filters into SQL WHERE clause parts.
+
+    Bug-5558: when *dim_type_map* is provided, numeric dimension values are
+    rendered as bare numeric literals (no single-quote wrapping) so BigQuery
+    INT64/FLOAT64 columns receive the correct type instead of a STRING
+    literal that triggers a type-mismatch error. Non-numeric or
+    non-validating values always fall back to quoted string literals.
+    """
+    dim_types = dim_type_map or {}
+
     clauses: list[str] = []
     for dim, vals in where_filters.items():
         if not dim:
             continue
         qd = quote_fn(dim)
-        between_vals = [v for v in vals if v.startswith("__BETWEEN__")]
-        normal_vals = [v for v in vals if not v.startswith("__BETWEEN__")]
+        col_type = dim_types.get(dim)
+        between_vals = [v for v in vals if v.startswith(_RANGE_PREFIX)]
+        normal_vals = [v for v in vals if not v.startswith(_RANGE_PREFIX)]
         for bv in between_vals:
-            parts = bv.split("__")
-            start_lit = "'" + parts[2].replace("'", "''") + "'"
-            end_lit = "'" + parts[3].replace("'", "''") + "'"
+            payload = bv[len(_RANGE_PREFIX):]
+            start_key, end_key = payload.split(_RANGE_SEP, 1)
+            start_lit = _where_literal(start_key, col_type)
+            end_lit = _where_literal(end_key, col_type)
             clauses.append(f"{qd} BETWEEN {start_lit} AND {end_lit}")
         if normal_vals:
             if len(normal_vals) == 1:
-                lit = "'" + normal_vals[0].replace("'", "''") + "'"
+                lit = _where_literal(normal_vals[0], col_type)
                 clauses.append(f"{qd} = {lit}")
             else:
-                in_list = ", ".join("'" + v.replace("'", "''") + "'" for v in normal_vals)
+                in_list = ", ".join(
+                    _where_literal(v, col_type) for v in normal_vals
+                )
                 clauses.append(f"{qd} IN ({in_list})")
     return clauses
+
+
+def _topn_member_predicate(
+    *,
+    detail_rows: list[dict[str, Any]],
+    grain_dim_cols: list[str],
+    quote_fn: Callable[[str], str],
+    dim_type_map: dict[str, str] | None = None,
+) -> str | None:
+    """Build a WHERE predicate constraining grain queries to the Top-N member set.
+
+    F-002-01: a Top-N (TopCount/BottomCount) pivot applies ``ORDER BY <measure>
+    ... LIMIT N`` to the DETAIL query only. The subtotal / grand-total grain
+    queries are built independently from ``where_sql`` and never receive the
+    ranked member set, so they aggregate ALL members (e.g. 6 rows) beneath a
+    detail axis that shows only the surviving N (e.g. 5 rows) — a silently wrong
+    subtotal / grand total.
+
+    The detail result has already had the Top-N ``LIMIT`` applied, so its rows
+    are exactly the surviving members. Every coarser subtotal is by definition
+    the aggregate over those same surviving detail children, so constraining each
+    grain query to the exact set of surviving detail-grain dimension tuples makes
+    every requested grain agree with the visible members. Returns the SQL
+    predicate (a single-column ``IN`` list, or an ``OR`` of composite tuple
+    equalities for a multi-column grain), or ``None`` when there is nothing to
+    constrain (no rows, or no grain dimension columns).
+    """
+    if not detail_rows or not grain_dim_cols:
+        return None
+
+    dim_types = dim_type_map or {}
+
+    # Distinct surviving member tuples over the detail grain, preserving first
+    # appearance order for deterministic SQL (and stable test assertions).
+    seen: set[tuple] = set()
+    tuples: list[tuple] = []
+    for row in detail_rows:
+        key = tuple(row.get(c) for c in grain_dim_cols)
+        if key in seen:
+            continue
+        seen.add(key)
+        tuples.append(key)
+
+    if not tuples:
+        return None
+
+    def _lit(col: str, value: Any) -> str:
+        col_type = dim_types.get(col)
+        if value is None:
+            # A NULL member value cannot participate in an equality/IN predicate;
+            # match it explicitly so a surviving NULL-keyed member is not dropped
+            # from the constrained subtotal (which would re-introduce the wrong
+            # total this fix exists to prevent).
+            return None
+        return _where_literal(str(value), col_type)
+
+    # Single-column grain: a compact IN (...) list, with an explicit NULL branch
+    # when a surviving member key is NULL.
+    if len(grain_dim_cols) == 1:
+        col = grain_dim_cols[0]
+        qc = quote_fn(col)
+        has_null = any(t[0] is None for t in tuples)
+        in_lits = [_lit(col, t[0]) for t in tuples if t[0] is not None]
+        parts: list[str] = []
+        if in_lits:
+            parts.append(f"{qc} IN ({', '.join(in_lits)})")
+        if has_null:
+            parts.append(f"{qc} IS NULL")
+        if not parts:
+            return None
+        return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
+
+    # Multi-column grain: OR of composite tuple equalities. Each surviving tuple
+    # becomes ``(col_a = v_a AND col_b = v_b ...)`` so the constraint matches the
+    # exact member combinations that survived Top-N, not the cross-product.
+    tuple_clauses: list[str] = []
+    for t in tuples:
+        conds: list[str] = []
+        for col, value in zip(grain_dim_cols, t):
+            qc = quote_fn(col)
+            if value is None:
+                conds.append(f"{qc} IS NULL")
+            else:
+                conds.append(f"{qc} = {_lit(col, value)}")
+        tuple_clauses.append("(" + " AND ".join(conds) + ")")
+    if not tuple_clauses:
+        return None
+    return "(" + " OR ".join(tuple_clauses) + ")"
+
+
+def _topn_requery_survivor_predicate(
+    *,
+    rows: list[dict[str, Any]],
+    columns: list[str],
+    dim_names_set: set[str],
+    axis_aliases: dict[str, str],
+    dimensions_meta: list[dict[str, Any]],
+) -> tuple[str | None, list[str]]:
+    """Derive the Top-N survivor WHERE predicate for a calc-member re-query.
+
+    Bug-8283: on a Top-N (TopCount/BottomCount) pivot the calc-member
+    ("Show Values As") denominator / aggregate re-queries must aggregate ONLY
+    the surviving ranked members. This is the PURE derivation used by
+    ``_handle_execute`` — extracted so its correctness on merged / aliased
+    inputs can be pinned by a revert-guarding unit test.
+
+    Returns ``(predicate, grain_cols)`` where ``predicate`` is the SQL member-set
+    constraint (or ``None`` if it cannot be built) and ``grain_cols`` is the
+    post-alias grain column list (used by the caller's fail-loud guard: a
+    non-empty ``grain_cols`` with a ``None`` predicate must SOAP-fault rather
+    than emit an all-member denominator).
+
+    Three properties this function guarantees, each guarding a distinct
+    silent-wrong / hard-fail failure the review rounds found:
+
+    1. DETAIL rows only (R3 finding 1). When the pivot also has a subtotal
+       hierarchy, ``rows`` is the MERGED result — subtotal / grand-total rows
+       (tagged ``SUBTOTAL_LEVEL_KEY != "detail"``) have ``None`` in their finer
+       dimension columns and would inject spurious ``... IS NULL`` survivor
+       branches matching hidden blank-member fact rows = contaminated
+       denominator. Filter to detail rows, exactly as the evaluator does
+       (``mdx_calc_members.py``). A flat pivot has no subtotal rows (no-op).
+    2. POST-alias grain cols (R1 finding 1). This runs AFTER
+       ``_alias_result_dimensions_for_hierarchy_axes`` renamed result columns to
+       hierarchy-alias names, so grain cols are keyed on ``dim_names_set`` (built
+       from post-alias ``dimensions_meta``), matching the post-alias ``columns``
+       and the re-query specs' ``_dim_cols`` basis. Keying on the pre-alias set
+       would find no grain cols -> None -> unconstrained denominator.
+    3. SOURCE identifiers in the SQL (R4 finding 1). The re-query is bound by the
+       query-router as canonical postgres, whose binder resolves SOURCE
+       dimension / level names, not bare MDX hierarchy-alias names. Translate
+       each grain col back to its source name via ``axis_aliases``
+       (alias->source) for BOTH the quoted identifier and the row-value lookup
+       (aliased detail rows retain both keys); this also lets the ``dim_type_map``
+       recover the source dim's ``data_type`` (the appended alias meta entry has
+       none), so a numeric member renders as a bare literal not a string.
+    """
+    from src.dax.subtotal_engine import select_detail_rows
+
+    detail_rows = select_detail_rows(rows)
+    # Grain cols are alias names post-rename; find them via the post-alias set.
+    grain_cols = [c for c in columns if c in dim_names_set]
+    # Translate to source names for the SQL (bindable identifiers + source row
+    # key + source data_type). Non-aliased cols map to themselves.
+    source_cols = [axis_aliases.get(c, c) for c in grain_cols]
+    predicate = _topn_member_predicate(
+        detail_rows=detail_rows,
+        grain_dim_cols=source_cols,
+        quote_fn=lambda n: _qi("postgresql", n),
+        dim_type_map=_dim_type_map_from_meta(dimensions_meta),
+    )
+    return predicate, grain_cols
+
+
+def _translate_requery_partition_identifiers(
+    *,
+    agg_specs: list,
+    denom_specs: list,
+    axis_aliases: dict[str, str],
+) -> None:
+    """Bug-8327: translate calc-member re-query partition-pin identifiers
+    alias->source in place.
+
+    The re-query partition pins (``ReQuerySpec.dim_col`` / ``partition_dims`` and
+    ``DenomReQuerySpec.partition_dims``) are built by the planners from the
+    POST-alias axis column names (``_dim_cols``, keyed on the post-alias
+    ``dim_names_set``). But every calc-member re-query is executed through the
+    query-router as canonical postgres, whose binder resolves SOURCE dimension /
+    level names — not MDX hierarchy-alias names. On an ALIASED pivot the
+    untranslated alias identifiers therefore fail to bind and FAULT the whole
+    Execute re-query.
+
+    Bug-8283 already fixed the Top-N SURVIVOR predicate this way (see
+    ``_topn_requery_survivor_predicate`` — post-alias keying + alias->source
+    identifier translation). The partition-pin path was left untranslated; this
+    applies the SAME translation to it. Only the emitted IDENTIFIERS are rewritten
+    — the partition VALUES were already read from the post-alias detail rows and
+    are correct as-is. Non-aliased columns map to themselves, so this is a no-op
+    on a flat (unaliased) pivot, which is what makes it revert-guardable by an
+    aliased-pivot unit test.
+    """
+    if not axis_aliases:
+        return
+    for sp in agg_specs or []:
+        sp.dim_col = axis_aliases.get(sp.dim_col, sp.dim_col)
+        sp.partition_dims = [axis_aliases.get(d, d) for d in sp.partition_dims]
+    for sp in denom_specs or []:
+        sp.partition_dims = [axis_aliases.get(d, d) for d in sp.partition_dims]
 
 
 class _TopNSpec:
@@ -3037,7 +5529,8 @@ _FILTER_PREDICATE = re.compile(
 # mdx_execute's `_CMP_OP` / `_MEASURE_REF` (Bug-5495) so the two layers agree on
 # which wrapped Filter() operands collapse to a bare measure predicate.
 _FILTER_CMP_OP = r'(?:>=|<=|<>|>|<|=)'
-_FILTER_BRACKET_MEASURE = r'\[Measures\]\.\[[^\]]+\]'
+# Bug-6717: accept ]] inside bracket bodies (MDX escaping of ]).
+_FILTER_BRACKET_MEASURE = r'\[Measures\]\.\[(?:[^\]]|\]\])+\]'
 # A measure operand wrapped only in balanced parentheses: `([Measures].[m])` or
 # `(( [Measures].[m] ))`. Collapsed to the bare reference before predicate
 # extraction so a paren-wrapped operand reads as the bare form.
@@ -3274,10 +5767,15 @@ def _span_overlaps(span: tuple[int, int], spans: list[tuple[int, int]]) -> bool:
 def _count_mdx_function_calls(axis_text: str, func_names: tuple[str, ...]) -> int:
     """Count occurrences of named MDX set functions (case-insensitive).
 
-    Used to detect TopCount/BottomCount/Filter calls that the narrow single-spec
-    extractors above cannot translate (composite first argument, a second
-    occurrence). When the count exceeds what was extracted the caller must
-    fail loud rather than silently run an over-complete result set (F-002-05).
+    Used to detect TopCount/BottomCount calls that the narrow single-spec
+    extractor cannot translate (composite first argument, a second occurrence).
+    When the count exceeds what was extracted the caller must fail loud rather
+    than silently run an over-complete result set (F-002-05).
+
+    ``Filter()`` no longer uses this counter: counting calls against a count of
+    extracted specs is exactly the Bug-8926 hole (one call producing two specs
+    tested ``1 > 2`` and passed). Filter consumption is tracked per call SPAN via
+    ``_iter_mdx_filter_calls``.
     """
     if not axis_text:
         return 0
@@ -3289,6 +5787,13 @@ def _count_mdx_function_calls(axis_text: str, func_names: tuple[str, ...]) -> in
 
 
 class _LabelFilterSpec:
+    """The four predicate fields of a translatable label filter.
+
+    Position-free: this is the render input for ``_label_filter_to_sql`` and
+    nothing else. The occurrence evidence the axis audit needs lives on
+    ``_AppliedLabelFilter``, which is the only type the production paths build.
+    """
+
     __slots__ = ("dim_ref", "operation", "value", "negated")
 
     def __init__(self, dim_ref: str, operation: str, value: str, negated: bool) -> None:
@@ -3298,73 +5803,504 @@ class _LabelFilterSpec:
         self.negated = negated
 
 
-def _extract_label_filter_specs(
+class _MdxFilterCall:
+    """One syntactic ``Filter(...)`` call located in an axis expression.
+
+    ``cond_span`` / ``cond_text`` describe the SECOND top-level argument (the
+    condition); ``set_text`` is the FIRST — the set being iterated. All three
+    are ``None`` when the call's parentheses do not balance or it carries no
+    top-level comma — a shape no translator can consume, which the caller's
+    consumption audit therefore rejects (fail closed).
+
+    Finding XMLA-LF-B2 (challenger round 2): ``set_text`` is not decoration. The condition's dimension must be
+    the dimension of the set being iterated, and until the set argument was
+    carried here nothing checked that.
+    """
+
+    __slots__ = ("call_span", "cond_span", "cond_text", "set_text")
+
+    def __init__(
+        self,
+        call_span: tuple[int, int],
+        cond_span: tuple[int, int] | None,
+        cond_text: str | None,
+        set_text: str | None = None,
+    ) -> None:
+        self.call_span = call_span
+        self.cond_span = cond_span
+        self.cond_text = cond_text
+        self.set_text = set_text
+
+
+def _iter_mdx_filter_calls(axis_text: str) -> list[_MdxFilterCall]:
+    """Locate EVERY syntactic ``Filter(...)`` call and split its two arguments.
+
+    Bug-8926. The previous accounting compared a COUNT of ``Filter(`` tokens
+    against a COUNT of extracted label predicates, so one call containing two
+    predicates tested ``1 > 2`` and passed — and passed more easily the more
+    predicates a single call carried. Two ``OR``-joined label predicates were
+    then rendered as two independent clauses joined by ``AND``, silently
+    returning a subset of the requested rows.
+
+    Consumption is therefore tracked per CALL SPAN, which requires knowing where
+    each call starts and ends. Every ``\\bFilter\\s*(`` occurrence is reported,
+    including one nested inside another call's set argument (each has its own
+    condition argument, so nested calls each translate independently) and
+    including one that occurs inside a string literal. Reporting the latter is
+    deliberate: ``_filter_condition_text`` sees it too, so treating it as a call
+    that must be consumed keeps the two views aligned and fails CLOSED.
+
+    Parenthesis depth is tracked outside double-quoted string literals so a
+    parenthesis or comma inside a label filter's literal cannot mis-bound the
+    condition.
+    """
+    calls: list[_MdxFilterCall] = []
+    for fm in re.finditer(r'\bFilter\s*\(', axis_text, re.IGNORECASE):
+        open_idx = fm.end() - 1  # index of the '('
+        depth = 0
+        in_str = False
+        end = -1
+        for j in range(open_idx, len(axis_text)):
+            ch = axis_text[j]
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end == -1:
+            # Unbalanced (or unterminated string): no condition can be proven,
+            # so record the call with no condition — it can never be consumed.
+            calls.append(_MdxFilterCall((fm.start(), len(axis_text)), None, None))
+            continue
+        call_span = (fm.start(), end + 1)
+        # Split off the set argument at the first TOP-LEVEL comma. BRACE depth
+        # counts as well as parenthesis depth: `Filter({a, b}, cond)` would
+        # otherwise split at the comma INSIDE the member set literal, leaving a
+        # condition no pattern can match — rejecting a legitimate label filter
+        # (the Bug-8925 availability class) rather than mistranslating it.
+        depth = 0
+        in_str = False
+        comma = -1
+        for k in range(open_idx + 1, end):
+            ch = axis_text[k]
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch in "({":
+                depth += 1
+            elif ch in ")}":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                comma = k
+                break
+        if comma == -1:
+            calls.append(_MdxFilterCall(call_span, None, None))
+            continue
+        cond_span = (comma + 1, end)
+        calls.append(_MdxFilterCall(
+            call_span,
+            cond_span,
+            axis_text[cond_span[0]:cond_span[1]],
+            axis_text[open_idx + 1:comma],
+        ))
+    return calls
+
+
+@dataclass(frozen=True)
+class _MdxSetGroup:
+    """One balanced ``(...)`` or ``{...}`` group in an axis expression.
+
+    ``name`` is the identifier immediately preceding an open parenthesis (the
+    MDX function being called), ``"{}"`` for a set literal, and ``""`` for a
+    bare grouping parenthesis. ``multi_element`` is True when the group contains
+    a top-level comma — i.e. it COMBINES two or more things rather than merely
+    grouping one.
+    """
+
+    open_idx: int
+    close_idx: int
+    name: str
+    multi_element: bool
+
+
+def _iter_mdx_set_groups(text: str) -> list[_MdxSetGroup]:
+    """Locate every bracket group in *text*, outside double-quoted literals.
+
+    An unterminated group is reported as running to the end of the text and as
+    multi-element: a shape this scanner cannot account for must constrain more,
+    never less (fail closed).
+    """
+    groups: list[_MdxSetGroup] = []
+    stack: list[list[Any]] = []  # [open_idx, open_char, saw_top_level_comma]
+    in_str = False
+    for i, ch in enumerate(text):
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in "({":
+            stack.append([i, ch, False])
+        elif ch in ")}":
+            if not stack:
+                continue
+            open_idx, open_ch, saw_comma = stack.pop()
+            groups.append(_MdxSetGroup(
+                open_idx, i + 1, _mdx_group_name(text, open_idx, open_ch),
+                bool(saw_comma),
+            ))
+        elif ch == "," and stack:
+            stack[-1][2] = True
+    while stack:
+        open_idx, open_ch, _saw_comma = stack.pop()
+        groups.append(_MdxSetGroup(
+            open_idx, len(text), _mdx_group_name(text, open_idx, open_ch), True,
+        ))
+    return groups
+
+
+def _mdx_group_name(text: str, open_idx: int, open_ch: str) -> str:
+    if open_ch == "{":
+        return "{}"
+    m = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*$', text[:open_idx])
+    return m.group(1) if m else ""
+
+
+# The only two enclosing constructs under which sibling set expressions compose
+# CONJUNCTIVELY, which is what AND-joining their rendered WHERE clauses means:
+#   CrossJoin(A, B) — the cartesian product of A and B.
+#   Filter(set, cond) — the label call sits in the SET argument of an outer
+#       Filter, so the outer condition restricts the already-restricted set.
+# Everything else with more than one top-level element is refused, including a
+# name this scanner does not recognise. A whitelist fails CLOSED; a blacklist of
+# known-OR combiners would fail OPEN on the first combiner nobody listed.
+_CONJUNCTIVE_SET_COMBINERS = frozenset({"crossjoin", "filter"})
+
+
+def _assert_label_filters_not_set_combined(
+    axis_text: str,
+    applied: Sequence[_AppliedLabelFilter],
+) -> None:
+    """Refuse a label filter that is COMBINED with other set elements.
+
+    Finding XMLA-LF-B1 (challenger round 2). The Bug-8926 guard proved that each ``Filter()`` call's condition
+    was consumed completely — consumption per SYNTACTIC UNIT. It said nothing
+    about how the units are combined with one another, so
+
+        Union(Filter([R].[R].Members, Left(...) = "US"),
+              Filter([R].[R].Members, Right(...) = "East"))
+
+    translated both calls, consumed both calls, and then appended both rendered
+    clauses to a list joined by ``AND``. MDX ``Union`` means OR. The query ran
+    and silently returned a SUBSET of the requested rows — the Bug-8926
+    wrong-numbers fault expressed across calls instead of inside one.
+
+    One label filter is enough to be wrong: ``Union(Filter(...), {[R].[R].&[E]})``
+    OR-combines a rendered LIKE with an enumerated member that the axis audit is
+    perfectly happy with, and the two are then AND-joined into a smaller result.
+
+    The generalised lesson, and the reason this is a separate guard rather than
+    an extension of the consumption check: consumption must be proven for the
+    WHOLE axis expression, not for each syntactic unit in isolation. A guard
+    scoped to the unit you happen to be looking at leaves the composition of
+    those units unproven.
+
+    Rendering true OR semantics is a larger change (the clause list is flat and
+    globally AND-joined). Until it exists, refusing is the only correct answer.
+    """
+    if not applied:
+        return
+    groups = _iter_mdx_set_groups(axis_text)
+    for lf in applied:
+        start, end = lf.filter_call_span
+        for group in groups:
+            if not group.multi_element:
+                continue
+            if not (group.open_idx < start and group.close_idx >= end):
+                continue
+            if group.name.lower() in _CONJUNCTIVE_SET_COMBINERS:
+                continue
+            combiner = f"{group.name}()" if group.name else "{...}"
+            raise ValueError(
+                f"Unsupported MDX set combination on an axis: the label filter "
+                f"on {lf.dim_ref} is combined with other set elements by "
+                f"{combiner}. A set combination such as Union() or a "
+                f"multi-element set literal means OR, but the gateway can only "
+                f"AND the rendered filter clauses together, which would "
+                f"silently return too few rows. Express each label filter over "
+                f"its own set instead — nested Filter() calls or CrossJoin() "
+                f"compose conjunctively and are supported."
+            )
+
+
+# The member reference a label filter operates on. Named groups so the exact
+# source SPAN of the reference can be recorded as translation evidence.
+_LABEL_MEMBER_REF = (
+    r'(?P<ref>\[(?P<dim>[^\]]+)\](?:\.\[(?P<hier>[^\]]+)\])?'
+    r'\.CurrentMember\.Name)'
+)
+
+# Bug-8925/Bug-8926: these ANCHOR the whole condition (``\A``/``\Z``). A
+# ``re.search`` would recognise a predicate buried inside a composite condition
+# and silently drop the rest; an anchored full match means "this Filter() call
+# contains exactly this one supported predicate, and nothing else".
+_LABEL_LEFT_COND = re.compile(
+    r'\A\s*Left\s*\(\s*' + _LABEL_MEMBER_REF +
+    r'\s*,\s*(?P<count>\d+)\s*\)\s*(?P<op>=|<>)\s*"(?P<val>[^"]*)"\s*\Z',
+    re.IGNORECASE,
+)
+_LABEL_RIGHT_COND = re.compile(
+    r'\A\s*Right\s*\(\s*' + _LABEL_MEMBER_REF +
+    r'\s*,\s*(?P<count>\d+)\s*\)\s*(?P<op>=|<>)\s*"(?P<val>[^"]*)"\s*\Z',
+    re.IGNORECASE,
+)
+_LABEL_INSTR_COND = re.compile(
+    r'\A\s*InStr\s*\(\s*' + _LABEL_MEMBER_REF +
+    r'\s*,\s*"(?P<val>[^"]*)"\s*\)\s*(?P<op>>|=)\s*0\s*\Z',
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class _AppliedLabelFilter:
+    """Occurrence-bound proof that ONE axis label predicate was translated.
+
+    Bug-8925. The enumerated-member audit rejects any ``[Dim].[Hier].<member>``
+    reference on a ROWS/COLUMNS axis that produced no filter. A label filter's
+    ``[Dim].[Hier].CurrentMember.Name`` reference matches that grammar but is
+    restricted through a DIFFERENT channel (a rendered ``LIKE`` clause), so the
+    audit faulted the whole Execute and the shipped Excel "Label Filter" feature
+    was unavailable.
+
+    The evidence handed to the audit is a SPAN, never a dimension name. The audit
+    exempts exactly the bracket reference contained in a proven translated
+    context; a second ``.CurrentMember`` occurrence — even on the same dimension
+    — remains subject to rejection. A global ``.CurrentMember`` token exemption
+    and a dimension-level exemption are both unsafe and deliberately absent:
+    ``Filter([R].[R].Members, Left(...) = "US" AND UnsupportedFn(
+    [R].[R].CurrentMember.Name))`` would excuse BOTH references when only one was
+    translated.
+
+    ``context_text`` pins the string identity of ``context_span``. The span is
+    only meaningful against the exact string it was computed from; if extraction
+    ran on one axis string and the audit iterates another (normalized, stripped,
+    re-concatenated), every span is silently wrong — and a wrong span grants a
+    spurious EXEMPTION, the unsafe direction. The audit re-slices and compares,
+    and fails closed on a mismatch.
+
+    ``sql_clause`` is rendered BEFORE this record exists: "recognised" never
+    bypasses the audit. The same string is what the SQL builder appends, so the
+    exemption is a proof — this exact reference already produced this predicate.
+    """
+
+    dim_ref: str
+    operation: str
+    value: str
+    negated: bool
+    context_span: tuple[int, int]
+    context_text: str
+    filter_call_span: tuple[int, int]
+    sql_clause: str
+
+
+def _match_label_condition(
+    cond_text: str,
+) -> tuple[str, str | None, str, str, bool, tuple[int, int]] | None:
+    """Full-match one ``Filter()`` condition against the supported label shapes.
+
+    Returns ``(dim, hierarchy, operation, value, negated, ref_span)`` or ``None``
+    when the condition is not EXACTLY one supported label predicate. ``ref_span``
+    is relative to *cond_text*.
+
+    The Left/Right character count is captured (it used to be a bare ``\\d+``,
+    discarded) and must equal the literal's length. ``Left(name, 2) = "USA"`` is
+    unsatisfiable in MDX — a 2-character prefix cannot equal a 3-character
+    literal — yet rendered as ``LIKE 'usa%'`` and returned rows. A disagreeing
+    count is rejected rather than reinterpreted.
+    """
+    for pattern, operation in (
+        (_LABEL_LEFT_COND, "begins_with"),
+        (_LABEL_RIGHT_COND, "ends_with"),
+    ):
+        m = pattern.match(cond_text)
+        if m:
+            value = m.group("val")
+            if int(m.group("count")) != len(value):
+                return None
+            return (
+                m.group("dim"), m.group("hier"), operation, value,
+                m.group("op") == "<>", m.span("ref"),
+            )
+    m = _LABEL_INSTR_COND.match(cond_text)
+    if m:
+        return (
+            m.group("dim"), m.group("hier"), "contains", m.group("val"),
+            m.group("op") == "=", m.span("ref"),
+        )
+    return None
+
+
+def _translate_label_filter_calls(
     axis_text: str,
     dim_names: set[str],
     hierarchy_level_dim_map: dict[str, dict[str, str]],
     hierarchy_default_dim_map: dict[str, str],
-) -> list[_LabelFilterSpec]:
-    """Extract label filter patterns from MDX axis text.
+    quote_fn: Callable[[str], str],
+) -> list[_AppliedLabelFilter]:
+    """Translate every ``Filter()`` call that is EXACTLY one label predicate.
 
-    Recognised patterns:
-      - Left([Dim].[Hier].CurrentMember.Name, N) = "prefix"  -> Begins With
-      - Left(...) <> "prefix"                                 -> Does Not Begin With
-      - InStr([Dim].[Hier].CurrentMember.Name, "text") > 0   -> Contains
-      - InStr(...) = 0                                        -> Does Not Contain
-      - Right([Dim].[Hier].CurrentMember.Name, N) = "suffix"  -> Ends With
-      - Right(...) <> "suffix"                                -> Does Not End With
+    THE single label-filter translator. The main SQL path, the subtotal/grain
+    path and the AVG/COUNT_DISTINCT re-query path all consume this one output, so
+    a variant supported by one of them can never be silently ignored by another.
+
+    Contract: one exact supported label predicate per ``Filter()`` call. Multiple
+    label filters stay supported when the client expresses them as separate or
+    nested calls (they compose conjunctively, which is what ``AND``-joining the
+    rendered clauses means). A COMPOSITE condition inside one call — including
+    ``Left(...) = "US" OR Right(...) = "East"`` and
+    ``Left(...) = "US" AND [Measures].[Sales] > 100`` — is NOT translated here;
+    it leaves the call unconsumed and the caller's consumption audit fails the
+    Execute closed. Boolean semantics inside one call are not implemented, and
+    guessing them is exactly the Bug-8926 wrong-numbers fault.
+
+    Finding XMLA-LF-B2 (challenger round 2): the condition's dimension must ALSO be the dimension of the SET
+    being iterated. ``Filter([Product].[Product].Members, Left([Region].[Region]
+    .CurrentMember.Name, 2) = "US")`` iterates products while testing the region
+    current member, which comes from the surrounding query context — it is not
+    the iterated member at all. Rendering it as a row-level ``region LIKE 'us%'``
+    is silently incorrect filtering, and dimension extraction can add region to
+    the SQL grain on top of that. A set argument that does not provably resolve
+    to exactly the condition's dimension is refused, including one that cannot
+    be resolved at all: "could not parse it" is never a reason to accept.
+
+    A call is skipped (left unconsumed, therefore rejected upstream) when the
+    condition is not an exact label predicate, the character count disagrees with
+    the literal, the dimension/hierarchy does not resolve to a known dimension,
+    the set argument's dimension does not resolve or does not agree with the
+    condition's, or the SQL clause does not render.
     """
-    specs: list[_LabelFilterSpec] = []
-
-    # Left(...) = "prefix" or Left(...) <> "prefix"
-    for m in re.finditer(
-        r'\bLeft\s*\(\s*\[([^\]]+)\](?:\.\[([^\]]+)\])?\.CurrentMember\.Name'
-        r'\s*,\s*\d+\s*\)\s*(=|<>)\s*"([^"]*)"',
-        axis_text, re.IGNORECASE,
-    ):
+    applied: list[_AppliedLabelFilter] = []
+    for call in _iter_mdx_filter_calls(axis_text):
+        if call.cond_span is None or call.cond_text is None:
+            continue
+        matched = _match_label_condition(call.cond_text)
+        if matched is None:
+            continue
+        dim_part, hier_part, operation, value, negated, ref_span = matched
         dim_ref = _resolve_label_filter_dim(
-            m.group(1), m.group(2), dim_names,
+            dim_part, hier_part, dim_names,
             hierarchy_level_dim_map, hierarchy_default_dim_map,
         )
-        if dim_ref:
-            specs.append(_LabelFilterSpec(
-                dim_ref=dim_ref, operation="begins_with",
-                value=m.group(4), negated=(m.group(3) == "<>"),
-            ))
-
-    # InStr(...) > 0 or InStr(...) = 0
-    for m in re.finditer(
-        r'\bInStr\s*\(\s*\[([^\]]+)\](?:\.\[([^\]]+)\])?\.CurrentMember\.Name'
-        r'\s*,\s*"([^"]*)"\s*\)\s*(>|=)\s*0',
-        axis_text, re.IGNORECASE,
-    ):
-        dim_ref = _resolve_label_filter_dim(
-            m.group(1), m.group(2), dim_names,
+        if not dim_ref or dim_ref not in dim_names:
+            continue
+        set_dim = _resolve_filter_set_dimension(
+            call.set_text, dim_names,
             hierarchy_level_dim_map, hierarchy_default_dim_map,
         )
-        if dim_ref:
-            specs.append(_LabelFilterSpec(
-                dim_ref=dim_ref, operation="contains",
-                value=m.group(3), negated=(m.group(4) == "="),
-            ))
-
-    # Right(...) = "suffix" or Right(...) <> "suffix"
-    for m in re.finditer(
-        r'\bRight\s*\(\s*\[([^\]]+)\](?:\.\[([^\]]+)\])?\.CurrentMember\.Name'
-        r'\s*,\s*\d+\s*\)\s*(=|<>)\s*"([^"]*)"',
-        axis_text, re.IGNORECASE,
-    ):
-        dim_ref = _resolve_label_filter_dim(
-            m.group(1), m.group(2), dim_names,
-            hierarchy_level_dim_map, hierarchy_default_dim_map,
+        if set_dim is None or set_dim != dim_ref:
+            continue
+        # Render BEFORE the evidence exists. "Recognised" must never bypass the
+        # audit; only a successfully rendered clause earns the exemption.
+        sql_clause = _label_filter_to_sql(
+            _LabelFilterSpec(dim_ref, operation, value, negated), quote_fn,
         )
-        if dim_ref:
-            specs.append(_LabelFilterSpec(
-                dim_ref=dim_ref, operation="ends_with",
-                value=m.group(4), negated=(m.group(3) == "<>"),
-            ))
+        if not sql_clause:
+            continue
+        start = call.cond_span[0] + ref_span[0]
+        end = call.cond_span[0] + ref_span[1]
+        applied.append(_AppliedLabelFilter(
+            dim_ref=dim_ref,
+            operation=operation,
+            value=value,
+            negated=negated,
+            context_span=(start, end),
+            context_text=axis_text[start:end],
+            filter_call_span=call.call_span,
+            sql_clause=sql_clause,
+        ))
+    return applied
 
-    return specs
+
+# A member / level reference inside a ``Filter()`` SET argument. The trailing
+# ``(?:\.&?\[...\])*`` swallows the key or caption tail of an enumerated member
+# (``[R].[R].&[US-East]``) so its key is never mistaken for a dimension of its
+# own. The lookbehind stops a match starting mid-chain.
+_SET_ARG_MEMBER_REF = re.compile(
+    r'(?<![\]\w.])\[([^\]]+)\]'
+    r'(?:\.\[([^\]]+)\])?'
+    r'(?:\.\[([^\]]+)\])?'
+    r'(?:\.&?\[[^\]]*\])*'
+)
+
+
+def _resolve_filter_set_dimension(
+    set_text: str | None,
+    dim_names: set[str],
+    hierarchy_level_dim_map: dict[str, dict[str, str]],
+    hierarchy_default_dim_map: dict[str, str],
+) -> str | None:
+    """Resolve the ONE dimension a ``Filter()`` set argument iterates.
+
+    Finding XMLA-LF-B2 (challenger round 2). Returns ``None`` — which the caller treats as "refuse" — when the
+    set argument is empty, when any member reference in it does not resolve to a
+    known dimension, or when it spans MORE than one dimension (a CrossJoin set,
+    say: the condition cannot be proven to test the iterated member).
+
+    Every reference in the argument must resolve, not merely one of them. A set
+    that is partly unresolvable is exactly the case where "the condition matches
+    the bit I could read" would license a filter on a dimension the query never
+    iterates.
+
+    Measures are skipped: they are never the iterated dimension and appear in a
+    nested condition when the set argument is itself a ``Filter()`` call, whose
+    own set references resolve alongside.
+    """
+    if not set_text or not set_text.strip():
+        return None
+    # A double-quoted literal is never a member reference. Blanked out (not
+    # deleted, so nothing is re-joined into a new reference) because a set
+    # argument that is itself a nested `Filter()` carries that call's condition,
+    # and `InStr(..., "a[b]c")` would otherwise present `[b]` as an
+    # unresolvable dimension and refuse a legitimate query.
+    scannable = re.sub(r'"[^"]*"', lambda m: " " * len(m.group(0)), set_text)
+    resolved_dims: set[str] = set()
+    for m in _SET_ARG_MEMBER_REF.finditer(scannable):
+        dim_part = (m.group(1) or "").strip()
+        if dim_part.lower() == "measures":
+            continue
+        hier_part = (m.group(2) or "").strip() or None
+        level_part = (m.group(3) or "").strip() or None
+        # `[Dim].[Hier].[X]` is ambiguous between a LEVEL and a caption MEMBER.
+        # Try the most specific reading first and fall back, so an enumerated
+        # member does not look like an unresolvable level.
+        candidate: str | None = None
+        for hier, level in ((hier_part, level_part), (hier_part, None), (None, None)):
+            got = _resolve_hierarchy_dimension_name(
+                dim_name=dim_part,
+                hierarchy_name=hier,
+                level_name=level,
+                dim_names=dim_names,
+                hierarchy_level_dim_map=hierarchy_level_dim_map,
+                hierarchy_default_dim_map=hierarchy_default_dim_map,
+            )
+            if got and got in dim_names:
+                candidate = got
+                break
+        if candidate is None:
+            return None
+        resolved_dims.add(candidate)
+    if len(resolved_dims) != 1:
+        return None
+    return next(iter(resolved_dims))
 
 
 def _resolve_label_filter_dim(
@@ -3387,22 +6323,34 @@ def _resolve_label_filter_dim(
 
 
 def _label_filter_to_sql(spec: _LabelFilterSpec, quote_fn) -> str:
-    """Convert a label filter spec to a SQL WHERE clause fragment."""
+    """Convert a label filter spec to a SQL WHERE clause fragment.
+
+    Bug-6938 / Bug-6635: the string-LITERAL body routes through the sanctioned
+    ``_ql()`` (``connector_qualify.quote_literal``) path — no hand-rolled
+    ''-doubling. The LIKE-PATTERN metacharacters (``%`` ``_``) and the ESCAPE
+    character (``\\``) still have to be escaped explicitly BEFORE the literal is
+    formed: ``quote_literal`` handles string-literal quoting only, not LIKE
+    wildcard semantics, and there is no shared LIKE-metachar helper. On
+    PostgreSQL (standard-conforming strings) ``_ql`` doubles ``'`` and preserves
+    ``\\`` verbatim, so the ``\\``-doubled metachars survive into the pattern and
+    are consumed by ``ESCAPE '\\'`` — matching a literal ``%`` / ``_`` / ``\\``.
+    """
     col = f"LOWER({quote_fn(spec.dim_ref)})"
-    escaped = (
+    like_safe = (
         spec.value.lower()
-        .replace("'", "''")
         .replace("\\", "\\\\")
         .replace("%", "\\%")
         .replace("_", "\\_")
     )
     op = "NOT LIKE" if spec.negated else "LIKE"
     if spec.operation == "begins_with":
-        return f"{col} {op} '{escaped}%' ESCAPE '\\'"
+        pattern = f"{like_safe}%"
     elif spec.operation == "ends_with":
-        return f"{col} {op} '%{escaped}' ESCAPE '\\'"
+        pattern = f"%{like_safe}"
     else:
-        return f"{col} {op} '%{escaped}%' ESCAPE '\\'"
+        pattern = f"%{like_safe}%"
+    quoted = _ql("postgresql", pattern)
+    return f"{col} {op} {quoted} ESCAPE '\\'"
 
 
 _TIME_GRAIN_RANK = {
@@ -3571,6 +6519,7 @@ def _mdx_to_sql(
     hierarchy_meta: list[dict[str, Any]] | None = None,
     model_slug: str = "",
     subtotal_hierarchies: list | None = None,
+    constant_measure_names: set[str] | None = None,
 ) -> tuple[str, str]:
     """
     Translate an MDX statement from Excel into SQL for the query-router.
@@ -3623,14 +6572,24 @@ def _mdx_to_sql(
     row_expr = _mdx_axis_expr(cleaned, 1)   # ON ROWS / ON 1
     where_expr = _mdx_where_expr(cleaned)
 
+    def _q(name: str) -> str:
+        return _qi("postgresql", name)
+
     # Extract TopCount/BottomCount/Filter before validation so we can
     # translate them to SQL instead of rejecting them.
+    #
+    # Bug-8925/Bug-8926: ``axis_text`` is built ONCE here and is the only string
+    # the label-filter translator and the axis member audit ever see. The
+    # translation evidence handed to the audit is a set of character SPANS, and a
+    # span is only meaningful against the exact string it was measured on — so
+    # the two sides must not independently re-derive "the axis text".
     axis_text = col_expr + " " + row_expr
     topn_spec = _extract_topn_spec(axis_text)
     filter_spec = _extract_filter_spec(axis_text, measure_names)
-    label_filter_specs = _extract_label_filter_specs(
+    applied_label_filters = _translate_label_filter_calls(
         axis_text, dim_names,
         hierarchy_level_dim_map, hierarchy_default_dim_map,
+        quote_fn=_q,
     )
 
     # F-002-05: the single-spec extractors above match only the first, simple
@@ -3651,20 +6610,48 @@ def _mdx_to_sql(
             "incorrect (unfiltered) results."
         )
 
-    filter_calls = _count_mdx_function_calls(axis_text, ("Filter",))
-    filter_consumed = 1 if filter_spec is not None else 0
-    # Each label filter is also written as a Filter(...) call in the MDX axis;
-    # those are consumed by _extract_label_filter_specs and must be discounted.
-    filter_consumed += len(label_filter_specs)
-    if filter_calls > filter_consumed:
+    # Bug-8926: whole-`Filter()`-call consumption. Consumption is tracked by the
+    # SPAN of each call, not by comparing a count of calls against a count of
+    # extracted predicates. The old count comparison passed whenever one call
+    # produced two or more specs (`1 > 2` is False) — so two OR-joined label
+    # predicates inside one call were accepted and then rendered as two clauses
+    # joined by AND, silently returning too few rows. Every located call must now
+    # be consumed COMPLETELY by exactly one supported translation family.
+    _filter_calls = _iter_mdx_filter_calls(axis_text)
+    _label_call_spans = [lf.filter_call_span for lf in applied_label_filters]
+    _label_consumed = set(_label_call_spans)
+    # "One exact label predicate per Filter() call" is enforced structurally, not
+    # only by the anchored condition match: if any call ever yielded two
+    # translations they would be AND-joined below regardless of the MDX joiner,
+    # which is precisely the Bug-8926 wrong-numbers fault.
+    _unconsumed = len(_label_consumed) != len(_label_call_spans)
+    _measure_consumed: set[tuple[int, int]] = set()
+    if filter_spec is not None and _filter_calls:
+        # `_extract_filter_spec` reads the FIRST `Filter(` call's condition
+        # (`_filter_condition_text`), so that is the one call it can consume.
+        _first_call_span = _filter_calls[0].call_span
+        if _first_call_span not in _label_consumed:
+            _measure_consumed.add(_first_call_span)
+    _unconsumed = _unconsumed or any(
+        call.call_span not in _label_consumed
+        and call.call_span not in _measure_consumed
+        for call in _filter_calls
+    )
+    if _unconsumed:
         raise ValueError(
-            "Unsupported Filter() usage on an axis. Only a single value filter "
-            "(Filter(set, [Measures].[M] op value)) or a recognised label "
-            "filter can be translated to SQL; additional or unrecognised "
-            "Filter() calls would return incorrect (unfiltered) results."
+            "Unsupported Filter() usage on an axis. Each Filter() call must be "
+            "either a single value filter (Filter(set, [Measures].[M] op value)) "
+            "or exactly ONE label filter (Left/Right/InStr over "
+            "[Dim].[Hier].CurrentMember.Name, with the character count equal to "
+            "the compared literal's length, over a set of that same dimension). "
+            "A composite condition inside one Filter() call (for example two "
+            "label predicates joined by AND/OR), a condition naming a different "
+            "dimension than the set being iterated, or an unrecognised Filter() "
+            "call, is rejected because translating it would return incorrect "
+            "(wrongly filtered) results."
         )
 
-    has_any_filter = bool(filter_spec) or bool(label_filter_specs)
+    has_any_filter = bool(filter_spec) or bool(applied_label_filters)
     has_topn = topn_spec is not None
     _check_unsupported_mdx_constructs(
         col_expr, "COLUMNS axis", allow_topn=has_topn, allow_filter=has_any_filter,
@@ -3674,9 +6661,15 @@ def _mdx_to_sql(
     )
     _check_unsupported_mdx_constructs(where_expr, "WHERE clause")
 
-    # Extract measures and dimensions from all parts
+    # Extract measures and dimensions from all parts. The measure set is derived
+    # by the SHARED ``_sql_measure_set`` helper (Bug-6887 Info measures,
+    # Bug-6888 KPI constants, Bug-8751 WITH-declared calc members and their input
+    # measures) so this path, the flat-LNE grain repair and the subtotal GRAIN
+    # queries cannot drift apart.
     all_text = col_expr + " " + row_expr + " " + where_expr
-    mdx_measures = _mdx_extract_measures(all_text)
+    mdx_measures = _sql_measure_set(
+        cleaned, all_text, constant_measure_names=constant_measure_names,
+    )
     mdx_dims = _mdx_extract_dimensions(
         col_expr + " " + row_expr,
         dim_names=dim_names,
@@ -3697,6 +6690,24 @@ def _mdx_to_sql(
                 existing.append(v)
         where_filters[dim] = existing
 
+    # Bug-5548: an enumerated member set on ROWS/COLUMNS must restrict the level
+    # to exactly those members. The axis dimension is already GROUP-BY'd by
+    # _mdx_extract_dimensions; merge the explicit members in as a WHERE filter so
+    # the level is no longer fully expanded. A bare .Members/.Children/
+    # .AllMembers expansion produces no filter (full level preserved).
+    axis_member_filters = _mdx_extract_axis_member_filters(
+        col_expr + " " + row_expr,
+        dim_names,
+        hierarchy_level_dim_map=hierarchy_level_dim_map,
+        hierarchy_default_dim_map=hierarchy_default_dim_map,
+    )
+    for dim, vals in axis_member_filters.items():
+        existing = where_filters.get(dim, [])
+        for v in vals:
+            if v not in existing:
+                existing.append(v)
+        where_filters[dim] = existing
+
     # Bug-1060: every WHERE-slicer dimension member must have resolved AND
     # produced a filter. Reject anything that would otherwise run unfiltered.
     _assert_where_members_applied(
@@ -3704,6 +6715,31 @@ def _mdx_to_sql(
         hierarchy_level_dim_map=hierarchy_level_dim_map,
         hierarchy_default_dim_map=hierarchy_default_dim_map,
     )
+    # Bug-5548 (Codex review): the AXIS enumerated-set path must fail loud too.
+    # An unknown or partially-resolving member set on ROWS/COLUMNS would
+    # otherwise be silently dropped (above, in the merge) and the level run
+    # unfiltered — the same fail-open seam as Bug-1060. Level expansions
+    # (.Members/.Children/.AllMembers) and (All) are exempt.
+    #
+    # Bug-8925: the audit also receives the occurrence-bound evidence of what the
+    # label-filter channel consumed — spans, never dimension names — so a
+    # reference that provably produced a rendered LIKE predicate is exempt and
+    # every other reference stays subject to rejection. The SAME `axis_text`
+    # object the spans were measured on is passed here.
+    _assert_axis_member_references_applied(
+        axis_text, where_filters, dim_names,
+        hierarchy_level_dim_map=hierarchy_level_dim_map,
+        hierarchy_default_dim_map=hierarchy_default_dim_map,
+        translated_label_filters=applied_label_filters,
+    )
+    # Finding XMLA-LF-B1: consumption was proven per Filter() CALL; this proves the whole
+    # axis EXPRESSION. Two calls that each translate cleanly still return the
+    # wrong rows when the axis combines them with Union() (or any other
+    # non-conjunctive set construct), because every rendered clause is appended
+    # to one globally AND-joined list below. Runs after the member audit so the
+    # existing, more specific member diagnostics are still what a user sees when
+    # they also apply.
+    _assert_label_filters_not_set_combined(axis_text, applied_label_filters)
 
     # When subtotals are detected, expand dimensions to include all
     # hierarchy levels so the detail query returns the grain columns
@@ -3760,9 +6796,6 @@ def _mdx_to_sql(
             )
         mdx_dims.append(hidden_lne_time_dim)
 
-    def _q(name: str) -> str:
-        return _qi("postgresql", name)
-
     select_parts: list[str] = []
     for dim in mdx_dims:
         if dim in dim_names:
@@ -3803,9 +6836,15 @@ def _mdx_to_sql(
         return mdx, "dax"
 
     from_table = _q(model_slug or "model_table")
-    where_sql_clauses = _build_where_sql_clauses(where_filters, _q)
-    for lf in label_filter_specs:
-        where_sql_clauses.append(_label_filter_to_sql(lf, _q))
+    where_sql_clauses = _build_where_sql_clauses(
+        where_filters, _q,
+        dim_type_map=_dim_type_map_from_meta(dimensions_meta),
+    )
+    # Bug-8925: the SAME rendered clause that earned the audit exemption is what
+    # reaches the SQL. The exemption is therefore a proof, not an assertion:
+    # this exact reference already produced this exact predicate.
+    for lf in applied_label_filters:
+        where_sql_clauses.append(lf.sql_clause)
     sql = f'SELECT {", ".join(select_parts)} FROM {from_table}'
     if where_sql_clauses:
         sql += f" WHERE {' AND '.join(where_sql_clauses)}"
@@ -3853,6 +6892,18 @@ def _mdx_to_sql(
         canon = measure_canonical.get(topn_spec.measure.lower(), topn_spec.measure)
         direction = "DESC" if topn_spec.descending else "ASC"
         sql += f' ORDER BY {_q(canon)} {direction} LIMIT {topn_spec.count}'
+    elif mdx_dims and not axis_member_filters:
+        # Bug-6655: add a deterministic ORDER BY on grain dimensions so flat
+        # pivot members appear in a stable, reproducible order across source
+        # engines and refreshes.  SSAS orders by member key/ordinal
+        # (Hierarchize); without this the order depends on the source GROUP BY
+        # implementation and can change between queries.
+        # Codex-R1-F8: skip when explicit enumerated member sets exist --
+        # the MDX set order must be preserved (build_real_execute_response
+        # uses result-row appearance order for axis construction).
+        order_cols = [_q(d) for d in mdx_dims if d in dim_names]
+        if order_cols:
+            sql += f' ORDER BY {", ".join(order_cols)}'
 
     return sql, "jdbc"
 
@@ -4002,6 +7053,62 @@ def _alias_result_dimensions_for_hierarchy_axes(
 # Named-set inlining (Bug-5499)
 # ---------------------------------------------------------------------------
 
+# Bug-6073: MDX reserved words and common set/member/statistical function names.
+# The named-set inliner replaces a set reference with the set's stored MDX
+# expression. The bracket-quoted form ``[Name]`` is an unambiguous identifier
+# and is always safe to replace. The BARE (unquoted) form, however, matches any
+# whole-word occurrence — so a set whose name collides with an MDX keyword or
+# function (e.g. a set literally named ``Order`` or ``Filter``) would rewrite
+# the ``Order(...)`` / ``Filter(...)`` function CALLS inside the very same
+# query, corrupting the MDX into an invalid or wrong statement. When a set name
+# collides with a token in this set we perform ONLY the bracketed replacement
+# and skip the bare one: a legitimately keyword-named set must be referenced in
+# brackets to be inlined, which is safe; skipping the ambiguous bare rewrite is
+# strictly better than corrupting the statement. Compared case-insensitively.
+_MDX_RESERVED_LOWER: frozenset[str] = frozenset(
+    w.lower()
+    for w in (
+        # Statement / axis keywords
+        "WITH", "SELECT", "FROM", "WHERE", "ON", "COLUMNS", "ROWS", "PAGES",
+        "SECTIONS", "CHAPTERS", "AXIS", "NON", "EMPTY", "MEMBER", "SET", "AS",
+        "DIMENSION", "PROPERTIES", "CELL", "CALCULATED", "CURRENTCUBE",
+        # Bare syntactic FLAG tokens (Bug-6073, Codex R1). These appear as bare
+        # words inside function calls — Order(set, expr, BDESC),
+        # Descendants(m, lvl, SELF_AND_BEFORE), DrilldownLevel(set, , POST) — so
+        # a set named after one of them would clobber the flag if inlined bare.
+        "ASC", "DESC", "BASC", "BDESC",
+        "SELF", "AFTER", "BEFORE", "BEFORE_AND_AFTER", "SELF_AND_AFTER",
+        "SELF_AND_BEFORE", "SELF_BEFORE_AFTER", "LEAVES",
+        "INCLUDEEMPTY", "EXCLUDEEMPTY", "RECURSIVE", "INCLUDE_CALC_MEMBERS",
+        "PRE", "POST", "ALL",
+        # Logical / conditional
+        "CASE", "WHEN", "THEN", "ELSE", "END", "IIF", "IS", "NULL", "AND",
+        "OR", "NOT", "XOR",
+        # Set / member navigation functions
+        "MEMBERS", "CHILDREN", "DESCENDANTS", "ANCESTOR", "ANCESTORS",
+        "PARENT", "FIRSTCHILD", "LASTCHILD", "PREVMEMBER", "NEXTMEMBER",
+        "LEAD", "LAG", "COUSIN", "SIBLINGS", "CURRENTMEMBER", "DEFAULTMEMBER",
+        "ALLMEMBERS", "LEVEL", "LEVELS", "HIERARCHY", "ORDINAL",
+        # Set operators / builders
+        "FILTER", "ORDER", "TOPCOUNT", "BOTTOMCOUNT", "TOPSUM", "BOTTOMSUM",
+        "TOPPERCENT", "BOTTOMPERCENT", "HEAD", "TAIL", "SUBSET", "UNION",
+        "EXCEPT", "INTERSECT", "CROSSJOIN", "HIERARCHIZE", "DISTINCT",
+        "GENERATE", "EXTRACT", "EXISTS", "NONEMPTY", "DRILLDOWNLEVEL",
+        "DRILLDOWNMEMBER", "DRILLUPLEVEL", "DRILLUPMEMBER", "TOGGLEDRILLSTATE",
+        # Aggregation / statistical
+        "SUM", "COUNT", "AVG", "MIN", "MAX", "AGGREGATE", "MEDIAN", "STDEV",
+        "STDDEV", "VAR", "VARIANCE", "RANK", "COALESCEEMPTY",
+        # Time-series
+        "PARALLELPERIOD", "PERIODSTODATE", "YTD", "QTD", "MTD", "WTD",
+        "CLOSINGPERIOD", "OPENINGPERIOD", "LASTPERIODS", "CLOSINGPERIOD",
+        # String / value / conversion
+        "STRTOSET", "STRTOMEMBER", "STRTOVALUE", "SETTOARRAY", "ITEM",
+        "NAME", "UNIQUENAME", "VALUE", "MEMBERVALUE", "FORMAT", "TUPLE",
+        "PROPERTIES",
+    )
+)
+
+
 def _inline_named_sets(
     mdx: str,
     named_sets: list[dict[str, Any]],
@@ -4032,12 +7139,23 @@ def _inline_named_sets(
                         a longer ``[X].[Y]`` hierarchy path)
 
     Sets whose expression is empty or whitespace-only are skipped.
+    Sets with ``list_type == "sql_fixed"`` are unconditionally skipped (Invariant 8).
     """
     if not named_sets or not mdx:
         return mdx
 
     result = mdx
     for ns in named_sets:
+        # Skip SQL-type named lists — they must never be inlined as MDX.
+        # Invariant 8 (architecture_tessallite-named-lists.md): an SQL list
+        # must never be pasted into MDX.  A NULL/empty expression would be
+        # harmlessly skipped by the empty-expression check below, but a
+        # sql_fixed set that somehow carries a non-empty expression would be
+        # wrongly inlined as MDX (silent wrong results).  list_type is the
+        # authoritative discriminator, not the expression value.
+        if ns.get("list_type") == "sql_fixed":
+            continue
+
         name = ns.get("name", "")
         expression = (ns.get("expression") or "").strip()
         if not name or not expression:
@@ -4053,37 +7171,423 @@ def _inline_named_sets(
             re.IGNORECASE,
         )
 
-        def _bracket_replace(m: re.Match) -> str:
+        # Bug-5696: capture ``result`` and ``expression`` via default
+        # arguments so each iteration's closure binds the current values,
+        # not the loop variable by reference (classic Python closure-in-a-
+        # loop pitfall).
+        def _bracket_replace(
+            m: re.Match,
+            _result: str = result,
+            _expression: str = expression,
+        ) -> str:
             # Check whether this match is preceded by FROM + whitespace.
             start = m.start()
-            prefix = result[:start].rstrip()
+            prefix = _result[:start].rstrip()
             if prefix.upper().endswith("FROM"):
                 return m.group(0)  # keep the cube name intact
-            return expression
+            return _expression
 
         result = pattern_bracket.sub(_bracket_replace, result)
 
         # (2) Bare unquoted form: `SetName` as a whole word, not inside brackets,
         #     not preceded by `[` or `.`, not followed by `]` or `.`.
         #     This catches `{SetName}` and `SetName ON ROWS`.
-        pattern_bare = re.compile(
-            r'(?<![.\[\w])' + re.escape(name) + r'(?![.\]\w])',
-            re.IGNORECASE,
-        )
-        result = pattern_bare.sub(expression, result)
+        #
+        # Bug-6073: skip the bare rewrite when the set name collides with an MDX
+        # keyword/function. The bracketed form above has already inlined any
+        # explicit `[SetName]` reference; doing the bare rewrite as well would
+        # also match the keyword/function CALLS in the query (e.g. a set named
+        # `Order` would clobber `Order(...)`), corrupting the MDX. A
+        # keyword-named set must be referenced in brackets to be inlined.
+        if name.strip().lower() not in _MDX_RESERVED_LOWER:
+            pattern_bare = re.compile(
+                r'(?<![.\[\w])' + re.escape(name) + r'(?![.\]\w])',
+                re.IGNORECASE,
+            )
+            # Bug-7252 (CF-018-Fable-F01801): the expression must be treated
+            # as a LITERAL replacement, not a regex template.  The old call
+            # ``pattern_bare.sub(expression, result)`` interprets backslashes
+            # (``\C``, ``\1``, ``\g<...>``) in the expression as group
+            # references, raising ``re.error`` for any set whose MDX
+            # expression contains a backslash (e.g. fixed-member keys like
+            # ``EMEA\Central``).  Using a callable mirrors the bracket path
+            # above (line ~4875) and avoids template interpretation.
+            result = pattern_bare.sub(lambda m, _e=expression: _e, result)
 
     return result
 
 
+_SELECT_KEYWORD_RE = re.compile(r'SELECT\b', re.IGNORECASE)
+_WITH_DECL_KEYWORD_RE = re.compile(r'(?:MEMBER|SET)\b', re.IGNORECASE)
+
+
+def _mdx_visible_positions(text: str):
+    """Yield ``(index, paren_depth)`` for each character of *text* that is real
+    MDX SYNTAX — never a character inside a string literal, a ``[bracket]`` body
+    (``]]``-escape aware), or a comment.
+
+    Block comments are counted with NESTING depth. SSAS MDX block comments nest
+    (Bug-6612, ``mdx_execute._mdx_strip_literals_and_comments``); a scanner that
+    closes at the first ``*/`` leaks the comment tail back into the syntax
+    stream, and a keyword found in that tail is treated as real — fail OPEN.
+
+    One walker so every "find the top-level X" question in this module answers
+    from the same lexing rules instead of growing another private scanner.
+    """
+    n = len(text)
+    i = 0
+    depth = 0
+    quote = ""
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch == "[":
+            i += 1
+            while i < n:
+                if text[i] == "]":
+                    if i + 1 < n and text[i + 1] == "]":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if text.startswith("/*", i):
+            level = 1
+            i += 2
+            while i < n and level:
+                if text.startswith("/*", i):
+                    level += 1
+                    i += 2
+                elif text.startswith("*/", i):
+                    level -= 1
+                    i += 2
+                else:
+                    i += 1
+            continue
+        if text.startswith("//", i) or text.startswith("--", i):
+            nl = text.find("\n", i + 2)
+            i = n if nl < 0 else nl + 1
+            continue
+        if ch in "({":
+            depth += 1
+            yield i, depth - 1
+            i += 1
+            continue
+        if ch in ")}":
+            depth = max(0, depth - 1)
+            yield i, depth
+            i += 1
+            continue
+        yield i, depth
+        i += 1
+
+
+def _mdx_top_level_keyword_positions(text: str, pattern: re.Pattern) -> list[int]:
+    """Start offsets where *pattern* matches a whole word at paren-depth 0 and
+    outside literals/brackets/comments."""
+    out: list[int] = []
+    for i, depth in _mdx_visible_positions(text):
+        if depth != 0:
+            continue
+        if i and (text[i - 1].isalnum() or text[i - 1] == "_"):
+            continue
+        if pattern.match(text, i):
+            out.append(i)
+    return out
+
+
+def _mdx_scan_statement_body_offset(mdx: str) -> int:
+    """Uncached scan for the first top-level ``SELECT`` offset (0 if none)."""
+    found = _mdx_top_level_keyword_positions(mdx, _SELECT_KEYWORD_RE)
+    return found[0] if found else 0
+
+
+# Above this length a statement is NOT memoised. The memo holds the only strong
+# reference to its key for the process lifetime, so a count-bounded cache is
+# byte-UNBOUNDED against a 10 MB request ceiling (deep-review R3 finding 4);
+# real Excel statements are ~100 KB, which is what the memo is for.
+_MDX_BODY_CACHE_MAX_CHARS = 1_000_000
+
+
+@functools.lru_cache(maxsize=32)
+def _mdx_statement_body_offset_cached(mdx: str) -> int:
+    return _mdx_scan_statement_body_offset(mdx)
+
+
+def _mdx_statement_body_offset(mdx: str) -> int:
+    """Offset of the statement's first top-level ``SELECT``, or 0.
+
+    Memoised (deep-review R2 finding 4). ``_mdx_visible_positions`` is a
+    per-character Python lexer, and a single ``_handle_execute`` asks the same
+    question ~20 times (three axis/where extractors, called from the handler, the
+    translator, the subtotal block and the re-query block). Measured on a real
+    119 KB Excel keep-only statement: 2.38 M characters re-lexed and ~278 ms of
+    pure-Python work per Execute. Statements are immutable strings, so one small
+    cache collapses that to a single pass.
+
+    Oversized statements bypass the cache entirely (R3 finding 4): with a 10 MB
+    request ceiling, pinning 32 of them would retain hundreds of MB of query text
+    — including member values — for the process lifetime.
+    """
+    if len(mdx) > _MDX_BODY_CACHE_MAX_CHARS:
+        return _mdx_scan_statement_body_offset(mdx)
+    return _mdx_statement_body_offset_cached(mdx)
+
+
+def _mdx_statement_body(mdx: str) -> str:
+    """Return the statement from its first TOP-LEVEL ``SELECT``, dropping any
+    ``WITH`` prelude.
+
+    Bug-8750. Every axis extractor below falls back to
+    ``(?:SELECT|,)\\s+(.*?)\\s+ON\\s+(?:COLUMNS|0)`` and ``re.search`` returns the
+    LEFTMOST match — so a comma anywhere in a ``WITH MEMBER ... AS ...`` prelude
+    (which is where Excel puts every "Show Values As" / custom-group definition)
+    anchors the axis-0 capture in the middle of the WITH clause. The captured
+    fragment then carries the tail of a calc-member EXPRESSION, which downstream
+    reads as axis content: an enumerated member in it becomes a keep-only WHERE
+    filter on the main detail SQL (silently one product instead of all), a
+    ROWS-axis dimension is attributed to the COLUMNS axis (wrong % of Row/Column
+    Total split), and an unfilterable reference trips the Bug-1060 fail-loud audit
+    and refuses the whole Execute.
+
+    Fixing it at each regex would leave the next extractor exposed, so the
+    statement body is normalised ONCE here and every axis extractor starts from
+    it. A subselect's inner ``SELECT`` (always inside ``FROM ( ... )``) and a
+    ``SELECT`` inside a member caption, string literal or comment are never
+    mistaken for the statement's own. Returns ``mdx`` unchanged when no top-level
+    ``SELECT`` exists (a DAX statement, or a fragment already extracted) — the
+    pre-fix behaviour, so an unparseable statement degrades safely.
+    """
+    if not mdx:
+        return mdx
+    cut = _mdx_statement_body_offset(mdx)
+    return mdx[cut:] if cut else mdx
+
+
+def _mdx_with_prelude(mdx: str) -> str:
+    """Everything BEFORE the statement's top-level ``SELECT`` — i.e. the ``WITH``
+    formula list, or ``""`` when the statement has none."""
+    if not mdx:
+        return ""
+    cut = _mdx_statement_body_offset(mdx)
+    return mdx[:cut] if cut else ""
+
+
+# ``MEMBER [Measures].[Name]`` and the unbracketed ``MEMBER [Measures].Name``
+# form (both are legal MDX and both are emitted in the wild).
+_WITH_MEMBER_MEASURE_DECL_RE = re.compile(
+    r'MEMBER\s+\[Measures\]\s*\.\s*(?:\[((?:[^\]]|\]\])+)\]|([A-Za-z_]\w*))',
+    re.IGNORECASE,
+)
+
+
+def _mdx_declared_calc_measures(mdx: str) -> dict[str, str]:
+    """Map ``WITH MEMBER [Measures].[X]`` name -> its expression text (Bug-8751).
+
+    Declaration boundaries are found with the shared top-level walker, so the
+    word "Member" inside a bracketed caption (``[Total Member Revenue]``, the
+    Bug-6066 R2 shape) or inside a comment does not split a member's expression.
+    """
+    prelude = _mdx_with_prelude(mdx)
+    if not prelude:
+        return {}
+    starts = _mdx_top_level_keyword_positions(prelude, _WITH_DECL_KEYWORD_RE)
+    out: dict[str, str] = {}
+    for idx, start in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else len(prelude)
+        m = _WITH_MEMBER_MEASURE_DECL_RE.match(prelude, start)
+        if not m:
+            continue
+        raw = m.group(1) or m.group(2) or ""
+        if raw:
+            out[raw.replace("]]", "]")] = prelude[m.end():end]
+    return out
+
+
+# A measure reference in EITHER legal spelling: ``[Measures].[Name]`` and the
+# unbracketed ``[Measures].Name``. Mirrors ``mdx_execute._MEASURE_REF``.
+_MEASURE_REF_ANY_FORM_RE = re.compile(
+    r'\[Measures\]\s*\.\s*(?:\[((?:[^\]]|\]\])+)\]|([A-Za-z_]\w*))',
+    re.IGNORECASE,
+)
+
+# MDX member/set FUNCTIONS and PROPERTIES that legally follow ``[Measures].``.
+# Deep-review R4 finding 1: the bare alternative above has no positional anchor,
+# so it matches any identifier in that position — and in real MDX an identifier
+# after ``[Measures].`` is more often a function/property than a member name.
+# ``_WITH_MEMBER_MEASURE_DECL_RE`` is safe from this only because it is anchored
+# after the ``MEMBER`` keyword, where an identifier IS a name by grammar; the
+# reference scan has to earn that guarantee explicitly. Collecting one of these
+# as a measure makes ``_mdx_to_sql`` refuse the whole statement with a FALSE
+# "Measure not available to this persona: MEMBERS" — a legal pivot denied, with
+# a message that misdirects an admin to the persona configuration.
+#
+# The denylist applies ONLY to the bare alternative. A real measure may
+# legitimately be named "Count"; referenced as ``[Measures].[Count]`` it is
+# still collected, and still fails loud under Bug-1067 when the persona hides it.
+_MDX_MEASURES_NAMESPACE_FUNCTIONS = frozenset({
+    "addcalculatedmembers", "allmembers", "caption", "children", "count",
+    "currentmember", "defaultmember", "dimension", "firstchild", "firstsibling",
+    "hierarchy", "item", "lag", "lastchild", "lastsibling", "lead", "level",
+    "levels", "members", "name", "nextmember", "ordinal", "parent",
+    "prevmember", "properties", "siblings", "uniquename", "value",
+})
+
+
+def _mdx_measure_refs_any_form(text: str) -> list[str]:
+    """Measure names referenced in *text*, in EITHER bracket spelling.
+
+    ``_mdx_extract_measures`` is bracket-only. ``_WITH_MEMBER_MEASURE_DECL_RE``
+    deliberately accepts both forms, and that asymmetry inside
+    :func:`_sql_measure_set` was a silent-blank defect (deep-review R3 finding
+    1): a member DECLARED with brackets whose input is referenced BARE was
+    correctly dropped from SQL resolution, and its input was then never added
+    back — so the detail SQL projected no measure at all and the pivot rendered
+    every cell blank with a 200 and no fault. Producer and consumer must
+    recognise the same syntax.
+
+    A BARE token is rejected when it is a known Measures-namespace function or
+    property, or when it is immediately applied as a call (``name(``) — see
+    ``_MDX_MEASURES_NAMESPACE_FUNCTIONS`` (R4 finding 1).
+
+    Shared-primitive note (CLAUDE.md): the only other place this two-spelling
+    syntax is recognised is ``mdx_execute._MEASURE_REF``. Its consumers
+    (``_strip_func_wrapped_comparison_measures``, ``_ANCHORED_MEASURE_RE``,
+    ``_BARE_MEASURE_RE``) are blanking/stripping passes that tolerate a spurious
+    hit; none of them fails closed, so they are NOT exposed to this
+    amplification. This function is the only one whose output drives a
+    fail-closed SQL projection.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    body = text or ""
+    for m in _MEASURE_REF_ANY_FORM_RE.finditer(body):
+        bracketed, bare = m.group(1), m.group(2)
+        if bare is not None:
+            if bare.lower() in _MDX_MEASURES_NAMESPACE_FUNCTIONS:
+                continue
+            # Bounded lookahead (never scan the whole remaining statement): an
+            # identifier immediately applied as ``name(...)`` is a call, not a
+            # member. Whitespace before the paren is legal but never long.
+            if body[m.end():m.end() + 8].lstrip()[:1] == "(":
+                continue
+        raw = bracketed if bracketed is not None else (bare or "")
+        name = raw.strip().replace("]]", "]")
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            out.append(name)
+    return out
+
+
+def _sql_measure_set(
+    statement: str,
+    axis_and_where_text: str,
+    *,
+    constant_measure_names: set[str] | None = None,
+) -> list[str]:
+    """THE measure set the SQL projection must resolve for *statement*.
+
+    Bug-8751 review finding 1. Three places derive "which measures does this
+    statement need from the source": ``_mdx_to_sql`` (the detail SQL), the flat
+    LAST_NON_EMPTY grain repair, and the subtotal GRAIN queries. They must agree
+    — the LNE repair in particular decides whether to collapse a HIDDEN time
+    grain that ``_mdx_to_sql`` added, and if it derives a narrower measure set it
+    leaves the phantom grain in the result and the pivot renders NO cells at all
+    (HTTP 200, no fault). One helper, three callers.
+
+    The set is: measures referenced on the axes / in the slicer, MINUS the three
+    kinds of member that are not SQL columns (Info/trust measures — Bug-6887;
+    KPI goal/status constants — Bug-6888; and the statement's own WITH-declared
+    calculated members — Bug-8751), PLUS the real measures those calculated
+    members need as INPUTS.
+
+    Input measures are collected only from calculated members actually placed on
+    an axis or in the slicer, followed transitively through chained members. A
+    member the client declared but never used contributes nothing — projecting
+    its inputs would cost a needless source aggregate and could fault the pivot
+    on an unrelated LNE-companion rule.
+
+    A referenced input the persona cannot see is deliberately LEFT in the set so
+    it fails loud under its OWN name (Bug-1067), rather than being silently
+    dropped.
+    """
+    const_lower = {c.lower() for c in (constant_measure_names or set())}
+
+    def _is_non_sql(name: str) -> bool:
+        low = name.lower()
+        return (
+            low in _INFO_MEASURES
+            or low in _INFO_DISPLAY_TO_INTERNAL
+            or low in const_lower
+        )
+
+    measures = [
+        m for m in _mdx_measure_refs_any_form(axis_and_where_text)
+        if not _is_non_sql(m)
+    ]
+    declared = _mdx_declared_calc_measures(statement)
+    if not declared:
+        return measures
+
+    declared_lower = {d.lower(): d for d in declared}
+    used = [declared_lower[m.lower()] for m in measures if m.lower() in declared_lower]
+    measures = [m for m in measures if m.lower() not in declared_lower]
+    have = {m.lower() for m in measures}
+
+    seen_decl = {d.lower() for d in used}
+    frontier = list(used)
+    while frontier:
+        for ref in _mdx_measure_refs_any_form(declared.get(frontier.pop(), "")):
+            low = ref.lower()
+            if low in declared_lower:
+                if low not in seen_decl:
+                    seen_decl.add(low)
+                    frontier.append(declared_lower[low])
+                continue
+            if low in have or _is_non_sql(ref):
+                continue
+            measures.append(ref)
+            have.add(low)
+    return measures
+
+
 def _mdx_axis_expr(mdx: str, axis_num: int) -> str:
-    """Extract the set expression for a given MDX axis."""
+    """Extract the set expression for a given MDX axis.
+
+    Bug-8750: the WITH prelude is stripped first (see ``_mdx_statement_body``) so
+    a comma inside a calc-member expression cannot anchor the axis-0 fallback.
+    """
+    mdx = _mdx_statement_body(mdx)
 
     def _clean(expr: str) -> str:
         out = (expr or "").strip()
         # Remove leading NON EMPTY
         out = re.sub(r'^NON\s+EMPTY\s+', '', out, flags=re.IGNORECASE).strip()
-        # Remove DIMENSION PROPERTIES clause
-        out = re.sub(r'\s+DIMENSION\s+PROPERTIES\s+[^,}]+', '', out, flags=re.IGNORECASE).strip()
+        # Remove the DIMENSION PROPERTIES clause in full (Bug-6698). Real Excel
+        # (MSOLAP) decorates every axis set with a comma-separated property list,
+        # e.g. `DIMENSION PROPERTIES MEMBER_KEY, MEMBER_VALUE, MEMBER_UNIQUE_NAME`
+        # and often LEVEL-QUALIFIED bracketed refs such as
+        # `[Dim].[Hier].[Level].[MEMBER_KEY]` — which are lexically identical to a
+        # member selection `[Dim].[Hier].[Level].[Member]`. The clause is axis
+        # metadata (which properties to RETURN), never a member selection. The
+        # captured axis fragment is already terminated at its `ON <axis>` keyword,
+        # so the property list runs to the end of the fragment: strip all of it.
+        # A previous `[^,}]+` form stopped at the FIRST comma, leaving the rest of
+        # the list (including the bracketed level-qualified refs) to be mis-parsed
+        # as member values, producing WHERE col IN ('MEMBER_KEY', ...) -> 0 rows.
+        out = re.sub(
+            r'\s+DIMENSION\s+PROPERTIES\s+.*$', '', out,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
         return out
 
     # Axis 1 is special: in standard MDX it appears after axis 0
@@ -4107,6 +7611,24 @@ def _mdx_axis_expr(mdx: str, axis_num: int) -> str:
         if match:
             return _clean(match.group(1))
 
+    # Bug-8281: for axis 0 (COLUMNS), try the ROWS-first variant BEFORE the
+    # SELECT-anchored fallback. When the MDX lists ROWS before COLUMNS
+    # (``SELECT {rows} ON ROWS, {cols} ON COLUMNS``) the generic
+    # ``(?:SELECT|,)...ON COLUMNS`` pattern below anchors on SELECT and captures
+    # the ROWS fragment into the axis-0 expression — so the COLUMNS axis (and
+    # every downstream extractor: measures, dims, member filters, the Bug-8272
+    # re-query merge) sees the wrong set. This mirrors the ROWS-first probe
+    # ``_mdx_axis_has_non_empty`` already uses (its Opus R1 F3 fix) so both
+    # helpers isolate the COLUMNS fragment identically for a ROWS-first query.
+    if axis_num == 0:
+        match = re.search(
+            r'\bON\s+(?:ROWS|1)\b\s*,\s*(.*?)\s+ON\s+(?:COLUMNS|0)\b',
+            mdx,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return _clean(match.group(1))
+
     axis_names = {0: "COLUMNS", 1: "ROWS"}
     name = axis_names.get(axis_num, str(axis_num))
     pattern = rf'(?:SELECT|,)\s+(.*?)\s+ON\s+(?:{name}|{axis_num})\b'
@@ -4116,12 +7638,72 @@ def _mdx_axis_expr(mdx: str, axis_num: int) -> str:
     return ""
 
 
+def _mdx_axis_has_non_empty(mdx: str, axis_num: int) -> bool:
+    """Return True when the axis set carries a leading ``NON EMPTY`` (Bug-6658).
+
+    ``_mdx_axis_expr`` strips ``NON EMPTY`` before returning, so it cannot tell an
+    explicit NON EMPTY axis from a plain one. This detects the keyword on the RAW
+    axis fragment so the Execute path can restore zero-fact members ("Show items
+    with no data") when NON EMPTY is ABSENT, and prune them when it is present.
+
+    Bug-8750: this helper carries the SAME ``(?:SELECT|,)`` axis-0 fallback as
+    ``_mdx_axis_expr`` and therefore the same WITH-prelude anchoring hole — a
+    calc-member pivot could be judged NON EMPTY (or not) from the wrong fragment,
+    silently pruning or restoring zero-fact members. Normalise identically.
+    """
+    mdx = _mdx_statement_body(mdx)
+
+    def _leads_non_empty(fragment: str) -> bool:
+        return bool(re.match(r'\s*NON\s+EMPTY\b', fragment or "", re.IGNORECASE))
+
+    if axis_num == 1:
+        match = re.search(
+            r'\bON\s+(?:COLUMNS|0)\b\s*,\s*(.*?)\s+ON\s+(?:ROWS|1)\b',
+            mdx, re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return _leads_non_empty(match.group(1))
+        match = re.search(
+            r'\bSELECT\s+(.*?)\s+ON\s+(?:ROWS|1)\b',
+            mdx, re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return _leads_non_empty(match.group(1))
+        return False
+
+    # Opus R1 F3: for axis 0 (COLUMNS), try the ROWS-first variant first so we
+    # correctly isolate the COLUMNS fragment when the MDX lists ROWS before
+    # COLUMNS. Without this, ``SELECT NON EMPTY {rows} ON ROWS, {cols} ON COLUMNS``
+    # falsely reports axis 0 as NON EMPTY from the ROWS axis's keyword.
+    if axis_num == 0:
+        match = re.search(
+            r'\bON\s+(?:ROWS|1)\b\s*,\s*(.*?)\s+ON\s+(?:COLUMNS|0)\b',
+            mdx, re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return _leads_non_empty(match.group(1))
+
+    axis_names = {0: "COLUMNS", 1: "ROWS"}
+    name = axis_names.get(axis_num, str(axis_num))
+    pattern = rf'(?:SELECT|,)\s+(.*?)\s+ON\s+(?:{name}|{axis_num})\b'
+    match = re.search(pattern, mdx, re.IGNORECASE | re.DOTALL)
+    if match:
+        return _leads_non_empty(match.group(1))
+    return False
+
+
 def _mdx_where_expr(mdx: str) -> str:
     """Extract the WHERE/slicer clause expression (measures references for context).
 
     Handles nested braces and parentheses for multi-select patterns like:
     ``WHERE ({[Dim].[Hier].[M1], [Dim].[Hier].[M2]}, [Measures].[X])``
+
+    Bug-8750 (sibling hardening): the WITH prelude is dropped first, so a
+    ``WHERE`` token appearing inside a calc-member expression or a member caption
+    ahead of ``SELECT`` cannot be mistaken for the statement's slicer — the
+    slicer, by grammar, always follows ``SELECT``.
     """
+    mdx = _mdx_statement_body(mdx)
     # Find WHERE keyword position, then capture everything up to CELL PROPERTIES or end
     where_match = re.search(r'\bWHERE\s+', mdx, re.IGNORECASE)
     if not where_match:
@@ -4143,18 +7725,25 @@ def _mdx_where_expr(mdx: str) -> str:
         if end > 0:
             return after_where[1:end].strip()
     # WHERE [Measures].[name] — bare member reference
-    bare = re.match(r'(\[Measures\]\.\[[^\]]+\])', after_where)
+    # Bug-6717: accept ]] inside bracket bodies.
+    bare = re.match(r'(\[Measures\]\.\[(?:[^\]]|\]\])+\])', after_where)
     if bare:
         return bare.group(1).strip()
     return ""
 
 
 def _mdx_extract_measures(expr: str) -> list[str]:
-    """Extract measure names from [Measures].[name] references."""
+    """Extract measure names from [Measures].[name] references.
+
+    Bug-6717: the bracket pattern accepts ``]]`` (escaped ``]``) inside
+    bracketed names and unescapes the captured content so the returned names
+    are the raw technical names suitable for model-metadata lookup.
+    """
     measures: list[str] = []
     seen: set[str] = set()
-    for m in re.finditer(r'\[Measures\]\.\[([^\]]+)\]', expr):
-        name = m.group(1).strip()
+    for m in re.finditer(r'\[Measures\]\.\[((?:[^\]]|\]\])+)\]', expr):
+        # Bug-6717: unescape ]] -> ] for model-metadata lookup
+        name = m.group(1).strip().replace("]]", "]")
         if name not in seen:
             seen.add(name)
             measures.append(name)
@@ -4264,6 +7853,18 @@ def _mdx_extract_subselect_filters(
         if not sub_match:
             break
         sub_expr = sub_match.group(1)
+        # Bug-6698 (Codex R2 finding 1): Excel can decorate a SUBSELECT axis set
+        # with a DIMENSION PROPERTIES clause too. The captured fragment is
+        # terminated at its `ON COLUMNS|0` keyword, so the property list runs to
+        # fragment end — strip ALL of it BEFORE member extraction, exactly like
+        # `_mdx_axis_expr._clean` does for the main axes. Otherwise
+        # level-qualified property refs ([D].[H].[L].[MEMBER_KEY]) parse as
+        # member selections and poison the slicer filter set with property
+        # tokens (empty pivots / loud date-cast errors).
+        sub_expr = re.sub(
+            r'\s+DIMENSION\s+PROPERTIES\s+.*$', '', sub_expr,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
         sub_where_text = re.sub(r'^\{|\}$', '', sub_expr.strip()).strip()
         level_filters = _mdx_extract_where_filters(
             sub_where_text, dim_names,
@@ -4288,6 +7889,7 @@ def _mdx_extract_where_filters(
     *,
     hierarchy_level_dim_map: dict[str, dict[str, str]] | None = None,
     hierarchy_default_dim_map: dict[str, str] | None = None,
+    exclude_level_expansions: bool = False,
 ) -> dict[str, list[str]]:
     """
     Extract dimension member filters from WHERE clause.
@@ -4295,6 +7897,15 @@ def _mdx_extract_where_filters(
     Supports single-member and multi-select patterns:
     - ``[Dim].[Hier].[Member]``
     - ``{[Dim].[Hier].[M1], [Dim].[Hier].[M2]}`` (OR semantics)
+
+    Bug-5548: ``exclude_level_expansions`` reuses this same member grammar to
+    pull an *enumerated member set* off a ROWS/COLUMNS axis (e.g.
+    ``{[cat].[cat].&[Shoes], [cat].[cat].&[Music]}``) and turn it into a
+    dimension filter, while NOT mistaking a full-level/children expansion
+    (``[cat].[cat].[Level].Members``, ``.Children``, ``.AllMembers``) for a
+    specific member. A bare ``.Members`` therefore still produces no filter and
+    keeps returning the whole level. Off by default so WHERE-slicer extraction
+    is byte-for-byte unchanged.
 
     B8 round-2 fix (deep-review Finding 4): member key references are
     parsed with the same grammar that ``mdx_execute`` uses to emit them
@@ -4311,6 +7922,18 @@ def _mdx_extract_where_filters(
         return filters
     hierarchy_level_dim_map = hierarchy_level_dim_map or {}
     hierarchy_default_dim_map = hierarchy_default_dim_map or {}
+
+    # Bug-5548: when reading an axis member set, a reference that is immediately
+    # followed by a level/children expansion keyword is NOT an enumerated member
+    # (it expands the whole level) and must not become a filter. The guard is
+    # empty for the WHERE path so its behaviour is unchanged.
+    _expansion_guard = (
+        # MDX method names are case-insensitive (Codex review): match
+        # Members/Children/AllMembers in any case so a lowercase `.members`
+        # is not mis-read as an enumerated member and turned into a bogus filter.
+        r'(?!\s*\.\s*(?i:Members|AllMembers|Children))'
+        if exclude_level_expansions else ''
+    )
 
     def _resolve_target(dim: str, hierarchy: str | None, level: str | None) -> str | None:
         resolved = _resolve_hierarchy_dimension_name(
@@ -4393,7 +8016,7 @@ def _mdx_extract_where_filters(
         target = _resolve_target(m.group(1).strip(), m.group(2).strip(), m.group(3).strip())
         if target:
             filters.setdefault(target, [])
-            sentinel = f"__BETWEEN__{start_key}__{end_key}"
+            sentinel = f"{_RANGE_PREFIX}{start_key}{_RANGE_SEP}{end_key}"
             if sentinel not in filters[target]:
                 filters[target].append(sentinel)
             range_seen.add(target)
@@ -4411,7 +8034,8 @@ def _mdx_extract_where_filters(
 
     # [Dim].[Hierarchy].[Level].&[Member] / .&[k0]&[k1]... / .[Member]
     for m in re.finditer(
-        r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\]\.' + KEYS_OR_CAPTION,
+        r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\]\.' + KEYS_OR_CAPTION
+        + _expansion_guard,
         where_expr,
     ):
         keys = parse_member_keys(m.group(4))
@@ -4429,7 +8053,7 @@ def _mdx_extract_where_filters(
     # (shared KEY_PATH fragment — an inline single-bracket copy here
     # truncated keys containing the SSAS ``]]`` escape, Bug-1052.)
     for m in re.finditer(
-        r'\[([^\]]+)\]\.\[([^\]]+)\]\.(' + KEY_PATH + r')',
+        r'\[([^\]]+)\]\.\[([^\]]+)\]\.(' + KEY_PATH + r')' + _expansion_guard,
         where_expr,
     ):
         keys = parse_member_keys(m.group(3))
@@ -4456,7 +8080,8 @@ def _mdx_extract_where_filters(
 
     # [Dim].[Hierarchy].[Member]
     for m in re.finditer(
-        r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\](?!\s*\.\s*(?:\[|&\[))',
+        r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\](?!\s*\.\s*(?:\[|&\[))'
+        + _expansion_guard,
         where_expr,
     ):
         member = m.group(3).strip().strip('()')
@@ -4465,6 +8090,162 @@ def _mdx_extract_where_filters(
             _add(target, member)
 
     return filters
+
+
+def _mdx_extract_axis_member_filters(
+    axis_expr: str,
+    dim_names: set[str],
+    *,
+    hierarchy_level_dim_map: dict[str, dict[str, str]] | None = None,
+    hierarchy_default_dim_map: dict[str, str] | None = None,
+) -> dict[str, list[str]]:
+    """Extract dimension filters from an *enumerated member set* on ROWS/COLUMNS.
+
+    Bug-5548: an explicit set of members on an axis
+    (``{[cat].[cat].&[Shoes], [cat].[cat].&[Music]}`` — key form — or
+    ``{[cat].[cat].[Shoes], ...}`` — caption form) must restrict the result to
+    exactly those members. The axis dimension is already added to GROUP BY by
+    ``_mdx_extract_dimensions``; this turns the enumerated members into a
+    ``WHERE col IN (...)`` filter so the level is restricted rather than fully
+    expanded. Server-defined named sets inlined by ``_inline_named_sets``
+    (Bug-5499) land here too, so named member lists finally filter.
+
+    A bare ``.Members`` / ``.Children`` / ``.AllMembers`` level expansion is
+    deliberately ignored (``exclude_level_expansions=True``), so the existing
+    full-level path is preserved with no regression.
+
+    Returns ``dim_name -> [member, ...]`` (same shape as the WHERE extractor),
+    ready to merge into ``where_filters`` and feed ``_build_where_sql_clauses``.
+    """
+    return _mdx_extract_where_filters(
+        axis_expr,
+        dim_names,
+        hierarchy_level_dim_map=hierarchy_level_dim_map,
+        hierarchy_default_dim_map=hierarchy_default_dim_map,
+        exclude_level_expansions=True,
+    )
+
+
+def _is_all_member_ref(text: str) -> bool:
+    """True for an ``[All]`` / ``[(All)]`` member reference.
+
+    An All member imposes no restriction — the extractors deliberately produce
+    no filter for it, so the audits must not flag it.
+    """
+    return bool(
+        re.search(r'\[\s*\(?\s*all\s*\)?\s*\]\s*$', text.strip(), re.IGNORECASE)
+    )
+
+
+def _iter_member_references(
+    expr: str,
+    *,
+    exclude_level_expansions: bool = False,
+):
+    """Yield every ENUMERATED dimension-member reference in *expr*.
+
+    Shared, side-effect-free enumeration used by BOTH member audits. It yields
+    ``(span, dim, hierarchy, level, ref_text)`` in the original four-pattern
+    order, with the original span-consumption and All-member rules, and takes NO
+    exemption evidence of any kind. Keeping the enumeration in one place is what
+    stops the WHERE audit and the axis audit from drifting apart in what counts
+    as a member reference; keeping exemption evidence OUT of it is what stops the
+    axis path from ever weakening the WHERE path (Bug-1060). ``span`` is measured
+    against *expr* exactly as passed.
+
+    ``exclude_level_expansions`` marks an axis expression, which legitimately
+    carries full-level expansions (``[D].[H].[L].Members`` / ``.Children`` /
+    ``.AllMembers``) that produce no filter.
+    """
+    consumed: list[tuple[int, int]] = []
+
+    def _overlaps(span: tuple[int, int]) -> bool:
+        return any(s <= span[0] < e for s, e in consumed)
+
+    def _expansion_follows(end: int) -> bool:
+        # Axis path: a member reference immediately followed by a level-expansion
+        # method (.Members/.Children/.AllMembers) is a full-level expansion, not
+        # an enumerated member — exempt it.
+        if not exclude_level_expansions:
+            return False
+        return bool(re.match(r'\s*\.\s*(?:Members|AllMembers|Children)\b',
+                             expr[end:], re.IGNORECASE))
+
+    # Member references, longest form first; spans consumed to avoid
+    # re-flagging the same text under a shorter pattern.
+    # [Dim].[Hier].[Level].&[k] / .[Member]  — also matches .[Level].[All]
+    for m in re.finditer(
+        r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\]\.(?:&?\[[^\]]*\]|[A-Za-z_])',
+        expr,
+    ):
+        consumed.append(m.span())
+        if exclude_level_expansions and not m.group(0).rstrip().endswith("]"):
+            # Axis path: `[D].[H].[L].Members/.Children/.AllMembers` is a
+            # full-level expansion (the regex consumes the leading method letter,
+            # so the match ends in a letter, not `]`), not an enumerated member.
+            continue
+        if _is_all_member_ref(m.group(0)):
+            continue
+        yield (m.span(), m.group(1), m.group(2), m.group(3),
+               f"[{m.group(1)}].[{m.group(2)}].[{m.group(3)}]")
+    # [Dim].[Hier].&[k]
+    for m in re.finditer(r'\[([^\]]+)\]\.\[([^\]]+)\]\.&\[[^\]]*\]', expr):
+        if _overlaps(m.span()):
+            continue
+        consumed.append(m.span())
+        if _expansion_follows(m.end()):
+            continue
+        if _is_all_member_ref(m.group(0)):
+            continue
+        yield (m.span(), m.group(1), m.group(2), None,
+               f"[{m.group(1)}].[{m.group(2)}]")
+    # [Dim].[Hier].[Member]  (caption form, not followed by a deeper ref)
+    for m in re.finditer(
+        r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\](?!\s*\.\s*(?:\[|&\[))',
+        expr,
+    ):
+        if _overlaps(m.span()):
+            continue
+        consumed.append(m.span())
+        if _expansion_follows(m.end()):
+            continue
+        if _is_all_member_ref(m.group(0)):
+            continue
+        yield (m.span(), m.group(1), m.group(2), None,
+               f"[{m.group(1)}].[{m.group(2)}].[{m.group(3)}]")
+    # Single-bracket attribute form: [Dim].&[k] / [Dim].[Member]
+    for m in re.finditer(r'(?<![\].])\[([^\]]+)\]\.(?:&?\[[^\]]*\])', expr):
+        if _overlaps(m.span()):
+            continue
+        if _expansion_follows(m.end()):
+            continue
+        if _is_all_member_ref(m.group(0)):
+            continue
+        yield m.span(), m.group(1), None, None, f"[{m.group(1)}]"
+
+
+def _resolve_audited_member_dimension(
+    dim: str,
+    hierarchy: str | None,
+    level: str | None,
+    dim_names: set[str],
+    hierarchy_level_dim_map: dict[str, dict[str, str]],
+    hierarchy_default_dim_map: dict[str, str],
+) -> str | None:
+    """Resolve one audited member reference to a known dimension name.
+
+    ``None`` means the reference does not resolve — both audits treat that as a
+    hard failure. Measure references are filtered out by the callers before this
+    point.
+    """
+    return _resolve_hierarchy_dimension_name(
+        dim_name=dim.strip(),
+        hierarchy_name=hierarchy.strip() if hierarchy else None,
+        level_name=level.strip() if level else None,
+        dim_names=dim_names,
+        hierarchy_level_dim_map=hierarchy_level_dim_map,
+        hierarchy_default_dim_map=hierarchy_default_dim_map,
+    )
 
 
 def _assert_where_members_applied(
@@ -4488,6 +8269,13 @@ def _assert_where_members_applied(
     known dimension AND have produced a captured filter; otherwise a ValueError
     is raised, which the Execute handler turns into a clean SOAP Client fault.
     A widened (unfiltered) result is never returned silently.
+
+    Bug-8925: this function serves the WHERE slicer and NOTHING else. The
+    ROWS/COLUMNS axis has its own entry point,
+    ``_assert_axis_member_references_applied``. The split is deliberate: the axis
+    path carries label-filter exemption evidence, and there must be no parameter
+    through which that evidence — or any other exemption — can reach the WHERE
+    slicer audit and weaken it as collateral damage.
     """
     if not where_expr:
         return
@@ -4495,21 +8283,14 @@ def _assert_where_members_applied(
     hierarchy_default_dim_map = hierarchy_default_dim_map or {}
     captured = {k for k, v in (where_filters or {}).items() if v}
 
-    def _is_all_ref(text: str) -> bool:
-        # An [All]/(All) member imposes no restriction — the extractor
-        # deliberately produces no filter for it, so it must not be flagged.
-        return bool(re.search(r'\[\s*\(?\s*all\s*\)?\s*\]\s*$', text.strip(), re.IGNORECASE))
-
-    def _check(dim: str, hierarchy: str | None, level: str | None, ref: str) -> None:
+    for _span, dim, hierarchy, level, ref in _iter_member_references(
+        where_expr, exclude_level_expansions=False,
+    ):
         if dim.strip().lower() == "measures":
-            return
-        resolved = _resolve_hierarchy_dimension_name(
-            dim_name=dim.strip(),
-            hierarchy_name=hierarchy.strip() if hierarchy else None,
-            level_name=level.strip() if level else None,
-            dim_names=dim_names,
-            hierarchy_level_dim_map=hierarchy_level_dim_map,
-            hierarchy_default_dim_map=hierarchy_default_dim_map,
+            continue
+        resolved = _resolve_audited_member_dimension(
+            dim, hierarchy, level, dim_names,
+            hierarchy_level_dim_map, hierarchy_default_dim_map,
         )
         if not resolved or resolved not in dim_names:
             raise ValueError(
@@ -4521,50 +8302,94 @@ def _assert_where_members_applied(
                 f"refusing to run the query unfiltered."
             )
 
-    # Member references, longest form first; spans consumed to avoid
-    # re-flagging the same text under a shorter pattern.
-    consumed: list[tuple[int, int]] = []
 
-    def _overlaps(span: tuple[int, int]) -> bool:
-        return any(s <= span[0] < e for s, e in consumed)
+def _assert_axis_member_references_applied(
+    axis_text: str,
+    where_filters: dict[str, list[str]],
+    dim_names: set[str],
+    *,
+    hierarchy_level_dim_map: dict[str, dict[str, str]] | None = None,
+    hierarchy_default_dim_map: dict[str, str] | None = None,
+    translated_label_filters: Sequence[_AppliedLabelFilter] = (),
+) -> None:
+    """Fail loud when a ROWS/COLUMNS axis member reference produced no filter.
 
-    # [Dim].[Hier].[Level].&[k] / .[Member]  — also matches .[Level].[All]
-    for m in re.finditer(
-        r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\]\.(?:&?\[[^\]]*\]|[A-Za-z_])',
-        where_expr,
+    Bug-5548: an enumerated member set on an axis must restrict the level to
+    exactly those members. An unknown or partially-resolving set would otherwise
+    be silently dropped and the level run unfiltered — the same fail-open seam as
+    Bug-1060. Full-level expansions (``.Members`` / ``.Children`` /
+    ``.AllMembers``) and ``[All]`` are exempt because they impose no restriction.
+
+    Bug-8925: a label filter restricts its level through a different channel — a
+    rendered ``LIKE`` predicate — so its ``[Dim].[Hier].CurrentMember.Name``
+    reference produces no entry in ``where_filters`` and was rejected, faulting
+    the whole Execute. ``translated_label_filters`` supplies the missing
+    producer/consumer contract as occurrence-bound evidence.
+
+    Exemption rule — CONTAINMENT, not overlap. An enumerated-member match is
+    exempt only when it lies ENTIRELY inside a proven translated context span.
+    Containment is the safe direction: a match that merely overlaps a translated
+    context extends into text that was never proven translated, and exempting it
+    would excuse an untranslated reference. Containment is strictly stricter than
+    overlap, and it is sufficient here because the audit's member grammar
+    (``[Dim].[Hier]``) is a prefix of the translated context
+    (``[Dim].[Hier].CurrentMember.Name``).
+
+    Span-identity guard: ``context_span`` is only meaningful against the exact
+    string it was measured on. Before any exemption is granted, each span is
+    re-sliced out of ``axis_text`` and compared with the ``context_text`` the
+    translator recorded. A normalized, stripped or re-concatenated axis string
+    would shift every span, and a shifted span grants a SPURIOUS exemption — the
+    unsafe direction — so a mismatch raises instead of exempting. That is this
+    coverage mechanism failing CLOSED on a shape it cannot account for.
+    """
+    if not axis_text:
+        return
+    hierarchy_level_dim_map = hierarchy_level_dim_map or {}
+    hierarchy_default_dim_map = hierarchy_default_dim_map or {}
+    captured = {k for k, v in (where_filters or {}).items() if v}
+
+    exempt_spans: list[tuple[int, int]] = []
+    for lf in translated_label_filters:
+        start, end = lf.context_span
+        if (
+            start < 0
+            or end > len(axis_text)
+            or start >= end
+            or axis_text[start:end] != lf.context_text
+        ):
+            raise ValueError(
+                "Internal error auditing an axis label filter: the translated "
+                "context span does not match the audited axis text; refusing to "
+                "run the query rather than exempt an unverified member reference."
+            )
+        exempt_spans.append((start, end))
+
+    def _within_translated_context(span: tuple[int, int]) -> bool:
+        start, end = span
+        return any(s <= start and end <= e for s, e in exempt_spans)
+
+    for span, dim, hierarchy, level, ref in _iter_member_references(
+        axis_text, exclude_level_expansions=True,
     ):
-        consumed.append(m.span())
-        if _is_all_ref(m.group(0)):
+        if dim.strip().lower() == "measures":
             continue
-        _check(m.group(1), m.group(2), m.group(3),
-               f"[{m.group(1)}].[{m.group(2)}].[{m.group(3)}]")
-    # [Dim].[Hier].&[k]
-    for m in re.finditer(r'\[([^\]]+)\]\.\[([^\]]+)\]\.&\[[^\]]*\]', where_expr):
-        if _overlaps(m.span()):
+        if _within_translated_context(span):
             continue
-        consumed.append(m.span())
-        if _is_all_ref(m.group(0)):
-            continue
-        _check(m.group(1), m.group(2), None, f"[{m.group(1)}].[{m.group(2)}]")
-    # [Dim].[Hier].[Member]  (caption form, not followed by a deeper ref)
-    for m in re.finditer(
-        r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\](?!\s*\.\s*(?:\[|&\[))',
-        where_expr,
-    ):
-        if _overlaps(m.span()):
-            continue
-        consumed.append(m.span())
-        if _is_all_ref(m.group(0)):
-            continue
-        _check(m.group(1), m.group(2), None,
-               f"[{m.group(1)}].[{m.group(2)}].[{m.group(3)}]")
-    # Single-bracket attribute form: [Dim].&[k] / [Dim].[Member]
-    for m in re.finditer(r'(?<![\].])\[([^\]]+)\]\.(?:&?\[[^\]]*\])', where_expr):
-        if _overlaps(m.span()):
-            continue
-        if _is_all_ref(m.group(0)):
-            continue
-        _check(m.group(1), None, None, f"[{m.group(1)}]")
+        resolved = _resolve_audited_member_dimension(
+            dim, hierarchy, level, dim_names,
+            hierarchy_level_dim_map, hierarchy_default_dim_map,
+        )
+        if not resolved or resolved not in dim_names:
+            raise ValueError(
+                f"Axis member set references an unknown dimension or "
+                f"hierarchy: {ref}"
+            )
+        if resolved not in captured:
+            raise ValueError(
+                f"Axis member {ref} could not be applied as a filter; "
+                f"refusing to run the query unfiltered."
+            )
 
 
 def _find_method(root: ET.Element) -> Optional[ET.Element]:
@@ -4604,6 +8429,66 @@ def _parse_properties(method_el: ET.Element) -> dict[str, str]:
     return props
 
 
+def _parse_xmla_parameters(method_el: ET.Element) -> dict[str, str]:
+    """Parse an XMLA Execute ``<Parameters>`` block into ``{canonical_name: value}``.
+
+    Wave C #11: the common scalar XMLA parameter form is
+    ``<Parameter><Name>Region</Name><Value>EMEA</Value></Parameter>``. The name is
+    canonicalised to ``lower(ltrim('@'))`` so ``Region`` and ``@Region`` map to the
+    same declared model parameter. The VALUE is taken as scalar text (which also
+    carries the existing JSON multi-value and date-range encodings — the
+    query-router resolver decodes those by declared ``param_type``).
+
+    Raises ``ValueError`` (→ SOAP client fault) on a malformed / duplicate /
+    table-valued / expression-valued parameter. It does NOT validate that the
+    parameter is DECLARED — that check needs the model and is done by the caller.
+    Returns ``{}`` when no ``<Parameters>`` block is present.
+    """
+    container = None
+    for el in method_el.iter():
+        if _tag_matches(el.tag, "Parameters"):
+            container = el
+            break
+    if container is None:
+        return {}
+
+    result: dict[str, str] = {}
+    for child in container:
+        if not _tag_matches(child.tag, "Parameter"):
+            continue
+        name: str | None = None
+        value_els: list[ET.Element] = []
+        for sub in child:
+            if _tag_matches(sub.tag, "Name"):
+                name = (sub.text or "").strip()
+            elif _tag_matches(sub.tag, "Value"):
+                value_els.append(sub)
+        if not name:
+            raise ValueError("An XMLA <Parameter> is missing its <Name>.")
+        if len(value_els) != 1:
+            raise ValueError(
+                f"XMLA parameter '{name}' must have exactly one <Value> "
+                "(scalar). Multi-valued/table-valued parameters are not supported."
+            )
+        value_el = value_els[0]
+        # A scalar <Value> carries only text. Element children mean a
+        # table-valued (rowset) or expression-valued parameter — not supported.
+        if len(list(value_el)) > 0:
+            raise ValueError(
+                f"XMLA parameter '{name}' is not a scalar value; table-valued and "
+                "expression-valued parameters are not supported."
+            )
+        canonical = name.lstrip("@").strip().lower()
+        if not canonical:
+            raise ValueError(f"XMLA parameter name '{name}' is not valid.")
+        if canonical in result:
+            raise ValueError(
+                f"XMLA parameter '{name}' is specified more than once."
+            )
+        result[canonical] = value_el.text or ""
+    return result
+
+
 def _find_command_statement(method_el: ET.Element) -> Optional[str]:
     """Extract the DAX statement from Command/Statement."""
     for el in method_el.iter():
@@ -4616,9 +8501,13 @@ def _is_cancel_command(method_el: ET.Element) -> bool:
     """True when the Execute Command is an XMLA <Cancel> (Bug-5436b).
 
     The Cancel command lives under ``Command`` and carries ConnectionID /
-    SessionID / SPID children. We only need to recognise the element name to
-    acknowledge it; we do not act on a specific connection because no
-    cancellable server-side state exists.
+    SessionID / SPID children. We only need to recognise the element name
+    here; the caller (``_handle_execute``) does the actual cancellation by
+    looking up the target SessionId in ``_xmla_inflight_tasks`` (Bug-5888).
+    A session with no registered in-flight task (unknown session, or a
+    subtotal/DMV sub-query phase not covered by the registry -- see the
+    registry docstring above) still acknowledges success, since there is
+    genuinely nothing left to cancel in that case.
     """
     for el in method_el.iter():
         if _tag_matches(el.tag, "Cancel"):
@@ -4669,9 +8558,14 @@ def _soap_response(inner_xml: str, session_id: str = "") -> Response:
     - xs: prefix for XSD namespace
     - Session header with tns: prefix
     """
+    # Bug-6069: the SessionId may be client-supplied (echoed from a <Session>
+    # header). Emit it into the response envelope as a properly XML-escaped
+    # attribute value so a crafted SessionId cannot inject markup / break out of
+    # the attribute and forge SOAP structure. _escape_xml covers & < > and the
+    # double-quote delimiter.
     header = (
         f'<soap11env:Header>'
-        f'<tns:Session SessionId="{session_id}"/>'
+        f'<tns:Session SessionId="{_escape_xml(session_id)}"/>'
         f'</soap11env:Header>'
         if session_id else ""
     )

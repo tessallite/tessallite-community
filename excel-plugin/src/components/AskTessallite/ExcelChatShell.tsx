@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  Alert,
   Box,
   Typography,
   IconButton,
@@ -12,7 +11,6 @@ import {
   DialogActions,
   Button,
   Skeleton,
-  Snackbar,
 } from "@mui/material";
 import { Add, History, DeleteOutline, SmartToy } from "@mui/icons-material";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -30,6 +28,14 @@ import InsertActions from "./InsertActions";
 import EmptyState from "../common/EmptyState";
 import { tokens } from "../../theme";
 import { recommendChartType, type ChartTypeRecommendation } from "../../utils/excelCharts";
+import { strings, templates } from "../../i18n/strings";
+import { useToast } from "../Toast/ToastProvider";
+// Bug-6520: inline the charts-css stylesheet TEXT so agent HTML artifacts render
+// styled inside the sandboxed task-pane iframe. RenderedOutput's `<link
+// rel="stylesheet" href="/charts.min.css">` 404s in the Excel host (the plugin
+// is served under /excel-plugin/, not the origin root), leaving charts unstyled.
+// `?inline` yields the CSS as a string with no external request or CDN.
+import chartsCssText from "charts.css/dist/charts.min.css?inline";
 
 interface ExcelChatShellProps {
   adapter: AgentChatAdapter;
@@ -93,8 +99,8 @@ function ConversationHeader({
         <IconButton
           size="small"
           onClick={onNewConversation}
-          title="New conversation"
-          aria-label="New conversation"
+          title={strings.chatShell.newConversation}
+          aria-label={strings.chatShell.newConversation}
           sx={{ p: 0.25 }}
         >
           <Add sx={{ fontSize: 16, color: tokens.colorPrimary }} />
@@ -103,8 +109,8 @@ function ConversationHeader({
           <IconButton
             size="small"
             onClick={(e) => setHistoryAnchor(e.currentTarget)}
-            title="Conversation history"
-            aria-label="Conversation history"
+            title={strings.chatShell.conversationHistory}
+            aria-label={strings.chatShell.conversationHistory}
             sx={{ p: 0.25 }}
           >
             <History sx={{ fontSize: 16, color: tokens.colorTextSecondary }} />
@@ -121,15 +127,18 @@ function ConversationHeader({
           <MenuItem
             key={c.id}
             selected={c.id === activeConversationId}
+            // F-037-03: attach selection to the MenuItem itself, not an inner
+            // Box. MUI moves keyboard focus to the MenuItem; a handler on a
+            // descendant Box never receives the Enter/Space activation, so
+            // keyboard-only Excel users could not return to an existing
+            // conversation. delete keeps its own stopPropagation below.
+            onClick={() => {
+              setHistoryAnchor(null);
+              onSelectConversation(c.id);
+            }}
             sx={{ display: "flex", justifyContent: "space-between" }}
           >
-            <Box
-              sx={{ flex: 1 }}
-              onClick={() => {
-                setHistoryAnchor(null);
-                onSelectConversation(c.id);
-              }}
-            >
+            <Box sx={{ flex: 1 }}>
               <Typography sx={{ fontSize: 11 }}>
                 {c.title || c.id.slice(0, 8)}
               </Typography>
@@ -142,7 +151,7 @@ function ConversationHeader({
                 setDeleteConfirmId(c.id);
               }}
               sx={{ p: 0.25 }}
-              aria-label={`Delete conversation ${c.title || c.id.slice(0, 8)}`}
+              aria-label={templates.chatShell.deleteConversationAria(c.title || c.id.slice(0, 8))}
             >
               <DeleteOutline sx={{ fontSize: 14, color: tokens.colorRed }} />
             </IconButton>
@@ -151,15 +160,15 @@ function ConversationHeader({
       </Menu>
 
       <Dialog open={deleteConfirmId !== null} onClose={() => setDeleteConfirmId(null)}>
-        <DialogTitle sx={{ fontSize: 14, fontWeight: 700 }}>Delete Conversation</DialogTitle>
+        <DialogTitle sx={{ fontSize: 14, fontWeight: 700 }}>{strings.chatShell.deleteTitle}</DialogTitle>
         <DialogContent>
           <Typography sx={{ fontSize: 13 }}>
-            This action cannot be undone. Delete this conversation?
+            {strings.chatShell.deleteConfirmation}
           </Typography>
         </DialogContent>
         <DialogActions>
           <Button size="small" onClick={() => setDeleteConfirmId(null)} sx={{ textTransform: "none" }}>
-            Cancel
+            {strings.chatShell.cancel}
           </Button>
           <Button
             size="small"
@@ -172,7 +181,7 @@ function ConversationHeader({
             }}
             sx={{ textTransform: "none" }}
           >
-            Delete
+            {strings.chatShell.delete}
           </Button>
         </DialogActions>
       </Dialog>
@@ -212,7 +221,9 @@ export default function ExcelChatShell({
     enabled: !!projectId && agentConfigured,
   });
 
-  const [scopeToast, setScopeToast] = useState<string | null>(null);
+  // Bug-6734: route through the centralized toast helper instead of a
+  // component-local Snackbar with an ad-hoc autoHideDuration.
+  const { showToast } = useToast();
 
   const handleSelectConversation = useCallback(
     (id: string) => {
@@ -224,15 +235,13 @@ export default function ExcelChatShell({
           (activeModelId ?? null) !== (conv.pinned_model_id ?? null);
         if (personaMismatch || modelMismatch) {
           startNewConversation();
-          setScopeToast(
-            t("chat.scopeMismatch"),
-          );
+          showToast(t("chat.scopeMismatch"), 'info');
           return;
         }
       }
       setActiveConversation(id);
     },
-    [conversations, activePersonaId, activeModelId, setActiveConversation, startNewConversation, t],
+    [conversations, activePersonaId, activeModelId, setActiveConversation, startNewConversation, t, showToast],
   );
 
   const handleDeleteConversation = useCallback(
@@ -259,12 +268,14 @@ export default function ExcelChatShell({
       );
 
       let recommendedAction: "table" | "chart" | "pivot" | "cube" | undefined;
+      let chartRec: ChartTypeRecommendation | undefined;
       if (rows.length === 0 || headers.length < 2) {
         recommendedAction = "table";
       } else if (turn.chart_type && turn.chart_type !== "kpi") {
         recommendedAction = "chart";
       } else {
         const rec = recommendChartType(headers, rows);
+        chartRec = rec.chartType;
         if (
           rec.confidence === "high" &&
           (rec.chartType === "line" || rec.chartType === "columnClustered")
@@ -281,7 +292,7 @@ export default function ExcelChatShell({
             data={resultRows}
             headers={headers}
             onInsertTable={onInsertTable ? () => onInsertTable(turn) : undefined}
-            onInsertChart={onInsertChart ? () => onInsertChart(turn) : undefined}
+            onInsertChart={onInsertChart ? () => onInsertChart(turn, chartRec) : undefined}
             onLocalPivot={onInsertLocalPivot ? () => onInsertLocalPivot(turn) : undefined}
             recommendedAction={recommendedAction}
           />
@@ -335,12 +346,24 @@ export default function ExcelChatShell({
       <Box sx={{ flex: 1 }}>
         <EmptyState
           icon={<SmartToy sx={{ fontSize: 48, color: tokens.colorGoldDark }} />}
-          title="Conversational analytics unavailable"
-          description="Contact your Tessallite administrator to configure an LLM provider."
+          title={strings.chatShell.unavailableTitle}
+          description={strings.chatShell.unavailableDescription}
         />
       </Box>
     );
   }
+
+  // F-037-04: derive a fail-closed visibility object from the loaded config and
+  // pass it to ChatCanvas, matching the main and standalone hosts. Without this
+  // Excel showed completed-turn trace fields whenever present and allowed
+  // streaming thought — silently depending on server redaction while the other
+  // hosts enforce the client-side half of the two-sided policy too. Boolean(...)
+  // defaults every flag to false when the config is null/unreachable.
+  const visibility = {
+    showThoughtProcess: Boolean(config?.show_thought_process),
+    showSemanticQuery: Boolean(config?.show_semantic_query),
+    showPhysicalQuery: Boolean(config?.show_physical_query),
+  };
 
   return (
     <>
@@ -352,6 +375,7 @@ export default function ExcelChatShell({
         activeModelId={activeModelId}
       >
         <ChatCanvas
+          visibility={visibility}
           headerSlot={
             <ConversationHeader
               providerModel={providerModel}
@@ -364,20 +388,11 @@ export default function ExcelChatShell({
           }
           onFeedback={onFeedback}
           feedbackEnabled={Boolean(config?.feedback_enabled)}
+          chartsCss={chartsCssText}
           renderTurnActions={renderTurnActions}
-          composerPlaceholder="Ask a question about your data..."
+          composerPlaceholder={strings.chatShell.composerPlaceholder}
         />
       </ChatProvider>
-      <Snackbar
-        open={Boolean(scopeToast)}
-        autoHideDuration={4000}
-        onClose={() => setScopeToast(null)}
-        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
-      >
-        <Alert severity="info" onClose={() => setScopeToast(null)} sx={{ fontSize: 12 }}>
-          {scopeToast}
-        </Alert>
-      </Snackbar>
     </>
   );
 }

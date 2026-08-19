@@ -47,6 +47,7 @@ import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import { glossaryApi } from "../../api/client";
 import { ui } from "../../theme/tokens";
 import { useT } from "../../i18n";
+import { useCanAuthorModel } from "../../auth/useCanAuthorModel";
 import type {
   GlossaryConfidence,
   GlossaryBootstrapResponse,
@@ -137,6 +138,8 @@ export default function GlossaryPanel() {
   const t = useT();
   const { projectId, modelId } = useParams<{ projectId: string; modelId: string }>();
   const qc = useQueryClient();
+  // F-026-04: gate every mutation entry point on the shared author capability.
+  const canEdit = useCanAuthorModel();
   const [feedback, setFeedback] = useState<{
     severity: "success" | "error" | "info" | "warning";
     text: string;
@@ -468,6 +471,7 @@ export default function GlossaryPanel() {
         </Alert>
       )}
 
+      {canEdit && (
       <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
         <Button
           variant="contained"
@@ -555,6 +559,7 @@ export default function GlossaryPanel() {
           {t("glossary.bulkDeleteButton")}
         </Button>
       </Stack>
+      )}
 
       {entries.isLoading && (
         <Box display="flex" justifyContent="center" py={3}>
@@ -716,6 +721,8 @@ export default function GlossaryPanel() {
                     </Typography>
                   )}
                   <Box display="flex" gap={0.5} mt={0.75} justifyContent="flex-end">
+                    {canEdit && (
+                    <>
                     {entry.status === "pending_review" && (
                       <Tooltip title={t("glossary.approveTooltip")}>
                         <IconButton
@@ -750,6 +757,8 @@ export default function GlossaryPanel() {
                         <DeleteOutlineIcon fontSize="small" />
                       </IconButton>
                     </Tooltip>
+                    </>
+                    )}
                   </Box>
                 </Box>
               ))}

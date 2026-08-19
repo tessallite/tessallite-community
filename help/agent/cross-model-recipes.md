@@ -118,6 +118,7 @@ The answer LLM is shown the description and parameters of every recipe in the pr
 - **Combines that hide divisions by zero.** If the denominator step can return zero, add a note in the recipe so the narration explicitly handles it.
 - **Recipes that wrap a single query.** If the recipe has one step and no combine, it is just a query. Use a query.
 - **Forgetting to allow-list both models.** A recipe that references a model not on the agent's allow-list refuses at execution time. Allow-list every model named by every recipe.
+- **Saving an old measure name during a rename.** Recipe writes wait for in-flight model-definition changes and validate measure names after the change finishes. If a measure was renamed while you were editing, the save is rejected instead of restoring the obsolete name. Refresh the recipe and select the new canonical name.
 
 ---
 

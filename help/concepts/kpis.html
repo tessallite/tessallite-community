@@ -182,11 +182,11 @@
 <p>Two guard rails apply, and both fail with a clear error rather than a silently wrong number:</p>
 <ul>
   <li><strong>Nesting is limited to 5 composite levels.</strong> Deeper hierarchies return "Composite evaluation failed &mdash; composite nesting deeper than 5 levels". If you hit this, your scorecard tree is probably trying to do too much in one number &mdash; split it.</li>
-  <li><strong>Circular references are rejected.</strong> A composite can never appear inside its own hierarchy.</li>
+  <li><strong>Circular references are rejected.</strong> Ownership and value/target references are checked together, so a child cannot refer back to its composite parent.</li>
 </ul>
 
 <h3>Who sees what</h3>
-<p>Composite scores respect the viewer's privileges. Draft children are excluded for users who cannot see drafts, and children referencing measures outside the viewer's persona scope are excluded too &mdash; in both cases the remaining weights are renormalised. This means a viewer and an admin can legitimately see <strong>different composite scores for the same KPI</strong>: each sees the weighted score of the children they are allowed to see. When comparing numbers across users, check certification status and persona scope first.</p>
+<p>Composite scores respect the viewer's privileges. Draft children are excluded for users who cannot see drafts, and children referencing measures outside the viewer's persona scope are excluded too &mdash; in both cases the remaining weights are renormalised. A child value or target that reaches a KPI denied by row security is different: the whole composite is marked <strong>Restricted</strong>, and visible siblings are not renormalised into an apparently complete score. This means a viewer and an admin can legitimately see <strong>different composite scores for the same KPI</strong>: each sees the weighted score of the children they are allowed to see. When comparing numbers across users, check certification status and persona scope first.</p>
 
 <h2>The KPI Scorecard</h2>
 <p>The KPI Scorecard provides a live, at-a-glance view of all KPIs in a model.</p>
@@ -208,7 +208,7 @@
 </ul>
 
 <h3>How evaluation works</h3>
-<p>The scorecard evaluates KPIs using the <code>evaluate-batch</code> endpoint. Each KPI's expression is compiled to SQL and executed via the query-router. Results include the computed value, formatted value, status code, status colour, trend direction, and sparkline data points. Results are cached with a configurable TTL, invalidated when a KPI is updated or the model is deployed.</p>
+<p>The scorecard evaluates KPIs using the <code>evaluate-batch</code> endpoint. Each KPI's expression is compiled to SQL and executed via the query-router. Results include the computed value, formatted value, status code, status colour, trend direction, and sparkline data points. Results are cached with a configurable TTL. The cache is invalidated when a KPI is created, updated, deleted, reverted, or the model is deployed. Composite-child changes also invalidate the parent and KPIs that depend on it.</p>
 
 <h2>Snapshots</h2>
 <p>KPIs can capture periodic snapshots of their evaluated values for historical tracking. Snapshot frequency and retention are configured per KPI in the wizard (only available for non-draft KPIs).</p>

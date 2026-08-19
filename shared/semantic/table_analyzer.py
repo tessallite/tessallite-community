@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from shared.semantic.graph_order import FACT_TABLE_TYPE
 from shared.type_family import (
     DATETIME as _FAM_DATETIME,
     NUMERIC as _FAM_NUMERIC,
@@ -127,18 +128,18 @@ def _classify_column(
         return "dimension", "name matches dimension/foreign-key pattern"
 
     if is_numeric and _MEASURE_PATTERNS.search(name):
-        if table_type != "fact":
+        if table_type != FACT_TABLE_TYPE:
             return "dimension", "numeric measure-like name but table is not a fact table"
         return "measure", "numeric column with measure-like name in fact table"
 
     if is_numeric and _AMBIGUOUS_PATTERNS.search(name):
         if _has_low_cardinality(cardinality, row_count):
             return "dimension", "ambiguous name with low cardinality — likely a categorical attribute"
-        if table_type == "fact":
+        if table_type == FACT_TABLE_TYPE:
             return "measure", "ambiguous name with high cardinality in fact table — likely a measure"
         return "dimension", "ambiguous name in non-fact table"
 
-    if is_numeric and table_type == "fact":
+    if is_numeric and table_type == FACT_TABLE_TYPE:
         if _has_low_cardinality(cardinality, row_count):
             return "dimension", "numeric column with low cardinality in fact table — likely a degenerate dimension"
         return "measure", "unrecognised numeric column in fact table — defaulting to measure"
@@ -258,7 +259,7 @@ def analyze_table(table: "ModelTable") -> TableAnalysisResult:
 
     current_type = table_type
 
-    if current_type == "fact":
+    if current_type == FACT_TABLE_TYPE:
         suggested_type = "fact"
         confidence = "high"
         reasoning = "Table is already classified as fact."

@@ -85,7 +85,13 @@ def _begin_nested_factory(fail_on_execute):
 
     The first execute is the F-017-29 pre-load SELECT of existing kpi_latest
     rows; it returns an empty set (no existing rows) and is not counted as an
-    upsert. *fail_on_execute* is indexed by upsert ordinal (1-based)."""
+    upsert. *fail_on_execute* is indexed by upsert ordinal (1-based).
+
+    Bug-7982 completion round: ``_upsert_kpi_latest_batch`` no longer issues its
+    own Model epoch SELECT — the caller passes ``eval_version_id``/``eval_epoch``
+    in explicitly (see ``kpis.py`` ``evaluate_batch``), so there is no epoch read
+    to mock here any more.
+    """
     calls = {"execute": 0, "upsert": 0}
 
     @contextlib.asynccontextmanager
@@ -193,18 +199,74 @@ async def test_upsert_long_label_persisted_truncated():
     db.commit.assert_awaited()
 
 
+@pytest.mark.asyncio
+async def test_upsert_stamps_caller_supplied_epoch_not_a_fresh_read():
+    """Bug-7982 completion round (wrong-number stamp-timing): the row must be
+    stamped with the ``eval_version_id``/``eval_epoch`` the CALLER passes in —
+    the value captured at evaluation start — never re-derived inside the
+    helper. This is the unit-level guard for the parameter-threading contract;
+    the live-DB mid-evaluation-revert test proves the end-to-end scenario."""
+    model_id = uuid.uuid4()
+    kpi_id = uuid.uuid4()
+    kpi_objs = {kpi_id: SimpleNamespace(name="rev")}
+    result_map = {kpi_id: _resp("On Track")}
+
+    captured = {}
+    state = {"first": True}
+
+    @contextlib.asynccontextmanager
+    async def _nested():
+        yield None
+
+    db = AsyncMock()
+    db.begin_nested = MagicMock(side_effect=lambda: _nested())
+    db.commit = AsyncMock()
+    db.rollback = AsyncMock()
+
+    async def _execute(stmt):
+        if state["first"]:
+            state["first"] = False
+            return _empty_select_result()
+        compiled = stmt.compile()
+        captured.update(compiled.params)
+        return MagicMock()
+
+    db.execute = AsyncMock(side_effect=_execute)
+
+    stale_version_id = uuid.uuid4()
+    await _upsert_kpi_latest_batch(
+        db, model_id, kpi_objs, result_map,
+        eval_version_id=stale_version_id, eval_epoch=5,
+    )
+
+    assert captured.get("evaluated_for_epoch") == 5
+    assert captured.get("evaluated_for_version_id") == stale_version_id
+    db.commit.assert_awaited()
+
+
 # ---------------------------------------------------------------------------
 # F-017-29: conditional write — unchanged rows are not re-written on a render
 # ---------------------------------------------------------------------------
 
 
 def _existing_row(kpi_id, *, name, value, target, status, status_label,
-                  trend_pct, formatted_value):
-    """A SimpleNamespace standing in for a loaded KPILatest ORM row."""
+                  trend_pct, formatted_value,
+                  eval_generation=None, eval_started_at=None):
+    """A SimpleNamespace standing in for a loaded KPILatest ORM row.
+
+    Bug-7982 R7 finding 1: the ORDERING TOKEN is now part of the stored state the
+    dedup consults — a same-value write with a LATER token is not a no-op,
+    because skipping it would strand the published token and let a staler
+    interleaved writer pass the ordering guard. These fixtures therefore have to
+    carry it. The dedup cases below pass ``eval_generation=None`` on both sides
+    (no token on either) so they still exercise pure value-equality.
+    """
     return SimpleNamespace(
         kpi_id=kpi_id, kpi_name=name, value=value, target=target,
         status=status, status_label=status_label, trend_pct=trend_pct,
         formatted_value=formatted_value,
+        evaluated_for_epoch=None, evaluated_for_version_id=None,
+        eval_generation=eval_generation, eval_started_at=eval_started_at,
     )
 
 

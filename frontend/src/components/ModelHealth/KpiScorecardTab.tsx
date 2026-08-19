@@ -46,7 +46,14 @@ export default function KpiScorecardTab({ projectId, modelId }: Props) {
   >("all");
   const [personaId, setPersonaId] = useState<string>("");
 
-  const { data: kpis, isLoading: kpisLoading } = useKpis(projectId, modelId, personaId || null);
+  // F-017-05 / F-103-03 (Bug-9091): the scorecard is a serving/viewer surface,
+  // so it reads the DEPLOYED KPI set (deployed_only) — the same rows JDBC $KPIs
+  // and XMLA MDSCHEMA_KPIS advertise. A certified-but-undeployed edit must not
+  // change the executive card before Deploy. The model builder (KpisPanel) keeps
+  // its own live list for authoring drafts.
+  const { data: kpis, isLoading: kpisLoading } = useKpis(
+    projectId, modelId, personaId || null, true,
+  );
   const { data: personas } = usePersonas(projectId, modelId);
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(
     new Set(),

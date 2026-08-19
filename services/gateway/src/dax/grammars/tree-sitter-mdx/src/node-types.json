@@ -94,6 +94,10 @@
       "required": true,
       "types": [
         {
+          "type": "at_param",
+          "named": true
+        },
+        {
           "type": "dotted_ref",
           "named": true
         },
@@ -107,6 +111,14 @@
         },
         {
           "type": "number",
+          "named": true
+        },
+        {
+          "type": "op",
+          "named": true
+        },
+        {
+          "type": "paren_group",
           "named": true
         },
         {
@@ -137,6 +149,10 @@
           "named": true
         },
         {
+          "type": "func_call",
+          "named": true
+        },
+        {
           "type": "identifier",
           "named": true
         },
@@ -146,6 +162,10 @@
         },
         {
           "type": "operator",
+          "named": true
+        },
+        {
+          "type": "set_literal",
           "named": true
         },
         {
@@ -180,6 +200,25 @@
       "types": [
         {
           "type": "calc_atom",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "cell_properties",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "dotted_ref",
+          "named": true
+        },
+        {
+          "type": "identifier",
           "named": true
         }
       ]
@@ -355,9 +394,29 @@
     }
   },
   {
+    "type": "op",
+    "named": true,
+    "fields": {}
+  },
+  {
     "type": "operator",
     "named": true,
     "fields": {}
+  },
+  {
+    "type": "paren_group",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "axis_token",
+          "named": true
+        }
+      ]
+    }
   },
   {
     "type": "return_clause",
@@ -399,6 +458,10 @@
       "types": [
         {
           "type": "axis_list",
+          "named": true
+        },
+        {
+          "type": "cell_properties",
           "named": true
         },
         {
@@ -486,11 +549,35 @@
       "required": false,
       "types": [
         {
+          "type": "at_param",
+          "named": true
+        },
+        {
           "type": "dotted_ref",
           "named": true
         },
         {
+          "type": "func_call",
+          "named": true
+        },
+        {
+          "type": "number",
+          "named": true
+        },
+        {
+          "type": "op",
+          "named": true
+        },
+        {
+          "type": "paren_group",
+          "named": true
+        },
+        {
           "type": "set_literal",
+          "named": true
+        },
+        {
+          "type": "string_literal",
           "named": true
         }
       ]
@@ -536,6 +623,10 @@
           {
             "type": "dotted_ref",
             "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
           }
         ]
       }
@@ -571,6 +662,10 @@
         "types": [
           {
             "type": "dotted_ref",
+            "named": true
+          },
+          {
+            "type": "identifier",
             "named": true
           }
         ]
@@ -642,8 +737,17 @@
     "named": false
   },
   {
+    "type": "at_param",
+    "named": true
+  },
+  {
     "type": "bracket_name",
     "named": true
+  },
+  {
+    "type": "comment",
+    "named": true,
+    "extra": true
   },
   {
     "type": "identifier",

@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -93,6 +94,33 @@ PROVIDERS = {
 }
 
 PLACEHOLDER_RE = re.compile(r"\{\{.*?\}\}|\{[^{}]*\}")
+NUMBER_RE = re.compile(r"(?<![\w.])-?\d+(?:[.,]\d+)*(?![\w.])")
+PROTECTED_TERMS = {
+    "Tessallite",
+    "API",
+    "BI",
+    "CSV",
+    "DAX",
+    "HTML",
+    "HTTP",
+    "HTTPS",
+    "ID",
+    "JSON",
+    "JWT",
+    "KPI",
+    "LLM",
+    "MDX",
+    "OAuth",
+    "OIDC",
+    "RBAC",
+    "REST",
+    "SAML",
+    "SQL",
+    "SSO",
+    "TSV",
+    "URL",
+    "XMLA",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -192,17 +220,18 @@ def diff_locale(source: dict, root: Path, locale: str) -> dict:
     missing = {}
     for fname, src_map in source.items():
         tgt_map = read_json(root / locale / fname)
-        todo = {
-            k: v for k, v in src_map.items()
-            if k not in tgt_map or tgt_map[k] == v
-        }
+        todo = {}
+        for k, v in src_map.items():
+            if k not in tgt_map:
+                todo[k] = v
+            elif tgt_map[k] == v and not intentional_identical_ok(v):
+                todo[k] = v
         if todo:
             missing[fname] = todo
     return missing
 
 
-def write_report(root: Path, locale: str, missing: dict) -> None:
-    path = root / locale / "missing-keys.md"
+def render_report(locale: str, missing: dict) -> str:
     total = sum(len(v) for v in missing.values())
     lines = [
         f"# Missing / untranslated keys — {locale} ({LANG_NAMES.get(locale, locale)})",
@@ -218,7 +247,12 @@ def write_report(root: Path, locale: str, missing: dict) -> None:
             flat = " ".join(str(val).split())
             lines.append(f"- `{key}` — {flat}")
         lines.append("")
-    path.write_text("\n".join(lines), encoding="utf-8")
+    return "\n".join(lines)
+
+
+def write_report(root: Path, locale: str, missing: dict) -> None:
+    path = root / locale / "missing-keys.md"
+    path.write_text(render_report(locale, missing), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -259,8 +293,35 @@ def parse_llm_json(text: str) -> dict:
 
 
 def placeholders_ok(src: str, dst: str) -> bool:
-    return PLACEHOLDER_RE.findall(src) == PLACEHOLDER_RE.findall(dst) or \
-        set(PLACEHOLDER_RE.findall(src)) <= set(PLACEHOLDER_RE.findall(dst))
+    return Counter(PLACEHOLDER_RE.findall(src)) == Counter(PLACEHOLDER_RE.findall(dst))
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z][A-Za-z0-9_-]*", text)
+
+
+def intentional_identical_ok(src: str) -> bool:
+    """True when a target matching English is likely intentional.
+
+    Brand names, acronyms, protocols, and numeric/version labels often do not
+    translate. Plain UI prose such as "Save" should still be sent for
+    translation when it equals English.
+    """
+    stripped = PLACEHOLDER_RE.sub(" ", src)
+    words = _words(stripped)
+    if not words:
+        return True
+    return all(w in PROTECTED_TERMS or w.upper() == w for w in words)
+
+
+def protected_tokens_ok(src: str, dst: str) -> bool:
+    """Validate preservation of brand/protocol tokens and numeric literals."""
+    for term in PROTECTED_TERMS:
+        if re.search(rf"\b{re.escape(term)}\b", src) and not re.search(
+            rf"\b{re.escape(term)}\b", dst
+        ):
+            return False
+    return Counter(NUMBER_RE.findall(src)) == Counter(NUMBER_RE.findall(dst))
 
 
 # --------------------------------------------------------------------------- #
@@ -389,12 +450,20 @@ def translate_file(provider, model, api_key, base, locale, fname, todo,
                 got = parse_llm_json(raw)
             except Exception as exc:  # noqa: BLE001 — report and retry
                 print(f"      chunk {ci} attempt {attempt} failed: {exc}")
+                if attempt == 3:
+                    failed.extend(pending)
                 continue
             # Validate: keep good keys, retry the rest.
             still = {}
             for k, src in pending.items():
                 dst = got.get(k)
-                if isinstance(dst, str) and dst and placeholders_ok(src, dst):
+                if (
+                    isinstance(dst, str)
+                    and dst
+                    and (dst != src or intentional_identical_ok(src))
+                    and placeholders_ok(src, dst)
+                    and protected_tokens_ok(src, dst)
+                ):
                     translations[k] = dst
                 else:
                     still[k] = src
@@ -407,7 +476,12 @@ def translate_file(provider, model, api_key, base, locale, fname, todo,
 
 
 def merge_target(root, source_map, locale, fname, translations) -> int:
-    """Write source-ordered target: new translations + existing values."""
+    """Write source-ordered target keys only.
+
+    English is the structural authority. Target-only keys are stale after their
+    English source key is removed, so retaining them makes every later pipeline
+    run preserve catalogue drift indefinitely.
+    """
     path = root / locale / fname
     existing = read_json(path)
     merged, added = {}, 0
@@ -419,11 +493,28 @@ def merge_target(root, source_map, locale, fname, translations) -> int:
             merged[key] = existing[key]
         else:
             merged[key] = en_val  # fallback so the key exists; retried next run
-    for key, val in existing.items():  # preserve target-only extras
-        if key not in merged:
-            merged[key] = val
     write_json(path, merged)
     return added
+
+
+def merge_all_targets(root, source, targets, translations_by_locale) -> int:
+    """Rewrite every source-backed target file in source order.
+
+    Translation work is optional here: files with no new translations are still
+    merged so stale target-only keys are pruned deterministically.
+    """
+    total_added = 0
+    for locale in targets:
+        locale_translations = translations_by_locale.get(locale, {})
+        for fname, source_map in source.items():
+            total_added += merge_target(
+                root,
+                source_map,
+                locale,
+                fname,
+                locale_translations.get(fname, {}),
+            )
+    return total_added
 
 
 # --------------------------------------------------------------------------- #
@@ -530,70 +621,79 @@ def main() -> int:
     work = {}
     for locale in targets:
         missing = diff_locale(source, root, locale)
-        write_report(root, locale, missing)
         total = sum(len(v) for v in missing.values())
-        print(f"  {locale}: {total} key(s) to translate "
-              f"across {len(missing)} file(s) -> {locale}/missing-keys.md")
+        if args.dry_run:
+            print(f"  {locale}: {total} key(s) to translate "
+                  f"across {len(missing)} file(s)")
+            if missing:
+                print(render_report(locale, missing))
+        else:
+            write_report(root, locale, missing)
+            print(f"  {locale}: {total} key(s) to translate "
+                  f"across {len(missing)} file(s) -> {locale}/missing-keys.md")
         if missing:
             work[locale] = missing
 
     if args.dry_run:
-        print("\nDry run: reports written, no translation performed.")
-        return 0
-    if not work:
-        print("\nNothing to translate. All locales are in sync.")
+        print("\nDry run: no files written, no translation performed.")
         return 0
 
-    # Phase 2 — provider/model selection.
-    available = detect_providers(env)
-    if args.provider:
-        if args.provider not in PROVIDERS:
-            print(f"ERROR: unknown provider '{args.provider}'. "
-                  f"Valid: {', '.join(PROVIDERS)}")
-            return 1
-        provider = args.provider
-        api_key = args.api_key or available.get(provider)
-        if not api_key:
-            if args.yes:
-                print(f"ERROR: no API key for '{provider}'. Pass --api-key or "
-                      f"set {'/'.join(PROVIDERS[provider]['env_keys'])}.")
+    # Phase 2 — provider/model selection, only when missing keys need LLM work.
+    if work:
+        available = detect_providers(env)
+        if args.provider:
+            if args.provider not in PROVIDERS:
+                print(f"ERROR: unknown provider '{args.provider}'. "
+                      f"Valid: {', '.join(PROVIDERS)}")
                 return 1
-            api_key = input(f"API key for {provider}: ").strip()
+            provider = args.provider
+            api_key = args.api_key or available.get(provider)
             if not api_key:
-                print("ERROR: no API key entered.")
-                return 1
-    elif args.yes:
-        print("ERROR: --yes requires --provider")
-        return 1
+                if args.yes:
+                    print(f"ERROR: no API key for '{provider}'. Pass --api-key or "
+                          f"set {'/'.join(PROVIDERS[provider]['env_keys'])}.")
+                    return 1
+                api_key = input(f"API key for {provider}: ").strip()
+                if not api_key:
+                    print("ERROR: no API key entered.")
+                    return 1
+        elif args.yes:
+            print("ERROR: --yes requires --provider")
+            return 1
+        else:
+            provider, api_key = choose_provider_and_key(available)
+        model = args.model or (PROVIDERS[provider].get("default_model")
+                               if args.yes else choose_model(provider, env))
+        base = PROVIDERS[provider]["base"]
+        print(f"\nUsing {provider} / {model}")
+        tmp_dir = root / ".i18n-translate-tmp"
+        tmp_dir.mkdir(exist_ok=True)
     else:
-        provider, api_key = choose_provider_and_key(available)
-    model = args.model or (PROVIDERS[provider].get("default_model")
-                           if args.yes else choose_model(provider, env))
-    base = PROVIDERS[provider]["base"]
-    print(f"\nUsing {provider} / {model}")
+        provider = model = api_key = base = None
+        tmp_dir = None
+        print("\nNo missing translations. Normalising target catalog structure.")
 
-    tmp_dir = root / ".i18n-translate-tmp"
-    tmp_dir.mkdir(exist_ok=True)
-
-    # Phase 3 — translate + merge, per target file.
+    # Phase 3 — translate missing keys, then merge every source-backed file.
+    translations_by_locale = {}
     grand_added, grand_failed = 0, 0
     for locale, missing in work.items():
         print(f"\n[{locale}] {LANG_NAMES.get(locale, locale)}")
+        translations_by_locale[locale] = {}
         for fname, todo in missing.items():
             print(f"  {fname}: {len(todo)} key(s)")
             translations, failed = translate_file(
                 provider, model, api_key, base, locale, fname, todo,
                 args.chunk_size, args.max_tokens, args.timeout, tmp_dir)
-            added = merge_target(root, source[fname], locale, fname,
-                                 translations)
-            grand_added += added
+            translations_by_locale[locale][fname] = translations
             grand_failed += len(failed)
             note = f" ({len(failed)} unresolved, left as English)" if failed else ""
-            print(f"    merged {added} key(s){note}")
+            print(f"    translated {len(translations)} key(s){note}")
 
+    grand_added = merge_all_targets(root, source, targets, translations_by_locale)
+
+    raw_note = (f" Raw LLM output kept in {tmp_dir.name}/" if tmp_dir else "")
     print(f"\nDone. {grand_added} key(s) translated; "
-          f"{grand_failed} left unresolved (re-run to retry). "
-          f"Raw LLM output kept in {tmp_dir.name}/")
+          f"{grand_failed} left unresolved (re-run to retry).{raw_note}")
     return 0
 
 

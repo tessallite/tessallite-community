@@ -37,9 +37,11 @@ Download this XML and upload it to your IdP (Auth0, Google Workspace, Okta, AD F
 
 In the tenant settings, provide:
 
+You can also set these from **Workspace Settings → project configuration drawer → Identity provider** without restarting the service. Process environment variables remain the deployment default; the workspace overlay is used for that tenant's login flow.
+
 | Setting | Purpose |
 |---|---|
-| `SAML_IDP_METADATA_URL` | URL to the IdP's SAML metadata (Tessallite fetches it automatically). Use this OR the XML field below — not both. |
+| `SAML_IDP_METADATA_URL` | URL to the IdP's SAML metadata. Tessallite fetches and parses it automatically at login time. Use this OR the XML field below — not both. The URL must be a public `https://` address the Tessallite host can reach; internal, loopback, and cloud-metadata addresses are refused for security. If the metadata cannot be fetched or parsed, SAML login fails cleanly (it never falls back to a half-configured state) and the reason is written to the service logs. |
 | `SAML_IDP_METADATA_XML` | Paste the IdP metadata XML directly. Use when the metadata URL is not accessible from the Tessallite host. |
 | `SAML_SP_ENTITY_ID` | The entity ID Tessallite uses to identify itself. Must match what is registered in the IdP. |
 
@@ -162,6 +164,7 @@ Users with a non-local auth source cannot change their password via Tessallite �
 
 - **"Sign in with SSO" button does not appear.** Check that `saml` or `oidc` is listed in the `AUTH_BACKENDS` tenant setting and that the IdP configuration fields are non-empty.
 - **"Invalid assertion" error after redirect.** The SP entity ID in Tessallite does not match what is registered in the IdP, or the ACS URL is wrong. Compare the SP metadata XML with the IdP's configuration.
+- **SAML login fails immediately when using a metadata URL.** Tessallite could not fetch or parse the document at `SAML_IDP_METADATA_URL`. Check the service logs for the exact reason. Common causes: the URL is not reachable from the Tessallite host, it points at an internal/loopback/cloud-metadata address (these are refused on purpose), it is served over plain `http://` (only `https://` is accepted unless `WEBHOOK_ALLOW_HTTP` is enabled), or the returned document is not valid SAML metadata. As a workaround, paste the metadata into `SAML_IDP_METADATA_XML` instead.
 - **User created but has no project access.** The user's IdP groups do not match any entry in group-to-role mappings, and the JIT default role is `viewer` (which may have no project bindings). Add the appropriate mapping.
 
 ---

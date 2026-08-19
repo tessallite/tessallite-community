@@ -300,6 +300,83 @@ class TestParameterUpdate:
         assert resp.status_code == 404
 
 
+    # ------------------------------------------------------------------
+    # Bug-7445: changing param_type must revalidate stored default/allowed
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_type_change_with_incompatible_stored_default_rejects(self, client):
+        """Bug-7445: changing type from string to number while stored default
+        is a non-numeric string must return 422, not silently succeed."""
+        param = _make_param(param_type="string", default_value="EMEA")
+        db = make_mock_db()
+        model = make_model()
+
+        db.get = AsyncMock(side_effect=lambda cls, id: model if id == TEST_MODEL_ID else param)
+        db.refresh = AsyncMock()
+
+        with patch("src.api.parameters.get_tenant_db", async_gen_from(db)):
+            resp = await client.put(
+                f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/parameters/{param.id}",
+                json={"param_type": "number"},
+            )
+        assert resp.status_code == 422, f"Expected 422, got {resp.status_code}: {resp.text}"
+
+    @pytest.mark.asyncio
+    async def test_type_change_with_compatible_stored_default_succeeds(self, client):
+        """Bug-7445: changing type from string to number when stored default
+        is a numeric string should succeed."""
+        param = _make_param(param_type="string", default_value="100")
+        db = make_mock_db()
+        model = make_model()
+
+        db.get = AsyncMock(side_effect=lambda cls, id: model if id == TEST_MODEL_ID else param)
+        db.refresh = AsyncMock()
+
+        with patch("src.api.parameters.get_tenant_db", async_gen_from(db)):
+            resp = await client.put(
+                f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/parameters/{param.id}",
+                json={"param_type": "number"},
+            )
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_type_change_with_incompatible_stored_allowed_values_rejects(self, client):
+        """Bug-7445: changing type to date_range when stored allowed_values
+        is non-empty must return 422 (date_range disallows allowed_values)."""
+        param = _make_param(param_type="string", default_value="US")
+        param.allowed_values = ["US", "EU"]
+        db = make_mock_db()
+        model = make_model()
+
+        db.get = AsyncMock(side_effect=lambda cls, id: model if id == TEST_MODEL_ID else param)
+        db.refresh = AsyncMock()
+
+        with patch("src.api.parameters.get_tenant_db", async_gen_from(db)):
+            resp = await client.put(
+                f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/parameters/{param.id}",
+                json={"param_type": "date_range"},
+            )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_type_change_with_null_default_succeeds(self, client):
+        """Bug-7445: changing type when stored default is None should succeed."""
+        param = _make_param(param_type="string", default_value=None)
+        db = make_mock_db()
+        model = make_model()
+
+        db.get = AsyncMock(side_effect=lambda cls, id: model if id == TEST_MODEL_ID else param)
+        db.refresh = AsyncMock()
+
+        with patch("src.api.parameters.get_tenant_db", async_gen_from(db)):
+            resp = await client.put(
+                f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/parameters/{param.id}",
+                json={"param_type": "number"},
+            )
+        assert resp.status_code == 200
+
+
 class TestParameterDelete:
 
     @pytest.mark.asyncio
@@ -328,3 +405,57 @@ class TestParameterDelete:
                 f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/parameters/{uuid.uuid4()}"
             )
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# F-029-06 / F-029-02 — date_range default is validated at write time
+# ---------------------------------------------------------------------------
+
+
+class TestDateRangeDefaultValidation:
+    """`_coerce_default_value` must reject a date_range default that could never
+    succeed at query time: missing bounds, non-ISO dates, an inverted range, or
+    extra keys. Mirrors the query-router resolver's query-time backstop."""
+
+    def test_valid_iso_from_to_passes(self):
+        from src.api.parameters import _coerce_default_value
+        rng = {"from": "2024-01-01", "to": "2024-12-31"}
+        assert _coerce_default_value("date_range", rng) == rng
+
+    def test_iso_datetime_bounds_pass(self):
+        from src.api.parameters import _coerce_default_value
+        rng = {"from": "2024-01-01T00:00:00", "to": "2024-12-31T23:59:59"}
+        assert _coerce_default_value("date_range", rng) == rng
+
+    def test_missing_bound_rejected(self):
+        from fastapi import HTTPException
+        from src.api.parameters import _coerce_default_value
+        with pytest.raises(HTTPException) as ei:
+            _coerce_default_value("date_range", {"from": "2024-01-01"})
+        assert ei.value.status_code == 422
+
+    def test_non_iso_bound_rejected(self):
+        from fastapi import HTTPException
+        from src.api.parameters import _coerce_default_value
+        with pytest.raises(HTTPException) as ei:
+            _coerce_default_value("date_range", {"from": "banana", "to": "pear"})
+        assert ei.value.status_code == 422
+
+    def test_inverted_range_rejected(self):
+        from fastapi import HTTPException
+        from src.api.parameters import _coerce_default_value
+        with pytest.raises(HTTPException) as ei:
+            _coerce_default_value(
+                "date_range", {"from": "2024-12-31", "to": "2024-01-01"}
+            )
+        assert ei.value.status_code == 422
+
+    def test_extra_keys_rejected(self):
+        from fastapi import HTTPException
+        from src.api.parameters import _coerce_default_value
+        with pytest.raises(HTTPException) as ei:
+            _coerce_default_value(
+                "date_range",
+                {"from": "2024-01-01", "to": "2024-12-31", "tz": "UTC"},
+            )
+        assert ei.value.status_code == 422

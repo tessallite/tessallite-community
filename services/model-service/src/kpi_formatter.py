@@ -149,7 +149,10 @@ def format_value(
         if format_custom:
             try:
                 result = format_custom.format(value)
-            except (ValueError, KeyError, IndexError):
+            except (ValueError, KeyError, IndexError, AttributeError, TypeError):
+                # Bug-7233: malformed format_custom (non-string type, or a
+                # string whose .format() raises) must degrade gracefully
+                # instead of 500-ing every evaluation of the KPI.
                 result = f"{value:,.2f}"
         else:
             result = f"{value:,.2f}"
@@ -196,10 +199,31 @@ def format_variance(
         return None, None
 
     raw_variance = value - target
+
+    if direction == "closer_is_better":
+        # F-017-07: closer_is_better has no "beat/miss" meaning — any distance
+        # from target is a deviation, not a signed shortfall. The old code
+        # returned -abs(...), so a value inside the green "On Track" band still
+        # printed a minus (e.g. green card, "-5"), which reads as missing. Show
+        # the deviation MAGNITUDE with a neutral "±" (distance from target).
+        magnitude = abs(raw_variance)
+        token = format_token or "decimal_2dp"
+        if token in ("currency", "currency_k"):
+            formatted_abs = f"±{currency_symbol}{magnitude:,.2f}"
+        elif token == "percent":
+            formatted_abs = f"±{magnitude * 100:,.1f}pp"
+        elif token == "percent_decimal":
+            formatted_abs = f"±{magnitude:,.1f}pp"
+        else:
+            formatted_abs = f"±{magnitude:,.2f}"
+        if target == 0:
+            formatted_pct = None
+        else:
+            formatted_pct = f"±{(magnitude / abs(target)) * 100:,.1f}%"
+        return formatted_abs, formatted_pct
+
     if direction == "lower_is_better":
         abs_variance = -raw_variance
-    elif direction == "closer_is_better":
-        abs_variance = -abs(raw_variance)
     else:
         abs_variance = raw_variance
     sign = "+" if abs_variance >= 0 else ""

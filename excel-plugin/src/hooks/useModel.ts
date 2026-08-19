@@ -62,23 +62,23 @@ export function useHierarchies(projectId: string | null, modelId: string | null,
   });
 }
 
-export function useKpis(projectId: string | null, modelId: string | null) {
+export function useKpis(projectId: string | null, modelId: string | null, personaId?: string | null) {
   const { data: model } = useModel(projectId, modelId);
   const versionKey = model?.deployed_version_id || 'latest';
   return useQuery({
-    queryKey: ['kpis', projectId, modelId, versionKey],
-    queryFn: () => getKpis(projectId!, modelId!),
+    queryKey: ['kpis', projectId, modelId, personaId ?? 'base', versionKey],
+    queryFn: () => getKpis(projectId!, modelId!, personaId || undefined),
     enabled: !!projectId && !!modelId,
     staleTime: 5 * 60 * 1000,
   });
 }
 
-export function useNamedSets(projectId: string | null, modelId: string | null) {
+export function useNamedSets(projectId: string | null, modelId: string | null, personaId?: string | null) {
   const { data: model } = useModel(projectId, modelId);
   const versionKey = model?.deployed_version_id || 'latest';
   return useQuery({
-    queryKey: ['namedSets', projectId, modelId, versionKey],
-    queryFn: () => getNamedSets(projectId!, modelId!),
+    queryKey: ['namedSets', projectId, modelId, personaId ?? 'base', versionKey],
+    queryFn: () => getNamedSets(projectId!, modelId!, personaId || undefined),
     enabled: !!projectId && !!modelId,
     staleTime: 5 * 60 * 1000,
   });

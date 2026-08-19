@@ -6,7 +6,7 @@ import uuid
 import pytest
 from fastapi import HTTPException
 
-from shared.auth.middleware import CurrentEmbedUser, CurrentUser
+from shared.auth.middleware import CurrentEmbedUser, CurrentServiceUser, CurrentUser
 from shared.auth.project_access import ensure_project_model_access, load_authorized_model
 from shared.db.models import Model, UserAccessBinding
 
@@ -17,6 +17,15 @@ def _user(role: str = "member") -> CurrentUser:
         tenant_id="tenant-1",
         email="user@example.com",
         role=role,
+    )
+
+
+def _system_admin() -> CurrentUser:
+    return CurrentUser(
+        user_id="admin@tessallite.local",
+        tenant_id="__system__",
+        email="admin@tessallite.local",
+        role="system_admin",
     )
 
 
@@ -55,7 +64,7 @@ class _DB:
         params = stmt.compile().params
         user_identity = next(
             (v for k, v in params.items() if k.startswith("user_identity")),
-            None,
+            next((v for k, v in params.items() if k.startswith("lower")), None),
         )
         project_id = next(
             (v for k, v in params.items() if k.startswith("project_id")),
@@ -64,7 +73,14 @@ class _DB:
         model_id = next((v for k, v in params.items() if k.startswith("model_id")), None)
         matching = [
             b for b in self.bindings
-            if (user_identity is None or b.user_identity == user_identity)
+            if (
+                user_identity is None
+                or b.user_identity == user_identity
+                or (
+                    "@" in str(user_identity)
+                    and str(b.user_identity).lower() == str(user_identity).lower()
+                )
+            )
             and (project_id is None or b.project_id == project_id)
         ]
         if "user_access_bindings.role" not in text:
@@ -90,6 +106,102 @@ async def test_project_binding_allows_model_viewer_access():
 
     await ensure_project_model_access(
         db, _user(), project_id=project_id, model_id=model_id, min_role="viewer"
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_binding_matches_legacy_mixed_case_email_identity():
+    project_id = uuid.uuid4()
+    model_id = uuid.uuid4()
+    db = _DB(bindings=[
+        types.SimpleNamespace(
+            user_identity="User@Example.COM",
+            project_id=project_id,
+            model_id=None,
+            role="viewer",
+        ),
+    ])
+    user = CurrentUser(
+        user_id="user@example.com",
+        tenant_id="tenant-1",
+        email="user@example.com",
+        role="member",
+    )
+
+    await ensure_project_model_access(
+        db, user, project_id=project_id, model_id=model_id, min_role="viewer"
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_access_allows_human_tenant_and_system_admin_bypass():
+    project_id = uuid.uuid4()
+    model_id = uuid.uuid4()
+    db = _DB(bindings=[])
+
+    await ensure_project_model_access(
+        db,
+        _user("tenant_admin"),
+        project_id=project_id,
+        model_id=model_id,
+        min_role="viewer",
+    )
+    await ensure_project_model_access(
+        db,
+        _system_admin(),
+        project_id=project_id,
+        model_id=model_id,
+        min_role="viewer",
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_access_refuses_unverified_service_principal():
+    """Bug-8613: service principals are refused by default when
+    service_scope_verified is False (the default)."""
+    project_id = uuid.uuid4()
+    model_id = uuid.uuid4()
+    db = _DB(bindings=[_binding(project_id, role="viewer")])
+    service_user = CurrentServiceUser(
+        principal="pocket-refresh",
+        tenant_id="tenant-1",
+        role="system_admin",
+        scopes=["query-router.pocket-refresh"],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await ensure_project_model_access(
+            db,
+            service_user,
+            project_id=project_id,
+            model_id=model_id,
+            min_role="viewer",
+        )
+    assert exc.value.status_code == 403
+    assert "scope not verified" in exc.value.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_project_access_allows_verified_service_principal():
+    """Bug-8613: service principals pass through when service_scope_verified
+    is True (indicating the route already verified the service scope)."""
+    project_id = uuid.uuid4()
+    model_id = uuid.uuid4()
+    db = _DB(bindings=[_binding(project_id, role="viewer")])
+    service_user = CurrentServiceUser(
+        principal="pocket-refresh",
+        tenant_id="tenant-1",
+        role="system_admin",
+        scopes=["query-router.pocket-refresh"],
+    )
+
+    await ensure_project_model_access(
+        db,
+        service_user,
+        project_id=project_id,
+        model_id=model_id,
+        min_role="viewer",
+        service_scope_verified=True,
     )
 
 

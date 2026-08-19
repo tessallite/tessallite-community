@@ -41,7 +41,7 @@ If you open such an attribute in the table editor, the **expression box is locke
 
 ## Health checks
 
-The panel checks whether hierarchy levels still point to valid attributes, whether required time metadata is present, and whether generated levels can be interpreted by the query compiler. Resolve hierarchy warnings before relying on time variants or drill paths.
+The panel checks whether hierarchy levels still point to valid attributes, whether required time metadata is present, and whether generated levels can be interpreted by the query compiler. Modellers also see member-integrity details from the source probe: orphan-member and multiple-parent counts, affected levels, bounded sample keys, and truncation or failure reasons. Read-only users receive metadata-only health without triggering a source probe. If a model-specific viewer binding rejects a probe, the panel retries metadata-only and does not expose sample keys. Unprobed and failed checks remain visible. Resolve hierarchy warnings before relying on time variants or drill paths.
 
 ---
 

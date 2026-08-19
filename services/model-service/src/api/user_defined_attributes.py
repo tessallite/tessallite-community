@@ -28,6 +28,7 @@ from shared.schemas.pydantic_models import (
     UserDefinedAttributeValidateRequest,
     UserDefinedAttributeValidateResponse,
 )
+from src.api._model_lock import acquire_model_definition_lock
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 from src.api._scope import ensure_model_in_project
@@ -433,6 +434,10 @@ async def create_user_defined_attribute(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> UserDefinedAttributeResponse:
     async for db in get_tenant_db(current_user.tenant_id):
+        # Read-modify-write: ModelTable is snapshot-owned and feeds the expression
+        # validation, so it must be read UNDER the lock (consistent with
+        # table_attributes.py). _get_table_or_404 also enforces ownership.
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         table = await _get_table_or_404(
             db,
             project_id=project_id,
@@ -536,6 +541,8 @@ async def update_user_defined_attribute(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> UserDefinedAttributeResponse:
     async for db in get_tenant_db(current_user.tenant_id):
+        # Read-modify-write: read ModelTable + the UDA under the lock.
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         table = await _get_table_or_404(
             db,
             project_id=project_id,
@@ -599,6 +606,8 @@ async def delete_user_defined_attribute(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> None:
     async for db in get_tenant_db(current_user.tenant_id):
+        # Read-modify-write: read ModelTable + the UDA under the lock.
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         await _get_table_or_404(
             db,
             project_id=project_id,
@@ -617,6 +626,109 @@ async def delete_user_defined_attribute(
 
         await db.delete(attr)
         await db.commit()
+
+
+async def _probe_uda_expression_live(
+    db,
+    *,
+    table: ModelTable,
+    expression: str,
+    project_id: UUID,
+    tenant_slug: str | None,
+) -> UserDefinedAttributeLiveValidationResult:
+    """F-016-03: actually execute the UDA expression against the source.
+
+    Static AST validation cannot catch type errors (e.g. arithmetic on a text
+    column) or function-argument mismatches — those surface only when the
+    source database evaluates the expression. This runs a bounded
+    ``SELECT (<expr>) FROM <table> LIMIT 1`` through the audited source
+    boundary and reports the real outcome. ``executed`` is True only when the
+    probe ran; ``success`` is NEVER reported True without an execution.
+    """
+    from shared.db.models import DataSource
+    from shared.schemas.connection_type import normalize_connection_type
+    from shared.source_executor import execute_source_sql
+    from src.api._scope import resolve_source_connection
+    from src.api._table_qualify import qualify_physical_name
+
+    source_id = getattr(table, "source_id", None)
+    source = await db.get(DataSource, source_id) if source_id is not None else None
+    if source is None:
+        return UserDefinedAttributeLiveValidationResult(
+            executed=False, success=False,
+            error="Source not found for this table.", sample_value=None,
+        )
+    try:
+        connection = await resolve_source_connection(
+            db, source, expected_project_id=project_id
+        )
+    except HTTPException as exc:
+        return UserDefinedAttributeLiveValidationResult(
+            executed=False, success=False,
+            error=str(exc.detail), sample_value=None,
+        )
+
+    connector = normalize_connection_type((connection.connection_type or "").lower())
+    # Bug-8294: include sqlserver (was missing → fell back to postgres and
+    # emitted invalid T-SQL). sqlglot's SQL Server dialect token is "tsql".
+    dialect_map = {
+        "postgresql": "postgres",
+        "redshift": "redshift",
+        "bigquery": "bigquery",
+        "hadoop_spark": "spark",
+        "snowflake": "snowflake",
+        "sqlserver": "tsql",
+    }
+    dialect = dialect_map.get(connector, "postgres")
+
+    qualified = qualify_physical_name(table.physical_name, connection, source)
+
+    # Bug-8294 [SQL rule 1]: author the WHOLE probe as canonical PostgreSQL and
+    # transpile it via sqlglot — never hand-write dialect-specific clauses. This
+    # converts the row-limit correctly per dialect (LIMIT 1 → TOP 1 on SQL
+    # Server) and quotes identifiers per dialect, so the probe is valid on every
+    # connector instead of breaking on SQL Server.
+    try:
+        # Bug-8294 follow-up (Fable re-gate): quote each dotted part of the
+        # qualified table so a hyphenated identifier (e.g. a BigQuery GCP
+        # project id like ``tessallite-io``) parses as a quoted multi-part
+        # identifier instead of raising a sqlglot ParseError on the hyphen.
+        qualified_quoted = ".".join(
+            '"' + p.replace('"', '""') + '"' for p in qualified.split(".")
+        )
+        canonical_probe = (
+            f'SELECT ({expression}) AS __uda_probe '
+            f'FROM {qualified_quoted} LIMIT 1'
+        )
+        probe_sql = sqlglot.parse_one(canonical_probe, read="postgres").sql(
+            dialect=dialect
+        )
+    except Exception as exc:
+        return UserDefinedAttributeLiveValidationResult(
+            executed=False, success=False,
+            error=f"Could not translate probe to source dialect: {exc}",
+            sample_value=None,
+        )
+
+    try:
+        rows, _cols = await execute_source_sql(
+            connection, probe_sql,
+            tenant_session=db,
+            purpose="uda_validation_probe",
+            tenant_slug=tenant_slug,
+        )
+    except Exception as exc:
+        return UserDefinedAttributeLiveValidationResult(
+            executed=True, success=False,
+            error=f"{type(exc).__name__}: {exc}", sample_value=None,
+        )
+    sample = None
+    if rows:
+        val = rows[0].get("__uda_probe")
+        sample = None if val is None else str(val)
+    return UserDefinedAttributeLiveValidationResult(
+        executed=True, success=True, error=None, sample_value=sample,
+    )
 
 
 @router.post(
@@ -645,19 +757,8 @@ async def validate_user_defined_attribute_expression(
                 expression=body.expression,
                 output_data_type=body.output_data_type,
             )
-            return UserDefinedAttributeValidateResponse(
-                parse_valid=validation.parse_valid,
-                columns_resolved=validation.columns_resolved,
-                referenced_columns=validation.referenced_columns,
-                unsupported_functions=validation.unsupported_functions,
-                live_validation=UserDefinedAttributeLiveValidationResult(
-                    executed=False,
-                    success=True,
-                    error=None,
-                    sample_value=None,
-                ),
-            )
         except HTTPException as exc:
+            # Static validation failed — do NOT claim live success.
             return UserDefinedAttributeValidateResponse(
                 parse_valid=False,
                 columns_resolved=False,
@@ -670,3 +771,19 @@ async def validate_user_defined_attribute_expression(
                     sample_value=None,
                 ),
             )
+        # Static validation passed — now actually execute against the source.
+        # F-016-03: never report live success without an execution.
+        live = await _probe_uda_expression_live(
+            db,
+            table=table,
+            expression=body.expression,
+            project_id=project_id,
+            tenant_slug=current_user.tenant_id,
+        )
+        return UserDefinedAttributeValidateResponse(
+            parse_valid=validation.parse_valid,
+            columns_resolved=validation.columns_resolved,
+            referenced_columns=validation.referenced_columns,
+            unsupported_functions=validation.unsupported_functions,
+            live_validation=live,
+        )

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
+from shared.semantic.join_keyword import edge_cardinality
 from shared.semantic.calculated_expression import (
     ExpressionValidationError,
     parse_expression,
@@ -472,10 +473,21 @@ def _compatibility_code(
         paths = _enumerate_paths(measure_table_id, dim_table_id, adjacency)
         if not paths:
             return NO_JOIN_PATH
+        # Many-to-many is a CARDINALITY, and cardinality lives in its own
+        # field (join-orientation contract, invariant 3). This used to read
+        # ``join_type``, which only ever held the token while the two
+        # properties shared one column: a many-to-many declared the way the
+        # Joins panel, ``JoinCreate`` and the YAML importer now write it
+        # (``join_type="left"`` + ``cardinality="many_to_many"``) sailed past
+        # the guard and the pair was offered as compatible, so querying it
+        # fanned out and double-counted with no warning.
+        # ``edge_cardinality`` reads the declared field and falls back to a
+        # legacy token still parked in ``join_type``, so pre-split rows keep
+        # being caught exactly as before.
         safe_paths = [
             path
             for path in paths
-            if not any(_join_type(edge) == "many_to_many" for edge in path)
+            if not any(edge_cardinality(edge) == "many_to_many" for edge in path)
         ]
         if not safe_paths:
             saw_many_to_many = True
@@ -804,10 +816,6 @@ def _suggestion_text(
 
 def _display_name(obj: Any) -> str:
     return str(getattr(obj, "display_name", None) or getattr(obj, "name", None) or obj.id)
-
-
-def _join_type(join: Any) -> str:
-    return str(getattr(join, "join_type", "") or "").strip().lower()
 
 
 def _severity_for_code(code: str) -> str:

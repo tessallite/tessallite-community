@@ -12,7 +12,7 @@ Run from tessallite/services/model-service/:
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -72,7 +72,10 @@ def patched(monkeypatch):
 
     mgr = MagicMock()
     mgr.classify_tenant.side_effect = lambda s: "demo" if s == "demo" else "own"
-    monkeypatch.setattr(mod, "get_license_manager", MagicMock(return_value=mgr))
+    # CP-08 (c0b3580f) switched edition._own_tenant_count from the sync
+    # get_license_manager() to the async _ensure_fresh_manager(); patch the
+    # symbol edition actually awaits now.
+    monkeypatch.setattr(mod, "_ensure_fresh_manager", AsyncMock(return_value=mgr))
     return mgr
 
 

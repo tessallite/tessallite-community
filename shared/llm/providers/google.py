@@ -21,6 +21,21 @@ from shared.llm.adapter import LLMAdapter, ThinkingCallback
 if TYPE_CHECKING:  # import only for type checkers; the SDK is an optional dep
     pass
 
+# Sentinel marking a drained synchronous stream. Using ``next(it, _STREAM_DONE)``
+# rather than letting ``StopIteration`` propagate keeps the exhaustion signal
+# marshallable across the ``asyncio.to_thread`` boundary (a raw StopIteration
+# raised inside a thread/async generator turns into a RuntimeError).
+_STREAM_DONE = object()
+
+
+def _next_or_done(iterator):
+    """Return the next item from ``iterator`` or ``_STREAM_DONE`` when drained.
+
+    Runs the SDK's blocking ``next()`` (a network read) so it can be offloaded
+    to a worker thread, keeping the event loop unblocked during streaming.
+    """
+    return next(iterator, _STREAM_DONE)
+
 
 def _genai():
     """Lazy-import the optional google-genai SDK.
@@ -84,15 +99,27 @@ def _client(config):
 class GoogleAdapter(LLMAdapter):
     supports_thinking: bool = True
 
-    async def complete(self, system: str, user: str, on_thinking: ThinkingCallback = None) -> str:
+    async def complete(
+        self, system: str, user: str, on_thinking: ThinkingCallback = None,
+        response_json: bool = False, cache_system_prefix: bool = False,
+    ) -> str:
+        # R1 (F1) — Gemini has no caller-placed cache breakpoint; it applies
+        # implicit prefix caching automatically. Explicit no-op: accept the flag
+        # so the shared adapter interface is uniform, but do not alter the
+        # request. Documented no-op.
+        _ = cache_system_prefix
         thinking, text = await asyncio.to_thread(
-            self._complete_sync, system, user, on_thinking is not None
+            self._complete_sync, system, user, on_thinking is not None,
+            response_json,
         )
         if thinking and on_thinking:
             await on_thinking(thinking)
         return text
 
-    def _complete_sync(self, system: str, user: str, include_thoughts: bool = False) -> tuple[str, str]:
+    def _complete_sync(
+        self, system: str, user: str, include_thoughts: bool = False,
+        response_json: bool = False,
+    ) -> tuple[str, str]:
         client = _client(self.config)
         _, types = _genai()
         config_kwargs: dict = {
@@ -102,6 +129,10 @@ class GoogleAdapter(LLMAdapter):
         }
         if include_thoughts:
             config_kwargs["thinking_config"] = types.ThinkingConfig(include_thoughts=True)
+        if response_json:
+            # R5 (F6) — native JSON-output mode. Guarantees valid JSON,
+            # removing the markdown-fence / prose-wrap parse-failure class.
+            config_kwargs["response_mime_type"] = "application/json"
         config = types.GenerateContentConfig(**config_kwargs)
         response = client.models.generate_content(
             model=self.config.model_name,
@@ -136,7 +167,12 @@ class GoogleAdapter(LLMAdapter):
             )
         return "".join(thinking_parts), text
 
-    async def stream_complete(self, system: str, user: str, on_thinking: ThinkingCallback = None) -> AsyncGenerator[str, None]:
+    async def stream_complete(
+        self, system: str, user: str, on_thinking: ThinkingCallback = None,
+        response_json: bool = False, cache_system_prefix: bool = False,
+    ) -> AsyncGenerator[str, None]:
+        # R1 (F1) — documented no-op (implicit prefix caching); see ``complete``.
+        _ = cache_system_prefix
         client = _client(self.config)
         _, types = _genai()
         config_kwargs: dict = {
@@ -146,6 +182,9 @@ class GoogleAdapter(LLMAdapter):
         }
         if on_thinking is not None:
             config_kwargs["thinking_config"] = types.ThinkingConfig(include_thoughts=True)
+        if response_json:
+            # R5 (F6) — native JSON-output mode (see _complete_sync).
+            config_kwargs["response_mime_type"] = "application/json"
         config = types.GenerateContentConfig(**config_kwargs)
         stream = await asyncio.to_thread(
             lambda: client.models.generate_content_stream(
@@ -156,7 +195,15 @@ class GoogleAdapter(LLMAdapter):
         )
         input_tokens = 0
         output_tokens = 0
-        for chunk in stream:
+        # Bug-6333: the google-genai stream is a SYNCHRONOUS generator; each
+        # ``next()`` is a blocking network read. Iterating it with a plain
+        # ``for`` on the event loop stalls the whole worker for every chunk.
+        # Offload each step to a thread so the loop stays free between chunks.
+        iterator = iter(stream)
+        while True:
+            chunk = await asyncio.to_thread(_next_or_done, iterator)
+            if chunk is _STREAM_DONE:
+                break
             candidates = getattr(chunk, "candidates", None) or []
             if candidates and getattr(candidates[0], "content", None):
                 for part in candidates[0].content.parts:

@@ -32,7 +32,7 @@
 <p>A predictive-aggregate misfire looks like:</p>
 <ul><li>Many blue bars (queries falling through to source).</li><li>Bar heights well above the dashed line.</li><li>Missing patterns visible in the <strong>Aggregate Lifecycle</strong> panel (no <code>built</code> events for the predicted candidates, or <code>failed</code> events instead).</li></ul>
 <p>A capacity issue looks like:</p>
-<ul><li>Mostly green bars but all of them taller than the dashed line — aggregates are matching but the source warehouse itself is slower than it was before the deploy.</li></ul>
+<ul><li>Mostly green bars but all of them taller than the dashed line — aggregates are matching but the source itself is slower than it was before the deploy.</li></ul>
 <h2>API</h2>
 <p>The section reads from <code>GET /api/v1/models/{model_id}/cold-start</code>:</p>
 <div class="table-wrapper"><table><thead><tr><th>Query param</th><th>Default</th><th>Meaning</th></tr></thead><tbody><tr><td><code>sample_size</code></td><td><code>25</code></td><td>Cap on the number of post-deploy queries to render.</td></tr><tr><td><code>baseline_days</code></td><td><code>14</code></td><td>Window of pre-deploy queries used to compute the baseline median.</td></tr></tbody></table></div>

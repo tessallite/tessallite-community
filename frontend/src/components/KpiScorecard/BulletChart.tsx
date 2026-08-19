@@ -100,6 +100,23 @@ export default function BulletChart({
         show: false,
       },
       series: [
+        // Bug-7820: transparent offset bar so the visible band stack starts at
+        // scaleMin instead of 0. For negative scaleMin (z_score presets) the
+        // bar extends left from 0; for positive scaleMin it shifts bands right.
+        // When scaleMin === 0 the bar is invisible and has no effect.
+        ...(scaleMin !== 0
+          ? [
+              {
+                type: "bar" as const,
+                stack: "bg",
+                barWidth: "64%",
+                data: [scaleMin],
+                itemStyle: { color: "transparent" },
+                silent: true,
+                animation: false,
+              },
+            ]
+          : []),
         // Saturated band track — the lanes the bullet passes through.
         ...effectiveBands.map((b) => ({
           type: "bar" as const,
@@ -135,9 +152,26 @@ export default function BulletChart({
           animation: false,
           z: 5,
         },
+        // Bug-7820: transparent offset for the bullet stack, same as the band
+        // track, so the bullet baselines at scaleMin (not 0).
+        ...(scaleMin !== 0
+          ? [
+              {
+                type: "bar" as const,
+                stack: "bullet",
+                barWidth: "34%",
+                barGap: "-100%",
+                data: [scaleMin],
+                itemStyle: { color: "transparent" },
+                silent: true,
+                animation: false,
+              },
+            ]
+          : []),
         // The bullet itself — a dark bar clearly riding over the bands.
         {
           type: "bar" as const,
+          stack: "bullet",
           barWidth: "34%",
           barGap: "-100%",
           data: [clamped - scaleMin],

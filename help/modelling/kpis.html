@@ -257,6 +257,22 @@
 
 <blockquote><strong>Broken inputs are flagged:</strong> If one of a composite's child KPIs fails to evaluate (a broken formula, a query error), the composite still scores from its working children but shows a <strong>Degraded</strong> badge on its scorecard card naming the broken child. A child that simply has no data is dropped quietly. See <a href="../concepts/kpis.html">KPI concepts</a> for the difference between a broken input and no data.</blockquote>
 
+<h3>When a KPI shows &ldquo;Restricted&rdquo; instead of a number</h3>
+<p>Sometimes a KPI card shows no number and a small <strong>Restricted</strong> badge. This is not a broken KPI and it is not missing data. It means the model has row security switched on, and the rules do not give your role permission to see any rows at all &mdash; so there is nothing for the KPI to add up.</p>
+<p>Three different situations can all leave a KPI card blank, and the card tells you which one you are looking at:</p>
+<table>
+  <thead>
+    <tr><th>What you see</th><th>What it means</th><th>What to do</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>A <strong>Restricted</strong> badge and no number</td><td>Row security on this model gives your role access to no rows</td><td>Ask an administrator to give you a role or persona that covers the data you need</td></tr>
+    <tr><td>No badge and no number</td><td>The query ran fine, but there genuinely are no matching rows</td><td>Widen the time window or remove a filter</td></tr>
+    <tr><td>An error message on the card</td><td>The formula or the model itself has a problem</td><td>Fix the formula, or check that the measures it uses still exist</td></tr>
+  </tbody>
+</table>
+<p>Hover over the <strong>Restricted</strong> badge for the full explanation.</p>
+<blockquote><strong>Worth knowing if you build models:</strong> the moment a model gets its first row-security rule, everybody whose role is not named in a rule sees nothing &mdash; including you, and including administrators. That is deliberate: it is safer to show nothing than to accidentally show data a rule was meant to hide. If you add a rule and the whole model suddenly goes blank for you, that is why. Add a rule that covers your own role, or set up a persona that is allowed to see everything, and the numbers come back. See <a href="configure-row-security.html">Configure row security</a>.</blockquote>
+
 <h3>Time calculation (optional)</h3>
 <p>Most formula types offer a &ldquo;+ Add time calculation&rdquo; link below the formula controls. Clicking it adds a secondary time-variant calculation that transforms the base formula&rsquo;s result over time. This is different from the time window &mdash; the time window says &ldquo;look at data from last month&rdquo;, while the time calculation says &ldquo;compare this month to last month&rdquo; or &ldquo;average across the last 3 months&rdquo;.</p>
 <p><strong>When to use it:</strong> You already have a base formula (like Sum of Revenue) and you want the KPI to automatically do something comparative or rolling with it. Without a time calculation, the KPI just shows the raw value for the chosen time window. With a time calculation, it can show change, trend, or smoothed values.</p>
@@ -365,14 +381,14 @@
 <p>A named list is a pre-defined set of values for a dimension. It can be:</p>
 <ul>
   <li><strong>Static</strong> &mdash; a fixed list of values (e.g. &ldquo;Enterprise Customers&rdquo; = [Acme Corp, BigCo, MegaInc]).</li>
-  <li><strong>Dynamic (Top/Bottom N)</strong> &mdash; automatically resolves to the top or bottom N members by a measure at evaluation time (e.g. &ldquo;Top 20 Products by Revenue&rdquo; recalculates every time the KPI is evaluated).</li>
-  <li><strong>Query-based</strong> &mdash; the members are determined by a query that runs at evaluation time.</li>
+  <li><strong>Dynamic (Top/Bottom N)</strong> &mdash; ranks members by a measure and stores the top or bottom N when you <strong>Refresh</strong> the list (e.g. &ldquo;Top 20 Products by Revenue&rdquo;). The stored members are what queries use; they do not recompute on every KPI evaluation.</li>
+  <li><strong>Query-based</strong> &mdash; the members are determined by a query that runs when you <strong>Refresh</strong> the list; the result is stored.</li>
 </ul>
-<p>Named lists are created and managed separately (see the <a href="named-sets.html">Named Lists</a> help page). Once created, they can be used in any KPI filter, any pivot query, or any dashboard slicer.</p>
+<p>Named lists are created and managed in the <a href="named-queries.html">Named Queries</a> panel (which covers MDX Named Sets, Tessallite Named Lists, and Named Queries). Once created, they can be used in any KPI filter, any pivot query, or any dashboard slicer.</p>
 <p><strong>Why use named lists instead of typing values directly?</strong></p>
 <ol>
   <li><strong>Consistency across KPIs.</strong> If you have 15 KPIs filtered to &ldquo;Strategic Accounts&rdquo;, changing the list in one place updates all 15 KPIs. Without named lists, you would edit each KPI individually.</li>
-  <li><strong>Dynamic membership.</strong> A &ldquo;Top 10 Customers by Revenue&rdquo; named list re-evaluates every month. The KPI always reflects the CURRENT top 10, not the top 10 from when you built it.</li>
+  <li><strong>Dynamic membership.</strong> A &ldquo;Top 10 Customers by Revenue&rdquo; named list is recomputed whenever you <strong>Refresh</strong> it and then <strong>Deploy</strong>; every KPI that uses it then reflects the newly stored top 10. Membership is stored, not recomputed on each query, and there is no automatic monthly sweep for named lists &mdash; refreshing is an explicit action. (A Named <em>Query</em> can be scheduled; a named <em>list</em> is refreshed on demand.)</li>
   <li><strong>Governance.</strong> Named lists can be certified, documented, and version-controlled. Everyone in the organisation uses the same definition of &ldquo;Western Europe&rdquo; or &ldquo;Premium Products&rdquo;.</li>
   <li><strong>Complex logic without complexity.</strong> A named list can encode complex membership rules (top N, conditional logic, exclusions) that would be impossible to express in a simple filter.</li>
 </ol>
@@ -662,11 +678,11 @@ consistent shape makes a scorecard faster to scan.</p>
 <ul>
   <li><a href="../concepts/kpis.html">KPIs (concept)</a> &mdash; full conceptual reference including expression language, scorecard, alerts, and agent integration.</li>
   <li><a href="define-measures.html">Define Measures</a> &mdash; create the measures that KPIs reference.</li>
-  <li><a href="named-sets.html">Named Lists</a> &mdash; reusable dimension member selections.</li>
-  <li><a href="impact-analysis.html">Impact Analysis</a> &mdash; check where KPIs are used downstream.</li>
+  <li><a href="named-queries.html">Named Queries</a> &mdash; MDX Named Sets, Tessallite Named Lists, and Named Queries (reusable dimension member selections and governed queries).</li>
+  <li><a href="usage-downstream-assets.html">Usage &amp; Downstream Assets</a> &mdash; record downstream consumers and review observed table usage.</li>
 </ul>
 
-<nav class="page-nav"><a href="named-sets.html" class="page-nav-btn prev">&larr; Named Lists</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="data-preview.html" class="page-nav-btn next">Data Preview &rarr;</a></nav>
+<nav class="page-nav"><a href="named-queries.html" class="page-nav-btn prev">&larr; Named Queries</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="data-preview.html" class="page-nav-btn next">Data Preview &rarr;</a></nav>
   </main>
   <footer class="site-footer"><p>Tessallite Help &mdash; <a href="../index.html">Back to contents</a></p></footer>
 </body>

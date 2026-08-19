@@ -110,6 +110,7 @@
   "publicGlossary.downloadPdf": "PDFをダウンロード",
   "publicGlossary.entryCount": "全 {{total}} 件中 {{visible}} 件を表示",
   "publicGlossary.invalidLink": "この共有リンクは無効か、期限切れです。所有者に新しいリンクの生成を依頼してください。",
+  "publicGlossary.loadError": "用語集を読み込めませんでした。しばらくしてからもう一度お試しいただくか、モデルの所有者にお問い合わせください。",
   "publicGlossary.noResults": "検索条件に一致する用語集項目はありません。",
   "publicGlossary.overline": "Tessallite 用語集",
   "publicGlossary.searchPlaceholder": "用語、定義、類義語を検索…",

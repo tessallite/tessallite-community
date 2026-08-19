@@ -104,4 +104,4 @@ Replace `<hostname>` with the gateway host and `<workspace-slug>` with your work
 
 ---
 
-← [Connect a BI Tool via JDBC](connect-a-bi-tool.md) | [Home](../index.md) | [Workspaces and Tenants →](../concepts/workspaces-and-tenants.md)
+← [Connect a BI Tool via JDBC](connect-a-bi-tool.md) | [Home](../index.md) | [Tessallite Features →](tessallite-features.md)

@@ -94,7 +94,7 @@ async def test_create_notification_route(client, url):
 
     with (
         patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
-        patch("src.api.notifications.audit", new_callable=AsyncMock) as mock_audit,
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock) as mock_audit,
     ):
         resp = await client.post(url, json={
             "event_type": "schema_drift",
@@ -155,6 +155,25 @@ async def test_event_types_catalogue_matches_backend(client, url):
 
 
 @pytest.mark.asyncio
+async def test_every_event_type_has_a_human_catalogue_label(client, url):
+    """Bug-8114 F-2: ``_EVENT_LABELS.get(name, name)`` falls back to the raw
+    event-type string, so a dispatcher EVENT_TYPES member with no entry in
+    ``_EVENT_LABELS`` is silently invisible in THIS test (values still match)
+    but renders the raw machine name (e.g. "pocket_refresh_failure" instead
+    of "Pocket Refresh Failure") in the Alerts panel dropdown. Assert every
+    label is an actual human label, not the value echoed back."""
+    from shared.alerting.dispatcher import EVENT_TYPES
+    resp = await client.get(f"{url}/event-types")
+    assert resp.status_code == 200
+    by_value = {e["value"]: e["label"] for e in resp.json()}
+    unlabelled = [v for v in EVENT_TYPES if by_value.get(v) == v]
+    assert not unlabelled, (
+        f"EVENT_TYPES member(s) with no human label in _EVENT_LABELS "
+        f"(notifications.py): {sorted(unlabelled)}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_catalogue_offers_no_kpi_events(client, url):
     resp = await client.get(f"{url}/event-types")
     values = {e["value"] for e in resp.json()}
@@ -191,7 +210,7 @@ async def test_update_notification_route_emits_audit(client, url):
 
     with (
         patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
-        patch("src.api.notifications.audit", new_callable=AsyncMock) as mock_audit,
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock) as mock_audit,
     ):
         resp = await client.put(f"{url}/{route.id}", json={
             "channel_type": "slack",
@@ -247,7 +266,7 @@ async def test_create_audit_excludes_channel_config_secret(client, url):
 
     with (
         patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
-        patch("src.api.notifications.audit", new_callable=AsyncMock) as mock_audit,
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock) as mock_audit,
     ):
         resp = await client.post(url, json={
             "event_type": "schema_drift",
@@ -266,7 +285,7 @@ async def test_update_audit_excludes_channel_config_secret(client, url):
 
     with (
         patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
-        patch("src.api.notifications.audit", new_callable=AsyncMock) as mock_audit,
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock) as mock_audit,
     ):
         resp = await client.put(f"{url}/{route.id}", json={
             "channel_type": "slack",
@@ -291,7 +310,7 @@ async def test_delete_audit_excludes_channel_config_secret(client, url):
     db = _mock_db_with_routes([route])
     with (
         patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
-        patch("src.api.notifications.audit", new_callable=AsyncMock) as mock_audit,
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock) as mock_audit,
     ):
         resp = await client.delete(f"{url}/{route.id}")
     assert resp.status_code == 204
@@ -309,7 +328,7 @@ async def test_delete_notification_route(client, url):
     db = _mock_db_with_routes([route])
     with (
         patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
-        patch("src.api.notifications.audit", new_callable=AsyncMock) as mock_audit,
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock) as mock_audit,
     ):
         resp = await client.delete(f"{url}/{route.id}")
     assert resp.status_code == 204
@@ -327,7 +346,7 @@ async def test_delete_not_found(client, url):
     db = make_mock_db()
     with (
         patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
-        patch("src.api.notifications.audit", new_callable=AsyncMock) as mock_audit,
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock) as mock_audit,
     ):
         resp = await client.delete(f"{url}/{uuid.uuid4()}")
     assert resp.status_code == 404
@@ -410,7 +429,7 @@ async def test_partial_update_channel_config_without_channel_type_is_validated(
 
     with (
         patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
-        patch("src.api.notifications.audit", new_callable=AsyncMock),
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock),
     ):
         resp = await client.put(f"{url}/{route.id}", json={
             # No channel_type -- partial update
@@ -419,3 +438,243 @@ async def test_partial_update_channel_config_without_channel_type_is_validated(
 
     # Must be rejected: empty recipients for an email route.
     assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_partial_update_channel_type_without_channel_config_is_validated(
+    client, url,
+):
+    """Bug-6016 (found on Bug-5999 re-review): the mirror of Bug-5277 -- a PUT
+    that changes channel_type WITHOUT resending channel_config must still be
+    validated. Before the fix this was skipped entirely, because validation
+    only ran when channel_config was provided. The route's config never
+    changes when channel_config is omitted, so switching channel_type alone
+    would leave a slack-typed route carrying its old email config
+    ({"recipients": [...]}) -- silently dropped by the dispatcher at send
+    time instead of rejected at save time.
+    """
+    route = _make_route(
+        channel_type="email",
+        channel_config={"recipients": ["admin@test.com"]},
+    )
+    db = _mock_db_with_routes([route])
+
+    with (
+        patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock),
+    ):
+        resp = await client.put(f"{url}/{route.id}", json={
+            # No channel_config -- the persisted email config has no
+            # webhook_url, so switching to slack must be rejected.
+            "channel_type": "slack",
+        })
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_partial_update_channel_type_resent_unchanged_without_config_still_valid(
+    client, url,
+):
+    """Redundantly resending the SAME channel_type without channel_config
+    must not be rejected -- the persisted config is already valid for that
+    channel_type, so nothing about the effective config actually changed."""
+    route = _make_route(
+        channel_type="email",
+        channel_config={"recipients": ["admin@test.com"]},
+    )
+    db = _mock_db_with_routes([route])
+
+    with (
+        patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock),
+    ):
+        resp = await client.put(f"{url}/{route.id}", json={
+            "channel_type": "email",
+            "enabled": False,
+        })
+
+    assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Bug-6007 (partial): encrypt/redact cycle coverage for Bug-5945/5999/6000/6001.
+# ---------------------------------------------------------------------------
+
+from cryptography.fernet import Fernet
+
+from shared.config import settings as settings_module
+from shared.security import credential_crypto as cc
+
+_TEST_WEBHOOK_URL = "https://hooks.slack.com/services/T000/B000/original-secret"
+
+
+def _set_encryption_key(monkeypatch) -> None:
+    monkeypatch.setenv("CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("CREDENTIAL_ENCRYPTION_KEY_PREVIOUS", "")
+    settings_module.get_settings.cache_clear()
+    cc._multifernet_cached.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_create_slack_route_encrypts_webhook_url_and_redacts_response(
+    client, url, monkeypatch,
+):
+    """Bug-5945: the plaintext URL must never reach the DB or the response;
+    the response must expose only ``has_webhook_url: true``."""
+    _set_encryption_key(monkeypatch)
+    db = make_mock_db()
+
+    async def fake_refresh(obj):
+        obj.id = uuid.uuid4()
+        obj.created_at = NOW
+        obj.updated_at = NOW
+
+    db.refresh = AsyncMock(side_effect=fake_refresh)
+
+    with (
+        patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock),
+    ):
+        resp = await client.post(url, json={
+            "event_type": "refresh_failure",
+            "channel_type": "slack",
+            "channel_config": {"webhook_url": _TEST_WEBHOOK_URL},
+        })
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["channel_config"] == {"has_webhook_url": True}
+
+    # The row handed to db.add() is the persistence-layer truth: plaintext
+    # must be gone, only the encrypted blob + flag remain.
+    stored = db.add.call_args_list[-1][0][0]
+    assert "webhook_url" not in stored.channel_config
+    assert stored.channel_config["has_webhook_url"] is True
+    encrypted = stored.channel_config["webhook_url_encrypted"]
+    assert encrypted != _TEST_WEBHOOK_URL
+    assert cc.decrypt_str(encrypted.encode()) == _TEST_WEBHOOK_URL
+
+
+@pytest.mark.asyncio
+async def test_list_legacy_plaintext_slack_route_reports_has_webhook_url_true(
+    client, url,
+):
+    """Bug-6001: a route saved before Bug-5945 (plaintext ``webhook_url``,
+    no ``has_webhook_url`` flag) must still report ``has_webhook_url: true``
+    -- the redaction check has to run before the plaintext key is popped."""
+    route = _make_route(
+        channel_type="slack",
+        channel_config={"webhook_url": _TEST_WEBHOOK_URL},
+    )
+    db = _mock_db_with_routes([route])
+    with patch("src.api.notifications.get_tenant_db", async_gen_from(db)):
+        resp = await client.get(url)
+    assert resp.status_code == 200
+    config = resp.json()[0]["channel_config"]
+    assert config == {"has_webhook_url": True}
+    assert "webhook_url" not in config
+    assert "webhook_url_encrypted" not in config
+
+
+@pytest.mark.asyncio
+async def test_update_blank_webhook_url_preserves_existing_secret(
+    client, url, monkeypatch,
+):
+    """Bug-5999: editing a Slack route without resupplying the URL must keep
+    the previously-configured secret, not wipe it or 422."""
+    _set_encryption_key(monkeypatch)
+    encrypted = cc.encrypt_str(_TEST_WEBHOOK_URL).decode("utf-8")
+    route = _make_route(
+        channel_type="slack",
+        channel_config={"webhook_url_encrypted": encrypted, "has_webhook_url": True},
+    )
+    db = _mock_db_with_routes([route])
+
+    with (
+        patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock),
+    ):
+        resp = await client.put(f"{url}/{route.id}", json={
+            "channel_config": {"webhook_url": ""},
+        })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["channel_config"] == {"has_webhook_url": True}
+    # The persisted secret must still decrypt to the original URL.
+    assert cc.decrypt_str(route.channel_config["webhook_url_encrypted"].encode()) == (
+        _TEST_WEBHOOK_URL
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_new_webhook_url_replaces_existing_secret(
+    client, url, monkeypatch,
+):
+    """Bug-5999: supplying a fresh URL on edit still replaces the secret."""
+    _set_encryption_key(monkeypatch)
+    old_encrypted = cc.encrypt_str(_TEST_WEBHOOK_URL).decode("utf-8")
+    route = _make_route(
+        channel_type="slack",
+        channel_config={"webhook_url_encrypted": old_encrypted, "has_webhook_url": True},
+    )
+    db = _mock_db_with_routes([route])
+    new_url = "https://hooks.slack.com/services/T111/B111/new-secret"
+
+    with (
+        patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
+        patch("src.api.notifications.audit_required", new_callable=AsyncMock),
+    ):
+        resp = await client.put(f"{url}/{route.id}", json={
+            "channel_config": {"webhook_url": new_url},
+        })
+    assert resp.status_code == 200
+    assert cc.decrypt_str(route.channel_config["webhook_url_encrypted"].encode()) == new_url
+
+
+@pytest.mark.asyncio
+async def test_update_blank_webhook_url_without_existing_secret_is_rejected(
+    client, url,
+):
+    """A blank webhook_url is only a no-op when a secret already exists.
+    A slack route with nothing configured yet must still 422."""
+    route = _make_route(channel_type="slack", channel_config={})
+    db = _mock_db_with_routes([route])
+
+    with patch("src.api.notifications.get_tenant_db", async_gen_from(db)):
+        resp = await client.put(f"{url}/{route.id}", json={
+            "channel_config": {"webhook_url": ""},
+        })
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_test_notification_route_decrypts_saved_secret(
+    client, url, monkeypatch,
+):
+    """Bug-5999: POST /{route_id}/test must decrypt and use the persisted
+    secret -- the client never resends the plaintext URL for a saved route."""
+    _set_encryption_key(monkeypatch)
+    encrypted = cc.encrypt_str(_TEST_WEBHOOK_URL).decode("utf-8")
+    route = _make_route(
+        channel_type="slack",
+        channel_config={"webhook_url_encrypted": encrypted, "has_webhook_url": True},
+    )
+    db = _mock_db_with_routes([route])
+
+    with (
+        patch("src.api.notifications.get_tenant_db", async_gen_from(db)),
+        patch("shared.alerting.slack_sender.send_slack", new_callable=AsyncMock) as mock_send,
+    ):
+        resp = await client.post(f"{url}/{route.id}/test")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "sent"
+    mock_send.assert_awaited_once()
+    assert mock_send.call_args.kwargs["webhook_url"] == _TEST_WEBHOOK_URL
+
+
+@pytest.mark.asyncio
+async def test_test_notification_route_not_found(client, url):
+    db = make_mock_db()
+    with patch("src.api.notifications.get_tenant_db", async_gen_from(db)):
+        resp = await client.post(f"{url}/{uuid.uuid4()}/test")
+    assert resp.status_code == 404

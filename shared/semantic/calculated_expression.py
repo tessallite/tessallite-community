@@ -63,6 +63,16 @@ _ALLOWED_FUNCTIONS: frozenset[str] = frozenset({
     "safe_div", "safe_ratio",
 })
 
+# Bug-7193: define exact arity for functions that have fixed signatures.
+# safe_div and safe_ratio require exactly 2 arguments (numerator,
+# denominator). Without this check, single-arg or 3-arg calls pass
+# validation but survive as un-expanded SAFE_DIV(...) / SAFE_RATIO(...)
+# tokens that fail late at the source database.
+_FUNCTION_ARITY: dict[str, int] = {
+    "safe_div": 2,
+    "safe_ratio": 2,
+}
+
 # sqlglot models CASE WHEN and IF as Func subclasses, but they are
 # structural control flow rather than scalar functions. Accept them
 # unconditionally.
@@ -134,6 +144,19 @@ def parse_expression(expression: str) -> ParsedExpression:
     if not expression or not expression.strip():
         raise ExpressionValidationError("expression is empty")
 
+    # Bug-6238 (F-015-43): the internal placeholder token must never appear in
+    # the user's raw expression. If it did, the literal identifier would pass
+    # ``_validate_ast`` (it is a member of ``valid_placeholders``) and, at
+    # rewrite time, the substitution would expand BOTH the real
+    # ``measure("x")`` reference AND the injected literal to the same physical
+    # expression — silently computing the referenced measure twice. Reject the
+    # reserved prefix up front so the collision can never form.
+    if _PLACEHOLDER_PREFIX in expression:
+        raise ExpressionValidationError(
+            "expression contains a reserved internal token "
+            f"({_PLACEHOLDER_PREFIX!r}); remove it"
+        )
+
     rewritten, references = _replace_measure_refs(expression)
 
     if re.search(r"\bmeasure\s*\(", rewritten, re.IGNORECASE):
@@ -202,6 +225,15 @@ def _validate_ast(ast: exp.Expression, *, valid_placeholders: set[str]) -> None:
                 raise ExpressionValidationError(
                     f"function {fn_name!r} is not in the allowed list"
                 )
+            # Bug-7193: enforce arity for functions with fixed signatures.
+            expected_arity = _FUNCTION_ARITY.get(fn_name)
+            if expected_arity is not None:
+                actual_arity = len(list(node.expressions or []))
+                if actual_arity != expected_arity:
+                    raise ExpressionValidationError(
+                        f"{fn_name} requires exactly {expected_arity} "
+                        f"arguments, got {actual_arity}"
+                    )
             continue
 
         if isinstance(node, exp.Func):
@@ -225,12 +257,26 @@ def _func_name(node: exp.Func) -> str:
 
 def expand_safe_helpers(ast: exp.Expression) -> exp.Expression:
     """Rewrite safe_div(num, den) / safe_ratio(num, den) into
-    ``CASE WHEN den = 0 THEN NULL ELSE num / den END``.
+    ``CASE WHEN den = 0 THEN NULL ELSE num * 1.0 / den END``
+    and coerce every bare ``/`` (Div node) to float division via
+    ``num * 1.0 / den``.
+
+    Bug-6221 (F-015-26): PostgreSQL integer division truncates toward zero
+    (``SUM(int)`` is bigint, and bigint / bigint yields bigint), so
+    ``safe_div(measure("gm"), measure("sales"))`` with integer measures
+    returned 0 or 1 instead of the correct fractional value. The ``* 1.0``
+    coercion forces float division across all dialects (BigQuery/Spark
+    already return floats from ``/``, so the coercion is a harmless no-op
+    there via sqlglot transpilation).
 
     Kept in ``shared`` so the query-router rewriter and the optimiser's
     CTAS emitters produce the same NULL-on-zero expansion for calculated
     measures.
     """
+    def _float_numerator(num: exp.Expression) -> exp.Expression:
+        """Wrap ``num`` as ``num * 1.0`` to force float division."""
+        return exp.Mul(this=num, expression=exp.Literal.number("1.0"))
+
     def _rewrite(node: exp.Expression) -> exp.Expression:
         if isinstance(node, exp.Anonymous):
             name = str(node.this or "").lower()
@@ -245,10 +291,53 @@ def expand_safe_helpers(ast: exp.Expression) -> exp.Expression:
                                 true=exp.Null(),
                             )
                         ],
-                        default=exp.Div(this=num.copy(), expression=den.copy()),
+                        default=exp.Div(
+                            this=_float_numerator(num.copy()),
+                            expression=den.copy(),
+                        ),
                     )
+        # Bug-6221: coerce bare division (``/`` operator) to float.
+        if isinstance(node, exp.Div):
+            return exp.Div(
+                this=_float_numerator(node.this.copy()),
+                expression=node.expression.copy(),
+            )
         return node
-    return ast.transform(_rewrite)
+
+    def _rewrite_bottom_up(node: exp.Expression) -> exp.Expression:
+        """Walk the AST bottom-up so nested divisions are ALL coerced.
+
+        Bug-6221 refinement: sqlglot's ``transform`` is top-down and skips
+        children of replaced nodes. For nested divisions like ``(a / b) / c``,
+        a single top-down pass coerces the outer Div but leaves the inner
+        ``a / b`` uncoerced. This manual bottom-up traversal processes
+        children first, then the parent, so every Div at every depth
+        receives the ``* 1.0`` coercion exactly once.
+        """
+        # Process each child bottom-up first
+        for key in list(node.arg_types.keys()):
+            val = node.args.get(key)
+            if isinstance(val, exp.Expression):
+                new_val = _rewrite_bottom_up(val)
+                if new_val is not val:
+                    node.set(key, new_val)
+            elif isinstance(val, list):
+                new_list = []
+                changed = False
+                for item in val:
+                    if isinstance(item, exp.Expression):
+                        new_item = _rewrite_bottom_up(item)
+                        new_list.append(new_item)
+                        if new_item is not item:
+                            changed = True
+                    else:
+                        new_list.append(item)
+                if changed:
+                    node.args[key] = new_list
+        # Then rewrite self
+        return _rewrite(node)
+
+    return _rewrite_bottom_up(ast.copy())
 
 
 # ---------------------------------------------------------------------------

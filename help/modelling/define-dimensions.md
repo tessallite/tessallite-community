@@ -24,7 +24,7 @@ A dimension is a named grouping attribute that maps a business-friendly label to
 
 A dimension maps a business name to a column in the model's source tables. For example, `orders.status_cd` might be exposed as a dimension named `Order Status`. BI tools see `Order Status` as a queryable column in the model's virtual schema.
 
-Dimensions from any table — fact, dim_aggregate, or dim_detail — are valid. Dimensions from `dim_aggregate` tables can be included in the aggregate grain; dimensions from `dim_detail` tables always cause queries to fall through to raw data.
+Dimensions can come from any table in the model -- fact tables, dimension tables, or any other joined table. Which table a dimension belongs to affects whether it can participate in aggregate routing (dimensions on tables included in the aggregate grain) or whether queries using it are served from raw source data.
 
 ---
 
@@ -34,7 +34,8 @@ Dimensions from any table — fact, dim_aggregate, or dim_detail — are valid. 
 |---|---|---|
 | Name | Yes | Unique identifier for this dimension in the model schema. Business-friendly, title case. |
 | Source table | Yes | The table in the model containing the column. |
-| Source column | Yes | The column in the source table. |
+| Source column | Yes | The column in the source table. This column provides the key value (the unique identifier for each member). |
+| Display column | No | A second column from the same table whose values are shown as the member caption in BI tools, while the source column stays the underlying key. For example, `customer_id` as the source column and `customer_name` as the display column. When blank, the source column value is used for both key and caption. |
 | Display name | No | Alternate label for BI tools that support display names. Defaults to Name if blank. |
 | Description | No | Free-text explanation shown in model metadata and some BI tool tooltips. |
 | Default sort order | No | ASC or DESC. Controls default sort when an analyst orders by this dimension. |
@@ -55,12 +56,25 @@ Dimensions from any table — fact, dim_aggregate, or dim_detail — are valid. 
 
 ## Example dimensions
 
-| Dimension name | Source table | Source column | Notes |
-|---|---|---|---|
-| Sale Date | `dim_date` | `date_actual` | From a dim_aggregate table; can be used as an aggregate grouping key. |
-| Product Category | `dim_product` | `category_name` | From a dim_aggregate table; enables pre-aggregation by category. |
-| Order Status | `orders` | `status_cd` | From the fact table itself; valid for filtering or grouping. |
-| Customer Name | `dim_customer` | `full_name` | From a dim_detail table; queries using this dimension fall through to raw data. |
+| Dimension name | Source table | Source column | Display column | Notes |
+|---|---|---|---|---|
+| Sale Date | `dim_date` | `date_actual` | -- | From a date dimension table. Can serve as an aggregate grouping key if included in the aggregate grain. |
+| Product Category | `dim_product` | `category_name` | -- | From a dimension table. Enables pre-aggregation by category when included in an aggregate grain. |
+| Order Status | `orders` | `status_cd` | -- | From the fact table itself. Valid for filtering or grouping. |
+| Customer | `dim_customer` | `customer_id` | `full_name` | Uses `customer_id` as the key and `full_name` as the display caption. BI tools show the name while queries filter on the id. |
+
+---
+
+## Attribute relationships
+
+After creating a dimension, you can declare **attribute relationships** to tell Tessallite that another column is functionally dependent on this dimension's key. For example, if every `customer_id` always maps to exactly one `customer_name`, `customer_email`, and `customer_region`, you can declare those as attributes of the Customer dimension.
+
+Attribute relationships serve two purposes:
+
+- **Query routing.** When Tessallite knows that `customer_region` is determined by `customer_id`, it can serve queries that group by region from an aggregate that was built at the customer-id grain, without falling through to raw data.
+- **Model clarity.** The relationship makes the one-to-one dependency explicit in the model, so anyone reading the model can see which columns belong together.
+
+To add an attribute relationship, open a dimension in the Model Builder, scroll to the **Attribute Relationships** section, and click **Add Relationship**. Select the detail column and save. The relationship is stored as model metadata and verified at deploy time.
 
 ---
 

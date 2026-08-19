@@ -35,10 +35,12 @@ from shared.db.session import get_tenant_db
 # Shared service-account-auth policy (single source of truth across the CRUD
 # guard, the import neutraliser, and the Google adapter). Aliased to the
 # historical private name used across this module + its tests.
+from shared.llm.base_url_validator import validate_llm_base_url
 from shared.llm.sa_auth import (
     service_account_auth_allowed,
     uses_service_account_auth as _uses_service_account_auth,
 )
+from shared.schemas.domains.tenants_projects import redact_config_bag
 from shared.schemas.pydantic_models import (
     LLMConnectionTestRequest,
     LLMConnectionTestResponse,
@@ -94,6 +96,21 @@ def _guard_service_account_auth(provider: str | None, config: dict | None) -> No
         )
 
 
+def _guard_base_url(base_url: str | None) -> None:
+    """Reject a ``base_url`` that is not on the SSRF allowlist (Bug-7108).
+
+    Translates the shared ``validate_llm_base_url`` ``ValueError`` into a 400
+    HTTPException so the persistence layer never stores a disallowed URL.
+    """
+    try:
+        validate_llm_base_url(base_url)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
 async def _ensure_project(db, project_id: UUID) -> Project:
     project = await db.get(Project, project_id)
     if project is None:
@@ -107,6 +124,15 @@ async def _ensure_project(db, project_id: UUID) -> Project:
 def _to_response(record: LLMProviderConfig) -> LLMProviderConfigResponse:
     resp = LLMProviderConfigResponse.model_validate(record)
     resp.has_api_key = record.encrypted_api_key is not None
+    # Bug-8259: ``config`` is plaintext JSONB and this response is readable by
+    # every project VIEWER, while writing it needs only project admin. The
+    # write path now rejects secret-like keys, but a row written before that
+    # gate — or by any non-API writer — could still carry one. Strip on every
+    # read, using the same barrier the connection config echo uses. The LLM
+    # edit dialog rebuilds ``config`` from a closed set of named form fields
+    # (anthropic_api_version, google_mode/project/location), so redaction here
+    # cannot round-trip a placeholder back into storage.
+    resp.config = redact_config_bag(record.config or {})
     return resp
 
 
@@ -146,6 +172,7 @@ async def create_llm_config(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> LLMProviderConfigResponse:
     _guard_service_account_auth(body.provider, body.config)
+    _guard_base_url(body.base_url)
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_project(db, project_id)
         record = LLMProviderConfig(
@@ -190,6 +217,13 @@ async def update_llm_config(
             updates.get("provider", record.provider),
             updates.get("config", record.config),
         )
+        # Bug-7108: validate base_url against the SSRF allowlist before
+        # persisting. Check the effective post-update value: if the caller
+        # sends base_url, validate that; otherwise the existing value is
+        # already stored (it was validated at create-time or pre-dates the
+        # guard — we do NOT retroactively reject untouched rows).
+        if "base_url" in updates:
+            _guard_base_url(updates["base_url"])
         if "api_key" in updates:
             record.encrypted_api_key = _encrypt_api_key(updates.pop("api_key"))
         for k, v in updates.items():

@@ -44,6 +44,7 @@ import { FrequencyPicker, RefreshRunHistory, cronToPreset, presetToCron } from "
 import SqlQueryEditor from "../Sql/SqlQueryEditor";
 
 type Mode = "create" | "edit";
+type TFn = (key: string, params?: Record<string, string>) => string;
 
 interface Props {
   open: boolean;
@@ -57,6 +58,16 @@ interface Props {
 }
 
 type TabKey = "query" | "schedule" | "advanced";
+
+
+/** R4 finding 7: prose for a validate-stage token; unknown tokens pass through. */
+function _stageLabel(stage: string | null | undefined, t: (k: string) => string): string {
+  if (!stage) return "";
+  const known = ["parse", "subset", "probe", "row_security"];
+  return known.includes(stage)
+    ? t(`pocketTables.drawer.stage.${stage}`)
+    : stage;
+}
 
 export default function PocketDrawer({
   open,
@@ -77,18 +88,20 @@ export default function PocketDrawer({
   const [definingSql, setDefiningSql] = useState<string>("");
 
   const [cron, setCron] = useState<string>("0 2 * * *");
-  const [enabled, setEnabled] = useState<boolean>(false);
+  // Bug-7002: default to enabled so a new schedule pocket is not inert.
+  const [enabled, setEnabled] = useState<boolean>(true);
   const [incrementalColumn, setIncrementalColumn] = useState<string>("");
   const [lookbackHours, setLookbackHours] = useState<number>(24);
   // F-005-21: refresh trigger — "schedule" (cron sweep) or "event"
   // (re-materialise when the source schema for the model drifts).
-  const [refreshPolicy, setRefreshPolicy] = useState<"schedule" | "event">("schedule");
-  const [initialRefreshPolicy, setInitialRefreshPolicy] = useState<"schedule" | "event">("schedule");
+  // Bug-7002: support "manual" pocket creation (no schedule at all).
+  const [refreshPolicy, setRefreshPolicy] = useState<"schedule" | "event" | "manual">("schedule");
+  const [initialRefreshPolicy, setInitialRefreshPolicy] = useState<"schedule" | "event" | "manual">("schedule");
 
   const [initialTargetId, setInitialTargetId] = useState<string>("");
   const [initialSql, setInitialSql] = useState<string>("");
   const [initialCron, setInitialCron] = useState<string>("0 2 * * *");
-  const [initialEnabled, setInitialEnabled] = useState<boolean>(false);
+  const [initialEnabled, setInitialEnabled] = useState<boolean>(true);
   const [initialIncrementalColumn, setInitialIncrementalColumn] = useState<string>("");
   const [initialLookbackHours, setInitialLookbackHours] = useState<number>(24);
 
@@ -104,8 +117,11 @@ export default function PocketDrawer({
     const nextSql = mode === "edit" && pocket ? pocket.defining_sql : (prefillSql ?? "");
     const nextIncCol = mode === "edit" && pocket ? (pocket.incremental_column ?? "") : "";
     const nextLookback = mode === "edit" && pocket ? (pocket.incremental_lookback_hours ?? 24) : 24;
-    const nextPolicy: "schedule" | "event" =
-      mode === "edit" && pocket && pocket.refresh_policy === "event" ? "event" : "schedule";
+    // Bug-7002: initialise to the pocket's persisted refresh_policy, including "manual".
+    const nextPolicy: "schedule" | "event" | "manual" =
+      mode === "edit" && pocket
+        ? (pocket.refresh_policy === "event" ? "event" : pocket.refresh_policy === "manual" ? "manual" : "schedule")
+        : "schedule";
     setTargetId(nextTarget);
     setDefiningSql(nextSql);
     setIncrementalColumn(nextIncCol);
@@ -172,22 +188,27 @@ export default function PocketDrawer({
       setSubmitError(null);
       setSubmitViolations(null);
       // F-005-21: an "event" pocket refreshes on source drift, not on a cron,
-      // so its schedule policy is disabled.
+      // so its schedule policy is disabled.  Bug-7002: "manual" pockets have
+      // no schedule at all.
       const isEvent = refreshPolicy === "event";
+      const isManual = refreshPolicy === "manual";
       if (mode === "create") {
+        // Bug-6998: include refresh_cron in the single create POST so the
+        // backend validates and provisions the schedule atomically. The
+        // former two-request flow (create then setPolicy) caused a race
+        // where the pocket existed without a schedule.
+        // Bug-7837: send refresh_policy_enabled so the backend honours the
+        // switch state atomically — no second setPolicy call needed.
         const payload: PocketCreate = {
           target_id: targetId,
           defining_sql: definingSql,
           refresh_policy: refreshPolicy,
+          refresh_cron: (isEvent || isManual) ? null : (cron || null),
+          refresh_policy_enabled: isManual ? false : (isEvent ? false : enabled),
           incremental_column: incrementalColumn || null,
           incremental_lookback_hours: incrementalColumn ? lookbackHours : null,
         };
-        const created = await pocketsApi.create(projectId, modelId, payload);
-        await pocketsApi.setPolicy(projectId, modelId, created.id, {
-          cron_expression: isEvent ? null : (cron || null),
-          is_enabled: isEvent ? false : enabled,
-        });
-        return created;
+        return pocketsApi.create(projectId, modelId, payload);
       }
       if (!pocket) throw new Error(t("pocket.noPocketError"));
       const sqlChanged = definingSql !== initialSql;
@@ -204,8 +225,8 @@ export default function PocketDrawer({
         await pocketsApi.update(projectId, modelId, pocket.id, patchBody);
       }
       await pocketsApi.setPolicy(projectId, modelId, pocket.id, {
-        cron_expression: isEvent ? null : (cron || null),
-        is_enabled: isEvent ? false : enabled,
+        cron_expression: (isEvent || isManual) ? null : (cron || null),
+        is_enabled: (isEvent || isManual) ? false : enabled,
       });
       return pocket;
     },
@@ -244,9 +265,10 @@ export default function PocketDrawer({
       cron !== initialCron ||
       enabled !== initialEnabled ||
       incrementalColumn !== initialIncrementalColumn ||
-      lookbackHours !== initialLookbackHours
+      lookbackHours !== initialLookbackHours ||
+      refreshPolicy !== initialRefreshPolicy
     );
-  }, [targetId, initialTargetId, definingSql, initialSql, cron, initialCron, enabled, initialEnabled, incrementalColumn, initialIncrementalColumn, lookbackHours, initialLookbackHours, saveMutation.isPending]);
+  }, [targetId, initialTargetId, definingSql, initialSql, cron, initialCron, enabled, initialEnabled, incrementalColumn, initialIncrementalColumn, lookbackHours, initialLookbackHours, refreshPolicy, initialRefreshPolicy, saveMutation.isPending]);
 
   async function handleClose() {
     if (!isDirty) {
@@ -318,7 +340,7 @@ export default function PocketDrawer({
 
             {isFailed && pocket?.failure_reason && (
               <Alert severity="error" variant="outlined" sx={{ py: 0.5 }}>
-                {t("pocketTables.drawer.failedValidation", { error: pocket.failure_reason })}
+                {t("pocketTables.drawer.failedValidation", { error: formatPocketFailureReason(t, pocket.failure_reason) })}
               </Alert>
             )}
 
@@ -349,9 +371,13 @@ export default function PocketDrawer({
                 }
                 onClose={() => setValidateResult(null)}
               >
+                {/* R4 finding 7: the API stage is an enum token; rendering it
+                    raw showed the modeller "failed at row_security". Map known
+                    tokens to prose, fall back to the token for an unknown one
+                    so a new stage degrades visibly rather than silently. */}
                 {validateResult.ok ? (
                   <>
-                    {t("pocketTables.drawer.validatedAt", { stage: validateResult.stage ?? "" })}
+                    {t("pocketTables.drawer.validatedAt", { stage: _stageLabel(validateResult.stage, t) })}
                     {validateResult.columns && validateResult.columns.length > 0 && (
                       <> {t("pocketTables.drawer.columns", { cols: validateResult.columns.join(", ") })}</>
                     )}
@@ -360,12 +386,12 @@ export default function PocketDrawer({
                 ) : validateResult.violations && validateResult.violations.length > 0 ? (
                   <>
                     <Box mb={0.5}>
-                      {t("pocketTables.drawer.failedAt", { stage: validateResult.stage ?? "" })}
+                      {t("pocketTables.drawer.failedAt", { stage: _stageLabel(validateResult.stage, t) })}
                     </Box>
-                    <ViolationList items={validateResult.violations} />
+                    <ViolationList items={validateResult.violations} t={t} />
                   </>
                 ) : (
-                  <>{t("pocketTables.drawer.failedAtWithError", { stage: validateResult.stage ?? "", error: validateResult.error ?? "" })}</>
+                  <>{t("pocketTables.drawer.failedAtWithError", { stage: _stageLabel(validateResult.stage, t), error: validateResult.error ?? "" })}</>
                 )}
               </Alert>
             )}
@@ -396,22 +422,28 @@ export default function PocketDrawer({
               size="small"
               fullWidth
               value={refreshPolicy}
-              onChange={(e) => setRefreshPolicy(e.target.value === "event" ? "event" : "schedule")}
+              onChange={(e) => {
+                const v = e.target.value;
+                setRefreshPolicy(v === "event" ? "event" : v === "manual" ? "manual" : "schedule");
+              }}
               helperText={
                 refreshPolicy === "event"
                   ? t("pocketTables.drawer.refreshTriggerEventHelp")
-                  : t("pocketTables.drawer.refreshTriggerScheduleHelp")
+                  : refreshPolicy === "manual"
+                    ? t("pocketTables.drawer.refreshTriggerManualHelp")
+                    : t("pocketTables.drawer.refreshTriggerScheduleHelp")
               }
             >
               <MenuItem value="schedule">{t("pocketTables.drawer.refreshTriggerSchedule")}</MenuItem>
               <MenuItem value="event">{t("pocketTables.drawer.refreshTriggerEvent")}</MenuItem>
+              <MenuItem value="manual">{t("pocketTables.drawer.refreshTriggerManual")}</MenuItem>
             </TextField>
             <FormControlLabel
               control={
                 <Switch
                   checked={enabled}
                   onChange={(_, v) => setEnabled(v)}
-                  disabled={refreshPolicy === "event"}
+                  disabled={refreshPolicy === "event" || refreshPolicy === "manual"}
                 />
               }
               label={t("pocketTables.drawer.enableScheduled")}
@@ -419,7 +451,7 @@ export default function PocketDrawer({
             <FrequencyPicker
               value={cronToPreset(cron)}
               onChange={(preset) => setCron(presetToCron(preset) ?? "")}
-              disabled={refreshPolicy === "event" || !enabled}
+              disabled={refreshPolicy === "event" || refreshPolicy === "manual" || !enabled}
             />
 
             <Typography variant="subtitle2" fontWeight={700} mt={2}>
@@ -466,7 +498,7 @@ export default function PocketDrawer({
 
         {tab === "advanced" && pocket && (
           <Stack spacing={1}>
-            <KV label={t("pocketTables.drawer.kvStatus")} value={pocket.status} />
+            <KV label={t("pocketTables.drawer.kvStatus")} value={pocketStatusLabel(t, pocket.status)} />
             <KV label={t("pocketTables.drawer.kvPhysicalTable")} value={pocket.physical_table_name} />
             <KV label={t("pocketTables.drawer.kvCreated")} value={new Date(pocket.created_at).toLocaleString()} />
             <KV
@@ -486,7 +518,7 @@ export default function PocketDrawer({
             {submitError}
           </Box>
           {submitViolations && submitViolations.length > 0 && (
-            <ViolationList items={submitViolations} />
+            <ViolationList items={submitViolations} t={t} />
           )}
         </Alert>
       )}
@@ -505,13 +537,13 @@ export default function PocketDrawer({
   );
 }
 
-function ViolationList({ items }: { items: PocketViolationItem[] }) {
+function ViolationList({ items, t }: { items: PocketViolationItem[]; t: TFn }) {
   return (
     <Box component="ul" sx={{ m: 0, pl: 2.5 }}>
       {items.map((v, i) => (
         <li key={`${v.code}-${i}`}>
           <Typography variant="body2" component="span">
-            <strong>{v.code}:</strong> {v.message}
+            <strong>{pocketViolationLabel(t, v.code)}:</strong> {v.message}
           </Typography>
           {v.suggestion && (
             <Typography variant="caption" component="div" color="text.secondary">
@@ -539,14 +571,43 @@ function extractError(err: unknown, tFn: (key: string) => string): string {
   return extractErrorAndViolations(err, tFn).message;
 }
 
-function extractErrorAndViolations(err: unknown, tFn: (key: string) => string): {
+/**
+ * Map an API failure onto the message (and violation list) the drawer shows.
+ *
+ * Exported for test: this is the contract that decides whether a user is told
+ * their SQL is wrong or that the check could not run (Bug-8162), and it is
+ * worth pinning directly rather than through the whole drawer.
+ */
+export function extractErrorAndViolations(err: unknown, tFn: (key: string) => string): {
   message: string;
   violations: PocketViolationItem[] | null;
 } {
+  // Bug-8162: a 503 means the query validator could not be reached, so the SQL
+  // was never judged. Rendering the server's prose here would read as a verdict
+  // on the user's SQL; it is not one.
+  const status = (err as { response?: { status?: number } })?.response?.status;
+  if (status === 503) {
+    return { message: tFn("errors.validatorUnavailable"), violations: null };
+  }
   const detail = (
     err as { response?: { data?: { detail?: unknown } } }
   )?.response?.data?.detail;
   if (detail && typeof detail === "object") {
+    // Bug-6998: Pydantic 422 responses return detail as an array of
+    // { loc, msg, type } objects. Render each as a violation-like entry
+    // so the user sees which field failed validation.
+    if (Array.isArray(detail)) {
+      const violations: PocketViolationItem[] = (detail as { loc?: unknown[]; msg?: string; type?: string }[]).map(
+        (entry) => ({
+          code: String(entry.type ?? "validation_error"),
+          message: `${(entry.loc ?? []).join(" > ")}: ${entry.msg ?? ""}`.trim(),
+        }),
+      );
+      return {
+        message: tFn("errors.validationFailed"),
+        violations: violations.length > 0 ? violations : null,
+      };
+    }
     const obj = detail as { message?: string; violations?: PocketViolationItem[] };
     if (Array.isArray(obj.violations)) {
       return {
@@ -560,3 +621,36 @@ function extractErrorAndViolations(err: unknown, tFn: (key: string) => string): 
   return { message: tFn("errors.requestFailed"), violations: null };
 }
 
+function pocketStatusLabel(t: TFn, status: string): string {
+  const key = `pocketTables.status.${status}`;
+  const translated = t(key);
+  return translated === key ? humanizeToken(status) : translated;
+}
+
+function pocketViolationLabel(t: TFn, code: string): string {
+  const key = `pocketTables.violation.${code}`;
+  const translated = t(key);
+  return translated === key ? humanizeToken(code) : translated;
+}
+
+function formatPocketFailureReason(t: TFn, reason: string): string {
+  return reason
+    .split(";")
+    .map((part) => {
+      const trimmed = part.trim();
+      const code = trimmed.match(/^([A-Z_]+):?/)?.[1];
+      if (!code) return trimmed;
+      const translated = pocketViolationLabel(t, code);
+      return trimmed.replace(code, translated);
+    })
+    .join("; ");
+}
+
+function humanizeToken(token: string): string {
+  return token
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
+    .replace(/^\w/, (c) => c.toUpperCase());
+}

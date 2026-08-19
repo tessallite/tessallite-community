@@ -29,12 +29,19 @@ import {
   schedulerApiClient,
 } from "../../api/client";
 import { useAggregates, useModel, usePersonas } from "../../api/hooks";
-import type { AggregateDefinition, AggregateROI, ModelUpdate } from "../../api/types";
+import type {
+  AggregateDefinition,
+  AggregateROI,
+  ModelUpdate,
+  RefreshPolicy,
+} from "../../api/types";
 import { useBuilderStore } from "../../store/builderStore";
+import { useCanAuthorModel } from "../../auth/useCanAuthorModel";
 import AggregateCard from "../Aggregates/AggregateCard";
 import PredictiveControls from "../Aggregates/PredictiveControls";
 import { FrequencyPicker, RebuildMethodPicker, cronToPreset, presetToCron } from "../Refresh";
 import type { RebuildMethod } from "../Refresh";
+import { buildAggregateRefreshPolicy } from "../Refresh/policyPayload";
 import AggregateDrawer from "./AggregateDrawer";
 import { useConfirm } from "../Confirm";
 
@@ -62,6 +69,8 @@ export default function AggregatesPanel() {
   const t = useT();
   const aggregateTab = useBuilderStore((s) => s.aggregateTab);
   const setAggregateTab = useBuilderStore((s) => s.setAggregateTab);
+  // F-026-04: gate every mutation entry point on the shared author capability.
+  const canEdit = useCanAuthorModel();
 
   const [tab, setTab] = useState<AggTab>(aggregateTab ?? "list");
   const [createOpen, setCreateOpen] = useState(false);
@@ -199,7 +208,7 @@ export default function AggregatesPanel() {
                 <Switch
                   checked={aggregationsEnabled}
                   onChange={(e) => toggleAggregations.mutate(e.target.checked)}
-                  disabled={toggleAggregations.isPending || !modelEnabled}
+                  disabled={!canEdit || toggleAggregations.isPending || !modelEnabled}
                   data-testid="agg-enable-toggle"
                 />
               }
@@ -212,7 +221,7 @@ export default function AggregatesPanel() {
                   onChange={(e) =>
                     updateModel.mutate({ include_all_measures: e.target.checked })
                   }
-                  disabled={updateModel.isPending || !modelEnabled || !aggregationsEnabled}
+                  disabled={!canEdit || updateModel.isPending || !modelEnabled || !aggregationsEnabled}
                   data-testid="include-all-measures-toggle"
                 />
               }
@@ -221,6 +230,7 @@ export default function AggregatesPanel() {
             />
           </Box>
 
+          {canEdit && (
           <Box display="flex" gap={1} mb={1.5}>
             <Box flexGrow={1} />
             <Button
@@ -234,6 +244,7 @@ export default function AggregatesPanel() {
               {t("aggregates.new")}
             </Button>
           </Box>
+          )}
 
           {!modelEnabled && (
             <Alert severity="info" sx={{ mb: 1 }}>
@@ -265,6 +276,7 @@ export default function AggregatesPanel() {
                   personaName={agg.persona_id ? personaNameById.get(agg.persona_id) : undefined}
                   onEdit={() => setEditAgg(agg)}
                   onDelete={() => handleDeleteAgg(agg)}
+                  canEdit={canEdit}
                 />
               ))}
             </Stack>
@@ -285,6 +297,7 @@ export default function AggregatesPanel() {
                 {t("aggregates.activeSummaries")} {activeAggCount}
               </Typography>
               <Stack direction="row" spacing={1}>
+                {canEdit && (
                 <Button
                   size="small"
                   variant="outlined"
@@ -301,6 +314,7 @@ export default function AggregatesPanel() {
                 >
                   {refreshingAll ? t("aggregates.rebuilding") : t("aggregates.rebuildAll")}
                 </Button>
+                )}
                 <Button
                   size="small"
                   variant="text"
@@ -326,7 +340,7 @@ export default function AggregatesPanel() {
 
       {/* ═══ Tab: Refresh ═══ */}
       {tab === "refresh" && (
-        <RefreshTab projectId={projectId!} modelId={modelId!} />
+        <RefreshTab projectId={projectId!} modelId={modelId!} canEdit={canEdit} />
       )}
 
       {/* ═══ Tab: Smart Builder ═══ */}
@@ -350,7 +364,7 @@ export default function AggregatesPanel() {
           </Typography>
           <PredictiveControls
             model={model.data}
-            disabled={updateModel.isPending || !modelEnabled}
+            disabled={!canEdit || updateModel.isPending || !modelEnabled}
             onSave={(patch) => updateModel.mutate(patch)}
           />
           <Box mt={2}>
@@ -371,7 +385,7 @@ export default function AggregatesPanel() {
               <Switch
                 checked={aggregationsEnabled}
                 onChange={(e) => toggleAggregations.mutate(e.target.checked)}
-                disabled={toggleAggregations.isPending || !modelEnabled}
+                disabled={!canEdit || toggleAggregations.isPending || !modelEnabled}
                 data-testid="agg-settings-enable-toggle"
               />
             }
@@ -429,7 +443,7 @@ export default function AggregatesPanel() {
 
 /* ─── Refresh Tab (per-aggregate schedule management) ─── */
 
-function RefreshTab({ projectId, modelId }: { projectId: string; modelId: string }) {
+export function RefreshTab({ projectId, modelId, canEdit }: { projectId: string; modelId: string; canEdit: boolean }) {
   const t = useT();
   const aggregates = useAggregates(projectId, modelId);
   const qc = useQueryClient();
@@ -437,37 +451,97 @@ function RefreshTab({ projectId, modelId }: { projectId: string; modelId: string
   const [feedback, setFeedback] = useState<string | null>(null);
   const activeAggs = aggregates.data?.filter((a) => a.status === "active") ?? [];
 
-  const [schedules, setSchedules] = useState<
-    Record<string, { preset: string; method: RebuildMethod; incrCol: string; lookback: number }>
-  >({});
+  // Bug-8785: the editor used to seed every row from a local daily/full/blank
+  // default and then POST every active aggregate on save, so an aggregate with a
+  // persisted incremental/append-only policy the user never opened was silently
+  // overwritten with defaults. Persisted policy is now hydrated, edits are
+  // tracked separately, and only edited rows are saved.
+  const aggIdsKey = activeAggs.map((a) => a.id).join(",");
+  const policies = useQuery({
+    queryKey: ["aggregate-refresh-policies", projectId, modelId, aggIdsKey],
+    enabled: activeAggs.length > 0,
+    queryFn: async () => {
+      const entries = await Promise.all(
+        activeAggs.map(async (a) => {
+          try {
+            return [a.id, await aggregatesApi.getPolicy(projectId, modelId, a.id)] as const;
+          } catch {
+            // 404 = no policy configured yet. Distinct from "policy is default":
+            // an unconfigured row must stay unconfigured unless the user edits it.
+            return [a.id, null] as const;
+          }
+        }),
+      );
+      return Object.fromEntries(entries) as Record<string, RefreshPolicy | null>;
+    },
+  });
 
-  function getSchedule(aggId: string) {
-    return schedules[aggId] ?? { preset: "daily_2am", method: "full" as RebuildMethod, incrCol: "", lookback: 1 };
+  type Schedule = {
+    preset: string;
+    method: RebuildMethod;
+    incrCol: string;
+    lookback: number;
+    fullInterval: number | null;
+  };
+  const UNCONFIGURED: Schedule = {
+    preset: "daily_2am",
+    method: "full",
+    incrCol: "",
+    lookback: 1,
+    fullInterval: null,
+  };
+
+  function fromPolicy(p: RefreshPolicy): Schedule {
+    const incremental = p.refresh_mode === "incremental";
+    return {
+      preset: cronToPreset(p.cron_expression),
+      method: incremental ? "incremental" : "full",
+      incrCol: p.incremental_column ?? "",
+      lookback: p.incremental_lookback ?? 1,
+      fullInterval: p.full_rebuild_interval_days,
+    };
   }
 
-  function updateSchedule(aggId: string, patch: Partial<typeof schedules[string]>) {
-    setSchedules((prev) => ({
-      ...prev,
-      [aggId]: { ...getSchedule(aggId), ...patch },
-    }));
+  // Only the fields the user actually touched. Never seeded from defaults, so a
+  // row the user never edited can never be written back.
+  const [edits, setEdits] = useState<Record<string, Partial<Schedule>>>({});
+
+  function persistedSchedule(aggId: string): Schedule {
+    const p = policies.data?.[aggId];
+    return p ? fromPolicy(p) : UNCONFIGURED;
   }
+
+  function getSchedule(aggId: string): Schedule {
+    return { ...persistedSchedule(aggId), ...edits[aggId] };
+  }
+
+  function updateSchedule(aggId: string, patch: Partial<Schedule>) {
+    setEdits((prev) => ({ ...prev, [aggId]: { ...prev[aggId], ...patch } }));
+  }
+
+  const dirtyIds = Object.keys(edits);
 
   async function handleSaveAll() {
     setSaving(true);
     setFeedback(null);
     let ok = 0;
     let failed = 0;
-    for (const agg of activeAggs) {
-      const s = getSchedule(agg.id);
+    for (const aggId of dirtyIds) {
+      const s = getSchedule(aggId);
       const cron = presetToCron(s.preset);
       try {
-        await aggregatesApi.setPolicy(projectId, modelId, agg.id, {
-          refresh_mode: cron ? "scheduled" : "manual",
-          cron_expression: cron,
-          incremental_column: s.method === "incremental" && s.incrCol ? s.incrCol : undefined,
-          incremental_lookback: s.method === "incremental" ? s.lookback : undefined,
-          is_enabled: !!cron,
-        });
+        await aggregatesApi.setPolicy(
+          projectId,
+          modelId,
+          aggId,
+          buildAggregateRefreshPolicy({
+            method: s.method,
+            cron,
+            incrementalColumn: s.incrCol,
+            lookbackDays: s.lookback,
+            fullRebuildIntervalDays: s.fullInterval,
+          }),
+        );
         ok++;
       } catch {
         failed++;
@@ -479,7 +553,9 @@ function RefreshTab({ projectId, modelId }: { projectId: string; modelId: string
         ? t("aggregates.refreshSaveSuccess", { count: String(ok) })
         : t("aggregates.refreshSavePartial", { ok: String(ok), failed: String(failed) }),
     );
+    if (failed === 0) setEdits({});
     qc.invalidateQueries({ queryKey: ["aggregates", projectId, modelId] });
+    qc.invalidateQueries({ queryKey: ["aggregate-refresh-policies", projectId, modelId] });
   }
 
   return (
@@ -524,6 +600,8 @@ function RefreshTab({ projectId, modelId }: { projectId: string; modelId: string
                     onIncrementalColumnChange={(col) => updateSchedule(agg.id, { incrCol: col })}
                     lookbackDays={s.lookback}
                     onLookbackChange={(d) => updateSchedule(agg.id, { lookback: d })}
+                    fullRebuildIntervalDays={s.fullInterval}
+                    onFullRebuildIntervalChange={(d) => updateSchedule(agg.id, { fullInterval: d })}
                   />
                 </Stack>
               </Box>
@@ -534,7 +612,7 @@ function RefreshTab({ projectId, modelId }: { projectId: string; modelId: string
             variant="contained"
             size="small"
             onClick={handleSaveAll}
-            disabled={saving}
+            disabled={!canEdit || saving || dirtyIds.length === 0}
             sx={{ alignSelf: "flex-start" }}
             data-testid="refresh-save-all"
           >

@@ -11,14 +11,14 @@ Tessallite exposes two connection protocols: a **PostgreSQL wire protocol** gate
 | Protocol | Port | Query language | Best for |
 |---|---|---|---|
 | **JDBC (PostgreSQL wire)** | 5433 | SQL | DBeaver, Tableau, Superset, pgAdmin, Python (psycopg2), any JDBC/ODBC client |
-| **XMLA/DAX** | 8080 | DAX, MDX | Excel PivotTable, Power BI |
+| **XMLA/DAX** | 8080 | DAX, MDX | Excel PivotTable |
 
 ## Compatibility matrix
 
 | Tool | Protocol | Connect | Browse schema | Query | Aggregates | Personas | Row security | Drill-through | Guide |
 |---|---|---|---|---|---|---|---|---|---|
 | **Microsoft Excel** | XMLA | Pass | Pass | Pass | Pass | Pass | Pass | Pass | [Guide](excel-xmla-connection-guide.md) |
-| **Power BI Desktop** | XMLA | Pass | Pass | Pass | Pass | Pass | Pass | N/A | [Guide](powerbi-connection-guide.md) |
+| **Power BI Desktop** | JDBC (PostgreSQL) | Pass | Pass | Pass | Pass | N/A | N/A | N/A | [Guide](powerbi-connection-guide.md) |
 | **DBeaver** | JDBC | Pass | Pass | Pass | Pass | N/A | N/A | N/A | [Guide](jdbc-connection-guide.md) |
 | **Tableau Desktop** | JDBC | Pass | Pass | Pass | Pass | N/A | N/A | N/A | [Guide](jdbc-connection-guide.md) |
 | **Apache Superset** | JDBC | Pass | Pass | Pass | Pass | N/A | N/A | N/A | [Guide](jdbc-connection-guide.md) |
@@ -50,12 +50,12 @@ Clients cannot bypass an applied rule by changing BI tools.
 
 ### Drill-through
 
-Drill-through (clicking a PivotTable cell to see the underlying detail rows) is supported in Excel via the XMLA endpoint. Power BI does not support XMLA drill-through natively. JDBC clients can achieve the same result by querying with the appropriate WHERE clause.
+Drill-through (clicking a PivotTable cell to see the underlying detail rows) is supported in Excel via the XMLA endpoint. JDBC clients, including Power BI over the PostgreSQL connector, can achieve the same result by querying with the appropriate WHERE clause.
 
 ## Choosing a protocol
 
 - **Excel users** should connect via XMLA. This gives full PivotTable functionality, persona support, row security, and drill-through.
-- **Power BI users** should connect via XMLA for the richest experience (measures, hierarchies, formatted values).
+- **Power BI users** should connect via the PostgreSQL connector on port 5433 in DirectQuery mode. Power BI Desktop's Analysis Services connector only supports Windows authentication, so it cannot use the XMLA endpoint; the PostgreSQL route keeps every query inside the Tessallite semantic layer.
 - **Tableau, Superset, DBeaver** and other SQL-based tools should connect via JDBC. They get SQL access to all published models with transparent aggregate routing.
 - **Looker Studio / Data Studio** uses its direct PostgreSQL route for relational reports and does not consume LookML. This route does not require `LOOKER_GATEWAY_ENABLED`.
 - **Optional Looker-hosted execution** uses generated LookML and the TLS JDBC gateway; enable `LOOKER_GATEWAY_ENABLED` only when a compatible Looker instance is available for controlled validation.

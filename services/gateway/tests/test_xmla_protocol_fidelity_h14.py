@@ -14,8 +14,7 @@ from src.dax.xmla_server import (
     _mdx_to_sql,
     _assert_where_members_applied,
     _collapse_flat_lne_rows,
-    _extract_label_filter_specs,
-    _label_filter_to_sql,
+    _translate_label_filter_calls,
 )
 
 
@@ -101,11 +100,11 @@ def test_label_filter_extracted_and_compiled():
         '{Filter([country].[country].Members, '
         'Left([country].[country].CurrentMember.Name, 1) = "N")}'
     )
-    specs = _extract_label_filter_specs(
-        axis, {"country"}, {}, {},
+    applied = _translate_label_filter_calls(
+        axis, {"country"}, {}, {}, quote_fn=lambda n: f'"{n}"',
     )
-    assert len(specs) == 1
-    sql = _label_filter_to_sql(specs[0], lambda n: f'"{n}"')
+    assert len(applied) == 1
+    sql = applied[0].sql_clause
     assert 'LOWER("country")' in sql
     assert "LIKE 'n%'" in sql
 
@@ -333,12 +332,12 @@ def _patch_flat_lne_model(
     """
 
     async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
-    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return measures
 
-    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id="", **kw):
         date_dim = {"name": "txn_date", "source_column_id": "col-date"}
         if with_time_unit:
             date_dim.update({
@@ -352,7 +351,7 @@ def _patch_flat_lne_model(
         ]
 
     async def fake_get_model_hierarchies(
-        model_id, tenant_slug, jwt_token, project_id="", include_details=True,
+        model_id, tenant_slug, jwt_token, project_id="", include_details=True, **kw,
     ):
         day_level = {
             "ordinal": 0,

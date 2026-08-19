@@ -217,7 +217,10 @@ async def test_sse_sync_blocked_answer_never_reaches_the_stream():
         yield db
 
     publisher = EventPublisher()
-    bundle = types.SimpleNamespace(system="sys")
+    bundle = types.SimpleNamespace(
+        system="sys", system_sections=[("## PROJECT CONTEXT", "sys")],
+        grounding_matches="",
+    )
 
     with (
         patch("src.api.conversations.get_tenant_db", _gen),
@@ -297,7 +300,11 @@ async def test_sse_sync_opaque_strips_reasoning_from_judged_event():
         patch("src.api.conversations.run_turn", AsyncMock(return_value=outcome)),
         patch("src.api.conversations.persist_turn", AsyncMock(return_value=turn)),
         patch("src.prompt.assembler.assemble_prompt",
-              AsyncMock(return_value=types.SimpleNamespace(system="sys"))),
+              AsyncMock(return_value=types.SimpleNamespace(
+                  system="sys",
+                  system_sections=[("## PROJECT CONTEXT", "sys")],
+                  grounding_matches="",
+              ))),
         patch("src.api.conversations.run_judge", AsyncMock(return_value=judge_outcome)),
         patch("src.api.conversations._prior_turns_for_judge", AsyncMock(return_value=[])),
         patch("src.api.conversations.record_turn_cost", AsyncMock()),
@@ -349,13 +356,25 @@ def _execution_stub():
     )
 
 
-async def _run_turn_with_mode(judge_mode: str):
+# Sentinel: pass to _run_turn_with_mode to build a cfg with NO judge_mode
+# attribute at all, exercising the run_turn missing-attribute fallback path.
+_ABSENT = object()
+
+
+async def _run_turn_with_mode(judge_mode):
     """Drive the real run_turn single-query branch with a live publisher
-    and return (emitted_events, narrate_stream_mock, narrate_mock)."""
+    and return (emitted_events, narrate_stream_mock, narrate_mock).
+
+    Pass ``_ABSENT`` to omit the ``judge_mode`` attribute entirely (tests the
+    run_turn fail-closed fallback); pass a string to set it explicitly."""
     from src.pipeline import run_turn
 
     model_uuid = uuid.uuid4()
-    cfg = _cfg("transparent", judge_mode=judge_mode)
+    cfg = _cfg("transparent")
+    if judge_mode is _ABSENT:
+        del cfg.judge_mode
+    else:
+        cfg.judge_mode = judge_mode
     cfg.chart_type_selector = "none"
     cfg.agent_output_format = "plain"
     cfg.max_query_complexity = 0
@@ -426,6 +445,137 @@ async def test_async_mode_still_streams_narration_tokens():
     narrate_stream.assert_called_once()
     narrate.assert_not_called()
     assert outcome.answer_text == SECRET_ANSWER
+
+
+# ---------------------------------------------------------------------------
+# F-023-29 / Bug-8148 — the DEFAULT judge mode is validated-first ("sync"):
+# an unvalidated answer must never be shown by default, and an explicit
+# "async" override must still stream pre-verdict.
+# Test escape: producer defaults + all missing-attribute fallbacks were "async",
+# so a new/attribute-less config exposed the answer before validation.
+# Guard: exact producer-default contract (ORM default + server_default), and all
+# THREE runtime fallbacks (_narration_publisher, run_turn _SyncVerdictGate wrap,
+# block._should_block) pinned individually to fall closed to "sync" when the
+# attribute is MISSING; each guard is proven to fail on a revert. (A present-but-
+# malformed stored value is normalised uniformly at ingress — intake
+# 2026-07-22-judge-mode-ingress-validation.md — not at each read gate, so the
+# gates key on == "sync" to stay coherent with the conversations.py delivery
+# boundary rather than diverging into a half-sync state.)
+# Tier: T1 (producer/consumer contract + security fail-closed).
+# ---------------------------------------------------------------------------
+
+
+def test_orm_default_judge_mode_is_validated_first():
+    """Producer contract: a ProjectAgentConfig with no explicit judge_mode
+    resolves to validated-first ("sync"), so the answer is validated before
+    it is shown."""
+    from shared.db.models import ProjectAgentConfig
+
+    col = ProjectAgentConfig.__table__.c.judge_mode
+    # Exact-match both defaults. NOTE: a substring check ("sync" in ...) is
+    # VACUOUS here because "async" contains "sync" — it would pass for a revert
+    # to 'async'. The server_default governs every row inserted outside the ORM
+    # (raw SQL, migration autogen comparison), so it must be pinned exactly.
+    assert col.default.arg == "sync"
+    assert str(col.server_default.arg).strip("'\"") == "sync"
+
+
+def test_pydantic_upsert_default_judge_mode_is_validated_first():
+    """Producer contract: creating an agent config without naming a mode
+    yields validated-first ("sync")."""
+    from src.api.agent_config import AgentConfigUpsert
+
+    assert AgentConfigUpsert().judge_mode == "sync"
+
+
+def test_narration_publisher_defaults_to_buffered_when_mode_absent():
+    """A config object missing judge_mode entirely must fall CLOSED to
+    validated-first: narration is buffered (no live publisher passthrough)."""
+    from src.pipeline import _narration_publisher
+
+    cfg_no_mode = types.SimpleNamespace()  # no judge_mode attribute at all
+    publisher = EventPublisher()
+    assert _narration_publisher(cfg_no_mode, publisher) is None
+
+
+def test_narration_publisher_streams_only_on_explicit_async():
+    """The explicit async override still streams pre-verdict."""
+    from src.pipeline import _narration_publisher
+
+    publisher = EventPublisher()
+    assert _narration_publisher(_cfg(judge_mode="async"), publisher) is publisher
+    assert _narration_publisher(_cfg(judge_mode="sync"), publisher) is None
+
+
+def test_should_block_fails_closed_when_mode_absent():
+    """block._should_block must withhold a non-vetted verdict for a config
+    missing judge_mode (default validated-first), not release it."""
+    from src.guardrails.block import _should_block
+
+    cfg_no_mode = types.SimpleNamespace(judge_block_visibility="transparent")
+    unknown = JudgeOutcome(
+        verdict="unknown", reasoning="judge could not run", metrics={},
+    )
+    assert _should_block(cfg_no_mode, unknown) is True
+
+
+@pytest.mark.asyncio
+async def test_default_mode_buffers_narration_no_tokens_before_verdict():
+    """End-to-end: a turn driven with NO judge_mode attribute (the run_turn
+    fail-closed fallback path) buffers narration exactly as explicit sync does
+    — no answer token leaves before the verdict."""
+    events, narrate_stream, narrate, outcome = await _run_turn_with_mode(_ABSENT)
+    narration_events = [e for e in events if e["event"] == "narration.delta"]
+    assert narration_events == []
+    narrate_stream.assert_not_called()
+    narrate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_turn_wraps_publisher_in_sync_gate_when_mode_absent():
+    """Pins the run_turn (pipeline.py:~1349) fail-closed fallback SPECIFICALLY:
+    a cfg missing judge_mode must still wrap the live publisher in the
+    _SyncVerdictGate pre-verdict allowlist. This gate protects the event types
+    _narration_publisher does not (thought.delta, compound first_row, combine
+    value), so it needs its own guard. Reverting the run_turn fallback to
+    "async" (or the gate condition to == "sync" with an "async" getattr
+    default) leaves an absent-attribute cfg UNWRAPPED and fails this test."""
+    import src.pipeline as pipeline
+
+    wrapped = {"count": 0}
+    real_gate = pipeline._SyncVerdictGate
+
+    class _SpyGate(real_gate):  # type: ignore[misc,valid-type]
+        def __init__(self, inner):
+            wrapped["count"] += 1
+            super().__init__(inner)
+
+    with patch.object(pipeline, "_SyncVerdictGate", _SpyGate):
+        await _run_turn_with_mode(_ABSENT)
+    assert wrapped["count"] == 1, (
+        "run_turn did not wrap the publisher in _SyncVerdictGate for a cfg "
+        "missing judge_mode — the pre-verdict gate fallback is not fail-closed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_turn_does_not_wrap_publisher_on_explicit_async():
+    """Complements the above: explicit async must NOT wrap the publisher, so
+    the spy proves the two branches are genuinely distinguished (not a
+    both-always-wrap false pass)."""
+    import src.pipeline as pipeline
+
+    wrapped = {"count": 0}
+    real_gate = pipeline._SyncVerdictGate
+
+    class _SpyGate(real_gate):  # type: ignore[misc,valid-type]
+        def __init__(self, inner):
+            wrapped["count"] += 1
+            super().__init__(inner)
+
+    with patch.object(pipeline, "_SyncVerdictGate", _SpyGate):
+        await _run_turn_with_mode("async")
+    assert wrapped["count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -739,7 +889,11 @@ async def _run_stream_with_webhooks(visibility: str, verdict: str):
         patch("src.api.conversations.run_turn", AsyncMock(return_value=outcome)),
         patch("src.api.conversations.persist_turn", AsyncMock(return_value=turn)),
         patch("src.prompt.assembler.assemble_prompt",
-              AsyncMock(return_value=types.SimpleNamespace(system="sys"))),
+              AsyncMock(return_value=types.SimpleNamespace(
+                  system="sys",
+                  system_sections=[("## PROJECT CONTEXT", "sys")],
+                  grounding_matches="",
+              ))),
         patch("src.api.conversations.run_judge", AsyncMock(return_value=judge_outcome)),
         patch("src.api.conversations._prior_turns_for_judge", AsyncMock(return_value=[])),
         patch("src.api.conversations.record_turn_cost", AsyncMock()),

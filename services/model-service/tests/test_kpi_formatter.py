@@ -79,6 +79,21 @@ class TestFormatValue:
         result = format_value(3.14, format_token="custom", format_custom="{invalid}")
         assert result.display == "3.14"
 
+    def test_custom_format_non_string_degrades_gracefully(self):
+        """Bug-7233: a malformed format_custom (non-string type) must not 500.
+
+        When format_custom is e.g. an integer or None-like object that lacks
+        .format(), the AttributeError/TypeError must be caught and the value
+        formatted with the decimal_2dp fallback.
+        """
+        result = format_value(42.5, format_token="custom", format_custom=12345)
+        assert result.display == "42.50"
+
+    def test_custom_format_bool_degrades_gracefully(self):
+        """Bug-7233: format_custom=True should not 500."""
+        result = format_value(7.0, format_token="custom", format_custom=True)
+        assert result.display == "7.00"
+
     def test_default_format(self):
         result = format_value(1234.567)
         assert result.display == "1,234.57"  # default is decimal_2dp
@@ -156,18 +171,25 @@ class TestFormatVariance:
         assert abs_var is not None
         assert abs_var.startswith("-")
 
-    def test_closer_is_better_any_deviation_negative(self):
-        """For closer_is_better, any distance from target is negative (bad)."""
-        abs_over, _ = format_variance(120, 100, direction="closer_is_better")
-        abs_under, _ = format_variance(80, 100, direction="closer_is_better")
-        assert abs_over is not None and abs_over.startswith("-")
-        assert abs_under is not None and abs_under.startswith("-")
+    def test_closer_is_better_any_deviation_neutral(self):
+        """F-017-07: closer_is_better has no beat/miss sign. A deviation in
+        either direction is shown as a neutral '±' magnitude (distance from
+        target), never a misleading minus on a green On Track card."""
+        abs_over, pct_over = format_variance(120, 100, direction="closer_is_better")
+        abs_under, pct_under = format_variance(80, 100, direction="closer_is_better")
+        assert abs_over is not None and abs_over.startswith("±")
+        assert abs_under is not None and abs_under.startswith("±")
+        assert not abs_over.startswith("-") and not abs_under.startswith("-")
+        # Equal distance either side of target formats identically.
+        assert abs_over == abs_under
+        assert pct_over == pct_under == "±20.0%"
 
     def test_closer_is_better_at_target_zero(self):
-        """At target, variance is zero."""
+        """At target, deviation is zero (±0)."""
         abs_var, _ = format_variance(100, 100, direction="closer_is_better")
         assert abs_var is not None
         assert "0" in abs_var
+        assert not abs_var.startswith("-")
 
 
 class TestLargeNumberSerialization:

@@ -162,30 +162,34 @@ export default function SavedQueriesPanel() {
                       <ContentCopyIcon fontSize="small" />
                     </IconButton>
                   </Tooltip>
-                  <Tooltip title={t("common.edit")}>
-                    <IconButton
-                      size="small"
-                      onClick={() => {
-                        setEditItem(q);
-                        setForm({
-                          name: q.name,
-                          description: q.description ?? "",
-                          query_text: q.query_text,
-                        });
-                      }}
-                    >
-                      <EditIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
-                  <Tooltip title={t("common.delete")}>
-                    <IconButton
-                      size="small"
-                      onClick={() => handleDelete(q)}
-                      disabled={deleteMutation.isPending}
-                    >
-                      <DeleteIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
+                  {q.can_edit !== false && (
+                    <Tooltip title={t("common.edit")}>
+                      <IconButton
+                        size="small"
+                        onClick={() => {
+                          setEditItem(q);
+                          setForm({
+                            name: q.name,
+                            description: q.description ?? "",
+                            query_text: q.query_text,
+                          });
+                        }}
+                      >
+                        <EditIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  )}
+                  {q.can_edit !== false && (
+                    <Tooltip title={t("common.delete")}>
+                      <IconButton
+                        size="small"
+                        onClick={() => handleDelete(q)}
+                        disabled={deleteMutation.isPending}
+                      >
+                        <DeleteIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  )}
                 </Stack>
               }
             >

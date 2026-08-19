@@ -119,11 +119,11 @@ In practice, three rounds of calibration are usually enough to get pass-rate abo
 
 ---
 
-## Choosing async vs sync mode
+## Choosing validated-first vs async mode
 
-*Async mode* is the default. The answer streams to the user; the judge runs in the background; the verdict appears later in the trace drawer and on the dashboard. User-visible latency is unchanged. Use this for internal tooling where you want the quality signal but the user is trusted.
+*Validated-first mode* is the default. The judge runs before the answer is delivered, so an unreviewed answer never reaches the reader. If the verdict is *fail* (or, in this mode, any verdict the judge could not clear) and *Judge block visibility* is set, the user sees a block message instead of the answer. Latency goes up by the judge call's wall time. This is the governed default: use it for external-facing surfaces and regulated domains where an unreviewed answer cannot leave the service.
 
-*Sync mode* runs the judge before the answer is delivered. If the verdict is *fail* and *Judge block visibility* is set, the user sees a block message instead of the answer. Latency goes up by the judge call's wall time. Use this for external-facing surfaces or for regulated domains where an unreviewed answer cannot leave the service.
+*Async mode* is the lower-assurance option. The answer streams to the user first; the judge runs in the background; the verdict appears later in the trace drawer and on the dashboard. User-visible latency is unchanged, but the reader can see a number before the judge has checked it. Use this only for internal tooling where the user is trusted and speed matters more than showing a pre-checked answer.
 
 Pick the cheapest, fastest LLM you can stomach for the judge — judging is a constrained task, and a 7B-class model is usually adequate.
 

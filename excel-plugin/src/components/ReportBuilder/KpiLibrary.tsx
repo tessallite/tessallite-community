@@ -1,8 +1,9 @@
 import { useMemo } from 'react';
-import { Box, Typography, Collapse, Skeleton } from '@mui/material';
+import { Box, Typography, Collapse, Skeleton, IconButton } from '@mui/material';
 import { ExpandLess, ExpandMore, Dashboard as DashboardIcon } from '@mui/icons-material';
 import { tokens } from '../../theme';
 import type { Kpi, Measure } from '../../types/tessallite';
+import { strings, templates } from '../../i18n/strings';
 import KpiCard, { type KpiInsertMode } from './KpiCard';
 
 interface KpiLibraryProps {
@@ -10,6 +11,7 @@ interface KpiLibraryProps {
   measures: Measure[];
   projectId: string;
   modelId: string;
+  personaId?: string | null;
   searchQuery: string;
   selectedKpiValueMeasureIds: string[];
   onToggleKpi: (kpi: Kpi) => void;
@@ -27,6 +29,7 @@ export default function KpiLibrary({
   measures,
   projectId,
   modelId,
+  personaId,
   searchQuery,
   selectedKpiValueMeasureIds,
   onToggleKpi,
@@ -76,24 +79,37 @@ export default function KpiLibrary({
         }}
       >
         <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-          KPIs ({kpis.length})
+          {templates.kpiLibrary.kpiCount(kpis.length)}
         </Typography>
+        {/* Bug-6708: was a clickable span with no role/tabIndex/key handling;
+            a real IconButton makes the scorecard insert keyboard-reachable. */}
         {onInsertScorecard && kpis.length > 0 && (
-          <Box
-            component="span"
+          <IconButton
+            size="small"
             onClick={(e: React.MouseEvent) => { e.stopPropagation(); onInsertScorecard(); }}
-            title="Insert KPI Scorecard"
+            title={strings.kpiLibrary.insertScorecard}
+            aria-label={strings.kpiLibrary.insertScorecard}
             sx={{
-              display: 'flex', alignItems: 'center', mr: 0.5,
-              p: '2px', borderRadius: 0.5, color: tokens.colorGoldDark,
+              width: 28, height: 28, mr: 0.5, color: tokens.colorGoldDark,
               '&:hover': { bgcolor: tokens.colorGoldBg },
             }}
           >
             <DashboardIcon sx={{ fontSize: 14 }} />
-          </Box>
+          </IconButton>
         )}
+        {/* Bug-6710: the header Box is a mouse-only convenience; this chevron
+            IconButton is the keyboard path to expand/collapse the section
+            (the cards inside the Collapse were unreachable without it). */}
         {(kpis.length > 0 || loading || searchQuery) && (
-          expanded ? <ExpandLess sx={{ fontSize: 16, color: tokens.colorTextSecondary }} /> : <ExpandMore sx={{ fontSize: 16, color: tokens.colorTextSecondary }} />
+          <IconButton
+            size="small"
+            onClick={(e) => { e.stopPropagation(); onToggleExpanded(); }}
+            aria-expanded={expanded}
+            aria-label={templates.library.toggleSectionAria(expanded, strings.library.kpisSection)}
+            sx={{ width: 24, height: 24, color: tokens.colorTextSecondary }}
+          >
+            {expanded ? <ExpandLess sx={{ fontSize: 16 }} /> : <ExpandMore sx={{ fontSize: 16 }} />}
+          </IconButton>
         )}
       </Box>
       <Collapse in={expanded}>
@@ -104,7 +120,7 @@ export default function KpiLibrary({
           </Box>
         ) : kpis.length === 0 ? (
           <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, px: 1.5, py: 1 }}>
-            {searchQuery ? 'No KPIs match your search' : 'No KPIs available'}
+            {searchQuery ? strings.kpiLibrary.noSearchMatch : strings.kpiLibrary.noKpisAvailable}
           </Typography>
         ) : (
           groupedKpis.map((group, gi) => (
@@ -124,6 +140,7 @@ export default function KpiLibrary({
                   measures={measures}
                   projectId={projectId}
                   modelId={modelId}
+                  personaId={personaId}
                   checked={kpi.value_measure_id ? selectedKpiValueMeasureIds.includes(kpi.value_measure_id) : false}
                   onToggle={() => onToggleKpi(kpi)}
                   onAddToValues={() => onAddKpiToValues(kpi)}

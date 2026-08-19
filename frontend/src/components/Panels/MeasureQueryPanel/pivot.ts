@@ -73,6 +73,11 @@ export function computePivot(
 ): PivotModel {
   const rowCols = rowDims.map((d) => d.name);
   const colCols = colDims.map((d) => d.name);
+  // Bug-6285: keep the business display names for the row-dimension headers
+  // alongside the technical names so headers/exports can show friendly labels
+  // while lookups stay keyed by name. (The column axis renders member values,
+  // not the column-dimension name, so it needs no display-label array.)
+  const rowLabels = rowDims.map((d) => d.display_name || d.name);
   const measureCol = measure.name;
   const allMeasureNames = [measure.name, ...extraMeasures.map((m) => m.name)];
 
@@ -125,7 +130,7 @@ export function computePivot(
       )
     : [[] as string[]];
 
-  return { rowCols, colCols, rowKeys, colKeys, byKey };
+  return { rowCols, colCols, rowLabels, rowKeys, colKeys, byKey };
 }
 
 export function cellLookupKey(rowKey: string[], colKey: string[]): string {

@@ -17,8 +17,6 @@ from src.drill.semantic_builder import (
     _clamp_limit,
     _hydrate_snapshot,
     build_drill_sql,
-    decode_cursor,
-    encode_cursor,
     resolve_drill_options,
 )
 
@@ -55,7 +53,14 @@ def _uda_measure(model_id=None, name="amount", default_agg="SUM", uda_id=None):
 
 
 def _model(slug="modely"):
-    return types.SimpleNamespace(id=_uuid(), slug=slug)
+    return types.SimpleNamespace(
+        id=_uuid(),
+        project_id=_uuid(),
+        slug=slug,
+        deployed_version_id=None,
+        deploy_epoch=0,
+        data_epoch=0,
+    )
 
 
 def _dimension(model_id, name, display_name=None, uda_id=None, col_id=None):
@@ -104,6 +109,9 @@ class FakeResult:
     def scalar_one_or_none(self):
         return self._items[0] if self._items else None
 
+    def all(self):
+        return self._items
+
 
 def _make_db(*, get_map=None, execute_results=None):
     """Build a fake AsyncSession with configurable get() and execute() responses."""
@@ -121,27 +129,6 @@ def _make_db(*, get_map=None, execute_results=None):
         db.execute = AsyncMock(return_value=FakeResult([]))
 
     return db
-
-
-# ---------------------------------------------------------------------------
-# encode_cursor / decode_cursor
-# ---------------------------------------------------------------------------
-
-
-def test_encode_decode_roundtrip():
-    for offset in (0, 1, 50, 999, 10_000):
-        assert decode_cursor(encode_cursor(offset)) == offset
-
-
-def test_decode_cursor_none_returns_zero():
-    assert decode_cursor(None) == 0
-    assert decode_cursor("") == 0
-
-
-def test_decode_cursor_invalid_raises():
-    with pytest.raises(DrillSemanticError) as exc:
-        decode_cursor("not-valid-base64!!")
-    assert exc.value.error_code == "INVALID_CURSOR"
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +219,7 @@ async def test_build_drill_sql_hierarchy_drill_down():
     (
         sql,
         model_id_str,
-        offset,
+        cursor_spec,
         limit,
         drill_dim,
         drill_mode,
@@ -260,10 +247,88 @@ async def test_build_drill_sql_hierarchy_drill_down():
     assert 'FROM "modely"' in sql
     assert '"business_date_year" = 2025' in sql
     assert "GROUP BY" in sql
-    assert offset == 0
+    assert cursor_spec.stable is True
     assert limit == 100
     assert len(drillable) == 1
     assert drillable[0].hierarchy_name == "business_date"
+
+
+def _drill_down_db(model_id, hier_id):
+    """Staged fake DB matching test_build_drill_sql_hierarchy_drill_down."""
+    year_uda_id = _uuid()
+    month_uda_id = _uuid()
+    measure = _measure(model_id=model_id, name="amount", default_agg="SUM")
+    model = _model(slug="modely")
+    year_dim = _dimension(model_id, "business_date_year", uda_id=year_uda_id)
+    month_dim = _dimension(model_id, "business_date_month", display_name="Month", uda_id=month_uda_id)
+    year_level = _level(hier_id, 0, "Year", year_uda_id)
+    month_level = _level(hier_id, 1, "Month", month_uda_id)
+    hier = _hierarchy(hier_id, model_id, "business_date")
+    db = _make_db(
+        get_map={("Measure", measure.id): measure, ("Model", model_id): model},
+        execute_results=[
+            [],                          # _load_curation
+            [year_dim],                  # _load_dimensions_by_name
+            [year_level],                # HierarchyLevel.where(key_attribute_id.in_)
+            [hier],                      # HierarchyDefinition.where(id.in_)
+            [year_level, month_level],   # all levels by hierarchy
+            [month_dim],                 # _resolve_level_dimension next level
+        ],
+    )
+    return db, measure
+
+
+# Bug-6277: an explicit hierarchy_id that is not drillable from the current
+# cell must fail loudly (HIERARCHY_NOT_DRILLABLE), never silently fall through
+# to leaf detail mode returning a different product than requested.
+async def test_build_drill_sql_non_drillable_hierarchy_id_raises():
+    model_id = _uuid()
+    hier_id = _uuid()
+    db, measure = _drill_down_db(model_id, hier_id)
+    with pytest.raises(DrillSemanticError) as exc:
+        await build_drill_sql(
+            measure_id=measure.id,
+            hierarchy_id=_uuid(),  # not the drillable hierarchy
+            grouping_levels=[{"column": "business_date_year", "value": 2025}],
+            limit=100,
+            db=db,
+        )
+    assert exc.value.error_code == "HIERARCHY_NOT_DRILLABLE"
+
+
+# Bug-6274 [SECURITY]: the persona allow-list filters the drillable set before
+# selection, so an explicitly-requested but non-allowed hierarchy cannot drill.
+async def test_build_drill_sql_allow_list_blocks_non_allowed_hierarchy():
+    model_id = _uuid()
+    hier_id = _uuid()
+    db, measure = _drill_down_db(model_id, hier_id)
+    with pytest.raises(DrillSemanticError) as exc:
+        await build_drill_sql(
+            measure_id=measure.id,
+            hierarchy_id=hier_id,                       # the real drillable hierarchy
+            grouping_levels=[{"column": "business_date_year", "value": 2025}],
+            limit=100,
+            db=db,
+            allowed_hierarchy_ids={str(_uuid())},        # but persona forbids it
+        )
+    assert exc.value.error_code == "HIERARCHY_NOT_DRILLABLE"
+
+
+async def test_build_drill_sql_allow_list_permits_allowed_hierarchy():
+    # Guard against over-block: an allowed hierarchy still drills.
+    model_id = _uuid()
+    hier_id = _uuid()
+    db, measure = _drill_down_db(model_id, hier_id)
+    _sql, _mid, _off, _lim, drill_dim, drill_mode, *_ = await build_drill_sql(
+        measure_id=measure.id,
+        hierarchy_id=None,
+        grouping_levels=[{"column": "business_date_year", "value": 2025}],
+        limit=100,
+        db=db,
+        allowed_hierarchy_ids={str(hier_id)},
+    )
+    assert drill_mode == "hierarchy"
+    assert drill_dim is not None
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +358,7 @@ async def test_build_drill_sql_leaf_level():
     (
         sql,
         model_id_str,
-        offset,
+        cursor_spec,
         limit,
         drill_dim,
         drill_mode,
@@ -448,13 +513,12 @@ async def test_build_drill_sql_null_value():
 # ---------------------------------------------------------------------------
 
 
-async def test_build_drill_sql_cursor_offset():
+async def test_build_drill_sql_uses_keyset_not_offset_on_first_page():
     model_id = _uuid()
     measure = _measure(model_id=model_id)
     model = _model(slug="modely")
     dim = _dimension(model_id, "region", col_id=_uuid())
 
-    cursor = encode_cursor(500)
     db = _make_db(
         get_map={
             ("Measure", measure.id): measure,
@@ -463,17 +527,17 @@ async def test_build_drill_sql_cursor_offset():
         execute_results=[[], [dim], []],
     )
 
-    sql, _, offset, limit, *_ = await build_drill_sql(
+    sql, _, cursor_spec, limit, *_ = await build_drill_sql(
         measure_id=measure.id,
         hierarchy_id=None,
         grouping_levels=[{"column": "region", "value": "US"}],
-        cursor=cursor,
+        cursor=None,
         limit=100,
         db=db,
     )
 
-    assert offset == 500
-    assert "OFFSET 500" in sql
+    assert cursor_spec.stable is False  # no PK-backed dimension in this fixture
+    assert "OFFSET" not in sql
     assert "LIMIT 101" in sql  # effective_limit + 1
 
 
@@ -944,6 +1008,10 @@ async def test_request_limit_overrides_curated_override():
 
 
 async def test_source_table_override_join_path_is_emitted_for_runtime_rewrite():
+    # F-019-01: a source-table override reached by a NON-expanding (many-to-one)
+    # join does NOT multiply the measure, so it is honoured and the join path is
+    # emitted for runtime rewrite. (The expanding case is rejected — see
+    # test_expanding_source_override_multiplying_measure_is_rejected.)
     model_id = _uuid()
     fact_table_id = _uuid()
     override_table_id = _uuid()
@@ -959,6 +1027,14 @@ async def test_source_table_override_join_path_is_emitted_for_runtime_rewrite():
         source_table_id=override_table_id,
         source_join_path=[str(join_id)],
     )
+    # many_to_one traversed FROM the fact table (fact=many, override=one): a
+    # lookup that does not duplicate the fact measure.
+    safe_join = types.SimpleNamespace(
+        id=join_id,
+        left_table_id=fact_table_id,
+        right_table_id=override_table_id,
+        join_type="many_to_one",
+    )
 
     db = _make_db(
         get_map={
@@ -971,8 +1047,9 @@ async def test_source_table_override_join_path_is_emitted_for_runtime_rewrite():
             ),
         },
         execute_results=[
-            [ds],
-            [],
+            [ds],           # _load_curation -> DrillThroughSet
+            [],             # tiebreaker
+            [safe_join],    # F-019-01 cardinality: resolve path joins (live)
             [_dimension(model_id, "region", col_id=_uuid())],
             [],
         ],
@@ -990,6 +1067,175 @@ async def test_source_table_override_join_path_is_emitted_for_runtime_rewrite():
     source_join_path = rest[-1]
     assert "tessallite_drill_join_path" not in sql
     assert source_join_path == [str(join_id)]
+
+
+async def test_expanding_source_override_multiplying_measure_is_rejected():
+    """F-019-01 (CRITICAL): a finer-grained source override reached by a
+    one-to-many join would repeat the parent fact measure on every child row,
+    so summing the projected measure multiplies the clicked cell. The builder
+    must refuse the configuration with a coded error rather than return a
+    non-reconciling detail set."""
+    model_id = _uuid()
+    fact_table_id = _uuid()
+    override_table_id = _uuid()
+    source_col_id = _uuid()
+    join_id = _uuid()
+    measure = _measure(
+        model_id=model_id, name="amount", source_column_id=source_col_id,
+    )
+    model = _model(slug="modely")
+    fact_table = types.SimpleNamespace(id=fact_table_id, physical_name="orders")
+    override_table = types.SimpleNamespace(id=override_table_id, physical_name="order_lines")
+    ds = _drill_set(
+        source_table_id=override_table_id,
+        source_join_path=[str(join_id)],
+    )
+    # one_to_many traversed FROM the fact table (fact=one, order_lines=many):
+    # each line repeats the order's amount -> SUM multiplies.
+    expanding_join = types.SimpleNamespace(
+        id=join_id,
+        left_table_id=fact_table_id,
+        right_table_id=override_table_id,
+        join_type="one_to_many",
+    )
+
+    db = _make_db(
+        get_map={
+            ("Measure", measure.id): measure,
+            ("Model", model_id): model,
+            ("ModelTable", override_table_id): override_table,
+            ("ModelTable", fact_table_id): fact_table,
+            ("ModelColumn", source_col_id): types.SimpleNamespace(
+                model_table_id=fact_table_id
+            ),
+        },
+        execute_results=[
+            [ds],               # _load_curation -> DrillThroughSet
+            [],                 # tiebreaker
+            [expanding_join],   # F-019-01 cardinality: resolve path joins (live)
+        ],
+    )
+
+    with pytest.raises(DrillSemanticError) as exc:
+        await build_drill_sql(
+            measure_id=measure.id,
+            hierarchy_id=None,
+            grouping_levels=[{"column": "region", "value": "EMEA"}],
+            cursor=None,
+            limit=None,
+            db=db,
+        )
+    assert exc.value.error_code == "DRILL_EXPANDING_OVERRIDE_MULTIPLIES_MEASURE"
+
+
+async def test_unresolvable_join_path_is_rejected():
+    """Opus-R1-F2: a saved source_join_path with stale/garbage join IDs that
+    don't resolve has unknowable cardinality. The guard rejects rather than
+    accepting an unknowable path (fail toward rejection, not wrong numbers)."""
+    model_id = _uuid()
+    fact_table_id = _uuid()
+    override_table_id = _uuid()
+    source_col_id = _uuid()
+    stale_join_id = _uuid()  # no join row for this ID exists
+    measure = _measure(
+        model_id=model_id, name="amount", source_column_id=source_col_id,
+    )
+    model = _model(slug="modely")
+    fact_table = types.SimpleNamespace(id=fact_table_id, physical_name="orders")
+    override_table = types.SimpleNamespace(id=override_table_id, physical_name="order_lines")
+    ds = _drill_set(
+        source_table_id=override_table_id,
+        source_join_path=[str(stale_join_id)],
+    )
+
+    db = _make_db(
+        get_map={
+            ("Measure", measure.id): measure,
+            ("Model", model_id): model,
+            ("ModelTable", override_table_id): override_table,
+            ("ModelTable", fact_table_id): fact_table,
+            ("ModelColumn", source_col_id): types.SimpleNamespace(
+                model_table_id=fact_table_id
+            ),
+        },
+        execute_results=[
+            [ds],   # _load_curation -> DrillThroughSet
+            [],     # tiebreaker
+            [],     # F-019-01 cardinality: resolve path joins (empty: stale ID)
+        ],
+    )
+
+    with pytest.raises(DrillSemanticError) as exc:
+        await build_drill_sql(
+            measure_id=measure.id,
+            hierarchy_id=None,
+            grouping_levels=[{"column": "region", "value": "EMEA"}],
+            cursor=None,
+            limit=None,
+            db=db,
+        )
+    assert exc.value.error_code == "DRILL_JOIN_PATH_UNRESOLVABLE"
+
+
+async def test_expanding_override_with_measure_on_leaf_table_is_allowed():
+    """F-019-01: the expanding-override guard fires only when the measure's
+    value column lives on the COARSER (fact) table. When the measure column is
+    physically on the override (leaf) table itself, each leaf row carries its
+    own detail value and the sum reconciles — so it is allowed."""
+    model_id = _uuid()
+    fact_table_id = _uuid()
+    override_table_id = _uuid()
+    source_col_id = _uuid()
+    join_id = _uuid()
+    # Measure's value column lives on the OVERRIDE (leaf) table.
+    measure = _measure(
+        model_id=model_id, name="line_amount", source_column_id=source_col_id,
+    )
+    model = _model(slug="modely")
+    fact_table = types.SimpleNamespace(id=fact_table_id, physical_name="orders")
+    override_table = types.SimpleNamespace(id=override_table_id, physical_name="order_lines")
+    ds = _drill_set(
+        source_table_id=override_table_id,
+        source_join_path=[str(join_id)],
+    )
+    expanding_join = types.SimpleNamespace(
+        id=join_id,
+        left_table_id=fact_table_id,
+        right_table_id=override_table_id,
+        join_type="one_to_many",
+    )
+
+    db = _make_db(
+        get_map={
+            ("Measure", measure.id): measure,
+            ("Model", model_id): model,
+            ("ModelTable", override_table_id): override_table,
+            ("ModelTable", fact_table_id): fact_table,
+            # Measure column is on the override (leaf) table.
+            ("ModelColumn", source_col_id): types.SimpleNamespace(
+                model_table_id=override_table_id
+            ),
+        },
+        execute_results=[
+            [ds],           # _load_curation -> DrillThroughSet
+            [],             # tiebreaker
+            [_dimension(model_id, "region", col_id=_uuid())],
+            [],
+        ],
+    )
+
+    # No _resolve_path_joins_live call happens because the measure column is on
+    # the override table (guard short-circuits before the cardinality query), so
+    # the build succeeds and emits the join path.
+    sql, *rest = await build_drill_sql(
+        measure_id=measure.id,
+        hierarchy_id=None,
+        grouping_levels=[{"column": "region", "value": "EMEA"}],
+        cursor=None,
+        limit=None,
+        db=db,
+    )
+    assert rest[-1] == [str(join_id)]
 
 
 async def test_source_table_override_without_join_path_is_rejected():
@@ -1126,7 +1372,7 @@ async def test_order_by_present_for_pagination_stability():
     )
 
     assert "ORDER BY" in sql
-    # ORDER BY must precede LIMIT/OFFSET so paging is stable.
+    # ORDER BY must precede LIMIT so the keyset boundary and result order agree.
     assert sql.index("ORDER BY") < sql.index("LIMIT")
 
 
@@ -1134,7 +1380,7 @@ async def test_leaf_order_by_is_total_order_not_constant_only():
     """Bug-1108: leaf ORDER BY must not be the constant cell coordinate only.
 
     The cell dimension value is constant across every contributing row, so an
-    ORDER BY over it alone is not a total order and LIMIT/OFFSET pages can
+    ORDER BY over it alone is not a total order and continuation pages can
     skip/duplicate on engines with non-stable scan order. The emitted ORDER BY
     must carry a tie-breaker tail (the un-aggregated measure value) so each row
     has a distinct ordering position.
@@ -1198,7 +1444,8 @@ async def test_leaf_order_by_appends_pk_dimension_tiebreaker():
         },
         execute_results=[
             [],            # _load_curation -> no DrillThroughSet
-            ["txn_id"],    # _resolve_pk_tiebreaker_dim -> PK dimension name
+            [(src_col_id, "txn_id_col", "txn_id")],
+            # _resolve_pk_tiebreaker_dims -> complete PK tuple
             [dim],         # _load_dimensions_by_name
             [],            # HierarchyLevel.where -> leaf
         ],
@@ -1216,9 +1463,116 @@ async def test_leaf_order_by_appends_pk_dimension_tiebreaker():
     # PK dimension is projected (transparency) and is the trailing unique key.
     assert '"txn_id"' in sql
     order_clause = sql[sql.index("ORDER BY"):sql.index("LIMIT")]
-    assert order_clause.rstrip().endswith('"txn_id"')
+    assert order_clause.rstrip().endswith('"txn_id" ASC NULLS LAST')
     assert '"account_type"' in order_clause
     assert '"amount"' in order_clause
+
+
+async def test_live_composite_pk_uses_full_tuple_for_repeated_first_component():
+    """R1 HIGH: a composite PK prefix is not unique; continuation must compare
+    the second component when adjacent rows repeat the first component."""
+    model_id = _uuid()
+    src_col_id = _uuid()
+    table_id = _uuid()
+    pk_a_id = _uuid()
+    pk_b_id = _uuid()
+    measure = _measure(
+        model_id=model_id, name="amount", source_column_id=src_col_id,
+    )
+    model = _model(slug="modely")
+    grouping_dim = _dimension(model_id, "account_type", col_id=_uuid())
+    src_col = types.SimpleNamespace(id=src_col_id, model_table_id=table_id)
+    src_table = types.SimpleNamespace(id=table_id, physical_name="demo.payment")
+
+    def make_db():
+        return _make_db(
+            get_map={
+                ("Measure", measure.id): measure,
+                ("Model", model_id): model,
+                ("ModelColumn", src_col_id): src_col,
+                ("ModelTable", table_id): src_table,
+            },
+            execute_results=[
+                [],
+                [
+                    (pk_a_id, "line_id", "line_key"),
+                    (pk_b_id, "tenant_id", "tenant_key"),
+                ],
+                [grouping_dim],
+                [],
+            ],
+        )
+
+    first_sql, _, spec, *_ = await build_drill_sql(
+        measure_id=measure.id,
+        hierarchy_id=None,
+        grouping_levels=[{"column": "account_type", "value": "WALLET"}],
+        cursor=None,
+        limit=2,
+        db=make_db(),
+    )
+    assert spec.stable is True
+    first_order = first_sql[first_sql.index("ORDER BY"):first_sql.index("LIMIT")]
+    assert first_order.index('"line_key"') < first_order.index('"tenant_key"')
+
+    token = spec.encode({
+        "account_type": "WALLET",
+        "amount": 10,
+        "line_key": 7,
+        "tenant_key": 41,
+    })
+    continued_sql, *_ = await build_drill_sql(
+        measure_id=measure.id,
+        hierarchy_id=None,
+        grouping_levels=[{"column": "account_type", "value": "WALLET"}],
+        cursor=token,
+        limit=2,
+        db=make_db(),
+    )
+    assert '"line_key" = 7' in continued_sql
+    assert '"tenant_key" > 41' in continued_sql
+
+
+async def test_live_composite_pk_missing_component_is_not_stable():
+    model_id = _uuid()
+    src_col_id = _uuid()
+    table_id = _uuid()
+    measure = _measure(
+        model_id=model_id, name="amount", source_column_id=src_col_id,
+    )
+    model = _model(slug="modely")
+    grouping_dim = _dimension(model_id, "account_type", col_id=_uuid())
+    db = _make_db(
+        get_map={
+            ("Measure", measure.id): measure,
+            ("Model", model_id): model,
+            ("ModelColumn", src_col_id): types.SimpleNamespace(
+                id=src_col_id, model_table_id=table_id,
+            ),
+            ("ModelTable", table_id): types.SimpleNamespace(
+                id=table_id, physical_name="demo.payment",
+            ),
+        },
+        execute_results=[
+            [],
+            [
+                (_uuid(), "line_id", "line_key"),
+                (_uuid(), "tenant_id", None),
+            ],
+            [grouping_dim],
+            [],
+        ],
+    )
+
+    _sql, _model_id, spec, *_ = await build_drill_sql(
+        measure_id=measure.id,
+        hierarchy_id=None,
+        grouping_levels=[{"column": "account_type", "value": "WALLET"}],
+        cursor=None,
+        limit=2,
+        db=db,
+    )
+    assert spec.stable is False
 
 
 async def test_leaf_order_by_without_pk_is_best_effort_not_total():
@@ -1257,43 +1611,6 @@ async def test_leaf_order_by_without_pk_is_best_effort_not_total():
     # The ORDER BY includes exactly the projection columns — no more, no less.
     # This is NOT a total order; it is the best the semantic path can achieve.
     # (If a PK dimension were modelled, it would appear as a trailing key.)
-
-
-def _rows_for_offset(order, offset, limit, total=23):
-    """Simulate an UNSTABLE-scan source: a deterministic SQL ORDER BY over a
-    UNIQUE key (txn_id 0..total-1) projected as paged windows. If the order
-    key were a constant, an unstable engine could return any window -- this
-    models the engine honouring a TOTAL order, which is exactly what the fix
-    guarantees by emitting one.
-    """
-    ordered = sorted(range(total), key=order)
-    return ordered[offset:offset + limit]
-
-
-async def test_leaf_pagination_disjoint_coverage_under_total_order():
-    """Disjoint-coverage proof: with a total-order key, consecutive LIMIT/
-    OFFSET pages are disjoint and their union is the full row set with no skip
-    or duplicate — the property F-019-04 promised. Simulated against an
-    unstable source by paging over a unique total-order key.
-    """
-    total = 23
-    page = 5
-    # Unique total-order key (txn_id); an unstable engine MUST still honour it.
-    key = lambda i: i  # noqa: E731
-    seen: list[int] = []
-    offset = 0
-    while offset < total:
-        rows = _rows_for_offset(key, offset, page, total=total)
-        if not rows:
-            break
-        # No overlap with previously returned rows.
-        assert not (set(rows) & set(seen)), f"duplicate at offset {offset}"
-        seen.extend(rows)
-        offset += page
-
-    # Union of all pages == full set, in order, no gaps, no dups.
-    assert seen == list(range(total))
-    assert len(seen) == len(set(seen)) == total
 
 
 # --- F-019-05: operators implemented (not silently equality) ----------------
@@ -1464,7 +1781,7 @@ async def test_drill_hierarchy_step_down_group_by_is_dimension_not_measure():
 
 def _snapshot(*, model_id, measures=None, dimensions=None,
               hierarchies=None, drill_through_sets=None,
-              columns=None, tables=None):
+              columns=None, tables=None, joins=None):
     """Build a minimal snapshot_json dict for testing."""
     return {
         "schema_version": 1,
@@ -1475,6 +1792,16 @@ def _snapshot(*, model_id, measures=None, dimensions=None,
         "drill_through_sets": drill_through_sets or [],
         "columns": columns or [],
         "tables": tables or [],
+        "joins": joins or [],
+    }
+
+
+def _snap_join(join_id, left_table_id, right_table_id, join_type="many_to_one"):
+    return {
+        "id": str(join_id),
+        "left_table_id": str(left_table_id),
+        "right_table_id": str(right_table_id),
+        "join_type": join_type,
     }
 
 
@@ -1879,3 +2206,630 @@ async def test_snapshot_pk_tiebreaker_resolved():
     assert '"txn_id"' in sql
     order_clause = sql[sql.index("ORDER BY"):sql.index("LIMIT")]
     assert '"txn_id"' in order_clause
+
+
+async def test_snapshot_composite_pk_continuation_uses_every_component():
+    """R1 HIGH snapshot parity: a repeated first PK component advances on the
+    second component rather than skipping or repeating the row."""
+    model_id = _uuid()
+    version_id = _uuid()
+    measure_id = _uuid()
+    src_col_id = _uuid()
+    pk_a_id = _uuid()
+    pk_b_id = _uuid()
+    table_id = _uuid()
+    grouping_col_id = _uuid()
+
+    snap_json = _snapshot(
+        model_id=model_id,
+        measures=[_snap_measure(
+            measure_id, model_id, "amount", source_column_id=src_col_id,
+        )],
+        dimensions=[
+            _snap_dimension(
+                _uuid(), model_id, "region", source_column_id=grouping_col_id,
+            ),
+            _snap_dimension(
+                _uuid(), model_id, "line_key", source_column_id=pk_a_id,
+            ),
+            _snap_dimension(
+                _uuid(), model_id, "tenant_key", source_column_id=pk_b_id,
+            ),
+        ],
+        columns=[
+            _snap_column(src_col_id, table_id, "amount_col"),
+            _snap_column(grouping_col_id, table_id, "region_col"),
+            _snap_column(pk_b_id, table_id, "tenant_id", is_primary_key=True),
+            _snap_column(pk_a_id, table_id, "line_id", is_primary_key=True),
+        ],
+        tables=[_snap_table(table_id, "payments")],
+    )
+    model = _model_with_version(slug="modely", deployed_version_id=version_id)
+    model.id = model_id
+    version = _model_version(version_id, model_id, snap_json)
+    live_measure = _measure(
+        model_id=model_id, name="amount", source_column_id=src_col_id,
+    )
+    live_measure.id = measure_id
+
+    def make_db():
+        return _make_snapshot_db(
+            get_map={
+                ("Measure", measure_id): live_measure,
+                ("Model", model_id): model,
+                ("ModelVersion", version_id): version,
+            },
+        )
+
+    sql, _, spec, *_ = await build_drill_sql(
+        measure_id=measure_id,
+        hierarchy_id=None,
+        grouping_levels=[{"column": "region", "value": "US"}],
+        cursor=None,
+        limit=2,
+        db=make_db(),
+    )
+    assert spec.stable is True
+    order_clause = sql[sql.index("ORDER BY"):sql.index("LIMIT")]
+    assert order_clause.index('"line_key"') < order_clause.index('"tenant_key"')
+
+    token = spec.encode({
+        "region": "US",
+        "amount": 10,
+        "line_key": 7,
+        "tenant_key": 41,
+    })
+    continued_sql, *_ = await build_drill_sql(
+        measure_id=measure_id,
+        hierarchy_id=None,
+        grouping_levels=[{"column": "region", "value": "US"}],
+        cursor=token,
+        limit=2,
+        db=make_db(),
+    )
+    assert '"line_key" = 7' in continued_sql
+    assert '"tenant_key" > 41' in continued_sql
+
+
+async def test_snapshot_composite_pk_missing_dimension_refuses_stability():
+    model_id = _uuid()
+    version_id = _uuid()
+    measure_id = _uuid()
+    src_col_id = _uuid()
+    pk_a_id = _uuid()
+    pk_b_id = _uuid()
+    table_id = _uuid()
+    region_col_id = _uuid()
+    snap_json = _snapshot(
+        model_id=model_id,
+        measures=[_snap_measure(
+            measure_id, model_id, "amount", source_column_id=src_col_id,
+        )],
+        dimensions=[
+            _snap_dimension(
+                _uuid(), model_id, "region", source_column_id=region_col_id,
+            ),
+            _snap_dimension(
+                _uuid(), model_id, "line_key", source_column_id=pk_a_id,
+            ),
+        ],
+        columns=[
+            _snap_column(src_col_id, table_id, "amount_col"),
+            _snap_column(region_col_id, table_id, "region_col"),
+            _snap_column(pk_a_id, table_id, "line_id", is_primary_key=True),
+            _snap_column(pk_b_id, table_id, "tenant_id", is_primary_key=True),
+        ],
+        tables=[_snap_table(table_id, "payments")],
+    )
+    model = _model_with_version(slug="modely", deployed_version_id=version_id)
+    model.id = model_id
+    version = _model_version(version_id, model_id, snap_json)
+    live_measure = _measure(
+        model_id=model_id, name="amount", source_column_id=src_col_id,
+    )
+    live_measure.id = measure_id
+    db = _make_snapshot_db(get_map={
+        ("Measure", measure_id): live_measure,
+        ("Model", model_id): model,
+        ("ModelVersion", version_id): version,
+    })
+
+    _sql, _model_id, spec, *_ = await build_drill_sql(
+        measure_id=measure_id,
+        hierarchy_id=None,
+        grouping_levels=[{"column": "region", "value": "US"}],
+        cursor=None,
+        limit=2,
+        db=db,
+    )
+    assert spec.stable is False
+
+
+# ===========================================================================
+# F-019-01 — expanding-override multiplication guard (snapshot path)
+# ===========================================================================
+
+
+def test_path_cardinality_reads_the_declared_cardinality_field():
+    """Join-orientation contract (invariant 3): the classification reads
+    ``Join.cardinality``, not the orientation field the two used to share.
+
+    A snapshot join carrying a real orientation token (everything the write
+    API has accepted since Bug-7775) used to classify as "mixed" whatever its
+    true fan-out was, so the expanding-override guard refused valid overrides.
+    A snapshot written before the split has no ``cardinality`` key at all, and
+    must keep falling back to the legacy token in ``join_type``.
+    """
+    from src.drill.semantic_builder import _path_cardinality_from
+
+    fact = _uuid()
+    dim = _uuid()
+
+    declared = types.SimpleNamespace(
+        left_table_id=fact, right_table_id=dim,
+        join_type="left", cardinality="many_to_one",
+    )
+    assert _path_cardinality_from(fact, [declared]) == "many-to-one"
+
+    undeclared = types.SimpleNamespace(
+        left_table_id=fact, right_table_id=dim,
+        join_type="left", cardinality=None,
+    )
+    assert _path_cardinality_from(fact, [undeclared]) == "mixed", (
+        "an undeclared fan-out is UNKNOWN, and an expanding hop repeats the "
+        "parent measure across child rows — the guard must stay closed"
+    )
+
+    legacy = types.SimpleNamespace(
+        left_table_id=fact, right_table_id=dim, join_type="many_to_one",
+    )
+    assert _path_cardinality_from(fact, [legacy]) == "many-to-one"
+
+
+def test_path_cardinality_from_classifies_expansion():
+    """Unit: _path_cardinality_from mirrors model-service cardinality — a
+    one-to-many hop FROM the fact table is 'one-to-many' (expanding)."""
+    from src.drill.semantic_builder import _path_cardinality_from
+
+    fact = _uuid()
+    lines = _uuid()
+    # Forward traversal fact->lines, one_to_many edge.
+    j_fwd = types.SimpleNamespace(
+        left_table_id=fact, right_table_id=lines, join_type="one_to_many",
+    )
+    assert _path_cardinality_from(fact, [j_fwd]) == "one-to-many"
+
+    # many_to_one lookup fact->dim: non-expanding.
+    dim = _uuid()
+    j_lookup = types.SimpleNamespace(
+        left_table_id=fact, right_table_id=dim, join_type="many_to_one",
+    )
+    assert _path_cardinality_from(fact, [j_lookup]) == "many-to-one"
+
+    # Reverse traversal inverts: a many_to_one edge stored lines->fact, but
+    # traversed FROM fact, becomes one-to-many (expanding).
+    j_rev = types.SimpleNamespace(
+        left_table_id=lines, right_table_id=fact, join_type="many_to_one",
+    )
+    assert _path_cardinality_from(fact, [j_rev]) == "one-to-many"
+
+    # Empty path: nothing to expand.
+    assert _path_cardinality_from(fact, []) == "none"
+
+    # Fable-R1-F1: multi-hop path in fact→override order (the reversed
+    # persisted path). Two hops: fact → mid (many_to_one) → lines
+    # (one_to_many). Mixed cardinality.
+    mid = _uuid()
+    j1 = types.SimpleNamespace(
+        left_table_id=fact, right_table_id=mid, join_type="many_to_one",
+    )
+    j2 = types.SimpleNamespace(
+        left_table_id=mid, right_table_id=lines, join_type="one_to_many",
+    )
+    assert _path_cardinality_from(fact, [j1, j2]) == "mixed"
+
+    # Two-hop all many_to_one (collapsing): safe.
+    dim2 = _uuid()
+    j3 = types.SimpleNamespace(
+        left_table_id=fact, right_table_id=mid, join_type="many_to_one",
+    )
+    j4 = types.SimpleNamespace(
+        left_table_id=mid, right_table_id=dim2, join_type="many_to_one",
+    )
+    assert _path_cardinality_from(fact, [j3, j4]) == "many-to-one"
+
+    # Two-hop all one_to_many (expanding): unsafe.
+    j5 = types.SimpleNamespace(
+        left_table_id=fact, right_table_id=mid, join_type="one_to_many",
+    )
+    j6 = types.SimpleNamespace(
+        left_table_id=mid, right_table_id=lines, join_type="one_to_many",
+    )
+    assert _path_cardinality_from(fact, [j5, j6]) == "one-to-many"
+
+
+async def test_snapshot_expanding_source_override_is_rejected():
+    """F-019-01: on the DEPLOYED (snapshot) path, an expanding one-to-many
+    source override that would multiply the parent fact measure is rejected."""
+    model_id = _uuid()
+    version_id = _uuid()
+    measure_id = _uuid()
+    src_col_id = _uuid()
+    dim_col_id = _uuid()
+    fact_table_id = _uuid()
+    override_table_id = _uuid()
+    join_id = _uuid()
+
+    snap_json = _snapshot(
+        model_id=model_id,
+        measures=[_snap_measure(measure_id, model_id, "amount",
+                                source_column_id=src_col_id)],
+        dimensions=[_snap_dimension(_uuid(), model_id, "region",
+                                    source_column_id=dim_col_id)],
+        columns=[
+            # Measure's value column lives on the FACT (coarser) table.
+            _snap_column(src_col_id, fact_table_id, "amount"),
+            _snap_column(dim_col_id, override_table_id, "region"),
+        ],
+        tables=[
+            _snap_table(fact_table_id, "orders"),
+            _snap_table(override_table_id, "order_lines"),
+        ],
+        drill_through_sets=[_snap_drill_set(
+            measure_id,
+            source_table_id=override_table_id,
+            source_join_path=[str(join_id)],
+        )],
+        joins=[_snap_join(join_id, fact_table_id, override_table_id, "one_to_many")],
+    )
+    model = _model_with_version(slug="modely", deployed_version_id=version_id)
+    model.id = model_id
+    version = _model_version(version_id, model_id, snap_json)
+
+    live_measure = _measure(model_id=model_id, name="amount")
+    live_measure.id = measure_id
+
+    db = _make_snapshot_db(
+        get_map={
+            ("Measure", measure_id): live_measure,
+            ("Model", model_id): model,
+            ("ModelVersion", version_id): version,
+        },
+    )
+
+    with pytest.raises(DrillSemanticError) as exc:
+        await build_drill_sql(
+            measure_id=measure_id,
+            hierarchy_id=None,
+            grouping_levels=[{"column": "region", "value": "US"}],
+            cursor=None,
+            limit=50,
+            db=db,
+        )
+    assert exc.value.error_code == "DRILL_EXPANDING_OVERRIDE_MULTIPLIES_MEASURE"
+
+
+async def test_snapshot_nonexpanding_source_override_is_allowed():
+    """F-019-01: a many-to-one (non-expanding) source override on the snapshot
+    path does not multiply the measure and is honoured."""
+    model_id = _uuid()
+    version_id = _uuid()
+    measure_id = _uuid()
+    src_col_id = _uuid()
+    dim_col_id = _uuid()
+    fact_table_id = _uuid()
+    override_table_id = _uuid()
+    join_id = _uuid()
+
+    snap_json = _snapshot(
+        model_id=model_id,
+        measures=[_snap_measure(measure_id, model_id, "amount",
+                                source_column_id=src_col_id)],
+        dimensions=[_snap_dimension(_uuid(), model_id, "region",
+                                    source_column_id=dim_col_id)],
+        columns=[
+            _snap_column(src_col_id, fact_table_id, "amount"),
+            _snap_column(dim_col_id, override_table_id, "region"),
+        ],
+        tables=[
+            _snap_table(fact_table_id, "orders"),
+            _snap_table(override_table_id, "customers"),
+        ],
+        drill_through_sets=[_snap_drill_set(
+            measure_id,
+            source_table_id=override_table_id,
+            source_join_path=[str(join_id)],
+        )],
+        joins=[_snap_join(join_id, fact_table_id, override_table_id, "many_to_one")],
+    )
+    model = _model_with_version(slug="modely", deployed_version_id=version_id)
+    model.id = model_id
+    version = _model_version(version_id, model_id, snap_json)
+
+    live_measure = _measure(model_id=model_id, name="amount")
+    live_measure.id = measure_id
+
+    db = _make_snapshot_db(
+        get_map={
+            ("Measure", measure_id): live_measure,
+            ("Model", model_id): model,
+            ("ModelVersion", version_id): version,
+        },
+    )
+
+    sql, *_ = await build_drill_sql(
+        measure_id=measure_id,
+        hierarchy_id=None,
+        grouping_levels=[{"column": "region", "value": "US"}],
+        cursor=None,
+        limit=50,
+        db=db,
+    )
+    # Build succeeds; leaf projection present.
+    assert 'FROM "modely"' in sql
+
+
+async def test_snapshot_unresolvable_join_path_is_rejected():
+    """Opus-R1-F2 (snapshot path): a saved source_join_path with stale join
+    IDs that don't exist in the snapshot is rejected (unknowable cardinality)."""
+    model_id = _uuid()
+    version_id = _uuid()
+    measure_id = _uuid()
+    src_col_id = _uuid()
+    dim_col_id = _uuid()
+    fact_table_id = _uuid()
+    override_table_id = _uuid()
+    stale_join_id = _uuid()  # no join with this ID in the snapshot
+
+    snap_json = _snapshot(
+        model_id=model_id,
+        measures=[_snap_measure(measure_id, model_id, "amount",
+                                source_column_id=src_col_id)],
+        dimensions=[_snap_dimension(_uuid(), model_id, "region",
+                                    source_column_id=dim_col_id)],
+        columns=[
+            _snap_column(src_col_id, fact_table_id, "amount"),
+            _snap_column(dim_col_id, override_table_id, "region"),
+        ],
+        tables=[
+            _snap_table(fact_table_id, "orders"),
+            _snap_table(override_table_id, "order_lines"),
+        ],
+        drill_through_sets=[_snap_drill_set(
+            measure_id,
+            source_table_id=override_table_id,
+            source_join_path=[str(stale_join_id)],
+        )],
+        joins=[],  # no join rows — the saved ID is stale
+    )
+    model = _model_with_version(slug="modely", deployed_version_id=version_id)
+    model.id = model_id
+    version = _model_version(version_id, model_id, snap_json)
+
+    live_measure = _measure(model_id=model_id, name="amount")
+    live_measure.id = measure_id
+
+    db = _make_snapshot_db(
+        get_map={
+            ("Measure", measure_id): live_measure,
+            ("Model", model_id): model,
+            ("ModelVersion", version_id): version,
+        },
+    )
+
+    with pytest.raises(DrillSemanticError) as exc:
+        await build_drill_sql(
+            measure_id=measure_id,
+            hierarchy_id=None,
+            grouping_levels=[{"column": "region", "value": "US"}],
+            cursor=None,
+            limit=50,
+            db=db,
+        )
+    assert exc.value.error_code == "DRILL_JOIN_PATH_UNRESOLVABLE"
+
+
+async def test_snapshot_multihop_expanding_override_in_persisted_order_is_rejected():
+    """Fable-R1-F1: a 2-hop expanding path in persisted (override->fact) order
+    must be correctly classified after reversal. The persisted order is
+    lines->mid->fact, which reversed is fact->mid->lines. If fact->mid is
+    many_to_one and mid->lines is one_to_many, the path expands and must be
+    rejected."""
+    model_id = _uuid()
+    version_id = _uuid()
+    measure_id = _uuid()
+    src_col_id = _uuid()
+    dim_col_id = _uuid()
+    fact_table_id = _uuid()
+    mid_table_id = _uuid()
+    override_table_id = _uuid()
+    join1_id = _uuid()
+    join2_id = _uuid()
+
+    # Persisted order: override->mid->fact. Join1: lines->mid (many_to_one).
+    # Join2: mid->fact (many_to_one). Reversed from fact: fact->mid
+    # (one_to_many) -> lines (one_to_many) -> expanding.
+    snap_json = _snapshot(
+        model_id=model_id,
+        measures=[_snap_measure(measure_id, model_id, "amount",
+                                source_column_id=src_col_id)],
+        dimensions=[_snap_dimension(_uuid(), model_id, "region",
+                                    source_column_id=dim_col_id)],
+        columns=[
+            _snap_column(src_col_id, fact_table_id, "amount"),
+            _snap_column(dim_col_id, override_table_id, "region"),
+        ],
+        tables=[
+            _snap_table(fact_table_id, "orders"),
+            _snap_table(mid_table_id, "intermediate"),
+            _snap_table(override_table_id, "order_lines"),
+        ],
+        drill_through_sets=[_snap_drill_set(
+            measure_id,
+            source_table_id=override_table_id,
+            # Persisted order: override(lines) -> mid -> fact
+            source_join_path=[str(join1_id), str(join2_id)],
+        )],
+        joins=[
+            # lines -> mid: many_to_one (from override perspective)
+            _snap_join(join1_id, override_table_id, mid_table_id, "many_to_one"),
+            # mid -> fact: many_to_one (from override perspective)
+            _snap_join(join2_id, mid_table_id, fact_table_id, "many_to_one"),
+        ],
+    )
+    model = _model_with_version(slug="modely", deployed_version_id=version_id)
+    model.id = model_id
+    version = _model_version(version_id, model_id, snap_json)
+
+    live_measure = _measure(model_id=model_id, name="amount")
+    live_measure.id = measure_id
+
+    db = _make_snapshot_db(
+        get_map={
+            ("Measure", measure_id): live_measure,
+            ("Model", model_id): model,
+            ("ModelVersion", version_id): version,
+        },
+    )
+
+    with pytest.raises(DrillSemanticError) as exc:
+        await build_drill_sql(
+            measure_id=measure_id,
+            hierarchy_id=None,
+            grouping_levels=[{"column": "region", "value": "US"}],
+            cursor=None,
+            limit=50,
+            db=db,
+        )
+    assert exc.value.error_code == "DRILL_EXPANDING_OVERRIDE_MULTIPLIES_MEASURE"
+
+
+async def test_snapshot_multihop_nonexpanding_override_is_allowed():
+    """Fable-R1-F1: a 2-hop non-expanding path in persisted order must be
+    correctly classified after reversal and allowed."""
+    model_id = _uuid()
+    version_id = _uuid()
+    measure_id = _uuid()
+    src_col_id = _uuid()
+    dim_col_id = _uuid()
+    fact_table_id = _uuid()
+    mid_table_id = _uuid()
+    override_table_id = _uuid()
+    join1_id = _uuid()
+    join2_id = _uuid()
+
+    # Persisted order: override->mid->fact. Join1: customers->mid
+    # (one_to_many). Join2: mid->fact (one_to_many). Reversed from fact:
+    # fact->mid (many_to_one) -> customers (many_to_one) -> collapsing (safe).
+    snap_json = _snapshot(
+        model_id=model_id,
+        measures=[_snap_measure(measure_id, model_id, "amount",
+                                source_column_id=src_col_id)],
+        dimensions=[_snap_dimension(_uuid(), model_id, "region",
+                                    source_column_id=dim_col_id)],
+        columns=[
+            _snap_column(src_col_id, fact_table_id, "amount"),
+            _snap_column(dim_col_id, override_table_id, "region"),
+        ],
+        tables=[
+            _snap_table(fact_table_id, "orders"),
+            _snap_table(mid_table_id, "intermediate"),
+            _snap_table(override_table_id, "customers"),
+        ],
+        drill_through_sets=[_snap_drill_set(
+            measure_id,
+            source_table_id=override_table_id,
+            source_join_path=[str(join1_id), str(join2_id)],
+        )],
+        joins=[
+            _snap_join(join1_id, override_table_id, mid_table_id, "one_to_many"),
+            _snap_join(join2_id, mid_table_id, fact_table_id, "one_to_many"),
+        ],
+    )
+    model = _model_with_version(slug="modely", deployed_version_id=version_id)
+    model.id = model_id
+    version = _model_version(version_id, model_id, snap_json)
+
+    live_measure = _measure(model_id=model_id, name="amount")
+    live_measure.id = measure_id
+
+    db = _make_snapshot_db(
+        get_map={
+            ("Measure", measure_id): live_measure,
+            ("Model", model_id): model,
+            ("ModelVersion", version_id): version,
+        },
+    )
+
+    sql, *_ = await build_drill_sql(
+        measure_id=measure_id,
+        hierarchy_id=None,
+        grouping_levels=[{"column": "region", "value": "US"}],
+        cursor=None,
+        limit=50,
+        db=db,
+    )
+    assert 'FROM "modely"' in sql
+
+
+async def test_snapshot_uda_measure_with_override_fails_closed():
+    """Fable-R1-F2: a UDA-backed measure on the deployed-snapshot path has
+    intrinsic_table = None (snapshot doesn't embed UDA table IDs). When a
+    source-table override with a join path is present, the guard cannot verify
+    cardinality and must fail closed rather than silently accept an unknowable
+    expanding path."""
+    model_id = _uuid()
+    version_id = _uuid()
+    measure_id = _uuid()
+    uda_id = _uuid()
+    dim_col_id = _uuid()
+    fact_table_id = _uuid()
+    override_table_id = _uuid()
+    join_id = _uuid()
+
+    snap_json = _snapshot(
+        model_id=model_id,
+        measures=[_snap_measure(measure_id, model_id, "amount",
+                                uda_id=uda_id)],  # UDA measure, no source_column_id
+        dimensions=[_snap_dimension(_uuid(), model_id, "region",
+                                    source_column_id=dim_col_id)],
+        columns=[
+            _snap_column(dim_col_id, override_table_id, "region"),
+        ],
+        tables=[
+            _snap_table(fact_table_id, "orders"),
+            _snap_table(override_table_id, "order_lines"),
+        ],
+        drill_through_sets=[_snap_drill_set(
+            measure_id,
+            source_table_id=override_table_id,
+            source_join_path=[str(join_id)],
+        )],
+        joins=[_snap_join(join_id, fact_table_id, override_table_id, "one_to_many")],
+    )
+    model = _model_with_version(slug="modely", deployed_version_id=version_id)
+    model.id = model_id
+    version = _model_version(version_id, model_id, snap_json)
+
+    # UDA measure -- no source_column_id -> snapshot intrinsic table is None.
+    live_measure = _uda_measure(model_id=model_id, name="amount", uda_id=uda_id)
+    live_measure.id = measure_id
+
+    db = _make_snapshot_db(
+        get_map={
+            ("Measure", measure_id): live_measure,
+            ("Model", model_id): model,
+            ("ModelVersion", version_id): version,
+        },
+    )
+
+    with pytest.raises(DrillSemanticError) as exc:
+        await build_drill_sql(
+            measure_id=measure_id,
+            hierarchy_id=None,
+            grouping_levels=[{"column": "region", "value": "US"}],
+            cursor=None,
+            limit=50,
+            db=db,
+        )
+    assert exc.value.error_code == "DRILL_INTRINSIC_TABLE_UNRESOLVABLE"

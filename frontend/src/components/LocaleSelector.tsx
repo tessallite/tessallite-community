@@ -1,21 +1,41 @@
 import { useState } from "react";
-import { IconButton, Menu, MenuItem, Tooltip } from "@mui/material";
+import {
+  IconButton,
+  ListSubheader,
+  Menu,
+  MenuItem,
+  Tooltip,
+  Typography,
+} from "@mui/material";
 import LanguageIcon from "@mui/icons-material/Language";
 import { useBuilderStore } from "../store/builderStore";
 import { useT } from "../i18n";
 
-const LOCALES = [
+/**
+ * Bug-7542: only English is a complete, fully-tested locale. The seven
+ * parked locales use English-fallback for many keys and have not completed
+ * their translation pass. They are offered under a "Preview" section so
+ * users know they are incomplete but can still try them.
+ */
+
+interface LocaleEntry {
+  code: string;
+  labelKey: string;
+}
+
+const SUPPORTED_LOCALES: LocaleEntry[] = [
   { code: "en", labelKey: "i18n.en" },
+];
+
+const PREVIEW_LOCALES: LocaleEntry[] = [
   { code: "ar", labelKey: "i18n.ar" },
-  { code: "fr", labelKey: "i18n.fr" },
   { code: "de", labelKey: "i18n.de" },
   { code: "es", labelKey: "i18n.es" },
+  { code: "fr", labelKey: "i18n.fr" },
   { code: "ja", labelKey: "i18n.ja" },
   { code: "pt", labelKey: "i18n.pt" },
   { code: "zh", labelKey: "i18n.zh" },
 ];
-
-const STORAGE_KEY = "user_language_preference";
 
 export default function LocaleSelector() {
   const t = useT();
@@ -26,9 +46,22 @@ export default function LocaleSelector() {
   const currentCode = displayLocale ? displayLocale.split("-")[0] : "en";
 
   function handleSelect(code: string) {
+    // Use a single storage key (display_locale) via the builder store.
+    // English is represented as null (base/default state).
     setDisplayLocale(code === "en" ? null : code);
-    localStorage.setItem(STORAGE_KEY, code);
     setAnchorEl(null);
+  }
+
+  function renderItem(l: LocaleEntry) {
+    return (
+      <MenuItem
+        key={l.code}
+        selected={l.code === currentCode}
+        onClick={() => handleSelect(l.code)}
+      >
+        {t(l.labelKey)}
+      </MenuItem>
+    );
   }
 
   return (
@@ -50,15 +83,13 @@ export default function LocaleSelector() {
         anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
         transformOrigin={{ vertical: "top", horizontal: "right" }}
       >
-        {LOCALES.map((l) => (
-          <MenuItem
-            key={l.code}
-            selected={l.code === currentCode}
-            onClick={() => handleSelect(l.code)}
-          >
-            {t(l.labelKey)}
-          </MenuItem>
-        ))}
+        {SUPPORTED_LOCALES.map(renderItem)}
+        <ListSubheader sx={{ lineHeight: "32px", fontSize: 11 }}>
+          <Typography variant="caption" color="text.secondary">
+            {t("i18n.previewLocales")}
+          </Typography>
+        </ListSubheader>
+        {PREVIEW_LOCALES.map(renderItem)}
       </Menu>
     </>
   );

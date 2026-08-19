@@ -65,4 +65,4 @@ The bootstrap action proposes glossary entries from the model's dimensions, meas
 
 ---
 
-← [Dimension Aliases](dimension-aliases.md) | [Home](../index.md) | [Define Measures →](define-measures.md)
+← [Dimension Attribute Relationships](dimension-attribute-relationships.md) | [Home](../index.md) | [Define Measures →](define-measures.md)

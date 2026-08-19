@@ -234,6 +234,9 @@ export default function Connections() {
               <MenuItem value="postgresql">{t("connections.connectionTypePostgresql")}</MenuItem>
               <MenuItem value="bigquery">{t("connections.connectionTypeBigquery")}</MenuItem>
               <MenuItem value="hadoop_spark">{t("connections.connectionTypeHadoopSpark")}</MenuItem>
+              <MenuItem value="redshift">{t("connections.connectionTypeRedshift")}</MenuItem>
+              <MenuItem value="snowflake">{t("connections.connectionTypeSnowflake")}</MenuItem>
+              <MenuItem value="sqlserver">{t("connections.connectionTypeSqlserver")}</MenuItem>
             </Select>
           </FormControl>
 

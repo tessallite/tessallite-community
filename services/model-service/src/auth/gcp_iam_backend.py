@@ -12,6 +12,7 @@ Flow:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -27,13 +28,49 @@ except ImportError:
     _google_id_token = None  # type: ignore[assignment]
     _google_requests = None  # type: ignore[assignment]
 
+# Bug-7324: hard ceiling on the time a single Google certificate fetch
+# may block.  Applied inside the thread wrapper so a stalled network
+# call cannot pin the worker indefinitely.
+_VERIFY_TIMEOUT_SECONDS = 10.0
 
-def _verify_token(token: str, audience: str) -> dict | None:
+
+class _TimeoutBoundRequest:
+    """Wrapper around ``google.auth.transport.requests.Request`` that forces
+    a network-level timeout on every HTTP call (AUTH-RR-04).
+
+    The default google-auth transport uses ``timeout=120`` inside its
+    ``__call__``; this wrapper overrides that so the thread terminates
+    promptly on network hangs rather than relying solely on the outer
+    ``asyncio.wait_for`` (which cannot cancel a running synchronous
+    thread).
+    """
+
+    def __init__(self, timeout: float) -> None:
+        self._inner = _google_requests.Request()
+        self._timeout = timeout
+
+    def __call__(self, url, method="GET", body=None, headers=None,
+                 timeout=None, **kwargs):
+        return self._inner(
+            url, method=method, body=body, headers=headers,
+            timeout=self._timeout, **kwargs,
+        )
+
+
+def _verify_token_sync(token: str, audience: str) -> dict | None:
+    """Synchronous token verification -- runs inside a thread (Bug-7324).
+
+    Uses a transport-level timeout on every underlying HTTP call so a
+    stalled certificate fetch terminates the thread itself rather than
+    relying solely on the outer asyncio ``wait_for`` cancellation
+    (AUTH-RR-04: asyncio cancel cannot stop a running synchronous thread).
+    """
     if _google_id_token is None or _google_requests is None:
         logger.error("google-auth package not installed")
         return None
+    transport = _TimeoutBoundRequest(timeout=_VERIFY_TIMEOUT_SECONDS)
     return _google_id_token.verify_oauth2_token(
-        token, _google_requests.Request(), audience,
+        token, transport, audience,
     )
 
 
@@ -57,7 +94,20 @@ class GcpIamAuthBackend:
             return None
 
         try:
-            claims = _verify_token(password, self._audience)
+            # Bug-7324: run the synchronous Google SDK verification in a
+            # thread so it does not block the FastAPI event loop.  A slow
+            # certificate fetch would otherwise stall all concurrent
+            # requests handled by the same worker.
+            claims = await asyncio.wait_for(
+                asyncio.to_thread(_verify_token_sync, password, self._audience),
+                timeout=_VERIFY_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "GCP IAM token verification timed out after %.0fs",
+                _VERIFY_TIMEOUT_SECONDS,
+            )
+            return None
         except Exception as exc:
             logger.debug("GCP IAM token verification failed: %s", exc)
             return None
@@ -87,10 +137,18 @@ class GcpIamAuthBackend:
             and token_email.endswith(".iam.gserviceaccount.com")
         )
 
+        groups: list[str] = []
+        raw_groups = claims.get("groups")
+        if isinstance(raw_groups, list):
+            groups = [str(g) for g in raw_groups if g]
+        hd = claims.get("hd")
+        if hd and str(hd) not in groups:
+            groups.append(str(hd))
+
         return UserIdentity(
             email=token_email,
             display_name=claims.get("name", ""),
-            groups=[],
+            groups=groups,
             source_backend=self.name,
             raw_claims={
                 "sub": claims.get("sub", ""),

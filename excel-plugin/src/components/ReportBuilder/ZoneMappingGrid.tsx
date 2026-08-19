@@ -28,6 +28,7 @@ import {
 import { tokens } from '../../theme';
 import type { Zone } from '../../types/tessallite';
 import { classifyDataType } from '../../utils/dataTypes';
+import { strings, templates } from '../../i18n/strings';
 
 export interface ZoneItem {
   id: string;
@@ -65,7 +66,10 @@ export interface ZoneItem {
 
 interface ZoneMappingGridProps {
   items: ZoneItem[];
-  onRemove: (id: string) => void;
+  // Bug-6358: remove is zone-qualified. The same field id can sit in two zones
+  // at once (e.g. a dimension on Rows AND as a Filter); deleting one chip must
+  // only remove that zone's item, not every item sharing the id.
+  onRemove: (id: string, zone: Zone) => void;
   onClear: () => void;
   onInsertTable: () => void;
   onInsertChart?: () => void;
@@ -86,13 +90,13 @@ function ChipList({
   onChipClick,
 }: {
   items: ZoneItem[];
-  onRemove: (id: string) => void;
+  onRemove: (id: string, zone: Zone) => void;
   onChipClick?: (item: ZoneItem) => void;
 }) {
   if (items.length === 0) {
     return (
       <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>
-        Empty
+        {strings.zone.empty}
       </Typography>
     );
   }
@@ -101,10 +105,10 @@ function ChipList({
     <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, minWidth: 0 }}>
       {items.map(item => (
         <Chip
-          key={item.id}
+          key={`${item.zone}:${item.id}`}
           label={item.operator ? `${item.name} ${item.operator} ${(item.values || []).join(', ') || '...'}` : item.name}
           size="small"
-          onDelete={() => onRemove(item.id)}
+          onDelete={() => onRemove(item.id, item.zone)}
           onClick={() => onChipClick?.(item)}
           sx={{
             maxWidth: '100%',
@@ -196,18 +200,18 @@ export default function ZoneMappingGrid({
     // Gate by the semantic category of the dimension's physical data_type.
     if ((editOperator === 'gt' || editOperator === 'lt')) {
       if (values.length === 0) {
-        setEditError('Enter a value to compare against.');
+        setEditError(strings.filter.enterValueToCompare);
         return;
       }
       const category = classifyDataType(editingFilter.data_type);
       if (category === 'numeric' || category === 'boolean') {
         if (!/^-?\d+(\.\d+)?$/.test(values[0])) {
-          setEditError(`"${values[0]}" is not a number. Greater Than / Less Than need a numeric value here.`);
+          setEditError(templates.filter.notANumber(values[0]));
           return;
         }
       } else if (category === 'date') {
         if (Number.isNaN(Date.parse(values[0]))) {
-          setEditError(`"${values[0]}" is not a date. Greater Than / Less Than need a date here (e.g. 2025-06-01).`);
+          setEditError(templates.filter.notADate(values[0]));
           return;
         }
       }
@@ -217,7 +221,7 @@ export default function ZoneMappingGrid({
       // Scalar operators bind a single value server-side; extra values are
       // silently ignored. Keep only the first and tell the analyst.
       if (values.length > 1) {
-        notice = `Greater Than / Less Than use a single value — using "${values[0]}".`;
+        notice = templates.filter.scalarTruncated(values[0]);
         values = [values[0]];
       }
     }
@@ -231,7 +235,7 @@ export default function ZoneMappingGrid({
       const db = Date.parse(b);
       if (!Number.isNaN(da) && !Number.isNaN(db) && da > db) {
         values = [b, a];
-        notice = `Dates were entered high-to-low — reordered to ${b} … ${a}.`;
+        notice = templates.filter.datesReordered(b, a);
       }
     }
 
@@ -245,10 +249,10 @@ export default function ZoneMappingGrid({
   }, [editingFilter, editOperator, editValues, onUpdateFilter]);
 
   const zoneRows: Array<{ label: string; hint: string; zoneItems: ZoneItem[]; editable?: boolean }> = [
-    { label: 'Values', hint: 'Add measures or KPIs', zoneItems: values },
-    { label: 'Rows', hint: 'Add dimensions', zoneItems: rows },
-    { label: 'Columns', hint: 'Optional split', zoneItems: columns },
-    { label: 'Filters', hint: 'Optional criteria', zoneItems: filters, editable: true },
+    { label: strings.zone.valuesLabel, hint: strings.zone.valuesHint, zoneItems: values },
+    { label: strings.zone.rowsLabel, hint: strings.zone.rowsHint, zoneItems: rows },
+    { label: strings.zone.columnsLabel, hint: strings.zone.columnsHint, zoneItems: columns },
+    { label: strings.zone.filtersLabel, hint: strings.zone.filtersHint, zoneItems: filters, editable: true },
   ];
 
   return (
@@ -257,15 +261,15 @@ export default function ZoneMappingGrid({
         <Box sx={{ display: 'flex', alignItems: 'center', mb: 0.75, gap: 0.75 }}>
           <Box sx={{ minWidth: 0, flex: 1 }}>
             <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, lineHeight: 1.2 }}>
-              Build report
+              {strings.zone.buildReport}
             </Typography>
             <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, lineHeight: 1.2 }}>
-              Pick fields, then insert into Excel.
+              {strings.zone.buildReportHint}
             </Typography>
           </Box>
           {hasItems && (
-            <Tooltip title="Clear layout">
-              <IconButton size="small" onClick={onClear} aria-label="Clear report layout" sx={{ color: tokens.colorTextSecondary }}>
+            <Tooltip title={strings.zone.clearLayout}>
+              <IconButton size="small" onClick={onClear} aria-label={strings.zone.clearLayoutAria} sx={{ color: tokens.colorTextSecondary }}>
                 <DeleteSweepOutlined sx={{ fontSize: 18 }} />
               </IconButton>
             </Tooltip>
@@ -277,7 +281,7 @@ export default function ZoneMappingGrid({
             onClick={onOpenTemplates}
             sx={{ fontSize: 11, minWidth: 'auto', textTransform: 'none', color: tokens.colorPrimary, px: 0.75 }}
           >
-            Templates
+            {strings.zone.templates}
           </Button>
         </Box>
 
@@ -329,7 +333,7 @@ export default function ZoneMappingGrid({
             ))}
             {compatibilityWarning.compatibleDimensionNames && compatibilityWarning.compatibleDimensionNames.length > 0 && (
               <Typography sx={{ fontSize: 10.5, lineHeight: 1.3 }}>
-                Compatible dimensions: {compatibilityWarning.compatibleDimensionNames.join(', ')}
+                {strings.zone.compatibleDimensions} {compatibilityWarning.compatibleDimensionNames.join(', ')}
               </Typography>
             )}
           </Alert>
@@ -339,7 +343,7 @@ export default function ZoneMappingGrid({
           <Box sx={{ mt: 0.5, display: 'flex', alignItems: 'center', gap: 0.5, color: tokens.colorTextSecondary }}>
             <TuneOutlined sx={{ fontSize: 13 }} />
             <Typography sx={{ fontSize: 10 }}>
-              Select a filter chip to set operator and values.
+              {strings.zone.filterChipHint}
             </Typography>
           </Box>
         )}
@@ -354,7 +358,7 @@ export default function ZoneMappingGrid({
             title={insertDisabledReason ?? undefined}
             sx={{ fontSize: 11, minWidth: 0, px: 0.75, '& .MuiButton-startIcon': { mr: 0.5 } }}
           >
-            Table
+            {strings.zone.tableButton}
           </Button>
           <Button
             size="small"
@@ -365,7 +369,7 @@ export default function ZoneMappingGrid({
             title={insertDisabledReason ?? undefined}
             sx={{ fontSize: 11, minWidth: 0, px: 0.75, '& .MuiButton-startIcon': { mr: 0.5 } }}
           >
-            Chart
+            {strings.zone.chartButton}
           </Button>
           <Button
             size="small"
@@ -376,13 +380,13 @@ export default function ZoneMappingGrid({
             title={insertDisabledReason ?? undefined}
             sx={{ fontSize: 11, minWidth: 0, px: 0.75, '& .MuiButton-startIcon': { mr: 0.5 } }}
           >
-            Pivot
+            {strings.zone.pivotButton}
           </Button>
         </Box>
 
         {!canInsert && (
           <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, mt: 0.5 }}>
-            Add at least one measure to enable insert actions.
+            {strings.zone.addMeasureHint}
           </Typography>
         )}
         {canInsert && insertDisabledReason && (
@@ -394,26 +398,26 @@ export default function ZoneMappingGrid({
 
       <Dialog open={Boolean(editingFilter)} onClose={() => closeFilterDialog(true)} maxWidth={false} sx={{ '& .MuiDialog-paper': { width: 300, borderRadius: 2 } }}>
         <DialogTitle sx={{ fontSize: 14, fontWeight: 700, pb: 0 }}>
-          Filter: {editingFilter?.name}
+          {strings.filter.dialogTitlePrefix} {editingFilter?.name}
         </DialogTitle>
         <DialogContent sx={{ p: 2 }}>
           <FormControl fullWidth size="small" sx={{ mb: 2 }}>
-            <InputLabel>Operator</InputLabel>
-            <Select value={editOperator} label="Operator" onChange={e => { setEditOperator(e.target.value); setEditError(null); setEditNotice(null); }}>
-              <MenuItem value="equals">Equals</MenuItem>
-              <MenuItem value="notEquals">Not Equals</MenuItem>
-              <MenuItem value="contains">Contains</MenuItem>
-              <MenuItem value="notContains">Not Contains</MenuItem>
-              <MenuItem value="gt">Greater Than</MenuItem>
-              <MenuItem value="lt">Less Than</MenuItem>
-              <MenuItem value="inDateRange">Date Range</MenuItem>
-              <MenuItem value="set">In Set</MenuItem>
+            <InputLabel>{strings.filter.operatorLabel}</InputLabel>
+            <Select value={editOperator} label={strings.filter.operatorLabel} onChange={e => { setEditOperator(e.target.value); setEditError(null); setEditNotice(null); }}>
+              <MenuItem value="equals">{strings.filter.equals}</MenuItem>
+              <MenuItem value="notEquals">{strings.filter.notEquals}</MenuItem>
+              <MenuItem value="contains">{strings.filter.contains}</MenuItem>
+              <MenuItem value="notContains">{strings.filter.notContains}</MenuItem>
+              <MenuItem value="gt">{strings.filter.greaterThan}</MenuItem>
+              <MenuItem value="lt">{strings.filter.lessThan}</MenuItem>
+              <MenuItem value="inDateRange">{strings.filter.dateRange}</MenuItem>
+              <MenuItem value="set">{strings.filter.inSet}</MenuItem>
             </Select>
           </FormControl>
           <TextField
             fullWidth
             size="small"
-            label={isScalarOperator ? `Value (${scalarValueKind})` : 'Values (comma-separated)'}
+            label={isScalarOperator ? templates.filter.valueLabel(scalarValueKind) : strings.filter.valuesComma}
             value={editValues}
             onChange={e => { setEditValues(e.target.value); setEditError(null); setEditNotice(null); }}
             error={Boolean(editError)}
@@ -421,10 +425,10 @@ export default function ZoneMappingGrid({
               editError
                 ? editError
                 : isScalarOperator
-                  ? `Enter a single ${scalarValueKind}`
+                  ? templates.filter.enterSingle(scalarValueKind)
                   : editOperator === 'inDateRange'
-                    ? 'Enter two dates: start, end'
-                    : 'Enter values separated by commas'
+                    ? strings.filter.enterTwoDates
+                    : strings.filter.enterValuesSeparated
             }
           />
           {editNotice && (
@@ -434,14 +438,14 @@ export default function ZoneMappingGrid({
           )}
         </DialogContent>
         <DialogActions sx={{ px: 2, pb: 1.5 }}>
-          <Button size="small" onClick={() => closeFilterDialog(true)} sx={{ textTransform: 'none' }}>Cancel</Button>
+          <Button size="small" onClick={() => closeFilterDialog(true)} sx={{ textTransform: 'none' }}>{strings.filter.cancel}</Button>
           <Button
             size="small"
             variant="contained"
             onClick={editNotice ? () => closeFilterDialog(false) : handleSaveFilter}
             sx={{ textTransform: 'none' }}
           >
-            {editNotice ? 'Done' : 'Apply'}
+            {editNotice ? strings.filter.done : strings.filter.apply}
           </Button>
         </DialogActions>
       </Dialog>

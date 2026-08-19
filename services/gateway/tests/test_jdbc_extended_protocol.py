@@ -82,18 +82,20 @@ class TestParseBindParameters:
         assert params == ["x"]
 
     def test_binary_int4(self):
+        # Wave C #6: binary params are decoded strictly by their DECLARED OID
+        # (never a byte-length guess), so the test declares the type as pgwire does.
         raw = struct.pack("!i", 99)
         payload = _build_bind_payload(format_codes=[1], params=[raw])
-        _, _, params, _ = proto.parse_bind_parameters(payload)
+        _, _, params, _ = proto.parse_bind_parameters(payload, param_oids=[proto.OID_INT4])
         assert params == ["99"]
 
     def test_binary_bool(self):
         payload = _build_bind_payload(format_codes=[1], params=[b"\x01"])
-        _, _, params, _ = proto.parse_bind_parameters(payload)
+        _, _, params, _ = proto.parse_bind_parameters(payload, param_oids=[proto.OID_BOOL])
         assert params == ["true"]
 
         payload = _build_bind_payload(format_codes=[1], params=[b"\x00"])
-        _, _, params, _ = proto.parse_bind_parameters(payload)
+        _, _, params, _ = proto.parse_bind_parameters(payload, param_oids=[proto.OID_BOOL])
         assert params == ["false"]
 
     def test_mixed_format_codes(self):
@@ -102,7 +104,9 @@ class TestParseBindParameters:
             format_codes=[0, 1],
             params=[b"text_val", int_val],
         )
-        _, _, params, _ = proto.parse_bind_parameters(payload)
+        _, _, params, _ = proto.parse_bind_parameters(
+            payload, param_oids=[proto.OID_TEXT, proto.OID_INT4],
+        )
         assert params == ["text_val", "7"]
 
     def test_single_format_code_applies_to_all(self):

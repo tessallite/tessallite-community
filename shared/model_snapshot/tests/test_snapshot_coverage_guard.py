@@ -59,6 +59,9 @@ COVERED: dict[str, str] = {
     "dimensions": "dimensions",
     "measures": "measures",
     "named_sets": "named_sets",
+    "named_queries": "named_queries",
+    "named_query_artifacts": "nested under named_queries",
+    "named_query_refresh_policies": "nested under named_queries",
     "kpis": "kpis",
     "drill_through_sets": "drill_through_sets",
     "lineage_mappings": "lineage_mappings",
@@ -88,14 +91,48 @@ COVERED: dict[str, str] = {
     "refresh_sla_configs": "refresh_sla_config",
     "data_quality_rules": "data_quality_rules",
     "entity_translations": "entity_translations",
+    # v4 (Bug-7359, derived-grain §5.3) — declared key-to-detail relationships.
+    # The DECLARATION is pinned model content and travels; verification EVIDENCE
+    # and active-run pointers are live state (Phase 2) and are EXCLUDED below.
+    "dimension_attribute_relationships": "attribute_relationships",
+    # v5 (Bug-7852, pNN aggregate coverage). Per-measure quantile coverage records
+    # proving pNN aggregate columns were built with the correct input fingerprint.
+    # Travels so an imported/reverted model carries its coverage proof; the consumer
+    # (quantile_routing proof gate) needs it to serve pNN from aggregates.
+    "quantile_coverage": "nested under aggregates",
 }
 
 # Tables intentionally NOT in the snapshot, with the reason. Runtime telemetry,
 # history, version rows themselves, per-tenant identity, project-scoped config,
 # and secret tokens.
 EXCLUDED: dict[str, str] = {
+    # Bug-8140: deliberately detached from models/projects/connections so the
+    # cleanup identity and retry/audit evidence survive their deletion. The
+    # FK-derived discovery above is structurally blind to this table; the
+    # dedicated fail-closed guard below asserts its table/column/no-FK contract.
+    "physical_cleanup_tasks": "durable detached target-cleanup outbox; runtime state, never semantic definition",
+    # Bug-7982 R7: the durable post-deploy KPI re-evaluation outbox (added by
+    # R6 / migration 0182, which never classified it here — this guard has been
+    # RED since). It is transient operational state: a row exists only between a
+    # deploy/revert commit and the re-evaluation that satisfies it. Carrying it
+    # in a snapshot would make an import/revert re-fire a re-eval for an epoch
+    # that no longer exists.
+    "pending_kpi_reeval": "durable re-eval outbox; transient operational state",
     "aggregate_refresh_runs": "runtime telemetry",
     "pocket_refresh_runs": "runtime telemetry",
+    "named_query_refresh_runs": "runtime telemetry",
+    # v4 (Bug-7359, derived-grain §5.3 / §7.6): live verification evidence tied
+    # to a deployed version + physical refresh run. NOT model content — a
+    # rehydrated model must be re-verified against its reverted/imported version,
+    # so this deliberately never travels in a snapshot. The pinned relationship
+    # DECLARATION does travel (COVERED above); the verification EVIDENCE does not.
+    "dimension_attribute_verifications": "live verification evidence, re-established after deploy/rehydrate; not model config",
+    # Bug-8615 phase G1: the same rule as the row above. The DECLARATION
+    # (joins.population_participation) is pinned model content and travels
+    # inside the "joins" key; the deploy-time row-loss/row-multiplication
+    # MEASUREMENT describes the source data's shape under one deployed version +
+    # deploy epoch and must be re-taken after a revert/import, never restored.
+    "join_population_checks": "live deploy-time join row-loss/multiplication evidence, re-measured on the next deploy; not model config",
     "data_quality_violations": "runtime telemetry (child of data_quality_rules)",
     "ai_optimizer_runs": "history / telemetry",
     "ai_aggregate_recommendations": "history / telemetry",
@@ -179,3 +216,26 @@ def test_covered_tables_are_actually_model_scoped():
         "COVERED lists tables that are no longer model-scoped / no longer "
         f"exist: {sorted(stale)}"
     )
+
+
+def test_bug_8140_detached_cleanup_outbox_is_explicitly_guarded():
+    """The FK-derived coverage tool cannot discover an intentionally detached
+    table, so pin the outbox contract directly instead of claiming the generic
+    graph walk proves it."""
+    table = TenantBase.metadata.tables["physical_cleanup_tasks"]
+    assert not table.foreign_keys, (
+        "cleanup retry identity must not be cascaded away with model/project/"
+        "connection metadata"
+    )
+    required = {
+        "artifact_kind", "artifact_id", "model_id", "project_id",
+        "connection_id", "connection_type", "encrypted_credentials",
+        "connection_config", "target_schema", "qualified_table_name",
+        "status", "attempts", "next_attempt_at", "error_message",
+    }
+    column_names = set(table.columns.keys())
+    assert required <= column_names, (
+        "detached cleanup outbox lost complete target/retry identity: "
+        f"{sorted(required - column_names)}"
+    )
+    assert "physical_cleanup_tasks" in EXCLUDED

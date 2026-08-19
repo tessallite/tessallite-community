@@ -23,7 +23,7 @@ A complete reference of every Tessallite feature, what it does, and where to fin
 | Dimension aliases | Same dimension mapped from multiple tables with unique names | Dimensions panel > Alias option |
 | Measures | Aggregations (SUM, COUNT, AVG, MIN, MAX, DISTINCT COUNT) with format tokens (currency, percent, decimal) | Model Builder > Measures panel |
 | Calculated measures | Expressions over other measures using `measure("name")`, `safe_div`, arithmetic, and numeric literals | Measures panel > Create calculated |
-| Semi-additive measures | Measures that aggregate differently across time: LAST_NON_EMPTY, FIRST_NON_EMPTY, AVG_OF_CHILDREN, MIN, MAX, BY_ACCOUNT | Measures drawer > semi_additive_behavior dropdown |
+| Semi-additive measures | Measures that aggregate differently across time: LAST_NON_EMPTY, FIRST_NON_EMPTY, AVG_OF_CHILDREN, MIN, MAX | Measures drawer > semi_additive_behavior dropdown |
 | Time intelligence variants | 14 canonical time calculations: lag, prior year/quarter/month/week, YTD/QTD/MTD/WTD, YoY growth, trailing N, moving average | Measures drawer > Variants (fx+ button) |
 | Hierarchies | Four types (explicit, date_embedded, segment, inferred) with time units and level-based calculations | Model Builder > Hierarchies panel |
 | Date hierarchy batch-create | Auto-create Year/Quarter/Month/Day hierarchies for unassigned date columns | Hierarchies panel > Create date hierarchies |
@@ -81,7 +81,7 @@ A complete reference of every Tessallite feature, what it does, and where to fin
 | Aggregate lifecycle | Automatic events: created, validated, refreshed, retired (idle), evicted (over cap) | Model Health > Lifecycle panel |
 | Idle retirement | Aggregates with zero hits over a configurable window are automatically retired | Scheduler > Idle retirement sweep |
 | Pocket tables | Materialised model slices (`SELECT * FROM model WHERE predicate`) for filtered workloads | Model Builder > Pocket Tables panel |
-| Pocket incremental refresh | Refresh only new rows based on incremental_column and lookback_hours | Pocket Tables drawer > Schedule tab |
+| Pocket incremental refresh | Refresh only rows changed since the last successful run, when the pocket exposes a row key; otherwise a full rebuild | Pocket Tables drawer > Schedule tab |
 | Pocket auto-suggestion | Optimizer analyses repeated WHERE predicates and suggests candidates within a size budget | Pocket Tables panel > Suggestions tab |
 
 ## Security and Access Control
@@ -103,13 +103,13 @@ A complete reference of every Tessallite feature, what it does, and where to fin
 | Feature | Description | Where to use it |
 |---|---|---|
 | Local authentication | Email/password with httpOnly cookie JWT and CSRF double-submit protection | Login page |
-| SSO: SAML 2.0 | SP-initiated SSO for Auth0, Google Workspace, and generic SAML providers | Admin > SSO Configuration |
-| SSO: OIDC | Authorization-code flow for generic OIDC providers | Admin > SSO Configuration |
-| SSO group mappings | Map IdP groups to Tessallite project/model roles; sync on each login | Admin > SSO Group Mappings |
-| LDAP authentication | Bind-and-search with configurable DN, filter, and attribute mapping | Admin > Workspace Settings |
-| GCP IAM OIDC | Google IAM backend with audience and domain validation | Admin > Workspace Settings |
+| SSO: SAML 2.0 | SP-initiated SSO for Auth0, Google Workspace, and generic SAML providers | Workspace Settings (project drawer) > Identity provider |
+| SSO: OIDC | Authorization-code flow for generic OIDC providers | Workspace Settings (project drawer) > Identity provider |
+| SSO group mappings | Map IdP groups to Tessallite project/model roles; sync on each login | Workspace Settings (project drawer) > SSO Mappings |
+| LDAP authentication | Bind-and-search with configurable DN, filter, and attribute mapping | Workspace Settings (project drawer) > Identity provider (status only; host/filters are server settings) |
+| GCP IAM OIDC | Google IAM backend with audience and domain validation | Workspace Settings (project drawer) > Identity provider (status only; audience is a server setting) |
 | JIT user adoption | Auto-create local user record from IdP attributes on first SSO login | Automatic on SSO login |
-| Embed tokens | Signed JWT tokens for third-party iframe embedding with scope (tenant, persona, model, capabilities) | API: `POST /api/v1/auth/embed-token` |
+| Embed tokens | Signed JWT tokens for third-party iframe embedding with scope (tenant, persona, model, capabilities) | Workspace Settings (project drawer) > Embed tokens; API: `POST /api/v1/auth/embed-token` |
 | User management | Create, edit, delete users; reset password; promote/demote roles per tenant | Admin > Users tab |
 
 ## BI Tool Integrations
@@ -221,4 +221,4 @@ must be recorded before those integrations are described as validated.
 
 ---
 
-<- [Connect Excel via XMLA](connect-excel.md) | [Home](../index.md) | [Workspaces and Tenants ->](../concepts/workspaces-and-tenants.md)
+<- [Connect Excel via XMLA](connect-excel.md) | [Home](../index.md) | [Choose Your Connection ->](../analyst-guides/choosing-your-connection.md)

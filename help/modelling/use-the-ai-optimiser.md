@@ -85,7 +85,7 @@ By default, an approved AI suggestion is built and routed straight away. If you 
 
 ### Only one run at a time
 
-An AI run holds a per-model lock while it works, and it runs in the background — you get an immediate acknowledgement and a visible "running" row rather than a frozen screen. If a run is already in progress — whether you started it or a schedule did — starting another is rejected with an "AI run in progress" message instead of running two at once. Wait for the current run to finish, then try again.
+An AI run holds a per-model lock while it works, and it runs in the background — you get an immediate acknowledgement and a visible row rather than a frozen screen. The row appears as "queued" for a moment while the run is handed to the background worker, then turns to "running". Being queued means the request is already saved: if the service restarts before the run starts, it is picked up and started afterwards rather than lost. If a run is already queued or in progress — whether you started it or a schedule did — starting another is rejected with an "AI run in progress" message instead of running two at once. Wait for the current run to finish, then try again.
 
 ---
 

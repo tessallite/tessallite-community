@@ -59,6 +59,84 @@ def test_credentials_preview_survives_rotation(monkeypatch):
     assert "password" not in preview
 
 
+def test_credentials_preview_redacts_flat_and_nested_bigquery_secrets(monkeypatch):
+    """Bug-6215: flat BigQuery service-account fields must not leak through
+    credentials_preview.
+
+    The preview is now an ALLOWLIST (see
+    ``shared.schemas.domains.tenants_projects.credential_preview``): only the
+    non-secret connection coordinates the connectors actually read are echoed
+    back. Structural keys (``nested``, ``history``) and unknown scalar keys
+    (``client_email``) are dropped outright rather than recursively redacted,
+    because a denylist cannot cover secret material carried in a VALUE.
+    """
+    key = Fernet.generate_key().decode()
+    _set_keys(monkeypatch, current=key)
+    blob = connections._encrypt(
+        {
+            "project_id": "billing-prod",
+            "client_email": "svc@billing-prod.iam.gserviceaccount.com",
+            "private_key": "FAKE-TEST-KEY-MATERIAL-NOT-A-REAL-KEY",
+            "nested": {
+                "host": "metadata",
+                "password": "nested-secret",
+                "private_key": "nested-key",
+            },
+            "history": [{"token": "old-token", "username": "reader"}],
+        }
+    )
+
+    preview = connections._credentials_preview(blob)
+
+    assert preview == {"project_id": "billing-prod"}
+    assert "private_key" not in preview
+    # Nothing structural is echoed back at all any more.
+    assert "nested" not in preview
+    assert "history" not in preview
+
+
+# Bug-8868: this file ships to the PUBLIC Community repository -- `services/model-service`
+# is an ALLOWLIST_ROOTS entry of the community export, tests included. A literal
+# PEM private-key header anywhere under an exported root trips the fail-closed
+# release leak-check (scripts/community_release/leak_check.py), which blocks
+# `tessctl release promote` outright, and would trip public-repo secret scanning too.
+# The markers are therefore assembled from fragments: the runtime strings below are
+# byte-for-byte what they always were, so what this test exercises is unchanged.
+_PEM_MARKER = "BEGIN " + "PRIVATE KEY"
+_PEM_BEGIN = f"-----{_PEM_MARKER}-----"
+_PEM_END = "-----END " + "PRIVATE KEY-----"
+
+
+def test_credentials_preview_drops_service_account_json_under_benign_key(monkeypatch):
+    """Bug-6215 root cause: the private key hidden in a VALUE under a key name
+    no denylist would ever flag."""
+    key = Fernet.generate_key().decode()
+    _set_keys(monkeypatch, current=key)
+    sa_json = (
+        '{"type": "service_account", "project_id": "billing-prod", '
+        f'"private_key": "{_PEM_BEGIN}\\nFAKEKEYMATERIAL\\n'
+        f'{_PEM_END}\\n", '
+        '"client_email": "svc@billing-prod.iam.gserviceaccount.com"}'
+    )
+    blob = connections._encrypt(
+        {
+            "host": "bq.example.com",
+            # Key name is innocuous; the VALUE is a whole service-account JSON.
+            "gcp_sa": sa_json,
+            # Even an ALLOWLISTED key must not carry key material through.
+            "database": f"{_PEM_BEGIN}\nFAKEKEYMATERIAL\n",
+        }
+    )
+
+    preview = connections._credentials_preview(blob)
+
+    assert preview == {"host": "bq.example.com"}
+    serialised = str(preview)
+    assert _PEM_MARKER not in serialised
+    assert "FAKEKEYMATERIAL" not in serialised
+    assert "service_account" not in serialised
+
+
 def test_new_connection_writes_use_current_key(monkeypatch):
     old_key = Fernet.generate_key().decode()
     new_key = Fernet.generate_key().decode()

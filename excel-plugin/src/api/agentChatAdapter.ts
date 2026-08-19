@@ -8,7 +8,8 @@ import type {
   AgentPersona,
   CreateConversationOptions,
 } from "@tessallite/shared-ui";
-import { apiClient, streamRequest } from "./client";
+import { apiClient, streamRequest, ApiError } from "./client";
+import { logError } from "../utils/diagnostics";
 import type {
   AgentConfig as LocalAgentConfig,
   AgentPersona as LocalAgentPersona,
@@ -46,7 +47,19 @@ interface RawTurn {
   semantic_query?: unknown;
   routed_sql?: string | null;
   route?: string | null;
-  citations?: Array<{ kind: string; id: string; name: string; display_name: string; value: unknown }> | null;
+  // Bug-8181 — mirrors shared-ui's Citation type (types/turn.ts) field-for-
+  // field. Names MUST match the backend citation dict exactly
+  // (services/agent-service/src/citations/builder.py).
+  citations?: Array<{
+    kind: string;
+    id: string;
+    name: string;
+    display_name: string;
+    value: unknown;
+    definition?: string | null;
+    route_type?: string | null;
+    filter_grain?: string | null;
+  }> | null;
   user_feedback?: { vote?: string; comment?: string | null } | null;
   judge_verdict?: string | null;
   judge_reasoning?: string | null;
@@ -83,6 +96,9 @@ function toTurnResponse(t: RawTurn): TurnResponse {
       name: c.name,
       display_name: c.display_name,
       value: c.value as number | string | null,
+      definition: c.definition ?? null,
+      route_type: c.route_type ?? null,
+      filter_grain: c.filter_grain ?? null,
     })) ?? null,
     user_feedback: t.user_feedback
       ? { vote: t.user_feedback.vote ?? "", comment: t.user_feedback.comment ?? null }
@@ -161,12 +177,40 @@ export function createExcelAdapter(activeModelId: () => string | null): AgentCha
       return turns.map(toTurnResponse);
     },
 
-    streamMessageRaw: async (projectId, conversationId, text, signal) => {
-      return streamRequest(
-        `${projectPath(projectId)}/conversations/${conversationId}/messages/stream`,
-        { text },
-        signal,
-      );
+    streamMessageRaw: async (projectId, conversationId, text, signal, idempotencyKey) => {
+      const path = `${projectPath(projectId)}/conversations/${conversationId}/messages/stream`;
+      try {
+        return await streamRequest(
+          path,
+          { text },
+          signal,
+          // Bug-6596: forward the per-send idempotency key as the
+          // Idempotency-Key header so the backend dedupes the turn reservation
+          // across streaming retries (mirrors the frontend adapter). Backward-
+          // compatible — omitted when the caller passes no key.
+          idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined,
+        );
+      } catch (err) {
+        // Bug-7388: SSE stream drops (server error, token expiry, rate limit,
+        // network failure) must not be silently swallowed. The shared-ui
+        // stream driver (sendMessageStream) reconnects/retries on this throw,
+        // but unlike apiClient.request, streamRequest does not record the drop
+        // in the plugin diagnostics log — so a support user copying diagnostics
+        // saw no trace of why a long agent response "finished early". Log the
+        // drop reason (HTTP status when available, else the error message)
+        // before re-raising so reconnect/backoff behaviour is unchanged.
+        if (err instanceof DOMException && err.name === "AbortError") {
+          // User-initiated cancel — not a fault, do not log as an error.
+          throw err;
+        }
+        if (err instanceof ApiError) {
+          logError(`SSE stream drop on message send: HTTP ${err.status} — ${err.message}`);
+        } else {
+          const reason = err instanceof Error ? err.message : String(err);
+          logError(`SSE stream drop on message send: ${reason}`);
+        }
+        throw err;
+      }
     },
 
     submitFeedback: async (projectId, conversationId, turnId, vote) => {

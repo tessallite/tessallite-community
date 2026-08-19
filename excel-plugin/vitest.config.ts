@@ -15,6 +15,7 @@ export default defineConfig({
       'react-dom',
       '@mui/material',
       '@mui/icons-material',
+      '@tanstack/react-query',
       'zustand',
       'dompurify',
       'react-markdown',
