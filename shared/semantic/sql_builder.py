@@ -19,6 +19,7 @@ Public surface
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from sqlalchemy import select
@@ -27,20 +28,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from shared.connector_qualify import coerce_join_types, quote_identifier, quote_table_ref
 from shared.db.models import (
     Dimension,
-    Join,
     Measure,
     ModelColumn,
-    ModelTable,
     PocketDefinition,
 )
+from shared.semantic.graph_order import (
+    CANONICAL_ORDER_DESCRIPTION,
+    anchor_is_by_convention,
+    canonical_column_order,
+    canonical_join_order,
+    canonical_table_order,
+    pick_anchor_table,
+    select_model_columns,
+    select_model_joins,
+    select_model_tables,
+)
+from shared.semantic.join_keyword import join_keyword
 
-
-_JOIN_SQL = {
-    "inner": "JOIN",
-    "left": "LEFT JOIN",
-    "right": "RIGHT JOIN",
-    "full": "FULL OUTER JOIN",
-}
+logger = logging.getLogger(__name__)
 
 
 async def build_from_clause(
@@ -56,9 +61,23 @@ async def build_from_clause(
     emit qualified column references (``t3."active_flag"``) instead of
     bare names.
 
-    Strategy: anchor on the first fact table (or first table if none is
-    flagged ``fact``); BFS-expand joins so every joined table appears
-    exactly once with a deterministic short alias.
+    Strategy: anchor on the model's fact table, or — when it has none,
+    which is legal — on the first table in canonical ``id`` order;
+    BFS-expand joins so every joined table appears exactly once with a
+    deterministic short alias.
+
+    Bug-8605: both reads go through ``shared.semantic.graph_order`` so the
+    anchor and the BFS expansion are a pure function of the model's rows
+    rather than of the order the database happened to return them in. The
+    anchor decides the LEFT JOIN base, so an unordered read let the same
+    unedited model materialise different totals run to run; the join order
+    decides alias numbering and breaks ties between equally short
+    anchor-to-table paths, which changes which intermediate tables reach
+    the FROM clause at all. Canonical order is ``id`` — the only key the
+    deployed snapshot carries verbatim and ``rehydrate_into_live``
+    preserves — so a CTAS built from live rows, source SQL built from the
+    deployed snapshot, and a graph rehydrated by a revert all anchor on
+    the same table. See ``shared/semantic/graph_order.py``.
 
     When ``needed_table_ids`` is supplied, the BFS computes the minimal
     join closure — the set of tables on any path from anchor to each
@@ -69,17 +88,14 @@ async def build_from_clause(
     for the specified tables.  Used by aggregate/pocket CTAS to
     substitute target-side calendar table names.
     """
-    tables_result = await db.execute(
-        select(ModelTable).where(ModelTable.model_id == model_id)
-    )
-    tables: dict = {t.id: t for t in tables_result.scalars().all()}
+    tables_result = await db.execute(select_model_tables(model_id))
+    ordered_tables = canonical_table_order(tables_result.scalars().all())
+    tables: dict = {t.id: t for t in ordered_tables}
     if not tables:
         raise ValueError(f"No ModelTable records for model {model_id}")
 
-    joins_result = await db.execute(
-        select(Join).where(Join.model_id == model_id)
-    )
-    joins = list(joins_result.scalars().all())
+    joins_result = await db.execute(select_model_joins(model_id))
+    joins = canonical_join_order(joins_result.scalars().all())
 
     col_ids = {j.left_column_id for j in joins} | {j.right_column_id for j in joins}
     cols: dict = {}
@@ -89,8 +105,15 @@ async def build_from_clause(
         )
         cols = {c.id: c for c in cols_result.scalars().all()}
 
-    facts = [t for t in tables.values() if t.table_type == "fact"]
-    anchor = facts[0] if facts else next(iter(tables.values()))
+    anchor = pick_anchor_table(ordered_tables)
+    if anchor_is_by_convention(ordered_tables):
+        logger.info(
+            "Model %s has no fact table; the FROM base is chosen by canonical "
+            "%s order and resolved to %r. The model carries no metadata "
+            "declaring a base table, so this is a platform convention rather "
+            "than a modelling decision (Bug-8605).",
+            model_id, CANONICAL_ORDER_DESCRIPTION, anchor.physical_name,
+        )
 
     # Build adjacency map for join closure computation.
     adjacency: dict[object, list[object]] = {}
@@ -125,12 +148,15 @@ async def build_from_clause(
             rt = tables.get(rid)
             if not (lc and rc and lt and rt):
                 continue
-            sql_join = _JOIN_SQL.get(j.join_type.lower(), "LEFT JOIN")
             q = lambda col: quote_identifier(connector, col)  # noqa: E731
 
             if lid in visited and rid not in visited:
                 if allowed_table_ids is not None and rid not in allowed_table_ids:
                     continue
+                # Bug-8628: FORWARD traversal — the already-visited table is
+                # the modeller's LEFT table, so the emitted keyword matches
+                # the declaration as written.
+                sql_join = join_keyword(j.join_type, flipped=False)
                 a = f"t{len(alias)}"
                 alias[rid] = a
                 lhs_expr = f"{alias[lid]}.{q(lc.column_name)}"
@@ -148,6 +174,17 @@ async def build_from_clause(
             elif rid in visited and lid not in visited:
                 if allowed_table_ids is not None and lid not in allowed_table_ids:
                     continue
+                # Bug-8628: REVERSED traversal — the already-visited table is
+                # the modeller's RIGHT table, so the newly added table (the
+                # modeller's LEFT one) lands on the physical right of the JOIN
+                # and the keyword must FLIP to keep the same relation
+                # preserved. This branch previously appended the SAME keyword
+                # string as the forward branch above, so a declared
+                # ``dim LEFT JOIN fact`` materialised as ``fact LEFT JOIN dim``
+                # — the opposite row population to what the source route
+                # (``rewrite/joins.py``, which has flipped since Bug-7775)
+                # serves for the same model.
+                sql_join = join_keyword(j.join_type, flipped=True)
                 a = f"t{len(alias)}"
                 alias[lid] = a
                 lhs_expr = f"{a}.{q(lc.column_name)}"
@@ -214,11 +251,7 @@ async def _load_field_index(
     """
     index: dict[str, tuple[Any, str]] = {}
 
-    cols_result = await db.execute(
-        select(ModelColumn)
-        .join(ModelTable, ModelColumn.model_table_id == ModelTable.id)
-        .where(ModelTable.model_id == model_id)
-    )
+    cols_result = await db.execute(select_model_columns(model_id))
     columns_by_id = {c.id: c for c in cols_result.scalars().all()}
 
     dims_result = await db.execute(
@@ -303,12 +336,18 @@ async def build_pocket_select_sql(
     if not (parsed.args.get("from") or parsed.args.get("from_")):
         raise ValueError("pocket defining_sql is missing a FROM clause")
 
-    cols_result = await db.execute(
-        select(ModelColumn)
-        .join(ModelTable, ModelColumn.model_table_id == ModelTable.id)
-        .where(ModelTable.model_id == pocket.model_id)
-    )
-    all_columns = list(cols_result.scalars().all())
+    # Bug-8605 (round-1 review, finding 3): canonically ordered. The alias
+    # loop below resolves a duplicate column name by ARRIVAL POSITION — first
+    # arrival keeps the plain name, later ones get an ``{alias}_`` prefix — and
+    # those names are materialised INTO the pocket table. The pocket route
+    # rewrites only the table reference, so the column names are a contract
+    # with every query written against the pocket. An unordered read made that
+    # contract depend on the storage engine's row order: two tables carrying
+    # ``region_id`` (entirely ordinary) could swap which one owns the plain
+    # name across a rebuild, and the same unchanged query would then group by
+    # a different table's column.
+    cols_result = await db.execute(select_model_columns(pocket.model_id))
+    all_columns = canonical_column_order(cols_result.scalars().all())
     if not all_columns:
         raise ValueError(
             f"Model {pocket.model_id} has no ModelColumn records to project"

@@ -2,20 +2,22 @@
 title: "Model Translations (i18n)"
 audience: modeller
 area: modelling
-updated: 2026-05-24
+updated: 2026-06-24
 ---
 
 ## What this covers
 
-Multi-language model metadata lets you provide translated display names for dimensions, measures, hierarchies, and other model entities. When a user selects a locale in the Explorer, all entity labels switch to that language. This page explains the translations API, the locale selector, and how translations are resolved at query time.
+Model translations let teams use the same governed model in more than one business language. A finance analyst can see "Revenue" while a French-speaking team sees "Chiffre d'affaires"; both labels point to the same measure, the same rules, and the same deployed model. This page explains what translations are for, how users choose a display language, and how an integration team can maintain translations safely.
 
 ---
 
 ## How it works
 
-Translations are stored in the `entity_translations` table, keyed by **(model_id, entity_type, entity_id, field_name, locale)**. Each row maps a specific field on a specific entity to a translated string in a specific locale.
+Translations are stored in the `entity_translations` table, keyed by **(model_id, entity_type, entity_id, field_name, locale)**. Each row maps one field on one model object to one translated label.
 
-When a user sets their display locale via the **Locale selector** in the Explorer, the frontend fetches all translations for the active model and locale. Entity labels throughout the UI are resolved using a simple fallback: if a translation exists for the current locale, show it; otherwise, show the original name.
+When a user sets their display locale with the **Locale selector**, Tessallite fetches the labels for the active model and locale. If a translation exists, the translated label is shown. If it does not, Tessallite falls back to the original model label. The fallback is deliberate: a partly translated model stays usable while the translation set is being completed.
+
+Translations change labels only. They do not change measure formulas, joins, security rules, aggregate routing, or API names. That is what makes them safe for multilingual reporting: the words can adapt to the audience without changing the numbers.
 
 ---
 
@@ -30,9 +32,11 @@ The selected locale is stored in the browser session (Zustand store). It persist
 
 ---
 
-## Managing translations
+## Managing translations safely
 
-Translations are managed via the REST API. There is no GUI editor yet; use the API directly or build an integration.
+Most teams should treat translations as reference content, not as day-to-day modelling work. The best workflow is to export a list of model objects, have a translator or local business owner review the labels, then load the approved translation set in bulk.
+
+There is no GUI translation editor yet. The REST API is mainly for controlled integration work: importing approved translation files, syncing from a terminology system, or correcting a label during a release. For one-off exploration, keep changes in a staging model first so reviewers can check the wording in context.
 
 ### Upsert a single translation
 
@@ -67,11 +71,13 @@ GET /api/v1/projects/{project_id}/models/{model_id}/translations?locale=fr
 
 Returns all translations for the specified locale within the model.
 
-### Delete a translation
+### Retire a translation
 
 ```
 DELETE /api/v1/projects/{project_id}/models/{model_id}/translations/{id}
 ```
+
+Use delete only as a cleanup operation: for example, when a label was imported for the wrong locale, an entity was renamed and the old wording would now mislead people, or a translation failed review. Do not delete a translation simply because a user wants to see the original English label; changing their locale is safer and reversible.
 
 ---
 
@@ -89,6 +95,8 @@ DELETE /api/v1/projects/{project_id}/models/{model_id}/translations/{id}
 ## Security
 
 All translation endpoints verify that the specified model belongs to the specified project. Attempting to manage translations for a model in a different project returns **404 Not Found**.
+
+Translation access should be limited to modellers or controlled automation. A bad translation can create a business misunderstanding even though it cannot change the underlying calculation.
 
 ---
 

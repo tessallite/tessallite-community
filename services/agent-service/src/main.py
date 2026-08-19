@@ -22,6 +22,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from shared.config.bootstrap import refresh_system_snapshot
 from shared.config.settings import get_settings
 from shared.metrics import PrometheusMiddleware, metrics_response
+from src.webhooks.dispatcher import close_client as _close_webhook_client
+from src.webhooks.dispatcher import init_client as _init_webhook_client
 from src.api import (
     agent_config,
     agent_log,
@@ -41,7 +43,10 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await refresh_system_snapshot()
+    # Bug-5756 — initialise the shared httpx client for webhook dispatch.
+    await _init_webhook_client()
     yield
+    await _close_webhook_client()
 
 
 app = FastAPI(
@@ -53,6 +58,16 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+
+# ---------------------------------------------------------------------------
+# Rate limiting — deliberately NOT attached here.
+# Per docs/architecture/architecture_rate-limit-placement.md (user decision
+# 2026-08-14), the per-tenant request-rate throttle lives where USER QUERIES
+# enter (the gateway), not on this service. Agent-service is LLM-bound; its
+# real exposure is LLM COST, already guarded by per-project budget/spend
+# controls (Bug-6334, api/eval.py cost ledger), not by request rate. A
+# request-rate limiter here would not bound that cost and is not re-added.
+# ---------------------------------------------------------------------------
 
 origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
 embed_origins = [o.strip() for o in settings.ALLOWED_EMBED_ORIGINS.split(",") if o.strip()]

@@ -9,6 +9,7 @@ import type {
   CalendarScriptRequest,
   CalendarScriptResponse,
   CalendarTable,
+  CalendarTypeAvailability,
   CalendarUpdateRequest,
   AIOptimizerRun,
   AIOptimizerRunStartResponse,
@@ -26,6 +27,9 @@ import type {
   Dimension,
   DiscoveredColumn,
   DimensionCreate,
+  DimensionAttributeRelationship,
+  DimensionAttributeRelationshipCreate,
+  DimensionAttributeRelationshipUpdate,
   Hierarchy,
   HierarchyCreate,
   HierarchyDetail,
@@ -131,6 +135,7 @@ import type {
   LoginResponse,
   TriggerRefreshResponse,
   User,
+  AccessSupersedePreflightResponse,
   UserAccessBinding,
   UserAccessBindingCreate,
   ValidateResponse as QueryValidateResponse,
@@ -143,9 +148,13 @@ import type {
   UserCreate,
   UserPasswordReset,
   UserUpdate,
+  PersonalAccessToken,
+  PersonalAccessTokenCreate,
+  PersonalAccessTokenCreateResponse,
   NotificationRoute,
   NotificationRouteCreate,
   NotificationRouteUpdate,
+  NotificationDelivery,
   EventTypeOption,
   FieldCompatibilityResponse,
   QueryLogFilters,
@@ -162,6 +171,15 @@ import {
   queryRouterBaseUrl,
   schedulerBaseUrl,
 } from "./apiBase";
+import { isApplyingHistory } from "../store/historyApplyGuard";
+// F-026-02: the store must be imported statically so markDirty runs
+// synchronously in the response interceptor — a dynamic import().then()
+// defers the revision bump by a microtask, causing pushAction (which reads
+// currentRevision synchronously in the mutation's onSuccess) to snapshot a
+// stale value and break edit→undo→clean. The original dynamic import was a
+// cycle guard (store→client→store), but historyApplyGuard.ts broke that
+// cycle by extracting the guard module.
+import { useModelEditorStore } from "../store/useModelEditorStore";
 
 function getCsrfToken(): string | undefined {
   return document.cookie
@@ -173,6 +191,8 @@ function getCsrfToken(): string | undefined {
 function csrfInterceptor(config: import("axios").InternalAxiosRequestConfig) {
   const csrf = getCsrfToken();
   if (csrf) config.headers["X-CSRF-Token"] = csrf;
+  config.headers["X-Requested-With"] = "TessalliteSPA";
+  config.headers["X-Tessallite-Client"] = "spa";
   return config;
 }
 
@@ -235,18 +255,22 @@ api.interceptors.response.use(
         res.status < 300
       ) {
         const m = MODEL_WRITE_RE.exec(url);
-        if (m && !isNonContentModelWrite(method, Boolean(m[2]), res.config?.data)) {
+        // F-026-02: when undo/redo replays an API write, the history hook sets
+        // the content revision directly (delta-based). The interceptor must not
+        // ALSO bump it — that would leave the model dirty after undoing the
+        // only edit back to the saved baseline.
+        const applyingHistory = isApplyingHistory();
+        if (m && !applyingHistory && !isNonContentModelWrite(method, Boolean(m[2]), res.config?.data)) {
           const writtenModelId = m[1];
-          // Late-imported to avoid a top-level cycle: store -> client -> store.
-          // Only mark dirty if the write targets the model currently open in
-          // the editor — a background write to a different model must not
-          // flip the editor's dirty flag.
-          import("../store/useModelEditorStore").then(({ useModelEditorStore }) => {
-            const openModelId = useModelEditorStore.getState().modelId;
-            if (openModelId && openModelId === writtenModelId) {
-              useModelEditorStore.getState().markDirty();
-            }
-          });
+          // F-026-02: mark dirty SYNCHRONOUSLY so the currentRevision bump
+          // lands before any mutation onSuccess (which records the history
+          // entry with revisionAfter = currentRevision). A deferred
+          // microtask (dynamic import .then) races the onSuccess and can
+          // snapshot a stale revision, breaking edit→undo→clean.
+          const openModelId = useModelEditorStore.getState().modelId;
+          if (openModelId && openModelId === writtenModelId) {
+            useModelEditorStore.getState().markDirty();
+          }
         }
       }
     } catch {
@@ -298,6 +322,8 @@ export const authApi = {
   systemLogin: (data: { email: string; password: string }) =>
     api.post<LoginResponse>("/api/v1/auth/system/login", data).then((r) => r.data),
   logout: () => api.post("/api/v1/auth/logout").then((r) => r.data),
+  refresh: () =>
+    api.post<LoginResponse>("/api/v1/auth/refresh").then((r) => r.data),
   bootstrapUser: (tenantId: string, data: UserCreate) =>
     api
       .post(
@@ -343,9 +369,43 @@ export const authApi = {
     api.post<User>("/api/v1/auth/users/me/complete-onboarding").then((r) => r.data),
 };
 
+// Personal Access Tokens (Bug-7314): a logged-in user manages their own PATs
+// for BI-client auth. The plaintext token is returned ONLY by create().
+export const patApi = {
+  list: () =>
+    api
+      .get<PersonalAccessToken[]>("/api/v1/auth/tokens")
+      .then((r) => r.data),
+  create: (data: PersonalAccessTokenCreate) =>
+    api
+      .post<PersonalAccessTokenCreateResponse>("/api/v1/auth/tokens", data)
+      .then((r) => r.data),
+  revoke: (tokenId: string) =>
+    api.delete(`/api/v1/auth/tokens/${encodeURIComponent(tokenId)}`),
+};
+
+// Bug-8164: the nested manager ``status()`` shape carried inside the GET
+// /admin/license response. When a persisted licence was rejected the backend puts
+// the fail-closed state here (``license_state``) alongside the stable
+// machine-readable ``error_code`` taxonomy token — so the card can render a
+// code-specific reason for a stored bad licence, not just a generic banner. The
+// code lives ONLY here (nested), never copied to the top-level response.
+export type LicenseStatusDetail = {
+  edition?: string;
+  activated?: boolean;
+  enforcement?: boolean;
+  license_id?: string;
+  expires_at?: string | null;
+  license_state?: string; // "invalid" | "expired" | "manager_load_failed"
+  // e.g. "license_expired" | "invalid_signature" | "unknown_key_id" |
+  // "malformed_license" | "unsupported_algorithm"
+  error_code?: string;
+  load_error?: string;
+};
+
 export type LicenseManagerStatus = {
   edition: string | null;
-  status: Record<string, unknown>;
+  status: LicenseStatusDetail;
   entitlements: Record<string, unknown>;
   enforcement_enabled: boolean;
   has_license: boolean;
@@ -360,6 +420,12 @@ export const adminApi = {
   installLicense: (doc: unknown) =>
     api
       .post<{ status: string; license: LicenseManagerStatus }>("/api/v1/admin/license", doc)
+      .then((r) => r.data),
+  uninstallLicense: () =>
+    api
+      .delete<{ status: string; license: LicenseManagerStatus; message?: string }>(
+        "/api/v1/admin/license",
+      )
       .then((r) => r.data),
 };
 
@@ -434,6 +500,13 @@ export type EditionStatus = {
   enforcement?: boolean;
   license_id?: string;
   expires_at?: string | null;
+  // Bug-7680: when a licence document IS installed but the verifier rejected it
+  // (expired / untrusted signature), the backend reports the fail-closed state
+  // with ``license_state: "invalid"`` (see model-service _InvalidLicenseManager).
+  // The UI must render this distinctly from both "activated" and the plain
+  // "unactivated / nothing installed" state, so an invalid licence is not
+  // mistaken for a normal one.
+  license_state?: string; // e.g. "invalid"
 };
 
 export type EditionLimits = {
@@ -555,9 +628,27 @@ export const accessApi = {
     api
       .get<UserAccessBinding[]>(`/api/v1/projects/${projectId}/access`)
       .then((r) => r.data),
-  grant: (projectId: string, data: UserAccessBindingCreate) =>
+  // Bug-8101: `supersede` confirms the Modeller-supersedes-Model-viewer rule.
+  // The server rejects (409 "modeller_supersedes_model_viewer") an overlapping
+  // grant unless supersede=true; the UI first calls preflight() to decide
+  // whether to show the confirmation.
+  grant: (
+    projectId: string,
+    data: UserAccessBindingCreate,
+    supersede = false,
+  ) =>
     api
-      .post<UserAccessBinding>(`/api/v1/projects/${projectId}/access`, data)
+      .post<UserAccessBinding>(
+        `/api/v1/projects/${projectId}/access${supersede ? "?supersede=true" : ""}`,
+        data,
+      )
+      .then((r) => r.data),
+  preflight: (projectId: string, data: UserAccessBindingCreate) =>
+    api
+      .post<AccessSupersedePreflightResponse>(
+        `/api/v1/projects/${projectId}/access/preflight`,
+        data,
+      )
       .then((r) => r.data),
   revoke: (projectId: string, bindingId: string) =>
     api.delete(`/api/v1/projects/${projectId}/access/${bindingId}`),
@@ -608,7 +699,10 @@ export const connectionsApi = {
       .then((r) => r.data),
   discoverTables: (projectId: string, connId: string, schemaFilter?: string) =>
     api
-      .get<Array<{ schema: string; table: string; type: string }>>(
+      .get<
+        | { tables: Array<{ schema: string; table: string; type: string }>; truncated?: boolean }
+        | Array<{ schema: string; table: string; type: string }>
+      >(
         `/api/v1/projects/${projectId}/connections/${connId}/tables${
           schemaFilter ? `?schema_filter=${encodeURIComponent(schemaFilter)}` : ""
         }`
@@ -786,6 +880,14 @@ export const calendarApi = {
         `/api/v1/projects/${projectId}/models/${modelId}/sources/${sourceId}/calendars`,
       )
       .then((r) => r.data),
+  // Bug-5920: backend-computed availability per calendar type, replacing
+  // the hardcoded HIJRI_AVAILABLE frontend flag.
+  types: (projectId: string, modelId: string, sourceId: string) =>
+    api
+      .get<CalendarTypeAvailability[]>(
+        `/api/v1/projects/${projectId}/models/${modelId}/sources/${sourceId}/calendars/types`,
+      )
+      .then((r) => r.data),
   script: (
     projectId: string,
     modelId: string,
@@ -951,7 +1053,13 @@ export const tableAttributesApi = {
     projectId: string,
     modelId: string,
     tableId: string,
-    columns: Array<{ column_name: string; data_type: string; is_nullable: boolean }>,
+    columns: Array<{
+      column_name: string;
+      data_type: string;
+      is_nullable: boolean;
+      /** Omit when unknown; the API leaves the stored flag alone (Bug-8618). */
+      is_primary_key?: boolean;
+    }>,
   ) =>
     api.post(
       `/api/v1/projects/${projectId}/models/${modelId}/tables/${tableId}/sync-columns`,
@@ -1156,10 +1264,11 @@ export const hierarchiesApi = {
       )
       .then((r) => r.data);
   },
-  health: (projectId: string, modelId: string) =>
+  health: (projectId: string, modelId: string, probeMembers = false) =>
     api
       .get<HierarchyHealthStatus[]>(
         `/api/v1/projects/${projectId}/models/${modelId}/hierarchy-health`,
+        { params: probeMembers ? { probe_members: true } : undefined },
       )
       .then((r) => r.data),
   grainSuggestions: (projectId: string, modelId: string) =>
@@ -1254,6 +1363,94 @@ export const dimensionsApi = {
     api.delete(
       `/api/v1/projects/${projectId}/models/${modelId}/dimensions/${dimId}`
     ),
+};
+
+// Dimension attribute relationships (derived-grain routing, spec section 5.3).
+// A modeller-declared key-to-detail relationship on a dimension; distinct from the
+// display column. Verification status is projected by the backend (DECLARED until
+// proven on deploy). Mirrors dimensionsApi's list/create/update/delete shape.
+export const attributeRelationshipsApi = {
+  list: (projectId: string, modelId: string, dimId: string) =>
+    api
+      .get<DimensionAttributeRelationship[]>(
+        `/api/v1/projects/${projectId}/models/${modelId}/dimensions/${dimId}/attribute-relationships`,
+      )
+      .then((r) => r.data),
+  create: (
+    projectId: string,
+    modelId: string,
+    dimId: string,
+    data: DimensionAttributeRelationshipCreate,
+  ) =>
+    api
+      .post<DimensionAttributeRelationship>(
+        `/api/v1/projects/${projectId}/models/${modelId}/dimensions/${dimId}/attribute-relationships`,
+        data,
+      )
+      .then((r) => r.data),
+  update: (
+    projectId: string,
+    modelId: string,
+    dimId: string,
+    relId: string,
+    data: DimensionAttributeRelationshipUpdate,
+  ) =>
+    api
+      .patch<DimensionAttributeRelationship>(
+        `/api/v1/projects/${projectId}/models/${modelId}/dimensions/${dimId}/attribute-relationships/${relId}`,
+        data,
+      )
+      .then((r) => r.data),
+  delete: (
+    projectId: string,
+    modelId: string,
+    dimId: string,
+    relId: string,
+    retireAggregates?: boolean,
+  ) =>
+    api.delete(
+      `/api/v1/projects/${projectId}/models/${modelId}/dimensions/${dimId}/attribute-relationships/${relId}`,
+      { params: retireAggregates ? { retire_aggregates: true } : undefined },
+    ),
+  validate: (
+    projectId: string,
+    modelId: string,
+    dimId: string,
+    detailColumns: Array<{ name: string; table_id: string }>,
+  ) =>
+    api
+      .post<
+        Array<{
+          column: string;
+          table_id?: string | null;
+          is_bijection: boolean;
+          reason: string;
+          error?: string | null;
+        }>
+      >(
+        `/api/v1/projects/${projectId}/models/${modelId}/dimensions/${dimId}/attribute-relationships/validate`,
+        { detail_columns: detailColumns },
+      )
+      .then((r) => r.data),
+  downstreamUsage: (
+    projectId: string,
+    modelId: string,
+    dimId: string,
+    relId: string,
+  ) =>
+    api
+      .get<{
+        linked_dimensions: Array<{ id: string; name: string }>;
+        affected_aggregates: Array<{
+          id: string;
+          physical_table_name: string;
+          grain: string[];
+          status: string;
+        }>;
+      }>(
+        `/api/v1/projects/${projectId}/models/${modelId}/dimensions/${dimId}/attribute-relationships/${relId}/downstream-usage`,
+      )
+      .then((r) => r.data),
 };
 
 export interface AvailableVariant {
@@ -1686,10 +1883,11 @@ export const logsApi = {
       status?: string;
       errorType?: string;
       routeType?: string;
-      clientKind?: "looker_studio" | "looker_cloud";
+      clientKind?: string;
       userIdentity?: string;
       dateFrom?: string;
       dateTo?: string;
+      includeProbes?: boolean;
     } = {},
   ) => {
     const params = new URLSearchParams({
@@ -1704,6 +1902,7 @@ export const logsApi = {
     if (filters.userIdentity) params.set("user_identity", filters.userIdentity);
     if (filters.dateFrom) params.set("date_from", filters.dateFrom);
     if (filters.dateTo) params.set("date_to", filters.dateTo);
+    if (filters.includeProbes) params.set("include_probes", "true");
     return api
       .get<PaginatedQueryLogs>(
         `/api/v1/projects/${projectId}/logs/queries?${params.toString()}`
@@ -1717,10 +1916,11 @@ export const logsApi = {
       status?: string;
       errorType?: string;
       routeType?: string;
-      clientKind?: "looker_studio" | "looker_cloud";
+      clientKind?: string;
       userIdentity?: string;
       dateFrom?: string;
       dateTo?: string;
+      includeProbes?: boolean;
     } = {},
   ) => {
     const params = new URLSearchParams();
@@ -1732,6 +1932,7 @@ export const logsApi = {
     if (filters.userIdentity) params.set("user_identity", filters.userIdentity);
     if (filters.dateFrom) params.set("date_from", filters.dateFrom);
     if (filters.dateTo) params.set("date_to", filters.dateTo);
+    if (filters.includeProbes) params.set("include_probes", "true");
     const qs = params.toString();
     return api
       .get(`/api/v1/projects/${projectId}/logs/queries/export${qs ? `?${qs}` : ""}`, {
@@ -1782,6 +1983,21 @@ export const notificationsApi = {
   test: (projectId: string, data: NotificationRouteCreate) =>
     api
       .post<{ status: string }>(`/api/v1/projects/${projectId}/notifications/test`, data)
+      .then((r) => r.data),
+  // Bug-5999: test-send an already-saved route. The API redacts a saved
+  // Slack route's webhook URL from every response, so the client cannot
+  // resupply it here -- the backend decrypts the stored secret itself.
+  testRoute: (projectId: string, routeId: string) =>
+    api
+      .post<{ status: string }>(
+        `/api/v1/projects/${projectId}/notifications/${routeId}/test`,
+      )
+      .then((r) => r.data),
+  deliveries: (projectId: string) =>
+    api
+      .get<NotificationDelivery[]>(
+        `/api/v1/projects/${projectId}/notifications/deliveries`,
+      )
       .then((r) => r.data),
 };
 
@@ -1853,9 +2069,15 @@ export const optimizerApiClient = {
     selections?: Array<{ grain: string[]; measure_names: string[] }>,
   ) =>
     optimizerApi
-      .post<import("./types").PredictiveBuildResult>(
+      .post<import("./types").PredictiveBuildAccepted>(
         `/api/v1/models/${modelId}/predictive/build`,
         selections ? { selections } : {},
+      )
+      .then((r) => r.data),
+  getPredictiveBuildStatus: (modelId: string, buildId: string) =>
+    optimizerApi
+      .get<import("./types").PredictiveBuildResult>(
+        `/api/v1/models/${modelId}/predictive/build/${buildId}`,
       )
       .then((r) => r.data),
   getAggregateLifecycle: (
@@ -1980,9 +2202,19 @@ export const schedulerApiClient = {
     schedulerApi
       .post<{
         snapshots_written: number;
+        kpis_failed: number;
         models_attempted: number;
         models_failed: number;
         models_skipped: number;
+        // Bug-7139: kpi_latest upsert outcome counters.
+        latest_persisted: number;
+        latest_failed: number;
+        // Bug-7982 completion round: a write the epoch-monotonicity guard
+        // suppressed (a fresher row was already published) — not a
+        // failure, excluded from `status`, but must stay visible so a
+        // chronic suppression is never indistinguishable from a healthy
+        // "nothing to do" sweep.
+        latest_suppressed: number;
         status: string;
         error_message: string | null;
       }>("/api/v1/scheduler/trigger/kpi-snapshot-sweep")
@@ -2176,7 +2408,13 @@ export const queryRouterApiClient = {
       .then((r) => r.data),
   discoverMembers: (modelId: string, dimensionName: string) =>
     queryRouterApi
-      .post<{ members: Array<{ name: string; key: string }>; levels: string[] }>(
+      .post<{
+        members: Array<{ name: string; key: string }>;
+        levels: string[];
+        // Bug-8453 / R4 finding 3: the denial channel on the member-discovery
+        // surface. Consumers classify it with utils/rowSecurity.ts.
+        security_rules_applied?: string[];
+      }>(
         "/api/v1/discover/members",
         { model_id: modelId, dimension_name: dimensionName },
       )
@@ -2237,11 +2475,11 @@ export const aiOptimizerApi = {
     optimizerApi
       .post<AIOptimizerRunStartResponse>("/api/v1/optimize/ai/run", data)
       .then((r) => r.data),
-  listRuns: (tenantId?: string, modelId?: string) => {
-    const parts: string[] = [];
-    if (tenantId) parts.push(`tenant_id=${encodeURIComponent(tenantId)}`);
-    if (modelId) parts.push(`model_id=${modelId}`);
-    const params = parts.length ? `?${parts.join("&")}` : "";
+  // Bug-6558 — removed dead `tenant_id` query param.  The optimizer
+  // route resolves the tenant from the JWT; it never declared tenant_id
+  // as a query parameter.
+  listRuns: (modelId?: string) => {
+    const params = modelId ? `?model_id=${modelId}` : "";
     return optimizerApi
       .get<AIOptimizerRun[]>(`/api/v1/optimize/ai/runs${params}`)
       .then((r) => r.data);
@@ -2494,13 +2732,17 @@ import type {
   ModelParameter,
   ModelParameterCreate,
   ModelParameterUpdate,
+  JoinPopulationHealthResponse,
+  RelationshipHealthResponse,
   SchemaChangeEvent,
   SchemaChangeEventListResponse,
   SecurityAuditListResponse,
   WebhookCreate,
+  WebhookCreateResponse,
   WebhookDelivery,
   WebhookEndpoint,
   WebhookUpdate,
+  WebhookUpdateResponse,
 } from "./types";
 
 export interface AuditEventFilters {
@@ -2529,6 +2771,8 @@ export const auditApi = {
       .get<AuditEventListResponse>(`/api/v1/admin/audit-events?${params}`)
       .then((r) => r.data);
   },
+  listActions: () =>
+    api.get<string[]>("/api/v1/admin/audit-events/actions").then((r) => r.data),
   exportCsv: (filters: AuditEventFilters = {}) => {
     const params = new URLSearchParams();
     if (filters.actor_email) params.set("actor_email", filters.actor_email);
@@ -2546,12 +2790,47 @@ export const auditApi = {
 };
 
 export const ssoApi = {
-  getBackends: () =>
-    api.get<AuthBackendsResponse>("/api/v1/auth/backends").then((r) => r.data),
+  getBackends: (tenantId?: string) =>
+    api
+      .get<AuthBackendsResponse>("/api/v1/auth/backends", {
+        params: tenantId ? { tenant_id: tenantId } : undefined,
+      })
+      .then((r) => r.data),
   samlLoginUrl: (tenantId: string) =>
     `/api/v1/auth/saml/login?tenant_id=${encodeURIComponent(tenantId)}`,
   oidcLoginUrl: (tenantId: string) =>
     `/api/v1/auth/oidc/login?tenant_id=${encodeURIComponent(tenantId)}`,
+  getConfig: () =>
+    api.get<SsoConfig>("/api/v1/auth/sso-config").then((r) => r.data),
+  putConfig: (data: SsoConfigWrite) =>
+    api.put<SsoConfig>("/api/v1/auth/sso-config", data).then((r) => r.data),
+};
+
+export type SsoConfig = {
+  saml: Record<string, unknown>;
+  oidc: Record<string, unknown> & { client_secret_set?: boolean };
+};
+
+export type SsoConfigWrite = {
+  saml?: Record<string, unknown>;
+  oidc?: Record<string, unknown>;
+};
+
+export type EmbedTokenRow = {
+  jti: string;
+  actor_email?: string | null;
+  user_identity: string;
+  capabilities: string[];
+  expires_at?: string | null;
+  revoked_at?: string | null;
+  created_at?: string | null;
+};
+
+export const embedTokensApi = {
+  list: () =>
+    api.get<EmbedTokenRow[]>("/api/v1/auth/embed-tokens").then((r) => r.data),
+  revoke: (jti: string) =>
+    api.delete(`/api/v1/auth/embed-token/${encodeURIComponent(jti)}`),
 };
 
 export const groupMappingsApi = {
@@ -2577,9 +2856,9 @@ export const webhooksApi = {
       .get<EventTypeOption[]>("/api/v1/admin/webhooks/event-types")
       .then((r) => r.data),
   create: (data: WebhookCreate) =>
-    api.post<WebhookEndpoint>("/api/v1/admin/webhooks", data).then((r) => r.data),
+    api.post<WebhookCreateResponse>("/api/v1/admin/webhooks", data).then((r) => r.data),
   update: (id: string, data: WebhookUpdate) =>
-    api.put<WebhookEndpoint>(`/api/v1/admin/webhooks/${id}`, data).then((r) => r.data),
+    api.put<WebhookUpdateResponse>(`/api/v1/admin/webhooks/${id}`, data).then((r) => r.data),
   delete: (id: string) =>
     api.delete(`/api/v1/admin/webhooks/${id}`),
   test: (id: string) =>
@@ -2632,6 +2911,28 @@ export const schemaDriftApi = {
       .then((r) => r.data),
 };
 
+export const relationshipHealthApi = {
+  list: (projectId: string, modelId: string) =>
+    api
+      .get<RelationshipHealthResponse>(
+        `/api/v1/projects/${projectId}/models/${modelId}/relationship-health`,
+      )
+      .then((r) => r.data),
+};
+
+// ---------------------------------------------------------------------------
+// Join population governance health (Model Health surface)
+// ---------------------------------------------------------------------------
+
+export const joinPopulationHealthApi = {
+  get: (projectId: string, modelId: string) =>
+    api
+      .get<JoinPopulationHealthResponse>(
+        `/api/v1/projects/${projectId}/models/${modelId}/join-population-health`,
+      )
+      .then((r) => r.data),
+};
+
 export const schemaChangesApi = {
   list: (projectId: string, modelId: string) =>
     api
@@ -2662,7 +2963,7 @@ export const securityAuditApi = {
 };
 
 // ---------------------------------------------------------------------------
-// Impact Analysis — Downstream Assets
+// Usage & Downstream Assets (routes keep /impact + /downstream-assets prefixes)
 // ---------------------------------------------------------------------------
 
 export const downstreamAssetsApi = {
@@ -2758,12 +3059,21 @@ export const dataTagsApi = {
 };
 
 export const namedSetsApi = {
+  /** Bug-7949: effective member cap from the backend, updated on every list fetch. */
+  _cachedMemberCap: 1000 as number,
   list: (projectId: string, modelId: string) =>
     api
       .get<import("./types").NamedSet[]>(
         `/api/v1/projects/${projectId}/models/${modelId}/named-sets`,
       )
-      .then((r) => r.data),
+      .then((r) => {
+        // Bug-7949: extract the effective member cap from the response header.
+        const capHeader = r.headers?.["x-named-list-member-cap"];
+        if (capHeader) {
+          namedSetsApi._cachedMemberCap = parseInt(capHeader, 10) || 1000;
+        }
+        return r.data;
+      }),
   create: (projectId: string, modelId: string, data: import("./types").NamedSetCreate) =>
     api
       .post<import("./types").NamedSet>(
@@ -2839,16 +3149,103 @@ export const namedSetsApi = {
         `/api/v1/projects/${projectId}/models/${modelId}/named-sets/${id}/usage`,
       )
       .then((r) => r.data),
+  refresh: (projectId: string, modelId: string, id: string) =>
+    api
+      .post<import("./types").NamedSet>(
+        `/api/v1/projects/${projectId}/models/${modelId}/named-sets/${id}/refresh`,
+      )
+      .then((r) => r.data),
+};
+
+export const namedQueriesApi = {
+  list: (projectId: string, modelId: string) =>
+    api
+      .get<import("./types").NamedQuery[]>(
+        `/api/v1/projects/${projectId}/models/${modelId}/named-queries`,
+      )
+      .then((r) => r.data),
+  get: (projectId: string, modelId: string, id: string) =>
+    api
+      .get<import("./types").NamedQuery>(
+        `/api/v1/projects/${projectId}/models/${modelId}/named-queries/${id}`,
+      )
+      .then((r) => r.data),
+  create: (projectId: string, modelId: string, data: import("./types").NamedQueryCreate) =>
+    api
+      .post<import("./types").NamedQuery>(
+        `/api/v1/projects/${projectId}/models/${modelId}/named-queries`,
+        data,
+      )
+      .then((r) => r.data),
+  update: (projectId: string, modelId: string, id: string, data: import("./types").NamedQueryUpdate) =>
+    api
+      .patch<import("./types").NamedQuery>(
+        `/api/v1/projects/${projectId}/models/${modelId}/named-queries/${id}`,
+        data,
+      )
+      .then((r) => r.data),
+  delete: (projectId: string, modelId: string, id: string) =>
+    api.delete(`/api/v1/projects/${projectId}/models/${modelId}/named-queries/${id}`),
+  validate: (projectId: string, modelId: string, data: import("./types").NamedQueryValidateRequest) =>
+    api
+      .post<import("./types").NamedQueryValidateResponse>(
+        `/api/v1/projects/${projectId}/models/${modelId}/named-queries/validate`,
+        data,
+      )
+      .then((r) => r.data),
+  refresh: (projectId: string, modelId: string, id: string) =>
+    api
+      .post<import("./types").NamedQueryRefreshRun>(
+        `/api/v1/projects/${projectId}/models/${modelId}/named-queries/${id}/refresh`,
+      )
+      .then((r) => r.data),
+  listRuns: (projectId: string, modelId: string, id: string) =>
+    api
+      .get<import("./types").NamedQueryRefreshRun[]>(
+        `/api/v1/projects/${projectId}/models/${modelId}/named-queries/${id}/refresh/runs`,
+      )
+      .then((r) => r.data),
+  // F-026-01 / F-101-07: the refresh schedule is its own snapshot-owned
+  // resource. PATCH on the Named Query ignores policy fields, so an edit to the
+  // cron must go through GET/PUT /refresh/policy. Create sends the schedule
+  // inline (backend inserts the policy row when refresh_policy == "schedule").
+  getPolicy: (projectId: string, modelId: string, id: string) =>
+    api
+      .get<import("./types").NamedQueryRefreshPolicy>(
+        `/api/v1/projects/${projectId}/models/${modelId}/named-queries/${id}/refresh/policy`,
+      )
+      .then((r) => r.data),
+  putPolicy: (
+    projectId: string,
+    modelId: string,
+    id: string,
+    data: import("./types").NamedQueryRefreshPolicyUpsert,
+  ) =>
+    api
+      .put<import("./types").NamedQueryRefreshPolicy>(
+        `/api/v1/projects/${projectId}/models/${modelId}/named-queries/${id}/refresh/policy`,
+        data,
+      )
+      .then((r) => r.data),
 };
 
 export const kpisApi = {
-  list: (projectId: string, modelId: string, personaId?: string) =>
-    api
+  // F-017-05 / F-103-03 (Bug-9091): consumption surfaces (Model Health
+  // scorecard, viewers) pass deployedOnly so a certified-but-undeployed edit
+  // never changes the executive card before Deploy — the served definition then
+  // comes from the deployed snapshot, matching JDBC/XMLA. The model builder omits
+  // the flag and keeps seeing live drafts.
+  list: (projectId: string, modelId: string, personaId?: string, deployedOnly?: boolean) => {
+    const params: Record<string, string | boolean> = {};
+    if (personaId) params.persona_id = personaId;
+    if (deployedOnly) params.deployed_only = true;
+    return api
       .get<import("./types").Kpi[]>(
         `/api/v1/projects/${projectId}/models/${modelId}/kpis`,
-        personaId ? { params: { persona_id: personaId } } : undefined,
+        Object.keys(params).length ? { params } : undefined,
       )
-      .then((r) => r.data),
+      .then((r) => r.data);
+  },
   create: (projectId: string, modelId: string, data: import("./types").KpiCreate) =>
     api
       .post<import("./types").Kpi>(
@@ -2887,6 +3284,23 @@ export const kpisApi = {
     api
       .post<import("./types").Kpi>(
         `/api/v1/projects/${projectId}/models/${modelId}/kpis/${id}/certify`,
+        {},
+      )
+      .then((r) => r.data),
+  // F-101-01: publish/unpublish a KPI to the BI catalogues (JDBC $KPIs, XMLA
+  // MDSCHEMA_KPIS). is_deployed is a publication flag layered on the deployed
+  // model snapshot; the model must be deployed first (backend returns 409).
+  deploy: (projectId: string, modelId: string, id: string) =>
+    api
+      .post<import("./types").Kpi>(
+        `/api/v1/projects/${projectId}/models/${modelId}/kpis/${id}/deploy`,
+        {},
+      )
+      .then((r) => r.data),
+  undeploy: (projectId: string, modelId: string, id: string) =>
+    api
+      .post<import("./types").Kpi>(
+        `/api/v1/projects/${projectId}/models/${modelId}/kpis/${id}/undeploy`,
         {},
       )
       .then((r) => r.data),
@@ -2936,6 +3350,9 @@ export const kpisApi = {
         data,
         // F-017-25: persona switcher on the scorecard re-evaluates under the
         // selected persona's measure scope (endpoint accepts persona_id query).
+        // The scorecard evaluates only the deployed KPI ids from the
+        // deployed_only list (F-017-05), and a deployed model pins each KPI to
+        // its snapshot definition server-side, so batch needs no separate flag.
         personaId ? { params: { persona_id: personaId } } : undefined,
       )
       .then((r) => r.data),
@@ -2981,7 +3398,104 @@ export const preferencesApi = {
         data,
       )
       .then((r) => r.data),
+  /** Bug-8183: the whole project's favourited models in one request. */
+  getFavouriteModels: (projectId: string) =>
+    api
+      .get<import("./types").FavouriteModelsResponse>(
+        `/api/v1/projects/${projectId}/preferences/favourite-models`,
+      )
+      .then((r) => r.data),
 };
+
+export type PivotSort = {
+  measure: {
+    measureId: string;
+    aggregation: string;
+    occurrence: number;
+  };
+  target:
+    | { kind: "column"; columnKey: string[] }
+    | { kind: "grand" };
+  direction: "asc" | "desc";
+};
+
+export interface PivotViewConfig extends Record<string, unknown> {
+  configVersion?: 2;
+  sort?: PivotSort | null;
+}
+
+export type PivotSortConfigIssue = "invalid-sort" | "unsupported-version";
+
+export type PivotSortConfigResult = {
+  sort: PivotSort | null;
+  issue: PivotSortConfigIssue | null;
+};
+
+export function buildPivotViewConfig(
+  config: Omit<PivotViewConfig, "configVersion" | "sort">,
+  sort: PivotSort | null,
+): PivotViewConfig {
+  return { configVersion: 2, ...config, sort };
+}
+
+export function parsePivotSort(value: unknown): PivotSort | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  const measure = candidate.measure;
+  const target = candidate.target;
+  if (!measure || typeof measure !== "object" || Array.isArray(measure)) return null;
+  if (!target || typeof target !== "object" || Array.isArray(target)) return null;
+  const m = measure as Record<string, unknown>;
+  const t = target as Record<string, unknown>;
+  if (
+    typeof m.measureId !== "string" ||
+    !m.measureId ||
+    typeof m.aggregation !== "string" ||
+    !m.aggregation ||
+    !Number.isInteger(m.occurrence) ||
+    (m.occurrence as number) < 0 ||
+    (candidate.direction !== "asc" && candidate.direction !== "desc")
+  ) return null;
+  if (t.kind === "column") {
+    if (!Array.isArray(t.columnKey) || !t.columnKey.every((part) => typeof part === "string")) {
+      return null;
+    }
+  } else if (t.kind !== "grand") {
+    return null;
+  }
+  return {
+    measure: {
+      measureId: m.measureId,
+      aggregation: m.aggregation.toUpperCase(),
+      occurrence: m.occurrence as number,
+    },
+    target: t.kind === "grand"
+      ? { kind: "grand" }
+      : { kind: "column", columnKey: [...(t.columnKey as string[])] },
+    direction: candidate.direction,
+  };
+}
+
+export function parsePivotViewSortConfig(config: unknown): PivotSortConfigResult {
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    return { sort: null, issue: "invalid-sort" };
+  }
+  const candidate = config as Record<string, unknown>;
+  const version = candidate.configVersion;
+  if (version !== undefined && version !== 2) {
+    return { sort: null, issue: "unsupported-version" };
+  }
+  if (candidate.sort === undefined || candidate.sort === null) {
+    return { sort: null, issue: null };
+  }
+  if (version !== 2) {
+    return { sort: null, issue: "unsupported-version" };
+  }
+  const sort = parsePivotSort(candidate.sort);
+  return sort
+    ? { sort, issue: null }
+    : { sort: null, issue: "invalid-sort" };
+}
 
 export interface PivotView {
   id: string;
@@ -2990,12 +3504,17 @@ export interface PivotView {
   measure_id: string;
   row_dim_ids: string[];
   col_dim_ids: string[];
-  config: Record<string, unknown> | null;
+  config: PivotViewConfig | null;
   created_by: string;
   /** Whether the view is visible to the whole tenant (F-029-22). */
   is_shared: boolean;
-  /** Whether the requesting user owns this view (drives share/delete controls). */
+  /** Whether the requesting user owns this view (drives the share control). */
   is_owner: boolean;
+  /**
+   * Whether the caller may edit/delete this view. True for the owner, and for
+   * a modeler+ on a shared view they do not own (Bug-5839).
+   */
+  can_edit: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -3015,7 +3534,7 @@ export const pivotViewsApi = {
       measure_id: string;
       row_dim_ids: string[];
       col_dim_ids: string[];
-      config?: Record<string, unknown>;
+      config?: PivotViewConfig;
       is_shared?: boolean;
     },
   ) =>
@@ -3034,7 +3553,7 @@ export const pivotViewsApi = {
       measure_id: string;
       row_dim_ids: string[];
       col_dim_ids: string[];
-      config: Record<string, unknown>;
+      config: PivotViewConfig;
       is_shared: boolean;
     }>,
   ) =>
@@ -3063,6 +3582,43 @@ export const impactScanApi = {
     api
       .get<GatewayQueryReference[]>(
         `/api/v1/projects/${projectId}/models/${modelId}/impact/query-references`
+      )
+      .then((r) => r.data),
+};
+
+// ---------------------------------------------------------------------------
+// Impact Analysis (Bug-7787, Phase 4)
+// ---------------------------------------------------------------------------
+
+export const impactAnalysisApi = {
+  catalogue: (
+    projectId: string,
+    modelId: string,
+    params?: { object_types?: string; search?: string; cursor?: string; limit?: number },
+  ) =>
+    api
+      .get<import("./types_domains/model_impact").ImpactCatalogueResponse>(
+        `/api/v1/projects/${projectId}/models/${modelId}/impact-analysis/objects`,
+        { params },
+      )
+      .then((r) => r.data),
+
+  query: (
+    projectId: string,
+    modelId: string,
+    body: import("./types_domains/model_impact").ImpactQueryRequest,
+  ) =>
+    api
+      .post<import("./types_domains/model_impact").ImpactResponse>(
+        `/api/v1/projects/${projectId}/models/${modelId}/impact-analysis/query`,
+        body,
+      )
+      .then((r) => r.data),
+
+  columnUsage: (projectId: string, modelId: string) =>
+    api
+      .get<import("./types_domains/governance_impact").ColumnUsageResponse>(
+        `/api/v1/projects/${projectId}/models/${modelId}/impact/column-usage`,
       )
       .then((r) => r.data),
 };

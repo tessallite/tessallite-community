@@ -44,4 +44,27 @@ describe("BulletChart", () => {
     const { container: cOver } = render(<BulletChart value={150} />);
     expect(cOver.querySelector("svg")).toBeTruthy();
   });
+
+  it("Bug-7820: renders without crashing for z_score bands with negative scaleMin", () => {
+    const zScoreBands: KpiThresholdBand[] = [
+      { label: "Far", color: "#D32F2F", min: null, max: -0.5 },
+      { label: "Near", color: "#F57C00", min: -0.5, max: 0.5 },
+      { label: "On Target", color: "#388E3C", min: 0.5, max: null },
+    ];
+    const { container } = render(
+      <BulletChart value={0.2} target={0} bands={zScoreBands} />,
+    );
+    expect(container.querySelector("svg")).toBeTruthy();
+  });
+
+  it("Bug-7820: renders z_score_closer bands with entirely negative scaleMin/Max", () => {
+    const closerBands: KpiThresholdBand[] = [
+      { label: "Far", color: "#D32F2F", min: -1.25, max: -0.75 },
+      { label: "Near", color: "#F57C00", min: -0.75, max: -0.3125 },
+    ];
+    const { container } = render(
+      <BulletChart value={-0.5} bands={closerBands} />,
+    );
+    expect(container.querySelector("svg")).toBeTruthy();
+  });
 });

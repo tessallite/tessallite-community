@@ -2,7 +2,9 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useT } from "../../i18n";
 import {
+  Alert,
   Box,
+  Button,
   Chip,
   CircularProgress,
   FormControl,
@@ -86,8 +88,28 @@ export default function UsageAnalyticsTab({ projectId, modelId }: Props) {
     queryFn: () => analyticsApi.topUsers(projectId, modelId, days),
   });
 
+  // Bug-7459: the primary loading gate must cover every panel it renders — the
+  // previous gate omitted routing, savings and top-users, so those could render
+  // before their queries settled.
   const loading =
-    summary.isLoading || volume.isLoading || topMeasures.isLoading || topAggregates.isLoading;
+    summary.isLoading ||
+    volume.isLoading ||
+    topMeasures.isLoading ||
+    topAggregates.isLoading ||
+    routing.isLoading ||
+    savings.isLoading ||
+    topUsers.isLoading;
+
+  // Bug-7459: a failed request must be shown as an explicit, retryable error —
+  // not silently collapsed into an empty/zero "no activity" view, which would
+  // misrepresent an outage as a legitimate finding.
+  const allQueries = [summary, volume, topMeasures, topAggregates, routing, savings, topUsers];
+  const anyError = allQueries.some((q) => q.isError);
+  const retryAll = () => {
+    allQueries.forEach((q) => {
+      if (q.isError) q.refetch();
+    });
+  };
 
   return (
     <Box sx={{ p: 2, maxWidth: 1400, mx: "auto" }}>
@@ -112,29 +134,54 @@ export default function UsageAnalyticsTab({ projectId, modelId }: Props) {
         </FormControl>
       </Box>
 
+      {anyError && (
+        <Alert
+          severity="error"
+          data-testid="usage-analytics-load-error"
+          sx={{ mb: 2 }}
+          action={
+            <Button color="inherit" size="small" onClick={retryAll}>
+              {t("common.retry")}
+            </Button>
+          }
+        >
+          {t("usageAnalytics.loadError")}
+        </Alert>
+      )}
+
       {loading ? (
         <CircularProgress size={20} />
       ) : (
         <>
-          {/* Summary cards */}
+          {/* Summary cards — Bug-7459: on a failed summary read, show a dash,
+              NOT fabricated zeros (0 / 0% would read as a legitimate "no
+              activity" result and mislead). */}
           <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
             <Stack direction="row" spacing={4} flexWrap="wrap">
-              <StatCard label={t("usageAnalytics.totalQueries")} value={summary.data?.total_queries ?? 0} />
+              <StatCard
+                label={t("usageAnalytics.totalQueries")}
+                value={summary.isError ? "—" : summary.data?.total_queries ?? 0}
+              />
               <StatCard
                 label={t("usageAnalytics.accelerationRate")}
-                value={`${summary.data?.acceleration_rate ?? 0}%`}
+                value={summary.isError ? "—" : `${summary.data?.acceleration_rate ?? 0}%`}
               />
               <StatCard
                 label={t("usageAnalytics.aggregateHitRate")}
-                value={`${summary.data?.aggregate_hit_rate ?? 0}%`}
+                value={summary.isError ? "—" : `${summary.data?.aggregate_hit_rate ?? 0}%`}
               />
-              <StatCard label={t("usageAnalytics.topMissedMeasure")} value={summary.data?.top_measure ?? "—"} />
+              <StatCard
+                label={t("usageAnalytics.topMissedMeasure")}
+                value={summary.isError ? "—" : summary.data?.top_measure ?? "—"}
+              />
               <StatCard
                 label={t("usageAnalytics.avgResponse")}
                 value={
-                  summary.data?.avg_response_ms != null
-                    ? `${summary.data.avg_response_ms} ms`
-                    : "—"
+                  summary.isError
+                    ? "—"
+                    : summary.data?.avg_response_ms != null
+                      ? `${summary.data.avg_response_ms} ms`
+                      : "—"
                 }
               />
               {savings.data && savings.data.time_saved_ms > 0 && (
@@ -155,6 +202,10 @@ export default function UsageAnalyticsTab({ projectId, modelId }: Props) {
               <Paper variant="outlined" sx={{ p: 2 }}>
                 {routing.isLoading ? (
                   <CircularProgress size={16} />
+                ) : routing.isError ? (
+                  <Typography variant="body2" color="error">
+                    {t("usageAnalytics.sectionLoadError")}
+                  </Typography>
                 ) : (routing.data ?? []).length === 0 ? (
                   <Typography variant="body2" color="text.secondary">
                     {t("usageAnalytics.noRoutingData")}
@@ -203,6 +254,10 @@ export default function UsageAnalyticsTab({ projectId, modelId }: Props) {
               <Paper variant="outlined" sx={{ p: 2 }}>
                 {savings.isLoading ? (
                   <CircularProgress size={16} />
+                ) : savings.isError ? (
+                  <Typography variant="body2" color="error">
+                    {t("usageAnalytics.sectionLoadError")}
+                  </Typography>
                 ) : !savings.data ? (
                   <Typography variant="body2" color="text.secondary">
                     {t("usageAnalytics.noSavingsData")}
@@ -231,7 +286,13 @@ export default function UsageAnalyticsTab({ projectId, modelId }: Props) {
           <Typography variant="subtitle2" fontWeight={600} color="text.secondary" sx={{ mt: 2, mb: 1 }}>
             {t("usageAnalytics.queryVolumeDaily")}
           </Typography>
-          {(volume.data ?? []).length === 0 ? (
+          {volume.isError ? (
+            <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+              <Typography variant="body2" color="error">
+                {t("usageAnalytics.sectionLoadError")}
+              </Typography>
+            </Paper>
+          ) : (volume.data ?? []).length === 0 ? (
             <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
               <Typography variant="body2" color="text.secondary">
                 {t("usageAnalytics.noQueryData")}
@@ -290,7 +351,15 @@ export default function UsageAnalyticsTab({ projectId, modelId }: Props) {
                     </TableRow>
                   </TableHead>
                   <TableBody>
-                    {(topMeasures.data ?? []).length === 0 ? (
+                    {topMeasures.isError ? (
+                      <TableRow>
+                        <TableCell colSpan={3}>
+                          <Typography variant="body2" color="error">
+                            {t("usageAnalytics.sectionLoadError")}
+                          </Typography>
+                        </TableCell>
+                      </TableRow>
+                    ) : (topMeasures.data ?? []).length === 0 ? (
                       <TableRow>
                         <TableCell colSpan={3}>
                           <Typography variant="body2" color="text.secondary">
@@ -334,6 +403,14 @@ export default function UsageAnalyticsTab({ projectId, modelId }: Props) {
                           <CircularProgress size={16} />
                         </TableCell>
                       </TableRow>
+                    ) : topUsers.isError ? (
+                      <TableRow>
+                        <TableCell colSpan={3}>
+                          <Typography variant="body2" color="error">
+                            {t("usageAnalytics.sectionLoadError")}
+                          </Typography>
+                        </TableCell>
+                      </TableRow>
                     ) : (topUsers.data ?? []).length === 0 ? (
                       <TableRow>
                         <TableCell colSpan={3}>
@@ -374,7 +451,15 @@ export default function UsageAnalyticsTab({ projectId, modelId }: Props) {
                 </TableRow>
               </TableHead>
               <TableBody>
-                {(topAggregates.data ?? []).length === 0 ? (
+                {topAggregates.isError ? (
+                  <TableRow>
+                    <TableCell colSpan={4}>
+                      <Typography variant="body2" color="error">
+                        {t("usageAnalytics.sectionLoadError")}
+                      </Typography>
+                    </TableCell>
+                  </TableRow>
+                ) : (topAggregates.data ?? []).length === 0 ? (
                   <TableRow>
                     <TableCell colSpan={4}>
                       <Typography variant="body2" color="text.secondary">

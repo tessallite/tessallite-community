@@ -2,6 +2,15 @@
 """
 Semantic rewrite validator — batch comparison of original vs rewritten SQL.
 
+Re-run trigger (Bug-6037): this suite MUST be re-run whenever any of these
+files change: routing/router.py, rewrite/source_sql.py, rewrite/raw_sql.py,
+rewrite/query_rewriter.py, routing/aggregate_matcher.py,
+routing/pocket_matcher.py, or semantic/binder.py. These are the rewrite-
+correctness evidence gates; the e2e SQL query sets prove shape/value but
+the LLM semantic-equivalence comparison proves that the rewrite preserves
+the original query's meaning. Requires: Docker stack up + Claude CLI (or
+BATCH_REVIEWER=codex for Codex CLI).
+
 Runs test queries in batches of 10 through BOTH:
   1. Direct psycopg2 to the source PostgreSQL (original SQL with table names
      substituted to physical names)
@@ -38,6 +47,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,6 +84,9 @@ SQL_FILE = os.environ.get(
 )
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
 PHYSICAL_TABLE = os.environ.get("PHYSICAL_TABLE", "demo_data.payment_transaction")
+REVIEWER = os.environ.get("BATCH_REVIEWER", "claude").strip().lower()
+REVIEWER_MODEL = os.environ.get("BATCH_REVIEWER_MODEL", "gpt-5.5").strip()
+REVIEWER_TIMEOUT = int(os.environ.get("BATCH_REVIEWER_TIMEOUT", "180"))
 
 # Queries that are expected to fail on direct source (physical JOINs blocked
 # on business view) — skip these in comparison.
@@ -232,10 +245,82 @@ def _run_query(conn, sql: str, label: str) -> QueryResult:
 
 
 # ---------------------------------------------------------------------------
-# Claude CLI validation
+# LLM validation
 # ---------------------------------------------------------------------------
-def _validate_batch_with_claude(comparisons: list[dict]) -> tuple[str, bool]:
-    """Call claude CLI to validate a batch of query comparisons.
+def _run_reviewer(prompt: str) -> tuple[str, bool]:
+    """Run the configured LLM reviewer and return (output, all_passed)."""
+    if REVIEWER in {"codex", "gpt", "openai", "gpt-5.5"}:
+        output_path = Path(tempfile.mkstemp(prefix="rewrite-review-", suffix=".txt")[1])
+        cmd = [
+            "codex", "exec",
+            "--model", REVIEWER_MODEL,
+            "--sandbox", "read-only",
+            "--ephemeral",
+            "--ignore-rules",
+            "--output-last-message", str(output_path),
+            "-",
+        ]
+        input_text = prompt
+        reviewer_label = f"codex/{REVIEWER_MODEL}"
+    elif REVIEWER == "claude":
+        output_path = None
+        cmd = ["claude", "-p", prompt, "--output-format", "text"]
+        input_text = None
+        reviewer_label = "claude"
+    else:
+        return (
+            "ERROR: unsupported BATCH_REVIEWER="
+            f"{REVIEWER!r}; use 'claude' or 'codex'",
+            False,
+        )
+
+    try:
+        result = subprocess.run(
+            cmd,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=REVIEWER_TIMEOUT,
+        )
+        if output_path is not None and output_path.exists():
+            output = output_path.read_text(encoding="utf-8", errors="replace").strip()
+        else:
+            output = result.stdout.strip()
+        if not output:
+            output = result.stderr.strip() or f"(no output from {reviewer_label})"
+        result_lines = [
+            line.strip()
+            for line in output.splitlines()
+            if line.strip().startswith("RESULT:")
+        ]
+        all_passed = bool(result_lines and result_lines[-1] == "RESULT: ALL_PASS")
+        return output, all_passed
+    except FileNotFoundError:
+        return f"ERROR: reviewer CLI not found for {reviewer_label}: {cmd[0]}", False
+    except subprocess.TimeoutExpired:
+        return (
+            f"ERROR: {reviewer_label} timed out after {REVIEWER_TIMEOUT}s",
+            False,
+        )
+    except Exception as e:
+        return f"ERROR: {e}", False
+    finally:
+        if output_path is not None:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _reviewer_available() -> bool:
+    exe = "codex" if REVIEWER in {"codex", "gpt", "openai", "gpt-5.5"} else REVIEWER
+    return shutil.which(exe) is not None
+
+
+def _validate_batch_with_reviewer(comparisons: list[dict]) -> tuple[str, bool]:
+    """Call the configured reviewer CLI to validate a batch of query comparisons.
 
     Returns (output_text, all_passed).
     """
@@ -259,7 +344,9 @@ def _validate_batch_with_claude(comparisons: list[dict]) -> tuple[str, bool]:
     8. When both sides return 0 rows, that is a PASS (the gateway may
        omit column descriptions for empty result sets).
     9. Row ORDER may differ ONLY when the original SQL has no ORDER BY
-       clause (non-deterministic ordering). If ORDER BY is present,
+       clause (non-deterministic ordering), OR when the only difference
+       is the order of rows with identical ORDER BY key values. If ORDER
+       BY is present and compared rows have different ORDER BY key values,
        row order must match.
 
     For each query, respond with exactly one line:
@@ -300,24 +387,7 @@ def _validate_batch_with_claude(comparisons: list[dict]) -> tuple[str, bool]:
                 prompt += f"GATEWAY sample (first 5): {json.dumps(_g_rows[:5])}\n"
         prompt += "\n"
 
-    try:
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "text"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        output = result.stdout.strip()
-        if not output:
-            output = result.stderr.strip() or "(no output from claude)"
-        all_passed = "RESULT: ALL_PASS" in output
-        return output, all_passed
-    except FileNotFoundError:
-        return "ERROR: 'claude' CLI not found in PATH", False
-    except subprocess.TimeoutExpired:
-        return "ERROR: claude CLI timed out after 120s", False
-    except Exception as e:
-        return f"ERROR: {e}", False
+    return _run_reviewer(prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -330,22 +400,20 @@ def main():
     queries = [q for q in queries if q.label not in SKIP_LABELS]
     print(f"Loaded {len(queries)} queries (skipped {len(SKIP_LABELS)} xfail)")
 
-    # Claude-CLI optionality (Bug-5453). The semantic verdict (PASS/FAIL) comes
-    # ENTIRELY from the `claude` CLI; the deterministic pass only logs DIVERGE
-    # status. In headless/non-auth contexts (e.g. the live-community gate) the CLI
-    # may be ABSENT or PRESENT-BUT-NON-INTERACTIVE (it then hangs to the 120s
-    # timeout per batch and the old code silently reported ALL_PASS over an empty
-    # comparison). So unless explicitly required, skip the whole validator upfront
-    # with a clear notice rather than depend on an unreliable CLI. Default
-    # REQUIRE=1 keeps the dev run strict (and fails loudly if the CLI is missing).
+    # Reviewer optionality (Bug-5453). The semantic verdict (PASS/FAIL) comes
+    # ENTIRELY from the configured LLM reviewer; the deterministic pass only logs
+    # DIVERGE status. In headless/non-auth contexts the reviewer may be absent or
+    # present-but-non-interactive, so unless explicitly required, skip the whole
+    # validator upfront with a clear notice rather than depend on an unreliable
+    # CLI. Default REQUIRE=1 keeps the dev run strict.
     require_claude = os.environ.get("BATCH_REQUIRE_CLAUDE", "1") == "1"
     if not require_claude:
-        print("SKIP: semantic comparison needs the `claude` CLI; BATCH_REQUIRE_CLAUDE=0 "
+        print("SKIP: semantic comparison needs an LLM reviewer; BATCH_REQUIRE_CLAUDE=0 "
               "so it is skipped (set =1 to enforce).")
         print("RESULT: SKIPPED")
         sys.exit(0)
-    if shutil.which("claude") is None:
-        print("ERROR: 'claude' CLI not found in PATH and BATCH_REQUIRE_CLAUDE=1 "
+    if not _reviewer_available():
+        print(f"ERROR: reviewer CLI for BATCH_REVIEWER={REVIEWER!r} not found "
               "(semantic comparison cannot run).")
         print("RESULT: HAS_FAILURES")
         sys.exit(1)
@@ -432,12 +500,18 @@ def main():
 
         # Send batch to Claude for semantic validation
         print("\n  Validating batch with Claude CLI...")
-        output, all_passed = _validate_batch_with_claude(comparisons)
+        output, all_passed = _validate_batch_with_reviewer(comparisons)
 
-        # Count results
+        # Count results. Fail closed if the reviewer transport reports
+        # RESULT: ALL_PASS but emits no per-query verdicts for a non-empty batch.
         batch_pass = output.count("PASS Q")
         batch_fail = output.count("FAIL Q")
         batch_skip = output.count("SKIP Q")
+        if comparisons and (batch_pass + batch_fail + batch_skip) == 0:
+            batch_fail = len(comparisons)
+            all_passed = False
+        elif not all_passed and batch_fail == 0:
+            batch_fail = max(1, len(comparisons) - batch_pass - batch_skip)
         total_pass += batch_pass
         total_fail += batch_fail
         total_skip += batch_skip

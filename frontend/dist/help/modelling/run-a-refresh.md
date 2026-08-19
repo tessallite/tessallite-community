@@ -17,7 +17,7 @@ A refresh re-executes the aggregate query against the source data and overwrites
 
 During a refresh, the Scheduler service:
 
-1. Connects to the source data warehouse and runs the aggregate's GROUP BY query.
+1. Connects to the source and runs the aggregate's GROUP BY query.
 2. Drops the existing summary table in the query target.
 3. Writes the new result set as the replacement summary table.
 
@@ -58,7 +58,7 @@ The drop-and-replace approach means the summary table is briefly unavailable dur
 
 1. At the bottom of Model Builder, locate the **Summary Bar**.
 2. Click **Refresh All**.
-3. Tessallite queues all aggregates in the model for refresh. Refreshes run sequentially, one aggregate at a time, to avoid placing concurrent load on the source data warehouse.
+3. Tessallite queues all aggregates in the model for refresh. Refreshes run sequentially, one aggregate at a time, to avoid placing concurrent load on the source.
 
 > **Note:** **Refresh All** runs aggregates sequentially, not in parallel. On a model with many aggregates, the full cycle may take several minutes. Monitor progress in the Canvas — each aggregate's status badge updates in real time.
 
@@ -75,7 +75,7 @@ The drop-and-replace approach means the summary table is briefly unavailable dur
 
 ## Refresh failures
 
-If a refresh fails, the aggregate status changes to **Error**. The Scheduler records the error message and timestamp. Open the Health tab in Model Builder to view the full error detail, including the SQL query that failed and the error returned by the data warehouse. Fix the root cause — most commonly a network issue, a missing permission on the query target, or a schema change in the source — and then run a manual refresh to confirm the fix before the next scheduled run.
+If a refresh fails, the aggregate status changes to **Error**. The Scheduler records the error message and timestamp. Open the Health tab in Model Builder to view the full error detail, including the SQL query that failed and the error returned by the source. Fix the root cause — most commonly a network issue, a missing permission on the query target, or a schema change in the source — and then run a manual refresh to confirm the fix before the next scheduled run.
 
 ---
 

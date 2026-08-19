@@ -763,16 +763,23 @@ QUERIES: list[QueryCase] = [
     # Query 24: stray semicolon truncates query (Bug-040)
     # ------------------------------------------------------------------
     QueryCase(
-        id="q24_stray_semicolon",
+        # Bug-7916 / Codex gate R2: multi-statement input is now rejected on
+        # ALL protocols (including XMLA). The stray semicolon test is replaced
+        # by test_multi_statement_rejected_on_xmla in the Bug-7916 guard tests.
+        # id="q24_stray_semicolon" — REMOVED (raises SyntaxErrorInSQL before
+        # the trace engine can inspect the IR).
+        id="q24_stray_semicolon_trailing_only",
         sql=(
             "SELECT CURRENT_DATE AS current_date_value, "
-            "CURRENT_TIMESTAMP AS current_timestamp_value;\n"
-            "FROM modely\n"
+            "CURRENT_TIMESTAMP AS current_timestamp_value "
+            "FROM modely "
             "ORDER BY sort_order;"
         ),
-        expected_issues={
-            "stray_semicolon",
-        },
+        # Bug-7916 / Codex gate R2: the original mid-stream semicolon
+        # query is now rejected by the multi-statement guard. This
+        # trailing-only variant has no stray_semicolon issue (the trailing
+        # semicolon is stripped during parsing -- valid SQL).
+        expected_issues=set(),
     ),
     # ------------------------------------------------------------------
     # Query 26: OR in WHERE with IS NOT NULL (Bug-046)

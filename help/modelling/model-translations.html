@@ -12,11 +12,12 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Model Translations (i18n)</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-06-24</span></div>
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-08-19</span></div>
 <h1>Model Translations (i18n)</h1>
 
 <h2>What this covers</h2>
 <p>Model translations let teams use the same governed model in more than one business language. A finance analyst can see &ldquo;Revenue&rdquo; while a French-speaking team sees &ldquo;Chiffre d&rsquo;affaires&rdquo;; both labels point to the same measure, the same rules, and the same deployed model. This page explains what translations are for, how users choose a display language, and how an integration team can maintain translations safely.</p>
+<p><strong>Scope: model labels only.</strong> Translations change the display names of your model objects &mdash; dimensions, measures, hierarchies, and levels. They do not translate the Tessallite application itself. The application interface &mdash; menus, buttons, panel titles, and dialogs &mdash; is shown in English, and there is no feature to translate the interface into other languages. Model translations are a separate, supported capability for the business vocabulary you define; the application chrome is English-only by design.</p>
 
 <h2>How it works</h2>
 <p>Translations are stored in the <code>entity_translations</code> table, keyed by <strong>(model_id, entity_type, entity_id, field_name, locale)</strong>. Each row maps one field on one model object to one translated label.</p>
@@ -34,7 +35,7 @@
 
 <h2>Managing translations safely</h2>
 <p>Most teams should treat translations as reference content, not as day-to-day modelling work. The best workflow is to export a list of model objects, have a translator or local business owner review the labels, then load the approved translation set in bulk.</p>
-<p>There is no GUI translation editor yet. The REST API is mainly for controlled integration work: importing approved translation files, syncing from a terminology system, or correcting a label during a release. For one-off exploration, keep changes in a staging model first so reviewers can check the wording in context.</p>
+<p>There is no GUI translation editor; model translations are maintained through the REST API. The API is mainly for controlled integration work: importing approved translation files, syncing from a terminology system, or correcting a label during a release. For one-off exploration, keep changes in a staging model first so reviewers can check the wording in context.</p>
 
 <h3>Upsert a single translation</h3>
 <pre><code>PUT /api/v1/projects/{project_id}/models/{model_id}/translations

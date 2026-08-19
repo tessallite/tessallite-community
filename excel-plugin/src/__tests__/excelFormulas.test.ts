@@ -8,6 +8,7 @@ import {
   generateCubeSet,
   buildCubeRankedMemberFormula,
   buildCubeKpiFormula,
+  buildCubeKpiValueFormula,
   CUBE_KPI_PROPERTIES,
   buildMsolapConnectionString,
   buildXmlaCatalogName,
@@ -16,6 +17,8 @@ import {
   dimensionMemberRef,
   escapeExcelString,
   escapeMdxIdentifier,
+  kpiValueCellFormula,
+  kpiStatusCellFormula,
 } from '../utils/excelFormulas';
 
 describe('excelFormulas', () => {
@@ -185,6 +188,52 @@ describe('excelFormulas', () => {
     it('escapes brackets in both the dimension and the member key', () => {
       expect(dimensionMemberRef('dim]x', 'mem]y'))
         .toBe('[dim]]x].[dim]]x].[mem]]y]');
+    });
+  });
+
+  // Bug-6729: the CUBEVALUE wrap for KPI property formulas.
+  describe('buildCubeKpiValueFormula (Bug-6729)', () => {
+    it('wraps CUBEKPIMEMBER Value inside CUBEVALUE', () => {
+      const result = buildCubeKpiValueFormula('MyConn', 'Revenue Growth', CUBE_KPI_PROPERTIES.Value);
+      expect(result).toBe('=CUBEVALUE("MyConn",CUBEKPIMEMBER("MyConn","Revenue Growth",1))');
+    });
+
+    it('wraps Status (property 3) inside CUBEVALUE', () => {
+      const result = buildCubeKpiValueFormula('MyConn', 'Revenue Growth', CUBE_KPI_PROPERTIES.Status);
+      expect(result).toBe('=CUBEVALUE("MyConn",CUBEKPIMEMBER("MyConn","Revenue Growth",3))');
+    });
+
+    it('escapes both connection name and KPI caption', () => {
+      const result = buildCubeKpiValueFormula('My "Conn"', 'Revenue "Growth"', CUBE_KPI_PROPERTIES.Value);
+      expect(result).toBe('=CUBEVALUE("My ""Conn""",CUBEKPIMEMBER("My ""Conn""","Revenue ""Growth""",1))');
+    });
+
+    it('never emits a bare CUBEKPIMEMBER (the caption-rendering defect)', () => {
+      const result = buildCubeKpiValueFormula('Tessallite', 'Shipping Cost', CUBE_KPI_PROPERTIES.Value);
+      expect(result).toMatch(/^=CUBEVALUE\(/);
+      expect(result).toContain('CUBEKPIMEMBER(');
+    });
+  });
+
+  // Bug-6729: kpiStatusCellFormula and kpiValueCellFormula produce the
+  // CUBEVALUE-wrapped formulas for scorecard / full-row / single-cell inserts.
+  describe('kpiStatusCellFormula (Bug-6729)', () => {
+    it('produces CUBEVALUE(CUBEKPIMEMBER(...,3)) for the Status cell', () => {
+      expect(kpiStatusCellFormula('Tessallite', 'Shipping Cost'))
+        .toBe('=CUBEVALUE("Tessallite",CUBEKPIMEMBER("Tessallite","Shipping Cost",3))');
+    });
+  });
+
+  describe('kpiValueCellFormula (Bug-6729)', () => {
+    it('measure-backed KPI: CUBEVALUE on the measure (unchanged)', () => {
+      expect(kpiValueCellFormula('Tessallite', 'kpi_name', 'net_sales'))
+        .toBe('=CUBEVALUE("Tessallite","[Measures].[net_sales]")');
+    });
+
+    it('custom KPI: CUBEVALUE(CUBEKPIMEMBER Value) -- never bare CUBEKPIMEMBER', () => {
+      const result = kpiValueCellFormula('Tessallite', 'kpi_name', null);
+      expect(result).toMatch(/^=CUBEVALUE\(/);
+      expect(result).toContain('CUBEKPIMEMBER("Tessallite","kpi_name",1)');
     });
   });
 

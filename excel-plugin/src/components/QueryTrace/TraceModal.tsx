@@ -1,6 +1,7 @@
 import { Box, Typography, Dialog, DialogTitle, DialogContent, DialogActions, Button, ThemeProvider, Chip } from '@mui/material';
 import { tokens, theme } from '../../theme';
 import type { SemanticQuery, PluginRouteTrace } from '../../types/tessallite';
+import { strings, templates } from '../../i18n/strings';
 
 interface TraceModalProps {
   open: boolean;
@@ -13,21 +14,21 @@ interface TraceModalProps {
 }
 
 const ROUTE_LABELS: Record<string, string> = {
-  aggregate: 'Aggregate (accelerated)',
-  pocket: 'Pocket table (accelerated)',
-  source: 'Source database',
+  aggregate: strings.trace.routeAggregate,
+  pocket: strings.trace.routePocket,
+  source: strings.trace.routeSource,
 };
 
 export default function TraceModal({ open, onClose, query, route, modelId, personaId }: TraceModalProps) {
   return (
     <ThemeProvider theme={theme}>
     <Dialog open={open} onClose={onClose} maxWidth={false} sx={{ '& .MuiDialog-paper': { width: 380, borderRadius: 2 } }}>
-      <DialogTitle sx={{ fontSize: 14, fontWeight: 700, pb: 0 }}>Query Trace</DialogTitle>
+      <DialogTitle sx={{ fontSize: 14, fontWeight: 700, pb: 0 }}>{strings.trace.title}</DialogTitle>
       <DialogContent sx={{ p: 2 }}>
         {query ? (
           <Box>
             <Typography sx={{ fontSize: 11, fontWeight: 600, color: tokens.colorTextSecondary, mb: 0.5 }}>
-              Model: {modelId}{personaId ? ` | Persona: ${personaId}` : ''}
+              {templates.trace.modelPersona(modelId, personaId)}
             </Typography>
 
             {/* F-025-20: show the route the report actually took. */}
@@ -51,27 +52,34 @@ export default function TraceModal({ open, onClose, query, route, modelId, perso
                     {route.rewritten_query}
                   </Box>
                 )}
+                {/* Bug-6389: explain a policy withhold instead of silently
+                    rendering nothing, so the trace does not look broken. */}
+                {!route.rewritten_query && route.rewritten_query_redacted && (
+                  <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, mb: 1 }}>
+                    {strings.trace.sqlRedacted}
+                  </Typography>
+                )}
               </Box>
             )}
 
             <Typography sx={{ fontSize: 11, fontWeight: 600, color: tokens.colorTextSecondary, mb: 0.5 }}>
-              Semantic query
+              {strings.trace.semanticQuery}
             </Typography>
             <Box sx={{ bgcolor: tokens.colorSubtleFill, p: 1, borderRadius: 1, fontFamily: tokens.fontMono, fontSize: 11, whiteSpace: 'pre-wrap', maxHeight: 280, overflow: 'auto' }}>
               {JSON.stringify(query, null, 2)}
             </Box>
             <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, mt: 1 }}>
-              The semantic query above is sent to the query-router. The route above is the server's decision — whether the report was answered from an accelerated aggregate/pocket table or the source database — with the rewritten SQL it ran. SQL generation, aggregate routing, and dialect translation are performed server-side.
+              {strings.trace.description}
             </Typography>
           </Box>
         ) : (
           <Typography sx={{ fontSize: 13, color: tokens.colorTextSecondary }}>
-            Execute a query in Report Builder to view its trace. Add measures to Values and run Insert Table or Insert Chart.
+            {strings.trace.emptyState}
           </Typography>
         )}
       </DialogContent>
       <DialogActions sx={{ px: 2, pb: 1.5 }}>
-        <Button size="small" onClick={onClose} sx={{ textTransform: 'none' }}>Close</Button>
+        <Button size="small" onClick={onClose} sx={{ textTransform: 'none' }}>{strings.trace.close}</Button>
       </DialogActions>
     </Dialog>
     </ThemeProvider>

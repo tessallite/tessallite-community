@@ -11,6 +11,12 @@ from typing import Any
 
 import yaml
 
+from shared.importers.import_warnings import (
+    ImportWarningResponse,
+    extend_known_import_warnings,
+    make_import_warning,
+)
+
 
 @dataclass
 class DbtEntity:
@@ -79,7 +85,7 @@ class DbtParseResult:
     semantic_models: list[DbtSemanticModel] = field(default_factory=list)
     metrics: list[DbtMetric] = field(default_factory=list)
     saved_queries: list[DbtSavedQuery] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[ImportWarningResponse] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -132,7 +138,11 @@ def parse_dbt_project(files: dict[str, str]) -> DbtParseResult:
         try:
             doc = yaml.safe_load(content)
         except yaml.YAMLError:
-            combined.warnings.append(f"Skipped {filename}: invalid YAML")
+            combined.warnings.append(make_import_warning(
+                code="dbt.file_skipped",
+                params={"file": filename, "reason": "invalid_yaml"},
+                detail=f"Skipped {filename}: invalid YAML",
+            ))
             continue
 
         if not isinstance(doc, dict):
@@ -144,14 +154,16 @@ def parse_dbt_project(files: dict[str, str]) -> DbtParseResult:
         try:
             partial = parse_dbt_yaml(content)
         except DbtParseError as exc:
-            combined.warnings.append(
-                f"Skipped {filename}: {'; '.join(exc.errors[:3])}"
-            )
+            combined.warnings.append(make_import_warning(
+                code="dbt.file_skipped",
+                params={"file": filename, "reason": "parse_error"},
+                detail=f"Skipped {filename}: {'; '.join(exc.errors[:3])}",
+            ))
             continue
         combined.semantic_models.extend(partial.semantic_models)
         combined.metrics.extend(partial.metrics)
         combined.saved_queries.extend(partial.saved_queries)
-        combined.warnings.extend(partial.warnings)
+        extend_known_import_warnings(combined.warnings, partial.warnings)
 
     if not combined.semantic_models:
         combined.errors.append("No semantic_models found in any YAML file")
@@ -255,7 +267,11 @@ def _parse_saved_query(
 ) -> DbtSavedQuery | None:
     name = raw.get("name", "")
     if not name:
-        result.warnings.append("saved_query entry missing 'name' — skipped")
+        result.warnings.append(make_import_warning(
+            code="dbt.saved_query_skipped",
+            params={"reason": "missing_name"},
+            detail="saved_query entry missing 'name' — skipped",
+        ))
         return None
 
     query_params = raw.get("query_params", {})
@@ -272,10 +288,14 @@ def _parse_saved_query(
 
     exports = raw.get("exports", [])
     if exports:
-        result.warnings.append(
-            f"saved_query '{name}' has {len(exports)} export(s) — "
-            f"Tessallite does not import dbt export configs"
-        )
+        result.warnings.append(make_import_warning(
+            code="dbt.saved_query_exports_omitted",
+            params={"saved_query": name, "count": len(exports)},
+            detail=(
+                f"saved_query '{name}' has {len(exports)} export(s) — "
+                "Tessallite does not import dbt export configs"
+            ),
+        ))
 
     return DbtSavedQuery(
         name=name,

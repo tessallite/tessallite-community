@@ -2,18 +2,23 @@ import { useState } from 'react';
 import { Box, Typography, Chip, Collapse, IconButton } from '@mui/material';
 import {
   Add as AddIcon,
+  Remove as RemoveIcon,
   Functions as FunctionsIcon,
   InfoOutlined,
   KeyboardArrowUpOutlined,
 } from '@mui/icons-material';
 import { tokens } from '../../theme';
 import type { Measure, GlossaryEntry } from '../../types/tessallite';
+import { strings, templates } from '../../i18n/strings';
 
 interface MeasureCardProps {
   measure: Measure;
   checked: boolean;
   onToggle: () => void;
   onAddToValues: () => void;
+  /** Phase A default: insert as TESSALLITE.VALUE() formula (connectionless). */
+  onInsertAsFunction?: () => void;
+  /** Advanced: insert as CUBEVALUE formula (requires workbook connection). */
   onInsertAsFormula?: () => void;
   glossaryEntries?: GlossaryEntry[];
 }
@@ -29,6 +34,7 @@ export default function MeasureCard({
   checked,
   onToggle,
   onAddToValues,
+  onInsertAsFunction,
   onInsertAsFormula,
   glossaryEntries,
 }: MeasureCardProps) {
@@ -41,12 +47,12 @@ export default function MeasureCard({
   );
 
   const detailRows = [
-    measure.effective_description && { label: 'Description', value: measure.effective_description },
-    measure.default_agg && { label: 'Aggregation', value: measure.default_agg },
-    measure.format && { label: 'Format', value: measure.format },
-    measure.display_folder && { label: 'Folder', value: measure.display_folder },
-    measure.semi_additive_behavior && { label: 'Semi-additive', value: measure.semi_additive_behavior },
-    glossaryMatch?.definition && { label: 'Definition', value: glossaryMatch.definition },
+    measure.effective_description && { label: strings.measureCard.detailDescription, value: measure.effective_description },
+    measure.default_agg && { label: strings.measureCard.detailAggregation, value: measure.default_agg },
+    measure.format && { label: strings.measureCard.detailFormat, value: measure.format },
+    measure.display_folder && { label: strings.measureCard.detailFolder, value: measure.display_folder },
+    measure.semi_additive_behavior && { label: strings.measureCard.detailSemiAdditive, value: measure.semi_additive_behavior },
+    glossaryMatch?.definition && { label: strings.measureCard.detailDefinition, value: glossaryMatch.definition },
   ].filter(Boolean) as { label: string; value: string }[];
 
   return (
@@ -90,8 +96,8 @@ export default function MeasureCard({
           <IconButton
             size="small"
             onClick={(e) => { e.stopPropagation(); setDetailsOpen(v => !v); }}
-            title={detailsOpen ? 'Hide details' : 'Show details'}
-            aria-label={`${detailsOpen ? 'Hide' : 'Show'} details for ${measure.display_name}`}
+            title={detailsOpen ? strings.measureCard.hideDetails : strings.measureCard.showDetails}
+            aria-label={templates.measureCardDetail.detailsAria(detailsOpen ? strings.measureCard.hideDetails : strings.measureCard.showDetails, measure.display_name)}
             sx={{
               width: 28,
               height: 28,
@@ -107,12 +113,26 @@ export default function MeasureCard({
             className="m-add"
             sx={{ display: 'flex', alignItems: 'center', gap: 0.25, flexShrink: 0 }}
           >
-            {onInsertAsFormula && (
+            {onInsertAsFunction && (
+              <IconButton
+                size="small"
+                onClick={(e) => { e.stopPropagation(); onInsertAsFunction(); }}
+                title={strings.measureCard.insertAsFunction}
+                aria-label={templates.measureCard.insertAsFunction(measure.display_name)}
+                sx={{
+                  width: 28, height: 28, color: tokens.colorGoldDark,
+                  '&:hover': { bgcolor: tokens.colorGoldBg },
+                }}
+              >
+                <FunctionsIcon sx={{ fontSize: 14 }} />
+              </IconButton>
+            )}
+            {onInsertAsFormula && !onInsertAsFunction && (
               <IconButton
                 size="small"
                 onClick={(e) => { e.stopPropagation(); onInsertAsFormula(); }}
-                title="Insert as CUBEVALUE formula"
-                aria-label={`Insert ${measure.display_name} as CUBEVALUE formula`}
+                title={strings.measureCard.insertAsCubeFormula}
+                aria-label={templates.measureCard.insertAsCubeFormula(measure.display_name)}
                 sx={{
                   width: 28, height: 28, color: tokens.colorGoldDark,
                   '&:hover': { bgcolor: tokens.colorGoldBg },
@@ -124,8 +144,8 @@ export default function MeasureCard({
             <IconButton
               size="small"
               onClick={(e) => { e.stopPropagation(); onAddToValues(); }}
-              title="Add to Values"
-              aria-label={`Add ${measure.display_name} to Values`}
+              title={strings.measureCard.addToValues}
+              aria-label={templates.measureCardDetail.addToValuesAria(measure.display_name)}
               sx={{
                 width: 28, height: 28, color: tokens.colorPrimary,
                 '&:hover': { bgcolor: tokens.colorPrimaryBg },
@@ -134,6 +154,24 @@ export default function MeasureCard({
               <AddIcon sx={{ fontSize: 14 }} />
             </IconButton>
           </Box>
+        )}
+        {/* Bug-6713: a staged (checked) measure previously hid its icon
+            cluster, leaving row-click as the only way to un-stage it --
+            unreachable by keyboard. Keyboard counterpart of the row click,
+            mirroring KpiCard's Bug-6710 remove button. */}
+        {checked && (
+          <IconButton
+            size="small"
+            onClick={(e) => { e.stopPropagation(); onToggle(); }}
+            title={strings.measureCard.removeFromValues}
+            aria-label={templates.measureCard.removeFromValuesAria(measure.display_name)}
+            sx={{
+              width: 28, height: 28, color: tokens.colorPrimary, flexShrink: 0,
+              '&:hover': { bgcolor: tokens.colorPrimaryBg },
+            }}
+          >
+            <RemoveIcon sx={{ fontSize: 14 }} />
+          </IconButton>
         )}
       </Box>
       <Collapse in={detailsOpen}>

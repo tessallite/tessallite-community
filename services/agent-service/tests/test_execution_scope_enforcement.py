@@ -28,6 +28,7 @@ from src.exec.query import (
     PersonaFieldScope,
     PersonaScopeViolationError,
     QueryExecutionError,
+    QueryExecution,
     _extract_router_error_detail,
     enforce_execution_scope,
     execute_query,
@@ -311,6 +312,82 @@ class TestRecipeExecutionEnforcement:
             )
         assert isinstance(exc.value.__cause__, PersonaScopeViolationError)
 
+    @pytest.mark.asyncio
+    async def test_saved_recipe_with_renamed_measure_executes_and_combines(self):
+        """Bug-8096: rename propagation must keep both step and combine names
+        aligned so an already-saved recipe remains executable."""
+        recipe = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            project_id=TEST_PROJECT_ID,
+            name="Net revenue ratio",
+            parameters=[],
+            steps=[
+                {
+                    "name": "sales",
+                    "model_id": str(ALLOWED_MODEL),
+                    "measures": ["Net Revenue"],
+                    "dimensions": [],
+                },
+                {
+                    "name": "units",
+                    "model_id": str(ALLOWED_MODEL),
+                    "measures": ["Units"],
+                    "dimensions": [],
+                },
+            ],
+            combine={
+                "op": "div",
+                "args": [
+                    {"ref": {"step": "sales", "measure": "Net Revenue"}},
+                    {"ref": {"step": "units", "measure": "Units"}},
+                ],
+            },
+        )
+        db = make_mock_db()
+        db.get = AsyncMock(return_value=recipe)
+        executions = [
+            QueryExecution(
+                sql="select 100",
+                columns=["Net Revenue"],
+                rows=[{"Net Revenue": 100}],
+                rows_returned=1,
+                route_type="source",
+                routed_sql=None,
+                aggregate_id=None,
+                pocket_id=None,
+                execution_ms=1,
+            ),
+            QueryExecution(
+                sql="select 4",
+                columns=["Units"],
+                rows=[{"Units": 4}],
+                rows_returned=1,
+                route_type="source",
+                routed_sql=None,
+                aggregate_id=None,
+                pocket_id=None,
+                execution_ms=1,
+            ),
+        ]
+
+        with patch(
+            "src.exec.recipe.execute_query",
+            new=AsyncMock(side_effect=executions),
+        ) as query:
+            result = await execute_recipe(
+                db,
+                TEST_PROJECT_ID,
+                RunRecipeToolCall(recipe_id=str(recipe.id), parameters={}),
+                "jwt",
+                allowed_model_ids={ALLOWED_MODEL},
+            )
+
+        assert [call.args[1].measures for call in query.await_args_list] == [
+            ["Net Revenue"],
+            ["Units"],
+        ]
+        assert result.combine_value == 25
+
 
 # ---------------------------------------------------------------------------
 # Read tools (evaluate_kpi / preview_named_set) + create_aggregate
@@ -323,8 +400,9 @@ class TestReadToolAllowList:
             allow_list_model_ids=[ALLOWED_MODEL], persona_scopes=None
         )
 
-    def test_evaluate_kpi_forbidden_model_refused(self):
-        outcome = _allow_list_refusal_outcome(
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_forbidden_model_refused(self):
+        outcome = await _allow_list_refusal_outcome(
             EvaluateKpiToolCall(model_id=str(FORBIDDEN_MODEL), kpi_id="k"),
             self._bundle(), None, None,
         )
@@ -332,8 +410,9 @@ class TestReadToolAllowList:
         assert outcome.status == "refused"
         assert outcome.guardrail_actions[0]["reason"] == "model_not_allow_listed"
 
-    def test_preview_named_set_forbidden_model_refused(self):
-        outcome = _allow_list_refusal_outcome(
+    @pytest.mark.asyncio
+    async def test_preview_named_set_forbidden_model_refused(self):
+        outcome = await _allow_list_refusal_outcome(
             PreviewNamedSetToolCall(
                 model_id=str(FORBIDDEN_MODEL), named_set_id="n"
             ),
@@ -342,15 +421,17 @@ class TestReadToolAllowList:
         assert outcome is not None
         assert outcome.status == "refused"
 
-    def test_allowed_model_passes(self):
-        outcome = _allow_list_refusal_outcome(
+    @pytest.mark.asyncio
+    async def test_allowed_model_passes(self):
+        outcome = await _allow_list_refusal_outcome(
             EvaluateKpiToolCall(model_id=str(ALLOWED_MODEL), kpi_id="k"),
             self._bundle(), None, None,
         )
         assert outcome is None
 
-    def test_create_aggregate_keeps_plan_shape(self):
-        outcome = _allow_list_refusal_outcome(
+    @pytest.mark.asyncio
+    async def test_create_aggregate_keeps_plan_shape(self):
+        outcome = await _allow_list_refusal_outcome(
             CreateAggregateToolCall(
                 model_id=str(FORBIDDEN_MODEL), measures=["m"],
                 dimensions=["d"], description="x",
@@ -362,8 +443,9 @@ class TestReadToolAllowList:
             "tool": "create_aggregate", "model_id": str(FORBIDDEN_MODEL)
         }
 
-    def test_invalid_model_id_refused(self):
-        outcome = _allow_list_refusal_outcome(
+    @pytest.mark.asyncio
+    async def test_invalid_model_id_refused(self):
+        outcome = await _allow_list_refusal_outcome(
             EvaluateKpiToolCall(model_id="garbage", kpi_id="k"),
             self._bundle(), None, None,
         )
@@ -499,6 +581,10 @@ async def _request(method: str, path: str, role: str, gate_db, endpoint_db, json
         with (
             patch("src.api.agent_config.get_tenant_db", lambda *a, **kw: _agen(gate_db)),
             patch("src.api.recipes.get_tenant_db", lambda *a, **kw: _agen(endpoint_db)),
+            patch(
+                "src.api.recipes.acquire_model_definition_lock",
+                new_callable=AsyncMock,
+            ),
         ):
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
@@ -520,7 +606,13 @@ def _endpoint_db(model_project_id=None) -> AsyncMock:
         project_id=TEST_PROJECT_ID
     )
     cfg_result.scalars.return_value.all.return_value = []
-    db.execute = AsyncMock(return_value=cfg_result)
+    measure_result = MagicMock()
+    measure_result.scalars.return_value.all.return_value = ["revenue"]
+
+    async def _execute(stmt):
+        return measure_result if "FROM measures" in str(stmt) else cfg_result
+
+    db.execute = AsyncMock(side_effect=_execute)
 
     async def _get(_cls, pk):
         return types.SimpleNamespace(
@@ -600,31 +692,96 @@ class TestRecipeCrudRoleGate:
         assert "not in project" in resp.text
 
 
-# ── Bug-5279: persona field-scope on KPI/named-set/create-aggregate ──────
+# ── Bug-5279 / Bug-6329: persona field-scope on KPI/named-set/aggregate ──
+
+MODEL_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
+
+
+class _Scalars:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _Result:
+    """Stand-in for a SQLAlchemy Result supporting ``.all()`` and
+    ``.scalars().all()``."""
+
+    def __init__(self, rows=None, *, scalar_rows=None):
+        self._rows = rows or []
+        self._scalar_rows = scalar_rows if scalar_rows is not None else (rows or [])
+
+    def all(self):
+        return self._rows
+
+    def scalars(self):
+        return _Scalars(self._scalar_rows)
+
+
+def _kpi_lineage_db(*, get_return, measure_rows=None, dim_rows=None, kpi_rows=None):
+    """Mock DB for the KPI lineage gate.
+
+    ``db.get`` -> the target KPI; ``db.execute`` is called three times, in
+    order: measure-id/name map (``.all()`` -> *measure_rows*), dimension
+    id/name map (``.all()`` -> *dim_rows*), then the model KPI set
+    (``.scalars().all()`` -> *kpi_rows*, for transitive kpi() refs)."""
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=get_return)
+    db.execute = AsyncMock(side_effect=[
+        _Result(measure_rows or []),
+        _Result(dim_rows or []),
+        _Result(scalar_rows=kpi_rows or []),
+    ])
+    return db
+
+
+def _ns_lineage_db(*, get_return, dim_rows=None):
+    """Mock DB for the named-set lineage gate: ``db.get`` -> the NamedSet;
+    a single ``db.execute`` -> ``.all()`` yields *dim_rows*."""
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=get_return)
+    db.execute = AsyncMock(return_value=_Result(dim_rows or []))
+    return db
+
+
+def _kpi_row(*, expression=None, target_expression=None,
+             value_measure_id=None, goal_measure_id=None,
+             target_measure_id=None, time_dimension_id=None,
+             name="KPI", model_id=MODEL_ID):
+    return types.SimpleNamespace(
+        id=uuid.uuid4(), model_id=model_id, name=name,
+        expression=expression, target_expression=target_expression,
+        value_measure_id=value_measure_id, goal_measure_id=goal_measure_id,
+        target_measure_id=target_measure_id, time_dimension_id=time_dimension_id,
+    )
+
+
+def _ns_row(*, expression=None, dimensions=None, model_id=MODEL_ID):
+    return types.SimpleNamespace(
+        id=uuid.uuid4(), model_id=model_id, expression=expression,
+        dimensions=dimensions,
+    )
+
 
 class TestPersonaScopeOnNonQueryTools:
     """Bug-5279 — the KPI, named-set, and create-aggregate branches must
-    enforce the persona field scope, not just the model allow-list."""
+    enforce the persona field scope, not just the model allow-list.
+    Bug-6329 — the KPI / named-set checks resolve measure / dimension
+    lineage from the DB (not an always-complete profile list)."""
 
-    def _bundle(self, *, persona_scopes=None, model_profiles=None, kpi_ids=None, ns_ids=None):
-        model_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
-        profile = types.SimpleNamespace(
-            id=model_id,
-            kpis=[types.SimpleNamespace(id=k) for k in (kpi_ids or [])],
-            named_sets=[types.SimpleNamespace(id=n) for n in (ns_ids or [])],
-        )
+    def _bundle(self, *, persona_scopes=None):
         return types.SimpleNamespace(
-            allow_list_model_ids=[model_id],
+            allow_list_model_ids=[MODEL_ID],
             persona_scopes=persona_scopes,
-            model_profiles=model_profiles or [profile],
+            model_profiles=[],
         )
 
-    def test_create_aggregate_blocked_when_measure_outside_persona(self):
-        from src.pipeline import _allow_list_refusal_outcome
-        from src.tools.spec import CreateAggregateToolCall
-        model_id = "11111111-1111-1111-1111-111111111111"
+    @pytest.mark.asyncio
+    async def test_create_aggregate_blocked_when_measure_outside_persona(self):
         call = CreateAggregateToolCall(
-            model_id=model_id,
+            model_id=str(MODEL_ID),
             measures=["hidden_measure"],
             dimensions=["dim1"],
             description="test",
@@ -633,20 +790,16 @@ class TestPersonaScopeOnNonQueryTools:
             measures=frozenset(["visible_measure"]),
             dimensions=frozenset(["dim1"]),
         )
-        bundle = self._bundle(
-            persona_scopes={uuid.UUID(model_id): scope},
-        )
-        result = _allow_list_refusal_outcome(call, bundle, None, None)
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        result = await _allow_list_refusal_outcome(call, bundle, None, None)
         assert result is not None
         assert result.status == "refused"
         assert "persona_scope_violation" in str(result.guardrail_actions)
 
-    def test_create_aggregate_passes_when_all_fields_in_scope(self):
-        from src.pipeline import _allow_list_refusal_outcome
-        from src.tools.spec import CreateAggregateToolCall
-        model_id = "11111111-1111-1111-1111-111111111111"
+    @pytest.mark.asyncio
+    async def test_create_aggregate_passes_when_all_fields_in_scope(self):
         call = CreateAggregateToolCall(
-            model_id=model_id,
+            model_id=str(MODEL_ID),
             measures=["visible_measure"],
             dimensions=["dim1"],
             description="test",
@@ -655,75 +808,326 @@ class TestPersonaScopeOnNonQueryTools:
             measures=frozenset(["visible_measure"]),
             dimensions=frozenset(["dim1"]),
         )
-        bundle = self._bundle(
-            persona_scopes={uuid.UUID(model_id): scope},
-        )
-        result = _allow_list_refusal_outcome(call, bundle, None, None)
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        result = await _allow_list_refusal_outcome(call, bundle, None, None)
         assert result is None
 
-    def test_evaluate_kpi_blocked_when_kpi_not_in_profile(self):
-        from src.pipeline import _allow_list_refusal_outcome
-        from src.tools.spec import EvaluateKpiToolCall
-        model_id = "11111111-1111-1111-1111-111111111111"
-        call = EvaluateKpiToolCall(model_id=model_id, kpi_id="hidden-kpi")
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_blocked_when_measure_hidden(self):
+        """Bug-6329 — a KPI whose expression references a measure the
+        persona cannot see must be refused, even though the (unfiltered)
+        prompt profile still lists it."""
+        kpi = _kpi_row(expression='measure("hidden_measure")')
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(kpi.id))
         scope = PersonaFieldScope(
-            measures=frozenset(["m1"]),
+            measures=frozenset(["visible_measure"]),
             dimensions=frozenset(["d1"]),
         )
-        bundle = self._bundle(
-            persona_scopes={uuid.UUID(model_id): scope},
-            kpi_ids=["visible-kpi"],  # hidden-kpi is not exposed
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(get_return=kpi, kpi_rows=[kpi])
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is not None
+        assert result.status == "refused"
+        assert "persona_scope_violation" in str(result.guardrail_actions)
+
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_blocked_via_legacy_measure_id(self):
+        """Bug-6329 — legacy value/goal/target measure-id bindings are
+        resolved and gated too."""
+        hidden_mid = uuid.uuid4()
+        kpi = _kpi_row(value_measure_id=hidden_mid)
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(kpi.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["d1"]),
         )
-        result = _allow_list_refusal_outcome(call, bundle, None, None)
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        # measure table maps the hidden id to a name NOT in the visible set
+        db = _kpi_lineage_db(
+            get_return=kpi, measure_rows=[(hidden_mid, "hidden_measure")], kpi_rows=[kpi],
+        )
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
         assert result is not None
         assert result.status == "refused"
 
-    def test_no_persona_allows_through(self):
-        from src.pipeline import _allow_list_refusal_outcome
-        from src.tools.spec import CreateAggregateToolCall
-        model_id = "11111111-1111-1111-1111-111111111111"
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_passes_when_measure_visible(self):
+        """Bug-6329 — a KPI on a visible measure is allowed through."""
+        kpi = _kpi_row(expression='measure("visible_measure")')
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(kpi.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["d1"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(get_return=kpi, kpi_rows=[kpi])
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_fail_closed_when_kpi_missing(self):
+        """Bug-6329 — an unresolvable KPI id is refused (fail-closed)."""
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(uuid.uuid4()))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["d1"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(get_return=None)
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is not None
+        assert result.status == "refused"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_fail_closed_on_unparseable_expression(self):
+        """Bug-6329 round-2 (Codex) — a KPI whose expression cannot be
+        parsed has indeterminate lineage and must be refused, not allowed
+        through with an empty inferred measure set (fail-closed)."""
+        kpi = _kpi_row(expression="this is not a valid ((kpi expression")
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(kpi.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["d1"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(get_return=kpi, kpi_rows=[kpi])
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is not None
+        assert result.status == "refused"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_blocked_via_composite_child_hidden_measure(self):
+        """Bug-6329 round-2 (Codex) — a composite KPI referencing a child
+        kpi() built on a hidden measure must be refused (transitive
+        lineage), even though the parent expression names no measure."""
+        child = _kpi_row(name="Child KPI", expression='measure("hidden_measure")')
+        parent = _kpi_row(name="Parent KPI", expression='kpi("Child KPI")')
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(parent.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["d1"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(get_return=parent, kpi_rows=[parent, child])
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is not None
+        assert result.status == "refused"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_composite_passes_when_child_measure_visible(self):
+        """Bug-6329 round-2 — a composite KPI whose child references only a
+        visible measure is allowed (transitive resolution succeeds)."""
+        child = _kpi_row(name="Child KPI", expression='measure("visible_measure")')
+        parent = _kpi_row(name="Parent KPI", expression='kpi("Child KPI")')
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(parent.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["d1"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(get_return=parent, kpi_rows=[parent, child])
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_fail_closed_on_unresolved_kpi_ref(self):
+        """Bug-6329 round-2 — a kpi() dependency that resolves to no KPI in
+        the model is indeterminate lineage and must be refused."""
+        parent = _kpi_row(name="Parent KPI", expression='kpi("Missing Child")')
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(parent.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["d1"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(get_return=parent, kpi_rows=[parent])
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is not None
+        assert result.status == "refused"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_blocked_when_dimension_ref_hidden(self):
+        """Bug-6329 round-2 (Codex deep-review) — a KPI whose expression
+        references a hidden dimension via dimension() must be refused; the
+        measure-only gate let this through."""
+        kpi = _kpi_row(expression='safe_div(measure("visible_measure"), dimension("hidden_dim"))')
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(kpi.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["visible_dim"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(
+            get_return=kpi,
+            dim_rows=[(uuid.uuid4(), "hidden_dim"), (uuid.uuid4(), "visible_dim")],
+            kpi_rows=[kpi],
+        )
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is not None
+        assert result.status == "refused"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_blocked_when_time_dimension_hidden(self):
+        """Bug-6329 round-2 — a KPI bound to a hidden time_dimension_id must
+        be refused."""
+        hidden_dim_id = uuid.uuid4()
+        kpi = _kpi_row(
+            expression='measure("visible_measure")', time_dimension_id=hidden_dim_id,
+        )
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(kpi.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["visible_dim"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(
+            get_return=kpi,
+            dim_rows=[(hidden_dim_id, "hidden_dim"), (uuid.uuid4(), "visible_dim")],
+            kpi_rows=[kpi],
+        )
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is not None
+        assert result.status == "refused"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_fail_closed_on_unresolved_dimension_ref(self):
+        """Bug-6329 round-2 verify — a dimension() ref that resolves to no
+        model dimension is indeterminate lineage and must be refused, not
+        silently ignored (symmetric with measure/kpi handling)."""
+        kpi = _kpi_row(expression='safe_div(measure("visible_measure"), dimension("ghost_dim"))')
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(kpi.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["visible_dim"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(
+            get_return=kpi,
+            dim_rows=[(uuid.uuid4(), "visible_dim")],  # ghost_dim absent
+            kpi_rows=[kpi],
+        )
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is not None
+        assert result.status == "refused"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_fail_closed_on_dangling_time_dimension(self):
+        """Bug-6329 round-2 verify — a time_dimension_id that does not
+        resolve to a model dimension (deleted/dangling) is indeterminate
+        lineage and must be refused."""
+        kpi = _kpi_row(
+            expression='measure("visible_measure")', time_dimension_id=uuid.uuid4(),
+        )
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(kpi.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["visible_dim"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(
+            get_return=kpi,
+            dim_rows=[(uuid.uuid4(), "visible_dim")],  # the tdid is not present
+            kpi_rows=[kpi],
+        )
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is not None
+        assert result.status == "refused"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_kpi_passes_when_dimension_visible(self):
+        """Bug-6329 round-2 — a KPI referencing only a visible dimension and
+        a visible time dimension is allowed."""
+        visible_dim_id = uuid.uuid4()
+        kpi = _kpi_row(
+            expression='safe_div(measure("visible_measure"), dimension("visible_dim"))',
+            time_dimension_id=visible_dim_id,
+        )
+        call = EvaluateKpiToolCall(model_id=str(MODEL_ID), kpi_id=str(kpi.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["visible_measure"]),
+            dimensions=frozenset(["visible_dim"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _kpi_lineage_db(
+            get_return=kpi,
+            dim_rows=[(uuid.uuid4(), "hidden_dim"), (visible_dim_id, "visible_dim")],
+            kpi_rows=[kpi],
+        )
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_no_persona_allows_through(self):
         call = CreateAggregateToolCall(
-            model_id=model_id,
+            model_id=str(MODEL_ID),
             measures=["any_measure"],
             dimensions=["any_dim"],
             description="test",
         )
         bundle = self._bundle(persona_scopes=None)
-        result = _allow_list_refusal_outcome(call, bundle, None, None)
+        result = await _allow_list_refusal_outcome(call, bundle, None, None)
         assert result is None
 
-    def test_model_not_in_persona_refused(self):
-        from src.pipeline import _allow_list_refusal_outcome
-        from src.tools.spec import CreateAggregateToolCall
-        model_id = "11111111-1111-1111-1111-111111111111"
+    @pytest.mark.asyncio
+    async def test_model_not_in_persona_refused(self):
         call = CreateAggregateToolCall(
-            model_id=model_id,
+            model_id=str(MODEL_ID),
             measures=["m1"],
             dimensions=["d1"],
             description="test",
         )
         # Persona scopes dict is set but the model is NOT in it
         bundle = self._bundle(persona_scopes={})
-        result = _allow_list_refusal_outcome(call, bundle, None, None)
+        result = await _allow_list_refusal_outcome(call, bundle, None, None)
         assert result is not None
         assert result.status == "refused"
         assert "persona" in result.answer_text.lower()
 
-    def test_preview_named_set_blocked_when_ns_not_in_profile(self):
-        """Review R1 5279-F2 — preview_named_set must be persona-scoped."""
-        from src.pipeline import _allow_list_refusal_outcome
-        from src.tools.spec import PreviewNamedSetToolCall
-        model_id = "11111111-1111-1111-1111-111111111111"
-        call = PreviewNamedSetToolCall(model_id=model_id, named_set_id="hidden-ns")
+    @pytest.mark.asyncio
+    async def test_preview_named_set_blocked_when_dimension_hidden(self):
+        """Bug-6329 — a named set referencing a real model dimension the
+        persona cannot see must be refused."""
+        ns = _ns_row(expression="[hidden_dim].members")
+        call = PreviewNamedSetToolCall(model_id=str(MODEL_ID), named_set_id=str(ns.id))
         scope = PersonaFieldScope(
             measures=frozenset(["m1"]),
-            dimensions=frozenset(["d1"]),
+            dimensions=frozenset(["visible_dim"]),
         )
-        bundle = self._bundle(
-            persona_scopes={uuid.UUID(model_id): scope},
-            ns_ids=["visible-ns"],  # hidden-ns is not exposed
-        )
-        result = _allow_list_refusal_outcome(call, bundle, None, None)
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _ns_lineage_db(get_return=ns, dim_rows=[("hidden_dim",), ("visible_dim",)])
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
         assert result is not None
         assert result.status == "refused"
         assert "persona_scope_violation" in str(result.guardrail_actions)
+
+    @pytest.mark.asyncio
+    async def test_preview_named_set_blocked_via_authoritative_dimensions_field(self):
+        """Bug-6329 round-2 (Codex) — the authoritative persisted
+        ``dimensions`` field is also consulted: a named set that names a
+        hidden dimension there is refused even when the MDX expression
+        yields no confident reference."""
+        ns = _ns_row(expression="{ some.opaque.Members }", dimensions="hidden_dim, other")
+        call = PreviewNamedSetToolCall(model_id=str(MODEL_ID), named_set_id=str(ns.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["m1"]),
+            dimensions=frozenset(["visible_dim"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _ns_lineage_db(get_return=ns, dim_rows=[("hidden_dim",), ("visible_dim",)])
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is not None
+        assert result.status == "refused"
+
+    @pytest.mark.asyncio
+    async def test_preview_named_set_passes_when_dimension_visible(self):
+        """Bug-6329 — a named set on a visible dimension is allowed."""
+        ns = _ns_row(expression="[visible_dim].members")
+        call = PreviewNamedSetToolCall(model_id=str(MODEL_ID), named_set_id=str(ns.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["m1"]),
+            dimensions=frozenset(["visible_dim"]),
+        )
+        bundle = self._bundle(persona_scopes={MODEL_ID: scope})
+        db = _ns_lineage_db(get_return=ns, dim_rows=[("hidden_dim",), ("visible_dim",)])
+        result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
+        assert result is None

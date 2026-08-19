@@ -866,6 +866,24 @@ def _parse_filter_list(
             )
         if op in ("is_null", "is_not_null"):
             f.setdefault("value", None)
+        # Bug-7360 -- validate value shape for between/in so a malformed
+        # value is caught at parse time (correction loop can repair) rather
+        # than silently dropped in _filter_to_sql (wrong numbers).
+        val = f.get("value")
+        if op == "between":
+            if not isinstance(val, (list, tuple)) or len(val) != 2:
+                raise ToolCallParseError(
+                    f"{key} filter on {f['name']!r} with op='between' "
+                    f"requires a 2-element list as 'value' "
+                    f"(e.g. [\"2026-01-01\", \"2026-01-31\"]), "
+                    f"got {type(val).__name__}."
+                )
+        if op == "in" and val is not None:
+            if not isinstance(val, list):
+                raise ToolCallParseError(
+                    f"{key} filter on {f['name']!r} with op='in' "
+                    f"requires a list as 'value', got {type(val).__name__}."
+                )
         flat.append(f)
     return flat, refs
 

@@ -110,6 +110,7 @@
   "publicGlossary.downloadPdf": "下载 PDF",
   "publicGlossary.entryCount": "{{visible}} / {{total}} 个条目",
   "publicGlossary.invalidLink": "此共享链接无效或已过期。请联系模型所有者重新生成。",
+  "publicGlossary.loadError": "无法加载术语表。请稍后重试或联系模型所有者。",
   "publicGlossary.noResults": "没有匹配搜索的词汇表条目。",
   "publicGlossary.overline": "Tessallite 词汇表",
   "publicGlossary.searchPlaceholder": "搜索术语、定义、同义词…",

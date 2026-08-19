@@ -7,7 +7,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 
 from shared.data_quality.validator import validate_rules
-from shared.db.models import DataQualityRule, DataQualityViolation, Model
+from shared.db.models import (
+    DataQualityRule,
+    DataQualityViolation,
+    Dimension,
+    Measure,
+    Model,
+    ModelColumn,
+)
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import (
     DataQualityRuleCreate,
@@ -18,11 +25,30 @@ from shared.schemas.pydantic_models import (
 )
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
+from src.api._model_lock import acquire_model_definition_lock
+from src.api._scope import ensure_target_in_model
 
 router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}/data-quality-rules",
     tags=["data-quality"],
 )
+
+# The ORM class that OWNS each ``target_type`` a data-quality rule may name.
+#
+# Keys must stay identical to ``_DQ_TARGET_TYPES`` in
+# ``shared/schemas/domains/governance_advanced.py`` — the request schema's own
+# vocabulary. ``tests/test_data_quality_target_scope.py`` pins the two sets
+# equal, so adding a target type to the schema without teaching this map fails
+# the suite rather than reaching ``ensure_target_in_model`` as an unrecognised
+# type (which fails closed, but as a 422 the modeller cannot act on).
+#
+# Every value is a real entity: unlike glossary attachments there is no id-less
+# "concept" target here, so ``None`` never appears and a rule always names a row.
+_DQ_RULE_TARGETS: dict[str, type] = {
+    "dimension": Dimension,
+    "measure": Measure,
+    "column": ModelColumn,
+}
 
 
 def _not_found(msg: str = "Not found") -> HTTPException:
@@ -66,6 +92,40 @@ async def create_rule(
 ) -> DataQualityRuleResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await _get_model(db, project_id, model_id)
+        # Bug-7982 finding 7 then 3: auth before lock; DataQualityRule is
+        # snapshot-owned (truncate-reinserted on revert).
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
+
+        # ``(target_type, target_id)`` is a POLYMORPHIC body foreign key that was
+        # written straight into the rule. RBAC proves only that the caller may
+        # act in the PATH project; nothing proved the submitted target belonged
+        # to it, and ``model_columns.id`` / ``dimensions.id`` / ``measures.id``
+        # are all tenant-schema-wide, so a project-B id satisfies the column type
+        # and persists.
+        #
+        # The consequence is a source-data read, not merely a mis-associated row.
+        # ``shared/data_quality/validator.py::_resolve_column_ref`` dereferences
+        # ``rule.target_id`` with a bare ``db.get(ModelColumn, ...)`` and NO
+        # ownership re-check, walks it to its ModelTable's ``physical_name``, and
+        # issues a COUNT/GROUP BY against that table through /introspect using a
+        # ``system_admin`` service token (``_mint_service_token``). A foreign
+        # target therefore turns "add a not-null rule" into a query over another
+        # project's physical table, with the row count and up to ten sample
+        # VALUES persisted into this model's DataQualityViolation rows and
+        # rendered in this model's UI.
+        #
+        # Validated under the definition lock and BEFORE ``db.add``: the helper's
+        # SELECT autoflushes, so a guard placed after the row is added would
+        # already have sent the unvalidated foreign key to the database.
+        await ensure_target_in_model(
+            db,
+            target_type=body.target_type,
+            target_id=body.target_id,
+            model_id=model_id,
+            project_id=project_id,
+            allowed_targets=_DQ_RULE_TARGETS,
+        )
+
         rule = DataQualityRule(
             model_id=model_id,
             name=body.name,
@@ -97,6 +157,7 @@ async def update_rule(
 ) -> DataQualityRuleResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await _get_model(db, project_id, model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         rule = await db.get(DataQualityRule, rule_id)
         if rule is None or rule.model_id != model_id:
             raise _not_found("Rule not found")
@@ -128,6 +189,7 @@ async def delete_rule(
 ) -> None:
     async for db in get_tenant_db(current_user.tenant_id):
         await _get_model(db, project_id, model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         rule = await db.get(DataQualityRule, rule_id)
         if rule is None or rule.model_id != model_id:
             raise _not_found("Rule not found")
@@ -183,6 +245,17 @@ async def clear_violations(
 ) -> None:
     async for db in get_tenant_db(current_user.tenant_id):
         await _get_model(db, project_id, model_id)
+        # Bug-8740: this endpoint is named for the VIOLATIONS it clears, and was
+        # allow-listed on that basis — but it also resets
+        # ``DataQualityRule.last_violation_count``, and ``data_quality_rules`` is
+        # a snapshot-owned table the revert delete-and-reinserts. That write went
+        # out unlocked, so the runtime guard reported a Bug-7982 violation on an
+        # ordinary "clear violations" click in the production ``warn`` default,
+        # and under a concurrent revert the reset was either lost or raised
+        # ``StaleDataError`` (0 rows matched) as an HTTP 500 to the modeller.
+        # READ-UNDER-LOCK: the rule fetch below is the read-modify-write's own
+        # ownership check, so the lock is taken first.
+        await acquire_model_definition_lock(db, model_id)
         rule = await db.get(DataQualityRule, rule_id)
         if rule is None or rule.model_id != model_id:
             raise _not_found("Rule not found")

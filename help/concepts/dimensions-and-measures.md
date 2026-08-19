@@ -80,6 +80,14 @@ This design lets modellers keep internal detail columns (like individual fee com
 
 ---
 
+## Attribute relationships
+
+A dimension often carries more than one column that describes the same member — a country dimension keyed on `country_code` may also hold `country_name`. When two such columns are genuinely interchangeable (a one-to-one, or **bijection**, mapping), a modeller can declare an **attribute relationship** between them. Once Tessallite proves the mapping holds across the real data, a query grouped by one column can be served from an aggregate built on the other, with identical results and no re-computation. The relationship is proven before it is trusted and fails closed to the source path whenever the mapping is unproven, ambiguous, or stale — so a declaration can never produce a wrong answer.
+
+An attribute relationship is a separate, explicit act. Choosing a display column for a dimension caption does **not** declare one and produces no routing acceleration. See [Dimension Attribute Relationships](../modelling/dimension-attribute-relationships.md) for the full concept, the one-to-one versus many-to-one distinction, null handling, and a worked example.
+
+---
+
 ## How dimensions and measures appear in the Model Builder
 
 In the Model Builder Canvas, each table node lists its defined dimensions and measures. The Toolbelt on the left allows you to add, rename, or remove them. The Drawer on the right shows the full definition of whichever object is selected — source column, aggregation type, and logical name.

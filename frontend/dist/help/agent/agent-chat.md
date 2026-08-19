@@ -20,7 +20,7 @@ The agent works at project level. A project can contain multiple models, but onl
 - **New conversation** starts a fresh thread with its own memory window.
 - **Conversation list** lets users return to previous work.
 - **Persona or model controls** narrow the semantic context when configured.
-- **Trace and citations** show which model objects, glossary terms, and query steps influenced the answer.
+- **Trace and citations** show which model objects, glossary terms, and query steps influenced the answer. Click a citation chip to open its provenance: the field's definition, the value, which data route answered it (a pre-built rollup, a smaller pocket table, or the live source), and the exact filters and grouping used — so a number can be checked, not just trusted. A "view technical trace" link inside that panel opens the same detailed trace shown for the whole answer.
 - **Judge verdicts** flag whether the answer passed the configured quality rubric.
 - **Visuals and data** show polished Tessallite-themed ECharts by default, with the data table kept in its own expandable section. Diagnostics such as thought summary and generated queries stay collapsed until opened.
 

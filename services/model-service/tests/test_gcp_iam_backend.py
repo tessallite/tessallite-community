@@ -25,7 +25,7 @@ async def test_gcp_iam_valid_token(gcp_settings):
         "hd": "example.com",
     }
 
-    with patch("src.auth.gcp_iam_backend._verify_token", return_value=claims):
+    with patch("src.auth.gcp_iam_backend._verify_token_sync", return_value=claims):
         from src.auth.gcp_iam_backend import GcpIamAuthBackend
         backend = GcpIamAuthBackend()
         identity = await backend.authenticate(
@@ -47,7 +47,7 @@ async def test_gcp_iam_wrong_domain(gcp_settings):
         "sub": "12345",
     }
 
-    with patch("src.auth.gcp_iam_backend._verify_token", return_value=claims):
+    with patch("src.auth.gcp_iam_backend._verify_token_sync", return_value=claims):
         from src.auth.gcp_iam_backend import GcpIamAuthBackend
         backend = GcpIamAuthBackend()
         identity = await backend.authenticate(
@@ -59,7 +59,7 @@ async def test_gcp_iam_wrong_domain(gcp_settings):
 
 @pytest.mark.asyncio
 async def test_gcp_iam_expired_token(gcp_settings):
-    with patch("src.auth.gcp_iam_backend._verify_token", side_effect=ValueError("Token expired")):
+    with patch("src.auth.gcp_iam_backend._verify_token_sync", side_effect=ValueError("Token expired")):
         from src.auth.gcp_iam_backend import GcpIamAuthBackend
         backend = GcpIamAuthBackend()
         identity = await backend.authenticate(
@@ -77,7 +77,7 @@ async def test_gcp_iam_unverified_email(gcp_settings):
         "name": "Alice User",
     }
 
-    with patch("src.auth.gcp_iam_backend._verify_token", return_value=claims):
+    with patch("src.auth.gcp_iam_backend._verify_token_sync", return_value=claims):
         from src.auth.gcp_iam_backend import GcpIamAuthBackend
         backend = GcpIamAuthBackend()
         identity = await backend.authenticate(
@@ -96,7 +96,7 @@ async def test_gcp_iam_service_account(gcp_settings):
         "sub": "svc-sub",
     }
 
-    with patch("src.auth.gcp_iam_backend._verify_token", return_value=claims):
+    with patch("src.auth.gcp_iam_backend._verify_token_sync", return_value=claims):
         # Allow the service account domain
         from shared.config.settings import get_settings
         import os
@@ -127,3 +127,25 @@ async def test_gcp_iam_returns_none_when_unconfigured(monkeypatch):
         assert identity is None
     finally:
         get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_gcp_iam_timeout_returns_none(gcp_settings):
+    """Bug-7324: a slow Google certificate fetch must not block the event loop
+    indefinitely -- the timeout guard must return None on timeout."""
+    import asyncio
+    import time
+
+    def _slow_verify(*args, **kwargs):
+        time.sleep(0.5)
+        return {"email": "alice@example.com", "email_verified": True, "name": "A"}
+
+    with patch("src.auth.gcp_iam_backend._verify_token_sync", side_effect=_slow_verify):
+        with patch("src.auth.gcp_iam_backend._VERIFY_TIMEOUT_SECONDS", 0.1):
+            from src.auth.gcp_iam_backend import GcpIamAuthBackend
+            backend = GcpIamAuthBackend()
+            identity = await backend.authenticate(
+                tenant_id="t1", email="alice@example.com", password="token"
+            )
+
+    assert identity is None, "Timed-out verification should return None"

@@ -59,7 +59,7 @@ A predictive-aggregate misfire looks like:
 
 A capacity issue looks like:
 
-- Mostly green bars but all of them taller than the dashed line — aggregates are matching but the source warehouse itself is slower than it was before the deploy.
+- Mostly green bars but all of them taller than the dashed line — aggregates are matching but the source itself is slower than it was before the deploy.
 
 ---
 

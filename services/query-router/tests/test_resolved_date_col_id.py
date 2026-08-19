@@ -153,6 +153,35 @@ class TestResolvedDateColIdReadPath:
         )
         assert result == '"base"."order_date"'
 
+    def test_verbose_timestamp_spelling_accepted(self):
+        """Intake 2026-07-07: the denormalized shortcut must accept the full
+        PostgreSQL spelling 'timestamp without time zone' — the exact-token
+        match used to reject it and silently fall through to the heuristic."""
+        col_id = uuid.uuid4()
+        table_id = uuid.uuid4()
+        mc = _make_model_column(
+            col_id=col_id, table_id=table_id, column_name="settlement_ts",
+            data_type="timestamp without time zone",
+        )
+        columns_by_id = {col_id: mc}
+
+        time_dim = _make_dim("order_month", is_time_dim=True)
+        columns_by_id[time_dim.source_column_id] = _make_model_column(
+            col_id=time_dim.source_column_id, data_type="INTEGER",
+        )
+
+        result = _resolve_variant_date_anchor(
+            time_dim=time_dim,
+            resolved_dimensions=[time_dim],
+            columns_by_id=columns_by_id,
+            get_phys_expr=lambda name, pg_canonical=False: None,
+            measure_name="yoy_revenue",
+            pg_canonical=True,
+            resolved_date_col_id=col_id,
+            alias_by_table_id={table_id: "fact"},
+        )
+        assert result == '"fact"."settlement_ts"'
+
     def test_timestamp_type_accepted(self):
         """TIMESTAMP columns should also be accepted as date anchors."""
         col_id = uuid.uuid4()

@@ -171,6 +171,7 @@ def build_select_parts(
     on_measure_emitted: Optional[Callable[[ResolvedMeasureCol, str, bool], None]] = None,
     on_grain_emitted: Optional[Callable[[ResolvedGrainCol], None]] = None,
     source_numeric_types: Optional[Mapping[UUID, str]] = None,
+    passenger_fragments: Optional[list[str]] = None,
 ) -> list[str]:
     """Assemble the grain + measure + row-count SELECT parts.
 
@@ -188,11 +189,12 @@ def build_select_parts(
       expression SQL keyed by physical_col_name (full-refresh paths). When
       absent (incremental), variant/calculated/stat columns are already
       excluded upstream.
-    - ``include_calculated_via_stat_type``: full-refresh paths recognise a
-      calculated column by ``stat_type == "calculated"`` *and* a non-empty
-      ``rendered_calculated`` entry; the incremental path has neither and
-      skips via the stat-column check. Kept as a flag so behaviour matches
-      each original copy exactly.
+    - ``include_calculated_via_stat_type``: full-refresh paths consume any
+      keyed ``rendered_calculated`` entry. The name is retained for API
+      compatibility; per-row calculated columns persist their outer stat type
+      (for example ``sum``), so stat type alone is not a valid discriminator.
+      The incremental path has no rendered map and skips calculated columns
+      upstream.
     - ``on_measure_emitted(measure, expr, is_plain_agg)``: optional hook the
       cross-DB builders use to collect column_defs. ``is_plain_agg`` is True
       only for the AGG-template branch (so the caller can pick the right
@@ -217,6 +219,17 @@ def build_select_parts(
         if on_grain_emitted is not None:
             on_grain_emitted(grain)
 
+    # Derived-grain passenger + diagnostics (spec §3.6). These are the SINGLE
+    # projection seam for creator, full-refresh DDL builders, cross-database
+    # definitions, and incremental refresh. Emitted AFTER the ordered grains and
+    # BEFORE measures/row count. Passengers/diagnostics are NEVER GROUP BY keys.
+    # ``passenger_fragments`` is pre-rendered ``<expr> AS <alias>`` text (already
+    # collision-clamped + connector-quoted by the caller / passenger_build). When
+    # None or empty (passenger build mode off, or no eligible relationship), the
+    # SELECT list stays byte-identical to the ordinary aggregate CTAS.
+    for frag in (passenger_fragments or []):
+        parts.append(f"  {frag}")
+
     for measure in layout.measure_cols:
         # Variant measure columns carry a pre-rendered window expression
         # (F-009-01) — the plain AGG template would silently rebuild them as
@@ -229,7 +242,6 @@ def build_select_parts(
             continue
         if (
             include_calculated_via_stat_type
-            and measure.stat_type == "calculated"
             and rendered_calculated
         ):
             expr = rendered_calculated.get(measure.physical_col_name)

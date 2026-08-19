@@ -11,6 +11,8 @@ from collections import defaultdict
 from typing import Any, Sequence
 
 from shared.connector_qualify import coerce_join_types, quote_identifier, quote_table_ref
+from shared.semantic.graph_order import canonical_join_order
+from shared.semantic.join_keyword import join_keyword as _join_keyword
 
 
 
@@ -40,6 +42,22 @@ def _build_joined_from_clause(
     base_table = tables_by_id.get(base_table_id)
     if not base_table:
         return None
+
+    # Bug-8605 round-3 review: normalise HERE rather than trusting the caller.
+    #
+    # Join order is load-bearing — it breaks ties between equally short
+    # base-to-table paths, so a different order puts different INTERMEDIATE
+    # tables in the FROM clause, with different join keywords and different ON
+    # columns. Three review rounds each found one more caller that handed this
+    # builder an unordered graph (the latest: the DEPLOYED snapshot's stored
+    # ``joins`` list, hydrated straight out of JSON and never re-sorted, so
+    # every snapshot written before the serialiser emitted canonical order
+    # made the served SQL expand the graph differently from the CTAS).
+    #
+    # Ordering the input at the point of use makes an unordered graph
+    # unobtainable here regardless of who calls it, which a static
+    # "did the caller remember?" guard demonstrably cannot.
+    joins = canonical_join_order(joins)
 
     adjacency: dict[Any, list[Any]] = defaultdict(list)
     for join in joins:
@@ -97,7 +115,13 @@ def _build_joined_from_clause(
                 if not current_col or not next_col:
                     return None
 
-                join_keyword = _join_keyword(join.join_type)
+                # Bug-7775: the modeler's join_type is defined relative to
+                # ``join.left_table_id`` / ``join.right_table_id``.  Here the
+                # already-joined ``table_id`` is the FROM/left side; the traversal
+                # is FLIPPED when that table is the modeler's RIGHT table (so the
+                # added ``next_table_id`` is the modeler's LEFT table).
+                flipped = table_id == join.right_table_id
+                join_keyword = _join_keyword(join.join_type, flipped=flipped)
                 lhs_expr = _qcol(alias_by_table_id[table_id], current_col.column_name)
                 rhs_expr = _qcol(alias_by_table_id[next_table_id], next_col.column_name)
                 lhs_expr, rhs_expr = _coerce_join_pair(
@@ -155,7 +179,10 @@ def _build_joined_from_clause(
                     continue
 
                 nonlocal from_clause
-                join_keyword = _join_keyword(join.join_type)
+                # Bug-7775: flip LEFT<->RIGHT when the already-joined table is
+                # the modeler's RIGHT table (see _append_preferred above).
+                flipped = table_id == join.right_table_id
+                join_keyword = _join_keyword(join.join_type, flipped=flipped)
                 lhs_expr = _qcol(alias_by_table_id[table_id], current_col.column_name)
                 rhs_expr = _qcol(alias_by_table_id[next_table_id], next_col.column_name)
                 lhs_expr, rhs_expr = _coerce_join_pair(
@@ -185,11 +212,16 @@ def _build_joined_from_clause(
     return from_clause
 
 
-def _join_keyword(join_type: str | None) -> str:
-    normalized = (join_type or "").strip().lower()
-    if normalized == "inner":
-        return "INNER JOIN"
-    return "LEFT JOIN"
+# Bug-7018 / Bug-7775 / Bug-8628: the join-type vocabulary and the flip rule
+# now live in ONE place for every SQL builder —
+# ``shared/semantic/join_keyword.py``, imported as ``_join_keyword`` at the top
+# of this module. This module keeps the name (``query_rewriter`` re-exports it
+# and the Bug-7775 suite imports it) but no longer owns a second copy of the
+# logic: the CTAS builder in ``shared/semantic/sql_builder.py`` had drifted to
+# a flat, flip-blind map and materialised the opposite row population to what
+# this route served. See
+# docs/architecture/architecture_join-orientation-and-cardinality.md
+# (invariant 1: one join-keyword function, not two).
 
 
 def _missing_join_error_message(

@@ -43,6 +43,7 @@ class JdbcConnectionGovernor:
         max_conn_per_ip: int | None = None,
         max_auth_failures: int | None = None,
         auth_failure_window_seconds: int | None = None,
+        max_tracked_keys: int | None = None,
         *,
         time_fn=time.monotonic,
     ) -> None:
@@ -60,6 +61,15 @@ class JdbcConnectionGovernor:
             settings.GATEWAY_JDBC_AUTH_FAILURE_WINDOW_SECONDS
             if auth_failure_window_seconds is None
             else auth_failure_window_seconds
+        )
+        # The canonical default + env override live on Settings
+        # (GATEWAY_JDBC_MAX_TRACKED_FAILURE_KEYS). getattr guards a rolling
+        # deploy / stale in-image `shared` where the field predates this change,
+        # falling back to the same default rather than failing import.
+        self._max_tracked_keys = (
+            getattr(settings, "GATEWAY_JDBC_MAX_TRACKED_FAILURE_KEYS", 20000)
+            if max_tracked_keys is None
+            else max_tracked_keys
         )
         self._time = time_fn
         self._lock = threading.Lock()
@@ -113,6 +123,8 @@ class JdbcConnectionGovernor:
             window = self._failures.setdefault(key, deque())
             window.append(now)
             self._evict_locked(window, now)
+            if 0 < self._max_tracked_keys < len(self._failures):
+                self._enforce_capacity_locked(now)
 
     def record_auth_success(self, ip: str) -> None:
         """Clear the failure window for *ip* after a successful auth."""
@@ -145,6 +157,51 @@ class JdbcConnectionGovernor:
         cutoff = now - self._window
         while window and window[0] < cutoff:
             window.popleft()
+
+    def _enforce_capacity_locked(self, now: float) -> None:
+        """Bound the failure map's size (caller holds the lock).
+
+        Bug-8143: JDBC keys the governor on the raw peer IP (naturally bounded),
+        but the XMLA throttle key embeds a client-supplied identity, so an
+        attacker could otherwise grow ``_failures`` without bound (one bucket
+        per fabricated username) and exhaust the gateway process, which also
+        serves JDBC. This runs only when the map already exceeds the cap.
+
+        Step 1 reclaims fully-expired windows — semantically free, because an
+        empty/expired window never throttles. Step 2, reached only under a
+        deliberate high-cardinality flood, evicts down to a low-water mark —
+        sub-threshold buckets before at-threshold ones (least-recently-active
+        within a tier) so an actively-throttling bucket is not flushed — so this
+        O(n) sweep amortises (it leaves headroom before it can run again)
+        instead of firing on every subsequent call.
+        """
+        for key in list(self._failures.keys()):
+            window = self._failures[key]
+            self._evict_locked(window, now)
+            if not window:
+                del self._failures[key]
+        if len(self._failures) <= self._max_tracked_keys:
+            return
+        low_water = max(1, (self._max_tracked_keys * 9) // 10)
+        # Eviction order (every remaining window is non-empty here, so
+        # ``window[-1]`` is a safe recency key):
+        #   1. sub-threshold buckets before at-threshold ones, so a
+        #      high-cardinality flood of single-failure fabricated keys is
+        #      reclaimed FIRST and an already-throttling bucket (a real account
+        #      under active attack) is not silently flushed and un-blocked by
+        #      the flood;
+        #   2. within a tier, least-recently-active first.
+        # Memory stays bounded regardless: filling the cap with at-threshold
+        # buckets would cost the attacker ``cap * max_failures`` real rejected
+        # logins, and even then at-threshold buckets are evicted oldest-first.
+        def _rank(item):
+            window = item[1]
+            at_threshold = len(window) >= self._max_failures
+            return (1 if at_threshold else 0, window[-1])
+
+        victims = sorted(self._failures.items(), key=_rank)
+        for key, _ in victims[: len(self._failures) - low_water]:
+            del self._failures[key]
 
 
 # Process-wide singleton used by the wire server.

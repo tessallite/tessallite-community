@@ -1,4 +1,5 @@
 {
+  "collibra.activate": "Aktivieren",
   "collibra.addConnection": "Verbindung hinzufügen",
   "collibra.assets": "Ressourcen",
   "collibra.assetsCount": "{{count}} Assets",
@@ -8,6 +9,7 @@
   "collibra.baseUrlPlaceholder": "https://ihr-unternehmen.collibra.com",
   "collibra.communityChip": "Community: {{value}}",
   "collibra.communityId": "Community-ID",
+  "collibra.deactivate": "Deaktivieren",
   "collibra.delete": "Löschen",
   "collibra.deleteFailed": "Löschen fehlgeschlagen.",
   "collibra.details": "Details",

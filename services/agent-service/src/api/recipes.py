@@ -18,10 +18,11 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select
 
-from shared.db.models import Model, ProjectAgentConfig, ProjectCrossModelRecipe
+from shared.db.model_lock import acquire_model_definition_lock
+from shared.db.models import Measure, Model, ProjectAgentConfig, ProjectCrossModelRecipe
 from shared.db.session import get_tenant_db
 from src.api.agent_config import (
     _require_project_modeller,
@@ -43,7 +44,33 @@ class RecipeStep(BaseModel):
     measures: list[str] = []
     dimensions: list[str] = []
     filters: list[dict] = []
-    limit: int = 100
+    # Bug-7367 -- enforce the same 1..1000 row-limit contract as the LLM tool
+    # spec (src/tools/spec.py). Without bounds, a modeller could save a recipe
+    # with zero, negative, or extremely large limits that bypass the query-router
+    # row-limit guardrail.
+    limit: int = Field(default=100, ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def _validate_filter_shapes(self) -> "RecipeStep":
+        """Bug-7360 -- validate between/in filter value shapes at save time
+        so a malformed filter is caught on the recipe API, not silently
+        dropped at execution time (wrong numbers)."""
+        for f in self.filters:
+            op = f.get("op")
+            val = f.get("value")
+            if op == "between":
+                if not isinstance(val, (list, tuple)) or len(val) != 2:
+                    raise ValueError(
+                        f"Filter on {f.get('name')!r} with op='between' "
+                        f"requires a 2-element list as 'value'."
+                    )
+            if op == "in" and val is not None:
+                if not isinstance(val, list):
+                    raise ValueError(
+                        f"Filter on {f.get('name')!r} with op='in' "
+                        f"requires a list as 'value'."
+                    )
+        return self
 
 
 class RecipeParameter(BaseModel):
@@ -69,13 +96,25 @@ class RecipeResponse(RecipeBody):
     id: UUID
 
 
+def _clamp_step_limit(step_dict: dict) -> dict:
+    """Bug-7367 -- clamp pre-existing out-of-range limits on read so
+    recipes saved before the validation tightening remain readable."""
+    d = dict(step_dict)
+    raw = d.get("limit", 100)
+    d["limit"] = max(1, min(1000, raw if isinstance(raw, int) else 100))
+    return d
+
+
 def _serialise(record: ProjectCrossModelRecipe) -> RecipeResponse:
+    # Bug-7367 / Bug-7360 -- use model_construct to skip validators on
+    # read so pre-existing recipes with out-of-range limits or malformed
+    # filters remain readable.  Validation runs on write (POST/PUT).
     return RecipeResponse(
         id=record.id,
         name=record.name,
         description=record.description,
         parameters=[RecipeParameter(**p) for p in (record.parameters or [])],
-        steps=[RecipeStep(**s) for s in (record.steps or [])],
+        steps=[RecipeStep.model_construct(**_clamp_step_limit(s)) for s in (record.steps or [])],
         combine=record.combine,
         notes=record.notes,
     )
@@ -104,6 +143,71 @@ async def _validate_step_models(db, project_id: UUID, steps: list[RecipeStep]) -
                 status_code=400,
                 detail=f"Model {step.model_id} not in project {project_id}",
             )
+
+        declared = set(step.measures)
+        if not declared:
+            continue
+        result = await db.execute(
+            select(Measure.name).where(
+                Measure.model_id == step.model_id,
+                Measure.name.in_(declared),
+            )
+        )
+        missing = sorted(declared - set(result.scalars().all()))
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Recipe step {step.name!r} references measures that do not "
+                    f"exist in model {step.model_id}: {', '.join(missing)}"
+                ),
+            )
+
+
+def _persisted_step_model_ids(steps: object) -> set[UUID]:
+    model_ids: set[UUID] = set()
+    if not isinstance(steps, list):
+        return model_ids
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        try:
+            model_ids.add(UUID(str(step.get("model_id"))))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return model_ids
+
+
+async def _lock_recipe_models(
+    db,
+    steps: list[RecipeStep],
+    persisted_steps: object = None,
+) -> None:
+    """Serialize recipe writes with every referenced model-definition edit."""
+    model_ids = {step.model_id for step in steps}
+    model_ids.update(_persisted_step_model_ids(persisted_steps))
+    for model_id in sorted(model_ids, key=lambda value: value.int):
+        await acquire_model_definition_lock(db, model_id)
+
+
+def _validate_step_names_unique(steps: list[RecipeStep]) -> None:
+    """Bug-8500 — reject recipes with duplicate step names (case-insensitive).
+
+    During execution, step results are stored by name and combine references
+    resolve by name. A duplicate step name causes one result to silently
+    overwrite another, producing wrong numbers."""
+    seen: dict[str, int] = {}
+    for idx, step in enumerate(steps):
+        lower = step.name.lower()
+        if lower in seen:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Duplicate step name {step.name!r} at indices "
+                    f"{seen[lower]} and {idx}."
+                ),
+            )
+        seen[lower] = idx
 
 
 def _validate_combine(combine: Optional[dict], steps: list[RecipeStep]) -> None:
@@ -153,9 +257,11 @@ async def create_recipe(
     # F-023-07 — recipe writes are modeller/admin surface, consistent
     # with the sibling agent config and allow-list write routes.
     await _require_project_modeller(project_id, current_user)
+    _validate_step_names_unique(body.steps)
     _validate_combine(body.combine, body.steps)
     async for db in get_tenant_db(current_user.tenant_id):
         await _require_agent(db, project_id)
+        await _lock_recipe_models(db, body.steps)
         await _validate_step_models(db, project_id, body.steps)
         record = ProjectCrossModelRecipe(
             project_id=project_id,
@@ -198,13 +304,21 @@ async def update_recipe(
 ) -> RecipeResponse:
     # F-023-07 — recipe writes are modeller/admin surface.
     await _require_project_modeller(project_id, current_user)
+    _validate_step_names_unique(body.steps)
     _validate_combine(body.combine, body.steps)
     async for db in get_tenant_db(current_user.tenant_id):
         await _require_agent(db, project_id)
-        await _validate_step_models(db, project_id, body.steps)
         record = await db.get(ProjectCrossModelRecipe, recipe_id)
         if record is None or record.project_id != project_id:
             raise HTTPException(status_code=404, detail="Recipe not found")
+        # Lock both the existing and replacement model sets. Locking only the
+        # replacement set lets a concurrent rename of a removed model rewrite
+        # this row from a stale pre-update JSON image and resurrect the old step.
+        await _lock_recipe_models(db, body.steps, record.steps)
+        await db.refresh(record)
+        if record.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Recipe not found")
+        await _validate_step_models(db, project_id, body.steps)
         record.name = body.name
         record.description = body.description
         record.parameters = [p.model_dump() for p in body.parameters]

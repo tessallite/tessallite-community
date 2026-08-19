@@ -2,7 +2,7 @@
 title: "Calendar Types"
 audience: modeller
 area: concepts
-updated: 2026-05-06
+updated: 2026-07-04
 ---
 
 ## What this covers
@@ -17,13 +17,17 @@ Tessallite computes period boundaries using SQL expressions derived from the hie
 
 A physical calendar table is **not required** for most calendar types. The system derives boundaries directly from the date column. Calendar tables remain valuable for:
 
-- **Retail 4-4-5** — the irregular 4-week/5-week period pattern cannot be expressed as simple date arithmetic.
+- **Retail 4-4-5 and Hijri** - these period systems require a physical table because their boundaries cannot be safely inferred from ordinary Gregorian date arithmetic.
 - **Dense date enumeration** — queries that need every date in a range, including dates with no fact rows.
 - **Custom period definitions** — non-standard boundaries that don't follow a formulaic pattern.
 
 When a calendar table IS present, the system uses its pre-computed columns instead of expressions for backward compatibility.
 
 ---
+
+## Calendar table binding rule
+
+Standard, fiscal, ISO Week, and Thai Buddhist calendars are expression-capable: Tessallite can compute their period boundaries from the hierarchy's calendar type and the fact date. Retail 4-4-5 and Hijri calendars are table-bound: they require a physical calendar table with real mapped source columns. A physical table is also required for dense date enumeration, custom business period columns, coverage checks, and role-playing calendar aliases.
 
 ## The six calendar types
 
@@ -81,7 +85,7 @@ A model can use any number of calendar types across its hierarchies. This is com
 - Your sales team uses 4-4-5 periods while finance uses standard months.
 - You serve both domestic (Hijri) and international (Gregorian) audiences.
 
-Each time hierarchy carries its own calendar type. When you create a time hierarchy, you set the calendar type on it. Different hierarchies on the same model can use different calendar types. Physical calendar tables are only needed for types that require them (retail 4-4-5, dense enumeration).
+Each time hierarchy carries its own calendar type. When you create a time hierarchy, you set the calendar type on it. Different hierarchies on the same model can use different calendar types. Physical calendar tables are only needed for table-bound calendar types (retail 4-4-5 and Hijri) or physical-table workflows such as dense enumeration, custom period columns, coverage checks, and role-playing aliases.
 
 **When one is enough:** If all your time-intelligence variants use the same calendar system, one hierarchy with one calendar type is sufficient. Don't create extra hierarchies "just in case" — each one adds complexity to the variant resolver.
 

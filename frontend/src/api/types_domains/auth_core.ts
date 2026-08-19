@@ -29,22 +29,60 @@ export interface UserUpdate {
 export interface UserPasswordReset {
   password: string;
 }
+export type RoleSource = "manual" | "sso";
+
 export interface User {
   id: string;
   username: string;
   email: string;
   is_active: boolean;
   role: LocalUserRole;
+  // Bug-6597: provenance of `role` — "manual" (operator-set) or "sso" (IdP-derived).
+  role_source?: RoleSource;
   has_completed_onboarding: boolean;
   created_at: string;
 }
 
-export type AccessRole = "admin" | "modeler" | "viewer";
+// ---------------------------------------------------------------------------
+// Personal Access Tokens (Bug-7314) — BI-client auth for SSO users
+// ---------------------------------------------------------------------------
+export interface PersonalAccessTokenCreate {
+  label?: string;
+  // Optional lifetime in days (1..365). Omit for a non-expiring token.
+  expires_in_days?: number | null;
+}
+
+export interface PersonalAccessToken {
+  id: string;
+  label: string;
+  token_prefix: string;
+  created_at: string;
+  expires_at?: string | null;
+  last_used_at?: string | null;
+  revoked_at?: string | null;
+}
+
+export interface PersonalAccessTokenCreateResponse {
+  // The plaintext PAT — shown ONCE at creation, never retrievable again.
+  token: string;
+  pat: PersonalAccessToken;
+}
+
+// Bug-8101 / F-104-01: model_viewer is the built-in read-only consumer role
+// (viewer-level privilege). Modeller supersedes it (mutual exclusivity).
+export type AccessRole = "admin" | "modeler" | "viewer" | "model_viewer";
 
 export interface UserAccessBindingCreate {
   user_identity: string;
   role: AccessRole;
   model_id?: string | null;
+}
+
+// Bug-8101: dry-run response for the Modeller/Model-viewer supersession check.
+export interface AccessSupersedePreflightResponse {
+  supersedes: boolean;
+  removed_model_viewer_count: number;
+  grant_is_redundant: boolean;
 }
 
 export interface UserAccessBinding {

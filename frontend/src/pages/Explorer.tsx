@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { safeLocalGet, safeLocalGetJson } from "../utils/safeLocalStorage";
+import {
+  safeLocalGet,
+  safeLocalGetJson,
+  safeLocalRemove,
+  safeLocalSet,
+} from "../utils/safeLocalStorage";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useT } from "../i18n";
@@ -57,14 +62,21 @@ import ModelImportExportDialog from "../components/importExport/ModelImportExpor
 import ProjectConfigDrawer from "../components/Settings/ProjectConfigDrawer";
 import HelpIconButton from "../components/HelpIconButton";
 import { canPerform } from "../auth/explorerPrivileges";
-import { projectsApi, modelsApi } from "../api/client";
+import { projectsApi, modelsApi, preferencesApi } from "../api/client";
 import { agentApi } from "../api/agentApi";
 import { versionsApi } from "../api/versionsApi";
-import { useModels, useProjects, useTenantMe } from "../api/hooks";
-import type { Model, Project } from "../api/types";
+import { useFavouriteModels, useModels, useProjects, useTenantMe } from "../api/hooks";
+import type { FavouriteModelsResponse, Model, Project } from "../api/types";
 
 const DRAWER_WIDTH = 260;
 
+/**
+ * Bug-8183: model favourites used to live only in this key, so a user who
+ * switched browser or machine lost every pin. They are now server-side, per
+ * user. The key is kept only long enough to move existing pins across — see
+ * the migration effect below — and is never written again.
+ */
+const legacyPinnedModelsKey = (tenantSlug: string) => `pinned_models_${tenantSlug}`;
 
 export default function Explorer() {
   const navigate = useNavigate();
@@ -96,22 +108,11 @@ export default function Explorer() {
   const [pinnedProjects, setPinnedProjects] = useState<string[]>(
     () => safeLocalGetJson(`pinned_projects_${tenantSlug}`, [] as string[]),
   );
-  const [pinnedModels, setPinnedModels] = useState<string[]>(
-    () => safeLocalGetJson(`pinned_models_${tenantSlug}`, [] as string[]),
-  );
 
   const togglePinProject = useCallback((id: string) => {
     setPinnedProjects((prev) => {
       const next = prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
-      localStorage.setItem(`pinned_projects_${tenantSlug}`, JSON.stringify(next));
-      return next;
-    });
-  }, [tenantSlug]);
-
-  const togglePinModel = useCallback((id: string) => {
-    setPinnedModels((prev) => {
-      const next = prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id];
-      localStorage.setItem(`pinned_models_${tenantSlug}`, JSON.stringify(next));
+      safeLocalSet(`pinned_projects_${tenantSlug}`, JSON.stringify(next));
       return next;
     });
   }, [tenantSlug]);
@@ -124,6 +125,87 @@ export default function Explorer() {
     queryFn: () => agentApi.getConfig(selectedProject!.id),
     enabled: Boolean(selectedProject?.id),
   });
+
+  // ── model favourites (Bug-8183) ──────────────────────────────────
+  // Server-held, per user, so a pin follows the person rather than the
+  // browser. Project pins stay local: there is no server-side preference
+  // scope for a project, and inventing one is not this change.
+  const favouriteModelsQuery = useFavouriteModels(selectedProject?.id ?? "");
+  const pinnedModels = useMemo(
+    () => favouriteModelsQuery.data?.model_ids ?? [],
+    [favouriteModelsQuery.data],
+  );
+
+  const toggleFavouriteModel = useMutation({
+    mutationFn: ({ projectId, modelId }: { projectId: string; modelId: string }) =>
+      preferencesApi.toggleFavourite(projectId, modelId, {
+        entity_type: "model",
+        entity_id: modelId,
+      }),
+    // Flip the star on click rather than after the round trip; a favourite is
+    // a low-stakes preference and waiting reads as an unresponsive control.
+    onMutate: async ({ projectId, modelId }) => {
+      const key = ["favourite-models", projectId];
+      await qc.cancelQueries({ queryKey: key });
+      const previous = qc.getQueryData<FavouriteModelsResponse>(key);
+      qc.setQueryData<FavouriteModelsResponse>(key, (current) => {
+        const ids = current?.model_ids ?? [];
+        return {
+          model_ids: ids.includes(modelId)
+            ? ids.filter((x) => x !== modelId)
+            : [modelId, ...ids],
+        };
+      });
+      return { key, previous };
+    },
+    onError: (_err, _vars, context) => {
+      // The write did not land, so put the star back where the server has it.
+      if (context?.previous !== undefined) {
+        qc.setQueryData(context.key, context.previous);
+      }
+    },
+    onSettled: (_data, _err, vars) => {
+      qc.invalidateQueries({ queryKey: ["favourite-models", vars.projectId] });
+    },
+  });
+
+  const favouriteModelMutate = toggleFavouriteModel.mutate;
+
+  const togglePinModel = useCallback((modelId: string) => {
+    if (!selectedProject) return;
+    favouriteModelMutate({ projectId: selectedProject.id, modelId });
+  }, [selectedProject, favouriteModelMutate]);
+
+  // One-time migration of the pins a user already has. The legacy key is
+  // tenant-wide while the API is project-scoped, so this drains it a project at
+  // a time as the user browses. Ids are removed from the key BEFORE the
+  // requests go out: /favourite is a TOGGLE, and a second pass over the same id
+  // would un-favourite what the first pass just pinned.
+  useEffect(() => {
+    const projectId = selectedProject?.id;
+    if (!projectId || !favouriteModelsQuery.isSuccess || !models.data) return;
+    const legacyKey = legacyPinnedModelsKey(tenantSlug);
+    const legacy = safeLocalGetJson<string[]>(legacyKey, []);
+    if (!Array.isArray(legacy) || legacy.length === 0) return;
+    const inThisProject = new Set(models.data.map((m) => m.id));
+    const alreadyFavourite = new Set(pinnedModels);
+    const claimed = legacy.filter((id) => inThisProject.has(id));
+    if (claimed.length === 0) return;
+    const remaining = legacy.filter((id) => !inThisProject.has(id));
+    if (remaining.length === 0) safeLocalRemove(legacyKey);
+    else safeLocalSet(legacyKey, JSON.stringify(remaining));
+    for (const modelId of claimed) {
+      if (alreadyFavourite.has(modelId)) continue;
+      favouriteModelMutate({ projectId, modelId });
+    }
+  }, [
+    selectedProject?.id,
+    favouriteModelsQuery.isSuccess,
+    models.data,
+    pinnedModels,
+    tenantSlug,
+    favouriteModelMutate,
+  ]);
 
   const sortedProjects = useMemo(() => {
     if (!projects.data) return [];

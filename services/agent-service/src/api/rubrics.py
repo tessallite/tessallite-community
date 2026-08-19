@@ -26,6 +26,16 @@ from sqlalchemy import select
 
 from shared.db.models import AgentJudgeRubric
 from shared.db.session import get_tenant_db
+# Bug-8460 — every route in this module shipped with NO authorization
+# beyond `forbid_embed_user` (which only rejects an embed token and
+# performs no binding lookup), so any authenticated tenant user could
+# read, overwrite, bulk-replace and DELETE any project's judge rubrics.
+# Reuse this service's canonical gates rather than adding a sixth
+# hand-rolled copy (Bug-8445 tracks collapsing all of them into one).
+from src.api.agent_config import (
+    _require_project_modeller,
+    _require_project_viewer,
+)
 from src.auth.middleware import CurrentUser, forbid_embed_user
 
 logger = logging.getLogger(__name__)
@@ -59,6 +69,7 @@ async def list_rubrics(
     project_id: UUID,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> list[RubricResponse]:
+    await _require_project_viewer(project_id, current_user)
     async for db in get_tenant_db(current_user.tenant_id):
         rows = await db.execute(
             select(AgentJudgeRubric)
@@ -75,6 +86,7 @@ async def create_rubric(
     body: RubricBody,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> RubricResponse:
+    await _require_project_modeller(project_id, current_user)
     async for db in get_tenant_db(current_user.tenant_id):
         record = AgentJudgeRubric(
             project_id=project_id,
@@ -94,6 +106,7 @@ async def get_rubric(
     rubric_id: UUID,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> RubricResponse:
+    await _require_project_viewer(project_id, current_user)
     async for db in get_tenant_db(current_user.tenant_id):
         record = await db.get(AgentJudgeRubric, rubric_id)
         if record is None or record.project_id != project_id:
@@ -109,6 +122,7 @@ async def update_rubric(
     body: RubricBody,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> RubricResponse:
+    await _require_project_modeller(project_id, current_user)
     async for db in get_tenant_db(current_user.tenant_id):
         record = await db.get(AgentJudgeRubric, rubric_id)
         if record is None or record.project_id != project_id:
@@ -127,6 +141,7 @@ async def delete_rubric(
     rubric_id: UUID,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> None:
+    await _require_project_modeller(project_id, current_user)
     async for db in get_tenant_db(current_user.tenant_id):
         record = await db.get(AgentJudgeRubric, rubric_id)
         if record is None or record.project_id != project_id:
@@ -148,6 +163,7 @@ async def bulk_import_rubrics(
     """Replace-by-name import. A row whose name matches an existing rubric
     in this project gets updated; new names get inserted. Other rubrics
     are left untouched."""
+    await _require_project_modeller(project_id, current_user)
     async for db in get_tenant_db(current_user.tenant_id):
         rows = await db.execute(
             select(AgentJudgeRubric).where(

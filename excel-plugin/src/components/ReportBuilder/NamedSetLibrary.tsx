@@ -1,7 +1,8 @@
 import { useMemo } from 'react';
-import { Box, Typography, Collapse, Skeleton } from '@mui/material';
+import { Box, Typography, Collapse, Skeleton, IconButton } from '@mui/material';
 import { ExpandLess, ExpandMore } from '@mui/icons-material';
 import { tokens } from '../../theme';
+import { strings, templates } from '../../i18n/strings';
 import type { NamedSet } from '../../types/tessallite';
 import NamedSetCard from './NamedSetCard';
 
@@ -10,6 +11,7 @@ interface NamedSetLibraryProps {
   searchQuery: string;
   projectId: string;
   modelId: string;
+  personaId?: string;
   onAddToRows: (ns: NamedSet) => void;
   onAddToColumns: (ns: NamedSet) => void;
   onAddToFilter: (ns: NamedSet) => void;
@@ -24,6 +26,7 @@ export default function NamedSetLibrary({
   searchQuery,
   projectId,
   modelId,
+  personaId,
   onAddToRows,
   onAddToColumns,
   onAddToFilter,
@@ -70,10 +73,19 @@ export default function NamedSetLibrary({
         }}
       >
         <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-          Named Lists ({namedSets.length})
+          {templates.library.namedSetsHeader(namedSets.length)}
         </Typography>
+        {/* Bug-6710: keyboard path to expand/collapse (header Box is mouse-only). */}
         {(namedSets.length > 0 || loading || searchQuery) && (
-          expanded ? <ExpandLess sx={{ fontSize: 16, color: tokens.colorTextSecondary }} /> : <ExpandMore sx={{ fontSize: 16, color: tokens.colorTextSecondary }} />
+          <IconButton
+            size="small"
+            onClick={(e) => { e.stopPropagation(); onToggleExpanded(); }}
+            aria-expanded={expanded}
+            aria-label={templates.library.toggleSectionAria(expanded, strings.library.namedSetsSection)}
+            sx={{ width: 24, height: 24, color: tokens.colorTextSecondary }}
+          >
+            {expanded ? <ExpandLess sx={{ fontSize: 16 }} /> : <ExpandMore sx={{ fontSize: 16 }} />}
+          </IconButton>
         )}
       </Box>
       <Collapse in={expanded}>
@@ -84,7 +96,7 @@ export default function NamedSetLibrary({
           </Box>
         ) : namedSets.length === 0 ? (
           <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, px: 1.5, py: 1 }}>
-            {searchQuery ? 'No named lists match your search' : 'No named lists available'}
+            {searchQuery ? strings.namedSetLibrary.noSearchMatch : strings.namedSetLibrary.noItemsAvailable}
           </Typography>
         ) : (
           groupedSets.map((group, gi) => (
@@ -103,6 +115,7 @@ export default function NamedSetLibrary({
                   namedSet={ns}
                   projectId={projectId}
                   modelId={modelId}
+                  personaId={personaId}
                   onAddToRows={() => onAddToRows(ns)}
                   onAddToColumns={() => onAddToColumns(ns)}
                   onAddToFilter={() => onAddToFilter(ns)}

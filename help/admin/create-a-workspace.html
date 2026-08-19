@@ -12,25 +12,16 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Create a Workspace</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-04-17</span></div>
+    <div class="article-meta"><span class="audience-badge">system-admin</span><span class="updated">Updated 2026-07-17</span></div>
     <h1>Create a Workspace</h1>
-<figure class="screencap"><img class="screencap" src="../assets/screencaps/create-workspace-dialog.png" alt="System Admin — Create new workspace dialog."></figure>
 <h2>What this covers</h2>
-<p>Only the System Admin can create workspaces. This article explains where to do it, what fields are required, and what is provisioned after creation.</p>
-<h2>Who can create a workspace</h2>
-<p>Workspace creation is restricted to the System Admin. This account is configured by the environment variables <code>ADMIN_USER</code> and <code>ADMIN_PASS</code> set during deployment. Tenant Admins cannot create workspaces; they manage users and settings within an existing workspace.</p>
-<h2>Steps to create a workspace</h2>
-<ol><li>Open a browser and navigate to Tessallite on port <code>3000</code>.</li><li>Sign in using the <code>ADMIN_USER</code> and <code>ADMIN_PASS</code> credentials. The application opens directly to the System Administration screen.</li><li>Click the <strong>Workspaces</strong> tab.</li><li>Click <strong>New Workspace</strong>.</li><li>Fill in the workspace fields (see reference below).</li><li>Enter the email address of the initial Tenant Admin user.</li><li>Click <strong>Create</strong>.</li></ol>
-<h2>Workspace fields</h2>
-<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Description</th><th>Constraints</th></tr></thead><tbody><tr><td>Display name</td><td>The label shown in the UI. Can be changed at any time.</td><td>Any text; max 80 characters.</td></tr><tr><td>Slug</td><td>Short identifier used as the JDBC database name and XMLA catalog name. Analysts need this value to connect BI tools.</td><td>Lowercase letters, numbers, and hyphens only. No spaces. Must be unique across the installation.</td></tr></tbody></table></div>
-<p>The slug cannot be changed after the workspace is created. It is used as the JDBC database field and the XMLA catalog name for all analyst connections. Choose it carefully before clicking Create.</p>
-<h2>What the slug is used for</h2>
-<ul><li><strong>JDBC connections</strong> (port 5433): the <em>Database</em> field must be set to the workspace slug.</li><li><strong>XMLA connections</strong> (port 8080): the <em>Catalog</em> field must be set to the workspace slug.</li></ul>
-<p>Share the slug with Analysts so they can configure their connections correctly.</p>
-<h2>What is provisioned after creation</h2>
-<ul><li>An isolated PostgreSQL schema for workspace metadata (projects, models, aggregates, users).</li><li>An empty workspace dashboard, accessible by the assigned Tenant Admin once they accept their invitation.</li><li>An invitation email sent to the Tenant Admin&#x27;s address, valid for 48 hours.</li></ul>
+<p>Workspace (tenant) creation is a System Admin operation. Only the platform administrator -- signed in with the <code>SYSTEM_ADMIN_EMAIL</code> and <code>SYSTEM_ADMIN_PASSWORD</code> credentials from the <code>.env</code> file -- can provision new workspaces.</p>
+<p>For the full walkthrough, including what gets provisioned under the hood, required fields, edition limits, slug best practices, and verification steps, see <strong><a href="../system-admin/create-a-tenant.html">Create a Tenant</a></strong> in the System Admin section.</p>
+<h2>Quick summary</h2>
+<ol><li>Sign in as the System Admin (default email: <code>admin@tessallite.local</code>).</li><li>Open <strong>System Administration</strong> and click the <strong>Workspaces</strong> tab.</li><li>Click <strong>New Workspace</strong>, fill in the display name, slug, and Tenant Admin email, then click <strong>Create</strong>.</li></ol>
+<p>Tessallite provisions a SystemTenant record, two isolated PostgreSQL schemas (<code>&lt;slug&gt;_meta</code> and <code>&lt;slug&gt;_aggregates</code>), and a Tenant Admin user automatically.</p>
 <h2>Related</h2>
-<ul><li><a href="manage-users.html">Manage Users</a></li><li><a href="../concepts/workspaces-and-tenants.html">Workspaces and Tenants (concepts)</a></li><li><a href="../getting-started/first-time-setup.html">First-Time Setup</a></li></ul>
+<ul><li><a href="../system-admin/create-a-tenant.html">Create a Tenant (full guide)</a></li><li><a href="manage-users.html">Manage Users</a></li><li><a href="../concepts/workspaces-and-tenants.html">Workspaces and Tenants (concepts)</a></li></ul>
 <nav class="page-nav"><a href="../agent/agent-stop-button.html" class="page-nav-btn prev">&larr; Agent Stop Button</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="manage-users.html" class="page-nav-btn next">Manage Users &rarr;</a></nav>
   </main>
   <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>

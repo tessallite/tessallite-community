@@ -1,4 +1,4 @@
-﻿"""Pocket table metadata and query-log route linkage.
+"""Pocket table metadata and query-log route linkage.
 
 Revision ID: 0018
 Revises: 0017

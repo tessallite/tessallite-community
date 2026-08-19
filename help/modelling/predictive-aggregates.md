@@ -7,7 +7,7 @@ updated: 2026-06-21
 
 ## What this covers
 
-Predictive aggregates are aggregates Tessallite builds *before* any query is observed, using **source statistics** collected from the connected database — row counts, distinct counts, null ratios, top-N values, and join selectivity. This article explains the idea behind the predictor, the four moving parts the modeller controls (storage budget, eviction policy, approval gate, feedback loop), what each control actually does, and how predictive aggregates coexist with manual and demand-defined ones.
+Predictive aggregates are aggregates Tessallite builds *before* any query is observed, using **source statistics** collected from the connected database. Tessallite collects row counts, distinct counts, null ratios, top-N values, and join selectivity, and shows them in the Statistics panel; the predictive *ranking today* is driven by grain **cardinality** — how far a candidate grain's distinct-value product reduces the fact's row count — while the other statistics are collected and displayed but not yet weighted into the score. This article explains the idea behind the predictor, the four moving parts the modeller controls (storage budget, eviction policy, approval gate, feedback loop), what each control actually does, and how predictive aggregates coexist with manual and demand-defined ones.
 
 ---
 
@@ -15,7 +15,7 @@ Predictive aggregates are aggregates Tessallite builds *before* any query is obs
 
 A freshly deployed model has no observed workload — no query log, no miss patterns, nothing for the demand-driven optimiser to learn from. The very first BI user therefore pays the full cold-path cost: a scan against the source, with no aggregate to short-circuit it. The demand optimiser only helps *after* a pattern of repeated queries has been seen, which is exactly what a brand-new model does not have yet.
 
-Predictive aggregates close that gap. Instead of waiting for queries, Tessallite samples the source, scores plausible aggregates by expected speed-up per unit of storage, and builds the most promising ones within the model's budget — so the first user already lands on a fast path.
+Predictive aggregates close that gap. Instead of waiting for queries, Tessallite samples the source, ranks plausible grains by how much they reduce the fact's cardinality per unit of storage, and builds the highest-ranked ones within the model's budget — so the first user already lands on a fast path.
 
 **Source coverage.** Statistics collection ships for **PostgreSQL, BigQuery, and Spark/Hive** sources. Each uses its own catalogue probes (PostgreSQL `pg_stats`, BigQuery `INFORMATION_SCHEMA` + `APPROX_*`, Spark `ANALYZE TABLE`). Snowflake and SQL Server are not yet fully supported for statistics — their probes return sparse results, so the predictor has little to work with on those sources today.
 
@@ -56,14 +56,14 @@ If you open the **Predictive** tab on a model that has no source statistics yet,
 The scorer (`predictive_scorer.py`) is a pure function. Given the statistics plus your model metadata (dimensions and measures), it ranks plausible aggregates — single dimensions, pairs, and triples — by a benefit-over-cost formula:
 
 ```
-expected_hit_rate × row_reduction
-─────────────────────────────────
-   build_cost × storage_cost
+heuristic_reuse_score × row_reduction
+─────────────────────────────────────
+     build_cost × storage_cost
 ```
 
 `row_reduction` is the ratio of source rows to the aggregate's estimated rows — a *multiplier* (for example, ten million rows collapsing to two hundred is a 50,000× reduction). The preview shows it with a `×` suffix, not as a percentage. Candidates whose grain would exceed 50% of the source cardinality are rejected outright (there is no worthwhile reduction there). Each candidate carries a rationale string that explains why it ranked where it did.
 
-The displayed `score` is a small benefit-density number, useful for *ranking* candidates relative to one another rather than as an absolute percentage. The `expected_hit_rate` shown is a heuristic assumption (it rises with the number of measures sharing the grain), not a measured hit rate — treat it as a planning estimate, not evidence.
+The displayed `score` is a small benefit-density number, useful for *ranking* candidates relative to one another rather than as an absolute percentage. The `heuristic_reuse_score` shown (labelled **Reuse heuristic** in the preview) is a cardinality-based assumption — it rises with the number of measures sharing the grain — **not** a measured or predicted hit rate. Treat it as a planning estimate, not evidence.
 
 ### 3. Auto-build sweep (hourly cron)
 

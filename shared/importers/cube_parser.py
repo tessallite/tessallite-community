@@ -13,6 +13,12 @@ from typing import Any
 
 import yaml
 
+from shared.importers.import_warnings import (
+    ImportWarningResponse,
+    extend_known_import_warnings,
+    make_import_warning,
+)
+
 
 @dataclass
 class CubeDimension:
@@ -84,7 +90,7 @@ class CubeDefinition:
 @dataclass
 class CubeParseResult:
     cubes: list[CubeDefinition] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[ImportWarningResponse] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -129,7 +135,11 @@ def parse_cube_project(files: dict[str, str]) -> CubeParseResult:
         try:
             doc = yaml.safe_load(content)
         except yaml.YAMLError:
-            combined.warnings.append(f"Skipped {filename}: invalid YAML")
+            combined.warnings.append(make_import_warning(
+                code="cube.file_skipped",
+                params={"file": filename, "reason": "invalid_yaml"},
+                detail=f"Skipped {filename}: invalid YAML",
+            ))
             continue
 
         if not isinstance(doc, dict):
@@ -140,12 +150,14 @@ def parse_cube_project(files: dict[str, str]) -> CubeParseResult:
         try:
             partial = parse_cube_yaml(content)
         except CubeParseError as exc:
-            combined.warnings.append(
-                f"Skipped {filename}: {'; '.join(exc.errors[:3])}"
-            )
+            combined.warnings.append(make_import_warning(
+                code="cube.file_skipped",
+                params={"file": filename, "reason": "parse_error"},
+                detail=f"Skipped {filename}: {'; '.join(exc.errors[:3])}",
+            ))
             continue
         combined.cubes.extend(partial.cubes)
-        combined.warnings.extend(partial.warnings)
+        extend_known_import_warnings(combined.warnings, partial.warnings)
 
     if not combined.cubes:
         combined.errors.append("No cubes found in any YAML file")

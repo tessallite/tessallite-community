@@ -7,6 +7,22 @@ export function safeLocalGet(key: string, fallback: string): string {
   }
 }
 
+export function safeLocalSet(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    console.warn(`Could not write localStorage key "${key}".`);
+  }
+}
+
+export function safeLocalRemove(key: string): void {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    console.warn(`Could not remove localStorage key "${key}".`);
+  }
+}
+
 export function safeLocalGetJson<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);

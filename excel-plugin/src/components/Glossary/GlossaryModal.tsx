@@ -6,6 +6,7 @@ import {
 import { Search as SearchIcon } from '@mui/icons-material';
 import { tokens, theme } from '../../theme';
 import type { GlossaryEntry } from '../../types/tessallite';
+import { strings } from '../../i18n/strings';
 
 interface GlossaryModalProps {
   open: boolean;
@@ -35,12 +36,12 @@ export default function GlossaryModal({ open, onClose, entries }: GlossaryModalP
   return (
     <ThemeProvider theme={theme}>
     <Dialog open={open} onClose={onClose} maxWidth={false} sx={{ '& .MuiDialog-paper': { width: 320, borderRadius: 2 } }}>
-      <DialogTitle sx={{ fontSize: 14, fontWeight: 700, pb: 0 }}>Glossary</DialogTitle>
+      <DialogTitle sx={{ fontSize: 14, fontWeight: 700, pb: 0 }}>{strings.glossary.title}</DialogTitle>
       <DialogContent sx={{ p: 1.5 }}>
         <TextField
           fullWidth
           size="small"
-          placeholder="Search glossary terms..."
+          placeholder={strings.glossary.searchPlaceholder}
           value={search}
           onChange={e => setSearch(e.target.value)}
           InputProps={{
@@ -51,7 +52,7 @@ export default function GlossaryModal({ open, onClose, entries }: GlossaryModalP
         />
         {filtered.length === 0 ? (
           <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, textAlign: 'center', py: 2 }}>
-            {search ? 'No matching glossary entries' : 'No glossary entries available'}
+            {search ? strings.glossary.noMatch : strings.glossary.noEntries}
           </Typography>
         ) : (
           filtered.map(e => {
@@ -65,7 +66,7 @@ export default function GlossaryModal({ open, onClose, entries }: GlossaryModalP
                 <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, mb: 0.25 }}>{e.definition}</Typography>
                 {e.synonyms.length > 0 && (
                   <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>
-                    Synonyms: {e.synonyms.join(', ')}
+                    {strings.glossary.synonyms} {e.synonyms.join(', ')}
                   </Typography>
                 )}
               </Box>

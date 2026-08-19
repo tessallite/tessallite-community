@@ -25,7 +25,8 @@
 <tr><td><code>CREDENTIAL_ENCRYPTION_KEY</code></td><td>Yes</td><td>—</td><td>Fernet key (base64, 32 bytes) used to encrypt source database credentials at rest. Generate with: <code>python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"</code></td></tr>
 <tr><td><code>JWT_SECRET_KEY</code></td><td>Yes</td><td>—</td><td>Secret used to sign user session tokens. Minimum 32 characters.</td></tr>
 <tr><td><code>SYSTEM_ADMIN_EMAIL</code></td><td>No</td><td><code>admin@tessallite.local</code></td><td>Email address of the system-level administrator.</td></tr>
-<tr><td><code>SYSTEM_ADMIN_PASSWORD</code></td><td>Yes</td><td>—</td><td>Password for the system administrator.</td></tr>
+<tr><td><code>SYSTEM_ADMIN_PASSWORD</code></td><td>Yes</td><td>—</td><td>Password for the system administrator. Production deployments require a minimum of 12 characters, with at least one uppercase letter, one lowercase letter, and one digit; the installers enforce this and set <code>ENFORCE_SECRET_STRENGTH=true</code>.</td></tr>
+<tr><td><code>ENFORCE_SECRET_STRENGTH</code></td><td>No</td><td><code>false</code></td><td>When <code>true</code>, a <code>SYSTEM_ADMIN_PASSWORD</code> that does not meet the strength floor is a fatal startup error. The production installers set this to <code>true</code>. Leave it <code>false</code> (or unset) for dev/test/CI/demo, where a short bootstrap password only logs a warning and starts normally.</td></tr>
 <tr><td><code>LICENSE_FILE_HOST</code></td><td>No</td><td><code>./license.json</code></td><td>Legacy/bootstrap host path to a signed local licence file. The License Manager upload stores the active licence in the platform database.</td></tr>
 <tr><td><code>LICENSE_PUBLIC_KEYS</code></td><td>No</td><td>built-in key</td><td>Optional public verification key override. Normal installs use the built-in Tessallite public key.</td></tr>
 <tr><td><code>LICENSE_ENFORCEMENT_ENABLED</code></td><td>No</td><td><code>true</code></td><td>Requires a valid signed licence at startup. Leave enabled for normal Community installs.</td></tr>
@@ -67,7 +68,7 @@ gcloud run services update SERVICE_NAME \
 <p>Never commit credential values to source control. In Community installs, keep <code>.env</code> with your installation backup, but outside git. Keep downloaded <code>license.json</code> files somewhere secure as records, but the active uploaded licence lives in the platform database. On GCP, secrets (<code>SYSTEM_DATABASE_URL</code>, <code>CREDENTIAL_ENCRYPTION_KEY</code>, <code>JWT_SECRET_KEY</code>, and other secret values) are stored in Secret Manager and mounted into Cloud Run at deploy time — they never appear in the service YAML. For key rotation, see <code>CREDENTIAL_ENCRYPTION_KEY_PREVIOUS</code> in the <a href="../../../docs/guides/guides_configuration-reference.md">Configuration Reference</a>.</p>
 <h2>Related</h2>
 <ul><li><a href="deploy-local.html">Deploy Locally</a></li><li><a href="deploy-gcp.html">Deploy on GCP</a></li><li><a href="service-reference.html">Service Reference</a></li></ul>
-<nav class="page-nav"><a href="deploy-kubernetes.html" class="page-nav-btn prev">&larr; Deploy on Kubernetes</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="system-configuration.html" class="page-nav-btn next">System Configuration &rarr;</a></nav>
+<nav class="page-nav"><a href="create-a-tenant.html" class="page-nav-btn prev">&larr; Create a Tenant</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="system-configuration.html" class="page-nav-btn next">System Configuration &rarr;</a></nav>
   </main>
   <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
 </body>

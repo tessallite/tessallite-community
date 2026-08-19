@@ -20,7 +20,7 @@ import logging
 from typing import Any, Optional
 
 from shared.audit.logger import audit
-from shared.webhooks.dispatcher import emit_webhook
+from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, status
@@ -28,11 +28,16 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.auth.identity import user_identity_matches
 from shared.config.registry import get_def, surfaced_for_level
 from shared.config.resolver import _read_project, get_setting, set_setting
 from shared.db.models import Project, UserAccessBinding
 from shared.db.session import get_system_db, get_tenant_db
-from src.auth.middleware import CurrentUser, forbid_embed_user
+from src.auth.middleware import (
+    CurrentUser,
+    forbid_embed_user,
+    is_human_tenant_admin_or_system_admin,
+)
 from src.auth.rbac import require_role
 
 logger = logging.getLogger(__name__)
@@ -78,26 +83,16 @@ async def _ensure_project_access(
             detail=f"Project {project_id} not found",
         )
 
-    if current_user.role in ("system_admin", "tenant_admin"):
+    if is_human_tenant_admin_or_system_admin(current_user):
         return project
 
     user_identity = current_user.email or current_user.user_id
-    # Bootstrap-admin rule (matches require_role): if the project has no
-    # bindings at all, the first authenticated user is implicit admin.
-    any_binding = (
-        await tenant_db.execute(
-            select(UserAccessBinding).where(
-                UserAccessBinding.project_id == project_id
-            ).limit(1)
-        )
-    ).scalar_one_or_none()
-    if any_binding is None:
-        return project
-
+    # Binding-only (F-021-04 hard cutover, decision #9): no zero-binding
+    # bootstrap-admin grant — a project with no binding for this caller denies.
     rows = await tenant_db.execute(
         select(UserAccessBinding).where(
             UserAccessBinding.project_id == project_id,
-            UserAccessBinding.user_identity == user_identity,
+            user_identity_matches(UserAccessBinding.user_identity, user_identity),
         )
     )
     binding = rows.scalar_one_or_none()
@@ -113,7 +108,11 @@ async def _ensure_project_access(
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.get("", response_model=ProjectSettingsListResponse)
+@router.get(
+    "",
+    response_model=ProjectSettingsListResponse,
+    dependencies=[require_role("viewer")],
+)
 async def list_project_settings(
     project_id: UUID,
     sys_db: AsyncSession = Depends(get_system_db),

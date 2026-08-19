@@ -257,7 +257,8 @@ class TestWindowVariants:
         )
         sql = emit_variant_expression("trailing_n", b).sql
         assert "SUM(SUM(sales))" in sql
-        assert "6 PRECEDING" in sql
+        # Bug-5673: frame is n-1 PRECEDING so the window holds exactly n rows
+        assert "5 PRECEDING" in sql
 
     def test_moving_avg_n(self):
         b = VariantBinding(
@@ -268,7 +269,8 @@ class TestWindowVariants:
         )
         sql = emit_variant_expression("moving_avg_n", b).sql
         assert "AVG(SUM(sales))" in sql
-        assert "30 PRECEDING" in sql
+        # Bug-5673: frame is n-1 PRECEDING so the window holds exactly n rows
+        assert "29 PRECEDING" in sql
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,6 @@ Tokens are Fernet-encrypted before storage and never returned in responses.
 from __future__ import annotations
 
 import logging
-import uuid as _uuid
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -40,6 +39,7 @@ from src.governance_helpers import (
     encrypt_credentials,
     get_model,
     not_found,
+    validate_governance_graph,
 )
 from src.solidatus_client import SolidatusClient
 from src.solidatus_sync import run_solidatus_sync
@@ -83,7 +83,26 @@ def _solidatus_effective_dry_run(body: SolidatusSyncRequest) -> bool:
                 "message": "dry_run=true is inconsistent with mode='push'. Use mode='dry_run'.",
             },
         )
-    return False
+    # Bug-5987 (F-030-03): live push always fails today —
+    # SolidatusClient.upsert_nodes/upsert_edges raise
+    # SolidatusPushNotImplementedError unconditionally (the real Solidatus
+    # API contract is unavailable; see solidatus_client.py). The frontend
+    # already disables push in the UI. Reject it here too, at the API
+    # boundary, rather than let a direct API caller run the full
+    # graph-build/hash/diff cycle only to fail at the final upsert step.
+    # Remove this check (and the frontend disable) together once a real
+    # SolidatusClient push implementation lands.
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "code": "solidatus_push_not_implemented",
+            "message": (
+                "Live push to Solidatus is not implemented yet — only "
+                "mode='dry_run' (preview) is supported. The real Solidatus "
+                "API contract is unavailable."
+            ),
+        },
+    )
 
 def _connection_to_response(c: SolidatusConnection) -> SolidatusConnectionResponse:
     return SolidatusConnectionResponse(
@@ -216,9 +235,9 @@ async def update_solidatus_config(
             conn.auth_type = body.auth_type
         if body.token is not None:
             conn.encrypted_credentials = encrypt_credentials({"token": body.token})
-        if body.workspace_id is not None:
+        if "workspace_id" in body.model_fields_set:
             conn.workspace_id = body.workspace_id
-        if body.model_ref is not None:
+        if "model_ref" in body.model_fields_set:
             conn.model_ref = body.model_ref
         if body.sync_scope is not None:
             conn.sync_scope = body.sync_scope
@@ -296,7 +315,13 @@ async def validate_solidatus_connection(
         creds = decrypt_credentials(conn.encrypted_credentials)
         token = creds.get("token", "")
 
-        client = SolidatusClient(base_url=conn.base_url, token=token)
+        # Bug-7718: pass connection config to the client.
+        client = SolidatusClient(
+            base_url=conn.base_url,
+            token=token,
+            workspace_id=conn.workspace_id or "",
+            model_ref=conn.model_ref or "",
+        )
         status_result = await client.validate_connection()
 
         return SolidatusValidateResponse(
@@ -326,7 +351,35 @@ async def solidatus_sync(
     async for db in get_tenant_db(current_user.tenant_id):
         model = await get_model(db, project_id, model_id)
         _require_exportable_snapshot(model, body.export_draft)
-        effective_dry_run = _solidatus_effective_dry_run(body)
+        try:
+            effective_dry_run = _solidatus_effective_dry_run(body)
+        except HTTPException as exc:
+            # Bug-7527: a rejected live-push attempt must leave an audit trail.
+            # The 501 is raised inside the pure helper, which has no DB/session,
+            # so emit the SANITIZED rejection here (no credentials, no full
+            # payload — only the target connection and reason) and COMMIT it
+            # before re-raising, so the caller's rollback on the 501 cannot lose
+            # it (the durable-rejection pattern used by auth.login_failure). Only
+            # the not-implemented push rejection is audited; the 422 validation
+            # rejections are caller input errors, not a push attempt.
+            if exc.status_code == status.HTTP_501_NOT_IMPLEMENTED:
+                conn = await db.get(SolidatusConnection, body.connection_id)
+                await audit(
+                    db,
+                    action="solidatus.sync.rejected",
+                    severity="warn",
+                    actor_email=current_user.email,
+                    target_type="solidatus_connection",
+                    target_id=conn.id if conn is not None else None,
+                    target_name=conn.display_name if conn is not None else None,
+                    detail={
+                        "reason": "push_not_implemented",
+                        "mode": body.mode,
+                        "export_draft": body.export_draft,
+                    },
+                )
+                await db.commit()
+            raise
 
         conn = await db.get(SolidatusConnection, body.connection_id)
         if conn is None or conn.model_id != model_id:
@@ -366,6 +419,7 @@ async def solidatus_sync(
                 include_downstream_assets=body.include_downstream_assets,
                 include_glossary=body.include_glossary,
                 include_security_tags=body.include_security_tags,
+                include_hidden_objects=body.include_hidden_objects,
                 export_draft=body.export_draft,
                 deprecate_missing=body.deprecate_missing,
             )
@@ -379,15 +433,30 @@ async def solidatus_sync(
                 nodes_updated=run.nodes_updated,
                 edges_created=run.edges_created,
                 edges_updated=run.edges_updated,
+                # Bug-7522: surface warnings from the run row.
+                warnings=(run.result_json or {}).get("warnings", []),
                 error_message=run.error_message,
             )
         except Exception as exc:
-            logger.exception("Solidatus sync failed")
-            return SolidatusSyncResponse(
-                run_id=_uuid.UUID("00000000-0000-0000-0000-000000000000"),
-                status="failed",
-                error_message=str(exc),
-            )
+            # Bug-5987 (F-030-03): run_solidatus_sync now returns (rather
+            # than raises) any failure that occurs after the SolidatusSyncRun
+            # row is persisted — see the SolidatusSyncResponse built from
+            # `run` above, which carries the real run_id and error_message.
+            # Reaching this block therefore means the failure happened
+            # BEFORE a run row could be created (e.g. the connection was
+            # deleted in a race after this endpoint's own lookup above).
+            # There is no persisted run to report, so returning a
+            # zero-UUID "success-shaped" failure response — claiming a run
+            # exists when it does not — is worse than a clear error. Fail
+            # the request instead.
+            logger.exception("Solidatus sync failed before a run could be persisted")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "code": "solidatus_sync_failed_before_run_created",
+                    "message": f"Solidatus sync could not start: {exc}",
+                },
+            ) from exc
 
 # ---------------------------------------------------------------------------
 # Export preview
@@ -431,6 +500,7 @@ async def solidatus_export_preview(
             include_downstream_assets=body.include_downstream_assets,
             include_glossary=body.include_glossary,
             include_security_tags=body.include_security_tags,
+            include_hidden_objects=body.include_hidden_objects,
             export_draft=body.export_draft,
         )
 
@@ -442,7 +512,8 @@ async def solidatus_export_preview(
             nodes_total=len(graph.nodes),
             edges_total=len(graph.edges),
             by_type=by_type,
-            warnings=[],
+            # Bug-7522: governance-quality warnings.
+            warnings=validate_governance_graph(graph),
         )
 
 # ---------------------------------------------------------------------------

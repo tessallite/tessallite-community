@@ -64,6 +64,9 @@ export default function ScratchpadPanel() {
     format: null,
     display_name: null,
   });
+  // Bug-5713: reject UNION keywords and SQL comment syntax (-- and /* */)
+  // as a defense-in-depth measure against injection in free-form expressions.
+  const [validationError, setValidationError] = useState<string | null>(null);
 
   const queryKey = ["scratchpad-measures", projectId, modelId];
 
@@ -100,6 +103,7 @@ export default function ScratchpadPanel() {
   function openCreate() {
     setEditing(null);
     setForm({ name: "", expression: "", data_type: "numeric", format: null, display_name: null });
+    setValidationError(null);
     setDialogOpen(true);
   }
 
@@ -112,15 +116,30 @@ export default function ScratchpadPanel() {
       format: m.format,
       display_name: m.display_name,
     });
+    setValidationError(null);
     setDialogOpen(true);
   }
 
   function closeDialog() {
     setDialogOpen(false);
     setEditing(null);
+    setValidationError(null);
+  }
+
+  function validateExpression(expr: string): boolean {
+    // Match UNION as a whole word (case-insensitive), -- line comments,
+    // or /* block comment openers.
+    const forbidden = /\bUNION\b|--|\/\*/i;
+    if (forbidden.test(expr)) {
+      setValidationError(t("scratchpad.expressionForbiddenPattern"));
+      return false;
+    }
+    setValidationError(null);
+    return true;
   }
 
   function handleSave() {
+    if (!validateExpression(form.expression)) return;
     if (editing) {
       updateMut.mutate({ id: editing.id, data: form });
     } else {
@@ -137,12 +156,23 @@ export default function ScratchpadPanel() {
   }
 
   const error = createMut.error ?? updateMut.error;
-  const errorMsg =
+  // Bug-8162: the server now REFUSES to save when it cannot reach the query
+  // validator. That refusal must not read as "your expression is wrong" — the
+  // expression was never judged. The server marks it with 503 (retryable);
+  // anything else is a real verdict and keeps rendering the server's detail.
+  const httpStatus =
     error && typeof error === "object" && "response" in error
-      ? ((error as { response?: { data?: { detail?: string } } }).response?.data?.detail ?? t("scratchpad.saveFailed"))
-      : error
-        ? String(error)
-        : null;
+      ? (error as { response?: { status?: number } }).response?.status
+      : undefined;
+  const serverErrorMsg =
+    httpStatus === 503
+      ? t("scratchpad.validatorUnavailable")
+      : error && typeof error === "object" && "response" in error
+        ? ((error as { response?: { data?: { detail?: string } } }).response?.data?.detail ?? t("scratchpad.saveFailed"))
+        : error
+          ? String(error)
+          : null;
+  const errorMsg = validationError ?? serverErrorMsg;
 
   return (
     <Box sx={{ p: 2 }}>

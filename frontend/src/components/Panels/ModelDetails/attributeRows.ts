@@ -1,4 +1,5 @@
 import ExcelJS from "exceljs";
+import { csvSafeCell } from "../../../utils/sanitize";
 import type {
   ModelTable,
   TableAttribute,
@@ -281,9 +282,18 @@ function rowValues(row: AttributeRow, labels: ExportLabels): string[] {
   ];
 }
 
+// Bug-7286: neutralise spreadsheet formula injection (leading =/+/-/@/tab/CR/LF)
+// before RFC-4180 quoting. Attribute rows carry source-derived text (names,
+// glossary descriptions, UDA formulas) that must never execute when the CSV is
+// opened in a spreadsheet. The `index` column is a plain integer and is exempt.
+function isPlainNumber(v: string): boolean {
+  return /^-?\d+(?:\.\d+)?$/.test(v);
+}
+
 function csvCell(v: string): string {
-  if (/[",\n]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
-  return v;
+  const guarded = isPlainNumber(v) ? v : csvSafeCell(v);
+  if (/[",\n\r]/.test(guarded)) return `"${guarded.replace(/"/g, '""')}"`;
+  return guarded;
 }
 
 export function rowsToCsv(rows: AttributeRow[], labels: ExportLabels): string {
@@ -325,7 +335,10 @@ export async function rowsToXlsx(
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet("Attributes");
 
-  const header = ws.addRow([...labels.headers]);
+  // Bug-7286: header labels are static i18n text (not source-derived), but guard
+  // them too so the worksheet has no unguarded string-cell path — consistent with
+  // the pivot XLSX export and safe against any future header source change.
+  const header = ws.addRow(labels.headers.map((h) => csvSafeCell(h)));
   header.eachCell((cell) => {
     cell.fill = {
       type: "pattern",
@@ -336,7 +349,12 @@ export async function rowsToXlsx(
   });
 
   for (const row of rows) {
-    ws.addRow(rowValues(row, labels));
+    // Bug-7286: ExcelJS writes a string beginning with "=" as a live formula.
+    // Guard every source-derived cell so planted formulas land as literal text.
+    // The leading index column is a plain integer and stays numeric.
+    ws.addRow(
+      rowValues(row, labels).map((v) => (isPlainNumber(v) ? v : csvSafeCell(v))),
+    );
   }
 
   for (let c = 1; c <= labels.headers.length; c++) {

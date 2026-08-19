@@ -17,9 +17,39 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
+from shared.connector_qualify import quote_identifier
+
 
 SUBTOTAL_LEVEL_KEY = "_subtotal_level"
 SUBTOTAL_GRAIN_KEY = "_subtotal_grain"
+
+
+def select_detail_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only the DETAIL (leaf-grain) rows of a merged result set.
+
+    Bug-8323 / Bug-8379 — one definition of the detail-grain invariant.
+
+    When a pivot requests hierarchy subtotals, ``merge_grain_results`` returns a
+    MERGED row list: leaf rows tagged ``SUBTOTAL_LEVEL_KEY == "detail"`` plus
+    subtotal / grand-total rows tagged with their grain level. A subtotal row
+    carries ``None`` in every dimension column finer than its own grain, so any
+    consumer that derives a *grain-sensitive* artefact from it — a
+    denominator/aggregate re-query partition key, a Top-N survivor predicate, a
+    custom-group member match, a Show-Values-As peer set — reads that ``None``
+    as a real "(blank)" member and produces a spurious or contaminated result.
+
+    Every such consumer previously re-implemented the same one-line filter, and
+    the copies drifted (``plan_denominator_requeried`` was left out of the
+    Bug-8323 fix and stayed exposed as Bug-8379). This helper is the single
+    home for the rule: a row with no ``SUBTOTAL_LEVEL_KEY`` at all is a detail
+    row, so this is a no-op on a flat (non-subtotal) pivot.
+    """
+    return [r for r in rows if r.get(SUBTOTAL_LEVEL_KEY, "detail") == "detail"]
+
+
+def select_non_detail_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Complement of :func:`select_detail_rows` — subtotal / grand-total rows."""
+    return [r for r in rows if r.get(SUBTOTAL_LEVEL_KEY, "detail") != "detail"]
 
 
 @dataclass
@@ -96,6 +126,29 @@ def detect_subtotal_hierarchies(
                 if not level_map:
                     continue
 
+                # Bug-6892: the two-part form is ambiguous. [Dim].[Hier].Members
+                # is a whole-hierarchy expansion (subtotals), but Excel emits a
+                # LEVEL-scoped request as [Hier].[Level].Members — same shape.
+                # When the FIRST part resolved to the hierarchy and the second
+                # part names one of its levels, the client asked for that level
+                # only; treating it as a full expansion grouped the SQL by every
+                # grain (a Year pivot came back at day grain — wrong numbers).
+                if (
+                    hkey == dim_part.lower()
+                    and hier_part.lower() != dim_part.lower()
+                    and hier_part.lower() in level_map
+                ):
+                    continue
+
+                # Bug-7596: symmetric guard for when hkey == hier_part and
+                # dim_part is a level of that hierarchy.
+                if (
+                    hkey == hier_part.lower()
+                    and dim_part.lower() != hier_part.lower()
+                    and dim_part.lower() in level_map
+                ):
+                    continue
+
                 hier_def = None
                 for h in hierarchy_meta:
                     if (h.get("name") or "").strip().lower() == hkey:
@@ -143,17 +196,15 @@ def build_subtotal_queries(
     measures_meta: list[dict[str, Any]],
     hierarchy: SubtotalHierarchy,
     measure_canonical: dict[str, str],
+    connector_type: str = "postgresql",
 ) -> list[GrainQuery]:
     """Generate SQL queries at each intermediate and grand-total grain.
 
     Does NOT generate the detail query (the caller uses the existing one).
-    LAST_NON_EMPTY measures are aggregated with SUM in these queries —
+    LAST_NON_EMPTY measures are aggregated with SUM in these queries ---
     the gateway replaces those values with Python-computed LAST_NON_EMPTY
     from the detail results afterward.
     """
-    def _q(name: str) -> str:
-        return f'"{name}"'
-
     measure_agg: dict[str, str] = {}
     for m_meta in measures_meta:
         mname = m_meta.get("name", "")
@@ -173,6 +224,7 @@ def build_subtotal_queries(
         sql = _build_grain_sql(
             grain_dims, mdx_measures, measure_agg, measure_canonical,
             where_sql_clauses, model_slug,
+            connector_type=connector_type,
         )
         queries.append(GrainQuery(
             sql=sql, protocol="jdbc",
@@ -183,6 +235,7 @@ def build_subtotal_queries(
     grand_sql = _build_grain_sql(
         non_hier_dims, mdx_measures, measure_agg, measure_canonical,
         where_sql_clauses, model_slug,
+        connector_type=connector_type,
     )
     queries.append(GrainQuery(
         sql=grand_sql, protocol="jdbc",
@@ -200,9 +253,11 @@ def _build_grain_sql(
     measure_canonical: dict[str, str],
     where_sql_clauses: list[str],
     model_slug: str,
+    *,
+    connector_type: str = "postgresql",
 ) -> str:
     def _q(name: str) -> str:
-        return f'"{name}"'
+        return quote_identifier(connector_type, name)
 
     select_parts: list[str] = [_q(d) for d in grain_dims]
     for meas in mdx_measures:
@@ -477,6 +532,7 @@ def build_multi_subtotal_queries(
     measures_meta: list[dict[str, Any]],
     hierarchies: list[SubtotalHierarchy],
     measure_canonical: dict[str, str],
+    connector_type: str = "postgresql",
 ) -> list[GrainQuery]:
     """Generate subtotal queries for all grain combinations across hierarchies.
 
@@ -540,6 +596,7 @@ def build_multi_subtotal_queries(
         sql = _build_grain_sql(
             grain_dims, mdx_measures, measure_agg, measure_canonical,
             where_sql_clauses, model_slug,
+            connector_type=connector_type,
         )
         queries.append(GrainQuery(
             sql=sql, protocol="jdbc",

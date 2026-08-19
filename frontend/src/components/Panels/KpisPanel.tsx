@@ -11,6 +11,7 @@ import {
   Chip,
   CircularProgress,
   IconButton,
+  Snackbar,
   Stack,
   Tooltip,
   Typography,
@@ -19,6 +20,9 @@ import AddIcon from "@mui/icons-material/Add";
 import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
 import DeleteIcon from "@mui/icons-material/Delete";
 import EditIcon from "@mui/icons-material/Edit";
+import PublishIcon from "@mui/icons-material/Publish";
+import UnpublishedIcon from "@mui/icons-material/Unpublished";
+import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import VerifiedIcon from "@mui/icons-material/Verified";
 import BlockIcon from "@mui/icons-material/Block";
 import TrendingUpIcon from "@mui/icons-material/TrendingUp";
@@ -34,8 +38,33 @@ import AccessTimeIcon from "@mui/icons-material/AccessTime";
 
 import { kpisApi, measuresApi, preferencesApi } from "../../api/client";
 import type { Kpi, KpiEvaluateResponse } from "../../api/types";
+import { recordDelete } from "../Builder/emitDrawerHistory";
+import { extractApiError } from "../../utils/extractApiError";
+
+/** KpiCreate-relevant fields, used to build the re-create payload for a
+ *  deleted KPI so undo/redo can restore it (Bug-8227). */
+const KPI_CREATE_KEYS = [
+  "name", "display_name", "description", "display_folder", "kpi_type",
+  "expression", "calc_agg_mode", "inner_agg", "inner_grain", "outer_agg",
+  "at_grain", "non_additive_agg", "carry_forward", "target_type",
+  "target_value", "target_measure_id", "target_expression", "target_period",
+  "direction", "presentation_type", "presentation_meta", "trend_period",
+  "trend_threshold", "trend_sparkline_periods", "format_token", "format_custom",
+  "unit_label", "null_display_value", "weight", "parent_kpi_id",
+  "indicator_type", "time_dimension_id", "business_definition",
+  "snapshot_frequency", "snapshot_retention", "status_graphic", "trend_graphic",
+] as const;
+
+function kpiToPayload(kpi: Kpi): Record<string, unknown> {
+  const record = kpi as unknown as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of KPI_CREATE_KEYS) {
+    if (record[key] !== undefined && record[key] !== null) out[key] = record[key];
+  }
+  return out;
+}
 import { useDimensions, useUserPreferences } from "../../api/hooks";
-import { canEditModelConfig, isTenantAdmin } from "../../auth/currentUser";
+import { isTenantAdmin } from "../../auth/currentUser";
 import { useBuilderStore } from "../../store/builderStore";
 import { useConfirm } from "../Confirm";
 import TemplateGalleryDialog from "./TemplateGalleryDialog";
@@ -84,7 +113,7 @@ export default function KpisPanel() {
   const qc = useQueryClient();
   const confirm = useConfirm();
   const storeReadOnly = useBuilderStore((s) => s.readOnly);
-  const canEdit = canEditModelConfig() && !storeReadOnly;
+  const canEdit = !storeReadOnly;  // Bug-8784: backend caller_can_author is authoritative
 
   const [templateGalleryOpen, setTemplateGalleryOpen] = useState(false);
   const [evalData, setEvalData] = useState<Record<string, KpiEvaluateResponse>>({});
@@ -137,8 +166,31 @@ export default function KpisPanel() {
   const [v2Template, setV2Template] = useState<KpiTemplateInit | null>(null);
 
   const deleteMut = useMutation({
-    mutationFn: (id: string) => kpisApi.delete(projectId, modelId, id),
+    mutationFn: async (kpi: Kpi) => {
+      await kpisApi.delete(projectId, modelId, kpi.id);
+      return kpi;
+    },
+    onSuccess: (kpi) => {
+      // Bug-8227: record the delete so undo re-creates the KPI from its prior
+      // definition / redo deletes it again.
+      recordDelete("kpi", kpi.id, kpiToPayload(kpi));
+      qc.invalidateQueries({ queryKey });
+    },
+  });
+
+  // F-101-01: publish/unpublish a KPI to the BI catalogues from the SPA. The
+  // backend requires the model itself to be deployed first (409 otherwise); the
+  // error surfaces so the modeller knows to deploy the model.
+  const [publishError, setPublishError] = useState<string | null>(null);
+  const deployMut = useMutation({
+    mutationFn: (kpi: Kpi) => kpisApi.deploy(projectId, modelId, kpi.id),
     onSuccess: () => qc.invalidateQueries({ queryKey }),
+    onError: (err: unknown) => setPublishError(extractApiError(err, t("kpis.publishFailed"))),
+  });
+  const undeployMut = useMutation({
+    mutationFn: (kpi: Kpi) => kpisApi.undeploy(projectId, modelId, kpi.id),
+    onSuccess: () => qc.invalidateQueries({ queryKey }),
+    onError: (err: unknown) => setPublishError(extractApiError(err, t("kpis.unpublishFailed"))),
   });
 
   const isAdmin = isTenantAdmin();
@@ -164,6 +216,7 @@ export default function KpisPanel() {
             trend: null,
             trend_label: null,
             trend_pct: null,
+            trend_pct_normalised: null,
             formatted_value: null,
             formatted_target: null,
             formatted_goal: null,
@@ -234,7 +287,18 @@ export default function KpisPanel() {
       message: t("kpis.deleteMessage", { name: kpi.display_name || kpi.name }),
       confirmLabel: t("common.delete"),
     });
-    if (ok) deleteMut.mutate(kpi.id);
+    if (ok) deleteMut.mutate(kpi);
+  }
+
+  async function handleUnpublish(kpi: Kpi) {
+    // F-101-01: unpublishing removes the KPI from Excel/JDBC immediately, so
+    // confirm before hiding it from BI clients.
+    const ok = await confirm({
+      title: t("kpis.unpublishConfirm"),
+      message: t("kpis.unpublishMessage", { name: kpi.display_name || kpi.name }),
+      confirmLabel: t("kpis.unpublish"),
+    });
+    if (ok) undeployMut.mutate(kpi);
   }
 
   return (
@@ -326,8 +390,43 @@ export default function KpisPanel() {
                         color={CERT_COLORS[kpi.certification_status] ?? "default"}
                       />
                     )}
+                    {/* F-101-01: publication state (visible to JDBC $KPIs /
+                        XMLA MDSCHEMA_KPIS). A certified KPI is not in the BI
+                        catalogue until it is published here. */}
+                    {kpi.is_deployed && (
+                      <Tooltip title={t("kpis.publishedHint")}>
+                        <Chip
+                          icon={<CloudDoneIcon />}
+                          label={t("kpis.published")}
+                          size="small"
+                          color="success"
+                          variant="outlined"
+                        />
+                      </Tooltip>
+                    )}
                     {canEdit && (
                       <>
+                        {kpi.certification_status === "certified" && !kpi.is_deployed && (
+                          <Button
+                            size="small"
+                            startIcon={<PublishIcon />}
+                            onClick={() => deployMut.mutate(kpi)}
+                            disabled={deployMut.isPending}
+                          >
+                            {t("kpis.publish")}
+                          </Button>
+                        )}
+                        {kpi.is_deployed && (
+                          <Button
+                            size="small"
+                            color="warning"
+                            startIcon={<UnpublishedIcon />}
+                            onClick={() => handleUnpublish(kpi)}
+                            disabled={undeployMut.isPending}
+                          >
+                            {t("kpis.unpublish")}
+                          </Button>
+                        )}
                         <Button size="small" startIcon={<EditIcon />} onClick={() => openEdit(kpi)}>
                           {t("common.edit")}
                         </Button>
@@ -405,6 +504,19 @@ export default function KpisPanel() {
                         variant="outlined"
                       />
                     )}
+                    {/* F-017-09: make the Python fallback visible — the value did
+                        not come from the SQL compiler, so operators/modellers can
+                        see a potential SQL-vs-Python divergence. */}
+                    {ev.evaluation_path && ev.evaluation_path !== "sql" && (
+                      <Tooltip title={ev.fallback_reason ?? ""}>
+                        <Chip
+                          size="small"
+                          color="warning"
+                          variant="outlined"
+                          label={t("kpis.evaluatedBy", { engine: ev.evaluation_path })}
+                        />
+                      </Tooltip>
+                    )}
                   </Box>
                 )}
                 {kpi.certification_status === "deprecated" && (
@@ -470,6 +582,16 @@ export default function KpisPanel() {
         entityType="kpi"
         onApplyKpi={applyKpiTemplate}
       />
+      <Snackbar
+        open={publishError !== null}
+        autoHideDuration={6000}
+        onClose={() => setPublishError(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="error" onClose={() => setPublishError(null)} sx={{ width: "100%" }}>
+          {publishError}
+        </Alert>
+      </Snackbar>
     </Box>
   );
 }

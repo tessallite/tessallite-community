@@ -23,12 +23,16 @@ from shared.auth.middleware import CurrentUser, require_tenant_admin
 from shared.db.models import Model, ProjectConnection
 from shared.db.session import get_tenant_db
 from shared.model_snapshot.importer import prepare_snapshot_for_import
-from shared.model_snapshot.rehydrator import rehydrate_into_live
+from shared.db.model_write_lock_guard import model_write_lock_exempt
+from shared.model_snapshot.rehydrator import SnapshotSchemaError, rehydrate_into_live
+from src.api.personas import seed_technical_persona
+from shared.model_snapshot.consistent_read import consistent_read_session
 from shared.model_snapshot.serialiser import snapshot_model
 from shared.model_snapshot.slug_utils import insert_model_with_slug_retry
 from shared.model_snapshot.yaml_deserialiser import YamlImportError, parse_project_yaml
 from shared.model_snapshot.yaml_serialiser import project_to_yaml, snapshot_to_yaml
-from sqlalchemy import select
+from sqlalchemy import func, select
+from src.licensing_guard import enforce_demo_source_locked, enforce_import_model_cap
 from starlette.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
@@ -52,7 +56,9 @@ async def export_project_yaml(
     project_id: UUID,
     current_user: CurrentUser = Depends(require_tenant_admin),
 ):
-    async for db in get_tenant_db(current_user.tenant_id):
+    # Bug-8380: project metadata, connections, model enumeration, and every
+    # model snapshot must come from one committed point in time.
+    async with consistent_read_session(current_user.tenant_id) as db:
         from shared.db.models import Project
         project = await db.get(Project, project_id)
         if project is None:
@@ -69,6 +75,12 @@ async def export_project_yaml(
             select(Model).where(Model.project_id == project_id)
         )
         models = list(model_result.scalars().all())
+
+        # Bug-5727: track invalid entities that the YAML serialiser will
+        # silently drop (is_invalid=True measures/dimensions). Log a warning
+        # for each so the export is auditable, and surface the count in a
+        # response header.
+        total_dropped = 0
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -89,6 +101,25 @@ async def export_project_yaml(
                     conn_id = ds[0].get("project_connection_id", "")
                     conn_name = conn_map.get(conn_id)
 
+                # Bug-5727: detect invalid measures/dimensions before
+                # serialisation so dropped entities are logged, not silent.
+                for meas in snap.get("measures", []):
+                    if meas.get("is_invalid"):
+                        total_dropped += 1
+                        logger.warning(
+                            "YAML export: dropping invalid measure %r "
+                            "(id=%s) from model %r",
+                            meas.get("name"), meas.get("id"), m.slug,
+                        )
+                for dim in snap.get("dimensions", []):
+                    if dim.get("is_invalid"):
+                        total_dropped += 1
+                        logger.warning(
+                            "YAML export: dropping invalid dimension %r "
+                            "(id=%s) from model %r",
+                            dim.get("name"), dim.get("id"), m.slug,
+                        )
+
                 model_yaml = snapshot_to_yaml(
                     snap,
                     project_name=project.slug,
@@ -99,10 +130,19 @@ async def export_project_yaml(
 
         buf.seek(0)
         filename = f"{project.slug}-export.zip"
+        headers: dict[str, str] = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        }
+        if total_dropped > 0:
+            headers["X-Tessallite-Export-Dropped"] = str(total_dropped)
+            logger.warning(
+                "YAML export for project %s: %d invalid entities omitted",
+                project.slug, total_dropped,
+            )
         return StreamingResponse(
             buf,
             media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers=headers,
         )
 
     raise HTTPException(status_code=500, detail="DB session exhausted")
@@ -118,6 +158,8 @@ async def import_project_yaml(
     file: UploadFile = File(...),
     current_user: CurrentUser = Depends(require_tenant_admin),
 ):
+    enforce_demo_source_locked(current_user.tenant_id)
+
     if not file.filename or not file.filename.endswith(".zip"):
         raise HTTPException(status_code=400, detail="Upload must be a .zip file")
 
@@ -165,11 +207,22 @@ async def import_project_yaml(
     model_names: list[str] = []
     models_created = 0
 
+    models_to_import = len(bundle.get("models", []))
+
     async for db in get_tenant_db(current_user.tenant_id):
         from shared.db.models import Project
         project = await db.get(Project, project_id)
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
+
+        # Bug-7468: enforce the licensed model cap BEFORE creating any models.
+        async def _count_models() -> int:
+            r = await db.execute(select(func.count()).select_from(Model))
+            return int(r.scalar() or 0)
+
+        # Bug-6567: pass db so imports and direct creates serialise via
+        # the same advisory lock, preventing concurrent cap bypass.
+        await enforce_import_model_cap(models_to_import, _count_models, db=db)
 
         # YAML carries no connection credentials; bind placeholder data
         # sources to an existing project connection. F-020-17: rebind each
@@ -208,7 +261,7 @@ async def import_project_yaml(
                     display_name="(imported — configure me)",
                     connection_type="postgresql",
                     encrypted_credentials=encrypt_json({}),
-                    config={},
+                    config={"unconfigured": True, "import_placeholder": True},
                 )
                 db.add(placeholder_conn)
                 await db.flush()
@@ -246,24 +299,71 @@ async def import_project_yaml(
                 rewritten["model"]["display_name"] = snap_model["display_name"]
 
             # F-020-19/22: headroom-safe collision suffixing + race-safe insert.
-            new_model, candidate = await insert_model_with_slug_retry(
-                db,
-                project_id=project_id,
-                base_slug=slug,
-                existing_slugs=existing_slugs,
-                display_name=snap_model.get("display_name") or slug,
-                new_model_id=new_model_id,
-            )
+            # Bug-6291: insert_model_with_slug_retry now enforces the BI-safe
+            # slug contract.  Catch the ValueError and surface a clear 422
+            # naming the offending model so YAML authors know what to fix.
+            try:
+                new_model, candidate = await insert_model_with_slug_retry(
+                    db,
+                    project_id=project_id,
+                    base_slug=slug,
+                    existing_slugs=existing_slugs,
+                    display_name=snap_model.get("display_name") or slug,
+                    new_model_id=new_model_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"YAML model '{slug}' has an invalid slug: {exc}. "
+                        f"Rename the model in the YAML file using only "
+                        f"letters, digits, and underscores (e.g. "
+                        f"'sales_model' instead of 'sales-model')."
+                    ),
+                ) from exc
             rewritten["model"]["slug"] = candidate
 
-            await rehydrate_into_live(
-                new_model_id, rewritten, db,
-                drop_orphan_aggregates=False,
-                actor=current_user.email or current_user.user_id,
-                force_aggregate_pending=True,
-                force_pocket_stale=True,
-                preserve_destination_seed=True,
-            )
+            # Bug-6291: rehydrate_into_live -> _insert_personas now
+            # validates persona slugs against the BI-safe contract.
+            # Catch ValueError and surface as a clear 422.
+            try:
+                # Bug-7982 R7: DELIBERATE non-holder. Rehydrates into a model
+                # created in THIS transaction, so no other writer can reference
+                # it yet and there is nothing to serialise against. Declared
+                # explicitly so the runtime write guard does not report (and
+                # thereby drown out) a benign wholesale rebuild.
+                async with model_write_lock_exempt(
+                    db, "import: wholesale rebuild into a model created in this transaction"
+                ):
+                    await rehydrate_into_live(
+                        new_model_id, rewritten, db,
+                        drop_orphan_aggregates=False,
+                        actor=current_user.email or current_user.user_id,
+                        force_aggregate_pending=True,
+                        force_pocket_stale=True,
+                        preserve_destination_seed=True,
+                    )
+            except SnapshotSchemaError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error_code": "PERSONA_IMPORT_VALIDATION",
+                        "message": str(exc),
+                    },
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"YAML model '{slug}' contains an invalid "
+                        f"persona slug: {exc}. "
+                        f"Rename the persona in the YAML file using "
+                        f"only letters, digits, and underscores."
+                    ),
+                ) from exc
+            # Bug-6138: importer-created models bypass create_model, so seed the
+            # canonical Technical persona here too (idempotent).
+            await seed_technical_persona(db, new_model_id)
             models_created += 1
 
         await db.commit()

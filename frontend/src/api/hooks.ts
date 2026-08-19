@@ -6,12 +6,14 @@ import {
   aggregatesApi,
   aiOptimizerApi,
   aiSchedulerApi,
+  attributeRelationshipsApi,
   connectionsApi,
   dataTagsApi,
   dimensionsApi,
   downstreamAssetsApi,
   fieldCompatibilityApi,
   hierarchiesApi,
+  impactAnalysisApi,
   impactScanApi,
   joinsApi,
   kpisApi,
@@ -19,6 +21,7 @@ import {
   logsApi,
   measuresApi,
   modelTablesApi,
+  namedQueriesApi,
   namedSetsApi,
   modelsApi,
   optimizerApiClient,
@@ -27,6 +30,7 @@ import {
   pocketsApi,
   rowSecurityApi,
   projectsApi,
+  projectSettingsApi,
   sourcesApi,
   tableAttributesApi,
   targetsApi,
@@ -285,6 +289,19 @@ export function useDimensions(projectId: string, modelId: string) {
   });
 }
 
+export function useAttributeRelationships(
+  projectId: string,
+  modelId: string,
+  dimensionId: string,
+) {
+  return useQuery({
+    queryKey: ["attributeRelationships", projectId, modelId, dimensionId],
+    queryFn: () =>
+      attributeRelationshipsApi.list(projectId, modelId, dimensionId),
+    enabled: !!projectId && !!modelId && !!dimensionId,
+  });
+}
+
 export function useMeasures(projectId: string, modelId: string) {
   return useQuery({
     queryKey: ["measures", projectId, modelId],
@@ -415,10 +432,11 @@ export function useQueryLogs(
     status?: string;
     errorType?: string;
     routeType?: string;
-    clientKind?: "looker_studio" | "looker_cloud";
+    clientKind?: string;
     userIdentity?: string;
     dateFrom?: string;
     dateTo?: string;
+    includeProbes?: boolean;
   } = {},
 ) {
   return useQuery({
@@ -481,13 +499,14 @@ export function useLLMConfigs(projectId: string | undefined) {
 // ---------------------------------------------------------------------------
 
 export function useAIOptimizerRuns(tenantId?: string, modelId?: string) {
-  // F-030-06: callers that lack a tenant id in scope (e.g. ModelHealthPanel)
-  // used to pass "" and silently disable the query. Fall back to the persisted
-  // auth-context tenant id so AI runs surface for every caller.
+  // Bug-6558 — the optimizer route resolves the tenant from the JWT;
+  // tenant_id was never a declared query parameter.  We keep the hook
+  // signature unchanged (callers still pass tenantId for the query key /
+  // enabled guard) but no longer forward it to the API call.
   const resolvedTenantId = tenantId || safeLocalGet("tenant_id", "");
   return useQuery({
     queryKey: ["aiOptimizerRuns", resolvedTenantId, modelId],
-    queryFn: () => aiOptimizerApi.listRuns(resolvedTenantId, modelId),
+    queryFn: () => aiOptimizerApi.listRuns(modelId),
     enabled: !!resolvedTenantId,
     refetchInterval: 30_000,
   });
@@ -532,111 +551,6 @@ export function usePersona(
   });
 }
 
-// ---------------------------------------------------------------------------
-// SSE — Refresh stream
-// ---------------------------------------------------------------------------
-
-export interface StreamRefreshRun {
-  run_type: "aggregate" | "pocket";
-  id: string;
-  status: string;
-  refresh_mode: string;
-  started_at: string | null;
-  completed_at: string | null;
-  rows_written: number | null;
-  error_message: string | null;
-}
-
-/**
- * Opens a Server-Sent Events connection to the refresh stream endpoint and
- * accumulates run updates. Falls back to a 5-second polling interval when
- * the EventSource connection fails.
- */
-export function useRefreshStream(projectId: string, modelId: string) {
-  const [runs, setRuns] = useState<StreamRefreshRun[]>([]);
-  const [connected, setConnected] = useState(false);
-  const [error, setError] = useState(false);
-  const esRef = useRef<EventSource | null>(null);
-  const fallbackRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const url = `/api/v1/projects/${projectId}/models/${modelId}/refresh/stream`;
-
-  const startFallbackPoll = useCallback(() => {
-    if (fallbackRef.current) return;
-    fallbackRef.current = setInterval(() => {
-      aggregatesApi.getModelRuns(projectId, modelId).then((data) => {
-        const mapped: StreamRefreshRun[] = data.map((r: any) => ({
-          run_type: "aggregate" as const,
-          id: r.id,
-          status: r.status,
-          refresh_mode: r.refresh_mode,
-          started_at: r.started_at,
-          completed_at: r.completed_at,
-          rows_written: r.rows_written ?? null,
-          error_message: r.error_message ?? null,
-        }));
-        setRuns(mapped);
-      });
-    }, 5_000);
-  }, [projectId, modelId]);
-
-  useEffect(() => {
-    if (!projectId || !modelId) return;
-
-    const es = new EventSource(url);
-    esRef.current = es;
-
-    es.addEventListener("connected", () => {
-      setConnected(true);
-      setError(false);
-    });
-
-    es.addEventListener("done", () => {
-      setConnected(false);
-      es.close();
-    });
-
-    es.addEventListener("timeout", () => {
-      setConnected(false);
-      es.close();
-    });
-
-    es.onmessage = (evt) => {
-      try {
-        const run: StreamRefreshRun = JSON.parse(evt.data);
-        setRuns((prev) => {
-          const idx = prev.findIndex((r) => r.id === run.id);
-          if (idx >= 0) {
-            const updated = [...prev];
-            updated[idx] = run;
-            return updated;
-          }
-          return [run, ...prev];
-        });
-      } catch {
-        // ignore malformed events
-      }
-    };
-
-    es.onerror = () => {
-      setError(true);
-      setConnected(false);
-      es.close();
-      startFallbackPoll();
-    };
-
-    return () => {
-      es.close();
-      esRef.current = null;
-      if (fallbackRef.current) {
-        clearInterval(fallbackRef.current);
-        fallbackRef.current = null;
-      }
-    };
-  }, [projectId, modelId, url, startFallbackPoll]);
-
-  return { runs, connected, error };
-}
 
 // ---------------------------------------------------------------------------
 // SSE — Agent token streaming
@@ -653,14 +567,26 @@ export function useAgentStream(projectId: string, conversationId: string) {
   const [text, setText] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [done, setDone] = useState(false);
-  const esRef = useRef<EventSource | null>(null);
+  // Bug-6670: AbortController replaces the dead esRef (which was typed as
+  // EventSource but never assigned — fetch+ReadableStream was the actual
+  // transport). Aborting the controller cancels both the fetch and the
+  // ReadableStream reader in one shot.
+  const abortRef = useRef<AbortController | null>(null);
+  // Bug-6670: monotonic turn token prevents a stale/aborted turn's chunks
+  // from leaking into the next turn's text accumulator.
+  const turnTokenRef = useRef(0);
 
   const send = useCallback(
     (message: string) => {
-      if (esRef.current) {
-        esRef.current.close();
-        esRef.current = null;
+      // Abort any in-flight streaming turn before starting the new one.
+      if (abortRef.current) {
+        abortRef.current.abort();
+        abortRef.current = null;
       }
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const currentTurn = ++turnTokenRef.current;
+
       setText("");
       setDone(false);
       setStreaming(true);
@@ -675,6 +601,7 @@ export function useAgentStream(projectId: string, conversationId: string) {
       fetch(url, {
         method: "POST",
         credentials: "include",
+        signal: controller.signal,
         headers: {
           "Content-Type": "application/json",
           ...(csrf ? { "X-CSRF-Token": csrf } : {}),
@@ -691,6 +618,8 @@ export function useAgentStream(projectId: string, conversationId: string) {
         let buffer = "";
 
         const processChunk = ({ done: streamDone, value }: ReadableStreamReadResult<Uint8Array>): Promise<void> | void => {
+          // Guard: if this turn was superseded, stop processing.
+          if (turnTokenRef.current !== currentTurn) return;
           if (streamDone) {
             setStreaming(false);
             setDone(true);
@@ -707,7 +636,7 @@ export function useAgentStream(projectId: string, conversationId: string) {
             if (line.startsWith("data:")) {
               try {
                 const payload = JSON.parse(line.slice(5).trim());
-                if (payload.text) {
+                if (payload.text && turnTokenRef.current === currentTurn) {
                   setText((prev) => prev + payload.text);
                 }
               } catch {
@@ -718,11 +647,14 @@ export function useAgentStream(projectId: string, conversationId: string) {
           return reader.read().then(processChunk);
         };
 
-        reader.read().then(processChunk).catch(() => {
+        reader.read().then(processChunk).catch((err) => {
+          // AbortError is expected when the user cancels — not a failure.
+          if (err?.name === "AbortError") return;
           setStreaming(false);
           setDone(true);
         });
-      }).catch(() => {
+      }).catch((err) => {
+        if (err?.name === "AbortError") return;
         setStreaming(false);
         setDone(true);
       });
@@ -731,20 +663,34 @@ export function useAgentStream(projectId: string, conversationId: string) {
   );
 
   const reset = useCallback(() => {
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
     }
+    // R1 Finding 3: bump the turn token so any in-flight chunk that
+    // resolved before the abort takes effect is discarded by the
+    // turnTokenRef guard instead of leaking into the cleared state.
+    ++turnTokenRef.current;
     setText("");
     setStreaming(false);
     setDone(false);
+  }, []);
+
+  // Cleanup on unmount: abort any in-flight stream.
+  useEffect(() => {
+    return () => {
+      if (abortRef.current) {
+        abortRef.current.abort();
+        abortRef.current = null;
+      }
+    };
   }, []);
 
   return { text, streaming, done, send, reset };
 }
 
 // ---------------------------------------------------------------------------
-// Impact Analysis — Downstream Assets
+// Usage & Downstream Assets
 // ---------------------------------------------------------------------------
 
 export function useDownstreamAssets(projectId: string, modelId: string) {
@@ -786,6 +732,41 @@ export function useGatewayQueryReferences(
 }
 
 // ---------------------------------------------------------------------------
+// Impact Analysis (Bug-7787, Phase 4)
+// ---------------------------------------------------------------------------
+
+export function useImpactCatalogue(
+  projectId: string,
+  modelId: string,
+  params?: { object_types?: string; search?: string; cursor?: string; limit?: number },
+) {
+  return useQuery({
+    queryKey: ["impact-catalogue", projectId, modelId, params],
+    queryFn: () => impactAnalysisApi.catalogue(projectId, modelId, params),
+    enabled: !!projectId && !!modelId,
+  });
+}
+
+export function useImpactQuery(
+  projectId: string,
+  modelId: string,
+  body: import("./types_domains/model_impact").ImpactQueryRequest | null,
+) {
+  return useQuery({
+    queryKey: ["impact-query", projectId, modelId, body],
+    queryFn: () => impactAnalysisApi.query(projectId, modelId, body!),
+    enabled: !!projectId && !!modelId && body !== null,
+  });
+}
+
+export function useColumnUsage(projectId: string, modelId: string) {
+  return useQuery({
+    queryKey: ["column-usage", projectId, modelId],
+    queryFn: () => impactAnalysisApi.columnUsage(projectId, modelId),
+    enabled: !!projectId && !!modelId,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Named Sets
 // ---------------------------------------------------------------------------
@@ -799,13 +780,91 @@ export function useNamedSets(projectId: string, modelId: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Named Queries
+// ---------------------------------------------------------------------------
+
+/** Module-level empty list so an unloaded query never hands consumers a new
+ *  array identity every render (Bug-100 ref-stability class). */
+const EMPTY_NAMED_QUERIES: import("./types").NamedQuery[] = [];
+
+/**
+ * Bug-100 (ref stability): both the joined data AND the wrapper object are
+ * memoised. TanStack Query returns a new result object every render, so
+ * consumers keying their own useMemo on `data` (the panel's kind filter, the
+ * editor's health lookup) would churn otherwise.
+ */
+export function useNamedQueries(projectId: string, modelId: string) {
+  const query = useQuery({
+    queryKey: ["namedQueries", projectId, modelId],
+    queryFn: () => namedQueriesApi.list(projectId, modelId),
+    enabled: !!projectId && !!modelId,
+  });
+  const data = useMemo<import("./types").NamedQuery[]>(
+    () => query.data ?? EMPTY_NAMED_QUERIES,
+    [query.data],
+  );
+  const isLoading = query.isLoading;
+  const isError = query.isError;
+  const isFetching = query.isFetching;
+  const refetch = query.refetch;
+  return useMemo(
+    () => ({ data, isLoading, isError, isFetching, refetch }),
+    [data, isLoading, isError, isFetching, refetch],
+  );
+}
+
+export interface NamedQueryCaps {
+  /** Effective system row cap (named_query.max_rows), null when unavailable. */
+  maxRows: number | null;
+  /** Effective system column cap (named_query.max_columns), null when unavailable. */
+  maxColumns: number | null;
+  isLoading: boolean;
+  isError: boolean;
+}
+
+/** Effective system caps for Named Query authoring, read through the project
+ *  settings API (viewer-accessible) so a per-Named-Query null cap can be shown
+ *  against the real default instead of a hardcoded literal. Bug-100: the
+ *  joined caps AND the wrapper are memoised. */
+export function useNamedQueryCaps(projectId: string): NamedQueryCaps {
+  const query = useQuery({
+    queryKey: ["project-settings", projectId, "named-query-caps"],
+    queryFn: () => projectSettingsApi.list(projectId),
+    enabled: !!projectId,
+  });
+  const joined = useMemo(() => {
+    const items = query.data ?? [];
+    let maxRows: number | null = null;
+    let maxColumns: number | null = null;
+    for (const item of items) {
+      if (item.key === "named_query.max_rows" && typeof item.effective_value === "number") {
+        maxRows = item.effective_value;
+      } else if (item.key === "named_query.max_columns" && typeof item.effective_value === "number") {
+        maxColumns = item.effective_value;
+      }
+    }
+    return { maxRows, maxColumns, isLoading: query.isLoading, isError: query.isError };
+  }, [query.data, query.isLoading, query.isError]);
+  return joined;
+}
+
+// ---------------------------------------------------------------------------
 // KPIs
 // ---------------------------------------------------------------------------
 
-export function useKpis(projectId: string, modelId: string, personaId?: string | null) {
+export function useKpis(
+  projectId: string,
+  modelId: string,
+  personaId?: string | null,
+  deployedOnly = false,
+) {
   return useQuery({
-    queryKey: ["kpis", projectId, modelId, personaId ?? null],
-    queryFn: () => kpisApi.list(projectId, modelId, personaId ?? undefined),
+    // F-017-05 / F-103-03 (Bug-9091): consumption surfaces (Model Health
+    // scorecard) pass deployedOnly so a certified-but-undeployed edit never
+    // reaches the executive card before Deploy. deployedOnly is part of the key
+    // so the builder (live) and scorecard (deployed) caches never alias.
+    queryKey: ["kpis", projectId, modelId, personaId ?? null, deployedOnly],
+    queryFn: () => kpisApi.list(projectId, modelId, personaId ?? undefined, deployedOnly),
     enabled: !!projectId && !!modelId,
   });
 }
@@ -841,6 +900,21 @@ export function useUserPreferences(projectId: string, modelId: string) {
     queryKey: ["preferences", projectId, modelId],
     queryFn: () => preferencesApi.get(projectId, modelId),
     enabled: !!projectId && !!modelId,
+  });
+}
+
+/**
+ * Bug-8183: the calling user's favourited models for one project.
+ *
+ * Separate query key from ``useUserPreferences`` because it is a different
+ * scope, not a different view of the same response — invalidating one must not
+ * refetch every open model's preferences.
+ */
+export function useFavouriteModels(projectId: string) {
+  return useQuery({
+    queryKey: ["favourite-models", projectId],
+    queryFn: () => preferencesApi.getFavouriteModels(projectId),
+    enabled: !!projectId,
   });
 }
 

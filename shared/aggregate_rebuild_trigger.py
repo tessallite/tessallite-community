@@ -11,11 +11,13 @@ the trigger logic (service-token mint + endpoint URL) lives in one place.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
 
 import httpx
-import jwt
 
+from shared.auth.service_principal import (
+    SCOPE_AGGREGATE_REBUILD,
+    create_service_access_token,
+)
 from shared.config.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -23,16 +25,14 @@ logger = logging.getLogger(__name__)
 
 def mint_service_token(tenant_id: str, *, subject: str, ttl_minutes: int = 30) -> str:
     """Mint a short-lived ``tenant_admin`` JWT for an internal service call."""
-    settings = get_settings()
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": subject,
-        "tenant_id": tenant_id,
-        "role": "tenant_admin",
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=ttl_minutes)).timestamp()),
-    }
-    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    principal = subject.removeprefix("service:")
+    return create_service_access_token(
+        principal=principal,
+        tenant_id=tenant_id,
+        role="tenant_admin",
+        ttl_minutes=ttl_minutes,
+        scopes=[SCOPE_AGGREGATE_REBUILD],
+    )
 
 
 async def trigger_model_refresh(

@@ -1,4 +1,4 @@
-﻿"""Model metrics endpoint for query routing observability."""
+"""Model metrics endpoint for query routing observability."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -18,6 +18,7 @@ from shared.db.models import (
     QueryMissLog,
 )
 from shared.db.session import get_tenant_db
+from shared.hit_rate import UNACCELERATABLE_ROUTE_TYPES, eligible_hit_rate as _eligible_hit_rate
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 
@@ -32,6 +33,28 @@ router = APIRouter(
 # aggregation in this module filters them out via this guard.
 _ANALYTICS_EXCLUDED_ROUTE_TYPES = ("introspect",)
 
+# Bug-6425 (routed from QR-1): member-discovery queries are logged with
+# ``protocol="discover_members"`` for auditability but are BI-client catalogue
+# probes, not user queries — exclude them from every metric. IS DISTINCT FROM
+# keeps NULL-protocol rows counted.
+_DISCOVERY_PROTOCOL = "discover_members"
+
+# Bug-6426: an in-TTL result-cache re-serve is logged with the ORIGINAL
+# route_type (aggregate/pocket/source) so volume/top-user analytics stay
+# correct, but with ``execution_ms=0``/``bytes_processed=0`` that are NOT real
+# measurements. ``cache_status="cache_hit"`` marks these rows. Acceleration-rate
+# and cost-savings rollups MUST exclude them: a cache re-serve is not a new
+# acceleration hit, and its zeros must not be averaged into savings. NULL means
+# a live execution, so ``IS DISTINCT FROM 'cache_hit'`` keeps historical/live
+# rows counted while dropping cache re-serves.
+_CACHE_HIT_STATUS = "cache_hit"
+
+# Bug-8180 / F-030-05: the unacceleratable route-type set and the eligible
+# hit-rate formula now live in ``shared.hit_rate`` so Model Health and Usage
+# Analytics compute ONE number. Aliased to the historical private name so the
+# existing SQL references below are unchanged.
+_UNACCELERATABLE_ROUTE_TYPES = UNACCELERATABLE_ROUTE_TYPES
+
 
 class HourlyVolume(BaseModel):
     hour: str
@@ -39,6 +62,8 @@ class HourlyVolume(BaseModel):
     aggregate_hits: int
     pocket_hits: int
     source_hits: int
+    # Bug-6426: cache re-serves per hour, kept distinct from real acceleration.
+    cache_hits: int = 0
 
 
 class RefreshHealthItem(BaseModel):
@@ -76,7 +101,24 @@ class ModelMetrics(BaseModel):
     aggregate_hits: int
     pocket_hits: int
     source_hits: int
+    # Bug-6426: in-TTL result-cache re-serves. They keep their original
+    # route_type for volume/top-user analytics but are NOT real acceleration
+    # events, so they are reported as a DISTINCT number and excluded from
+    # aggregate_hits / pocket_hits / hit_rate / bytes_avoided. Business report:
+    # "queries accelerated by an aggregate/pocket" vs "queries served from the
+    # result cache" are separate, decomposable figures — never conflated.
+    cache_hits: int
     hit_rate: float
+    # Bug-8180: structurally unacceleratable queries (route_type="raw" —
+    # explicit ungrouped flat-row detail pulls) are reported both as a rate
+    # of total traffic (``unacceleratable``) and a raw count
+    # (``unacceleratable_queries``), and excluded from a second,
+    # eligibility-scoped hit rate so a rise in detail-query traffic cannot
+    # be misread as a drop in acceleration coverage.
+    unacceleratable: float
+    unacceleratable_queries: int
+    eligible_queries: int
+    eligible_hit_rate: float
     bytes_avoided: int
     hourly_volume: list[HourlyVolume]
     refresh_health: list[RefreshHealthItem]
@@ -120,24 +162,80 @@ async def get_model_metrics(
             QueryLog.created_at >= since,
             QueryLog.status == "success",
             QueryLog.route_type.notin_(_ANALYTICS_EXCLUDED_ROUTE_TYPES),
+            # Bug-6425: member-discovery probes are not user queries.
+            QueryLog.protocol.is_distinct_from(_DISCOVERY_PROTOCOL),
         )
 
+        # Bug-6426: a cache re-serve (cache_status="cache_hit") is NOT an
+        # acceleration event — its zeros would inflate the acceleration rate and
+        # dilute savings. Count real aggregate/pocket acceleration only for LIVE
+        # rows, and report cache re-serves as a separate ``cache_hits`` figure.
+        _is_live = QueryLog.cache_status.is_distinct_from(_CACHE_HIT_STATUS)
+        _is_cache_hit = QueryLog.cache_status == _CACHE_HIT_STATUS
         rollup_stmt = select(
             func.count().label("total"),
             func.coalesce(
-                func.sum(case((QueryLog.route_type == "aggregate", 1), else_=0)), 0
+                func.sum(
+                    case(
+                        ((QueryLog.route_type == "aggregate") & _is_live, 1),
+                        else_=0,
+                    )
+                ),
+                0,
             ).label("aggregate_hits"),
             func.coalesce(
-                func.sum(case((QueryLog.route_type == "pocket", 1), else_=0)), 0
+                func.sum(
+                    case(
+                        ((QueryLog.route_type == "pocket") & _is_live, 1),
+                        else_=0,
+                    )
+                ),
+                0,
             ).label("pocket_hits"),
+            func.coalesce(
+                func.sum(case((_is_cache_hit, 1), else_=0)), 0
+            ).label("cache_hits"),
+            # Bug-8180: count structurally unacceleratable rows in the same
+            # rollup so eligible_hit_rate can exclude them from the
+            # denominator without a second query.
+            func.coalesce(
+                func.sum(
+                    case(
+                        (QueryLog.route_type.in_(_UNACCELERATABLE_ROUTE_TYPES), 1),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("unacceleratable_queries"),
         ).where(*base_filters)
         rollup = (await db.execute(rollup_stmt)).one()
 
         total_queries = int(rollup.total or 0)
         aggregate_hits = int(rollup.aggregate_hits or 0)
         pocket_hits = int(rollup.pocket_hits or 0)
-        source_hits = total_queries - aggregate_hits - pocket_hits
+        cache_hits = int(rollup.cache_hits or 0)
+        unacceleratable_queries = int(rollup.unacceleratable_queries or 0)
+        # source_hits = live source executions. total = live source + live
+        # aggregate + live pocket + cache re-serves, so source is the remainder.
+        # (route_type="raw" unacceleratable rows are NOT their own bucket here —
+        # they remain part of source_hits/total for volume accounting, same as
+        # before; Bug-8180 only changes the acceleration-rate DENOMINATOR below.)
+        source_hits = total_queries - aggregate_hits - pocket_hits - cache_hits
+        # Acceleration rate reflects REAL acceleration only; cache re-serves are
+        # neither numerator nor conflated with it (they are reported separately).
         hit_rate = (aggregate_hits + pocket_hits) / total_queries if total_queries else 0.0
+        # Bug-8180 / F-030-05: eligible_hit_rate excludes structurally
+        # unacceleratable queries from the denominator so a rise in raw-route
+        # detail traffic cannot be misread as declining coverage. Computed
+        # through the shared formula so Usage Analytics agrees exactly.
+        eligible_queries = total_queries - unacceleratable_queries
+        eligible_hit_rate = _eligible_hit_rate(
+            aggregate_hits=aggregate_hits,
+            pocket_hits=pocket_hits,
+            total_queries=total_queries,
+            unacceleratable_queries=unacceleratable_queries,
+        )
+        unacceleratable = unacceleratable_queries / total_queries if total_queries else 0.0
         bytes_avoided = await _calculate_bytes_avoided(db, model_id, since)
 
         hourly_volume = await _build_hourly_volume(db, base_filters, since, now)
@@ -241,7 +339,12 @@ async def get_model_metrics(
             aggregate_hits=aggregate_hits,
             pocket_hits=pocket_hits,
             source_hits=source_hits,
+            cache_hits=cache_hits,
             hit_rate=round(hit_rate, 4),
+            unacceleratable=round(unacceleratable, 4),
+            unacceleratable_queries=unacceleratable_queries,
+            eligible_queries=eligible_queries,
+            eligible_hit_rate=round(eligible_hit_rate, 4),
             bytes_avoided=bytes_avoided,
             hourly_volume=hourly_volume,
             refresh_health=refresh_health,
@@ -265,16 +368,29 @@ async def _build_hourly_volume(
     backfilled to zero so the bar strip renders a continuous timeline.
     """
     hour_col = func.date_trunc("hour", QueryLog.created_at)
+    # Bug-6426: real acceleration counts are LIVE-only; cache re-serves are a
+    # distinct series so source_hits is not polluted by them.
+    _is_live = QueryLog.cache_status.is_distinct_from(_CACHE_HIT_STATUS)
+    _is_cache_hit = QueryLog.cache_status == _CACHE_HIT_STATUS
     stmt = (
         select(
             hour_col.label("hour"),
             func.count().label("total"),
             func.coalesce(
-                func.sum(case((QueryLog.route_type == "aggregate", 1), else_=0)), 0
+                func.sum(
+                    case(((QueryLog.route_type == "aggregate") & _is_live, 1), else_=0)
+                ),
+                0,
             ).label("aggregate_hits"),
             func.coalesce(
-                func.sum(case((QueryLog.route_type == "pocket", 1), else_=0)), 0
+                func.sum(
+                    case(((QueryLog.route_type == "pocket") & _is_live, 1), else_=0)
+                ),
+                0,
             ).label("pocket_hits"),
+            func.coalesce(
+                func.sum(case((_is_cache_hit, 1), else_=0)), 0
+            ).label("cache_hits"),
         )
         .where(*base_filters)
         .group_by(hour_col)
@@ -291,26 +407,28 @@ async def _build_hourly_volume(
         total = int(row.total or 0)
         agg = int(row.aggregate_hits or 0)
         pocket = int(row.pocket_hits or 0)
+        cache = int(row.cache_hits or 0)
         counts[key] = {
             "total": total,
             "aggregate_hits": agg,
             "pocket_hits": pocket,
-            "source_hits": total - agg - pocket,
+            "cache_hits": cache,
+            "source_hits": total - agg - pocket - cache,
         }
 
     out: list[HourlyVolume] = []
     cursor = since.replace(minute=0, second=0, microsecond=0)
+    _empty = {"total": 0, "aggregate_hits": 0, "pocket_hits": 0, "cache_hits": 0, "source_hits": 0}
     while cursor <= now:
         key = cursor.strftime("%Y-%m-%dT%H:00:00Z")
-        vals = counts.get(
-            key, {"total": 0, "aggregate_hits": 0, "pocket_hits": 0, "source_hits": 0}
-        )
+        vals = counts.get(key, _empty)
         out.append(
             HourlyVolume(
                 hour=key,
                 total=vals["total"],
                 aggregate_hits=vals["aggregate_hits"],
                 pocket_hits=vals["pocket_hits"],
+                cache_hits=vals["cache_hits"],
                 source_hits=vals["source_hits"],
             )
         )
@@ -326,6 +444,14 @@ async def _calculate_bytes_avoided(db, model_id: UUID, since: datetime) -> int:
     savings number, compare each accelerated fingerprint against the average
     source-route scan for that same fingerprint and clamp negative deltas to
     zero. Fingerprints without a source baseline contribute no avoided bytes.
+
+    Bug-6426: a cache re-serve is logged with ``bytes_processed=0`` and
+    ``cache_status="cache_hit"``. It must be excluded from BOTH sides: a cached
+    source re-serve would drag the source baseline toward zero, and a cached
+    aggregate/pocket re-serve would fabricate a full ``baseline`` of avoided
+    bytes per hit (0 scanned, so ``baseline - 0`` credited) — inflating the
+    cost-saving figure shown to a customer/CFO. Only real (live) executions,
+    with real scanned-byte measurements, contribute here.
     """
     source_stmt = (
         select(
@@ -338,6 +464,10 @@ async def _calculate_bytes_avoided(db, model_id: UUID, since: datetime) -> int:
             QueryLog.status == "success",
             QueryLog.route_type == "source",
             QueryLog.bytes_processed.is_not(None),
+            # Bug-6426: exclude cache re-serves (0 bytes) from the baseline.
+            QueryLog.cache_status.is_distinct_from(_CACHE_HIT_STATUS),
+            # Bug-6425: member-discovery probes are not user queries.
+            QueryLog.protocol.is_distinct_from(_DISCOVERY_PROTOCOL),
         )
         .group_by(QueryLog.query_fingerprint)
     )
@@ -362,6 +492,12 @@ async def _calculate_bytes_avoided(db, model_id: UUID, since: datetime) -> int:
             QueryLog.status == "success",
             QueryLog.route_type.in_(("aggregate", "pocket")),
             QueryLog.bytes_processed.is_not(None),
+            # Bug-6426: a cache re-serve scanned no bytes; crediting it a full
+            # source baseline per hit fabricates savings. Count live
+            # acceleration only.
+            QueryLog.cache_status.is_distinct_from(_CACHE_HIT_STATUS),
+            # Bug-6425: member-discovery probes are not user queries.
+            QueryLog.protocol.is_distinct_from(_DISCOVERY_PROTOCOL),
         )
         .group_by(QueryLog.query_fingerprint)
     )

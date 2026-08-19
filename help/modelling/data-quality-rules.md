@@ -42,6 +42,15 @@ A rule targets a specific object within the model:
 | `dimension` | The source column of a dimension; `target_id` is the dimension UUID |
 | `measure` | The source column of a standard measure; `target_id` is the measure UUID |
 
+The target must belong to the model you are adding the rule to. If you paste an ID
+that belongs to a different model — even another model in the same project — the
+rule is refused and nothing is saved. This is deliberate: a rule pointing at
+another model's column would run its check against that model's table and store
+the results, including sample values, under this model.
+
+If a rule will not save, the usual cause is an ID copied from the wrong model.
+Re-copy it from the model you are working in.
+
 ## Severity levels
 
 | Severity | Effect on model alerts |
@@ -101,4 +110,4 @@ Each rule keeps a violation history. Click the expand button on a rule row to se
 
 ---
 
-← [Parameterized Filters](parameterized-filters.md) | [Home](../index.md) | [Impact Analysis →](impact-analysis.md)
+← [Parameterized Filters](parameterized-filters.md) | [Home](../index.md) | [Usage & Downstream Assets →](usage-downstream-assets.md)

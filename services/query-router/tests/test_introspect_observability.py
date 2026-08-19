@@ -199,6 +199,62 @@ class TestSingleIntrospectFailureLogging:
         assert log_calls[0].get("error_type") == "execution_error"
         assert "source exploded" in log_calls[0].get("error_detail", "")
 
+    @pytest.mark.asyncio
+    async def test_bug_schema_drift_absent_source_table_is_explicit_404(self, client, monkeypatch):
+        """A confirmed absent table is distinct from an unreachable router."""
+        class MissingTableError(Exception):
+            sqlstate = "42P01"
+
+        model_id = str(uuid.uuid4())
+        db = _mock_tenant_db()
+        log_calls: list = []
+
+        async def _capture_log(*args, **kwargs):
+            log_calls.append(kwargs)
+
+        monkeypatch.setattr(
+            "src.api.introspect.load_authorized_model",
+            AsyncMock(return_value=MagicMock(project_id=uuid.uuid4())),
+        )
+        monkeypatch.setattr(
+            "src.api.introspect.execute_source_sql",
+            AsyncMock(side_effect=MissingTableError("relation does not exist")),
+        )
+        monkeypatch.setattr(
+            "src.api.introspect._resolve_model_connection",
+            AsyncMock(return_value=(MagicMock(), None)),
+        )
+        monkeypatch.setattr("src.api.introspect._log_introspect", _capture_log)
+
+        with patch("src.api.introspect.get_tenant_db", _async_gen(db)):
+            resp = await client.post(
+                "/api/v1/introspect",
+                json={"model_id": model_id, "raw_sql": "SELECT 1 FROM demo_data.calendar"},
+                headers=_auth(),
+            )
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["code"] == "source_table_not_found"
+        assert log_calls[0]["error_type"] == "source_table_not_found"
+
+
+def test_bug_schema_drift_missing_table_metadata_covers_postgres_and_bigquery():
+    """PG SQLSTATE and BQ HTTP metadata share one connector-neutral classifier."""
+    from shared.source_table_probe import is_source_table_not_found_error
+
+    class PostgresMissingTable(Exception):
+        sqlstate = "42P01"
+
+    class BigQueryMissingTable(Exception):
+        code = 404
+
+    class PermissionDenied(Exception):
+        code = 403
+
+    assert is_source_table_not_found_error(PostgresMissingTable()) is True
+    assert is_source_table_not_found_error(BigQueryMissingTable()) is True
+    assert is_source_table_not_found_error(PermissionDenied()) is False
+
 
 class TestBatchIntrospectFailureLogging:
     """Bug-5323: batch-introspect per-item failures must record error status."""

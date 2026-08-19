@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Build a Power BI Report — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Analyst Guides</span> / <span>Build a Power BI Report</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">end user</span><span class="updated">Updated 2026-08-04</span></div>
+    <h1>Build a Power BI Report</h1>
+<h2>What this covers</h2>
+<p>A complete walk from an empty Power BI Desktop file to a finished, refreshable report page on the Tessallite demo model: a sales-by-product bar chart, a trend line, a country slicer, and a pair of KPI cards — connected live, so every refresh re-asks Tessallite and benefits from acceleration automatically.</p>
+<h2>Before you start</h2>
+<ul>
+<li>Power BI Desktop installed.</li>
+<li>Your Tessallite sign-in, the workspace slug, and the gateway address. On the local demo these are <code>admin@acme-demo.com</code> / <code>acme-demo</code>, slug <code>acme-demo</code>, gateway <code>localhost</code>.</li>
+<li>The full connection reference — including how to scope the connection to one model — is at <a href="../integrations/powerbi-connection-guide.html">Power BI Connection Guide</a>. This page picks up the moment after connecting.</li>
+</ul>
+<h2>The one setting that matters: DirectQuery</h2>
+<p>When the connection dialog appears, you face the only decision with long-term consequences: <strong>Data Connectivity mode</strong>.</p>
+<figure class="screencap"><img class="screencap" src="../assets/screencaps/powerbi-connection-dialog.png" alt="Power BI Desktop -- PostgreSQL connection dialog."></figure>
+<ul>
+<li><strong>DirectQuery</strong> — every visual asks Tessallite a live question when it renders or refreshes. Tessallite answers from a pre-computed summary when one covers the question, so the report stays both current and fast.</li>
+<li><strong>Import</strong> — Power BI copies a snapshot of the data into the file. It works, but the report is a photograph: it cannot be accelerated by new summaries, and it goes stale until someone refreshes the extract.</li>
+</ul>
+<p>Choose <strong>DirectQuery</strong>. That is the whole decision.</p>
+<blockquote><p><strong>Why not Import, ever?</strong> Two honest reasons. First, freshness: with DirectQuery the number on screen is the number in the source right now. Second, governance: an imported extract is a copy of the data sitting in a file, outside the reach of the security rules that govern every live query. Live keeps the data where the rules are.</p></blockquote>
+<h2>Step 1 — Connect and load the model</h2>
+<ol>
+<li>Open Power BI Desktop, click <strong>Get Data</strong>, choose <strong>Database &gt; PostgreSQL database</strong>, and click <strong>Connect</strong>.</li>
+<li><strong>Server</strong>: <code>localhost:5433</code> (or your host, always with the port).</li>
+<li><strong>Database</strong>: <code>acme-demo</code> — or <code>acme-demo/modelx</code> to open directly on the one model this walkthrough uses.</li>
+<li><strong>Data Connectivity mode</strong>: <strong>DirectQuery</strong>.</li>
+<li>When asked for credentials, choose <strong>Database</strong> authentication and enter your Tessallite email and password.</li>
+<li>In the Navigator, tick <strong><code>modelx</code></strong> and click <strong>Load</strong>.</li>
+</ol>
+<p>The Fields pane on the right now lists the model: dimensions like <code>product_name</code>, <code>country_code</code>, and <code>business_date</code>; measures like <code>net_sales</code> and <code>gross_margin</code>. In DirectQuery mode there is no data in the file — the Fields pane is a window into the model, and every visual you build asks a live question.</p>
+<h2>Step 2 — The bar chart: sales by product</h2>
+<ol>
+<li>Click the <strong>stacked bar chart</strong> icon in the Visualizations pane. An empty frame appears.</li>
+<li>Drag <strong><code>product_name</code></strong> onto the <strong>Y-axis</strong> field well.</li>
+<li>Drag <strong><code>net_sales</code></strong> onto the <strong>X-axis</strong> well.</li>
+</ol>
+<p>The chart fills in — one bar per product, longest first if you sort descending (click the <strong>...</strong> menu on the visual, <strong>Sort axis &gt; net sales</strong>). Each drag sent a grouped query through the gateway; if the model has a summary covering sales by product, the answer came back from it in a blink.</p>
+<blockquote><p><strong>Tip: the filter pane is server-side too.</strong> Drag <code>channel_code</code> into the <strong>Filters on this visual</strong> well and tick <code>online</code>. Power BI adds the filter to the query it sends Tessallite — the narrowing happens in the database, not in the file — so the visual stays fast and the totals stay honest.</p></blockquote>
+<h2>Step 3 — The trend line</h2>
+<ol>
+<li>Click empty canvas, then the <strong>line chart</strong> icon.</li>
+<li>Drag <strong><code>business_date</code></strong> onto <strong>X-axis</strong> and <strong><code>net_sales</code></strong> onto <strong>Y-axis</strong>.</li>
+<li>Power BI groups dates into a year-quarter-month-day hierarchy automatically; use the little expand arrows on the axis to drill down to months.</li>
+</ol>
+<p>You now have the two shapes every sales report wants: <em>who</em> (products) and <em>when</em> (the trend). Both are live views of the same governed model.</p>
+<h2>Step 4 — The slicer</h2>
+<ol>
+<li>Click empty canvas, choose the <strong>slicer</strong> icon, and drop <strong><code>country_code</code></strong> into its field well.</li>
+<li>Click a country in the slicer. Both visuals re-query and redraw for that country alone.</li>
+</ol>
+<p>This is the interactive payoff of DirectQuery: a slicer click is a fresh question to Tessallite, answered live — and because the slicer applies to the whole page, your two visuals can never drift into showing different countries.</p>
+<h2>Step 5 — KPI cards</h2>
+<ol>
+<li>Click empty canvas, choose the <strong>card</strong> visual, and drop <strong><code>net_sales</code></strong> in. A big, boardroom-ready number.</li>
+<li>Repeat with <strong><code>gross_margin</code></strong>, or with a model measure like <code>Revenue</code> if your report prefers the governed headline.</li>
+</ol>
+<p>Keep the cards at the top of the page, chart and trend below, slicer at the left — the same layout instinct as the Excel dashboard, and for the same reason: the eye lands on the headline first.</p>
+<h2>Step 6 — Save, refresh, and share sensibly</h2>
+<p>Save the <code>.pbix</code>. From now on:</p>
+<ul>
+<li><strong>Refresh</strong> (or simply opening the file) re-issues every visual's query against current data. There is nothing to re-point and nothing to paste.</li>
+<li><strong>Other tools agree.</strong> A colleague reading net sales by product in Excel or in the Tessallite web app sees the same figure, because every surface computes it from the same model definition.</li>
+<li><strong>One known gap:</strong> Power BI does not support XMLA drill-through natively over this connection, so right-click drill-through to detail rows is not available here. When you need the rows behind a number, that is a job for Excel (PivotTable or add-in drill-through) or the Tessallite web app's query panel.</li>
+</ul>
+<blockquote><p><strong>Common trap: rebuilding the model inside Power BI.</strong> Power BI will happily let you add calculated columns and DAX measures on top of the model. Resist the urge for anything the business shares. A "net sales after adjustments" that lives only in your <code>.pbix</code> is a number nobody else can see, trust, or reuse — and next quarter it will disagree with the official one in a meeting, in public. If the adjustment is real, ask the modeller to add it to the model once, governed, for everyone.</p></blockquote>
+<h2>Troubleshooting</h2>
+<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr></thead><tbody>
+<tr><td>The Analysis Services connector fails</td><td>Power BI Desktop's AS connector does not work with Tessallite</td><td>Use the <strong>PostgreSQL</strong> connector instead — see the <a href="../integrations/powerbi-connection-guide.html">connection guide</a></td></tr>
+<tr><td>Navigator shows nothing</td><td>No deployed models in the workspace</td><td>Ask your modeller to deploy one</td></tr>
+<tr><td>Visuals feel slow on first load</td><td>The query went to the source path (no summary covers it yet)</td><td>It is still correct; the optimizer learns from misses and proposes summaries over time</td></tr>
+<tr><td>Authentication errors after a password change</td><td>Stored credentials are stale</td><td><strong>File &gt; Options &gt; Data source settings</strong>, clear the entry, and reconnect</td></tr>
+<tr><td>A measure shows as a sum of text or an error</td><td>The field was dropped into the wrong well</td><td>Measures go in value wells; dimensions go on axes and slicers</td></tr>
+</tbody></table></div>
+<h2>Related</h2>
+<ul>
+<li><a href="../integrations/powerbi-connection-guide.html">Power BI Connection Guide</a></li>
+<li><a href="choosing-your-connection.html">Choose Your Connection</a></li>
+<li><a href="build-a-tableau-dashboard.html">Build a Tableau Dashboard</a></li>
+<li><a href="../querying/live-vs-aggregate.html">Live vs Aggregate</a></li>
+</ul>
+<nav class="page-nav"><a href="excel-formulas-that-stay-live.html" class="page-nav-btn prev">&larr; Excel Formulas That Stay Live</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="build-a-tableau-dashboard.html" class="page-nav-btn next">Build a Tableau Dashboard &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

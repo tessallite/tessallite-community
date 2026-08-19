@@ -24,7 +24,7 @@
   <thead><tr><th>Protocol</th><th>Port</th><th>Query language</th><th>Best for</th></tr></thead>
   <tbody>
     <tr><td><strong>JDBC (PostgreSQL wire)</strong></td><td>5433</td><td>SQL</td><td>DBeaver, Tableau, Superset, pgAdmin, Python (psycopg2), any JDBC/ODBC client</td></tr>
-    <tr><td><strong>XMLA/DAX</strong></td><td>8080</td><td>DAX, MDX</td><td>Excel PivotTable, Power BI</td></tr>
+    <tr><td><strong>XMLA/DAX</strong></td><td>8080</td><td>DAX, MDX</td><td>Excel PivotTable</td></tr>
   </tbody>
 </table>
 </div>
@@ -53,7 +53,7 @@
       <td><a href="excel-xmla-connection-guide.html">Guide</a></td>
     </tr>
     <tr>
-      <td><strong>Power BI Desktop</strong></td><td>XMLA</td>
+      <td><strong>Power BI Desktop</strong></td><td>JDBC (PostgreSQL)</td>
       <td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>Pass</td><td>N/A</td>
       <td><a href="powerbi-connection-guide.html">Guide</a></td>
     </tr>
@@ -112,12 +112,12 @@
 <p>Row-level security is enforced server-side when a query is bound to its applicable rule or persona context, including persona-catalogue JDBC queries. Clients cannot bypass an applied rule by changing BI tools.</p>
 
 <h3>Drill-through</h3>
-<p>Drill-through (clicking a PivotTable cell to see the underlying detail rows) is supported in Excel via the XMLA endpoint. Power BI does not support XMLA drill-through natively. JDBC clients can achieve the same result by querying with the appropriate WHERE clause.</p>
+<p>Drill-through (clicking a PivotTable cell to see the underlying detail rows) is supported in Excel via the XMLA endpoint. JDBC clients, including Power BI over the PostgreSQL connector, can achieve the same result by querying with the appropriate WHERE clause.</p>
 
 <h2>Choosing a protocol</h2>
 <ul>
   <li><strong>Excel users</strong> should connect via XMLA. This gives full PivotTable functionality, persona support, row security, and drill-through.</li>
-  <li><strong>Power BI users</strong> should connect via XMLA for the richest experience (measures, hierarchies, formatted values).</li>
+  <li><strong>Power BI users</strong> should connect via the PostgreSQL connector on port 5433 in DirectQuery mode. Power BI Desktop's Analysis Services connector only supports Windows authentication, so it cannot use the XMLA endpoint; the PostgreSQL route keeps every query inside the Tessallite semantic layer.</li>
   <li><strong>Tableau, Superset, DBeaver</strong> and other SQL-based tools should connect via JDBC. They get SQL access to all published models with transparent aggregate routing.</li>
   <li><strong>Looker Studio / Data Studio</strong> uses its direct PostgreSQL route for relational reports and does not consume LookML. This route does not require <code>LOOKER_GATEWAY_ENABLED</code>.</li>
   <li><strong>Optional Looker-hosted execution</strong> uses generated LookML and the TLS JDBC gateway; enable <code>LOOKER_GATEWAY_ENABLED</code> only when an eligible instance is available for validation.</li>

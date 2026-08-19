@@ -4,6 +4,29 @@ import { cellLookupKey } from "../pivot";
 import type { CellCoord, PivotModel } from "../types";
 import { NOT_ADDITIVE, type TotalsModel, type TotalValue } from "../totals";
 import type { EmptyCellMode } from "../grid/PivotGrid";
+import { csvSafeCell } from "../../../../utils/sanitize";
+
+// Bug-7286: ExcelJS writes a string cell beginning with "=" (or "+"/"-"/"@") as
+// a LIVE formula. Dimension row/column members are source-derived, so a planted
+// value like `=WEBSERVICE(...)` would execute when the workbook is opened. Guard
+// every string cell written to the sheet; numeric cells are left untouched so
+// they stay real numbers. Data/total values are already coerced to number | null
+// | "—" upstream, so this only rewrites genuine text cells.
+function guardCell(v: string | number | null): string | number | null {
+  return typeof v === "string" ? csvSafeCell(v) : v;
+}
+
+function guardCells(
+  cells: (string | number | null)[],
+): (string | number | null)[] {
+  return cells.map(guardCell);
+}
+
+export interface XlsxExportLabels {
+  worksheetName?: string;
+  subtotalSuffix?: string;
+  grandTotal?: string;
+}
 
 export interface XlsxOptions {
   // F-019-08: extra column measures, so the workbook carries every measure
@@ -16,13 +39,12 @@ export interface XlsxOptions {
   showSubtotals?: boolean;
   showGrandTotals?: boolean;
   emptyCellMode?: EmptyCellMode;
-  // F-019-08: the grid's current sorted row order, so the workbook honours
-  // the user's header-click sort.
+  // F-019-08: the grid's current sorted row/column order, so the workbook
+  // honours the user's header-click sort.
   rowKeyOrder?: string[][];
-}
-
-function isPercentToken(token: MeasureFormatToken | null | undefined): boolean {
-  return token === "percent" || token === "percent_2dp";
+  colKeyOrder?: string[][];
+  // Localized labels for exported worksheet and totals.
+  labels?: XlsxExportLabels;
 }
 
 function formatTokenToExcel(token: MeasureFormatToken | null | undefined): string {
@@ -30,10 +52,17 @@ function formatTokenToExcel(token: MeasureFormatToken | null | undefined): strin
   switch (token) {
     case "currency":
       return "$#,##0.00";
+    // F-015-01: use Excel's NATIVE percent format. A native `0%` / `0.00%`
+    // format multiplies by 100 for DISPLAY only — the stored cell value stays
+    // the raw engine ratio (0.125, not 12.5). The previous `#,##0"%"` was a
+    // literal-suffix format that forced the value itself to be pre-scaled,
+    // corrupting every exported percent cell (a 100x error on re-import, sum,
+    // or chart). CSV already keeps the raw ratio; this aligns XLSX with it and
+    // with the XMLA FORMAT_STRING tokens.
     case "percent":
-      return '#,##0"%"';
+      return "0%";
     case "percent_2dp":
-      return '#,##0.00"%"';
+      return "0.00%";
     case "integer":
     case "decimal_0":
       return "#,##0";
@@ -54,14 +83,16 @@ function formatTokenToExcel(token: MeasureFormatToken | null | undefined): strin
   }
 }
 
-function normalizePercent(v: number): number {
-  return Math.abs(v) < 1 ? v * 100 : v;
-}
-
+// F-015-01: the exported cell holds the RAW engine value (a percent measure is
+// a decimal ratio, e.g. 0.125). Display scaling to "12.5%" is delegated to the
+// native Excel `0%` / `0.00%` number format applied in `applyValueFormats`, so
+// the stored value is never mutated. Pre-scaling the value here (the old
+// `v * 100`) produced a 100x error the moment anyone summed, charted, or
+// re-imported the column. CSV keeps the raw ratio too; the two exports now
+// agree.
 function totalToCell(
   v: TotalValue,
   emptyMode: EmptyCellMode,
-  pct: boolean,
 ): string | number | null {
   if (v === NOT_ADDITIVE) return "—";
   if (v === null) {
@@ -69,21 +100,19 @@ function totalToCell(
     if (emptyMode === "dash") return "—";
     return null;
   }
-  return pct ? normalizePercent(v) : v;
+  return v;
 }
 
 function rawToCell(
   v: unknown,
   emptyMode: EmptyCellMode,
-  pct: boolean,
 ): string | number | null {
   if (v === null || v === undefined) {
     if (emptyMode === "zero") return 0;
     if (emptyMode === "dash") return "—";
     return null;
   }
-  const n = Number(v);
-  return pct ? normalizePercent(n) : n;
+  return Number(v);
 }
 
 function cellMeasureValue(cell: CellCoord | undefined, m: Measure, first: Measure): unknown {
@@ -101,17 +130,35 @@ export async function pivotToXlsx(
   measure: Measure,
   opts?: XlsxOptions,
 ): Promise<Blob> {
+  const lb = opts?.labels ?? {};
+  const lbSubtotal = lb.subtotalSuffix ?? "Total";
+  const lbGrand = lb.grandTotal ?? "Grand Total";
   const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet("Pivot");
+  const ws = wb.addWorksheet(lb.worksheetName ?? "Pivot");
 
   const allMeasures: Measure[] = [measure, ...(opts?.extraMeasures ?? [])];
   const measureCount = allMeasures.length;
   const multiMeasure = measureCount > 1;
 
-  const { rowCols, colCols, byKey } = pivot;
-  const colKeys = opts?.rowKeyOrder ? pivot.colKeys : pivot.colKeys;
+  const { rowCols, colCols, rowLabels, byKey } = pivot;
+  const colKeys = opts?.colKeyOrder ?? pivot.colKeys;
   const rowKeys = opts?.rowKeyOrder ?? pivot.rowKeys;
   const hasCols = colCols.length > 0;
+  // Bug-6285: exported row-dimension headers use business display names.
+  const rowHead = (i: number): string => rowLabels[i] ?? rowCols[i];
+
+  // Bug-6272: build maps from serialized row/col key to the ORIGINAL index in
+  // pivot.rowKeys / pivot.colKeys. The totals arrays are indexed by the
+  // original pivot order; after a header-click sort, the output order differs.
+  // Without these maps the export writes the wrong row's/column's totals.
+  const originalRowIndex = new Map<string, number>();
+  for (let i = 0; i < pivot.rowKeys.length; i++) {
+    originalRowIndex.set(JSON.stringify(pivot.rowKeys[i]), i);
+  }
+  const originalColIndex = new Map<string, number>();
+  for (let i = 0; i < pivot.colKeys.length; i++) {
+    originalColIndex.set(JSON.stringify(pivot.colKeys[i]), i);
+  }
   // F-019-08: per-measure totals; fall back to the legacy single-measure map.
   const allTotals: Map<string, TotalsModel | null> | null =
     opts?.allTotals ?? (opts?.totals ? new Map([[measure.name, opts.totals]]) : null);
@@ -121,7 +168,6 @@ export async function pivotToXlsx(
 
   const totalsFor = (m: Measure): TotalsModel | null => allTotals?.get(m.name) ?? null;
   const fmtOf = (m: Measure) => (m.format ?? null) as MeasureFormatToken | null;
-  const pctOf = (m: Measure) => isPercentToken(fmtOf(m));
   const numFmtOf = (m: Measure) => formatTokenToExcel(fmtOf(m));
 
   const headerFill: ExcelJS.FillPattern = {
@@ -158,8 +204,11 @@ export async function pivotToXlsx(
       }
     }
     for (const head of colHeads) {
-      colKeys.forEach((ck, ckIndex) => {
-        if ((ck[0] ?? "") === head) displayCols.push({ kind: "data", ck, ckIndex });
+      colKeys.forEach((ck) => {
+        if ((ck[0] ?? "") === head) {
+          const ckIndex = originalColIndex.get(JSON.stringify(ck)) ?? 0;
+          displayCols.push({ kind: "data", ck, ckIndex });
+        }
       });
       if (colSubtotalsActive) displayCols.push({ kind: "subtotalCol", head });
     }
@@ -177,20 +226,20 @@ export async function pivotToXlsx(
   if (hasCols) {
     for (let lvl = 0; lvl < colCols.length; lvl++) {
       const cells: string[] = [];
-      for (let i = 0; i < rowCols.length; i++) cells.push(lvl === 0 ? rowCols[i] : "");
+      for (let i = 0; i < rowCols.length; i++) cells.push(lvl === 0 ? rowHead(i) : "");
       for (const dc of displayCols) {
         const label =
           dc.kind === "data"
             ? (dc.ck[lvl] ?? "")
             : lvl === 0
               ? dc.kind === "subtotalCol"
-                ? `${dc.head} Total`
-                : "Grand Total"
+                ? `${dc.head} ${lbSubtotal}`
+                : lbGrand
               : "";
         cells.push(label);
         for (let s = 1; s < measureCount; s++) cells.push("");
       }
-      const row = ws.addRow(cells);
+      const row = ws.addRow(guardCells(cells));
       row.eachCell((cell) => {
         cell.fill = headerFill;
         cell.font = headerFont;
@@ -202,7 +251,7 @@ export async function pivotToXlsx(
       for (const _dc of displayCols) {
         for (const m of allMeasures) cells.push(m.display_name || m.name);
       }
-      const row = ws.addRow(cells);
+      const row = ws.addRow(guardCells(cells));
       row.eachCell((cell) => {
         cell.fill = headerFill;
         cell.font = headerFont;
@@ -211,9 +260,9 @@ export async function pivotToXlsx(
     }
   } else {
     const cells = multiMeasure
-      ? [...rowCols, ...allMeasures.map((m) => m.display_name || m.name)]
-      : [...rowCols, measure.display_name];
-    const row = ws.addRow(cells);
+      ? [...rowCols.map((_, i) => rowHead(i)), ...allMeasures.map((m) => m.display_name || m.name)]
+      : [...rowCols.map((_, i) => rowHead(i)), measure.display_name];
+    const row = ws.addRow(guardCells(cells));
     row.eachCell((cell) => {
       cell.fill = headerFill;
       cell.font = headerFont;
@@ -249,23 +298,25 @@ export async function pivotToXlsx(
   }
 
   let dataRowOrdinal = 0;
-  function addDataRow(rk: string[], rkIndex: number) {
+  function addDataRow(rk: string[]) {
+    // Bug-6272: resolve the row key back to its original pivot index so that
+    // grandCol and colSubtotals look up the correct row's totals after sorting.
+    const origIdx = originalRowIndex.get(JSON.stringify(rk)) ?? 0;
     const cells: (string | number | null)[] = [...rk];
     for (const dc of displayCols) {
       for (const m of allMeasures) {
         const totals = totalsFor(m);
-        const pct = pctOf(m);
         if (dc.kind === "data") {
           const cell = byKey.get(cellLookupKey(rk, dc.ck));
-          cells.push(rawToCell(cellMeasureValue(cell, m, measure), emptyMode, pct));
+          cells.push(rawToCell(cellMeasureValue(cell, m, measure), emptyMode));
         } else if (dc.kind === "subtotalCol") {
-          cells.push(totalToCell(totals?.colSubtotals.get(dc.head)?.[rkIndex] ?? null, emptyMode, pct));
+          cells.push(totalToCell(totals?.colSubtotals.get(dc.head)?.[origIdx] ?? null, emptyMode));
         } else {
-          cells.push(totalToCell(totals?.grandCol[rkIndex] ?? null, emptyMode, pct));
+          cells.push(totalToCell(totals?.grandCol[origIdx] ?? null, emptyMode));
         }
       }
     }
-    const row = ws.addRow(cells);
+    const row = ws.addRow(guardCells(cells));
     applyValueFormats(row);
     if (dataRowOrdinal % 2 === 0) {
       const banded: ExcelJS.FillPattern = {
@@ -282,23 +333,22 @@ export async function pivotToXlsx(
 
   function addRowSubtotalRow(head: string) {
     const cells: (string | number | null)[] = rowCols.map((_, i) =>
-      i === 0 ? `${head} Total` : "",
+      i === 0 ? `${head} ${lbSubtotal}` : "",
     );
     for (const dc of displayCols) {
       for (const m of allMeasures) {
         const totals = totalsFor(m);
-        const pct = pctOf(m);
         const rowSubs = totals?.rowSubtotals.get(head);
         if (dc.kind === "data") {
-          cells.push(totalToCell(rowSubs?.[dc.ckIndex] ?? null, emptyMode, pct));
+          cells.push(totalToCell(rowSubs?.[dc.ckIndex] ?? null, emptyMode));
         } else if (dc.kind === "subtotalCol") {
-          cells.push(totalToCell(totals?.crossSubtotals.get(`${head}||${dc.head}`) ?? null, emptyMode, pct));
+          cells.push(totalToCell(totals?.crossSubtotals.get(`${head}||${dc.head}`) ?? null, emptyMode));
         } else {
-          cells.push(totalToCell(totals?.rowSubtotalGrand.get(head) ?? null, emptyMode, pct));
+          cells.push(totalToCell(totals?.rowSubtotalGrand.get(head) ?? null, emptyMode));
         }
       }
     }
-    const row = ws.addRow(cells);
+    const row = ws.addRow(guardCells(cells));
     row.eachCell((cell) => {
       cell.fill = totalFill;
       cell.font = totalFont;
@@ -307,11 +357,9 @@ export async function pivotToXlsx(
   }
 
   const rowSubtotalsActive = showSubtotals && hasTotals && rowCols.length >= 2;
-  let globalRkIdx = 0;
   for (const head of rowHeads) {
     for (const rk of rowGroupMap.get(head) ?? []) {
-      addDataRow(rk, globalRkIdx);
-      globalRkIdx++;
+      addDataRow(rk);
     }
     if (rowSubtotalsActive) addRowSubtotalRow(head);
   }
@@ -319,22 +367,21 @@ export async function pivotToXlsx(
   // Grand total row.
   if (grandActive) {
     const cells: (string | number | null)[] = rowCols.map((_, i) =>
-      i === 0 ? "Grand Total" : "",
+      i === 0 ? lbGrand : "",
     );
     for (const dc of displayCols) {
       for (const m of allMeasures) {
         const totals = totalsFor(m);
-        const pct = pctOf(m);
         if (dc.kind === "data") {
-          cells.push(totalToCell(totals?.grandRow[dc.ckIndex] ?? null, emptyMode, pct));
+          cells.push(totalToCell(totals?.grandRow[dc.ckIndex] ?? null, emptyMode));
         } else if (dc.kind === "subtotalCol") {
-          cells.push(totalToCell(totals?.colSubtotalGrand.get(dc.head) ?? null, emptyMode, pct));
+          cells.push(totalToCell(totals?.colSubtotalGrand.get(dc.head) ?? null, emptyMode));
         } else {
-          cells.push(totalToCell(totals?.grandGrand ?? null, emptyMode, pct));
+          cells.push(totalToCell(totals?.grandGrand ?? null, emptyMode));
         }
       }
     }
-    const row = ws.addRow(cells);
+    const row = ws.addRow(guardCells(cells));
     row.eachCell((cell) => {
       cell.fill = totalFill;
       cell.font = totalFont;

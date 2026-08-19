@@ -1,6 +1,7 @@
-import { Box, Typography, Collapse, CircularProgress, Skeleton } from '@mui/material';
+import { Box, Typography, Collapse, CircularProgress, Skeleton, IconButton } from '@mui/material';
 import { ExpandLess, ExpandMore } from '@mui/icons-material';
 import { tokens } from '../../theme';
+import { strings, templates } from '../../i18n/strings';
 import type { Dimension, Zone, DiscoverMembersResponse } from '../../types/tessallite';
 import DimensionCard from './DimensionCard';
 import type { DimensionCompatibilityState } from '../../utils/fieldCompatibility';
@@ -52,10 +53,19 @@ export default function DimensionLibrary({
         }}
       >
         <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-          Dimensions ({dimensions.length})
+          {templates.library.dimensionsHeader(dimensions.length)}
         </Typography>
+        {/* Bug-6710: keyboard path to expand/collapse (header Box is mouse-only). */}
         {(dimensions.length > 0 || loading || searchQuery) && (
-          expanded ? <ExpandLess sx={{ fontSize: 16, color: tokens.colorTextSecondary }} /> : <ExpandMore sx={{ fontSize: 16, color: tokens.colorTextSecondary }} />
+          <IconButton
+            size="small"
+            onClick={(e) => { e.stopPropagation(); onToggleExpanded(); }}
+            aria-expanded={expanded}
+            aria-label={templates.library.toggleSectionAria(expanded, strings.library.dimensionsSection)}
+            sx={{ width: 24, height: 24, color: tokens.colorTextSecondary }}
+          >
+            {expanded ? <ExpandLess sx={{ fontSize: 16 }} /> : <ExpandMore sx={{ fontSize: 16 }} />}
+          </IconButton>
         )}
       </Box>
       <Collapse in={expanded} sx={{ overflow: 'visible' }}>
@@ -67,7 +77,7 @@ export default function DimensionLibrary({
           </Box>
         ) : dimensions.length === 0 ? (
           <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, px: 1.5, py: 1 }}>
-            {searchQuery ? 'No dimensions match your search' : 'No dimensions available'}
+            {searchQuery ? strings.dimensionLibrary.noSearchMatch : strings.dimensionLibrary.noItemsAvailable}
           </Typography>
         ) : (
           <Box sx={{ px: 0.5 }}>
@@ -95,10 +105,20 @@ export default function DimensionLibrary({
               <Box sx={{ mx: 0.5, mb: 1, p: 1, bgcolor: tokens.colorSubtleFill, borderRadius: 1, maxHeight: 160, overflowY: 'auto' }}>
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 0.5 }}>
                   <Typography sx={{ fontSize: 10, fontWeight: 600, color: tokens.colorTextSecondary, flex: 1 }}>
-                    Members
+                    {strings.dimensionLibrary.membersLabel}
                   </Typography>
-                  <Box component="span" sx={{ fontSize: 9, color: tokens.colorPrimary, cursor: 'pointer' }} onClick={onCloseMemberPreview}>
-                    Close
+                  {/* Bug-6713: was a mouse-only span; a native button gives
+                      focus + Enter/Space activation. */}
+                  <Box
+                    component="button"
+                    onClick={onCloseMemberPreview}
+                    aria-label={strings.dimensionLibrary.closeMemberPreviewAria}
+                    sx={{
+                      fontSize: 9, color: tokens.colorPrimary, cursor: 'pointer',
+                      border: 'none', bgcolor: 'transparent', p: 0, fontFamily: 'inherit',
+                    }}
+                  >
+                    {strings.dimensionLibrary.closeMemberPreview}
                   </Box>
                 </Box>
                 {membersPreviewLoading ? (
@@ -108,7 +128,7 @@ export default function DimensionLibrary({
                     <Typography key={m.key} sx={{ fontSize: 10, color: tokens.colorCharcoal }}>{m.name}</Typography>
                   ))
                 ) : (
-                  <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>No members found</Typography>
+                  <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>{strings.dimensionLibrary.noMembersFound}</Typography>
                 )}
               </Box>
             )}

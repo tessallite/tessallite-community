@@ -9,7 +9,14 @@ import pytest
 
 from shared.db.models import Model, PocketDefinition, PocketRefreshPolicy
 
-from .conftest import TEST_MODEL_ID, TEST_PROJECT_ID, async_gen_from, client, make_mock_db
+from .conftest import (
+    TEST_MODEL_ID,
+    TEST_PROJECT_ID,
+    TEST_TENANT,
+    async_gen_from,
+    client,
+    make_mock_db,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -123,16 +130,18 @@ async def test_pocket_metrics_returns_expected_shape(client):
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["total_pockets"] == 2
+    assert data["total_pockets"] == 1
     assert data["fresh_pockets"] == 1
+    assert data["retired_pockets"] == 1
     assert "top_pockets" in data
+    assert [p["pocket_id"] for p in data["top_pockets"]] == ["p1"]
     # F-005-08: hit ratio is pocket queries / all queries (3/10 = 0.3), a
     # fraction in [0,1] — NOT total hits / pocket count (which was 9/2 = 4.5).
     assert data["pocket_hit_rate"] == pytest.approx(0.3)
     # time_saved is now the genuine saved total (sum of per-pocket
     # time_saved_ms_total), which the route-time accumulator fills with
     # baseline-minus-pocket figures.
-    assert data["pocket_time_saved_ms"] == 1250
+    assert data["pocket_time_saved_ms"] == 1200
 
 
 @pytest.mark.asyncio
@@ -402,8 +411,14 @@ async def test_validate_pocket_sql_fails_on_garbage(client):
 
 @pytest.mark.asyncio
 async def test_dry_run_happy_path_returns_row_count(client):
+    # Bug-5898: dry-run now reuses _validate_via_router + subset validation
+    # (same as validate/create) before the count probe, so this must mock
+    # _validate_via_router like every other pockets test does — otherwise
+    # the unmocked call attempts a real HTTP request to the query-router.
     db = make_mock_db()
-    scoped_model = types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+    )
 
     async def _get(cls, obj_id):
         if cls is Model:
@@ -414,11 +429,12 @@ async def test_dry_run_happy_path_returns_row_count(client):
     route_result = {"rows": [{"__c": 42}]}
 
     with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets._validate_via_router", AsyncMock(return_value=_router_response())), \
          patch("src.api.pockets._route_query", AsyncMock(return_value=route_result)), \
          patch("src.api.pockets.get_setting", AsyncMock(return_value=300)):
         resp = await client.post(
             f"{PREFIX}/dry-run",
-            json={"defining_sql": "SELECT id FROM public.sales"},
+            json={"defining_sql": "SELECT id FROM modely"},
             headers=AUTH_HEADERS,
         )
 
@@ -426,6 +442,76 @@ async def test_dry_run_happy_path_returns_row_count(client):
     data = resp.json()
     assert data["ok"] is True
     assert data["row_count"] == 42
+
+
+@pytest.mark.asyncio
+async def test_dry_run_rejects_subset_violating_sql(client):
+    """Bug-5898: dry-run must reject SQL that fails _check_pocket_structure
+    (e.g. FROM a physical table instead of the model slug) instead of
+    wrapping it in a COUNT(*) probe and reporting a misleading success."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+    )
+
+    async def _get(cls, obj_id):
+        if cls is Model:
+            return scoped_model
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets._validate_via_router", AsyncMock(
+             return_value=_router_response(from_tables=["demo_data.sales_data"])
+         )), \
+         patch("src.api.pockets._route_query", AsyncMock(
+             side_effect=AssertionError("count probe must not run")
+         )):
+        resp = await client.post(
+            f"{PREFIX}/dry-run",
+            json={"defining_sql": "SELECT * FROM demo_data.sales_data"},
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["ok"] is False
+    assert "row_count" not in data or data["row_count"] is None
+
+
+@pytest.mark.asyncio
+async def test_dry_run_rejects_invalid_target_id(client):
+    """Bug-5898: same target_id existence check as validate/create."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+    )
+
+    async def _get(cls, obj_id):
+        if cls is Model:
+            return scoped_model
+        return None  # DataTarget lookup resolves to nothing
+
+    db.get = AsyncMock(side_effect=_get)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets._route_query", AsyncMock(
+             side_effect=AssertionError("count probe must not run")
+         )):
+        resp = await client.post(
+            f"{PREFIX}/dry-run",
+            json={
+                "defining_sql": "SELECT * FROM modely",
+                "target_id": str(uuid.uuid4()),
+            },
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert "invalid target_id" in data["error"].lower()
 
 
 @pytest.mark.asyncio
@@ -466,6 +552,87 @@ async def test_validate_pocket_sql_rejects_physical_table_from(client):
 
 
 @pytest.mark.asyncio
+async def test_validate_pocket_sql_rejects_invalid_target_id(client):
+    """Bug-5898: validate must load and check a supplied target_id the same
+    way create does — an unresolvable/foreign target_id must not be
+    reported as a validated pocket."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+    )
+
+    async def _get(cls, obj_id):
+        if cls is Model:
+            return scoped_model
+        return None  # DataTarget lookup resolves to nothing
+
+    db.get = AsyncMock(side_effect=_get)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)):
+        resp = await client.post(
+            f"{PREFIX}/validate",
+            json={
+                "defining_sql": "SELECT * FROM modely",
+                "target_id": str(uuid.uuid4()),
+            },
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert "invalid target_id" in data["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_validate_pocket_sql_rejects_cross_connector_target(client):
+    """Bug-5898: validate must run the same source/target connector
+    compatibility check create does (via _pocket_combo_error), not just
+    confirm the target row exists."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+    )
+    target_id = uuid.uuid4()
+    target = types.SimpleNamespace(
+        id=target_id, model_id=TEST_MODEL_ID, project_connection_id="conn-pg",
+    )
+    pg_conn = types.SimpleNamespace(
+        id="conn-pg", connection_type="postgresql", project_id=TEST_PROJECT_ID,
+    )
+    bq_source = types.SimpleNamespace(id="conn-bq", connection_type="bigquery")
+
+    async def _get(cls, obj_id):
+        from shared.db.models import DataTarget, ProjectConnection
+        if cls is Model:
+            return scoped_model
+        if cls is DataTarget:
+            return target
+        if cls is ProjectConnection:
+            return pg_conn
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets.resolve_source_connection", AsyncMock(return_value=bq_source)), \
+         patch("src.api.pockets.is_same_database", return_value=False):
+        resp = await client.post(
+            f"{PREFIX}/validate",
+            json={
+                "defining_sql": "SELECT * FROM modely",
+                "target_id": str(target_id),
+            },
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert "cross-connector" in data["error"].lower()
+
+
+@pytest.mark.asyncio
 async def test_validate_pocket_sql_accepts_select_from_model_slug(client):
     """Structural check passes when FROM references the model slug."""
     db = make_mock_db()
@@ -500,6 +667,214 @@ async def test_validate_pocket_sql_accepts_select_from_model_slug(client):
     data = resp.json()
     assert data["ok"] is True
     assert data["stage"] == "probe"
+
+
+# ---------------------------------------------------------------------------
+# Bug-8162 — an unreachable validator is not a verdict on the user's SQL.
+#
+# The sibling of ``scratchpad_measures._validate_expression_against_model``.
+# ``_validate_via_router`` already failed CLOSED, but it collapsed "the router
+# is down" into the same ValueError as "the router rejected your SQL", so an
+# outage surfaced to a modeller as "Pocket SQL failed validation" — telling
+# them their correct SQL was wrong. A network error escaped uncaught as a 500.
+# ---------------------------------------------------------------------------
+
+
+def _httpx_client_raising(exc: Exception):
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            raise exc
+
+    return _Client
+
+
+def _httpx_client_returning(status: int, payload: dict | None = None):
+    class _Resp:
+        status_code = status
+        text = "stub"
+
+        def json(self):
+            return payload if payload is not None else {}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            return _Resp()
+
+    return _Client
+
+
+@pytest.mark.asyncio
+async def test_bug_8162_router_5xx_is_unavailability_not_a_rejection(monkeypatch):
+    """Bug-8162: a 5xx must raise RouterUnavailableError, not ValueError."""
+    import httpx as _httpx
+
+    from src.api import pockets as pk
+
+    monkeypatch.setattr(pk.httpx, "AsyncClient", _httpx_client_returning(503))
+    with pytest.raises(pk.RouterUnavailableError):
+        await pk._validate_via_router(TEST_MODEL_ID, "SELECT * FROM modely", "tok")
+
+    # A network error is the same class of "no answer".
+    monkeypatch.setattr(
+        pk.httpx, "AsyncClient", _httpx_client_raising(_httpx.ConnectError("down"))
+    )
+    with pytest.raises(pk.RouterUnavailableError):
+        await pk._validate_via_router(TEST_MODEL_ID, "SELECT * FROM modely", "tok")
+
+    # ...and a 4xx is still a verdict, still a ValueError. RouterUnavailableError
+    # deliberately does not subclass ValueError, so the two never blur.
+    monkeypatch.setattr(
+        pk.httpx,
+        "AsyncClient",
+        _httpx_client_returning(400, {"detail": "unknown column"}),
+    )
+    with pytest.raises(ValueError) as exc:
+        await pk._validate_via_router(TEST_MODEL_ID, "SELECT * FROM modely", "tok")
+    assert not isinstance(exc.value, pk.RouterUnavailableError)
+    assert "unknown column" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_bug_8162_create_pocket_503s_when_router_unavailable(client):
+    """Bug-8162 END-TO-END: an outage answers 503 and persists nothing.
+
+    The SQL below is valid. Before the fix the caller got a 400 saying their
+    SQL failed validation — a false statement about correct SQL, and the exact
+    "careless implementation" the decision warned against.
+    """
+    from src.api.pockets import RouterUnavailableError
+
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID,
+        project_id=TEST_PROJECT_ID,
+        slug="modely",
+        display_name="Model Y",
+        seed="deadbeef",
+    )
+
+    async def _get(cls, obj_id):
+        if cls is Model:
+            return scoped_model
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets._validate_via_router", AsyncMock(
+             side_effect=RouterUnavailableError("router returned HTTP 503")
+         )):
+        resp = await client.post(
+            PREFIX,
+            json={
+                "target_id": str(uuid.uuid4()),
+                "defining_sql": "SELECT * FROM modely",
+                "refresh_policy": "manual",
+                "ttl_days": 14,
+            },
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 503, resp.text
+    detail = resp.json()["detail"]
+    assert "validator_unavailable" in detail
+    assert "not been rejected" in detail
+    db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bug_8162_validate_endpoint_503s_instead_of_claiming_ok_false(client):
+    """Bug-8162: ``ok=false, stage="parse"`` is a verdict; an outage has none."""
+    from src.api.pockets import RouterUnavailableError
+
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+    )
+
+    async def _get(cls, obj_id):
+        if cls is Model:
+            return scoped_model
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets._validate_via_router", AsyncMock(
+             side_effect=RouterUnavailableError("ConnectError: router down")
+         )):
+        resp = await client.post(
+            f"{PREFIX}/validate",
+            json={"defining_sql": "SELECT * FROM modely"},
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert "validator_unavailable" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_bug_8162_real_rejection_still_reads_as_a_verdict(client):
+    """Bug-8162 (other half): a genuine 4xx rejection must NOT say "retry".
+
+    Fail-closed is only half the decision — the response must still tell a user
+    with genuinely bad SQL that their SQL is bad. This pins the contrast, so an
+    implementation that answers 503 to everything cannot pass.
+    """
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID,
+        project_id=TEST_PROJECT_ID,
+        slug="modely",
+        display_name="Model Y",
+        seed="deadbeef",
+    )
+
+    async def _get(cls, obj_id):
+        if cls is Model:
+            return scoped_model
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets._validate_via_router", AsyncMock(
+             side_effect=ValueError("column no_such_col does not exist")
+         )):
+        resp = await client.post(
+            PREFIX,
+            json={
+                "target_id": str(uuid.uuid4()),
+                "defining_sql": "SELECT no_such_col FROM modely",
+                "refresh_policy": "manual",
+                "ttl_days": 14,
+            },
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 400, resp.text
+    detail = resp.json()["detail"]
+    assert "no_such_col" in detail
+    assert "validator_unavailable" not in detail
+    db.commit.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -677,6 +1052,155 @@ async def test_patch_pocket_rejects_unresolvable_where_fail_closed(client):
     db.commit.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_patch_pocket_rejects_unknown_refresh_policy(client):
+    """Bug-6108 / Bug-6593: PATCH must reject an unknown refresh_policy, not
+    write it. A token outside the policy universe ({schedule, manual, event})
+    is refused at the schema boundary (Pydantic 422) — the same status create
+    returns for the same malformed input, so the two endpoints stay consistent.
+    The handler's per-tenant allow-list (400) is a distinct rule for a
+    universe-valid token a tenant has disabled; it is not exercised here."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+        display_name="Model Y",
+    )
+    pocket_id = uuid.uuid4()
+    existing = PocketDefinition(
+        model_id=TEST_MODEL_ID, target_id=uuid.uuid4(),
+        physical_table_name="pocket_x", defining_sql="SELECT * FROM modely",
+        query_fingerprint="fp", predicate_set_hash="h",
+        refresh_policy="manual", ttl_days=14, status="stale",
+    )
+    existing.id = pocket_id
+
+    async def _get(cls, obj_id):
+        if cls is Model:
+            return scoped_model
+        if cls is PocketDefinition:
+            return existing
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets.get_setting", AsyncMock(
+             side_effect=lambda key, **kw: ["manual", "schedule"] if "allowed" in key else 14
+         )):
+        resp = await client.patch(
+            f"{PREFIX}/{pocket_id}",
+            json={"refresh_policy": "every_hour"},
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 422, resp.text
+    assert "refresh_policy must be one of" in resp.text
+    db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_patch_pocket_rejects_invalid_cron(client):
+    """Bug-6108 / Bug-6593: PATCH must reject an unparseable refresh_cron instead
+    of silently writing a cron the scheduler can never fire. The cron is
+    validated at the schema boundary (Pydantic 422), matching create for the
+    same malformed input; the handler cron check is defense-in-depth behind it."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+        display_name="Model Y",
+    )
+    pocket_id = uuid.uuid4()
+    existing = PocketDefinition(
+        model_id=TEST_MODEL_ID, target_id=uuid.uuid4(),
+        physical_table_name="pocket_x", defining_sql="SELECT * FROM modely",
+        query_fingerprint="fp", predicate_set_hash="h",
+        refresh_policy="schedule", ttl_days=14, status="stale",
+    )
+    existing.id = pocket_id
+
+    async def _get(cls, obj_id):
+        if cls is Model:
+            return scoped_model
+        if cls is PocketDefinition:
+            return existing
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets.get_setting", AsyncMock(
+             side_effect=lambda key, **kw: ["manual", "schedule"] if "allowed" in key else 14
+         )):
+        resp = await client.patch(
+            f"{PREFIX}/{pocket_id}",
+            json={"refresh_cron": "not a cron"},
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 422, resp.text
+    assert "Invalid cron expression" in resp.text
+    db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_patch_pocket_schedule_change_syncs_policy_row(client):
+    """Bug-6108: a PATCH that sets a scheduled refresh must upsert the
+    authoritative PocketRefreshPolicy child row (the scheduler reads it), not
+    just the deprecated pocket.refresh_cron column."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+        display_name="Model Y",
+    )
+    pocket_id = uuid.uuid4()
+    existing = PocketDefinition(
+        model_id=TEST_MODEL_ID, target_id=uuid.uuid4(),
+        physical_table_name="pocket_x", defining_sql="SELECT * FROM modely",
+        query_fingerprint="fp", predicate_set_hash="h",
+        refresh_policy="manual", ttl_days=14, status="stale",
+    )
+    existing.id = pocket_id
+
+    async def _get(cls, obj_id):
+        if cls is Model:
+            return scoped_model
+        if cls is PocketDefinition:
+            return existing
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    def _execute(*args, **kwargs):
+        result = MagicMock()
+        # No pre-existing policy row -> the sync inserts one.
+        result.scalar_one_or_none.return_value = None
+        # Final select echoes a valid response object.
+        result.scalar_one.return_value = _pocket_response_stub([])
+        return result
+
+    db.execute = AsyncMock(side_effect=_execute)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets.get_setting", AsyncMock(
+             side_effect=lambda key, **kw: ["manual", "schedule"] if "allowed" in key else 14
+         )):
+        resp = await client.patch(
+            f"{PREFIX}/{pocket_id}",
+            json={"refresh_policy": "schedule", "refresh_cron": "0 3 * * *"},
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 200, resp.text
+    policies = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if call.args and isinstance(call.args[0], PocketRefreshPolicy)
+    ]
+    assert len(policies) == 1, "scheduled PATCH must upsert the refresh-policy row"
+    assert policies[0].cron_expression == "0 3 * * *"
+    assert policies[0].is_enabled is True
+
+
 # ---------------------------------------------------------------------------
 # Bug-1093 / Bug-1096 (F-005): predicate rows are derived authoritatively from
 # the validated SQL at every defining_sql write. The matcher trusts these rows
@@ -850,6 +1374,65 @@ async def test_create_pocket_allows_bigquery_same_connector_target(client):
 
     assert resp.status_code == 201, resp.text
     db.commit.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_create_scheduled_pocket_creates_refresh_policy_row(client):
+    """Bug-5575: refresh_policy='schedule' must create the enabled
+    PocketRefreshPolicy row the scheduler sweep joins on."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID,
+        project_id=TEST_PROJECT_ID,
+        slug="modely",
+        display_name="Model Y",
+        seed="deadbeef",
+    )
+    target_id = uuid.uuid4()
+    target = types.SimpleNamespace(id=target_id, model_id=TEST_MODEL_ID)
+
+    async def _get(cls, obj_id):
+        from shared.db.models import DataTarget
+
+        if cls is Model:
+            return scoped_model
+        if cls is DataTarget and str(obj_id) == str(target_id):
+            return target
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    def _execute(*args, **kwargs):
+        result = MagicMock()
+        result.scalar_one.return_value = _pocket_response_stub(_captured_predicates(db))
+        return result
+
+    db.execute = AsyncMock(side_effect=_execute)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets._validate_via_router", AsyncMock(return_value=_router_response())), \
+         patch("src.api.pockets.get_setting", AsyncMock(side_effect=lambda key, **kw: ["manual", "schedule"] if "allowed" in key else 14)):
+        resp = await client.post(
+            PREFIX,
+            json={
+                "target_id": str(target_id),
+                "defining_sql": "SELECT * FROM modely",
+                "refresh_policy": "schedule",
+                "refresh_cron": "0 2 * * *",
+                "ttl_days": 14,
+            },
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 201, resp.text
+    policies = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if call.args and isinstance(call.args[0], PocketRefreshPolicy)
+    ]
+    assert len(policies) == 1
+    assert policies[0].cron_expression == "0 2 * * *"
+    assert policies[0].is_enabled is True
 
 
 @pytest.mark.asyncio
@@ -1067,8 +1650,14 @@ async def test_patch_pocket_identity_collision_returns_409(client):
 
 @pytest.mark.asyncio
 async def test_dry_run_requires_authentication(client):
+    # Bug-5898: dry-run now validates via _validate_via_router before the
+    # count probe (_route_query) — mock that to succeed so the auth
+    # failure this test targets is exercised on the probe itself, same as
+    # the other pockets tests mock _validate_via_router.
     db = make_mock_db()
-    scoped_model = types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+    )
 
     async def _get(cls, obj_id):
         if cls is Model:
@@ -1078,16 +1667,171 @@ async def test_dry_run_requires_authentication(client):
     db.get = AsyncMock(side_effect=_get)
 
     with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets._validate_via_router", AsyncMock(return_value=_router_response())), \
          patch("src.api.pockets._route_query", AsyncMock(
              side_effect=Exception("401 Unauthorized: authentication required")
          )), \
          patch("src.api.pockets.get_setting", AsyncMock(return_value=300)):
         resp = await client.post(
             f"{PREFIX}/dry-run",
-            json={"defining_sql": "SELECT 1"},
+            json={"defining_sql": "SELECT 1 FROM modely"},
         )
 
     assert resp.status_code == 200
     data = resp.json()
     assert data["ok"] is False
     assert "authentication" in data["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_create_scheduled_pocket_honours_policy_enabled_flag(client):
+    """Bug-7007: the COMPLETE initial refresh policy is created atomically in the
+    single create request. A create carrying refresh_policy_enabled=False must
+    write a DISABLED PocketRefreshPolicy row — proving no second setPolicy
+    request is needed to finish configuring the pocket."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(
+        id=TEST_MODEL_ID,
+        project_id=TEST_PROJECT_ID,
+        slug="modely",
+        display_name="Model Y",
+        seed="deadbeef",
+    )
+    target_id = uuid.uuid4()
+    target = types.SimpleNamespace(id=target_id, model_id=TEST_MODEL_ID)
+
+    async def _get(cls, obj_id):
+        from shared.db.models import DataTarget
+
+        if cls is Model:
+            return scoped_model
+        if cls is DataTarget and str(obj_id) == str(target_id):
+            return target
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
+    def _execute(*args, **kwargs):
+        result = MagicMock()
+        result.scalar_one.return_value = _pocket_response_stub(_captured_predicates(db))
+        return result
+
+    db.execute = AsyncMock(side_effect=_execute)
+
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)), \
+         patch("src.api.pockets._validate_via_router", AsyncMock(return_value=_router_response())), \
+         patch("src.api.pockets.get_setting", AsyncMock(side_effect=lambda key, **kw: ["manual", "schedule"] if "allowed" in key else 14)):
+        resp = await client.post(
+            PREFIX,
+            json={
+                "target_id": str(target_id),
+                "defining_sql": "SELECT * FROM modely",
+                "refresh_policy": "schedule",
+                "refresh_cron": "0 2 * * *",
+                "refresh_policy_enabled": False,
+                "ttl_days": 14,
+            },
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 201, resp.text
+    policies = [
+        call.args[0]
+        for call in db.add.call_args_list
+        if call.args and isinstance(call.args[0], PocketRefreshPolicy)
+    ]
+    # Exactly one policy row, created in the same transaction, honouring the
+    # caller's disabled state — no separate PUT /refresh/policy required.
+    assert len(policies) == 1
+    assert policies[0].cron_expression == "0 2 * * *"
+    assert policies[0].is_enabled is False
+
+
+# ---------------------------------------------------------------------------
+# Bug-8581 — deleting a pocket must not leave the query-router serving it.
+# ---------------------------------------------------------------------------
+
+
+def _pocket_row():
+    return types.SimpleNamespace(
+        id=uuid.uuid4(),
+        model_id=TEST_MODEL_ID,
+        physical_table_name="pocket_abc",
+        target_schema="public",
+        target_id=uuid.uuid4(),
+        status="fresh",
+        retired_at=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_bug_8581_delete_pocket_evicts_the_query_router_cache(client):
+    """Observed live (LIVE-POCKET-RLS-001): after a pocket DELETE returned 204
+    and its physical table was verified gone, the same query kept returning
+    route_type=pocket with the deleted pocket's id and a routed SQL naming the
+    dropped table, for 15+ seconds — replayed from the router's result cache.
+
+    Mechanism 2 of the cache-invalidation contract (mechanism 1, the serve-time
+    servability check, lives in the query-router): clear the receiving replica
+    immediately, so the operator who just deleted a pocket does not keep being
+    told it is serving. Deleting the wired call fails this test."""
+    from src.api import pockets as _pockets
+
+    pocket = _pocket_row()
+    model = types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+    db = make_mock_db()
+    db.get = AsyncMock(return_value=pocket)
+
+    evict = AsyncMock()
+    with (
+        patch("src.api.pockets.get_tenant_db", async_gen_from(db)),
+        patch.object(_pockets, "_get_scoped_model", new=AsyncMock(return_value=model)),
+        patch.object(_pockets, "drop_pocket_storage", new=AsyncMock()),
+        patch.object(_pockets, "_evict_query_router_cache", evict),
+    ):
+        resp = await client.delete(f"{PREFIX}/{pocket.id}", headers=AUTH_HEADERS)
+
+    assert resp.status_code == 204, resp.text
+    evict.assert_awaited_once_with(TEST_MODEL_ID, TEST_TENANT)
+
+
+@pytest.mark.asyncio
+async def test_bug_8581_delete_still_succeeds_when_the_router_is_unreachable(client):
+    """Best-effort by contract, exercised through the REAL helper: the delete has
+    already committed, so an unreachable query-router must not turn a completed
+    delete into an error. Uses the real ``_evict_query_router_cache`` with a
+    broken transport rather than a raising mock — a mock that raises would be
+    asserting a shape the helper cannot produce. The serve-time servability check
+    in the query-router is what makes correctness independent of this call
+    landing at all."""
+    import httpx as _httpx
+    from src.api import pockets as _pockets
+
+    pocket = _pocket_row()
+    model = types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+    db = make_mock_db()
+    db.get = AsyncMock(return_value=pocket)
+
+    class _BrokenClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def delete(self, *a, **k):
+            raise _httpx.ConnectError("query-router unreachable")
+
+    with (
+        patch("src.api.pockets.get_tenant_db", async_gen_from(db)),
+        patch.object(_pockets, "_get_scoped_model", new=AsyncMock(return_value=model)),
+        patch.object(_pockets, "drop_pocket_storage", new=AsyncMock()),
+        patch("httpx.AsyncClient", _BrokenClient),
+    ):
+        resp = await client.delete(f"{PREFIX}/{pocket.id}", headers=AUTH_HEADERS)
+
+    assert resp.status_code == 204, resp.text
+    assert db.delete.await_count == 1

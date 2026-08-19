@@ -26,22 +26,18 @@ import DownloadIcon from "@mui/icons-material/Download";
 import SearchIcon from "@mui/icons-material/Search";
 import axios from "axios";
 
-interface GlossaryAttachment {
-  target_type: string;
-  target_id: string | null;
-}
+// Bug-7957: the public payload contains ONLY what this page renders.
+// No internal object IDs (model.id, attachment target_id) are included.
 interface GlossaryEntry {
   term: string;
   definition: string;
   context_notes: string | null;
   synonyms: string[];
-  attachments: GlossaryAttachment[];
   version: number;
   updated_at: string;
 }
 interface GlossaryPayload {
   model: {
-    id: string;
     slug: string;
     display_name: string | null;
     description: string | null;
@@ -69,13 +65,19 @@ export default function PublicGlossary() {
       .get<GlossaryPayload>(`${API_BASE}/api/v1/glossary/public/${encodeURIComponent(token)}`)
       .then((r) => setData(r.data))
       .catch((err) => {
-        const detail =
-          err?.response?.data?.detail ??
-          t("publicGlossary.invalidLink");
-        setError(detail);
+        // Bug-7964: map HTTP failure modes to i18n keys instead of
+        // echoing backend error detail (English server wording on a
+        // public page). 404 = invalid/expired/revoked link; anything
+        // else = generic server error.
+        const status = err?.response?.status;
+        if (status === 404) {
+          setError(t("publicGlossary.invalidLink"));
+        } else {
+          setError(t("publicGlossary.loadError"));
+        }
       })
       .finally(() => setLoading(false));
-  }, [token]);
+  }, [token, t]);
 
   const filtered = useMemo(() => {
     if (!data) return [];

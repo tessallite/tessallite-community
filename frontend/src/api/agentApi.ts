@@ -35,6 +35,13 @@ export type AgentConfig = {
   default_locale: string | null;
   disclosure_text: string | null;
   webhook_url: string | null;
+  // Bug-8553 — true only on the save response that rotated an existing
+  // receiver secret; ordinary GET responses return false.
+  webhook_secret_rotated: boolean;
+  // Bug-8411 — which agent events the webhook receiver subscribes to.
+  // ["*"] (the default) means every event; null means the project predates
+  // the column and is treated by the dispatcher as "every event" too.
+  webhook_event_filters: string[] | null;
   primary_model_id: string | null;
   answer_llm_config_id: string | null;
   judge_llm_config_id: string | null;
@@ -75,12 +82,19 @@ export type AgentModelContext = {
   dimension_aliases?: unknown[];
 };
 
+// Bug-8181 — mirrors shared-ui's Citation type (types/turn.ts) field-for-field,
+// same pattern this file already uses for the rest of AgentTurn/TurnResponse.
+// Names MUST match the backend citation dict exactly
+// (services/agent-service/src/citations/builder.py).
 export type AgentCitation = {
   kind: "measure" | "dimension";
   id: string;
   name: string;
   display_name: string;
   value: number | string | null;
+  definition: string | null;
+  route_type: string | null;
+  filter_grain: string | null;
 };
 
 export type RubricSection = {
@@ -214,16 +228,38 @@ export type CostReport = {
   per_day: CostDay[];
 };
 
+export type EvalFieldComparison = {
+  field_name: string;
+  matched: boolean;
+  expected: unknown;
+  actual: unknown;
+  detail: string | null;
+};
+
+export type EvalDecompositionComparison = {
+  matched: boolean;
+  skipped: boolean;
+  skip_reason?: string | null;
+  fields?: EvalFieldComparison[];
+};
+
 export type EvalReportRow = {
   model_id: string;
   question: string;
-  expected_decomposition: string | null;
+  expected_decomposition: unknown;
   status: string;
   plan: Record<string, unknown> | null;
   answer_text: string | null;
   error: string | null;
+  decomposition_match: boolean | null;
+  decomposition_comparison: EvalDecompositionComparison | null;
 };
 
+// Mirrors EvalReportOut in agent-service src/api/eval.py. The four fields
+// below the rows were produced by the server and declared nowhere on this side,
+// so no screen could show them — in particular `regressed`, which the server
+// documents as the flag a client gating on eval accuracy MUST treat as a failed
+// run regardless of the ok/refused/error counts.
 export type EvalReport = {
   project_id: string;
   total: number;
@@ -232,12 +268,27 @@ export type EvalReport = {
   clarify: number;
   error: number;
   rows: EvalReportRow[];
+  accuracy_score: number | null;
+  decomposition_regressions: number;
+  /** Set to the reason when the run stopped early on an exhausted budget. */
+  budget_stopped: string | null;
+  decomposition_compared: number;
+  decomposition_unparseable: number;
+  regressed: boolean;
+};
+
+export type WebhookEventType = {
+  value: string;
+  label: string;
 };
 
 export type WebhookDlqRow = {
   id: string;
   event_type: string;
-  target_url: string;
+  // Bug-8350 — the raw destination URL is never returned (it may embed a
+  // bearer token or API key, in the path as much as the query string);
+  // only a sanitised scheme://host[:port] hint is.
+  target_host: string | null;
   attempt_count: number;
   last_status_code: number | null;
   last_error: string | null;
@@ -344,12 +395,16 @@ export const DEFAULT_AGENT_CONFIG: AgentConfig = {
   default_locale: "en-GB",
   disclosure_text: null,
   webhook_url: null,
+  webhook_secret_rotated: false,
+  webhook_event_filters: ["*"],
   primary_model_id: null,
   answer_llm_config_id: null,
   judge_llm_config_id: null,
   aggregate_llm_config_id: null,
   glossary_llm_config_id: null,
-  judge_mode: "async",
+  // F-023-29 / Bug-8148 — default is validated-first ("sync"): the answer is
+  // validated before it is shown. "async" is an explicit lower-assurance override.
+  judge_mode: "sync",
   judge_rubric_id: null,
   judge_block_visibility: "transparent",
   show_thought_process: true,
@@ -595,6 +650,14 @@ export const agentApi = {
       .then((r) => r.data),
 
   // Webhooks (C2)
+  // Bug-8411 — the event catalogue is served by the backend so the Settings
+  // checkboxes can never drift from what the dispatcher actually emits.
+  listWebhookEventTypes: (projectId: string) =>
+    agent
+      .get<WebhookEventType[]>(
+        `/api/v1/projects/${projectId}/agent/webhook/event-types`,
+      )
+      .then((r) => r.data),
   rotateWebhookSecret: (projectId: string) =>
     agent
       .post<{ signing_secret: string }>(

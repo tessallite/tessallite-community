@@ -88,7 +88,7 @@ describe("AggregatesPanel — Predictive tab", () => {
           measure_names: ["total_sales"],
           fact_table: "public.sales",
           score: 0.87,
-          expected_hit_rate: 0.62,
+          heuristic_reuse_score: 0.62,
           row_reduction: 50000,
           estimated_rows: 1200,
           rationale: "Low-cardinality grain (50000× reduction)",

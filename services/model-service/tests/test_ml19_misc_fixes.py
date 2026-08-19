@@ -144,7 +144,17 @@ class TestScratchpadValidation:
         dup_result = AsyncMock()
         dup_result.scalar_one_or_none = lambda: existing
         db.execute = AsyncMock(return_value=dup_result)
-        with patch("src.api.scratchpad_measures.get_tenant_db", async_gen_from(db)):
+        # Bug-8162: this test used to reach the duplicate check with NO router
+        # stub at all — it passed only because the (unreachable) router failed
+        # OPEN in the test environment. Under the fail-closed contract that is
+        # now a 503, so the router leg has to be stubbed explicitly. The
+        # assertion below is unchanged: what is under test is still "duplicate
+        # name → 409, not 500".
+        with patch("src.api.scratchpad_measures.get_tenant_db", async_gen_from(db)), \
+             patch(
+                 "src.api.scratchpad_measures._validate_expression_against_model",
+                 AsyncMock(return_value=None),
+             ):
             resp = await client.post(
                 f"{BASE}/scratchpad-measures",
                 json={"name": "m1", "expression": "1+1"},
@@ -209,6 +219,15 @@ class TestEmbedCannotMutate:
                 f"{BASE}/pivot-views",
                 json={"name": "v", "measure_id": "m", "row_dim_ids": [], "col_dim_ids": []},
             )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_embed_cannot_list_pivot_views(self, embed_client):
+        # Bug-6423: pivot-view reads must fail closed for embed tokens, matching
+        # the stricter saved-queries read endpoints.
+        db = _db_with()
+        with patch("src.api.pivot_views.get_tenant_db", async_gen_from(db)):
+            resp = await embed_client.get(f"{BASE}/pivot-views")
         assert resp.status_code == 403
 
     @pytest.mark.asyncio
@@ -349,31 +368,147 @@ class TestPivotViewSharing:
         assert added.is_shared is True
 
     @pytest.mark.asyncio
-    async def test_list_returns_owner_flag_for_others_shared_view(self, client):
-        # A view shared by a colleague is visible and marked not-owned.
+    async def test_create_view_with_empty_measure_id_succeeds(self, client):
+        # Bug-6412: a first measure of Record Count / scratchpad / none makes the
+        # frontend send an empty primary measure_id (the real selection lives in
+        # config). The save must succeed rather than 400 on measure validation.
+        db = _db_with()
+
+        async def _refresh(view):
+            view.id = uuid.uuid4()
+            view.created_at = NOW
+            view.updated_at = NOW
+
+        db.refresh = AsyncMock(side_effect=_refresh)
+        with patch("src.api.pivot_views.get_tenant_db", async_gen_from(db)):
+            resp = await client.post(
+                f"{BASE}/pivot-views",
+                json={
+                    "name": "rc-only", "measure_id": "",
+                    "row_dim_ids": [], "col_dim_ids": [],
+                },
+            )
+        assert resp.status_code == 201
+        assert resp.json()["measure_id"] == ""
+
+    @pytest.mark.asyncio
+    async def test_list_marks_others_shared_view_not_owned_or_editable(self, client):
+        # A view shared by a colleague is visible, marked not-owned, and — for a
+        # non-modeler caller — not editable.
         other = _pivot(name="shared-by-bob", created_by="bob@acme", is_shared=True)
         rows = AsyncMock()
         rows.scalars = lambda: types.SimpleNamespace(all=lambda: [other])
         db = _db_with()
         db.execute = AsyncMock(return_value=rows)
-        with patch("src.api.pivot_views.get_tenant_db", async_gen_from(db)):
+        with patch("src.api.pivot_views.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.pivot_views.caller_has_role", AsyncMock(return_value=False)):
             resp = await client.get(f"{BASE}/pivot-views")
         assert resp.status_code == 200
         items = resp.json()
         assert len(items) == 1
         assert items[0]["is_shared"] is True
         assert items[0]["is_owner"] is False
+        assert items[0]["can_edit"] is False
         assert items[0]["created_by"] == "bob@acme"
 
     @pytest.mark.asyncio
-    async def test_non_owner_cannot_delete_shared_view(self, client):
-        # Deleting a colleague's shared view is rejected (ownership-scoped).
+    async def test_list_marks_others_shared_view_editable_for_modeler(self, client):
+        # Bug-5839: a modeler may edit/delete shared views they do not own, so
+        # can_edit is True even though they are not the owner.
+        other = _pivot(name="shared-by-bob", created_by="bob@acme", is_shared=True)
+        rows = AsyncMock()
+        rows.scalars = lambda: types.SimpleNamespace(all=lambda: [other])
+        db = _db_with()
+        db.execute = AsyncMock(return_value=rows)
+        with patch("src.api.pivot_views.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.pivot_views.caller_has_role", AsyncMock(return_value=True)):
+            resp = await client.get(f"{BASE}/pivot-views")
+        items = resp.json()
+        assert items[0]["is_owner"] is False
+        assert items[0]["can_edit"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_owner_viewer_cannot_delete_shared_view(self, client):
+        # A viewer cannot delete a colleague's shared view — 403, not a silent
+        # 404 that hides a view they can actually see (Bug-5839 boundary).
         other = _pivot(created_by="bob@acme", is_shared=True)
+        db = _db_with(pivot=other)
+        with patch("src.api.pivot_views.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.pivot_views.caller_has_role", AsyncMock(return_value=False)):
+            resp = await client.delete(f"{BASE}/pivot-views/{other.id}")
+        assert resp.status_code == 403
+        db.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_owner_cannot_delete_personal_view(self, client):
+        # A personal (unshared) view of another user stays private: 404 hides its
+        # existence, regardless of the caller's role.
+        other = _pivot(created_by="bob@acme", is_shared=False)
         db = _db_with(pivot=other)
         with patch("src.api.pivot_views.get_tenant_db", async_gen_from(db)):
             resp = await client.delete(f"{BASE}/pivot-views/{other.id}")
         assert resp.status_code == 404
         db.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_modeler_can_delete_shared_view(self, client):
+        # Bug-5839: a modeler may delete a shared view they do not own.
+        other = _pivot(created_by="bob@acme", is_shared=True)
+        db = _db_with(pivot=other)
+        with patch("src.api.pivot_views.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.pivot_views.caller_has_role", AsyncMock(return_value=True)):
+            resp = await client.delete(f"{BASE}/pivot-views/{other.id}")
+        assert resp.status_code == 204
+        db.delete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_modeler_can_update_shared_view(self, client):
+        # Bug-5839: a modeler may rename/retire a shared view they do not own.
+        other = _pivot(name="old", created_by="bob@acme", is_shared=True)
+        db = _db_with(pivot=other)
+        with patch("src.api.pivot_views.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.pivot_views.caller_has_role", AsyncMock(return_value=True)):
+            resp = await client.patch(
+                f"{BASE}/pivot-views/{other.id}", json={"name": "renamed"},
+            )
+        assert resp.status_code == 200
+        assert other.name == "renamed"
+        assert resp.json()["can_edit"] is True
+        assert resp.json()["is_owner"] is False
+
+    @pytest.mark.asyncio
+    async def test_modeler_cannot_unshare_others_view(self, client):
+        # Bug-5839 share boundary: a modeler may edit a shared view they do not
+        # own, but publishing/unpublishing stays owner-only. Flipping another
+        # user's shared view to personal would hide it from everyone — reject.
+        other = _pivot(created_by="bob@acme", is_shared=True)
+        db = _db_with(pivot=other)
+        with patch("src.api.pivot_views.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.pivot_views.caller_has_role", AsyncMock(return_value=True)):
+            resp = await client.patch(
+                f"{BASE}/pivot-views/{other.id}", json={"is_shared": False},
+            )
+        assert resp.status_code == 403
+        # The stored flag is untouched.
+        assert other.is_shared is True
+
+    @pytest.mark.asyncio
+    async def test_patch_empty_measure_id_still_validates_dims(self, client):
+        # Bug-6412 / Bug-5316: clearing measure_id skips only the measure
+        # existence check; the dimension refs are still validated.
+        # L18 (Bug-8161/8182/7442): a config-VALIDATION failure like a malformed
+        # dimension id is now a TYPED 422 carrying ``error_code`` (was a bare
+        # 400) so the client can map it. The intent — dims are still validated
+        # when the measure pointer is cleared — is unchanged.
+        own = _pivot(created_by=USER_EMAIL, is_shared=False)
+        db = _db_with(pivot=own)
+        with patch("src.api.pivot_views.get_tenant_db", async_gen_from(db)):
+            resp = await client.patch(
+                f"{BASE}/pivot-views/{own.id}",
+                json={"measure_id": "", "row_dim_ids": ["not-a-uuid"]},
+            )
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["error_code"] == "INVALID_DIMENSION_ID"
 
     @pytest.mark.asyncio
     async def test_owner_can_toggle_share_via_patch(self, client):

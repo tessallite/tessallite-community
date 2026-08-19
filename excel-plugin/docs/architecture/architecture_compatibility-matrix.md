@@ -55,6 +55,26 @@ Run `npm run dev`, sideload in Excel, open Diagnostics panel, and click "Run Spi
 - Context menu support requires Office 2016+ with VersionOverridesV1_1
 - Some operations may require user interaction or native Excel UI
 
+## Custom functions on perpetual Office (verified 2026-07-11, Bug-6905)
+
+Custom functions work on Office 2019 perpetual (Build 16.0.20131) via
+shared-folder sideload, subject to:
+
+- The manifest must use `VersionOverridesV1_0`; perpetual hosts ignore a V1_1
+  CustomFunctions extension point for sideloaded add-ins.
+- The Script URL must be a classic-script (IIFE) bundle (`functions.iife.js`);
+  an ES module crashes the JS-only runtime in a ~30 s restart loop.
+- Registration happens through the Page URL (`functions.html`), which loads
+  the CDN `custom-functions-runtime.js`.
+- The functions runtime executes in a WWAHost AppContainer: for localhost
+  servers it needs loopback exemptions (`CheckNetIsolation LoopbackExempt`)
+  and the server CA in the machine Root store (user store is not consulted).
+- The runtime does not always start on a plain Excel restart; re-inserting
+  the add-in from the shared folder reliably triggers registration.
+
+See the plugin README "Custom functions on perpetual Office" section and
+Bug-6905 for the full setup and troubleshooting chain.
+
 ---
 
-*Last updated: 2026-05-25*
+*Last updated: 2026-07-11*

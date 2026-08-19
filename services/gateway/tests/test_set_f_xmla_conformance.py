@@ -178,20 +178,42 @@ def test_is_tmschema_dmv_detection():
     assert not xmla_server._is_tmschema_dmv(None)
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        # Wave C #3: a missing structured parser now fails closed for EVERY
+        # statement class — simple SELECT too — never a fallback interpretation.
+        "SELECT {[Measures].[Sales]} ON 0 FROM [cube]",
+        "DRILLTHROUGH SELECT {[Measures].[Sales]} ON 0 FROM [cube]",
+        "WITH MEMBER [Measures].[X] AS '1' SELECT {[Measures].[X]} ON 0 FROM [cube]",
+    ],
+)
+def test_parse_mdx_for_execute_fails_closed_when_parser_missing(
+    monkeypatch, statement,
+):
+    def missing_parser(_statement):
+        raise xmla_server.MDXParserUnavailableError("tree_sitter missing")
+
+    monkeypatch.setattr(xmla_server, "parse_mdx_statement", missing_parser)
+
+    with pytest.raises(ValueError, match="structured MDX parser"):
+        xmla_server._parse_mdx_for_execute(statement)
+
+
 @pytest.mark.asyncio
 async def test_handle_execute_dispatches_tmschema_dmv(monkeypatch):
     """A $SYSTEM.TMSCHEMA_* Execute is answered from model metadata as a flat
     Rowset, not routed through MDX translation."""
     async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
-    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return [{"name": "Sales", "expression": "SUM(x)"}]
 
-    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return [{"name": "Region"}]
 
-    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False):
+    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False, **kw):
         return []
 
     def _boom(*_a, **_k):
@@ -242,19 +264,19 @@ async def test_tmschema_dmv_persona_excludes_access_restricted_includes_hidden(m
     }
 
     async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
-        return "model-1", "project-1", persona
+        return "model-1", "project-1", persona, None
 
-    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return [
             {"id": "m-sales", "name": "Sales", "expression": "SUM(amount)"},
             {"id": "m-secret", "name": "SecretMargin", "expression": "SUM(secret_margin)"},
             {"id": "m-hidden", "name": "HiddenCost", "expression": "SUM(cost)", "is_hidden": True},
         ]
 
-    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return [{"id": "d-region", "name": "Region"}]
 
-    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False):
+    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False, **kw):
         return []
 
     monkeypatch.setattr(xmla_server, "_resolve_model_id", fake_resolve_model_id)
@@ -310,9 +332,9 @@ async def test_tmschema_dmv_cls_restricted_column_measure_excluded(monkeypatch):
     }
 
     async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
-        return "model-1", "project-1", persona
+        return "model-1", "project-1", persona, None
 
-    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return [
             {"id": "m-sales", "name": "Sales", "expression": "SUM(amount)",
              "source_column_id": "col-amount"},
@@ -320,10 +342,10 @@ async def test_tmschema_dmv_cls_restricted_column_measure_excluded(monkeypatch):
              "source_column_id": "col-salary"},
         ]
 
-    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return [{"id": "d-region", "name": "Region", "source_column_id": "col-region"}]
 
-    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False):
+    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False, **kw):
         return []
 
     async def fake_get_model_snapshot(model_id, tenant_slug, jwt_token, project_id=""):
@@ -368,6 +390,91 @@ async def test_tmschema_dmv_cls_restricted_column_measure_excluded(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tmschema_dmv_cls_transitive_variant_and_uda_excluded(monkeypatch):
+    """F-008-04 — the XMLA/Excel catalogue must hide objects that reach a
+    restricted column TRANSITIVELY (a variant of a restricted base measure, a
+    UDA-backed dimension whose UDA references a restricted column), matching the
+    JDBC catalogue and the runtime serving gate. Before the fix these carried no
+    direct source_column_id and were advertised in full over XMLA."""
+    persona = {
+        "id": "persona-tr",
+        "includes_hidden_columns": False,
+        "included_measure_ids": ["m-salary", "m-salary-ytd", "m-sales"],
+        "included_dimension_ids": ["d-region", "d-band"],
+        "restricted_column_ids": ["col-salary"],
+    }
+
+    async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
+        return "model-1", "project-1", persona, None
+
+    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id="", **kw):
+        return [
+            {"id": "m-sales", "name": "Sales", "expression": "SUM(amount)",
+             "source_column_id": "col-amount"},
+            {"id": "m-salary", "name": "Salary", "expression": "SUM(salary)",
+             "source_column_id": "col-salary"},
+            # Variant of the restricted base — no direct source column.
+            {"id": "m-salary-ytd", "name": "SalaryYTD", "expression": "",
+             "source_column_id": None, "variant_of_measure_id": "m-salary"},
+        ]
+
+    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id="", **kw):
+        return [
+            {"id": "d-region", "name": "Region", "source_column_id": "col-region"},
+            # UDA-backed dimension whose UDA references the restricted column.
+            {"id": "d-band", "name": "SalaryBand", "source_column_id": None,
+             "user_defined_attribute_id": "uda-band"},
+        ]
+
+    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False, **kw):
+        return []
+
+    async def fake_get_model_snapshot(model_id, tenant_slug, jwt_token, project_id=""):
+        return {
+            "columns": [
+                {"id": "col-amount", "column_name": "amount"},
+                {"id": "col-salary", "column_name": "salary"},
+                {"id": "col-region", "column_name": "region"},
+            ],
+            "uda_column_refs": [
+                {"attribute_id": "uda-band", "column_id": "col-salary"},
+            ],
+            "tables": [],
+        }
+
+    monkeypatch.setattr(xmla_server, "_resolve_model_id", fake_resolve_model_id)
+    monkeypatch.setattr(xmla_server, "get_model_measures", fake_get_model_measures)
+    monkeypatch.setattr(xmla_server, "get_model_dimensions", fake_get_model_dimensions)
+    monkeypatch.setattr(xmla_server, "get_model_hierarchies", fake_get_model_hierarchies)
+    monkeypatch.setattr(xmla_server, "get_model_snapshot", fake_get_model_snapshot)
+
+    execute = """<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <Execute xmlns="urn:schemas-microsoft-com:xml-analysis">
+      <Command><Statement>SELECT * FROM $SYSTEM.TMSCHEMA_MEASURES</Statement></Command>
+      <Properties><PropertyList><Catalog>mymodel_tr</Catalog></PropertyList></Properties>
+    </Execute>
+  </soap:Body>
+</soap:Envelope>"""
+
+    response = await xmla_server._handle_execute(
+        _execute_method(execute), tenant_slug="demo", jwt_token="token", session_id="sid-tr",
+    )
+    body = response.body.decode("utf-8")
+    root = ET.fromstring(body)
+    by_name = {r.get("Name"): r for r in _tmschema_measure_rows(root)}
+
+    assert response.status_code == 200
+    # Non-restricted measure stays.
+    assert "Sales" in by_name
+    # Direct restricted + its variant are both gone (transitive channel).
+    assert "Salary" not in by_name
+    assert "SalaryYTD" not in by_name
+    assert "salary" not in body
+
+
+@pytest.mark.asyncio
 async def test_tmschema_dmv_cls_blanks_calculated_expression_referencing_restricted_column(monkeypatch):
     """Bug-5493 column-disclosure guard — an allow-listed CALCULATED measure that
     carries no source_column_id but whose free-text DAX expression references a
@@ -381,9 +488,9 @@ async def test_tmschema_dmv_cls_blanks_calculated_expression_referencing_restric
     }
 
     async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
-        return "model-1", "project-1", persona
+        return "model-1", "project-1", persona, None
 
-    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id="", **kw):
         # Calculated measure: no source_column_id, expression names the restricted
         # column "salary" (and a safe column "amount").
         return [
@@ -392,10 +499,10 @@ async def test_tmschema_dmv_cls_blanks_calculated_expression_referencing_restric
              "expression": "SUM(amount) - SUM(salary)"},
         ]
 
-    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return []
 
-    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False):
+    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False, **kw):
         return []
 
     async def fake_get_model_snapshot(model_id, tenant_slug, jwt_token, project_id=""):
@@ -451,9 +558,9 @@ async def test_tmschema_dmv_cls_fails_closed_when_snapshot_unavailable(monkeypat
     }
 
     async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
-        return "model-1", "project-1", persona
+        return "model-1", "project-1", persona, None
 
-    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return [
             # Calculated measure: expression references the restricted column.
             {"id": "m-margin", "name": "Margin", "measure_type": "calculated",
@@ -465,10 +572,10 @@ async def test_tmschema_dmv_cls_fails_closed_when_snapshot_unavailable(monkeypat
              "source_column_id": "col-salary"},
         ]
 
-    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return []
 
-    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False):
+    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False, **kw):
         return []
 
     async def fake_get_model_snapshot(model_id, tenant_slug, jwt_token, project_id=""):
@@ -522,19 +629,19 @@ async def test_tmschema_dmv_cls_fails_closed_when_restricted_id_missing_from_sna
     }
 
     async def fake_resolve_model_id(catalog, tenant_slug, jwt_token):
-        return "model-1", "project-1", persona
+        return "model-1", "project-1", persona, None
 
-    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_measures(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return [
             {"id": "m-margin", "name": "Margin", "measure_type": "calculated",
              "source_column_id": None,
              "expression": "SUM(amount) - SUM(bonus)"},
         ]
 
-    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id=""):
+    async def fake_get_model_dimensions(model_id, tenant_slug, jwt_token, project_id="", **kw):
         return []
 
-    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False):
+    async def fake_get_model_hierarchies(model_id, tenant_slug, jwt_token, project_id="", include_details=False, **kw):
         return []
 
     async def fake_get_model_snapshot(model_id, tenant_slug, jwt_token, project_id=""):

@@ -10,7 +10,15 @@ from sqlalchemy import select
 
 from shared.db.models import Join, ModelColumn, ModelTable
 from shared.db.session import get_tenant_db
-from shared.schemas.pydantic_models import JoinCreate, JoinResponse, JoinUpdate
+from shared.schemas.pydantic_models import (
+    JoinCreate,
+    JoinResponse,
+    JoinUpdate,
+    coerce_population_participation,
+)
+from shared.semantic.graph_order import is_fact_table
+from src.api._model_lock import acquire_model_definition_lock
+from src.api._scope import ensure_model_in_project
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 from src.api._column_helpers import resolve_column
@@ -18,6 +26,55 @@ from src.api._column_helpers import resolve_column
 router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}/joins", tags=["joins"]
 )
+
+
+async def _build_join_response(
+    db,
+    join: Join,
+    *,
+    table_cache: dict[UUID, ModelTable] | None = None,
+) -> JoinResponse:
+    """Build the one authoritative join response, including type warnings."""
+    left_col = await db.get(ModelColumn, join.left_column_id)
+    right_col = await db.get(ModelColumn, join.right_column_id)
+    warnings: list[str] | None = None
+    if left_col and right_col:
+        cache = table_cache if table_cache is not None else {}
+        for table_id in (join.left_table_id, join.right_table_id):
+            if table_id not in cache:
+                cache[table_id] = await db.get(ModelTable, table_id)
+        left_table = cache.get(join.left_table_id)
+        right_table = cache.get(join.right_table_id)
+        if left_table and right_table:
+            mismatch = _check_join_type_mismatch(
+                left_col,
+                right_col,
+                left_table,
+                right_table,
+                left_col.column_name,
+                right_col.column_name,
+            )
+            warnings = mismatch or None
+    return JoinResponse(
+        id=join.id,
+        model_id=join.model_id,
+        left_table_id=join.left_table_id,
+        right_table_id=join.right_table_id,
+        join_type=join.join_type,
+        cardinality=join.cardinality,
+        # Bug-8615 G1: coerced on READ so a row written before the field
+        # existed, or one carrying a value from a hand-edited bundle, cannot
+        # make the joins list 500.
+        population_participation=coerce_population_participation(
+            join.population_participation
+        ),
+        left_column_id=join.left_column_id,
+        right_column_id=join.right_column_id,
+        left_column_name=left_col.column_name if left_col else None,
+        right_column_name=right_col.column_name if right_col else None,
+        created_at=join.created_at,
+        warnings=warnings,
+    )
 
 
 async def _auto_hide_dim_join_key(
@@ -33,9 +90,9 @@ async def _auto_hide_dim_join_key(
     by the user (hidden_reason='user').
     """
     dim_col: ModelColumn | None = None
-    if left_table.table_type == "fact" and right_table.table_type.startswith("dim_"):
+    if is_fact_table(left_table) and right_table.table_type.startswith("dim_"):
         dim_col = right_col
-    elif right_table.table_type == "fact" and left_table.table_type.startswith("dim_"):
+    elif is_fact_table(right_table) and left_table.table_type.startswith("dim_"):
         dim_col = left_col
 
     if dim_col is None:
@@ -64,9 +121,9 @@ async def _auto_unhide_dim_join_key(
     that are still referenced by another join.
     """
     dim_col: ModelColumn | None = None
-    if left_table.table_type == "fact" and right_table.table_type.startswith("dim_"):
+    if is_fact_table(left_table) and right_table.table_type.startswith("dim_"):
         dim_col = right_col
-    elif right_table.table_type == "fact" and left_table.table_type.startswith("dim_"):
+    elif is_fact_table(right_table) and left_table.table_type.startswith("dim_"):
         dim_col = left_col
 
     if dim_col is None:
@@ -107,6 +164,10 @@ async def create_join(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> JoinResponse:
     async for db in get_tenant_db(current_user.tenant_id):
+        await ensure_model_in_project(
+            db, project_id=project_id, model_id=model_id,
+        )
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (read-modify-write: entity read UNDER lock)
         # Verify tables exist and belong to this model
         left_table = await db.get(ModelTable, body.left_table_id)
         if left_table is None or left_table.model_id != model_id:
@@ -116,12 +177,15 @@ async def create_join(
             raise HTTPException(status_code=404, detail="Right table not found")
 
         # Resolve column names to ModelColumn records
-        left_col = await resolve_column(db, body.left_table_id, body.left_column_name)
-        right_col = await resolve_column(db, body.right_table_id, body.right_column_name)
-
-        warnings = _check_join_type_mismatch(
-            left_col, right_col, left_table, right_table,
-            body.left_column_name, body.right_column_name,
+        left_col = await resolve_column(
+            db, body.left_table_id, body.left_column_name,
+            model_id=model_id, project_id=project_id,
+            field_name="left_table_id",
+        )
+        right_col = await resolve_column(
+            db, body.right_table_id, body.right_column_name,
+            model_id=model_id, project_id=project_id,
+            field_name="right_table_id",
         )
 
         j = Join(
@@ -129,6 +193,11 @@ async def create_join(
             left_table_id=body.left_table_id,
             right_table_id=body.right_table_id,
             join_type=body.join_type,
+            cardinality=body.cardinality,
+            # Bug-8615 G1: the schema default is ``preserve_base_rows``, so a
+            # caller that does not send this field creates exactly the join it
+            # created before the field existed.
+            population_participation=body.population_participation,
             left_column_id=left_col.id,
             right_column_id=right_col.id,
         )
@@ -140,67 +209,31 @@ async def create_join(
 
         await db.commit()
         await db.refresh(j)
-        return JoinResponse(
-            id=j.id,
-            model_id=j.model_id,
-            left_table_id=j.left_table_id,
-            right_table_id=j.right_table_id,
-            join_type=j.join_type,
-            left_column_id=j.left_column_id,
-            right_column_id=j.right_column_id,
-            left_column_name=body.left_column_name,
-            right_column_name=body.right_column_name,
-            created_at=j.created_at,
-            warnings=warnings or None,
-        )
+        return await _build_join_response(db, j)
 
 
-@router.get("", response_model=list[JoinResponse])
+@router.get("", response_model=list[JoinResponse], dependencies=[require_role("viewer")])
 async def list_joins(
     project_id: UUID,
     model_id: UUID,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> list[JoinResponse]:
     async for db in get_tenant_db(current_user.tenant_id):
+        await ensure_model_in_project(
+            db, project_id=project_id, model_id=model_id,
+        )
         result = await db.execute(
             select(Join).where(Join.model_id == model_id)
         )
         joins = result.scalars().all()
         table_cache: dict[UUID, ModelTable] = {}
-        responses = []
-        for j in joins:
-            left_col = await db.get(ModelColumn, j.left_column_id)
-            right_col = await db.get(ModelColumn, j.right_column_id)
-            warnings = None
-            if left_col and right_col:
-                for tid in (j.left_table_id, j.right_table_id):
-                    if tid not in table_cache:
-                        table_cache[tid] = await db.get(ModelTable, tid)
-                lt = table_cache.get(j.left_table_id)
-                rt = table_cache.get(j.right_table_id)
-                if lt and rt:
-                    w = _check_join_type_mismatch(
-                        left_col, right_col, lt, rt,
-                        left_col.column_name, right_col.column_name,
-                    )
-                    warnings = w or None
-            responses.append(JoinResponse(
-                id=j.id,
-                model_id=j.model_id,
-                left_table_id=j.left_table_id,
-                right_table_id=j.right_table_id,
-                join_type=j.join_type,
-                left_column_id=j.left_column_id,
-                right_column_id=j.right_column_id,
-                left_column_name=left_col.column_name if left_col else None,
-                right_column_name=right_col.column_name if right_col else None,
-                created_at=j.created_at,
-                warnings=warnings,
-            ))
-        return responses
+        return [
+            await _build_join_response(db, j, table_cache=table_cache)
+            for j in joins
+        ]
 
 
-@router.get("/{join_id}", response_model=JoinResponse)
+@router.get("/{join_id}", response_model=JoinResponse, dependencies=[require_role("viewer")])
 async def get_join(
     project_id: UUID,
     model_id: UUID,
@@ -208,34 +241,13 @@ async def get_join(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> JoinResponse:
     async for db in get_tenant_db(current_user.tenant_id):
+        await ensure_model_in_project(
+            db, project_id=project_id, model_id=model_id,
+        )
         j = await db.get(Join, join_id)
         if j is None or j.model_id != model_id:
             raise HTTPException(status_code=404, detail="Join not found")
-        left_col = await db.get(ModelColumn, j.left_column_id)
-        right_col = await db.get(ModelColumn, j.right_column_id)
-        warnings = None
-        if left_col and right_col:
-            lt = await db.get(ModelTable, j.left_table_id)
-            rt = await db.get(ModelTable, j.right_table_id)
-            if lt and rt:
-                w = _check_join_type_mismatch(
-                    left_col, right_col, lt, rt,
-                    left_col.column_name, right_col.column_name,
-                )
-                warnings = w or None
-        return JoinResponse(
-            id=j.id,
-            model_id=j.model_id,
-            left_table_id=j.left_table_id,
-            right_table_id=j.right_table_id,
-            join_type=j.join_type,
-            left_column_id=j.left_column_id,
-            right_column_id=j.right_column_id,
-            left_column_name=left_col.column_name if left_col else None,
-            right_column_name=right_col.column_name if right_col else None,
-            created_at=j.created_at,
-            warnings=warnings,
-        )
+        return await _build_join_response(db, j)
 
 
 @router.patch(
@@ -251,6 +263,10 @@ async def update_join(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> JoinResponse:
     async for db in get_tenant_db(current_user.tenant_id):
+        await ensure_model_in_project(
+            db, project_id=project_id, model_id=model_id,
+        )
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (read-modify-write: entity read UNDER lock)
         j = await db.get(Join, join_id)
         if j is None or j.model_id != model_id:
             raise HTTPException(status_code=404, detail="Join not found")
@@ -265,12 +281,37 @@ async def update_join(
         join_cols_changed = False
         if "join_type" in data:
             j.join_type = data["join_type"]
+        if "cardinality" in data:
+            # Orthogonal to join_type (contract invariant 3): declaring the
+            # cardinality never changes the rendered JOIN keyword.
+            j.cardinality = data["cardinality"]
+        if data.get("population_participation") is not None:
+            # Bug-8615 G1. Orthogonal to BOTH fields above: it declares the
+            # modeller's INTENT about the model's row population, and in this
+            # phase nothing reads it at serve time (wiring is phase G3). An
+            # explicit null is ignored rather than treated as "clear it" —
+            # ``population_participation`` is NOT NULL and its four states are
+            # all meaningful, so there is nothing to clear TO.
+            j.population_participation = data["population_participation"]
         if "left_column_name" in data:
-            left_col = await resolve_column(db, j.left_table_id, data["left_column_name"])
+            # ``j.left_table_id`` is persisted state on a join already proven to
+            # belong to this model, not a body value — but the model context is
+            # still passed, because the engine's guarantee is that NO caller can
+            # write a column into an unscoped table, not that each caller
+            # remembers whether its own table id was trustworthy.
+            left_col = await resolve_column(
+                db, j.left_table_id, data["left_column_name"],
+                model_id=model_id, project_id=project_id,
+                field_name="left_table_id",
+            )
             j.left_column_id = left_col.id
             join_cols_changed = True
         if "right_column_name" in data:
-            right_col = await resolve_column(db, j.right_table_id, data["right_column_name"])
+            right_col = await resolve_column(
+                db, j.right_table_id, data["right_column_name"],
+                model_id=model_id, project_id=project_id,
+                field_name="right_table_id",
+            )
             j.right_column_id = right_col.id
             join_cols_changed = True
 
@@ -300,20 +341,7 @@ async def update_join(
         await db.commit()
         await db.refresh(j)
 
-        left_col = await db.get(ModelColumn, j.left_column_id)
-        right_col = await db.get(ModelColumn, j.right_column_id)
-        return JoinResponse(
-            id=j.id,
-            model_id=j.model_id,
-            left_table_id=j.left_table_id,
-            right_table_id=j.right_table_id,
-            join_type=j.join_type,
-            left_column_id=j.left_column_id,
-            right_column_id=j.right_column_id,
-            left_column_name=left_col.column_name if left_col else None,
-            right_column_name=right_col.column_name if right_col else None,
-            created_at=j.created_at,
-        )
+        return await _build_join_response(db, j)
 
 
 @router.delete(
@@ -330,6 +358,10 @@ async def delete_join(
     from shared.semantic.model_validator import revalidate_model
 
     async for db in get_tenant_db(current_user.tenant_id):
+        await ensure_model_in_project(
+            db, project_id=project_id, model_id=model_id,
+        )
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (read-modify-write: entity read UNDER lock)
         j = await db.get(Join, join_id)
         if j is None or j.model_id != model_id:
             raise HTTPException(status_code=404, detail="Join not found")

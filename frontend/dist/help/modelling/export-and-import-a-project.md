@@ -109,6 +109,8 @@ Deletes all existing content in the target project (models, connections, LLM con
 
 10. Click **Import**.
 
+Before applying either mode, Tessallite validates every cross-model recipe in the bundle. Recipe steps are remapped to the new model IDs, and their measure and combine references must resolve against the imported model definitions. If a recipe is malformed or names a model that is not in the bundle, the whole import stops before creating or deleting project content. The error identifies the recipe and exact JSON path.
+
 ---
 
 ## After import

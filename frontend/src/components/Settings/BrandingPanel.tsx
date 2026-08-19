@@ -11,6 +11,7 @@ import {
 import SaveIcon from "@mui/icons-material/Save";
 import { brandingApi, type BrandingConfig } from "../../api/client";
 import { safeLocalGet } from "../../utils/safeLocalStorage";
+import { BRANDING_CHANGED_EVENT } from "../../utils/brandingEvents";
 import { useT } from "../../i18n";
 
 export default function BrandingPanel() {
@@ -39,7 +40,10 @@ export default function BrandingPanel() {
 
   const saveMut = useMutation({
     mutationFn: () => brandingApi.update(tenantId, form),
-    onSuccess: () => qc.invalidateQueries({ queryKey }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey });
+      window.dispatchEvent(new Event(BRANDING_CHANGED_EVENT));
+    },
   });
 
   if (brandingQuery.isLoading) {

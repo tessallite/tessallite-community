@@ -2,7 +2,7 @@
 title: "Configure Time Variants"
 audience: modeller
 area: modelling
-updated: 2026-05-06
+updated: 2026-07-28
 ---
 
 ## What this covers
@@ -31,14 +31,20 @@ To create one:
    - **standard** — Gregorian calendar, year starts January 1. (Expression-based, no calendar table required.)
    - **fiscal** — Gregorian calendar with a shifted year start. Select the **fiscal year start month** (e.g. April for a UK fiscal year, July for Australian). (Expression-based, no calendar table required.)
    - **iso** — ISO 8601 week-based year. (Expression-based, no calendar table required.)
-   - **hijri** — Islamic calendar, year starts 1 Muharram. (Requires a calendar table due to lunar month complexity.)
-   - **retail_445** — Retail 4-4-5 calendar pattern. (Requires a calendar table due to irregular week patterns.)
-   - **thai_buddhist** — Thai Buddhist calendar. (Requires a calendar table due to era offset handling.)
+   - **hijri** - Islamic calendar, year starts 1 Muharram. (Table-bound; requires a physical calendar table.)
+   - **retail_445** - Retail 4-4-5 calendar pattern. (Table-bound; requires a physical calendar table.)
+   - **thai_buddhist** - Thai Buddhist calendar. (Expression-based, no calendar table required.)
 4. Add levels for each time granularity you need (e.g. year, quarter, month). On each level, set the **time unit** and enable the **allowed time calculations** for the variants you plan to use.
 
-Period boundaries (where a year, quarter, or month starts and ends) are computed automatically from the calendar type. For **standard**, **fiscal**, and **iso** calendar types, a calendar table is not required — the system derives boundaries using date expressions. For **hijri**, **retail_445**, and **thai_buddhist** calendar types, a physical calendar table is required due to the complexity of their date calculations.
+Period boundaries (where a year, quarter, or month starts and ends) are computed automatically from the calendar type. For **standard**, **fiscal**, **iso**, and **thai_buddhist** calendar types, a calendar table is not required because the system derives boundaries using date expressions. For **hijri** and **retail_445** calendar types, a physical calendar table is required.
 
 If a calendar table IS present in the model, the system uses it for backward compatibility. The system automatically associates measures with the time hierarchy that shares the same table as the measure's source column — no manual linking step is needed.
+
+### Calendar table binding rule
+
+Standard, fiscal, ISO Week, and Thai Buddhist period-aware variants can compute period boundaries from the hierarchy's calendar type without a physical calendar table. Retail 4-4-5 and Hijri variants require a bound physical calendar table. A physical table is also required for dense date enumeration, custom business period columns, coverage checks, and calendar dimension aliases.
+
+To create or bind one, open the **Calendar tables** dialog from a time dimension. **Generate** builds a calendar table and its alias for you; **Bind** attaches a source table that already holds calendar period columns. Either way, the columns you map must be real columns of that source table. See [Associate Calendar with Dimensions](associate-calendar-with-dimensions.md) for the full walkthrough.
 
 ### Prerequisite summary
 
@@ -86,31 +92,14 @@ Variants that fail any rule are not offered for selection in the drawer.
 
 ---
 
-## Creating variants — two paths
-
-There are two ways to create time variants. Both produce the same result — a new measure row in the catalog.
-
-### Path A: From the Measures panel (Toolbelt)
+## Creating a variant
 
 1. Open the base measure in the Drawer (Toolbelt → Measures → click the measure name).
-2. Under **Time variants**, tick the variants you want. For `trailing_n` and `moving_avg_n`, enter an `N` (defaults: 12 and 30).
+2. Under **Time variants**, tick the variants you want. For `trailing_n` and `moving_avg_n`, enter an `N` (defaults: 12 and 30). Ineligible kinds are disabled and display the specific reason they cannot be created (for example, "This measure has no associated time hierarchy"). Variants that already exist are disabled with an "already added" label.
 3. For period-boundary variants, select the **hierarchy** to use. The dropdown shows all hierarchies with matching capabilities. Different hierarchies point to different calendar tables (e.g. standard vs fiscal), so the choice determines which calendar system the variant uses.
 4. Click **Save**. The catalog refreshes; each ticked variant appears as its own measure row beside the base, named `<base>_<variant>`.
 
-### Path B: From the Measure Query Panel (pivot table)
-
-This is a shortcut for when you are actively testing a measure and want to quickly add a variant without leaving the pivot context.
-
-1. Open the **Measure Query Panel** from the Toolbelt.
-2. Select a measure in the Measure dropdown.
-3. Next to the measure dropdown, find the **variant button** — a small icon showing a function symbol (f) with a plus sign (+).
-4. Click the button. A popover opens showing all 14 variant kinds.
-5. Each variant shows its eligibility status:
-   - **Eligible** variants display the suggested name (e.g. `base_amount_ytd`) and can be clicked to create immediately.
-   - **Ineligible** variants show the specific reason they cannot be created and what needs to be configured. For example: "This measure has no associated time hierarchy. Create a time hierarchy with the required levels on the same table as the measure's source column."
-   - **Already added** variants are greyed out.
-6. For parametric variants (`trailing_n`, `moving_avg_n`), a text field appears where you can enter the window size `N`.
-7. Click an eligible variant to create it. The new measure is added to the catalog and becomes available in the pivot table's measure dropdown.
+Once created, the variant appears in every measure surface — including the Measure Query Panel's **Add Measure** dropdown, where it shows a small label indicating the variant kind (e.g. "(ytd)"). Select it like any other measure to query it in the pivot.
 
 ### Managing variants
 
@@ -191,6 +180,26 @@ The optimiser materialises only **window-based** variants in CTAS pre-aggregate 
 These variants depend on a calendar-table JOIN whose validity moves with the calendar contents. Baking that JOIN into a CTAS would couple the aggregate to a specific calendar snapshot, so Tessallite refuses the materialisation by design. They still execute correctly via the rewriter — only the *pre-aggregate* path is closed.
 
 A window-based variant additionally requires the aggregate's grain to contain a time dimension (used for `ORDER BY` in the window). If you create an aggregate at a non-time grain, only base measures and non-variant aggregations are materialised.
+
+---
+
+## Partial and sparse windows (limitation)
+
+`trailing_n`, `moving_avg_n`, and `lag` use **row frames** with a semantic period guard: the source and aggregate routes share the selected time grain and period order. They do not insert zero rows for empty periods. This matters in two situations.
+
+### The start of a series
+
+The first few periods of any new measure do not have enough earlier rows to fill the window yet. Tessallite does not wait for a full window before it starts returning values — it sums or averages whatever rows exist so far. `moving_avg_6` on the very first month of data averages that one month, not six; by the third month it averages three months; it only becomes a true six-month average once six months of data exist. The measure's name stays `moving_avg_6` the whole time — nothing on the value itself flags that an early figure covers fewer months than the name implies.
+
+### Gaps in an existing series
+
+Once a series is running, a period with **no data at all** — a new product before its first sale, a seasonal item outside its season, a region with a quiet month — does not create a zero-value row. If that missing period falls inside a requested frame, the affected window value is `NULL` rather than reaching farther back.
+
+**Worked example.** A product has monthly sales rows for January, February, and April; March had zero orders, so no row exists for March. A `trailing_3` measure evaluated at April returns `NULL` because the three-row frame spans a four-calendar-month range. `moving_avg_n` behaves the same way. The window does not invent a zero or silently select an older row.
+
+This is deliberate fail-closed behaviour: a calendar-period-aware row window uses the same per-grain period key as the `ytd` / `prior_year` family, and a gap inside the frame returns blank instead of a plausible wider number. If you need zero-filled periods, model the calendar rows explicitly or use a date-filtered expression.
+
+**How to tell it happened:** a `NULL` window value identifies a missing period inside the frame. Plot the underlying base measure over the same date range to find the gap, then decide whether the report should keep the blank or explicitly model a zero.
 
 ---
 
@@ -300,6 +309,7 @@ Use the rolling variant when you want to **plot** the trend; use a filtered quer
 | "The associated time hierarchy has no '...'-grain level." | The hierarchy has the right calculation but is missing a level at the required granularity (e.g. no year-level for YTD). | Edit the hierarchy and add a level with the missing time unit. |
 | "The associated time hierarchy has no calendar type configured." | Period-aware variants need a calendar type on the hierarchy. | Edit the hierarchy and set a calendar type (standard, fiscal, hijri, or iso). |
 | "A measure named '...' already exists in this model." | A variant with this name was previously created, or another measure uses the same name. | Delete or rename the conflicting measure, then try again. |
+| A `trailing_n` or `moving_avg_n` value is blank. | A period inside the guarded frame has no row, so the window could not prove period adjacency. See "Partial and sparse windows" above. | Confirm the source gap. Keep the blank for strict semantics, or model explicit calendar rows if the report needs zero-filled periods. |
 
 ---
 
@@ -321,4 +331,4 @@ Use the rolling variant when you want to **plot** the trend; use a filtered quer
 
 ---
 
-← [Calculated Measures](calculated-measures.md) | [Home](../index.md) | [Configure Calendar Table →](configure-calendar-table.md)
+← [Calculated Measures](calculated-measures.md) | [Home](../index.md) | [Understanding Window Functions →](window-functions.md)

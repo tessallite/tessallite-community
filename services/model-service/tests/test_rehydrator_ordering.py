@@ -21,10 +21,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from shared.model_snapshot.rehydrator import (
+    SnapshotSchemaError,
     _insert_aggregates,
     _insert_glossary,
     _insert_hierarchies,
     _insert_pockets,
+    _insert_row_security,
     _insert_source_statistics,
     _insert_tables_and_columns,
     _insert_calendar_tables,
@@ -531,3 +533,174 @@ async def test_revert_empty_snapshot_succeeds():
 
     with patch("shared.model_snapshot.rehydrator._truncate_model_children", new=AsyncMock()):
         await rehydrate_into_live(_MODEL_ID, snap, mock_db)
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Bug-6132 — rehydrator rejects uncompilable RLS DSL at import
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_insert_row_security_rejects_unsupported_dsl():
+    """Bug-6132: dimension_in is not a supported DSL function.
+
+    The rehydrator must fail loud (SnapshotSchemaError) when a
+    role_predicate rule uses an uncompilable expression, instead of
+    silently inserting an inert rule that hard-blocks every matched caller.
+    """
+    snap = {
+        "row_security_rules": [
+            {
+                "id": _u(),
+                "model_id": str(_MODEL_ID),
+                "name": "Bad DSL rule",
+                "dimension_path": "channel_code",
+                "rule_type": "role_predicate",
+                "predicate_expression": "dimension_in('channel_code', ['POS', 'WEB'])",
+                "applies_to_roles": ["account_manager"],
+                "attribute_source": "jwt_role",
+                "attribute_claim_name": None,
+                "is_enabled": True,
+                "mapping_table_id": None,
+                "mapping_user_column": None,
+                "mapping_value_column": None,
+            }
+        ]
+    }
+    db = _noop_db()
+
+    with pytest.raises(SnapshotSchemaError, match="uncompilable predicate"):
+        await _insert_row_security(_MODEL_ID, snap, db)
+
+
+@pytest.mark.asyncio
+async def test_insert_row_security_accepts_valid_in_dsl():
+    """Bug-6132: the supported in() form must pass validation and insert.
+
+    Verifies that the rehydrator accepts the correct DSL and calls
+    db.execute to insert the rule row.
+    """
+    snap = {
+        "row_security_rules": [
+            {
+                "id": _u(),
+                "model_id": str(_MODEL_ID),
+                "name": "Valid DSL rule",
+                "dimension_path": "channel_code",
+                "rule_type": "role_predicate",
+                "predicate_expression": "in('channel_code', 'POS', 'WEB', 'MOBILE')",
+                "applies_to_roles": ["account_manager"],
+                "attribute_source": "jwt_role",
+                "attribute_claim_name": None,
+                "is_enabled": True,
+                "mapping_table_id": None,
+                "mapping_user_column": None,
+                "mapping_value_column": None,
+            }
+        ]
+    }
+    db = _noop_db()
+
+    # Should not raise
+    await _insert_row_security(_MODEL_ID, snap, db)
+
+    # Verify the rule was actually inserted via db.execute
+    assert db.execute.call_count >= 1, (
+        "db.execute should have been called to insert the row-security rule"
+    )
+
+
+@pytest.mark.asyncio
+async def test_insert_row_security_skips_validation_for_user_mapping():
+    """Bug-6132: user_mapping rules have no predicate_expression to compile.
+
+    The DSL compile-validation must only run for role_predicate rules; a
+    user_mapping rule with no predicate_expression must pass through
+    without error.
+    """
+    snap = {
+        "row_security_rules": [
+            {
+                "id": _u(),
+                "model_id": str(_MODEL_ID),
+                "name": "User mapping rule",
+                "dimension_path": "region_code",
+                "rule_type": "user_mapping",
+                "predicate_expression": None,
+                "applies_to_roles": ["*"],
+                "attribute_source": "jwt_role",
+                "attribute_claim_name": None,
+                "is_enabled": True,
+                "mapping_table_id": _u(),
+                "mapping_user_column": "user_email",
+                "mapping_value_column": "region_code",
+            }
+        ]
+    }
+    db = _noop_db()
+
+    # Should not raise
+    await _insert_row_security(_MODEL_ID, snap, db)
+    assert db.execute.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_insert_row_security_rejects_empty_predicate():
+    """Bug-6132: a role_predicate with an empty predicate_expression would
+    crash at runtime (_compile_dsl_expression raises on empty strings).
+
+    The rehydrator must reject it at import time with a clear error rather
+    than silently inserting a rule that will 500 every matched caller.
+    """
+    snap = {
+        "row_security_rules": [
+            {
+                "id": _u(),
+                "model_id": str(_MODEL_ID),
+                "name": "Empty predicate rule",
+                "dimension_path": "channel_code",
+                "rule_type": "role_predicate",
+                "predicate_expression": "",
+                "applies_to_roles": ["account_manager"],
+                "attribute_source": "jwt_role",
+                "attribute_claim_name": None,
+                "is_enabled": True,
+                "mapping_table_id": None,
+                "mapping_user_column": None,
+                "mapping_value_column": None,
+            }
+        ]
+    }
+    db = _noop_db()
+
+    with pytest.raises(SnapshotSchemaError, match="empty predicate_expression"):
+        await _insert_row_security(_MODEL_ID, snap, db)
+
+
+@pytest.mark.asyncio
+async def test_insert_row_security_rejects_none_predicate():
+    """Bug-6132: a role_predicate with predicate_expression=None must also
+    be rejected at import time (same crash path as empty string).
+    """
+    snap = {
+        "row_security_rules": [
+            {
+                "id": _u(),
+                "model_id": str(_MODEL_ID),
+                "name": "None predicate rule",
+                "dimension_path": "channel_code",
+                "rule_type": "role_predicate",
+                "predicate_expression": None,
+                "applies_to_roles": ["account_manager"],
+                "attribute_source": "jwt_role",
+                "attribute_claim_name": None,
+                "is_enabled": True,
+                "mapping_table_id": None,
+                "mapping_user_column": None,
+                "mapping_value_column": None,
+            }
+        ]
+    }
+    db = _noop_db()
+
+    with pytest.raises(SnapshotSchemaError, match="empty predicate_expression"):
+        await _insert_row_security(_MODEL_ID, snap, db)

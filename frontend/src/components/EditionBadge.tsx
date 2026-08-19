@@ -29,7 +29,9 @@ export default function EditionBadge() {
         ? t("edition.enterprise")
         : name === "unactivated"
           ? t("edition.unactivated")
-          : name;
+          : name === "internal-unlimited"
+            ? t("edition.internal-unlimited")
+            : name;
 
   const ent = (limits?.entitlements ?? {}) as Record<string, unknown>;
   const usedModels = limits?.usage?.models;

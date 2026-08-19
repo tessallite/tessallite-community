@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Admin</span> / <span>Manage Users</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-04-17</span></div>
+    <div class="article-meta"><span class="audience-badge">tenant-admin</span><span class="updated">Updated 2026-08-11</span></div>
     <h1>Manage Users</h1>
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/admin-users-tab.png" alt="Admin panel Users tab listing tenant users."></figure>
 <h2>What this covers</h2>
@@ -33,6 +33,12 @@
 <h2>Resetting a user&#x27;s password</h2>
 <ol><li>On the Users tab, click the user&#x27;s name to open their detail view.</li><li>Click <strong>Reset Password</strong>.</li><li>Confirm in the dialog.</li></ol>
 <p>The user receives a password reset link valid for 24 hours. Their current password remains active until they complete the reset.</p>
+<h3>Password rules</h3>
+<p>Where you type a password directly &mdash; creating a user, or setting a new one for someone &mdash; Tessallite requires at least <strong>8 characters</strong>, with at least one <strong>capital letter</strong>, one <strong>small letter</strong>, and one <strong>number</strong>. The form states this under the password box and the Save button stays greyed out until the password satisfies it, so you find out before you submit rather than after.</p>
+<h2>How quickly access changes take effect</h2>
+<p>Changes to a user&#x27;s access are enforced by the length of their sign-in session:</p>
+<ul><li><strong>Web app sessions</strong> end as soon as you remove a user or change their role.</li><li><strong>BI-tool connections</strong> (Excel, Power BI, and other tools connected over XMLA or JDBC) hold a signed session token. After you disable a user or reset their password, an already-connected BI tool can keep working on its existing token until that token expires — up to the session lifetime, <strong>60 minutes by default</strong>. New connections are refused right away, but a live one is not cut off mid-session.</li></ul>
+<p>If you need to be certain a disabled account cannot query at all, wait out the session lifetime (default 60 minutes) after disabling, or rotate the connection credentials the BI tool uses. Immediate token cut-off on disable is a planned enhancement.</p>
 <h2>Viewing user details</h2>
 <p>Clicking a user&#x27;s name opens a detail panel showing:</p>
 <ul><li><strong>Last active</strong>: timestamp of the user&#x27;s most recent authenticated request.</li><li><strong>Assigned role</strong>: the workspace-level role currently in effect.</li><li><strong>Project memberships</strong>: the projects the user can access and their role within each.</li></ul>

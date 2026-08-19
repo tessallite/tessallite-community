@@ -27,6 +27,7 @@ from shared.agent.retention import (
 from shared.db.models import AgentConversation, AgentTurn, ProjectAgentConfig
 from shared.db.session import get_tenant_db
 from src.auth.middleware import CurrentUser, require_tenant_admin
+from src.guardrails.budget import sweep_orphaned_reservations
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/agent", tags=["agent-admin"])
@@ -82,11 +83,18 @@ async def cleanup_inactive_conversations(
     # both run identical behaviour (one source of truth).
     async for db in get_tenant_db(current_user.tenant_id):
         soft_deleted = await soft_delete_inactive_conversations(db, project_id, days)
-        if soft_deleted:
+        # Housekeeping: reclaim budget reservations stranded by a process death
+        # (ws2#26). The budget sum already excludes them; this bounds ledger
+        # growth. Scoped to this project so an admin cleanup only touches its
+        # own rows.
+        reclaimed = await sweep_orphaned_reservations(db, project_id)
+        if soft_deleted or reclaimed:
             await db.commit()
         logger.info(
-            "agent retention cleanup tenant=%s project=%s retention_days=%s cutoff=%s soft_deleted=%s",
-            current_user.tenant_id, project_id, days, cutoff.isoformat(), soft_deleted,
+            "agent retention cleanup tenant=%s project=%s retention_days=%s "
+            "cutoff=%s soft_deleted=%s orphaned_reservations_reclaimed=%s",
+            current_user.tenant_id, project_id, days, cutoff.isoformat(),
+            soft_deleted, reclaimed,
         )
     return CleanupResult(
         retention_days=days,

@@ -390,8 +390,13 @@ def _collect_predicate_scopes(ast: exp.Expression) -> list[exp.Expression]:
 
     Walks the outer query chain: the root SELECT (or each branch of a set
     operation), its FROM source and INNER-joined sources, recursing through
-    subqueries and CTE definitions (this covers the row-security wrapper:
-    ``SELECT * FROM (…) __rls WHERE sec = …``).
+    subqueries and CTE definitions. Row security itself no longer produces a
+    wrapper for this to find — F-007-01 replaced the outer
+    ``SELECT * FROM (…) __rls WHERE sec = …`` with per-scan WHERE injection, so
+    the security predicate now lives in the same SELECT as each scan. The
+    recursion is still required: a CALLER-authored subquery or CTE is exactly
+    where an injected predicate lands, and a set-operation branch is a separate
+    constraining scope.
 
     Deliberately EXCLUDED (their predicates do not restrict outer rows):
     predicate-side subqueries (EXISTS (…), IN (SELECT …)) and LEFT / RIGHT /
@@ -839,12 +844,26 @@ def audit_result_columns(
     if lq is None:
         return
 
-    if getattr(lq, "has_complex_sql", False):
-        return
-    if getattr(lq, "has_passthrough_expressions", False):
-        return
-    if getattr(bound_query, "has_passthrough_expressions", False):
-        return
+    # F-003-02: complex SQL no longer returns early UNCONDITIONALLY. The binder
+    # now validates every physical column reference against the deployed model
+    # (fail-closed) and publishes the validated model physical set on
+    # ``allowed_physical_columns``, so the result audit stays ACTIVE as a
+    # defence-in-depth guard over the returned columns. It is skipped only for an
+    # outer ``SELECT *`` complex query, whose result column names come straight
+    # from the (already binder-validated) inner scan and can legitimately be
+    # renames the outer projection never named — auditing those would false-fail.
+    _is_complex = getattr(lq, "has_complex_sql", False)
+    if _is_complex:
+        _has_validated_physical = bool(
+            getattr(bound_query, "allowed_physical_columns", None)
+        )
+        if getattr(lq, "select_star", False) or not _has_validated_physical:
+            return
+    else:
+        if getattr(lq, "has_passthrough_expressions", False):
+            return
+        if getattr(bound_query, "has_passthrough_expressions", False):
+            return
 
     if not result_columns:
         return
@@ -907,6 +926,20 @@ def audit_result_columns(
     physical = getattr(bound_query, "allowed_physical_columns", None)
     if physical:
         allowed.update(physical)
+
+    # Complex SQL: names the QUERY ITSELF defines in its outermost projection —
+    # a SELECT-list alias, or a CTE / derived-table output name projected onward
+    # (``SELECT total_amount FROM (SELECT SUM(x) AS total_amount ...) s``). They
+    # are not model columns, so they are absent from ``allowed_physical_columns``
+    # and the parser records no alias for the bare-reference form; the audit used
+    # to read them as unauthorised columns and block the whole result. The binder
+    # publishes this set only after proving every PHYSICAL read in the query is a
+    # modelled column, so each name here is already-authorised data under a name
+    # the query chose.
+    if _is_complex:
+        allowed.update(
+            getattr(bound_query, "complex_projection_names", None) or set()
+        )
 
     # Synthetic / well-known columns
     allowed.update(_SYNTHETIC_COLUMNS)

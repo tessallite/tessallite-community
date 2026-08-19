@@ -67,7 +67,13 @@ export default function Webhooks({ embedded }: { embedded?: boolean } = {}) {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<WebhookEndpoint | null>(null);
   const [historyEndpoint, setHistoryEndpoint] = useState<WebhookEndpoint | null>(null);
-  const [secretDialog, setSecretDialog] = useState<string | null>(null);
+  // Bug-8556: the one-time secret dialog also opens after an edit that
+  // repointed the endpoint, because that rotates the signing secret
+  // server-side. ``rotatedByUrlChange`` tells the admin WHY they are being
+  // shown a secret they did not ask to rotate.
+  const [secretDialog, setSecretDialog] = useState<
+    { secret: string; rotatedByUrlChange: boolean } | null
+  >(null);
   const [error, setError] = useState<string | null>(null);
 
   return (
@@ -123,7 +129,9 @@ export default function Webhooks({ embedded }: { embedded?: boolean } = {}) {
             setDialogOpen(true);
           }}
           onHistory={setHistoryEndpoint}
-          onSecretRotated={(secret) => setSecretDialog(secret)}
+          onSecretRotated={(secret) =>
+            setSecretDialog({ secret, rotatedByUrlChange: false })
+          }
         />
       )}
 
@@ -138,11 +146,14 @@ export default function Webhooks({ embedded }: { embedded?: boolean } = {}) {
           setEditing(null);
           setError(null);
         }}
-        onSaved={() => {
+        onSaved={(signingSecret, rotatedByUrlChange) => {
           setDialogOpen(false);
           setEditing(null);
           setError(null);
           qc.invalidateQueries({ queryKey: ["webhooks"] });
+          if (signingSecret) {
+            setSecretDialog({ secret: signingSecret, rotatedByUrlChange });
+          }
         }}
         onError={setError}
       />
@@ -154,7 +165,8 @@ export default function Webhooks({ embedded }: { embedded?: boolean } = {}) {
 
       {secretDialog !== null && (
         <SecretRevealDialog
-          secret={secretDialog}
+          secret={secretDialog.secret}
+          rotatedByUrlChange={secretDialog.rotatedByUrlChange}
           onClose={() => setSecretDialog(null)}
         />
       )}
@@ -168,7 +180,15 @@ export default function Webhooks({ embedded }: { embedded?: boolean } = {}) {
 
 const SECRET_REVEAL_TIMEOUT_MS = 30_000;
 
-function SecretRevealDialog({ secret, onClose }: { secret: string; onClose: () => void }) {
+function SecretRevealDialog({
+  secret,
+  rotatedByUrlChange = false,
+  onClose,
+}: {
+  secret: string;
+  rotatedByUrlChange?: boolean;
+  onClose: () => void;
+}) {
   const t = useT();
   const [visible, setVisible] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -192,6 +212,11 @@ function SecretRevealDialog({ secret, onClose }: { secret: string; onClose: () =
     <Dialog open onClose={onClose} maxWidth="sm" fullWidth>
       <DialogTitle>{t("webhooks.secretDialogTitle")}</DialogTitle>
       <DialogContent>
+        {rotatedByUrlChange && (
+          <Alert severity="info" sx={{ mb: 2 }}>
+            {t("webhooks.secretRotatedByUrlChange")}
+          </Alert>
+        )}
         <Alert severity="warning" sx={{ mb: 2 }}>
           {t("webhooks.secretWarning")}
         </Alert>
@@ -489,7 +514,7 @@ function EndpointDialog({
   endpoint: WebhookEndpoint | null;
   error: string | null;
   onClose: () => void;
-  onSaved: () => void;
+  onSaved: (signingSecret: string | undefined, rotatedByUrlChange: boolean) => void;
   onError: (e: string) => void;
 }) {
   const t = useT();
@@ -525,19 +550,30 @@ function EndpointDialog({
   };
 
   const saveMut = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (): Promise<{ secret?: string; rotated: boolean }> => {
       const filters = allEvents ? ["*"] : Array.from(selectedEvents);
       if (endpoint) {
-        await webhooksApi.update(endpoint.id, {
+        // Bug-8556: repointing the endpoint at a different receiver rotates
+        // the signing secret server-side and returns the one-time plaintext
+        // here. Surfacing it is what stops the admin from saving an edit and
+        // silently killing the endpoint — the new receiver rejects every
+        // event signed with a secret nobody has shared with it, and a 4xx is
+        // terminal, so the first event goes straight to the DLQ.
+        const updated = await webhooksApi.update(endpoint.id, {
           name,
           url,
           event_filters: filters,
         });
+        return {
+          secret: updated.signing_secret ?? undefined,
+          rotated: Boolean(updated.signing_secret),
+        };
       } else {
-        await webhooksApi.create({ name, url, event_filters: filters });
+        const created = await webhooksApi.create({ name, url, event_filters: filters });
+        return { secret: created.signing_secret, rotated: false };
       }
     },
-    onSuccess: onSaved,
+    onSuccess: ({ secret, rotated }) => onSaved(secret, rotated),
     onError: (err: any) => {
       onError(err?.response?.data?.detail ?? t("common.saveFailed"));
     },

@@ -7,6 +7,7 @@ from shared.semantic.table_analyzer import (
     _classify_column,
     _has_low_cardinality,
     _validate_measure,
+    analyze_table,
     validate_measures,
 )
 
@@ -318,3 +319,67 @@ class TestValidateMeasures:
         table = _make_table([], row_count=50000)
         warnings = validate_measures(table, ["revenue"])
         assert len(warnings) == 0
+
+
+class TestFactTableTypeConstant:
+    """Bug-8626 / L14. ``_classify_column``'s fact-vs-non-fact branches
+    (lines checking ``table_type == "fact"`` / ``!= "fact"``) were converted
+    to compare against ``shared.semantic.graph_order.FACT_TABLE_TYPE`` instead
+    of a private ``"fact"`` literal, so this module cannot silently drift from
+    the storage layer's own fact spelling the way ``pick_anchor_table`` and
+    the anchor rule once did (Bug-8600). ``table_type`` here is a bare string
+    parameter, not an ORM row, so the caller-side primitive is the constant —
+    not ``is_fact_table``, which reads a ``.table_type`` attribute/key off a
+    row and would silently return False if handed the string directly."""
+
+    def test_constant_is_the_storage_layer_literal(self):
+        from shared.semantic.graph_order import FACT_TABLE_TYPE
+
+        assert FACT_TABLE_TYPE == "fact"
+
+    def test_measure_like_column_is_a_measure_via_the_constant(self):
+        from shared.semantic.graph_order import FACT_TABLE_TYPE
+
+        role, _ = _classify_column(
+            "total_revenue", "numeric", None, None, FACT_TABLE_TYPE
+        )
+        assert role == "measure"
+
+    def test_measure_like_column_in_a_non_fact_table_is_a_dimension(self):
+        role, _ = _classify_column(
+            "total_revenue", "numeric", None, None, "dim_detail"
+        )
+        assert role == "dimension"
+
+    def test_l14_r1_f1_analyze_table_already_fact_branch_uses_the_constant(self):
+        """L14-R1-F1 (round-1 deep review). ``analyze_table``'s
+        ``current_type == "fact"`` short-circuit (an alias of
+        ``table.table_type``, itself a bare string, not a row) was missed by
+        the initial L14 sweep and still compared against a private ``"fact"``
+        literal after ``_classify_column`` had already been converted. Now
+        reads ``FACT_TABLE_TYPE``. A table already typed as fact must take
+        this exact branch (not the measure-ratio/date-column heuristic that
+        also yields "fact") regardless of its columns, so an empty-column
+        fact table is the discriminating case: no columns means no measures
+        and no dates, so only the ``current_type == FACT_TABLE_TYPE`` branch
+        can explain a "fact" result with high confidence and the
+        "already classified" reasoning."""
+        from shared.semantic.graph_order import FACT_TABLE_TYPE
+
+        table = _make_table([], row_count=1000, table_type=FACT_TABLE_TYPE)
+        result = analyze_table(table)
+
+        assert result.suggested_table_type == "fact"
+        assert result.confidence == "high"
+        assert result.reasoning == "Table is already classified as fact."
+
+    def test_l14_r1_f1_analyze_table_non_fact_type_does_not_take_the_shortcut(self):
+        """Negative pairing for L14-R1-F1: a non-fact ``table_type`` with no
+        columns has no measure/date signal either, so it must fall through
+        to the "insufficient signal" default rather than the already-a-fact
+        branch — proving the comparison is exact-match, not a truthy check."""
+        table = _make_table([], row_count=1000, table_type="dim_detail")
+        result = analyze_table(table)
+
+        assert result.suggested_table_type == "dim_detail"
+        assert result.reasoning != "Table is already classified as fact."

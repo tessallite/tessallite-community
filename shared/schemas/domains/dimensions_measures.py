@@ -16,15 +16,288 @@ from ..measure_formats import (
     TIME_VARIANT_NAMES as _TIME_VARIANT_NAMES,
 )
 
+from ...aggregate_quantiles import QUANTILE_STAT_TYPES as _QUANTILE_STAT_TYPES
+
 from ._base import OrmBase
 
 # Canonical valid semi_additive_behavior values. Single source of truth shared
 # by the Measure validator below and the snapshot rehydrator's enum gate
 # (F-020-09) so importers cannot store invalid enums bypassing the API layer.
+#
+# Wave 2 scope enforcement (#10): ``by_account`` was REMOVED from this set. It is
+# not a supported product behaviour — per-account aggregation dispatch was never
+# implemented, and the query rewriter already fails loud on it
+# (``query-router/rewrite/source_sql.py`` / ``rewrite/calendar_support.py``).
+# Removing it from the single source of truth means the forward create/update API
+# rejects new by_account measures, and the rehydrate/import boundary
+# (``rehydrator._validate_measure_enums``) imports any already-persisted
+# by_account measure as a DISABLED measure (is_invalid + reason), the same
+# mechanism used for any other unresolvable semi-additive token. Existing live
+# rows are flagged by migration ``0215_disable_by_account_semi_additive``.
 VALID_SEMI_ADDITIVE_BEHAVIORS: frozenset[str] = frozenset({
     "last_non_empty", "first_non_empty", "avg_of_children",
-    "min", "max", "by_account",
+    "min", "max",
 })
+
+# Canonical valid default_agg values (Bug-6223). The additive/base set that the
+# aggregate builder (grain_resolver.AGG_TEMPLATES) and query-time renderer
+# (source_sql._wrap_agg) understand, plus the quantile stat suffixes
+# (p01..p99) used by median/percentile measures.
+#
+# F-015-19: this set is a SUPERSET of what the frontend Measures panel offers.
+# The panel's ``AGG_OPTIONS`` exposes only the six base aggregates
+# (sum/avg/min/max/count/count_distinct); the quantile suffixes are accepted by
+# the API and understood by materialisation but are NOT authorable in the
+# drawer today (see G-015-02 / Bug-5891 for the median-routing decision). Do not
+# assume UI parity from this comment.
+#
+# VALIDATION CONTRACT (two boundaries, deliberately asymmetric):
+#   * FORWARD (strict, per-model-and-per-field): the ``_validate_default_agg``
+#     validator runs strictly on ``MeasureCreate`` and tolerantly on
+#     ``MeasureUpdate``. Create rejects legacy synonyms so fresh data stays
+#     canonical; update canonicalizes only known historical synonyms
+#     (average->avg, median->p50) so round-trip edits of old persisted rows do
+#     not 422. A raw-API caller still cannot persist a free-form
+#     aggregate (e.g. "total") that saves cleanly then fails-late at the source
+#     with "TOTAL(...) does not exist" on either path. The semi-additive
+#     validator (``_check_semi_additive_fields``) is wired on BOTH
+#     ``MeasureCreate`` and ``MeasureUpdate`` (Bug-6620). Create rejects
+#     non-canonical values strictly; Update validates when the field is supplied
+#     (partial-update semantics: None = not supplied = no-op). The rehydrator
+#     read-coercion below is the backstop that keeps such a persisted value from
+#     bricking a later revert/import.
+#   * READ / REHYDRATE (tolerant, read-coercion): the snapshot rehydrator
+#     inserts measure rows directly, bypassing these validators, so it CANNOT be
+#     strict — legacy saved versions and exported bundles carry pre-normalisation
+#     tokens that a hard reject would brick (un-revertable / un-importable). Both
+#     default_agg AND semi_additive_behavior are therefore read-coerced at
+#     ``model_snapshot/rehydrator.py::_validate_measure_enums``: a known legacy
+#     token maps to its canonical form (default_agg average->avg, median->p50;
+#     semi_additive last_value->last_non_empty, ...); an unresolvable token
+#     imports as a DISABLED measure (safe default + is_invalid + reason), never a
+#     crash. Ecosystem mappers (atscale/dbt/cube) normalise on their own import
+#     path so fresh imports already arrive canonical.
+VALID_DEFAULT_AGGS: frozenset[str] = frozenset(
+    {"sum", "avg", "min", "max", "count", "count_distinct"}
+) | frozenset(_QUANTILE_STAT_TYPES)
+
+LEGACY_DEFAULT_AGG_SYNONYMS: dict[str, str] = {
+    "average": "avg",
+    "median": "p50",
+}
+
+# ---------------------------------------------------------------------------
+# Effective additivity (Bug-8257)
+# ---------------------------------------------------------------------------
+# ``Measure.is_additive`` is a NOT NULL column that defaults to True, so an
+# untouched measure carries True regardless of what it actually computes. A
+# True flag is therefore indistinguishable from "nobody set it", and every
+# consumer that trusts it (client-side pivot totals, aggregate column planning,
+# the matcher's re-aggregation gate, the agent prompt catalogue) inherits a
+# wrong-numbers risk on measures that are mathematically non-additive.
+#
+# This is the SINGLE definition of effective additivity. The producers below
+# (MeasureCreate, the model-service update path, the snapshot rehydrator) coerce
+# with it so the persisted flag is trustworthy; the agent prompt renderer reads
+# the same helper so the catalogue and the database can never disagree.
+#
+# PRECEDENCE (mathematical nature wins over the declared flag, one direction
+# only):
+#   1. non-additive aggregation (avg/min/max/count_distinct/quantiles) -> False
+#   2. semi-additive measure (a declared semi_additive_behavior)        -> False
+#      A last-non-empty balance is the textbook non-summable measure: adding up
+#      each day's closing balance is exactly the wrong number semi-additive
+#      support exists to prevent. This rule was MISSING from the first version
+#      of this helper (deep-review R5 finding 2) even though the sibling gate
+#      ``aggregate_matcher.compute_has_non_additive`` already implemented it and
+#      the column sits immediately beside ``is_additive`` in the ORM. The
+#      Measures panel defaults the Additive toggle to true and sends
+#      ``semi_additive_behavior`` independently, so a balance measure created
+#      through the shipped UI persisted is_additive=True and the Explorer pivot
+#      grand total summed the daily balances.
+#   3. time-variant measure (PY/YTD/trailing/moving windows)           -> False
+#      ("non-additive across periods": stacking across periods double-counts
+#      even when the base aggregation is a plain sum)
+#   4. calculated measure (ratios etc. do not re-aggregate)            -> False
+#   5. otherwise, the declared flag stands.
+# A declared FALSE is never overridden: a modeller marking a plain sum measure
+# non-additive (a semi-additive balance, a rate stored as a sum) is stating
+# something the shape cannot prove, and that statement is the safe direction.
+#
+# NOTE on min/max, and on what this flag does NOT decide (deep-review R3
+# finding 4). MIN(MIN(x)) = MIN(x), so min/max ARE re-aggregatable, and avg is
+# derivable from a stored sum/count pair. They are still non-additive HERE
+# because ``is_additive`` means "safe to combine by ADDITION" — the client
+# totals algorithm only knows how to sum, so summing a column of maxima is a
+# wrong number.
+#
+# Be aware that this coercion DOES tighten serve-time rollup as a side effect:
+# ``aggregate_matcher.compute_has_non_additive`` short-circuits on
+# ``not is_additive`` BEFORE it consults the aggregate-function registry's
+# routing class, so a coerced measure becomes exact-grain-only rather than
+# being classified as ``mappable``/``derivable``. That costs acceleration, never
+# correctness (the query falls back to source). Whether to separate the two
+# questions properly is an open product decision — see
+# ``docs/questions/questions_measure-additivity-vs-rollup.md``.
+ADDITIVE_AGGS: frozenset[str] = frozenset({"sum", "count"})
+NON_ADDITIVE_AGGS: frozenset[str] = VALID_DEFAULT_AGGS - ADDITIVE_AGGS
+
+
+def derive_is_additive(
+    *,
+    default_agg: Optional[str],
+    measure_type: Optional[str] = "standard",
+    variant_kind: Optional[str] = None,
+    semi_additive_behavior: Optional[str] = None,
+    declared: Optional[bool] = None,
+) -> bool:
+    """Effective additivity of a measure — see the precedence note above.
+
+    ``declared`` is the modeller-supplied flag (``None`` means "not supplied",
+    treated as the True default). Returns the value that should be PERSISTED,
+    so every reader of ``Measure.is_additive`` gets a trustworthy answer without
+    having to re-derive this precedence for itself.
+    """
+    agg = (default_agg or "").strip().lower()
+    agg = LEGACY_DEFAULT_AGG_SYNONYMS.get(agg, agg)
+    if agg in NON_ADDITIVE_AGGS:
+        return False
+    if semi_additive_behavior:
+        return False
+    if variant_kind:
+        return False
+    if (measure_type or "standard") == "calculated":
+        return False
+    return True if declared is None else bool(declared)
+
+
+def _validate_default_agg(
+    value: Optional[str],
+    *,
+    allow_legacy_synonyms: bool = False,
+) -> Optional[str]:
+    """Reject unknown aggregate functions at the schema boundary.
+
+    Case-insensitive (query-time ``_wrap_agg`` upper-cases before use) and
+    canonicalizes to lowercase so the persisted value matches the
+    ``{name}__{default_agg}`` physical-column convention used by the
+    aggregate/variant column builders. ``None`` (MeasureUpdate no-op) passes
+    through unchanged. ``MeasureUpdate`` enables the legacy-synonym bridge so
+    safe old rows can be edited and saved back as canonical values.
+    """
+    if value is None:
+        return None
+    canonical = value.strip().lower()
+    if allow_legacy_synonyms:
+        canonical = LEGACY_DEFAULT_AGG_SYNONYMS.get(canonical, canonical)
+    if canonical not in VALID_DEFAULT_AGGS:
+        raise ValueError(
+            f"default_agg must be one of {sorted(VALID_DEFAULT_AGGS)}; "
+            f"got {value!r}"
+        )
+    return canonical
+
+# ---------------------------------------------------------------------------
+# Dimension attribute relationship (derived-grain routing, spec §5.3)
+# ---------------------------------------------------------------------------
+# A modeller-declared key-to-detail relationship on a dimension. Explicit and
+# multi-row (one dimension key may govern several details). Kept STRICTLY
+# separate from ``display_column_id`` (a caption choice); a display column never
+# declares 1:1 and never creates one of these. Phase 1b persists + round-trips
+# the declaration; NO serving/verification (Phase 2+).
+
+# Cardinality (spec §5.3 / I14). A bijection is an exact partition relabel; an
+# N:1 edge is a real coarsening. Never opportunistically upgraded N:1 -> exact.
+ATTRIBUTE_RELATIONSHIP_CARDINALITIES: frozenset[str] = frozenset(
+    {"BIJECTION", "FUNCTIONAL_N_TO_1"}
+)
+
+# Current verification status projected into API responses (spec §5.3, §10.3).
+# ``DECLARED`` is the pre-verify default; the verifier writes
+# VERIFIED/BROKEN/STALE/ERROR. Bug-7894 adds PENDING: a text (VARCHAR/CHAR/STRING)
+# BIJECTION detail proven 1:1 by data at deploy but whose serve-collation
+# fold-safety can be certified only at artifact-build time. PENDING is
+# non-serving (the router trust predicate admits only VERIFIED) and clears to
+# VERIFIED after the passenger aggregate is built and re-verified — never a defect
+# (BROKEN) or fault (ERROR). Defined here so the frontend type and the verifier
+# share one vocabulary.
+ATTRIBUTE_RELATIONSHIP_STATUSES: frozenset[str] = frozenset(
+    {"DECLARED", "PENDING", "VERIFIED", "BROKEN", "STALE", "ERROR"}
+)
+
+
+class DimensionAttributeRelationshipCreate(BaseModel):
+    """Declare a key-to-detail relationship on a dimension (spec §5.3).
+
+    ``key_column_name`` is optional: when omitted the API pins the owning
+    dimension's current key column. The detail column must be a physical column
+    in the same governed model relation.
+    """
+
+    detail_column_name: str = Field(
+        description="Physical detail column (in the governed model relation) mapped from the dimension key.",
+    )
+    cardinality: str = Field(
+        description="BIJECTION (exact 1:1 relabel) or FUNCTIONAL_N_TO_1 (many keys -> one detail).",
+    )
+    key_column_name: Optional[str] = Field(
+        default=None,
+        description="Optional explicit key column; defaults to the dimension's current key column.",
+    )
+    enabled: bool = True
+
+    @field_validator("cardinality")
+    @classmethod
+    def _check_cardinality(cls, v: str) -> str:
+        u = (v or "").strip().upper()
+        if u not in ATTRIBUTE_RELATIONSHIP_CARDINALITIES:
+            raise ValueError(
+                f"cardinality must be one of {sorted(ATTRIBUTE_RELATIONSHIP_CARDINALITIES)}; got {v!r}"
+            )
+        return u
+
+
+class DimensionAttributeRelationshipUpdate(BaseModel):
+    """Partial update. Changing the detail column or cardinality changes the
+    declaration hash and (in Phase 2) stales all prior verification evidence."""
+
+    detail_column_name: Optional[str] = None
+    cardinality: Optional[str] = None
+    key_column_name: Optional[str] = None
+    enabled: Optional[bool] = None
+
+    @field_validator("cardinality")
+    @classmethod
+    def _check_cardinality(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        u = v.strip().upper()
+        if u not in ATTRIBUTE_RELATIONSHIP_CARDINALITIES:
+            raise ValueError(
+                f"cardinality must be one of {sorted(ATTRIBUTE_RELATIONSHIP_CARDINALITIES)}; got {v!r}"
+            )
+        return u
+
+
+class DimensionAttributeRelationshipResponse(OrmBase):
+    id: uuid.UUID
+    model_id: uuid.UUID
+    dimension_id: uuid.UUID
+    key_column_id: Optional[uuid.UUID] = None
+    key_column_name: Optional[str] = None
+    detail_column_id: Optional[uuid.UUID] = None
+    detail_column_name: Optional[str] = None
+    cardinality: str
+    null_policy: str = "REJECT_NULL"
+    enabled: bool = True
+    declaration_hash: str
+    # Denormalised current verification status for the UI. Always ``DECLARED`` in
+    # Phase 1b (no verifier yet); the Phase-2 verifier projects the real status.
+    verification_status: str = "DECLARED"
+    verified_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
 
 # ---------------------------------------------------------------------------
 # Dimension
@@ -110,6 +383,11 @@ class ModelRevalidationReportResponse(BaseModel):
     newly_valid_dimension_count: int
     newly_valid_measure_count: int
     newly_valid_aggregate_count: int
+    unresolved_hierarchy_issue_count: int = 0
+    failed_pocket_count: int = 0
+    unacknowledged_schema_drift_count: int = 0
+    latest_recorded_schema_drift_at: Optional[datetime] = None
+    live_source_checked: bool = False
     measure_warnings: list[MeasureWarningResponse] = []
 
 
@@ -159,6 +437,18 @@ class DimensionResponse(OrmBase):
     redundant_partner: Optional[RedundantPartnerInfo] = None
     high_cardinality: Optional[bool] = None
     warnings: list[str] = Field(default_factory=list)
+    # Provenance: when a dimension was auto-added as a detail of another
+    # dimension's bijection relationship, these record the source relationship
+    # and owning dimension. Null for independently created dimensions.
+    detail_of_relationship_id: Optional[uuid.UUID] = None
+    detail_of_dimension_id: Optional[uuid.UUID] = None
+    detail_of_dimension_name: Optional[str] = None
+    # Derived-grain routing (spec §5.3): declared key-to-detail relationships on
+    # this dimension. Distinct from ``display_column_id``. Empty for dimensions
+    # with no declared relationship. Diagnostic/declaration only in Phase 1b.
+    attribute_relationships: list[DimensionAttributeRelationshipResponse] = Field(
+        default_factory=list
+    )
     created_at: datetime
     updated_at: datetime
 
@@ -213,6 +503,29 @@ def _validate_variant_fields(
         raise ValueError(
             "variant_n is only valid for parametric variants (trailing_n, moving_avg_n)"
         )
+    # Bug-7181: variant_n must be explicitly supplied for parametric
+    # variants. The previous behaviour silently defaulted to 12 or 30,
+    # which assumes monthly grain. By requiring the caller to supply
+    # variant_n, the modeller chooses a window size appropriate for the
+    # data's actual grain.
+    if variant_kind in _VARIANTS_REQUIRING_N and variant_n is None:
+        raise ValueError(
+            f"variant_n is required for {variant_kind} variants. "
+            "Specify the number of periods for the rolling window "
+            "(e.g. variant_n=12 for a 12-period trailing window)."
+        )
+    # Bug-7181: enforce a sensible range on variant_n.
+    if variant_n is not None:
+        if variant_n < 1:
+            raise ValueError(
+                f"variant_n must be >= 1; got {variant_n}"
+            )
+        if variant_n > 1000:
+            raise ValueError(
+                f"variant_n must be <= 1000 (got {variant_n}); "
+                "extremely large window frames can cause performance "
+                "issues on some database engines."
+            )
     return variant_kind
 
 
@@ -253,11 +566,15 @@ class MeasureCreate(BaseModel):
     is_additive: bool = True
     semi_additive_behavior: Optional[str] = Field(
         default=None,
-        description="Semi-additive aggregation across time: last_non_empty, first_non_empty, avg_of_children, min, max, by_account",
+        description="Semi-additive aggregation across time: last_non_empty, first_non_empty, avg_of_children, min, max",
     )
     semi_additive_account_column_id: Optional[uuid.UUID] = Field(
         default=None,
-        description="Column that determines per-row aggregation type when semi_additive_behavior='by_account'",
+        description=(
+            "Retained for pre-existing data only. It was the per-account "
+            "aggregation column used by the now-unsupported 'by_account' "
+            "behaviour (#10); no supported behaviour reads it."
+        ),
     )
     calendar_model_table_id: Optional[uuid.UUID] = Field(
         default=None,
@@ -301,8 +618,17 @@ class MeasureCreate(BaseModel):
             )
         return value
 
+    @field_validator("default_agg")
+    @classmethod
+    def _check_default_agg(cls, value: str) -> str:
+        return _validate_default_agg(value)
+
     @model_validator(mode="after")
     def _check_semi_additive_fields(self):
+        # #10: ``by_account`` is no longer in VALID_SEMI_ADDITIVE_BEHAVIORS, so a
+        # by_account authoring attempt is rejected here as an invalid enum. No
+        # account-column requirement branch is needed any more (it was only
+        # reachable for by_account, which never reaches this point).
         valid_behaviors = VALID_SEMI_ADDITIVE_BEHAVIORS
         if self.semi_additive_behavior is not None:
             if self.semi_additive_behavior not in valid_behaviors:
@@ -310,8 +636,6 @@ class MeasureCreate(BaseModel):
                     f"semi_additive_behavior must be one of {sorted(valid_behaviors)}; "
                     f"got {self.semi_additive_behavior!r}"
                 )
-            if self.semi_additive_behavior == "by_account" and not self.semi_additive_account_column_id:
-                raise ValueError("by_account requires semi_additive_account_column_id")
         return self
 
     @model_validator(mode="after")
@@ -366,6 +690,29 @@ class MeasureCreate(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _coerce_is_additive(self) -> "MeasureCreate":
+        """Bug-8257: never persist ``is_additive=True`` on a measure whose own
+        shape proves it cannot be summed.
+
+        Coercion rather than rejection: ``is_additive`` defaults to True in the
+        schema AND in the Measures panel's toggle, so a modeller picking ``avg``
+        would otherwise get a 422 for a default they never chose. The response
+        carries the coerced value, so the UI shows what was actually stored.
+
+        A variant's ``default_agg`` is inherited from its base at persistence
+        time and is not visible here, but ``variant_kind`` alone already forces
+        False, so the variant leg needs no lookup.
+        """
+        self.is_additive = derive_is_additive(
+            default_agg=self.default_agg,
+            measure_type=self.measure_type,
+            variant_kind=self.variant_kind,
+            semi_additive_behavior=self.semi_additive_behavior,
+            declared=self.is_additive,
+        )
+        return self
+
 
 class MeasureUpdate(BaseModel):
     name: Optional[str] = None
@@ -401,6 +748,55 @@ class MeasureUpdate(BaseModel):
                 f"format must be one of {sorted(_MEASURE_FORMAT_TOKENS)}; got {value!r}"
             )
         return value
+
+    @field_validator("default_agg")
+    @classmethod
+    def _check_default_agg(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_default_agg(value, allow_legacy_synonyms=True)
+
+    @model_validator(mode="after")
+    def _check_semi_additive_fields(self):
+        """Bug-6620: validate semi_additive_behavior on update, not just create.
+
+        A PATCH previously bypassed the canonical-enum gate, allowing free-form
+        values like ``last_value`` to persist and fail late (at query time or
+        aggregate build). The validator mirrors MeasureCreate but is tolerant of
+        None (partial update: field not supplied -> no-op).
+        """
+        # #10: ``by_account`` is no longer valid, so a PATCH that sets it is
+        # rejected here as an invalid enum — a persisted by_account measure
+        # cannot be edited to stay by_account, and no supported behaviour needs
+        # the account column, so no account-column branch remains.
+        if self.semi_additive_behavior is not None:
+            valid_behaviors = VALID_SEMI_ADDITIVE_BEHAVIORS
+            if self.semi_additive_behavior not in valid_behaviors:
+                raise ValueError(
+                    f"semi_additive_behavior must be one of {sorted(valid_behaviors)}; "
+                    f"got {self.semi_additive_behavior!r}"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _check_variant_n_range(self) -> "MeasureUpdate":
+        """Bug-7181 (codex F3): validate variant_n range on PATCH too.
+
+        MeasureCreate requires variant_n for parametric variants and
+        rejects out-of-range values. MeasureUpdate must apply the same
+        range check when variant_n is supplied (partial-update: None
+        means not supplied, no-op).
+        """
+        if self.variant_n is not None:
+            if self.variant_n < 1:
+                raise ValueError(
+                    f"variant_n must be >= 1; got {self.variant_n}"
+                )
+            if self.variant_n > 1000:
+                raise ValueError(
+                    f"variant_n must be <= 1000 (got {self.variant_n}); "
+                    "extremely large window frames can cause performance "
+                    "issues on some database engines."
+                )
+        return self
 
     @model_validator(mode="after")
     def _check_cross_model_ref_update(self) -> "MeasureUpdate":
@@ -500,5 +896,3 @@ class CalculatedExpressionValidateResponse(BaseModel):
         default=None,
         description="Populated when valid=false with a human-readable reason.",
     )
-
-

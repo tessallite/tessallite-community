@@ -9,6 +9,9 @@ from urllib.parse import urlparse
 
 import httpx
 
+from shared.webhooks.ssrf import ssrf_safe_transport
+from shared.webhooks.ssrf import validate_webhook_url as ssrf_validate_webhook_url
+
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
@@ -41,13 +44,18 @@ async def send_slack(
         return
 
     validate_webhook_url(webhook_url)
+    safe_url = ssrf_validate_webhook_url(webhook_url)
 
     payload: dict = {"text": text}
     if blocks:
         payload["blocks"] = blocks
 
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.post(webhook_url, json=payload)
+    async with httpx.AsyncClient(
+        transport=ssrf_safe_transport(),
+        timeout=_TIMEOUT,
+        follow_redirects=False,
+    ) as client:
+        resp = await client.post(safe_url, json=payload)
         if resp.status_code != 200:
             logger.error(
                 "Slack webhook returned %d: %s", resp.status_code, resp.text[:200]

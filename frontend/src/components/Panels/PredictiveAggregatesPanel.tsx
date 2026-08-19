@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -20,6 +20,7 @@ import {
 import { hierarchiesApi, optimizerApiClient } from "../../api/client";
 import type {
   GrainSuggestion,
+  PredictiveBuildAccepted,
   PredictiveBuildResult,
   PredictiveCandidate,
   PredictivePreview,
@@ -65,10 +66,47 @@ export default function PredictiveAggregatesPanel({ requiresApproval = false }: 
   const qc = useQueryClient();
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [lastResult, setLastResult] = useState<PredictiveBuildResult | null>(null);
+  const [buildRunning, setBuildRunning] = useState(false);
   // The preview is read-only analysis open to every tenant user, but the
   // build endpoint requires tenant_admin — hide what the user cannot do
   // instead of surfacing a 403 alert (review F-1).
   const canBuild = isTenantAdmin();
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Clean up polling timer on unmount.
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    };
+  }, []);
+
+  const pollBuildStatus = useCallback(
+    (buildId: string) => {
+      if (!modelId) return;
+      const poll = async () => {
+        try {
+          const result = await optimizerApiClient.getPredictiveBuildStatus(
+            modelId,
+            buildId,
+          );
+          if (result.status === "running") {
+            pollTimerRef.current = setTimeout(poll, 2000);
+            return;
+          }
+          // Build completed or failed.
+          setBuildRunning(false);
+          setLastResult(result);
+          qc.invalidateQueries({ queryKey: ["predictive-preview", modelId] });
+          qc.invalidateQueries({ queryKey: ["aggregates"] });
+        } catch {
+          // Poll failure — stop polling and show last known state.
+          setBuildRunning(false);
+        }
+      };
+      pollTimerRef.current = setTimeout(poll, 1500);
+    },
+    [modelId, qc],
+  );
 
   const previewQuery = useQuery<PredictivePreview>({
     queryKey: ["predictive-preview", modelId],
@@ -91,11 +129,11 @@ export default function PredictiveAggregatesPanel({ requiresApproval = false }: 
     mutationFn: (vars: {
       selections?: Array<{ grain: string[]; measure_names: string[] }>;
     }) => optimizerApiClient.runPredictiveBuild(modelId!, vars.selections),
-    onSuccess: (data) => {
-      setLastResult(data);
+    onSuccess: (data: PredictiveBuildAccepted) => {
       setSelected(new Set());
-      qc.invalidateQueries({ queryKey: ["predictive-preview", modelId] });
-      qc.invalidateQueries({ queryKey: ["aggregates"] });
+      setBuildRunning(true);
+      setLastResult(null);
+      pollBuildStatus(data.build_id);
     },
   });
 
@@ -208,11 +246,19 @@ export default function PredictiveAggregatesPanel({ requiresApproval = false }: 
       )}
 
       {canBuild && (
-        <Box display="flex" gap={1} justifyContent="flex-end">
+        <Box display="flex" gap={1} justifyContent="flex-end" alignItems="center">
+          {buildRunning && (
+            <>
+              <CircularProgress size={16} />
+              <Typography variant="body2" color="text.secondary">
+                {t("predictiveAgg.building")}
+              </Typography>
+            </>
+          )}
           <Button
             size="small"
             variant="outlined"
-            disabled={selected.size === 0 || buildMutation.isPending}
+            disabled={selected.size === 0 || buildMutation.isPending || buildRunning}
             onClick={handleBuildSelected}
           >
             {buildMutation.isPending && selected.size > 0
@@ -222,7 +268,7 @@ export default function PredictiveAggregatesPanel({ requiresApproval = false }: 
           <Button
             size="small"
             variant="contained"
-            disabled={candidates.length === 0 || buildMutation.isPending}
+            disabled={candidates.length === 0 || buildMutation.isPending || buildRunning}
             onClick={handleBuildAll}
           >
             {buildMutation.isPending && selected.size === 0
@@ -259,6 +305,22 @@ export default function PredictiveAggregatesPanel({ requiresApproval = false }: 
                 created: String(lastResult.created_aggregate_ids.length),
                 skipped: String(lastResult.skipped_count),
               })}
+        </Alert>
+      )}
+
+      {/* Bug-7091 consumer: governance/capacity outcomes (e.g. byte-ceiling
+          trimming) are NOT errors — the build still reports success. Surface
+          them as an informational notice so an operator who sees fewer (or
+          zero) aggregates created than requested understands WHY, rather than
+          reading a bare "success with 0 created". */}
+      {lastResult && (lastResult.governance_notes?.length ?? 0) > 0 && (
+        <Alert severity="info" data-testid="predictive-governance-notes">
+          {t("predictiveAgg.governanceNotesTitle")}
+          <Box component="ul" sx={{ m: 0, pl: 2.5 }}>
+            {lastResult.governance_notes!.map((note, i) => (
+              <li key={i}>{note}</li>
+            ))}
+          </Box>
         </Alert>
       )}
 
@@ -338,10 +400,11 @@ export default function PredictiveAggregatesPanel({ requiresApproval = false }: 
                           })}
                         </TableCell>
                         <TableCell align="right">
-                          {/* F-010-15: this is an assumed hit rate (a function
-                              of measure count), not a measured one — the tilde
-                              prefix and header tooltip signal that. */}
-                          {`~${formatPercent(c.expected_hit_rate, t)}`}
+                          {/* F-010-02: this is a cardinality-based reuse
+                              HEURISTIC (a function of measure count), not a
+                              measured or predicted hit rate — the header and
+                              the "~" prefix signal that it is an estimate. */}
+                          {`~${formatPercent(c.heuristic_reuse_score, t)}`}
                         </TableCell>
                         <TableCell align="right">
                           {formatMultiplier(c.row_reduction, t)}

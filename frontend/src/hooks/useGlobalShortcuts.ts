@@ -16,7 +16,14 @@ type ShortcutContext = {
   onFitView?: () => void;
 };
 
-function isEditableTarget(t: EventTarget | null): boolean {
+/**
+ * True when the event target is an element that already swallows typing, so a
+ * global keyboard shortcut must not hijack the keystroke. Exported so every
+ * window-level shortcut handler (including the canvas undo/redo handler in
+ * useCanvasHistory) shares one authoritative guard rather than a weaker copy
+ * that omits SELECT / contenteditable (Bug-7408).
+ */
+export function isEditableTarget(t: EventTarget | null): boolean {
   if (!t || !(t instanceof HTMLElement)) return false;
   const tag = t.tagName;
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
@@ -112,6 +119,10 @@ export function useGlobalShortcuts(ctx: ShortcutContext): void {
 export const SHORTCUTS: Array<{ keys: string; action: string }> = [
   { keys: "Cmd/Ctrl + ?", action: "shortcuts.showHelp" },
   { keys: "Cmd/Ctrl + K", action: "shortcuts.focusMiniTabs" },
+  // F-026-11: undo/redo are wired in useCanvasHistory (canvas keydown); they
+  // belong in this help table so modellers can discover them.
+  { keys: "Cmd/Ctrl + Z", action: "shortcuts.undo" },
+  { keys: "Cmd/Ctrl + Shift + Z / Cmd/Ctrl + Y", action: "shortcuts.redo" },
   { keys: "1", action: "shortcuts.switchToCanvas" },
   { keys: "2", action: "shortcuts.switchToQuery" },
   { keys: "3", action: "shortcuts.switchToHealth" },

@@ -17,12 +17,118 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.db.models import AgentJudgeRubric, ProjectAgentConfig
 from shared.llm.adapter import build_adapter, RetryingAdapter
 from shared.llm.config_resolution import resolve_agent_llm_config
 logger = logging.getLogger(__name__)
+
+
+# R2 (F2) — distillation is a STRIP-list, not a keep-list (review R1 finding 1).
+# Only the headings below — non-evidential planner instructions the judge never
+# scores against (task examples, trust-hierarchy meta-rules, output schemas) —
+# are removed from the judge's evidence pack. EVERYTHING ELSE IS KEPT, so a
+# renamed or newly added planner section degrades to extra distractor tokens,
+# never to lost evidence (fail-safe in the correctness direction). The
+# evidential set below documents the sections we expect to keep; a
+# producer-derived parity test asserts the assembler's headings are exactly the
+# union of the two sets, so any assembler heading change breaks a test instead
+# of silently changing what the judge sees.
+_JUDGE_NON_EVIDENTIAL_HEADINGS: frozenset[str] = frozenset(
+    {
+        "## TASK",
+        "## RUNTIME INPUT ROBUSTNESS",
+        "## OUTPUT FORMAT",
+    }
+)
+
+_JUDGE_EVIDENTIAL_HEADINGS: frozenset[str] = frozenset(
+    {
+        "## PROJECT CONTEXT",
+        "## AVAILABLE MODELS",
+        "## GROUNDING",
+        "## CROSS-MODEL RECIPES",
+    }
+)
+
+
+def build_judge_evidence(
+    system_prompt: str,
+    system_sections: list[tuple[str, str]] | None,
+    grounding_matches: str | None,
+    mode: str,
+) -> str:
+    """Assemble the judge's view of what the planner saw (R2/F2 + intake fix).
+
+    ``mode == "full"`` returns the planner system prompt verbatim (the pre-R2
+    behaviour, kept as the project-level escape hatch).
+
+    ``mode == "distilled"`` strips ONLY the known non-evidential boilerplate
+    sections (``_JUDGE_NON_EVIDENTIAL_HEADINGS``) and keeps every other
+    section — including any heading it does not recognise, so planner-prompt
+    drift can only ADD distractor tokens, never remove evidence. It ALWAYS
+    appends the per-turn GROUNDING MATCHES block so the judge sees the
+    retrieved glossary cards the planner used for term resolution in
+    two-tier / retrieval-only glossary modes (intake fix — those cards live in
+    the planner's user suffix, not the system prompt).
+
+    Correctness guards — the judge must never score on LESS evidence than the
+    planner had:
+      * ``system_sections`` missing/empty (an older caller that only passed the
+        joined string) → fall back to the full ``system_prompt``.
+      * distillation that would keep NO section at all (every heading in the
+        strip-list — degenerate input) → fall back to full + warn, rather than
+        hand the judge an empty evidence view.
+    """
+    grounding_block = (grounding_matches or "").strip()
+
+    def _with_grounding(body: str) -> str:
+        if grounding_block:
+            return f"{body}\n\n## GROUNDING MATCHES\n{grounding_block}"
+        return body
+
+    if mode == "full":
+        # Full mode still surfaces the retrieved cards — they are evidence the
+        # planner acted on, and in full-glossary mode they are already inside
+        # the verbatim system prompt so grounding_block is empty (no dup).
+        return _with_grounding(system_prompt)
+
+    if not system_sections:
+        # No section breakdown available — never distil blindly; use the full
+        # prompt so the judge keeps every piece of evidence.
+        logger.warning(
+            "Judge evidence: distilled mode requested but no system_sections "
+            "provided; falling back to the full planner system prompt."
+        )
+        return _with_grounding(system_prompt)
+
+    kept: list[str] = []
+    for heading, body in system_sections:
+        if heading in _JUDGE_NON_EVIDENTIAL_HEADINGS:
+            continue  # known boilerplate — the only thing distillation removes
+        if heading not in _JUDGE_EVIDENTIAL_HEADINGS:
+            # Unknown heading — keep it (fail-safe: cost tokens, never
+            # evidence) and warn so the drift is noticed and classified.
+            logger.warning(
+                "Judge evidence: unrecognised planner section %r kept in the "
+                "distilled pack (fail-safe). Classify it in judge.py's "
+                "strip/keep sets.",
+                heading,
+            )
+        kept.append(f"{heading}\n{body}")
+
+    if not kept:
+        # Every section was in the strip-list (degenerate input) — fail loud
+        # and fall back to the full prompt (never judge on nothing).
+        logger.warning(
+            "Judge evidence: distilled mode kept no sections at all; falling "
+            "back to the full planner system prompt so no evidence is lost."
+        )
+        return _with_grounding(system_prompt)
+
+    return _with_grounding("\n\n".join(kept))
 
 
 JUDGE_INSTRUCTIONS = """\
@@ -44,11 +150,21 @@ You will be provided with:
    B) Previous questions in the conversation (to resolve references to
       prior subjects — e.g. "break that down", "same period", "show me
       that by region").
-   C) The agent's complete system prompt — copied verbatim. This
-      includes the agent's task definition, runtime robustness rules,
-      project context, available models with field lists and source
-      statistics, grounding rules with glossary, cross-model recipes,
-      and output format schemas.
+   C) The agent's CONTEXT — the evidential parts of the agent's prompt:
+      project context (role, locale, safety policy), the available models
+      with their field lists and per-attribute semantics, the grounding
+      rules with the glossary / term index / alias maps, the cross-model
+      recipes, and — when present — a GROUNDING MATCHES section holding the
+      glossary cards retrieved for THIS question. This is the same model and
+      grounding evidence the agent planned against. (Non-evidential planner
+      boilerplate — task examples, output-format schemas, expression rules —
+      is intentionally omitted; do not treat its absence as missing context.)
+   D) The DATE ANCHOR — the current date the agent resolved relative dates
+      ("last month", "this quarter", "YTD") against, plus the same
+      relative-date rules the agent saw. Use this as the authoritative
+      "today" for date-range verification. If no DATE ANCHOR section is
+      present, do not assume any particular current date — verify date
+      ranges only against the question and the returned data.
 3. The agent's outputs:
    A) The semantic query plan (QUERY PLAN).
    B) The result rows from query execution (DATA RETURNED).
@@ -75,10 +191,17 @@ You produce EXACTLY one JSON verdict.
 
 EVALUATION STEPS:
 1. Read the RUBRIC. Each section title becomes a key in your metrics dict.
+   IMPORTANT: The examples below use illustrative metric keys ("Factual
+   accuracy", "Query correctness", etc.) for demonstration only. When a
+   custom rubric is provided, use the actual rubric section titles as your
+   metric keys — do NOT copy the example keys.
 2. Read the QUERY PLAN and verify:
    - Every measure, dimension, and filter field exists in AVAILABLE MODELS.
    - The selected model is appropriate for the question.
-   - Filters and date ranges match the question's intent.
+   - Filters and date ranges match the question's intent. Resolve any
+     relative dates in the question ("last month", "this quarter", "YTD")
+     against the DATE ANCHOR (2D) — that is the current date the agent used.
+     Do not assume today's date from your own clock.
    - If the question is a follow-up, verify the plan correctly carries
      forward or modifies the prior query's scope using CONVERSATION HISTORY.
 3. Compare the ASSISTANT ANSWER to DATA RETURNED:
@@ -99,7 +222,7 @@ EVALUATION STEPS:
      reformatted.
    - The answer MUST NOT invent a currency symbol or code (e.g. "USD",
      "$", "£", "GBP") unless that symbol or code appears verbatim in
-     the DATA RETURNED rows or in the agent's system prompt. Transactions
+     the DATA RETURNED rows or in the agent's CONTEXT (2C). Transactions
      may be in mixed currencies; adding any currency label not present
      in the data is a factual violation.
 5. Check compliance — does the answer respect the safety policy, brand
@@ -118,9 +241,14 @@ EDGE CASES:
 - Empty result set: if DATA RETURNED has 0 rows, the answer should say so
   explicitly. Score factual accuracy on whether the answer acknowledges the
   empty result, not on data matching.
-- Truncated sample: DATA RETURNED may show fewer rows than the total.
-  If the answer references values outside the sample, you cannot verify them.
-  Do not penalise unverifiable claims — note the limitation in reasoning.
+- Truncated sample: DATA RETURNED may show fewer rows than the total
+  result set. The header states "N total, showing M". If M < N, claims
+  about data beyond the shown sample (e.g. peaks, tails, outliers, or
+  rankings that depend on unseen rows) CANNOT be verified. Do not treat
+  such claims as confirmed. Note each unverifiable claim explicitly in
+  your reasoning and reduce the relevant metric score proportionally to
+  the verification gap. Only claims grounded in the visible rows may
+  receive full credit.
 - Follow-up without history: if the question appears to reference a prior
   turn but no CONVERSATION HISTORY is provided, note this in reasoning.
   Do not penalise the query plan for missing context you also lack.
@@ -195,6 +323,9 @@ Reply with EXACTLY one JSON object — no prose, no markdown fences, no explanat
 }
 """
 
+
+_RAW_OUTPUT_CAP = 500
+"""Max chars of raw LLM output kept for diagnostics on malformed judge responses."""
 
 _ABBREV_MULTIPLIERS = {
     "k": 1_000, "K": 1_000,
@@ -289,6 +420,11 @@ class JudgeOutcome:
     verdict: str
     reasoning: str
     metrics: dict[str, Any]
+    # Debug-only diagnostic (Bug-6336): truncated raw LLM text captured when
+    # the judge response could not be parsed. Never persisted to a
+    # user-visible column and never copied into ``reasoning`` — callers must
+    # surface it only to logs or an admin-only trace, never to end users.
+    raw_output: str | None = None
     usage_input_tokens: int = 0
     usage_output_tokens: int = 0
     provider: str = ""
@@ -334,13 +470,30 @@ def _build_judge_user_prompt(
     rubric: AgentJudgeRubric | None,
     user_message: str,
     conversation_history: list[dict[str, str]] | None,
-    system_prompt: str,
+    evidence: str,
     plan: dict[str, Any] | None,
     sample_rows: list[dict[str, Any]],
     total_rows: int,
     answer_text: str,
     verified_matches: list[str] | None = None,
+    date_anchor: str | None = None,
 ) -> str:
+    # ``evidence`` is the judge's view of what the planner saw (R2/F2): either
+    # the distilled evidence pack (model layer + grounding + retrieved cards,
+    # boilerplate stripped) or, in full mode / on a fallback, the verbatim
+    # planner system prompt. Either way it is the SAME evidence the planner
+    # acted on — the judge never sees less.
+    #
+    # ``date_anchor`` (integration fix) is the per-turn ``## DATE ANCHOR`` block
+    # Lane G moved OUT of the cacheable planner system prefix and into the
+    # planner's user suffix. It is NOT part of ``evidence`` (built only from the
+    # system sections / grounding cards), so without threading it here the judge
+    # would run with no CURRENT_DATE and JUDGE_INSTRUCTIONS step 2 (date-range
+    # verification) would be unanchored. It renders in the per-turn user prompt
+    # (never in JUDGE_INSTRUCTIONS, which is cache_system_prefix=True — a daily
+    # date there would break that cache) so the judge anchors on the SAME date
+    # the planner did, in both judge_context_mode values.
+    anchor_block = (date_anchor or "").strip()
     parts: list[str] = [
         "## 1. RUBRIC\n",
         f"Score each section 0.0-1.0:\n\n{_format_rubric(rubric)}",
@@ -348,16 +501,26 @@ def _build_judge_user_prompt(
         f"### A) Current question\n\n{user_message}",
         f"\n\n### B) Conversation history\n\n"
         f"{_format_conversation_history(conversation_history)}",
-        f"\n\n### C) Agent system prompt\n\n{system_prompt}",
+        f"\n\n### C) Agent context (models, grounding, glossary the planner "
+        f"saw)\n\n{evidence}",
+    ]
+    if anchor_block:
+        parts.append(
+            f"\n\n### D) Date anchor (the current date the planner resolved "
+            f"relative dates against)\n\n## DATE ANCHOR\n{anchor_block}"
+        )
+    parts += [
         "\n\n## 3. AGENT OUTPUT\n",
         f"### A) Query plan\n\n{json.dumps(plan or {}, default=str)}",
         f"\n\n### B) Data returned ({total_rows} total, "
         f"showing {len(sample_rows)})\n\n"
         f"{json.dumps(sample_rows, default=str)}"
-        + (f"\n\n**NOTE:** Only {len(sample_rows)} of {total_rows} rows are "
-           f"shown above. The agent's answer may reference data from rows not "
-           f"included in this sample. Do NOT penalise the answer for "
-           f"referencing values that could exist in the unseen rows."
+        + (f"\n\n**NOTE — PARTIAL SAMPLE:** Only {len(sample_rows)} of "
+           f"{total_rows} total result rows are shown above. Claims in the "
+           f"answer about data beyond this sample (e.g. peaks, tails, "
+           f"outliers, rankings depending on unseen rows) cannot be verified. "
+           f"Do NOT treat such claims as confirmed — note each unverifiable "
+           f"claim in your reasoning and reduce metric scores proportionally."
            if total_rows > len(sample_rows) else ""),
     ]
     if verified_matches:
@@ -396,6 +559,47 @@ def _parse_judge_json(raw: str) -> JudgeOutcome:
     return JudgeOutcome(verdict=verdict, reasoning=reasoning, metrics=metrics)
 
 
+async def _resolve_judge_context_mode(db: AsyncSession, project_id) -> str:
+    """R2 (F2) PER-PROJECT escape hatch — 'distilled' (default) or 'full'.
+
+    Resolved through the project-level setting ``agent.judge_context_mode``
+    (spec section 7: a judge-quality regression observed in one project's
+    judge-block-rate KPI must be revertible for THAT project without a deploy
+    and without touching other projects). Falls back to the registry default
+    ('distilled') when unset. Any resolver failure or unknown value resolves
+    to 'distilled' — the accuracy-neutral-to-positive default — with a
+    warning, never an exception (the judge must still run).
+    """
+    try:
+        from shared.config.resolver import get_setting
+
+        # Review R2 finding 1 / R3 finding 1 — run the settings SELECT under a
+        # SAVEPOINT. A DB-level failure would otherwise leave the shared
+        # AsyncSession in an aborted-transaction state (later commit/get →
+        # PendingRollbackError, verdict discarded). A full ``db.rollback()``
+        # is NOT the answer: rollback expires every loaded ORM instance
+        # (rubric/cfg/turn), and the next lazy attribute read raises
+        # MissingGreenlet under AsyncSession — same discarded verdict, plus a
+        # regression for non-DB resolver failures on a healthy session. The
+        # savepoint confines the failure: on error only the savepoint rolls
+        # back, the outer transaction and all loaded instances stay intact.
+        async with db.begin_nested():
+            mode = await get_setting(
+                "agent.judge_context_mode",
+                tenant_session=db,
+                project_id=project_id,
+            )
+    except Exception:
+        logger.warning(
+            "Judge context mode could not be resolved for project %s; "
+            "defaulting to 'distilled'.",
+            project_id,
+            exc_info=True,
+        )
+        return "distilled"
+    return "full" if mode == "full" else "distilled"
+
+
 async def run_judge(
     db: AsyncSession,
     cfg: ProjectAgentConfig,
@@ -406,12 +610,45 @@ async def run_judge(
     sample_rows: list[dict[str, Any]] | None,
     result_row_count: int | None = None,
     conversation_history: list[dict[str, str]] | None = None,
+    system_sections: list[tuple[str, str]] | None = None,
+    grounding_matches: str | None = None,
+    date_anchor: str | None = None,
 ) -> JudgeOutcome:
-    """Run the judge LLM. Caller decides sync vs background dispatch."""
+    """Run the judge LLM. Caller decides sync vs background dispatch.
 
+    R2 (F2): ``system_sections`` (the planner prompt's ordered (heading, body)
+    list) and ``grounding_matches`` (the per-turn retrieved glossary cards) let
+    the judge receive a DISTILLED evidence pack — all evidential context, none
+    of the non-evidential planner boilerplate. ``system_prompt`` remains the
+    full-mode value and the fallback whenever distillation cannot run, so the
+    judge never scores on less evidence than the planner had. Callers that do
+    not pass ``system_sections`` get the full prompt (back-compatible).
+
+    Integration fix: ``date_anchor`` is the per-turn ``## DATE ANCHOR`` block
+    Lane G moved out of the cacheable system prefix into the planner user
+    suffix. It is threaded through here (not part of ``system_sections`` /
+    ``grounding_matches``) and rendered in the judge user prompt so the judge
+    anchors relative-date verification on the SAME current date the planner
+    used. Callers that do not pass it simply omit the anchor block.
+    """
+
+    # Scoped to the project that owns this config. PUT/PATCH /agent/config
+    # prove a SUBMITTED judge_rubric_id belongs to the path project, but a
+    # ``project_agent_configs`` row bound to another project's rubric before
+    # that guard existed still resolved through a bare ``db.get``, and the
+    # rubric's ``sections`` are rendered into the judge prompt — another
+    # project's rubric TEXT deciding how this project's answers are judged.
+    # A rubric this project does not own resolves to nothing, which is exactly
+    # what an unset judge_rubric_id already means: no rubric configured.
     rubric: AgentJudgeRubric | None = None
     if cfg.judge_rubric_id is not None:
-        rubric = await db.get(AgentJudgeRubric, cfg.judge_rubric_id)
+        rubric = (
+            await db.execute(
+                select(AgentJudgeRubric)
+                .where(AgentJudgeRubric.project_id == cfg.project_id)
+                .where(AgentJudgeRubric.id == cfg.judge_rubric_id)
+            )
+        ).scalars().one_or_none()
 
     try:
         llm_config = await resolve_agent_llm_config(cfg.project_id, "judge", db)
@@ -419,7 +656,9 @@ async def run_judge(
         logger.warning("Judge LLM not resolvable: %s", exc)
         return JudgeOutcome(
             verdict="unknown",
-            reasoning=f"Judge LLM not configured: {exc}",
+            # Bug-5957 — do not expose raw exception in reasoning; it
+            # can reach end users via TurnResponse.judge_reasoning.
+            reasoning="Judge could not run: LLM configuration issue.",
             metrics={},
         )
 
@@ -431,7 +670,8 @@ async def run_judge(
         logger.warning("Judge adapter build failed: %s", exc)
         return JudgeOutcome(
             verdict="unknown",
-            reasoning=f"Judge LLM API key missing: {exc}",
+            # Bug-5957 — do not expose raw exception in reasoning.
+            reasoning="Judge could not run: LLM configuration issue.",
             metrics={},
             provider=provider,
         )
@@ -451,25 +691,43 @@ async def run_judge(
         else []
     )
 
+    # R2 (F2) — build the judge's evidence view (distilled by default; verbatim
+    # in 'full' mode / on any distillation fallback) and thread in the retrieved
+    # glossary cards the planner saw (intake fix).
+    evidence = build_judge_evidence(
+        system_prompt=system_prompt,
+        system_sections=system_sections,
+        grounding_matches=grounding_matches,
+        mode=await _resolve_judge_context_mode(db, cfg.project_id),
+    )
+
     judge_user = _build_judge_user_prompt(
         rubric=rubric,
         user_message=user_message,
         conversation_history=conversation_history,
-        system_prompt=system_prompt,
+        evidence=evidence,
         plan=plan,
         sample_rows=rows_sample,
         total_rows=total_rows,
         answer_text=answer_text,
         verified_matches=verified_matches or None,
+        date_anchor=date_anchor,
     )
 
     try:
-        raw = await adapter.complete(JUDGE_INSTRUCTIONS, judge_user)
+        # R1 (F1) — JUDGE_INSTRUCTIONS is a fixed ~2k-token block identical on
+        # every judge call; mark it cacheable so repeated judge invocations
+        # (async every-turn default) serve it from the provider cache. The
+        # marker never changes the rendered text.
+        raw = await adapter.complete(
+            JUDGE_INSTRUCTIONS, judge_user, cache_system_prefix=True
+        )
     except Exception as exc:
         logger.exception("Judge LLM call failed")
         return JudgeOutcome(
             verdict="unknown",
-            reasoning=f"Judge LLM call failed: {exc}",
+            # Bug-5957 — do not expose raw exception in reasoning.
+            reasoning="Judge could not run: evaluation service error.",
             metrics={},
             provider=provider,
         )
@@ -481,11 +739,16 @@ async def run_judge(
     try:
         outcome = _parse_judge_json(raw)
     except (ValueError, json.JSONDecodeError) as exc:
-        logger.warning("Judge produced malformed JSON: %s", exc)
+        logger.warning(
+            "Judge produced malformed JSON: %s — raw output: %s",
+            exc, raw[:_RAW_OUTPUT_CAP],
+        )
         return JudgeOutcome(
             verdict="unknown",
-            reasoning=f"Judge output malformed: {raw[:300]}",
+            reasoning="Judge evaluation could not be completed: the judge "
+                      "output was not in the expected format.",
             metrics={},
+            raw_output=raw[:_RAW_OUTPUT_CAP],
             usage_input_tokens=in_tok,
             usage_output_tokens=out_tok,
             provider=provider,

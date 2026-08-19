@@ -55,6 +55,7 @@ from src.rewrite.dialect_resolution import (
     resolve_target_dialect_for_bound,
 )
 from src.rewrite.dialects import (
+    PassthroughTranspileError,
     _dialect_from_connection_type,
     _dialect_to_connector,
     _requote_identifiers_for_bigquery,
@@ -99,6 +100,7 @@ __all__ = [
     # Errors
     "SemanticBindingError",
     "AggregateRewriteUnsupported",
+    "PassthroughTranspileError",
     # Test-imported internals
     "_build_source_sql",
     "_build_persona_star_sql",

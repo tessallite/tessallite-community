@@ -50,15 +50,24 @@ const BANDS_CLOSER: KpiThresholdBand[] = [
   { label: "On Track", color: "#388E3C", min: 0.90, max: null },
 ];
 
-// F-017-02 / F-017-16: variance evaluation (absolute_variance, percentage_variance)
-// matches against RAW DEVIATION (0 = perfect), so bands are deviation-ordered —
-// green at the low end, badness increasing upward. Mirrors the backend
-// "variance" preset (kpi_threshold.py). For percentage_variance the boundaries
-// read as 10% / 20% deviation; for absolute_variance the user retunes them.
+// closer_is_better variance evaluation matches against RAW DEVIATION (0 =
+// perfect), so bands are deviation-ordered — green at the low end, badness
+// increasing upward. Mirrors the backend "variance" preset (kpi_threshold.py).
 const BANDS_VARIANCE: KpiThresholdBand[] = [
   { label: "On Track", color: "#388E3C", min: null, max: 0.10 },
   { label: "Near Target", color: "#F57C00", min: 0.10, max: 0.20 },
   { label: "Off Target", color: "#D32F2F", min: 0.20, max: null },
+];
+
+// F-017-01 / F-103-06: directional (higher/lower) variance is SIGNED favourable
+// — positive = beating the goal. Bands are favourable-ordered around zero, so a
+// cost KPI beating budget is green and one missing it is red. Mirrors the
+// backend "variance_directional" preset. For percentage_variance the boundaries
+// read as -20% / 0% variance; for absolute_variance they are scaled by |target|.
+const BANDS_VARIANCE_DIRECTIONAL: KpiThresholdBand[] = [
+  { label: "Off Target", color: "#D32F2F", min: null, max: -0.20 },
+  { label: "Near Target", color: "#F57C00", min: -0.20, max: 0.0 },
+  { label: "On Track", color: "#388E3C", min: 0.0, max: null },
 ];
 
 // z_score: bands match against the z-score (direction-normalised so higher =
@@ -70,14 +79,23 @@ const BANDS_ZSCORE: KpiThresholdBand[] = [
   { label: "On Track", color: "#388E3C", min: 1.0, max: null },
 ];
 
+// F-017-10: percentile_rank default bands must match the backend
+// "percentile_rank" preset (25 / 50), not the old 33 / 67, so a wizard-authored
+// KPI classifies identically to an API evaluate that falls through to backend
+// defaults. Pinned by a contract test against get_preset_bands("percentile_rank").
 const BANDS_PERCENTILE: KpiThresholdBand[] = [
-  { label: "Off Target", color: "#D32F2F", min: null, max: 33 },
-  { label: "Near Target", color: "#F57C00", min: 33, max: 67 },
-  { label: "On Track", color: "#388E3C", min: 67, max: null },
+  { label: "Off Target", color: "#D32F2F", min: null, max: 25 },
+  { label: "Near Target", color: "#F57C00", min: 25, max: 50 },
+  { label: "On Track", color: "#388E3C", min: 50, max: null },
 ];
 
 function defaultBandsForDirection(direction?: string, evaluationType?: string): KpiThresholdBand[] {
   if (evaluationType === "absolute_variance" || evaluationType === "percentage_variance") {
+    // Directional (higher/lower) variance is signed favourable; closer keeps the
+    // deviation-ordered preset. Mirrors backend _get_default_bands.
+    if (direction === "higher_is_better" || direction === "lower_is_better") {
+      return BANDS_VARIANCE_DIRECTIONAL;
+    }
     return BANDS_VARIANCE;
   }
   if (evaluationType === "z_score") return BANDS_ZSCORE;
@@ -97,32 +115,36 @@ export function createDefaultPresentationMeta(
   direction?: string,
   forceEvaluationType?: string,
 ): KpiPresentationMeta {
-  const effectiveType = forceEvaluationType
-    ?? (direction === "closer_is_better" ? "percentage_of_target" : "absolute_value");
+  // F-017-20: the spec default evaluation type is percentage_of_target ("most
+  // common"), and the engine defaults a null presentation_meta to it — so seed
+  // KPIs (null meta) and wizard-authored KPIs must default to the same basis, or
+  // two visually identical KPIs classify on different scales.
+  const effectiveType = forceEvaluationType ?? "percentage_of_target";
   const baseBands = defaultBandsForDirection(direction, effectiveType);
 
   if (effectiveType === "percentage_of_target") {
     return { evaluation_type: "percentage_of_target", bands: baseBands };
   }
-  // F-017-16: variance / z_score / percentile_rank bands are stored verbatim
-  // (deviation, z-score, or percentile scale) — not scaled by target like
-  // absolute_value.
+  // percentage_variance / z_score / percentile_rank bands are dimensionless
+  // (variance fraction, z-score, or percentile scale) and stored verbatim.
   if (
-    effectiveType === "absolute_variance" ||
     effectiveType === "percentage_variance" ||
     effectiveType === "z_score" ||
     effectiveType === "percentile_rank"
   ) {
     return { evaluation_type: effectiveType, bands: baseBands };
   }
-  // Absolute-value bands: scale ratio-based boundaries (0-1) to target range.
-  const max = target && target > 0 ? target : 100;
+  // absolute_value and absolute_variance bands are in the measure's own units:
+  // scale the fraction-of-target boundaries by |target|. absolute_variance must
+  // match the backend, which scales its default absolute_variance bands by
+  // |target| (F-017-01) — storing them unscaled would repaint a beating KPI red.
+  const scale = target && Math.abs(target) > 0 ? Math.abs(target) : 100;
   return {
-    evaluation_type: "absolute_value",
+    evaluation_type: effectiveType,
     bands: baseBands.map((band) => ({
       ...band,
-      min: band.min === null ? null : Number((band.min * max).toFixed(6)),
-      max: band.max === null ? null : Number((band.max * max).toFixed(6)),
+      min: band.min === null ? null : Number((band.min * scale).toFixed(6)),
+      max: band.max === null ? null : Number((band.max * scale).toFixed(6)),
     })),
   };
 }
@@ -222,7 +244,7 @@ export function KpiThresholdEditor({ meta, direction, target, onChange, onBandsC
   const m = (direction === "closer_is_better" && raw.evaluation_type === "absolute_value")
     ? { ...raw, ...createDefaultPresentationMeta(null, direction, "percentage_of_target") }
     : raw;
-  const evaluationType = m.evaluation_type ?? "absolute_value";
+  const evaluationType = m.evaluation_type ?? "percentage_of_target";  // F-017-20
   const bands: KpiThresholdBand[] = m.bands ?? defaultBandsForDirection(direction, evaluationType);
   const colorblind = m.colorblind ?? false;
 
@@ -336,6 +358,14 @@ export function KpiThresholdEditor({ meta, direction, target, onChange, onBandsC
           value={m.peer_dimension ?? ""}
           onChange={(e) => updateMeta({ peer_dimension: e.target.value })}
         />
+      )}
+
+      {/* F-017-08: z_score needs snapshot history, which only exists when the
+          KPI has a snapshot schedule — surface it so save is not a surprise 400. */}
+      {evaluationType === "z_score" && (
+        <Typography variant="caption" color="text.secondary">
+          {t("kpiBusiness.zScoreSnapshotHint")}
+        </Typography>
       )}
 
       <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>

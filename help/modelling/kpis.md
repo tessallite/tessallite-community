@@ -318,6 +318,22 @@ After selecting a formula card, the builder shows the relevant controls for that
 
 **Broken inputs are flagged:** If one of a composite's child KPIs fails to evaluate (a broken formula, a query error), the composite still scores from its working children but shows a **Degraded** badge on its scorecard card naming the broken child. A child that simply has no data is dropped quietly. See [KPI concepts](../concepts/kpis.md) for the difference between a broken input and no data.
 
+### When a KPI shows "Restricted" instead of a number
+
+Sometimes a KPI card shows no number and a small **Restricted** badge. This is not a broken KPI and it is not missing data. It means the model has row security switched on, and the rules do not give your role permission to see any rows at all — so there is nothing for the KPI to add up.
+
+Three different situations can all leave a KPI card blank, and the card tells you which one you are looking at:
+
+| What you see | What it means | What to do |
+| --- | --- | --- |
+| A **Restricted** badge and no number | Row security on this model gives your role access to no rows | Ask an administrator to give you a role or persona that covers the data you need |
+| No badge and no number | The query ran fine, but there genuinely are no matching rows | Widen the time window or remove a filter |
+| An error message on the card | The formula or the model itself has a problem | Fix the formula, or check that the measures it uses still exist |
+
+Hover over the **Restricted** badge for the full explanation.
+
+**Worth knowing if you build models:** the moment a model gets its first row-security rule, everybody whose role is not named in a rule sees nothing — including you, and including administrators. That is deliberate: it is safer to show nothing than to accidentally show data a rule was meant to hide. If you add a rule and the whole model suddenly goes blank for you, that is why. Add a rule that covers your own role, or set up a persona that is allowed to see everything, and the numbers come back. See [Configure row security](configure-row-security.md).
+
 ### Time calculation (optional)
 
 Most formula types offer a "+ Add time calculation" link below the formula controls. Clicking it adds a secondary time-variant calculation that transforms the base formula's result over time. This is different from the time window -- the time window says "look at data from last month", while the time calculation says "compare this month to last month" or "average across the last 3 months".
@@ -455,15 +471,15 @@ A **named list** is a saved, reusable set of dimension members. Instead of typin
 A named list is a pre-defined set of values for a dimension. It can be:
 
 - **Static** -- a fixed list of values (e.g. "Enterprise Customers" = [Acme Corp, BigCo, MegaInc]).
-- **Dynamic (Top/Bottom N)** -- automatically resolves to the top or bottom N members by a measure at evaluation time (e.g. "Top 20 Products by Revenue" recalculates every time the KPI is evaluated).
-- **Query-based** -- the members are determined by a query that runs at evaluation time.
+- **Dynamic (Top/Bottom N)** -- ranks members by a measure and stores the top or bottom N when you **Refresh** the list (e.g. "Top 20 Products by Revenue"). The stored members are what queries use; they do not recompute on every KPI evaluation.
+- **Query-based** -- the members are determined by a query that runs when you **Refresh** the list; the result is stored.
 
 Named lists are created and managed separately (see the Named Lists help page). Once created, they can be used in any KPI filter, any pivot query, or any dashboard slicer.
 
 **Why use named lists instead of typing values directly?**
 
 1. **Consistency across KPIs.** If you have 15 KPIs filtered to "Strategic Accounts", changing the list in one place updates all 15 KPIs. Without named lists, you would edit each KPI individually.
-2. **Dynamic membership.** A "Top 10 Customers by Revenue" named list re-evaluates every month. The KPI always reflects the CURRENT top 10, not the top 10 from when you built it.
+2. **Dynamic membership.** A "Top 10 Customers by Revenue" named list is recomputed whenever you **Refresh** it and then **Deploy**; every KPI that uses it then reflects the newly stored top 10. Membership is stored, not recomputed on each query, and there is no automatic monthly sweep for named lists — refreshing is an explicit action. (A Named *Query* can be scheduled; a named *list* is refreshed on demand.)
 3. **Governance.** Named lists can be certified, documented, and version-controlled. Everyone in the organisation uses the same definition of "Western Europe" or "Premium Products".
 4. **Complex logic without complexity.** A named list can encode complex membership rules (top N, conditional logic, exclusions) that would be impossible to express in a simple filter.
 
@@ -797,5 +813,5 @@ Snapshots are captured by the scheduler service and stored in the `kpi_snapshots
 
 - [KPIs (concept)](../concepts/kpis.md) -- full conceptual reference including expression language, scorecard, alerts, and agent integration.
 - [Define Measures](define-measures.md) -- create the measures that KPIs reference.
-- [Named Lists](named-sets.md) -- reusable dimension member selections.
-- [Impact Analysis](impact-analysis.md) -- check where KPIs are used downstream.
+- [Named Queries](named-queries.md) -- MDX Named Sets, Tessallite Named Lists, and Named Queries (reusable dimension member selections and governed queries).
+- [Usage & Downstream Assets](usage-downstream-assets.md) -- record downstream consumers and review observed table usage.

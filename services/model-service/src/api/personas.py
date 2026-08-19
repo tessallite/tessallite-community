@@ -18,23 +18,33 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
+from shared.db.model_write_lock_guard import model_write_lock_exempt
 from shared.db.models import (
+    DataTag,
     Dimension,
     HierarchyDefinition,
     Measure,
+    ModelColumn,
+    ModelTable,
     Persona,
     PersonaTagRestriction,
+    ProjectPersonaModelScope,
+    UserDefinedAttributeColumnRef,
     data_tag_columns,
 )
-from shared.schemas.domains.aggregates_security import PERSONA_FILTER_OPERATORS
+from shared.schemas.domains.aggregates_security import persona_filter_value_is_valid
 from shared.db.session import get_tenant_db
+from shared.auth.roles import MODEL_TECHNICAL_ROLE
 from shared.security.persona_resolver import (
+    PersonaAudienceNarrowingError,
     caller_roles,
     is_in_audience,
     is_privileged_by_role,
+    payload_narrows_visibility,
+    reject_empty_audience_narrowing,
 )
 from shared.schemas.pydantic_models import (
     PersonaCreate,
@@ -42,6 +52,9 @@ from shared.schemas.pydantic_models import (
     PersonaResponse,
     PersonaUpdate,
 )
+from shared.audit.logger import audit_required
+from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
+from src.api._model_lock import acquire_model_definition_lock
 from src.api._scope import ensure_model_in_project
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
@@ -60,6 +73,70 @@ _INCLUDED_FIELDS = (
 )
 
 
+# Canonical seeded "Technical" persona. Every model gets one at creation so the
+# hidden-columns technical catalogue (surfaced by the gateway as
+# ``<slug>_technical``) is available immediately. Mirrors migrations 0042 (seed)
+# + 0124 (audience gate); those only seeded models that predated the migration,
+# so models created afterwards had an inert technical flow (Bug-6138).
+TECHNICAL_PERSONA_SLUG = "technical"
+TECHNICAL_PERSONA_NAME = "Technical"
+TECHNICAL_PERSONA_DESCRIPTION = (
+    "Auto-seeded technical view — shows every column including those "
+    "marked hidden on the business view."
+)
+
+
+async def seed_technical_persona(db, model_id: UUID) -> Persona:
+    """Seed (or return the existing) canonical Technical persona for a model.
+
+    Idempotent: if a persona with ``slug='technical'`` already exists on the
+    model (imported bundle, migration 0042, or a re-run) it is returned
+    unchanged. The row is flushed but NOT committed — the caller owns the
+    transaction boundary so model creation and persona seeding commit atomically.
+
+    The persona exposes hidden columns (``includes_hidden_columns=True``) and is
+    gated to the ``model_technical`` audience role, matching migration 0124 so a
+    non-technical viewer is not force-locked into the technical view.
+    """
+    # Bug-7982 R7 (review round 5, F1): this helper is part of a WHOLESALE
+    # REBUILD of snapshot-owned state into a model created in the caller's own
+    # transaction, so it is a DELIBERATE non-holder of the per-model
+    # definition lock. The exemption is declared HERE, not at each call site:
+    # round 5 found 13 call sites where the caller exempted
+    # rehydrate_into_live and then wrote personas/model_versions unexempt two
+    # lines later, flooding the runtime write guard's report and muting it for
+    # real violations.
+    async with model_write_lock_exempt(
+        db, "seed: canonical Technical persona for a model created in this transaction"
+    ):
+        existing = (
+            await db.execute(
+                select(Persona).where(
+                    Persona.model_id == model_id,
+                    Persona.slug == TECHNICAL_PERSONA_SLUG,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+        persona = Persona(
+            model_id=model_id,
+            name=TECHNICAL_PERSONA_NAME,
+            slug=TECHNICAL_PERSONA_SLUG,
+            description=TECHNICAL_PERSONA_DESCRIPTION,
+            included_measure_ids=[],
+            included_dimension_ids=[],
+            included_hierarchy_ids=[],
+            audience_roles=[MODEL_TECHNICAL_ROLE],
+            default_filters={},
+            bypass_row_security=False,
+            includes_hidden_columns=True,
+        )
+        db.add(persona)
+        await db.flush()
+        return persona
+
+
 async def strip_id_from_personas(
     db,
     *,
@@ -72,6 +149,14 @@ async def strip_id_from_personas(
     ``object_class`` is one of ``measure | dimension | hierarchy``. Returns
     the names of personas that were touched, so the caller can surface
     them to the user as a warning.
+
+    Bug-7793: also sweeps ``ProjectPersonaModelScope`` rows for the same
+    model_id. Project persona scopes carry ``included_measure_ids`` and
+    ``included_dimension_ids`` JSONB arrays that reference the same objects
+    as model-level personas. Without this sweep, deleting a measure or
+    dimension left dangling UUIDs in the project-persona scope arrays,
+    silently shrinking the agent's grounded attribute set with no
+    operator-visible cause.
     """
     field_map = {
         "measure": "included_measure_ids",
@@ -91,11 +176,34 @@ async def strip_id_from_personas(
         if target in ids:
             setattr(p, field, [i for i in ids if i != target])
             touched.append(p.name)
+
+    # Bug-7793: sweep project-persona model scopes (agent-facing). These
+    # carry included_measure_ids and included_dimension_ids but NOT
+    # included_hierarchy_ids, so we only sweep for measure/dimension.
+    scope_field_map = {
+        "measure": "included_measure_ids",
+        "dimension": "included_dimension_ids",
+    }
+    scope_field = scope_field_map.get(object_class)
+    if scope_field is not None:
+        scope_result = await db.execute(
+            select(ProjectPersonaModelScope).where(
+                ProjectPersonaModelScope.model_id == model_id
+            )
+        )
+        for scope in scope_result.scalars().all():
+            ids = list(getattr(scope, scope_field) or [])
+            if target in ids:
+                setattr(scope, scope_field, [i for i in ids if i != target])
+
     return touched
 
 
 def _to_response(
-    p: Persona, restricted_column_ids: list[UUID] | None = None,
+    p: Persona,
+    restricted_column_ids: list[UUID] | None = None,
+    cls_blocked_measure_ids: list[UUID] | None = None,
+    cls_blocked_dimension_ids: list[UUID] | None = None,
 ) -> PersonaResponse:
     return PersonaResponse(
         id=p.id,
@@ -111,6 +219,8 @@ def _to_response(
         bypass_row_security=bool(getattr(p, "bypass_row_security", False)),
         includes_hidden_columns=bool(getattr(p, "includes_hidden_columns", False)),
         restricted_column_ids=restricted_column_ids or [],
+        cls_blocked_measure_ids=cls_blocked_measure_ids or [],
+        cls_blocked_dimension_ids=cls_blocked_dimension_ids or [],
         created_at=p.created_at,
         updated_at=p.updated_at,
     )
@@ -144,6 +254,169 @@ async def _restricted_columns_by_persona(
     return out
 
 
+def _payload_narrows_visibility(
+    *,
+    included_measure_ids=None,
+    included_dimension_ids=None,
+    included_hierarchy_ids=None,
+    default_filters=None,
+    restricted_tag_ids=None,
+) -> bool:
+    return payload_narrows_visibility(
+        included_measure_ids=included_measure_ids,
+        included_dimension_ids=included_dimension_ids,
+        included_hierarchy_ids=included_hierarchy_ids,
+        default_filters=default_filters,
+        restricted_tag_ids=restricted_tag_ids,
+    )
+
+
+def _reject_empty_audience_narrowing(
+    audience_roles,
+    *,
+    included_measure_ids=None,
+    included_dimension_ids=None,
+    included_hierarchy_ids=None,
+    default_filters=None,
+    restricted_tag_ids=None,
+) -> None:
+    """F-008-03: a narrowing persona with an empty audience is inert after
+    explicit-audience assignment. Reject at save time (shared helper).
+    """
+    try:
+        reject_empty_audience_narrowing(
+            audience_roles,
+            included_measure_ids=included_measure_ids,
+            included_dimension_ids=included_dimension_ids,
+            included_hierarchy_ids=included_hierarchy_ids,
+            default_filters=default_filters,
+            restricted_tag_ids=restricted_tag_ids,
+        )
+    except PersonaAudienceNarrowingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_code": "PERSONA_EMPTY_AUDIENCE_NARROWING",
+                "message": str(exc),
+            },
+        ) from exc
+
+
+class ClsClosureBase:
+    """Model-wide CLS closure inputs (measures, dimensions, column rows) loaded
+    ONCE per request and reused across every persona.
+
+    ``list_personas`` computes the CLS overlay for every persona in a model; the
+    measures/dimensions/columns are identical for all of them, so re-loading them
+    per persona turned an N-persona listing into N model-wide scans (quadratic on
+    large models). Load them once and pass this bundle to each
+    ``_cls_blocked_object_ids`` call. Only the persona-specific restricted set
+    stays per-call."""
+
+    __slots__ = ("measures", "dims", "col_rows")
+
+    def __init__(self, measures, dims, col_rows):
+        self.measures = measures
+        self.dims = dims
+        self.col_rows = col_rows
+
+
+async def _load_cls_closure_base(db, model_id: UUID) -> "ClsClosureBase":
+    measures = list(
+        (
+            await db.execute(select(Measure).where(Measure.model_id == model_id))
+        ).scalars().all()
+    )
+    dims = list(
+        (
+            await db.execute(
+                select(Dimension).where(Dimension.model_id == model_id)
+            )
+        ).scalars().all()
+    )
+    col_rows = (
+        await db.execute(
+            select(ModelColumn.id, ModelColumn.column_name, ModelTable.physical_name)
+            .join(ModelTable, ModelTable.id == ModelColumn.model_table_id)
+            .where(ModelTable.model_id == model_id)
+        )
+    ).all()
+    return ClsClosureBase(measures, dims, col_rows)
+
+
+async def _cls_blocked_object_ids(
+    db, model_id: UUID, restricted_column_ids: list[UUID] | None,
+    *, base: "ClsClosureBase | None" = None,
+) -> tuple[list[UUID], list[UUID]]:
+    """Measure/dimension ids the CLS closure blocks for this persona (F-008-06).
+
+    Uses ``object_touches_restricted`` so calculated objects with no single
+    ``source_column_id`` still appear in the canvas overlay.
+
+    ``base`` lets a caller iterating personas load the model-wide inputs once and
+    reuse them (see ``ClsClosureBase``). When omitted they are loaded here, so a
+    single-persona call is unchanged.
+    """
+    if not restricted_column_ids:
+        return [], []
+    from shared.security.restricted_column_closure import (
+        ClosureContext,
+        normalise_id_set,
+        object_touches_restricted,
+    )
+
+    if base is None:
+        base = await _load_cls_closure_base(db, model_id)
+    measures = base.measures
+    dims = base.dims
+    col_rows = base.col_rows
+
+    restricted = normalise_id_set(restricted_column_ids)
+    restricted_phys = {
+        str(name).lower()
+        for cid, name, _phys in col_rows
+        if str(cid) in restricted and name
+    }
+    known_phys = {str(name).lower() for _cid, name, _phys in col_rows if name}
+    table_idents = {
+        str(phys).lower() for _cid, _name, phys in col_rows if phys
+    }
+    # Scope the attribute-ref lookup to THIS persona's restricted columns (an
+    # indexed IN over a small set) instead of scanning the whole
+    # UserDefinedAttributeColumnRef table on every call. The result is identical:
+    # only refs whose column is restricted contribute to ``restricted_uda``.
+    uda_rows = (
+        await db.execute(
+            select(
+                UserDefinedAttributeColumnRef.attribute_id,
+                UserDefinedAttributeColumnRef.column_id,
+            ).where(
+                UserDefinedAttributeColumnRef.column_id.in_(list(restricted_column_ids))
+            )
+        )
+    ).all()
+    restricted_uda = {
+        str(attr_id)
+        for attr_id, col_id in uda_rows
+        if str(col_id) in restricted
+    }
+    ctx = ClosureContext(
+        restricted_uda_ids=restricted_uda,
+        measures_by_id={str(m.id): m for m in measures},
+        measures_by_name={m.name: m for m in measures if getattr(m, "name", None)},
+        restricted_physical_names=restricted_phys,
+        known_physical_names=known_phys,
+        table_identifiers=table_idents,
+    )
+    blocked_m = [
+        m.id for m in measures if object_touches_restricted(m, restricted, ctx)
+    ]
+    blocked_d = [
+        d.id for d in dims if object_touches_restricted(d, restricted, ctx)
+    ]
+    return blocked_m, blocked_d
+
+
 def _serialise_uuid_list(values) -> list[str]:
     return [str(v) for v in (values or [])]
 
@@ -170,22 +443,8 @@ async def _existing_ids(db, table, model_id: UUID, ids) -> set[str]:
 
 
 def _filter_value_is_valid(raw) -> bool:
-    """F-008-16: one default_filters value shape check (no DB needed).
-
-    Scalar -> eq, list -> in, dict -> {operator: value} with the operator in
-    the canonical supported set and BETWEEN carrying exactly two bounds.
-    """
-    if isinstance(raw, dict):
-        if len(raw) != 1:
-            return False
-        op, val = next(iter(raw.items()))
-        if op not in PERSONA_FILTER_OPERATORS:
-            return False
-        if op == "between":
-            return isinstance(val, (list, tuple)) and len(val) == 2
-        return True
-    # scalar or list — always coercible
-    return True
+    """F-008-16: one default_filters value shape check (no DB needed)."""
+    return persona_filter_value_is_valid(raw)
 
 
 async def _validate_persona_scope(
@@ -267,6 +526,59 @@ async def _validate_persona_scope(
             )
 
 
+async def _validate_restricted_tags(
+    db, model_id: UUID, tag_ids: list[UUID],
+) -> None:
+    """Reject tag ids that do not belong to the target model (Bug-7051).
+
+    Mirrors the validation in data_tags._validate_tags_in_model but lives
+    here so the persona create/update path can validate without importing
+    the data_tags module.
+    """
+    if not tag_ids:
+        return
+    found = set(
+        (
+            await db.execute(
+                select(DataTag.id).where(
+                    DataTag.id.in_(tag_ids), DataTag.model_id == model_id,
+                )
+            )
+        ).scalars().all()
+    )
+    missing = [str(t) for t in tag_ids if t not in found]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_code": "PERSONA_RESTRICTION_TAG_NOT_IN_MODEL",
+                "message": (
+                    "These data-tag ids do not belong to this model "
+                    f"and cannot be used as restrictions: {', '.join(missing)}."
+                ),
+            },
+        )
+
+
+async def _persist_tag_restrictions(
+    db, persona_id: UUID, tag_ids: list[UUID],
+) -> None:
+    """Replace all tag restrictions for a persona within the current transaction.
+
+    Bug-7051: called inside the same transaction as persona create/update so
+    persona row and restriction rows either both commit or both roll back.
+    """
+    # Delete existing restrictions (idempotent for create where none exist yet)
+    await db.execute(
+        delete(PersonaTagRestriction).where(
+            PersonaTagRestriction.persona_id == persona_id,
+        )
+    )
+    # Insert the new set
+    for tag_id in tag_ids:
+        db.add(PersonaTagRestriction(persona_id=persona_id, data_tag_id=tag_id))
+
+
 @router.post(
     "/personas",
     response_model=PersonaResponse,
@@ -281,6 +593,7 @@ async def create_persona(
 ) -> PersonaResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         # F-008-16 / F-008-21: reject foreign include ids and malformed
         # default filters before persisting (fail closed).
         await _validate_persona_scope(
@@ -290,6 +603,19 @@ async def create_persona(
             included_hierarchy_ids=body.included_hierarchy_ids,
             default_filters=body.default_filters,
         )
+        # Bug-7051: validate restricted_tag_ids before any mutation so a
+        # bad tag id never reaches the insert path.
+        if body.restricted_tag_ids is not None:
+            await _validate_restricted_tags(db, model_id, body.restricted_tag_ids)
+        _reject_empty_audience_narrowing(
+            body.audience_roles,
+            included_measure_ids=body.included_measure_ids,
+            included_dimension_ids=body.included_dimension_ids,
+            included_hierarchy_ids=body.included_hierarchy_ids,
+            default_filters=body.default_filters,
+            restricted_tag_ids=body.restricted_tag_ids or [],
+        )
+
         p = Persona(
             model_id=model_id,
             name=body.name,
@@ -304,6 +630,51 @@ async def create_persona(
             includes_hidden_columns=bool(body.includes_hidden_columns),
         )
         db.add(p)
+        # Bug-7051: flush (not commit) to get the persona id, then insert
+        # tag restrictions before committing — both writes in one
+        # transaction. On any failure the whole transaction rolls back so
+        # a persona can never exist without its intended restrictions.
+        try:
+            await db.flush()
+        except IntegrityError:
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error_code": "PERSONA_NAME_CONFLICT",
+                    "message": (
+                        f"A persona named '{body.name}' or with slug "
+                        f"'{body.slug}' already exists in this model."
+                    ),
+                },
+            )
+
+        # Bug-7051: persist tag restrictions in the SAME transaction
+        if body.restricted_tag_ids is not None:
+            await _persist_tag_restrictions(db, p.id, body.restricted_tag_ids)
+
+        # Bug-7052 / ER-RLS-001 / Bug-8261: fail-closed audit BEFORE commit so
+        # the persona mutation and its audit record are in the SAME
+        # transaction. If the audit write fails, the create rolls back too —
+        # a security persona is never created without durable evidence.
+        await audit_required(
+            db, action="security.persona_create", severity="critical",
+            actor_email=current_user.email,
+            target_type="persona", target_id=p.id,
+            target_name=p.name,
+            detail={
+                "model_id": str(model_id),
+                "bypass_row_security": bool(p.bypass_row_security),
+                "has_allow_lists": bool(
+                    p.included_measure_ids or p.included_dimension_ids
+                    or p.included_hierarchy_ids
+                ),
+                "has_default_filters": bool(p.default_filters),
+                "has_tag_restrictions": body.restricted_tag_ids is not None
+                    and len(body.restricted_tag_ids or []) > 0,
+            },
+        )
+
         try:
             await db.commit()
         except IntegrityError:
@@ -319,7 +690,19 @@ async def create_persona(
                 },
             )
         await db.refresh(p)
-        return _to_response(p)
+        await emit_webhook(current_user.tenant_id, "security.persona_create", {
+            "persona_id": str(p.id),
+            "name": p.name,
+            "model_id": str(model_id),
+            "actor": current_user.email,
+        })
+        restricted = await _restricted_columns_by_persona(db, [p.id])
+        blocked_m, blocked_d = await _cls_blocked_object_ids(
+            db, model_id, restricted.get(p.id),
+        )
+        return _to_response(
+            p, restricted.get(p.id), blocked_m, blocked_d,
+        )
 
 
 @router.get(
@@ -351,11 +734,42 @@ async def list_personas(
             # I-1: one shared audience predicate (persona_resolver) so the
             # listing and query-time enforcement can never drift apart.
             roles = caller_roles(current_user)
-            items = [p for p in items if is_in_audience(p, roles)]
+            tagged = set()
+            if items:
+                tagged = set(
+                    (
+                        await db.execute(
+                            select(PersonaTagRestriction.persona_id).where(
+                                PersonaTagRestriction.persona_id.in_(
+                                    [p.id for p in items]
+                                )
+                            )
+                        )
+                    ).scalars().all()
+                )
+            items = [
+                p for p in items
+                if is_in_audience(
+                    p, roles, has_tag_restrictions=p.id in tagged,
+                )
+            ]
         restricted = await _restricted_columns_by_persona(
             db, [p.id for p in items],
         )
-        return [_to_response(p, restricted.get(p.id)) for p in items]
+        # Load the model-wide CLS closure inputs ONCE and reuse them for every
+        # persona (was N model-wide scans for an N-persona listing).
+        cls_base = await _load_cls_closure_base(db, model_id) if items else None
+        out = []
+        for p in items:
+            blocked_m, blocked_d = await _cls_blocked_object_ids(
+                db, model_id, restricted.get(p.id), base=cls_base,
+            )
+            out.append(
+                _to_response(
+                    p, restricted.get(p.id), blocked_m, blocked_d,
+                )
+            )
+        return out
 
 
 @router.get(
@@ -373,7 +787,12 @@ async def get_persona(
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
         p = await _load_or_404(db, model_id, persona_id)
         restricted = await _restricted_columns_by_persona(db, [p.id])
-        return _to_response(p, restricted.get(p.id))
+        blocked_m, blocked_d = await _cls_blocked_object_ids(
+            db, model_id, restricted.get(p.id),
+        )
+        return _to_response(
+            p, restricted.get(p.id), blocked_m, blocked_d,
+        )
 
 
 @router.patch(
@@ -390,6 +809,7 @@ async def update_persona(
 ) -> PersonaResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         p = await _load_or_404(db, model_id, persona_id)
         updates = body.model_dump(exclude_unset=True)
         # F-008-16 / F-008-21: validate the EFFECTIVE post-update scope (the
@@ -403,6 +823,35 @@ async def update_persona(
             included_hierarchy_ids=updates.get("included_hierarchy_ids", p.included_hierarchy_ids),
             default_filters=updates.get("default_filters", p.default_filters),
         )
+        # Bug-7051: validate restricted_tag_ids before any mutation
+        if "restricted_tag_ids" in updates and updates["restricted_tag_ids"] is not None:
+            await _validate_restricted_tags(db, model_id, updates["restricted_tag_ids"])
+        _eff_tags = updates.get("restricted_tag_ids")
+        if _eff_tags is None:
+            _eff_tags = list(
+                (
+                    await db.execute(
+                        select(PersonaTagRestriction.data_tag_id).where(
+                            PersonaTagRestriction.persona_id == p.id
+                        )
+                    )
+                ).scalars().all()
+            )
+        _reject_empty_audience_narrowing(
+            updates.get("audience_roles", p.audience_roles),
+            included_measure_ids=updates.get(
+                "included_measure_ids", p.included_measure_ids
+            ),
+            included_dimension_ids=updates.get(
+                "included_dimension_ids", p.included_dimension_ids
+            ),
+            included_hierarchy_ids=updates.get(
+                "included_hierarchy_ids", p.included_hierarchy_ids
+            ),
+            default_filters=updates.get("default_filters", p.default_filters),
+            restricted_tag_ids=_eff_tags,
+        )
+
         if "name" in updates:
             p.name = updates["name"]
         if "slug" in updates:
@@ -423,6 +872,47 @@ async def update_persona(
             p.bypass_row_security = bool(updates["bypass_row_security"])
         if "includes_hidden_columns" in updates:
             p.includes_hidden_columns = bool(updates["includes_hidden_columns"])
+
+        # Bug-7051: persist tag restriction changes in the SAME transaction
+        # as the persona field updates, so both commit or both roll back.
+        if "restricted_tag_ids" in updates and updates["restricted_tag_ids"] is not None:
+            await _persist_tag_restrictions(db, p.id, updates["restricted_tag_ids"])
+
+        # Bug-7052 / ER-RLS-001: stage audit event BEFORE commit so
+        # the mutation and its audit record commit atomically.
+        # ER-RLS-002: includes_hidden_columns is security-relevant.
+        _sec_fields = [
+            f for f in (
+                "bypass_row_security", "audience_roles", "default_filters",
+                "included_measure_ids", "included_dimension_ids",
+                "included_hierarchy_ids", "restricted_tag_ids",
+                "includes_hidden_columns",
+            ) if f in updates
+        ]
+        if _sec_fields:
+            _widens = (
+                "bypass_row_security" in updates and bool(updates["bypass_row_security"])
+            ) or (
+                "includes_hidden_columns" in updates and bool(updates["includes_hidden_columns"])
+            ) or (
+                "restricted_tag_ids" in updates
+                and len(updates.get("restricted_tag_ids") or []) == 0
+            )
+            # Bug-8261: fail-closed audit before commit — a security-field
+            # persona update (bypass/allow-lists/default-filters/tag
+            # restrictions) never commits without its durable record.
+            await audit_required(
+                db, action="security.persona_update", severity="critical",
+                actor_email=current_user.email,
+                target_type="persona", target_id=p.id,
+                target_name=p.name,
+                detail={
+                    "model_id": str(model_id),
+                    "changed_fields": _sec_fields,
+                    "widens_access": _widens,
+                },
+            )
+
         try:
             await db.commit()
         except IntegrityError:
@@ -438,8 +928,21 @@ async def update_persona(
                 },
             )
         await db.refresh(p)
+        if _sec_fields:
+            await emit_webhook(current_user.tenant_id, "security.persona_update", {
+                "persona_id": str(p.id),
+                "name": p.name,
+                "model_id": str(model_id),
+                "changed_fields": _sec_fields,
+                "actor": current_user.email,
+            })
         restricted = await _restricted_columns_by_persona(db, [p.id])
-        return _to_response(p, restricted.get(p.id))
+        blocked_m, blocked_d = await _cls_blocked_object_ids(
+            db, model_id, restricted.get(p.id),
+        )
+        return _to_response(
+            p, restricted.get(p.id), blocked_m, blocked_d,
+        )
 
 
 @router.delete(
@@ -455,9 +958,34 @@ async def delete_persona(
 ) -> None:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         p = await _load_or_404(db, model_id, persona_id)
+        _persona_name = p.name
+        _had_bypass = bool(p.bypass_row_security)
         await db.delete(p)
+        # Bug-8261: durable, fail-closed audit in the SAME transaction, BEFORE
+        # commit. Previously the delete committed first and audit() ran
+        # fail-open afterwards, so a persona (including a bypass_row_security
+        # surface) could be deleted with the audit write silently lost. Emitting
+        # audit_required before the single commit makes the delete and its
+        # evidence atomic — an audit-store failure rolls the delete back.
+        await audit_required(
+            db, action="security.persona_delete", severity="critical",
+            actor_email=current_user.email,
+            target_type="persona", target_id=persona_id,
+            target_name=_persona_name,
+            detail={
+                "model_id": str(model_id),
+                "had_bypass_row_security": _had_bypass,
+            },
+        )
         await db.commit()
+        await emit_webhook(current_user.tenant_id, "security.persona_delete", {
+            "persona_id": str(persona_id),
+            "name": _persona_name,
+            "model_id": str(model_id),
+            "actor": current_user.email,
+        })
 
 
 async def _resolve_object(

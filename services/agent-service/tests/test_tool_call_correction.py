@@ -109,7 +109,7 @@ async def test_correction_accumulates_usage():
 
 
 @pytest.mark.asyncio
-async def test_correction_includes_last_two_turns():
+async def test_correction_includes_recent_turns():
     turns = [
         ("first question", "first answer"),
         ("second question", "second answer"),
@@ -124,6 +124,76 @@ async def test_correction_includes_last_two_turns():
     _, user_prompt = adapter.complete.call_args.args
     assert "first question" in user_prompt
     assert "second question" in user_prompt
+
+
+@pytest.mark.asyncio
+async def test_correction_context_window_is_configurable(monkeypatch):
+    """Bug-7353 — the correction context window must be env-tunable (default 4,
+    up from the previous hard-coded 2) so a follow-up correction can carry more
+    than two recent turns. The SQL LIMIT applied to the history fetch must equal
+    the configured window."""
+    import importlib
+    import src.pipeline as pipeline
+
+    monkeypatch.setenv("AGENT_TOOL_CORRECTION_CONTEXT_TURNS", "6")
+    importlib.reload(pipeline)
+    try:
+        assert pipeline._TOOL_CORRECTION_CONTEXT_TURNS == 6
+
+        captured: dict[str, int] = {}
+
+        class _CapDB:
+            async def execute(self, stmt):
+                # Pull the LIMIT off the compiled statement so we assert the
+                # window is actually threaded into the query, not just stored.
+                captured["limit"] = stmt._limit
+                result_mock = MagicMock()
+                result_mock.all.return_value = []
+                return result_mock
+
+        adapter = _mock_adapter('{"query": {"model_id":"x","measures":["m"]}}')
+        usage = {"input": 0, "output": 0}
+        await pipeline._attempt_tool_call_correction(
+            adapter, "bad", "error", _CapDB(), CONV_ID, usage,
+        )
+        assert captured["limit"] == 6
+    finally:
+        monkeypatch.delenv("AGENT_TOOL_CORRECTION_CONTEXT_TURNS", raising=False)
+        importlib.reload(pipeline)
+
+
+def test_tuning_knob_defaults_and_invalid_env(monkeypatch):
+    """Bug-7353 / Bug-7354 — the narration + correction tuning knobs default to
+    their historical values and reject invalid/zero env overrides rather than
+    silently zeroing a limit."""
+    import importlib
+    import src.pipeline as pipeline
+
+    # Defaults with no env set.
+    for var in (
+        "AGENT_MAX_NARRATE_ROWS",
+        "AGENT_RESULT_SAMPLE_CAP",
+        "AGENT_TOOL_CORRECTION_CONTEXT_TURNS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    importlib.reload(pipeline)
+    assert pipeline._MAX_NARRATE_ROWS == 25
+    assert pipeline._RESULT_SAMPLE_CAP == 50
+    assert pipeline._TOOL_CORRECTION_CONTEXT_TURNS == 4
+
+    # Valid override raises the narration sample size.
+    monkeypatch.setenv("AGENT_MAX_NARRATE_ROWS", "100")
+    importlib.reload(pipeline)
+    assert pipeline._MAX_NARRATE_ROWS == 100
+
+    # Invalid / below-minimum overrides fall back to the default.
+    for bad in ("0", "-3", "notanint", "", "  "):
+        monkeypatch.setenv("AGENT_MAX_NARRATE_ROWS", bad)
+        importlib.reload(pipeline)
+        assert pipeline._MAX_NARRATE_ROWS == 25, f"bad={bad!r} should fall back"
+
+    monkeypatch.delenv("AGENT_MAX_NARRATE_ROWS", raising=False)
+    importlib.reload(pipeline)
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ import type { Model } from "../../api/types";
 import ModelContextDialog from "./ModelContextDialog";
 import RecipesTab from "./RecipesTab";
 import JudgeTab from "./JudgeTab";
+import WebhookPanel from "./WebhookPanel";
 import { useT } from "../../i18n";
 
 export type AgentTabKey =
@@ -53,6 +54,7 @@ export default function ProjectAgentTabs({ projectId, tab }: Props) {
   const t = useT();
   const [draft, setDraft] = useState<AgentConfig>(DEFAULT_AGENT_CONFIG);
   const [error, setError] = useState<string | null>(null);
+  const [webhookSecretRotated, setWebhookSecretRotated] = useState(false);
 
   const configQuery = useQuery({
     queryKey: ["agent-config", projectId],
@@ -71,12 +73,17 @@ export default function ProjectAgentTabs({ projectId, tab }: Props) {
 
   const upsertConfig = useMutation({
     mutationFn: (body: AgentConfig) => agentApi.upsertConfig(projectId, body),
+    onMutate: () => {
+      setWebhookSecretRotated(false);
+    },
     onSuccess: (data) => {
       setDraft({ ...DEFAULT_AGENT_CONFIG, ...data });
+      setWebhookSecretRotated(data.webhook_secret_rotated);
       setError(null);
       qc.invalidateQueries({ queryKey: ["agent-config", projectId] });
     },
     onError: (err: { response?: { data?: { detail?: string } } }) => {
+      setWebhookSecretRotated(false);
       setError(err.response?.data?.detail ?? t("agent.setup.saveFailed"));
     },
   });
@@ -120,6 +127,7 @@ export default function ProjectAgentTabs({ projectId, tab }: Props) {
           projectId={projectId}
           draft={draft}
           update={update}
+          webhookSecretRotated={webhookSecretRotated}
         />
       )}
 
@@ -678,10 +686,12 @@ function AdvancedPanel({
   projectId,
   draft,
   update,
+  webhookSecretRotated,
 }: {
   projectId: string;
   draft: AgentConfig;
   update: ChangeFn;
+  webhookSecretRotated: boolean;
 }) {
   const t = useT();
   const qc = useQueryClient();
@@ -782,16 +792,15 @@ function AdvancedPanel({
 
       <Divider />
 
-      <Typography variant="subtitle2">{t("agent.setup.webhookHeading")}</Typography>
-      <Typography variant="caption" color="text.secondary">
-        {t("agent.webhookHelp")}
-      </Typography>
-      <TextField
-        label={t("agent.setup.webhookUrl")}
-        size="small"
-        value={draft.webhook_url ?? ""}
-        onChange={(e) => update("webhook_url", e.target.value || null)}
-        helperText={t("agent.setup.webhookHelp")}
+      {/* Bug-8411 -- the webhook surface (URL, signing-secret rotation, event
+          subscription, DLQ viewer) lives in its own component; this section
+          used to render only the URL field, leaving the rotate-secret and
+          DLQ endpoints unreachable from the product. */}
+      <WebhookPanel
+        projectId={projectId}
+        draft={draft}
+        update={update}
+        webhookSecretRotated={webhookSecretRotated}
       />
 
       <Divider />

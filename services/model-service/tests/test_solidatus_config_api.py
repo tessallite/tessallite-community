@@ -210,6 +210,70 @@ class TestUpdateSolidatusConfig:
             )
         assert resp.status_code == 404
 
+    @pytest.mark.anyio
+    async def test_explicit_null_clears_optional_field(self, client):
+        """Bug-6490: sending null for workspace_id / model_ref must clear them."""
+        conn_id = uuid.uuid4()
+        conn = _make_solidatus_connection(conn_id=conn_id)
+        # Verify the connection starts with non-null values
+        assert conn.workspace_id == "ws-123"
+        assert conn.model_ref == "tessallite-sales"
+
+        db = _setup_db_for_cud()
+        model = make_model()
+        db.get = AsyncMock(side_effect=lambda model_cls, pk: (
+            model if pk == TEST_MODEL_ID else conn
+        ))
+        db.commit = AsyncMock()
+
+        with patch("src.api.solidatus.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.solidatus.audit", new_callable=AsyncMock):
+            resp = await client.put(
+                f"{SOLIDATUS_PREFIX}/config/{conn_id}",
+                json={"workspace_id": None, "model_ref": None},
+            )
+        assert resp.status_code == 200, resp.text
+        # The mock connection object should have been mutated to None
+        assert conn.workspace_id is None, (
+            "workspace_id must be cleared when explicit null is sent"
+        )
+        assert conn.model_ref is None, (
+            "model_ref must be cleared when explicit null is sent"
+        )
+        data = resp.json()
+        assert data["workspace_id"] is None
+        assert data["model_ref"] is None
+
+    @pytest.mark.anyio
+    async def test_omitted_field_left_unchanged(self, client):
+        """Bug-6490: omitting workspace_id / model_ref must leave them unchanged."""
+        conn_id = uuid.uuid4()
+        conn = _make_solidatus_connection(conn_id=conn_id)
+        original_workspace = conn.workspace_id
+        original_model_ref = conn.model_ref
+
+        db = _setup_db_for_cud()
+        model = make_model()
+        db.get = AsyncMock(side_effect=lambda model_cls, pk: (
+            model if pk == TEST_MODEL_ID else conn
+        ))
+        db.commit = AsyncMock()
+
+        with patch("src.api.solidatus.get_tenant_db", async_gen_from(db)), \
+             patch("src.api.solidatus.audit", new_callable=AsyncMock):
+            # Only send display_name — workspace_id and model_ref are omitted
+            resp = await client.put(
+                f"{SOLIDATUS_PREFIX}/config/{conn_id}",
+                json={"display_name": "Renamed"},
+            )
+        assert resp.status_code == 200, resp.text
+        assert conn.workspace_id == original_workspace, (
+            "workspace_id must stay unchanged when omitted from payload"
+        )
+        assert conn.model_ref == original_model_ref, (
+            "model_ref must stay unchanged when omitted from payload"
+        )
+
 
 # ------------------------------------------------------------------ #
 # DELETE /config/{id}

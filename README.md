@@ -4,44 +4,42 @@ Tessallite is a self-hosted semantic layer and analytics platform: define each
 business metric once, govern who can see it, and serve the same trusted answer to
 Excel, BI tools, dashboards, applications, and AI data assistants.
 
-This repository is the **source-available Community Edition**. It is a developer
-source checkout — **not** the recommended way to install the product.
+This repository is the **source-available Community Edition**. It is for
+**inspection and review** of the public source. It is **not** an installer and
+it is **not** a runnable product checkout.
 
-## Install (recommended): the signed bundle
+## Install (supported): the signed bundle
 
-Most users should **not** build from source. Download the pre-built, signed
+Do not build this tree expecting a working stack. Download the pre-built, signed
 Community bundle and run it on your own server:
 
 - Download: https://tessallite.io/download.html
 - Get a free Community licence: https://tessallite.io/register.html
-- Install guide & docs: https://tessallite.io/help/index.html
+- Install guide: https://tessallite.io/help/install-local.html
 
-The bundle is self-contained (all images included), installs offline, and is
-verified by checksum and Ed25519 signature. See the download page for the exact
-`sha256sum -c` and signature-verification steps.
+The bundle is self-contained (images included), installs offline, and is
+verified by a detached checksum and Ed25519 signature **before** extraction.
+See the download page for the exact `sha256sum -c` and signature-verification
+steps.
 
-## What Community includes
+## What this source tree contains
 
-The full product — semantic modelling, Excel/XMLA and JDBC/BI access, the
-conversational agent (bring your own LLM key), acceleration, and the demo dataset.
-The limits are control-plane only:
+Public source for the React frontend (including `shared-ui`), the gateway shell
+and open routes, model-service APIs, the query-router parse/bind/security/
+source-rewrite path, agent-service, shared schemas, help, and Excel plugin
+source. Closed acceleration, optimizer, and licensing-guard components are
+**not** included.
 
-- 2 tenants (a built-in demo plus 1 of your own)
-- unlimited projects
-- 2 models total in your own tenant
-- 2 users
+This checkout does **not** ship Compose or Helm installers, the scheduler, or
+the signed images. Those live in the signed bundle. A source-only tree cannot
+start Tessallite; unavailable closed components are not a “degraded but running”
+mode.
 
-A licence unlocks more users and models plus enterprise packaging and support.
-See https://tessallite.io/pricing.html.
+## Source-only Docker builds (inspection, not the advertised install)
 
-## Developer source checkout
-
-This repo contains the open Community source: the React frontend, the gateway
-shell and open routes, model-service APIs, the query-router source/parse/bind/
-security/source-rewrite path, agent-service, shared schemas, and deployment
-descriptors. The closed acceleration/optimizer and the licensing/guard components
-are **not** included; in source-only mode those features report "component
-unavailable" and the product still runs against your configured sources.
+Closed modules are stripped from this tree. For review or CI you can `docker
+build` the generated source-only Dockerfiles (no Cython compile step). That is
+**not** the supported customer install — use the signed bundle above.
 
 ## Licence
 

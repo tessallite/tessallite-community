@@ -1,5 +1,6 @@
 import { Box, Button, Typography } from '@mui/material';
 import { tokens } from '../../theme';
+import { strings, templates } from '../../i18n/strings';
 
 interface InsertActionsProps {
   data: Record<string, unknown>[];
@@ -43,7 +44,7 @@ export default function InsertActions({
             sx={{ fontSize: 11, textTransform: 'none', ...recommendedStyle('table') }}
             onClick={onInsertTable}
           >
-            Insert Table
+            {strings.insertActions.insertTable}
           </Button>
         )}
         {onInsertChart && (
@@ -52,7 +53,7 @@ export default function InsertActions({
             sx={{ fontSize: 11, textTransform: 'none', ...recommendedStyle('chart') }}
             onClick={onInsertChart}
           >
-            Chart
+            {strings.insertActions.chart}
           </Button>
         )}
         {onLocalPivot && (
@@ -61,28 +62,28 @@ export default function InsertActions({
             sx={{ fontSize: 11, textTransform: 'none', ...recommendedStyle('pivot') }}
             onClick={onLocalPivot}
           >
-            Local Pivot
+            {strings.insertActions.localPivot}
           </Button>
         )}
         {onCubeFormulas && (
           <Button size="small" variant="outlined" sx={{ fontSize: 11, textTransform: 'none' }} onClick={onCubeFormulas}>
-            CUBE formulas
+            {strings.insertActions.cubeFormulas}
           </Button>
         )}
         {onLiveConnection && (
           <Button size="small" variant="outlined" sx={{ fontSize: 11, textTransform: 'none' }} onClick={onLiveConnection}>
-            Live connection
+            {strings.insertActions.liveConnection}
           </Button>
         )}
         {onShowQuery && (
           <Button size="small" variant="outlined" sx={{ fontSize: 11, textTransform: 'none', color: tokens.colorTextSecondary }} onClick={onShowQuery}>
-            Show Query
+            {strings.insertActions.showQuery}
           </Button>
         )}
       </Box>
       {rowCount > 0 && (
         <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, mt: 0.5 }}>
-          {rowCount} rows x {colCount} columns
+          {templates.insertActions.dimensions(rowCount, colCount)}
         </Typography>
       )}
     </Box>

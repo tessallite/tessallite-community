@@ -58,6 +58,30 @@ print(response.json())
 
 ---
 
+## Personal Access Tokens (for single sign-on users)
+
+If you sign in to Tessallite through single sign-on (SAML or OIDC), you do not have a password to type into a BI tool such as Excel or Power BI. Instead, generate a **Personal Access Token** and use it in place of the password.
+
+**How to create one:**
+
+1. Sign in to the Tessallite web app.
+2. Open the account menu (top right) and choose **Personal Access Tokens**.
+3. Click **Generate token**, give it a label (for example, "Excel on my laptop"), and optionally set an expiry.
+4. Copy the token immediately. It is shown **once** and cannot be retrieved again. Store it somewhere safe, like a password manager.
+
+**How to use one:**
+
+- In Excel (Analysis Services / XMLA), Power BI (PostgreSQL connector on port 5433), or any JDBC/SQL client, enter your Tessallite **email** as the username and the **token** as the password.
+- The token carries your own permissions. Revoking it, or deactivating your account, stops it working.
+
+**Managing tokens:** the same page lists your tokens (label, a masked preview, when each was created, and when it was last used) and lets you **revoke** any token. A revoked or expired token is refused on its next connection; a BI session already open ends within a short window.
+
+> A Personal Access Token is a secret, just like a password. Anyone who has it can query Tessallite as you until it is revoked or expires. Do not paste it into email, chat, or source code.
+
+Password users can also generate a token — it is a convenient way to connect a BI tool without embedding your account password in a connection string.
+
+---
+
 ## Common authentication errors
 
 | HTTP status | Meaning | Resolution |

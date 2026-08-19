@@ -7,7 +7,8 @@ SML uses a multi-file YAML layout:
     metrics/                      — simple metrics (calculation_method + column)
     calculations/                 — MDX/calculated metrics
     datasets/                     — table/column definitions
-    connections/                  — connection configs (ignored)
+    connections/                  — connection configs (schema/database/platform captured;
+                                     credentials are never present in an SML bundle)
 
 Produces a list of parsed structures that atscale_mapper.py then converts to
 Tessallite project bundles.
@@ -19,6 +20,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from shared.importers.import_warnings import (
+    ImportWarningResponse,
+    make_import_warning,
+)
 
 
 @dataclass
@@ -124,6 +130,12 @@ class SmlConnection:
     label: str = ""
     schema: str = ""
     database: str = ""
+    # Bug-5939 (F-020-03): AtScale's public SML spec does not settle on one
+    # canonical key for the underlying database platform across connector
+    # config blocks — capture whichever of these plausible keys is present
+    # (see `_parse_connection` below) so the mapper can attempt to preserve
+    # the real source type instead of always defaulting to postgresql.
+    platform: str = ""
 
 
 @dataclass
@@ -152,7 +164,7 @@ class SmlParseResult:
     calculations: list[SmlCalculation] = field(default_factory=list)
     connections: list[SmlConnection] = field(default_factory=list)
     row_security_rules: list[SmlRowSecurity] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[ImportWarningResponse] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -177,7 +189,11 @@ def parse_sml_project(files: dict[str, str]) -> SmlParseResult:
         try:
             docs = list(yaml.safe_load_all(content))
         except yaml.YAMLError:
-            result.warnings.append(f"Skipped {filepath}: invalid YAML")
+            result.warnings.append(make_import_warning(
+                code="atscale.file_skipped",
+                params={"file": filepath, "reason": "invalid_yaml"},
+                detail=f"Skipped {filepath}: invalid YAML",
+            ))
             continue
 
         for doc in docs:
@@ -200,9 +216,14 @@ def parse_sml_project(files: dict[str, str]) -> SmlParseResult:
         deduped: list[SmlModel] = []
         for m in result.models:
             if m.unique_name in seen:
-                result.warnings.append(
-                    f"Duplicate model '{m.unique_name}' — keeping first occurrence"
-                )
+                result.warnings.append(make_import_warning(
+                    code="atscale.duplicate_model_ignored",
+                    params={"model": m.unique_name},
+                    detail=(
+                        f"Duplicate model '{m.unique_name}' — keeping first "
+                        "occurrence"
+                    ),
+                ))
             else:
                 seen[m.unique_name] = len(deduped)
                 deduped.append(m)
@@ -255,16 +276,41 @@ def _dispatch_object(
             label=doc.get("label", ""),
             schema=doc.get("schema", ""),
             database=doc.get("database", ""),
+            # Bug-5939: `as_connection` is the confirmed real-world AtScale
+            # SML key for the platform/connection-pool name — see the
+            # shipped example fixture
+            # docs/strategy/competitive-analysis/atscale/sml-models-crisp-cpg-retail/connections/Connection - Crisp.yml,
+            # which has ``as_connection: Databricks``. Other spellings are
+            # kept as fallbacks for connector/version variance; the
+            # mapper's keyword heuristic (matching unique_name/label text)
+            # is the last resort when none of these are present.
+            platform=str(
+                doc.get("as_connection")
+                or doc.get("platform")
+                or doc.get("type")
+                or doc.get("adapter")
+                or doc.get("database_platform")
+                or doc.get("connection_type")
+                or ""
+            ),
         ))
     elif obj_type == "row_security":
         _parse_row_security(doc, result)
     elif obj_type in ("composite_model", "package"):
-        result.warnings.append(
-            f"Object type '{obj_type}' in {filepath} is not imported — "
-            f"review manually after import"
-        )
+        result.warnings.append(make_import_warning(
+            code="atscale.object_type_unsupported",
+            params={"object_type": obj_type, "file": filepath},
+            detail=(
+                f"Object type '{obj_type}' in {filepath} is not imported — "
+                "review manually after import"
+            ),
+        ))
     else:
-        result.warnings.append(f"Unknown object_type '{obj_type}' in {filepath}")
+        result.warnings.append(make_import_warning(
+            code="atscale.object_type_unknown",
+            params={"object_type": str(obj_type), "file": filepath},
+            detail=f"Unknown object_type '{obj_type}' in {filepath}",
+        ))
 
 
 def _parse_model(doc: dict[str, Any], result: SmlParseResult) -> None:
@@ -408,7 +454,11 @@ def _parse_metric(doc: dict[str, Any], result: SmlParseResult) -> None:
 def _parse_row_security(doc: dict[str, Any], result: SmlParseResult) -> None:
     name = doc.get("unique_name", "")
     if not name:
-        result.warnings.append("row_security entry missing 'unique_name' — skipped")
+        result.warnings.append(make_import_warning(
+            code="atscale.row_security_skipped",
+            params={"reason": "missing_unique_name"},
+            detail="row_security entry missing 'unique_name' — skipped",
+        ))
         return
     result.row_security_rules.append(SmlRowSecurity(
         unique_name=name,
@@ -416,10 +466,14 @@ def _parse_row_security(doc: dict[str, Any], result: SmlParseResult) -> None:
         dimension=doc.get("dimension", ""),
         attribute=doc.get("attribute", ""),
     ))
-    result.warnings.append(
-        f"Row security rule '{name}' found — imported model requires manual "
-        f"security configuration in Tessallite before use"
-    )
+    result.warnings.append(make_import_warning(
+        code="atscale.row_security_manual",
+        params={"rule": name},
+        detail=(
+            f"Row security rule '{name}' found — imported model requires manual "
+            "security configuration in Tessallite before use"
+        ),
+    ))
 
 
 def _parse_calculation(doc: dict[str, Any], result: SmlParseResult) -> None:

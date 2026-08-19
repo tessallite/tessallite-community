@@ -70,6 +70,42 @@ class TestAuditLogger:
         db.add.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "configured_level,severity,should_write",
+        [
+            ("off", "critical", False),
+            ("warn", "info", False),
+            ("warn", "warn", True),
+            ("critical", "warn", False),
+            ("critical", "critical", True),
+        ],
+    )
+    async def test_audit_honors_scalar_log_level_registry_value(
+        self, configured_level, severity, should_write
+    ):
+        """Bug-5946: audit.log_level may be stored as a scalar string in
+        TenantSetting.value_json; the writer must honor it."""
+        from shared.audit.logger import audit
+
+        db = make_mock_db()
+        setting_result = MagicMock()
+        setting_result.scalar_one_or_none.return_value = configured_level
+        db.execute = AsyncMock(return_value=setting_result)
+
+        event = await audit(
+            db,
+            action="audit.scalar-level",
+            severity=severity,
+            actor_email="user@test.com",
+        )
+
+        assert (event is not None) is should_write
+        if should_write:
+            db.add.assert_called_once()
+        else:
+            db.add.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_audit_info_suppressed_at_critical_level(self):
         from shared.audit.logger import audit
 
@@ -195,6 +231,85 @@ class TestAuditLogger:
         assert event is None
 
 
+class TestAuditRequiredFailsClosed:
+    """F-022-02: a protected mutation must not commit when its required audit
+    evidence cannot be persisted. ``audit_required`` raises AuditWriteError on a
+    write failure (so the enclosing transaction rolls back), while the fail-open
+    ``audit`` keeps swallowing errors for informational events.
+
+    Test escape: no prior test simulated an audit write failure, so the fail-open
+    swallow silently dropped evidence for successful security mutations.
+    Guard: ``audit_required`` raises; producers call it before ``db.commit()``.
+    Tier: T1 (producer/consumer safety contract).
+    """
+
+    @pytest.mark.asyncio
+    async def test_audit_required_raises_on_write_failure(self):
+        from shared.audit.logger import audit_required, AuditWriteError
+
+        db = make_mock_db()
+        # Gating read succeeds (info level), but the flush that persists the row
+        # fails — the only durable evidence would be lost.
+        setting_result = MagicMock()
+        setting_result.scalar_one_or_none.return_value = "info"
+        db.execute = AsyncMock(return_value=setting_result)
+        db.flush = AsyncMock(side_effect=Exception("disk full"))
+
+        with pytest.raises(AuditWriteError):
+            await audit_required(
+                db, action="connection.update", severity="warn",
+                actor_email="admin@test.com",
+                target_type="connection",
+            )
+
+    @pytest.mark.asyncio
+    async def test_audit_required_writes_when_gated_off(self):
+        """F-022-07: required events still persist when audit.log_level is off."""
+        from shared.audit.logger import audit_required
+
+        db = make_mock_db()
+        setting_result = MagicMock()
+        setting_result.scalar_one_or_none.return_value = "off"
+        db.execute = AsyncMock(return_value=setting_result)
+
+        event = await audit_required(
+            db, action="connection.update", severity="warn",
+            actor_email="admin@test.com",
+        )
+        assert event is not None
+        db.add.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_audit_required_writes_normally_on_success(self):
+        from shared.audit.logger import audit_required
+
+        db = make_mock_db()
+        setting_result = MagicMock()
+        setting_result.scalar_one_or_none.return_value = "info"
+        db.execute = AsyncMock(return_value=setting_result)
+
+        event = await audit_required(
+            db, action="connection.update", severity="warn",
+            actor_email="admin@test.com", target_type="connection",
+        )
+        assert event is not None
+        db.add.assert_called_once()
+        db.flush.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_plain_audit_still_swallows(self):
+        """The fail-open variant is unchanged for informational events."""
+        from shared.audit.logger import audit
+
+        db = make_mock_db()
+        db.execute = AsyncMock(side_effect=Exception("DB down"))
+        event = await audit(
+            db, action="model.read", severity="info",
+            actor_email="user@test.com",
+        )
+        assert event is None
+
+
 # ---------------------------------------------------------------------------
 # Audit API tests
 # ---------------------------------------------------------------------------
@@ -293,6 +408,35 @@ class TestAuditApi:
         assert data["items"][0]["action"] == "model.create"
 
     @pytest.mark.asyncio
+    async def test_list_audit_actions_returns_distinct(self, admin_user):
+        """F-022-15: the action picker is a distinct catalogue, not the current page."""
+        db = make_mock_db()
+        rows_result = MagicMock()
+        rows_result.scalars.return_value.all.return_value = [
+            "auth.login_success",
+            "user.update",
+        ]
+        db.execute = AsyncMock(return_value=rows_result)
+
+        with patch("src.api.audit.get_tenant_db", async_gen_from(db)):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as client:
+                resp = await client.get("/api/v1/admin/audit-events/actions")
+
+        assert resp.status_code == 200
+        assert resp.json() == ["auth.login_success", "user.update"]
+
+    def test_actor_email_filter_is_case_insensitive(self):
+        """F-022-19: Admin@… must match the stored canonical actor email."""
+        from src.api.audit import _build_query
+
+        stmt = _build_query(actor_email="Admin@Example.COM")
+        compiled = str(stmt.compile())
+        assert "lower" in compiled.lower()
+
+    @pytest.mark.asyncio
     async def test_export_csv(self, admin_user):
         db = make_mock_db()
 
@@ -351,7 +495,8 @@ class TestAuditPurge:
         with patch.object(purge_mod, "get_setting", AsyncMock(return_value=90)):
             purged = await purge_mod.purge_audit_events(db)
         assert purged == 5
-        db.commit.assert_awaited_once()
+        # Batch delete commits once; G-022-06 then writes audit.purge and commits.
+        assert db.commit.await_count == 2
 
     @pytest.mark.asyncio
     async def test_purge_skips_indefinite_retention(self):

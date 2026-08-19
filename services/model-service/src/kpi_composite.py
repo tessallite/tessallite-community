@@ -71,6 +71,15 @@ class ChildScore:
     # (surfaced as ``degraded`` on the parent) from a silent no-data
     # exclusion (unchanged behaviour).
     error_reason: Optional[str] = None
+    # Bug-8449 (Codex gate finding 6): the child produced no value because ROW
+    # SECURITY denied the caller every row, not because it has no data. A
+    # restricted child must NOT be silently excluded with its weight
+    # redistributed over the visible children -- that renormalisation silently
+    # changes what the composite MEANS and presents the result as a complete,
+    # authoritative score. Measured before the fix: one restricted child plus
+    # one visible child returned score=50.0, status='ok', with the visible
+    # child renormalised to 100% weight.
+    restricted: bool = False
     # F-017-09: per-child min_max bounds derived from the child's trailing
     # snapshots when the composite has no explicit normalisation_min/max.
     # Spec 9.1 mandates a historical-bounds fallback so a min_max composite
@@ -83,6 +92,12 @@ class ChildScore:
 COMPOSITE_STATUS_OK = "ok"
 COMPOSITE_STATUS_DEGRADED = "degraded"
 COMPOSITE_STATUS_ERROR = "error"
+# Bug-8449 (Codex gate finding 6): at least one child is row-security
+# RESTRICTED, so no complete score can be produced for this caller. Distinct
+# from ``error`` (a broken input) -- nothing is broken, the caller simply may
+# not see part of the composite inputs. The score is None: a partial score
+# over the visible subset would be a silently wrong number.
+COMPOSITE_STATUS_RESTRICTED = "restricted"
 
 
 @dataclass
@@ -107,7 +122,8 @@ class CompositeResult:
     total_weight_after: float = 0.0
     # Bug-4255: health of the composite given its children's evaluation.
     # ``ok`` — no child errored; ``degraded`` — score computed but at least
-    # one child errored; ``error`` — every child errored (score is None).
+    # one child errored; ``error`` — every child errored; ``restricted`` — at
+    # least one child was denied by row security (score is None).
     status: str = COMPOSITE_STATUS_OK
     errored_children: list[ErroredChild] = field(default_factory=list)
 
@@ -134,14 +150,32 @@ def normalise_pct_target(
         return None
 
     if direction == "lower_is_better":
-        if value == 0:
+        if value <= 0 and target > 0:
+            # Bug-7223: value at or below zero for a lower-is-better KPI is
+            # the best possible outcome (e.g. negative cost = credit).  The
+            # ratio target/value is undefined (div-by-zero) or negative,
+            # which would floor-clamp to 0 and misclassify a best-case as
+            # worst-case.  Return 100 (perfect composite contribution).
             return 100.0
+        if value <= 0 and target <= 0:
+            # Bug-7223 R1: both negative — lower is still better. Use
+            # value/target: when value is more negative than target (better),
+            # ratio > 1 (clamped to 100%); when less negative (worse), < 1.
+            # Guard div-by-zero.
+            if target == 0:
+                return None
+            return max(0.0, min(100.0, (value / target) * 100.0))
         return max(0.0, min(100.0, (target / value) * 100.0))
 
     if direction == "closer_is_better":
         return max(0.0, min(100.0, (1.0 - abs(value - target) / abs(target)) * 100.0))
 
-    return min(100.0, (value / target) * 100.0)
+    # Bug-6254: higher_is_better must be floor-clamped like the other two
+    # directions. A negative value against a positive target (e.g. negative
+    # profit) yields a negative percentage; without the max(0.0, ...) floor the
+    # composite score escapes the documented [0, 100] contract and drags the
+    # weighted mean below zero.
+    return max(0.0, min(100.0, (value / target) * 100.0))
 
 
 def normalise_min_max(
@@ -241,6 +275,38 @@ def evaluate_composite(
     """
     total_weight_before = sum(c.weight for c in children)
 
+    # Bug-8449 (Codex gate finding 6): a row-security restriction on ANY child
+    # is decided BEFORE normalisation, because the failure mode is precisely
+    # that the restricted child looks like an ordinary null, gets excluded, and
+    # has its weight renormalised into a complete-looking score.
+    restricted_children = [c for c in children if c.restricted]
+    errored_children = [
+        ErroredChild(
+            kpi_id=c.kpi_id,
+            kpi_name=c.kpi_name,
+            error_reason=c.error_reason or "evaluation_failed",
+        )
+        for c in children
+        if c.error_reason is not None
+    ]
+
+    if restricted_children:
+        # Decide before normalising any visible child so no partial score or
+        # derived child contribution is produced and then discarded.
+        for child in restricted_children:
+            child.excluded = True
+            child.exclude_reason = "row_security_restricted"
+            child.normalised = None
+        return CompositeResult(
+            composite_score=None,
+            children=children,
+            normalisation_method=normalisation_method,
+            total_weight_before=total_weight_before,
+            total_weight_after=0.0,
+            status=COMPOSITE_STATUS_RESTRICTED,
+            errored_children=errored_children,
+        )
+
     # Step 1: Normalise each child
     for child in children:
         if child.error_reason is not None:
@@ -285,18 +351,6 @@ def evaluate_composite(
                     child.target,
                     child.direction,
                 )
-
-    # Bug-4255: collect children whose evaluation genuinely failed (not
-    # no-data). These drive the parent's degraded/error signal.
-    errored_children = [
-        ErroredChild(
-            kpi_id=c.kpi_id,
-            kpi_name=c.kpi_name,
-            error_reason=c.error_reason or "evaluation_failed",
-        )
-        for c in children
-        if c.error_reason is not None
-    ]
 
     # Step 2: Re-normalise weights over non-excluded children
     normalise_weights(children)
@@ -367,7 +421,8 @@ def build_composite_children(
         should have ``value`` and ``target`` keys, and may carry an
         ``error_reason`` (Bug-4255) when the child's evaluation failed — that
         reason flags the parent as degraded instead of silently excluding the
-        child as no-data.
+        child as no-data. ``restricted`` (Bug-8449) identifies a governance
+        denial that must fail the whole composite closed.
 
     Returns
     -------
@@ -391,6 +446,7 @@ def build_composite_children(
             weight=kpi.get("weight") or 1.0,
             direction=kpi.get("direction", "higher_is_better"),
             error_reason=cached.get("error_reason"),
+            restricted=bool(cached.get("restricted", False)),
         ))
 
     return children

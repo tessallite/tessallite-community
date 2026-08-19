@@ -9,7 +9,11 @@ from pydantic import BaseModel, field_validator
 
 from shared.config.resolver import get_setting, set_setting
 from shared.db.session import get_tenant_db
-from src.auth.middleware import CurrentUser, get_current_user, require_tenant_admin
+from src.auth.middleware import (
+    CurrentUser,
+    require_human_user,
+    require_tenant_admin,
+)
 
 router = APIRouter(prefix="/tenants/{tenant_id}/branding", tags=["branding"])
 
@@ -85,8 +89,14 @@ def _assert_own_tenant(tenant_id: str, current_user: CurrentUser) -> None:
 @router.get("", response_model=BrandingConfig)
 async def get_branding(
     tenant_id: str,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_human_user),
 ) -> BrandingConfig:
+    # Bug-7441: branding is a tenant management/config surface. The PUT already
+    # requires a tenant admin (embed tokens rejected); the GET must likewise
+    # reject embed tokens so an embed session cannot read the tenant's branding
+    # config, keeping read/write access on this surface consistent (the same
+    # embed-forbidden invariant applied to sibling per-user library reads,
+    # Bug-6423). ``_assert_own_tenant`` still enforces the tenant match.
     _assert_own_tenant(tenant_id, current_user)
     async for db in get_tenant_db(current_user.tenant_id):
         return BrandingConfig(
@@ -126,5 +136,14 @@ async def update_branding(
                     tenant_session=db, tenant_scope=True,
                 )
         await db.commit()
-        return body
+        # Bug-5837: re-read persisted values from DB instead of echoing
+        # the submitted body, so the response reflects the actual stored
+        # state (e.g. after any coercion or default resolution).
+        return BrandingConfig(
+            logo_url=await get_setting("branding.logo_url", tenant_session=db),
+            primary_color=await get_setting("branding.primary_color", tenant_session=db),
+            secondary_color=await get_setting("branding.secondary_color", tenant_session=db),
+            font_family=await get_setting("branding.font_family", tenant_session=db),
+            app_title=await get_setting("branding.app_title", tenant_session=db),
+        )
     raise HTTPException(status_code=500, detail="DB session exhausted")

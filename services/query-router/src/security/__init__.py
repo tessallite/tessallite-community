@@ -8,14 +8,18 @@ from shared.security import (
     CompiledPredicate,
     Principal,
     RowSecurityCompileError,
+    RowSecurityDialectError,
     compile_row_security,
     has_active_rules,
+    render_predicate_for_dialect,
 )
 
 __all__ = [
     "CompiledPredicate",
     "Principal",
     "RowSecurityCompileError",
+    "RowSecurityDialectError",
     "compile_row_security",
     "has_active_rules",
+    "render_predicate_for_dialect",
 ]

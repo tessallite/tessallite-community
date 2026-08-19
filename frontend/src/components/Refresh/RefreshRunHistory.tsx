@@ -8,6 +8,7 @@ import {
 } from "@mui/material";
 import { statusColor } from "../../theme/tokens";
 import { useT } from "../../i18n";
+import { runStatusLabel } from "../../utils/runStatus";
 
 interface Run {
   id: string;
@@ -55,8 +56,15 @@ export default function RefreshRunHistory({ runs, limit = 5 }: Props) {
       case "in_progress":
       case "running":
         return t("refreshHistory.running");
-      default:
-        return status.charAt(0).toUpperCase() + status.slice(1);
+      default: {
+        // F-559-04: the shared run-status labels cover the statuses this
+        // panel's own keys do not (notably "queued"). Anything neither knows
+        // keeps the original capitalised passthrough rather than a raw key.
+        const shared = runStatusLabel(status, t);
+        return shared === status
+          ? status.charAt(0).toUpperCase() + status.slice(1)
+          : shared;
+      }
     }
   }
 

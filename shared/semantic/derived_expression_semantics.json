@@ -1,0 +1,119 @@
+{
+  "registry_version": "v0",
+  "_comment": "Function-semantics registry for derived-grain aggregate routing (spec section 6.2). DATA, not connector if-branches. Deliberately small in v1 (spec section 6.2: 'start with a deliberately small exact registry ... Breadth is added by theorem and known-answer tests, not by optimistic allow-listing'). Each entry declares the semantic function id, the sqlglot node/function aliases that canonicalise to it, input/output type signatures, volatility, totality, NULL behaviour, collation/timezone dependencies, exact source/target dialect profiles, and (later phases) derivation theorems. Unknown functions are SOURCE_ONLY by omission. No derivation theorems are enabled yet: capture + canonicalisation only.",
+  "functions": {
+    "timestamp_trunc": {
+      "_comment": "sqlglot TimestampTrunc node (key 'timestamptrunc'). PostgreSQL DATE_TRUNC('month', ts) and BigQuery TIMESTAMP_TRUNC(ts, MONTH) both parse to this node. It truncates a TIMESTAMP. It is kept DISTINCT from date_trunc (the DATE-typed BigQuery DATE_TRUNC node) because the two are different typed operations with different input-type / timezone semantics (spec I5): the pre-binding fingerprint must NOT merge them. Any cross-node semantic equality is a later-phase registry theorem gated on the bound SemanticContext, never an accidental alias fold here.",
+      "aliases": ["timestamptrunc"],
+      "inputs": ["str_unit", "timestamp"],
+      "output": "timestamp",
+      "volatility": "IMMUTABLE",
+      "totality": "TOTAL",
+      "null_behavior": "NULL_IN_NULL_OUT",
+      "timezone_dependent": true,
+      "collation_dependent": false,
+      "timezone_policy": "REQUIRE_EXPLICIT_OR_MODEL_SEMANTIC_TIMEZONE",
+      "certified_profiles": [],
+      "theorems": []
+    },
+    "date_trunc": {
+      "_comment": "sqlglot DateTrunc node (key 'datetrunc'), e.g. BigQuery DATE_TRUNC(date_col, MONTH) over a DATE. Distinct from timestamp_trunc; truncates a DATE. Kept separate per spec I5 so a DATE truncation never fingerprint-collides with a TIMESTAMP truncation before binding.",
+      "aliases": ["datetrunc"],
+      "inputs": ["str_unit", "date"],
+      "output": "date",
+      "volatility": "IMMUTABLE",
+      "totality": "TOTAL",
+      "null_behavior": "NULL_IN_NULL_OUT",
+      "timezone_dependent": false,
+      "collation_dependent": false,
+      "timezone_policy": "REQUIRE_EXPLICIT_OR_MODEL_SEMANTIC_TIMEZONE",
+      "certified_profiles": [],
+      "theorems": []
+    },
+    "upper": {
+      "aliases": ["upper"],
+      "inputs": ["text"],
+      "output": "text",
+      "volatility": "IMMUTABLE",
+      "totality": "TOTAL",
+      "null_behavior": "NULL_IN_NULL_OUT",
+      "timezone_dependent": false,
+      "collation_dependent": true,
+      "certified_profiles": [],
+      "theorems": []
+    },
+    "lower": {
+      "aliases": ["lower"],
+      "inputs": ["text"],
+      "output": "text",
+      "volatility": "IMMUTABLE",
+      "totality": "TOTAL",
+      "null_behavior": "NULL_IN_NULL_OUT",
+      "timezone_dependent": false,
+      "collation_dependent": true,
+      "certified_profiles": [],
+      "theorems": []
+    },
+    "coalesce": {
+      "aliases": ["coalesce"],
+      "inputs": ["any"],
+      "output": "any",
+      "volatility": "IMMUTABLE",
+      "totality": "TOTAL",
+      "null_behavior": "COALESCE",
+      "timezone_dependent": false,
+      "collation_dependent": false,
+      "certified_profiles": [],
+      "theorems": []
+    },
+    "nullif": {
+      "aliases": ["nullif"],
+      "inputs": ["any", "any"],
+      "output": "any",
+      "volatility": "IMMUTABLE",
+      "totality": "TOTAL",
+      "null_behavior": "NULLIF",
+      "timezone_dependent": false,
+      "collation_dependent": false,
+      "certified_profiles": [],
+      "theorems": []
+    },
+    "case": {
+      "aliases": ["case", "if"],
+      "inputs": ["bool", "any"],
+      "output": "any",
+      "volatility": "IMMUTABLE",
+      "totality": "GUARDED",
+      "null_behavior": "3VL",
+      "timezone_dependent": false,
+      "collation_dependent": false,
+      "certified_profiles": [],
+      "theorems": []
+    },
+    "cast": {
+      "aliases": ["cast"],
+      "inputs": ["any", "type"],
+      "output": "type",
+      "volatility": "IMMUTABLE",
+      "totality": "MAY_ERROR",
+      "null_behavior": "NULL_IN_NULL_OUT",
+      "timezone_dependent": false,
+      "collation_dependent": false,
+      "certified_profiles": [],
+      "theorems": []
+    },
+    "try_cast": {
+      "_comment": "TRY_CAST / SAFE_CAST returns NULL on invalid input rather than erroring. It has DIFFERENT null/error semantics from CAST (spec I5/I6), so it must NOT share CAST's identity — a folding of the two would let an errorable CAST fingerprint-match a NULL-returning TRY_CAST and change grouping/predicate behaviour.",
+      "aliases": ["trycast", "try_cast", "safe_cast"],
+      "inputs": ["any", "type"],
+      "output": "type",
+      "volatility": "IMMUTABLE",
+      "totality": "GUARDED",
+      "null_behavior": "NULL_ON_ERROR",
+      "timezone_dependent": false,
+      "collation_dependent": false,
+      "certified_profiles": [],
+      "theorems": []
+    }
+  }
+}

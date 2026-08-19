@@ -25,7 +25,7 @@ export async function executeQuery(
     measures: query.measures,
     dimensions: query.dimensions,
     filters: query.filters?.map(f => ({
-      dimension: f.member,
+      dimension: f.dimension,
       operator: f.operator,
       values: f.values,
     })),

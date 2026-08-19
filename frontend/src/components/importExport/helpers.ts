@@ -1,5 +1,12 @@
 import type { ConnectionStub, ExportBundle } from "../../api/importExportApi";
 
+// Bug-6292: the on-disk model export file is the bundle plus the authoritative
+// connection stub list. Older exports omit `connections_required`; those fall
+// back to deriving stubs from the snapshot.
+export type ModelExportFile = ExportBundle & {
+  connections_required?: ConnectionStub[];
+};
+
 export function readFileAsText(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const r = new FileReader();
@@ -45,6 +52,29 @@ export function extractStubsFromBundle(bundle: ExportBundle): ConnectionStub[] {
     }
   }
   return out;
+}
+
+// Bug-6292: prefer the authoritative connection stub list embedded at export
+// time. It carries the real ProjectConnection.connection_type, whereas the
+// snapshot only records the source_type/target_type vocabulary
+// (jdbc/tessallite_passthrough), which does not match a local connection's
+// connection_type (postgresql/hadoop_spark/...) — so re-deriving from the
+// snapshot makes the import dialog's compatibility filter reject every local
+// connection and dead-end the rebind. Only fall back to snapshot derivation
+// for older files that predate the embedded list.
+export function stubsFromExportFile(file: ModelExportFile): ConnectionStub[] {
+  const embedded = file.connections_required;
+  if (Array.isArray(embedded)) {
+    return embedded
+      .filter((s) => s && typeof s.id === "string" && s.id.length > 0)
+      .map((s) => ({
+        id: s.id,
+        role: s.role === "target" ? "target" : "source",
+        display_name: s.display_name ?? null,
+        connection_type: s.connection_type ?? null,
+      }));
+  }
+  return extractStubsFromBundle(file);
 }
 
 export const SECTION_KEYS = [

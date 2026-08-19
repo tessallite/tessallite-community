@@ -34,11 +34,11 @@
 <p>If you open the <strong>Predictive</strong> tab on a model that has no source statistics yet, the panel now shows an explicit warning — <em>"No source statistics have been collected for this model yet. Refresh source statistics before deploying or building predictive aggregates."</em> — instead of an empty "no candidates" message. This distinguishes the two states that previously looked identical: "statistics exist, but nothing is worth building" versus "the predictor simply has nothing to work with yet". If you see the warning, recompute statistics first.</p>
 <h3>2. The scorer</h3>
 <p>The scorer (<code>predictive_scorer.py</code>) is a pure function. Given the statistics plus your model metadata (dimensions and measures), it ranks plausible aggregates — single dimensions, pairs, and triples — by a benefit-over-cost formula:</p>
-<pre><code>expected_hit_rate × row_reduction
-─────────────────────────────────
-   build_cost × storage_cost</code></pre>
+<pre><code>heuristic_reuse_score × row_reduction
+─────────────────────────────────────
+     build_cost × storage_cost</code></pre>
 <p><code>row_reduction</code> is the ratio of source rows to the aggregate&#x27;s estimated rows — a <em>multiplier</em> (for example, ten million rows collapsing to two hundred is a 50,000× reduction). The preview shows it with a <code>×</code> suffix, not as a percentage. Candidates whose grain would exceed 50% of the source cardinality are rejected outright (there is no worthwhile reduction there). Each candidate carries a rationale string that explains why it ranked where it did.</p>
-<p>The displayed <code>score</code> is a small benefit-density number, useful for <em>ranking</em> candidates relative to one another rather than as an absolute percentage. The <code>expected_hit_rate</code> shown is a heuristic assumption (it rises with the number of measures sharing the grain), not a measured hit rate — treat it as a planning estimate, not evidence.</p>
+<p>The displayed <code>score</code> is a small benefit-density number, useful for <em>ranking</em> candidates relative to one another rather than as an absolute percentage. The <code>heuristic_reuse_score</code> shown (labelled <strong>Reuse heuristic</strong> in the preview) is a cardinality-based assumption — it rises with the number of measures sharing the grain — <strong>not</strong> a measured or predicted hit rate. Treat it as a planning estimate, not evidence.</p>
 <h3>3. Auto-build sweep (hourly cron)</h3>
 <p>An <strong>hourly</strong> background sweep (<code>predictive_build_sweep</code>) walks every active tenant and looks for models where:</p>
 <ul><li>the model has a deployed version,</li><li>aggregations are enabled,</li><li>approval is <strong>not</strong> required (auto-approve mode — the default),</li><li>the deployed version has not already been processed by the predictor.</li></ul>

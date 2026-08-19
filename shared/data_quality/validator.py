@@ -7,15 +7,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
 
 import httpx
-from jose import jwt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.auth.service_principal import SCOPE_DATA_QUALITY, create_service_access_token
 from shared.config.settings import get_settings
 from shared.connector_qualify import quote_identifier, quote_table_ref, transpile_preview_sql
 from shared.db.models import (
@@ -47,13 +47,13 @@ class _Violation:
 
 def _mint_service_token(tenant_id: str) -> str:
     """Mint a short-lived JWT for service-to-service /introspect calls."""
-    payload = {
-        "sub": "service:data-quality-validator",
-        "tenant_id": tenant_id,
-        "role": "system_admin",
-        "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
-    }
-    return jwt.encode(payload, _settings.JWT_SECRET_KEY, algorithm=_settings.JWT_ALGORITHM)
+    return create_service_access_token(
+        principal="data-quality-validator",
+        tenant_id=tenant_id,
+        role="system_admin",
+        ttl_minutes=5,
+        scopes=[SCOPE_DATA_QUALITY],
+    )
 
 
 def _escape_sql_string(value: str) -> str:

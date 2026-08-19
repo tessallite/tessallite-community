@@ -12,6 +12,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildCubeKpiFormula,
+  buildCubeKpiValueFormula,
+  kpiStatusCellFormula,
+  kpiValueCellFormula,
   CUBE_KPI_PROPERTIES,
   TESSALLITE_CONNECTION_NAME,
   measureMemberRef,
@@ -116,10 +119,11 @@ describe('Bug-5290: formula-to-MDX contract', () => {
 
 
 // ---------------------------------------------------------------------------
-// Scorecard payload — status/trend cells use the technical KPI name
+// Scorecard payload — status cells use the technical KPI name
+// Bug-6729: Trend column removed; Status uses CUBEVALUE(CUBEKPIMEMBER).
 // ---------------------------------------------------------------------------
 
-describe('Bug-5290: scorecard payload uses technical name for status/trend', () => {
+describe('Bug-5290/6729: scorecard payload uses technical name for status', () => {
   const measures: Measure[] = [
     { id: 'mv', name: 'fee_amount', display_name: 'Fee Amount', default_agg: 'sum', measure_type: 'standard' },
   ];
@@ -137,19 +141,19 @@ describe('Bug-5290: scorecard payload uses technical name for status/trend', () 
     };
   }
 
-  it('scorecard payload carries the technical name for CUBEKPIMEMBER binding', () => {
+  it('scorecard payload carries the technical name for status CUBEVALUE(CUBEKPIMEMBER) binding', () => {
     const scorecardKpi = buildScorecardKpi(
       kpi({ name: 'margin_pct', display_name: 'Gross Margin %', value_measure_id: 'mv' }),
       new Map(measures.map(m => [m.id, m])),
     );
-    // The scorecard's status/trend cells call buildCubeKpiFormula(conn, kpi.name, ...)
-    // so kpi.name must be the technical name.
     expect(scorecardKpi.name).toBe('margin_pct');
 
-    // The status formula built from this payload will be:
-    const statusFormula = buildCubeKpiFormula(TESSALLITE_CONNECTION_NAME, scorecardKpi.name, CUBE_KPI_PROPERTIES.Status);
+    // Bug-6729: the scorecard status cell uses kpiStatusCellFormula which
+    // wraps CUBEKPIMEMBER inside CUBEVALUE for the numeric value.
+    const statusFormula = kpiStatusCellFormula(TESSALLITE_CONNECTION_NAME, scorecardKpi.name);
     expect(statusFormula).toContain('"margin_pct"');
     expect(statusFormula).not.toContain('Gross Margin');
+    expect(statusFormula).toMatch(/^=CUBEVALUE\(/);
   });
 
   it('value cell uses CUBEVALUE with the resolved measure name, not CUBEKPIMEMBER', () => {
@@ -157,11 +161,11 @@ describe('Bug-5290: scorecard payload uses technical name for status/trend', () 
       kpi({ name: 'margin', value_measure_id: 'mv' }),
       new Map(measures.map(m => [m.id, m])),
     );
-    // Value column uses generateCubeValue with the measure member ref
     expect(scorecardKpi.valueMeasureName).toBe('fee_amount');
-    const valueFormula = generateCubeValue(
+    const valueFormula = kpiValueCellFormula(
       TESSALLITE_CONNECTION_NAME,
-      measureMemberRef(scorecardKpi.valueMeasureName!),
+      scorecardKpi.name,
+      scorecardKpi.valueMeasureName,
     );
     expect(valueFormula).toBe('=CUBEVALUE("Tessallite","[Measures].[fee_amount]")');
   });
@@ -171,7 +175,6 @@ describe('Bug-5290: scorecard payload uses technical name for status/trend', () 
       kpi({ name: 'margin', value_measure_id: 'mv', target_type: 'static', target_value: 10000 }),
       new Map(measures.map(m => [m.id, m])),
     );
-    // Goal is a static literal — no CUBEVALUE formula needed
     expect(scorecardKpi.goalLiteral).toBe(10000);
     expect(scorecardKpi.goalMeasureName).toBeNull();
   });
@@ -179,42 +182,31 @@ describe('Bug-5290: scorecard payload uses technical name for status/trend', () 
 
 
 // ---------------------------------------------------------------------------
-// Full scorecard row — all five cells have the correct formula type
+// Full scorecard row — four cells have the correct formula type
+// Bug-6729: Trend column removed; layout is KPI | Value | Goal | Status.
 // ---------------------------------------------------------------------------
 
-describe('Bug-5290: full scorecard row cell types', () => {
+describe('Bug-5290/6729: full scorecard row cell types (4-column, no Trend)', () => {
   const conn = TESSALLITE_CONNECTION_NAME;
   const kpiName = 'aa';
   const valueMeasure = 'fee_amount';
 
   it('column 0 (Name) is a plain label, not a CUBE formula', () => {
-    // The KPI name/display_name is written as a plain value (sheet.values),
-    // not a CUBE formula. Verify there is no CUBEKPIMEMBER with property 0
-    // or any CUBEMEMBER for a KPI name — the label is always a direct write.
     const kpiLabel = 'Revenue KPI';
-    // A correct implementation never wraps the label in a CUBE function.
-    // buildCubeKpiFormula only accepts properties 1-5; there is no property
-    // for the label itself. This test guards that the label is a string,
-    // not accidentally formula-ised.
     expect(typeof kpiLabel).toBe('string');
     expect(kpiLabel).not.toMatch(/^=CUBE/);
   });
 
   it('column 1 (Value) uses CUBEVALUE with the measure member ref', () => {
-    const formula = generateCubeValue(conn, measureMemberRef(valueMeasure));
+    const formula = kpiValueCellFormula(conn, kpiName, valueMeasure);
     expect(formula).toBe('=CUBEVALUE("Tessallite","[Measures].[fee_amount]")');
-    // This formula goes through the normal MDX->SQL pipeline, NOT through KPI resolution
   });
 
-  it('column 3 (Status) uses CUBEKPIMEMBER with property 3', () => {
-    const formula = buildCubeKpiFormula(conn, kpiName, CUBE_KPI_PROPERTIES.Status);
-    expect(formula).toBe('=CUBEKPIMEMBER("Tessallite","aa",3)');
-    // This formula triggers KPIStatus("aa") on the gateway
+  it('column 3 (Status) uses CUBEVALUE(CUBEKPIMEMBER) for the numeric value (Bug-6729)', () => {
+    const formula = kpiStatusCellFormula(conn, kpiName);
+    expect(formula).toBe('=CUBEVALUE("Tessallite",CUBEKPIMEMBER("Tessallite","aa",3))');
   });
 
-  it('column 4 (Trend) uses CUBEKPIMEMBER with property 4', () => {
-    const formula = buildCubeKpiFormula(conn, kpiName, CUBE_KPI_PROPERTIES.Trend);
-    expect(formula).toBe('=CUBEKPIMEMBER("Tessallite","aa",4)');
-    // This formula triggers KPITrend("aa") on the gateway
-  });
+  // Bug-6729: Trend column removed -- the gateway does not serve KPI Trend
+  // members. No column 4 test; the scorecard layout is 4 columns.
 });

@@ -171,7 +171,7 @@ class TestLevelsMultiLevel:
             "demo", [_explicit_hierarchy_dim()],
             _explicit_hierarchy_member_data(),
         )
-        geo_levels = [r for r in rows if r["DIMENSION_UNIQUE_NAME"] == "[Geography]"]
+        geo_levels = [r for r in rows if r["HIERARCHY_UNIQUE_NAME"] == "[Geography].[Geography]"]
         level_names = [r["LEVEL_NAME"] for r in geo_levels]
         assert level_names == ["(All)", "Region", "Country", "City"]
 
@@ -180,7 +180,7 @@ class TestLevelsMultiLevel:
             "demo", [_explicit_hierarchy_dim()],
             _explicit_hierarchy_member_data(),
         )
-        geo_levels = [r for r in rows if r["DIMENSION_UNIQUE_NAME"] == "[Geography]"]
+        geo_levels = [r for r in rows if r["HIERARCHY_UNIQUE_NAME"] == "[Geography].[Geography]"]
         level_nums = [r["LEVEL_NUMBER"] for r in geo_levels]
         assert level_nums == ["0", "1", "2", "3"]
 
@@ -189,7 +189,7 @@ class TestLevelsMultiLevel:
             "demo", [_explicit_hierarchy_dim()],
             _explicit_hierarchy_member_data(),
         )
-        all_level = next(r for r in rows if r["LEVEL_NAME"] == "(All)" and r["DIMENSION_UNIQUE_NAME"] == "[Geography]")
+        all_level = next(r for r in rows if r["LEVEL_NAME"] == "(All)" and r["HIERARCHY_UNIQUE_NAME"] == "[Geography].[Geography]")
         assert all_level["LEVEL_TYPE"] == "1"
 
     def test_regular_level_type_is_zero(self):
@@ -205,7 +205,7 @@ class TestLevelsMultiLevel:
             "demo", [_date_embedded_dim()],
             _date_embedded_member_data(),
         )
-        cal_levels = {r["LEVEL_NAME"]: r for r in rows if r["DIMENSION_UNIQUE_NAME"] == "[Calendar]"}
+        cal_levels = {r["LEVEL_NAME"]: r for r in rows if r["HIERARCHY_UNIQUE_NAME"] == "[Calendar].[Calendar]"}
         assert cal_levels["(All)"]["LEVEL_TYPE"] == "1"
         assert cal_levels["Year"]["LEVEL_TYPE"] == "20"
         assert cal_levels["Month"]["LEVEL_TYPE"] == "132"
@@ -390,7 +390,12 @@ class TestFlatHierarchy:
         rows = _rows_levels(
             "demo", [_flat_dim()], _flat_member_data(),
         )
-        at_levels = [r for r in rows if r["DIMENSION_UNIQUE_NAME"] == "[account_type]"]
+        # Bug-6603: the flat attribute dim groups under [Dimensions]; filter by its
+        # (unchanged) hierarchy unique name instead of the dimension group column.
+        at_levels = [
+            r for r in rows
+            if r["HIERARCHY_UNIQUE_NAME"] == "[account_type].[account_type]"
+        ]
         assert len(at_levels) == 2
         assert at_levels[0]["LEVEL_NAME"] == "(All)"
         assert at_levels[1]["LEVEL_NAME"] == "account_type"
@@ -453,7 +458,7 @@ class TestRaggedHierarchy:
         rows = _rows_levels(
             "demo", [self._ragged_dim()], self._ragged_member_data(),
         )
-        loc_levels = [r["LEVEL_NAME"] for r in rows if r["DIMENSION_UNIQUE_NAME"] == "[Location]"]
+        loc_levels = [r["LEVEL_NAME"] for r in rows if r["HIERARCHY_UNIQUE_NAME"] == "[Location].[Location]"]
         assert loc_levels == ["(All)", "Country", "State", "City"]
 
     def test_ragged_leaf_without_intermediate_still_has_parent(self):

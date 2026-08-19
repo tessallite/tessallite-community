@@ -20,6 +20,7 @@ import {
 } from "@mui/material";
 import { useT } from "../../i18n";
 import { kpisApi } from "../../api/client";
+import { recordCreate, recordUpdate } from "../Builder/emitDrawerHistory";
 import type {
   Dimension,
   Kpi,
@@ -329,9 +330,21 @@ export default function KpiWizard({
         if (form.certification_status) {
           payload.certification_status = form.certification_status;
         }
+        // Bug-8227: build the inverse payload from the prior KPI, touching
+        // exactly the fields this update sends, so undo restores the prior
+        // definition without disturbing unrelated fields.
+        const priorRecord = editKpi as unknown as Record<string, unknown>;
+        const priorPayload: Record<string, unknown> = {};
+        for (const key of Object.keys(payload)) {
+          // Preserve null explicitly so undo actively resets a newly-set
+          // field (null->value) back to null rather than omitting it.
+          priorPayload[key] = priorRecord[key] !== undefined ? priorRecord[key] : null;
+        }
         await kpisApi.update(projectId, modelId, editKpi.id, payload);
+        recordUpdate("kpi", editKpi.id, priorPayload, payload);
       } else {
-        await kpisApi.create(projectId, modelId, payload as unknown as KpiCreate);
+        const created = await kpisApi.create(projectId, modelId, payload as unknown as KpiCreate);
+        recordCreate("kpi", created.id, payload);
       }
       onSaved();
       onClose();

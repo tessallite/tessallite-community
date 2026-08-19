@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -31,20 +32,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select as sa_select
 
 from shared.db.models import (
+    KPI,
+    NamedSet,
     AgentConversation,
     AgentTurn,
+    Dimension,
     Measure,
     Model,
     ProjectAgentConfig,
 )
+from shared.semantic.kpi_expression import _collect_references, parse_kpi_expression
 from src.chart_config import effective_chart_selector
-from src.citations.builder import build_citations
+from src.citations.builder import build_citations, describe_filter_grain
 from src.charts.selector import select_chart_type
 from src.exec.query import (
     ModelNotAllowListedError,
     PersonaScopeViolationError,
     QueryExecution,
     QueryExecutionError,
+    RowSecurityDeniedQueryError,
     execute_query,
 )
 from src.exec.recipe import (
@@ -122,7 +128,12 @@ def _narration_publisher(
     the non-streaming narrate path runs and the (possibly blocked)
     answer is delivered only via the post-judge ``turn.completed`` event.
     Phase events (plan.tool, query.rows, ...) still stream."""
-    if getattr(cfg, "judge_mode", "async") == "sync":
+    # F-023-29 / Bug-8148 — the default is validated-first ("sync"); a cfg
+    # missing the attribute entirely falls closed to buffered narration.
+    # (Keyed on ``== "sync"`` to match the answer-delivery boundary in
+    # conversations.py; uniform malformed-value normalisation at ingress is
+    # deferred — intake 2026-07-22-judge-mode-ingress-validation.md.)
+    if getattr(cfg, "judge_mode", "sync") == "sync":
         return None
     return publisher
 
@@ -190,8 +201,48 @@ def _is_retryable_llm_error(exc: Exception) -> bool:
     if "503" in detail or "502" in detail or "service unavailable" in detail:
         return True
     return False
-_MAX_NARRATE_ROWS = 25
-_RESULT_SAMPLE_CAP = 50
+
+
+def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    """Read a positive-integer tuning knob from the environment.
+
+    CLAUDE.md forbids hard-coding config values in source. These narration /
+    correction limits are operational tuning knobs, so they are read from the
+    environment (with the historical value as the default) rather than baked in.
+    A missing, blank, non-numeric, or below-``minimum`` value falls back to the
+    default so a misconfiguration can never silently zero out a limit.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-integer %s=%r; using default %d", name, raw, default)
+        return default
+    if value < minimum:
+        logger.warning("Ignoring %s=%d below minimum %d; using default %d", name, value, minimum, default)
+        return default
+    return value
+
+
+# Bug-7354 — the number of sample rows handed to the narration LLM was a
+# hard-coded 25, so on a wide result the intermediate rows between row 25 and the
+# end were invisible to the narrator. It is now an environment-tunable knob
+# (default 25 preserves prior behaviour). Raising it lets the narrator see more
+# of the result set; the effective upper bound is the query's own SQL LIMIT
+# (rows already fetched), so a large value cannot pull more rows than the query
+# returned. This knob only affects the narration prompt sample, not the persisted
+# result_sample (capped independently by _RESULT_SAMPLE_CAP).
+_MAX_NARRATE_ROWS = _int_env("AGENT_MAX_NARRATE_ROWS", 25)
+_RESULT_SAMPLE_CAP = _int_env("AGENT_RESULT_SAMPLE_CAP", 50)
+
+# Bug-7353 — the malformed-tool-call correction prompt fed only the last 2
+# conversation turns, which can be too little context when a follow-up
+# correction depends on an earlier turn. The window is now env-tunable (default
+# 4, up from the previous hard-coded 2) so operators can widen it without a code
+# change, and follow-up corrections carry more of the recent dialogue.
+_TOOL_CORRECTION_CONTEXT_TURNS = _int_env("AGENT_TOOL_CORRECTION_CONTEXT_TURNS", 4)
 
 # Bug-3587: a router-side security denial (persona gate rejection, column-level
 # security, row security, restricted column) comes back to the agent as a generic
@@ -529,7 +580,7 @@ def _render_shaped_output(
         if should_include_table:
             return render_table(columns, rows) or None
         return None
-    return render_visual_artifact(
+    result = render_visual_artifact(
         chart_type,
         columns,
         rows,
@@ -537,7 +588,15 @@ def _render_shaped_output(
         size=getattr(cfg, "chart_size", "md"),
         include_table=should_include_table,
         legacy_html=legacy_html,
-    ) or None
+    )
+    # Bug-7350 -- log when a chart was requested but the renderer returned None.
+    if result is None and chart_type is not None:
+        logger.debug(
+            "render_visual_artifact returned None for chart_type=%s "
+            "(columns=%d, rows=%d, renderer=echarts)",
+            chart_type, len(columns), len(rows),
+        )
+    return result or None
 
 
 def _numeric_float(value: Any) -> float | None:
@@ -573,6 +632,17 @@ def _scalar_contribution_pie_shape(
     percentage = _numeric_float(combine_value)
     if percentage is None or percentage < 0 or percentage > 100:
         return None
+    # Bug-7349 -- detect ratio values (0.0..1.0 exclusive) that were not
+    # multiplied by 100.  A value like 0.42 would produce a nonsensical
+    # 0.42% slice with 99.58% remaining.  Suppress the pie whenever the
+    # label signals a ratio/fraction/proportion (the value is almost
+    # certainly 0-1 scaled).  For labels that do NOT signal a ratio (e.g.
+    # "Cairo share (%)" = 0.6 meaning a genuine sub-1% share), allow
+    # through -- legitimate sub-1% percentages are rare but possible.
+    if 0 < percentage < 1.0:
+        label_lower = (result_label or "").lower()
+        if any(kw in label_lower for kw in ("ratio", "fraction", "proportion", "index", "factor")):
+            return None
 
     label = (result_label or "Selected contribution").strip()
     label = re.sub(r"\s*\(%\)\s*$", "", label).strip()
@@ -693,15 +763,19 @@ async def _attempt_tool_call_correction(
 ) -> str | None:
     """Single-shot LLM correction for a malformed tool call.
 
-    Sends the tool schema, failing output, error, and last two conversation
-    turns to the LLM for one correction attempt.  Returns the corrected raw
-    response or ``None`` if the correction call itself fails.
+    Sends the tool schema, failing output, error, and the most recent
+    conversation turns to the LLM for one correction attempt.  Returns the
+    corrected raw response or ``None`` if the correction call itself fails.
+
+    Bug-7353 — the context window is ``_TOOL_CORRECTION_CONTEXT_TURNS``
+    (env-tunable, default 4) rather than a hard-coded 2, so a follow-up
+    correction that depends on an earlier turn keeps that context.
     """
     q = await db.execute(
         sa_select(AgentTurn.user_message, AgentTurn.answer_text)
         .where(AgentTurn.conversation_id == conversation_id)
         .order_by(AgentTurn.turn_index.desc())
-        .limit(2)
+        .limit(_TOOL_CORRECTION_CONTEXT_TURNS)
     )
     recent = list(reversed(q.all()))
     context_lines: list[str] = []
@@ -728,7 +802,10 @@ async def _attempt_tool_call_correction(
     )
 
     try:
-        corrected = await adapter.complete(system, user)
+        # R5 (F6) — the correction step also produces a tool-call JSON object;
+        # request native JSON-output mode so a second malformed (non-JSON)
+        # response is prevented at source where the provider supports it.
+        corrected = await adapter.complete(system, user, response_json=True)
         _accumulate_usage(adapter, usage_totals)
         return corrected
     except Exception:
@@ -925,22 +1002,33 @@ def _field_roles_for_compound_result(
     )
 
 
-def _allow_list_refusal_outcome(
+async def _allow_list_refusal_outcome(
     call: Any,
     bundle: Any,
     prompt_messages: dict[str, Any] | None,
     llm_raw_response: str | None,
+    db: AsyncSession | None = None,
 ) -> "TurnOutcome | None":
-    """F-023-07 / Bug-5279 — shared allow-list AND persona field-scope gate
-    for tool branches that do not flow through ``execute_query``
-    (create_aggregate, evaluate_kpi, preview_named_set).
+    """F-023-07 / Bug-5279 / Bug-6329 — shared allow-list AND persona
+    field-scope gate for tool branches that do not flow through
+    ``execute_query`` (create_aggregate, evaluate_kpi, preview_named_set).
 
     Returns a refusal outcome when ``call.model_id`` is invalid, outside
-    the agent allow-list, or (Bug-5279) when the tool references measures
-    or dimensions outside the active persona's field scope.  Previously
-    only the model-level allow-list was checked; the field-level persona
-    scope was bypassed, so a restricted persona could evaluate any KPI or
-    create aggregates on hidden fields."""
+    the agent allow-list, or when the tool references measures or
+    dimensions outside the active persona's field scope.  Previously only
+    the model-level allow-list was checked; the field-level persona scope
+    was bypassed, so a restricted persona could evaluate any KPI or create
+    aggregates on hidden fields (Bug-5279).
+
+    Bug-6329 (F-023-01): the KPI / named-set checks formerly compared the
+    requested id against the model profile's KPI / named-set list, which
+    is NEVER filtered by persona at assembly time — so every KPI and named
+    set was always "exposed" and a restricted persona could evaluate a KPI
+    built on a hidden measure.  The gate now resolves the KPI's measure
+    lineage (and the named set's dimension lineage) from the database and
+    refuses when any dependency falls outside the persona's visible field
+    set.  It is fail-closed: an unresolvable KPI / named set, or one whose
+    lineage cannot be confirmed in scope, is refused."""
     try:
         model_uuid = UUID(call.model_id)
     except (ValueError, TypeError):
@@ -990,20 +1078,24 @@ def _allow_list_refusal_outcome(
         if isinstance(call, CreateAggregateToolCall):
             violations += [m for m in (call.measures or []) if m not in scope.measures]
             violations += [d for d in (call.dimensions or []) if d not in scope.dimensions]
-        # evaluate_kpi — the KPI id is an opaque reference, but we can
-        # cross-check against the model profile's KPI list (which was
-        # already filtered by persona at assembly time).  If the KPI id
-        # was removed from the profile, the persona does not expose it.
+        # evaluate_kpi — Bug-6329: resolve the KPI's measure lineage from
+        # the DB and refuse when any underlying measure is outside the
+        # persona's visible measure set. Fail-closed: an unresolvable KPI
+        # (or one we cannot confirm is fully in scope) is refused.
         if isinstance(call, EvaluateKpiToolCall):
             kpi_id = getattr(call, "kpi_id", None)
-            exposed_kpi_ids = _exposed_kpi_ids_for_model(bundle, model_uuid)
-            if exposed_kpi_ids is not None and kpi_id not in exposed_kpi_ids:
+            if await _kpi_outside_persona_scope(
+                db, kpi_id, model_uuid, scope.measures, scope.dimensions
+            ):
                 violations.append(f"kpi:{kpi_id}")
-        # preview_named_set — same pattern as KPIs
+        # preview_named_set — Bug-6329: resolve the named set's dimension
+        # lineage from the DB and refuse when it references a real model
+        # dimension the persona cannot see.
         if isinstance(call, PreviewNamedSetToolCall):
             ns_id = getattr(call, "named_set_id", None)
-            exposed_ns_ids = _exposed_named_set_ids_for_model(bundle, model_uuid)
-            if exposed_ns_ids is not None and ns_id not in exposed_ns_ids:
+            if await _named_set_outside_persona_scope(
+                db, ns_id, model_uuid, scope.dimensions
+            ):
                 violations.append(f"named_set:{ns_id}")
 
         if violations:
@@ -1027,28 +1119,215 @@ def _allow_list_refusal_outcome(
     return None
 
 
-def _exposed_kpi_ids_for_model(bundle: Any, model_uuid: UUID) -> set[str] | None:
-    """Return the set of KPI id strings exposed in the prompt for a model,
-    or None if no profile is found (fail-open for backward compat)."""
-    for profile in getattr(bundle, "model_profiles", []) or []:
-        if getattr(profile, "id", None) == model_uuid:
-            kpis = getattr(profile, "kpis", None)
-            if kpis is not None:
-                return {str(getattr(k, "id", "")) for k in kpis}
-            return None
-    return None
+# Mirrors the MDX bracket-token extraction in model-service
+# ``named_sets.py`` (Bug-5963): member keys ``&[key]`` are stripped first
+# so source values are never mistaken for dimension-name references, then
+# structural tokens that can never name a dimension are dropped.
+_NS_MEMBER_KEY_RE = re.compile(r"&\[[^\]]*\]")
+_NS_BRACKET_REF_RE = re.compile(r"\[([^\]]+)\]")
+_NS_NON_DIMENSION_TOKENS = frozenset({"measures", "model", "members", "all"})
 
 
-def _exposed_named_set_ids_for_model(bundle: Any, model_uuid: UUID) -> set[str] | None:
-    """Return the set of named-set id strings exposed in the prompt for a model,
-    or None if no profile is found."""
-    for profile in getattr(bundle, "model_profiles", []) or []:
-        if getattr(profile, "id", None) == model_uuid:
-            named_sets = getattr(profile, "named_sets", None)
-            if named_sets is not None:
-                return {str(getattr(ns, "id", "")) for ns in named_sets}
-            return None
-    return None
+def _named_set_referenced_dimension_names(expression: str | None) -> set[str]:
+    """Candidate dimension-name references in an MDX set expression."""
+    if not expression:
+        return set()
+    expr_without_keys = _NS_MEMBER_KEY_RE.sub("", expression)
+    refs = _NS_BRACKET_REF_RE.findall(expr_without_keys)
+    return {r for r in refs if r.lower() not in _NS_NON_DIMENSION_TOKENS}
+
+
+def _kpi_expr_refs(expr: str) -> tuple[set[str], set[str], set[str]]:
+    """Return ``(measure_names, kpi_names, dimension_names)`` referenced by
+    a KPI expression.
+
+    Raises on a parse failure so the caller can fail closed rather than
+    silently treating an unparseable expression as having no lineage."""
+    ast = parse_kpi_expression(expr)
+    measures, kpis, dims = _collect_references(ast)
+    return set(measures), set(kpis), set(dims)
+
+
+async def _kpi_outside_persona_scope(
+    db: AsyncSession | None,
+    kpi_id: Any,
+    model_uuid: UUID,
+    visible_measures: frozenset[str],
+    visible_dimensions: frozenset[str],
+) -> bool:
+    """True when the KPI cannot be evaluated under the persona's visible
+    field set (Bug-6329 / F-023-01).
+
+    Resolves the KPI's FULL lineage — transitively through ``kpi("...")``
+    references (composite KPIs):
+
+    * MEASURE lineage: ``measure()`` refs in the expression / target
+      expression plus the legacy value/goal/target measure-id bindings;
+      every referenced measure must be in ``visible_measures``.
+    * DIMENSION lineage: ``dimension()`` refs in the expression / target
+      expression plus the KPI's ``time_dimension_id`` binding; any
+      referenced dimension that is a real model dimension the persona
+      cannot see (not in ``visible_dimensions``) blocks evaluation — a
+      restricted persona must not evaluate a KPI whose value is computed
+      over a hidden dimension (Codex round-2 finding).
+
+    Fail-closed (returns ``True`` → refuse) on any lineage uncertainty: a
+    missing DB session, an unparseable id, a KPI that does not belong to
+    the model, an expression that fails to parse, a ``kpi()`` dependency
+    that does not resolve to a KPI in the model, or a legacy measure-id
+    that cannot be resolved to a model measure."""
+    if db is None:
+        return True
+    try:
+        kid = kpi_id if isinstance(kpi_id, UUID) else UUID(str(kpi_id))
+    except (TypeError, ValueError):
+        return True
+    kpi = await db.get(KPI, kid)
+    if kpi is None or kpi.model_id != model_uuid:
+        return True
+
+    # Resolve the whole model's measure/dimension/kpi maps once so legacy
+    # id bindings and transitive kpi() refs resolve without per-node
+    # round-trips.
+    meas_rows = await db.execute(
+        sa_select(Measure.id, Measure.name).where(Measure.model_id == model_uuid)
+    )
+    measure_id_to_name = {mid: name for mid, name in meas_rows.all()}
+    dim_rows = await db.execute(
+        sa_select(Dimension.id, Dimension.name).where(Dimension.model_id == model_uuid)
+    )
+    dim_id_to_name: dict[Any, str] = {did: dname for did, dname in dim_rows.all()}
+    kpi_rows = await db.execute(
+        sa_select(KPI).where(KPI.model_id == model_uuid)
+    )
+    kpis_by_name = {row.name: row for row in kpi_rows.scalars().all()}
+
+    visible_dims_lower = {d.lower() for d in visible_dimensions}
+    referenced_measures: set[str] = set()
+    # Lowercased dimension names the KPI depends on. Every entry must be a
+    # visible dimension; an unresolved dimension() ref (no matching model
+    # dimension) is left here too so the final check fails closed on it —
+    # symmetric with measure handling, per the round-2 fail-closed goal.
+    referenced_dimensions: set[str] = set()
+    seen: set[Any] = set()
+    stack: list[Any] = [kpi]
+    while stack:
+        cur = stack.pop()
+        cur_id = getattr(cur, "id", None)
+        if cur_id in seen:
+            continue
+        seen.add(cur_id)
+
+        for expr in (
+            getattr(cur, "expression", None),
+            getattr(cur, "target_expression", None),
+        ):
+            if not expr or not str(expr).strip():
+                continue
+            try:
+                m_names, k_names, d_names = _kpi_expr_refs(expr)
+            except Exception:
+                return True  # unparseable expression → indeterminate → refuse
+            referenced_measures.update(m_names)
+            # Add every dimension() ref: a hidden or unresolved name will
+            # fall outside visible_dims_lower and fail closed below.
+            referenced_dimensions.update(d.lower() for d in d_names)
+            for kname in k_names:
+                child = kpis_by_name.get(kname)
+                if child is None:
+                    return True  # unresolved kpi() dependency → refuse
+                if getattr(child, "id", None) not in seen:
+                    stack.append(child)
+
+        for attr in ("value_measure_id", "goal_measure_id", "target_measure_id"):
+            raw = getattr(cur, attr, None)
+            if raw is None:
+                continue
+            try:
+                muid = raw if isinstance(raw, UUID) else UUID(str(raw))
+            except (TypeError, ValueError):
+                return True
+            name = measure_id_to_name.get(muid)
+            if name is None:
+                return True  # legacy binding to unknown measure → refuse
+            referenced_measures.add(name)
+
+        # time_dimension_id binds the KPI to a (possibly hidden) dimension.
+        # Fail closed when it is set but does not resolve to a model
+        # dimension (dangling/deleted binding = indeterminate lineage).
+        tdid = getattr(cur, "time_dimension_id", None)
+        if tdid is not None:
+            try:
+                tduid = tdid if isinstance(tdid, UUID) else UUID(str(tdid))
+            except (TypeError, ValueError):
+                return True
+            tdname = dim_id_to_name.get(tduid)
+            if tdname is None:
+                return True  # dangling time-dimension binding → refuse
+            referenced_dimensions.add(tdname.lower())
+
+    if any(name not in visible_measures for name in referenced_measures):
+        return True
+    if any(dl not in visible_dims_lower for dl in referenced_dimensions):
+        return True
+    return False
+
+
+async def _named_set_outside_persona_scope(
+    db: AsyncSession | None,
+    ns_id: Any,
+    model_uuid: UUID,
+    visible_dimensions: frozenset[str],
+) -> bool:
+    """True when the named set references a real model dimension the
+    persona cannot see (Bug-6329 / F-023-01).
+
+    Mirrors model-service ``_named_set_visible_to_persona``: an MDX
+    expression's bracket tokens also cover hierarchy/level names and
+    literal member captions, so this restricts only on a confident match
+    to a real model dimension outside the persona's visible dimension set.
+    Fail-closed on a missing DB session, an unparseable id, or a named set
+    that does not belong to the model.
+
+    Bug-7348 -- accepted risk: bracket tokens that are NOT real model
+    dimension names (hierarchy names, level names, member captions) pass
+    through this heuristic silently.  This is intentional: the true
+    enforcement is at the query-router binder, which refuses any dimension
+    reference outside the persona's visible set at SQL generation time."""
+    if db is None:
+        return True
+    try:
+        nid = ns_id if isinstance(ns_id, UUID) else UUID(str(ns_id))
+    except (TypeError, ValueError):
+        return True
+    ns = await db.get(NamedSet, nid)
+    if ns is None or ns.model_id != model_uuid:
+        return True
+
+    # Two lineage signals: (1) the authoritative persisted ``dimensions``
+    # field (comma/semicolon-separated dimension names, when the builder
+    # populated it) and (2) confident dimension-name references extracted
+    # from the MDX expression. Refuse when EITHER names a real model
+    # dimension the persona cannot see.
+    referenced = _named_set_referenced_dimension_names(getattr(ns, "expression", None))
+    raw_dims = getattr(ns, "dimensions", None)
+    if raw_dims:
+        for part in re.split(r"[;,]", str(raw_dims)):
+            token = part.strip()
+            if token:
+                referenced.add(token)
+    if not referenced:
+        return False
+    rows = await db.execute(
+        sa_select(Dimension.name).where(Dimension.model_id == model_uuid)
+    )
+    all_dim_lower = {name.lower() for (name,) in rows.all()}
+    visible_lower = {d.lower() for d in visible_dimensions}
+    for ref in referenced:
+        rl = ref.lower()
+        if rl in all_dim_lower and rl not in visible_lower:
+            return True
+    return False
 
 
 async def run_turn(
@@ -1059,11 +1338,18 @@ async def run_turn(
     jwt_token: str,
     publisher: EventPublisher | None = None,
     persona_id: UUID | None = None,
+    embed_model_ids: list[str] | None = None,
+    budget_reservation_id: UUID | None = None,
 ) -> TurnOutcome:
     # F-023-03 (round 2) — in sync judge mode every emission from the
     # pipeline (including the compound/recipe branches and execute_recipe)
     # goes through the fail-closed pre-verdict gate.
-    if publisher is not None and getattr(cfg, "judge_mode", "async") == "sync":
+    # F-023-29 / Bug-8148 — the default is validated-first ("sync"); a cfg
+    # missing the attribute falls closed to the pre-verdict gate. (Keyed on
+    # ``== "sync"`` to match the answer-delivery boundary in conversations.py;
+    # uniform malformed-value normalisation at ingress is deferred — intake
+    # 2026-07-22-judge-mode-ingress-validation.md.)
+    if publisher is not None and getattr(cfg, "judge_mode", "sync") == "sync":
         publisher = _SyncVerdictGate(publisher)
 
     await _emit(
@@ -1099,6 +1385,7 @@ async def run_turn(
         db, cfg, conversation.id, user_message,
         persona_id=persona_id or getattr(conversation, "persona_id", None),
         pinned_model_id=getattr(conversation, "pinned_model_id", None),
+        embed_model_ids=embed_model_ids,
     )
     _prompt_msgs = {"system": bundle.system, "user": bundle.user}
 
@@ -1141,7 +1428,13 @@ async def run_turn(
     llm_config = llm_configs[0]
 
     # Budget check — before spending tokens.
-    budget_reason = await check_budget(db, cfg)
+    # Bug-7777 — exclude the pessimistic reservation written by reserve_budget
+    # so it does not count against its own turn's budget check.  Without this,
+    # projects with daily_token_budget <= 8096 refuse every turn because the
+    # reservation's estimated tokens already fill or exceed the budget.
+    budget_reason = await check_budget(
+        db, cfg, exclude_reservation_id=budget_reservation_id,
+    )
     if budget_reason:
         budget_messages = {
             "daily_token_budget_exceeded": (
@@ -1151,6 +1444,12 @@ async def run_turn(
             "daily_cost_budget_exceeded": (
                 "The project's daily cost budget has been reached. "
                 "Ask your administrator to raise the limit or wait until tomorrow."
+            ),
+            # Bug-5754 — fail-closed: DB error during budget verification.
+            "budget_check_unavailable": (
+                "Unable to verify budget status at the moment. "
+                "Please try again shortly. If the issue persists, "
+                "contact your tenant administrator."
             ),
         }
         msg = budget_messages.get(budget_reason, "Budget exceeded.")
@@ -1174,7 +1473,12 @@ async def run_turn(
 
     async def _on_thinking(token: str) -> None:
         thinking_parts.append(token)
-        if publisher is not None:
+        # Bug-7376 / Bug-7545 — gate streaming thought tokens on
+        # show_thought_process.  Persisted turns already strip the field
+        # in _redact_trace, but the live SSE path was an unguarded
+        # parallel channel.  Suppressing here prevents the tokens from
+        # ever crossing the API boundary.
+        if publisher is not None and getattr(cfg, "show_thought_process", True):
             await publisher.emit("thought.delta", text=token)
 
     raw = None
@@ -1185,7 +1489,23 @@ async def run_turn(
         except ValueError:
             continue
         try:
-            raw = await adapter.complete(bundle.system, bundle.user, on_thinking=_on_thinking)
+            # R5 (F6) — the planner emits exactly one JSON tool-call object.
+            # Request native JSON-output mode (response_json) so providers that
+            # support it (OpenAI-family json_object, Gemini application/json)
+            # guarantee valid JSON, eliminating the markdown-fence / prose parse
+            # failure that otherwise burns the single correction round. Anthropic
+            # ignores the flag and relies on the JSON-in-text parser (documented
+            # fallback).
+            raw = await adapter.complete(
+                bundle.system, bundle.user, on_thinking=_on_thinking,
+                response_json=True,
+                # R1 (F1) — mark the stable planner prefix cacheable. Lane B
+                # kept per-turn content out of bundle.system and R1 moved the
+                # daily CURRENT_DATE into bundle.user, so bundle.system is now
+                # byte-stable across turns AND day boundaries — the big cache
+                # win. The marker never changes the rendered prompt text.
+                cache_system_prefix=True,
+            )
             _accumulate_usage(adapter, usage_totals)
             if i > 0:
                 logger.warning(
@@ -1209,35 +1529,43 @@ async def run_turn(
         exc = last_exc or ValueError("No LLM provider available")
         logger.exception("Answer LLM call failed")
         detail = str(exc)
+        # Bug-5957 — user-facing messages must NOT expose provider names,
+        # model names, API key hints, timeout configs, or raw exception
+        # strings.  Log the full detail server-side and return a safe,
+        # generic message that guides the user without leaking internals.
         if "401" in detail or "authentication" in detail.lower() or "unauthorized" in detail.lower():
             user_msg = (
-                f"Authentication failed for {llm_config.provider}/{llm_config.model_name}. "
-                f"The API key may be invalid or expired. Open Project Settings > "
-                f"LLM Configurations and verify the API key for "
-                f"'{llm_config.display_name}'."
+                "The language-model service could not authenticate. "
+                "Please ask your administrator to verify the LLM "
+                "configuration in Project Settings."
             )
         elif "404" in detail or "not found" in detail.lower():
             user_msg = (
-                f"Model '{llm_config.model_name}' was not found by the "
-                f"{llm_config.provider} API. Check that the model name is "
-                f"correct in Project Settings > LLM Configurations."
+                "The configured language model could not be found. "
+                "Please ask your administrator to check the LLM "
+                "configuration in Project Settings."
             )
         elif "429" in detail or "rate" in detail.lower():
             user_msg = (
-                f"Rate limit exceeded for {llm_config.provider}/{llm_config.model_name}. "
-                f"Wait a moment and try again."
+                "The language-model service is temporarily rate-limited. "
+                "Please wait a moment and try again."
             )
         elif "timeout" in detail.lower() or "timed out" in detail.lower():
             user_msg = (
-                f"Request to {llm_config.provider} timed out after "
-                f"{llm_config.timeout_seconds}s. The service may be temporarily "
-                f"overloaded — try again shortly."
+                "The language-model service did not respond in time. "
+                "The service may be temporarily overloaded — "
+                "please try again shortly."
             )
         else:
             user_msg = (
-                f"LLM call to {llm_config.provider}/{llm_config.model_name} "
-                f"failed: {detail}"
+                "The language-model service is currently unavailable. "
+                "Please try again shortly or contact your administrator "
+                "if the issue persists."
             )
+        logger.error(
+            "[AGENT] LLM error detail (not sent to user): %s/%s — %s",
+            llm_config.provider, llm_config.model_name, detail,
+        )
         return TurnOutcome(
             answer_text=user_msg,
             status="error",
@@ -1543,7 +1871,7 @@ async def run_turn(
 
     if isinstance(call, EvaluateKpiToolCall):
         # F-023-07 — the read tools must honour the agent allow-list too.
-        refusal = _allow_list_refusal_outcome(call, bundle, _prompt_msgs, raw)
+        refusal = await _allow_list_refusal_outcome(call, bundle, _prompt_msgs, raw, db=db)
         if refusal is not None:
             return refusal
         outcome = await _run_evaluate_kpi_branch(
@@ -1558,7 +1886,7 @@ async def run_turn(
 
     if isinstance(call, PreviewNamedSetToolCall):
         # F-023-07 — the read tools must honour the agent allow-list too.
-        refusal = _allow_list_refusal_outcome(call, bundle, _prompt_msgs, raw)
+        refusal = await _allow_list_refusal_outcome(call, bundle, _prompt_msgs, raw, db=db)
         if refusal is not None:
             return refusal
         outcome = await _run_preview_named_set_branch(
@@ -1572,7 +1900,7 @@ async def run_turn(
         return outcome
 
     if isinstance(call, CreateAggregateToolCall):
-        refusal = _allow_list_refusal_outcome(call, bundle, _prompt_msgs, raw)
+        refusal = await _allow_list_refusal_outcome(call, bundle, _prompt_msgs, raw, db=db)
         if refusal is not None:
             return refusal
         outcome = await _run_create_aggregate_branch(
@@ -1661,6 +1989,11 @@ async def run_turn(
             db, call, jwt_token,
             allowed_model_ids=bundle.allow_list_model_ids,
             persona_scopes=bundle.persona_scopes,
+            # This path RENDERS a row-security denial (narrate.py branches on
+            # execution.row_security_denied and tells the user their access is
+            # restricted), so it opts out of the chokepoint's refusal. The
+            # compound and recipe paths deliberately do NOT opt out.
+            allow_row_security_denial=True,
         )
         await _emit(
             publisher,
@@ -1805,11 +2138,15 @@ async def run_turn(
             )
         _accumulate_usage(adapter, usage_totals)
     except Exception as exc:
-        logger.exception("Narration LLM call failed")
+        # Bug-5957 — do not expose route type, row count, or raw exception
+        # in the user-facing answer.  Log the full detail server-side.
+        logger.exception(
+            "Narration LLM call failed (route=%s, rows=%d)",
+            execution.route_type, execution.rows_returned,
+        )
         narration = (
-            f"Query ran (route={execution.route_type}, "
-            f"rows={execution.rows_returned}) but I could not narrate the "
-            f"result: {exc}"
+            "The query executed successfully but the narration service "
+            "could not summarise the result. Please try again."
         )
 
     output = apply_output_guardrails(cfg, narration)
@@ -1817,12 +2154,29 @@ async def run_turn(
     # In streaming mode narration.delta tokens already emitted above; in non-streaming
     # mode publisher is None and _emit is a no-op — either way nothing more to emit here.
 
+    # Bug-8181 (L3) — thread the route that served this answer and a
+    # human-readable filter/grain summary of THIS call onto every citation, so
+    # a citation chip is checkable (definition + route + exact slice), not
+    # just a semantic label. See citations/builder.py for the field contract.
+    # F-L3-R1-02 (round 2): where_refs/having/having_refs are threaded too —
+    # a structured predicate (function-on-column, OR/NOT) is an equally
+    # supported call shape as the flat `where` list, and omitting it here
+    # made a genuinely filtered query render as "unfiltered" in the citation
+    # dialog.
     citations = await build_citations(
         db,
         UUID(call.model_id),
         call.measures,
         call.dimensions,
         execution.rows,
+        route_type=execution.route_type or None,
+        filter_grain=describe_filter_grain(
+            call.where,
+            call.dimensions,
+            where_refs=call.where_refs,
+            having=call.having,
+            having_refs=call.having_refs,
+        ),
     )
 
     return TurnOutcome(
@@ -1889,10 +2243,44 @@ async def _run_recipe_branch(
             reason = "model_not_allow_listed"
         elif isinstance(cause, PersonaScopeViolationError):
             reason = "persona_scope_violation"
+        elif isinstance(cause, RowSecurityDeniedQueryError):
+            # R3 finding B-3: the chokepoint refusal reaches here wrapped in a
+            # RecipeExecutionError. Without this branch it fell to
+            # "recipe_failed" -> "please try again", telling a user to retry
+            # something that did not fail and will never succeed, and hiding
+            # the permissions truth. Same misattribution the compound branch
+            # got a dedicated handler to avoid.
+            reason = "row_security_denied"
         else:
             reason = "recipe_failed"
+        # Bug-5957 — do not expose raw exception in user-facing answer.
+        logger.warning("Recipe execution failed: %s", exc)
+        if reason == "persona_scope_violation":
+            safe_msg = (
+                "That recipe needs data that is not available to your "
+                "current persona. Please ask an administrator about "
+                "your persona scope."
+            )
+        elif reason == "model_not_allow_listed":
+            safe_msg = (
+                "That recipe references a model that is not allow-listed "
+                "for this project."
+            )
+        elif reason == "row_security_denied":
+            safe_msg = (
+                "That recipe cannot be run because your row-level security "
+                "permissions grant you access to none of the underlying rows. "
+                "This is a permissions restriction, not an absence of data, "
+                "and retrying will not change it. Contact your administrator "
+                "if you believe you should have access."
+            )
+        else:
+            safe_msg = (
+                "The recipe could not be executed. Please try again "
+                "or contact your administrator if the issue persists."
+            )
         return TurnOutcome(
-            answer_text=f"I could not run that recipe: {exc}",
+            answer_text=safe_msg,
             status="refused",
             plan=plan,
             semantic_query=None,
@@ -1919,6 +2307,9 @@ async def _run_recipe_branch(
             "columns": step.execution.columns,
             "rows_returned": step.execution.rows_returned,
             "sample_rows": step.execution.rows[:_MAX_NARRATE_ROWS],
+            # R10 (compound scope, review R1-3) — full rows for date-range
+            # aggregation only; never rendered into the prompt.
+            "all_rows": step.execution.rows,
         })
 
     computed: dict[str, Any] = {
@@ -1927,6 +2318,13 @@ async def _run_recipe_branch(
         "value": recipe_exec.combine_value,
         "is_multi_row": False,
         "alignment_mode": "recipe",
+        # R10 (compound scope, review R1-2) — a recipe value computed from
+        # row-capped step data is a partial-data figure; the narration prompt
+        # must disclose it.
+        "steps_truncated": any(
+            bool(getattr(s.execution, "truncated", False))
+            for s in recipe_exec.steps
+        ),
     }
 
     output_fmt = getattr(cfg, "agent_output_format", "plain")
@@ -1949,15 +2347,15 @@ async def _run_recipe_branch(
             )
         _accumulate_usage(adapter, usage_totals)
     except Exception as exc:
-        logger.exception("Recipe narration LLM call failed")
-        combine_line = (
-            f" {recipe_exec.recipe_name}: {recipe_exec.combine_value}."
-            if recipe_exec.combine_expression else ""
+        # Bug-5957 — do not expose recipe name, step count, combine
+        # values, or raw exception in the user-facing answer.
+        logger.exception(
+            "Recipe narration LLM call failed (recipe=%s, steps=%d)",
+            recipe_exec.recipe_name, len(recipe_exec.steps),
         )
         narration = (
-            f"Ran recipe '{recipe_exec.recipe_name}' "
-            f"({len(recipe_exec.steps)} step(s)).{combine_line} "
-            f"Narration failed: {exc}"
+            "The recipe executed successfully but the narration service "
+            "could not summarise the result. Please try again."
         )
     output = apply_output_guardrails(cfg, narration)
     narration = output.text
@@ -2330,6 +2728,39 @@ async def _run_compound_query_branch(
                 prompt_messages=prompt_messages,
                 llm_raw_response=llm_raw_response,
             )
+        except RowSecurityDeniedQueryError:
+            # R2 finding B2: a denied step must refuse with the TRUTH, not with
+            # "the step failed" (nothing failed) and above all not by feeding a
+            # WHERE 0 = 1 zero into the combine expression, which would have
+            # the agent state a fabricated business figure.
+            msg = (
+                f"Compound query step '{step.name}' cannot be answered because "
+                f"your row-level security permissions grant you access to none "
+                f"of the underlying rows. This is a permissions restriction, "
+                f"not an absence of data — no figure can be calculated from "
+                f"it. Contact your administrator if you believe you should have "
+                f"access."
+            )
+            await _emit(
+                publisher, "turn.blocked",
+                reason="row_security_denied", message=msg,
+            )
+            return TurnOutcome(
+                answer_text=msg,
+                status="refused",
+                plan=plan,
+                semantic_query=None,
+                routed_sql=None,
+                route=None,
+                rows_returned=0,
+                guardrail_actions=[
+                    {"layer": "compound", "action": "refuse",
+                     "reason": "row_security_denied",
+                     "detail": f"step={step.name}"}
+                ],
+                prompt_messages=prompt_messages,
+                llm_raw_response=llm_raw_response,
+            )
         except QueryExecutionError as exc:
             human_msg = _humanize_query_error(str(exc))
             await _emit(publisher, "turn.blocked", reason="step_failed", message=human_msg)
@@ -2391,6 +2822,52 @@ async def _run_compound_query_branch(
             llm_raw_response=llm_raw_response,
         )
 
+    # Bug-7361 -- when alignment falls back to a stacked mode, the derived
+    # metric cannot be computed.  Surface a diagnostic refusal instead of
+    # returning an unlabelled stacked table with no computed answer.
+    # Covers all three stacked modes: no_shared_dims, no_overlap, and
+    # ambiguous_grain (where multiple steps have non-unique keys on the
+    # shared dimensions).
+    _STACKED_MESSAGES = {
+        "stacked_no_shared_dims": (
+            "I ran all the sub-queries but could not align them to compute "
+            f"'{call.result_label}' -- the sub-queries returned data on "
+            "different dimensions with no shared grouping. Please rephrase "
+            "so both parts of the question use the same grouping dimension."
+        ),
+        "stacked_no_overlap": (
+            "I ran all the sub-queries but could not align them to compute "
+            f"'{call.result_label}' -- the sub-queries share dimensions "
+            "but returned non-overlapping values. Please rephrase so both "
+            "parts of the question cover the same data range."
+        ),
+        "stacked_ambiguous_grain": (
+            "I ran all the sub-queries but could not align them to compute "
+            f"'{call.result_label}' -- the sub-queries returned rows at "
+            "different levels of detail (ambiguous grain). Please rephrase "
+            "so both parts of the question use the same grouping level."
+        ),
+    }
+    if alignment_mode in _STACKED_MESSAGES:
+        _stacked_reason = _STACKED_MESSAGES[alignment_mode]
+        await _emit(publisher, "turn.blocked", reason="alignment_failed", message=_stacked_reason)
+        return TurnOutcome(
+            answer_text=_stacked_reason,
+            status="refused",
+            plan=plan,
+            semantic_query=None,
+            routed_sql=None,
+            route=None,
+            rows_returned=total_rows,
+            guardrail_actions=[
+                {"layer": "compound", "action": "refuse",
+                 "reason": "alignment_failed",
+                 "detail": f"alignment_mode={alignment_mode}"}
+            ],
+            prompt_messages=prompt_messages,
+            llm_raw_response=llm_raw_response,
+        )
+
     if not is_multi_row and result_rows:
         first = result_rows[0]
         if call.result_label in first:
@@ -2420,6 +2897,11 @@ async def _run_compound_query_branch(
             "columns": execution.columns,
             "rows_returned": execution.rows_returned,
             "sample_rows": sample,
+            # R10 (compound scope, review R1-3) — full rows for DATE-RANGE
+            # aggregation only (never rendered into the prompt). Computing the
+            # range from the 25-row sample would understate min/max on sorted
+            # results while the narrator is ordered to state it as exact.
+            "all_rows": execution.rows,
         })
 
     computed: dict[str, Any] = {
@@ -2429,8 +2911,21 @@ async def _run_compound_query_branch(
         "is_multi_row": is_multi_row,
         "alignment_mode": alignment_mode,
         "alignment": alignment_trace,
+        # R10 (compound scope, review R1-2) — when any step hit the DB row cap,
+        # the combined result derives from PARTIAL step data. The narration
+        # prompt must never claim a "COMPLETE result" in that case.
+        "steps_truncated": any(
+            bool(getattr(execution, "truncated", False))
+            for _, execution in step_executions
+        ),
     }
     if is_multi_row:
+        # R10 (compound scope) — cap the narrator's view at _MAX_NARRATE_ROWS
+        # but record the TRUE per-dimension row count so the narration prompt
+        # can disclose "showing N of M" and forbid presenting shown-row
+        # extremes as the overall extreme. The full result reaches the user via
+        # the compound table / chart; only the narrator's sample is capped.
+        computed["result_total_rows"] = len(result_rows)
         computed["result_rows"] = result_rows[:_MAX_NARRATE_ROWS]
         computed["result_columns"] = result_columns
 
@@ -2554,11 +3049,15 @@ async def _run_compound_query_branch(
             )
         _accumulate_usage(adapter, usage_totals)
     except Exception as exc:
-        logger.exception("Compound narration LLM call failed")
+        # Bug-5957 — do not expose step count, result label, combine
+        # value, or raw exception in the user-facing answer.
+        logger.exception(
+            "Compound narration LLM call failed (steps=%d, label=%s)",
+            len(call.steps), call.result_label,
+        )
         narration = (
-            f"Compound query completed ({len(call.steps)} steps). "
-            f"{call.result_label}: {combine_value}. "
-            f"Narration failed: {exc}"
+            "The compound query executed successfully but the narration "
+            "service could not summarise the result. Please try again."
         )
 
     output = apply_output_guardrails(cfg, narration)
@@ -2715,6 +3214,7 @@ async def persist_turn(
     started_monotonic: float,
     cfg: ProjectAgentConfig | None = None,
     llm_provider: str = "",
+    budget_reservation_id: UUID | None = None,
 ) -> AgentTurn:
     latency_ms = int((time.monotonic() - started_monotonic) * 1000)
 
@@ -2783,11 +3283,16 @@ async def persist_turn(
         # (review R1 5283-F1). The pre-turn check gates new turns; the
         # post-turn check detects when one expensive request pushes spend
         # past the budget within a single turn.
+        # Bug-7777 — exclude this turn's pessimistic reservation row. On the
+        # happy path the callers reconciled it away before persist_turn, so
+        # this is a no-op; when reconcile failed (swallowed warning) it stops
+        # the stale reservation from being counted on top of real spend.
         budget_breach = await check_budget_post_turn(
             db, cfg,
             turn_input_tokens=outcome.usage_input_tokens,
             turn_output_tokens=outcome.usage_output_tokens,
             provider=llm_provider,
+            exclude_reservation_id=budget_reservation_id,
         )
         await record_turn_cost(
             db=db,
@@ -2842,8 +3347,13 @@ async def _run_evaluate_kpi_branch(
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(url, headers=headers)
     except httpx.HTTPError as exc:
+        # Bug-5957 — do not expose raw httpx exception to the user.
+        logger.warning("KPI evaluation HTTP error: %s", exc)
         return TurnOutcome(
-            answer_text=f"Could not evaluate the KPI: {exc}",
+            answer_text=(
+                "The KPI evaluation service is temporarily unavailable. "
+                "Please try again shortly."
+            ),
             status="error",
             plan=plan,
             semantic_query=None,
@@ -2858,9 +3368,16 @@ async def _run_evaluate_kpi_branch(
         )
 
     if resp.status_code >= 400:
-        detail = resp.text[:200]
+        # Bug-5957 — do not expose HTTP status or internal response body.
+        logger.warning(
+            "KPI evaluation failed (HTTP %d): %s",
+            resp.status_code, resp.text[:500],
+        )
         return TurnOutcome(
-            answer_text=f"KPI evaluation failed (HTTP {resp.status_code}): {detail}",
+            answer_text=(
+                "The KPI could not be evaluated at this time. "
+                "Please try again or contact your administrator."
+            ),
             status="error",
             plan=plan,
             semantic_query=None,
@@ -2923,9 +3440,16 @@ async def _run_preview_named_set_branch(
     # F-023-09 — thread the real project id; the literal `_` segment failed
     # model-service UUID path validation (HTTP 422) before any handler ran.
     project_seg = str(project_id) if project_id is not None else str(cfg.project_id)
+    # Bug-8712: the conversational agent is a CONSUMPTION surface, so it previews
+    # the DEPLOYED definition. Without the flag a modeller's unsaved expression
+    # edit changed the members the agent quoted back to every user, with no
+    # Deploy — the same leak as TESSALLITE.LISTBYID, on a different transport.
+    # Root contract: the deployed snapshot is the contract, the live state is
+    # editor-only (F-013-01).
     url = (
         f"{settings.MODEL_SERVICE_URL}/api/v1/projects/{project_seg}/models/"
         f"{call.model_id}/named-sets/{call.named_set_id}/preview"
+        f"?deployed_only=true"
     )
     # internal_request_headers: agent -> model-service metadata reads are
     # internal pipeline traffic — exempt from the per-tenant rate limiter.
@@ -2938,8 +3462,13 @@ async def _run_preview_named_set_branch(
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(url, headers=headers)
     except httpx.HTTPError as exc:
+        # Bug-5957 — do not expose raw httpx exception to the user.
+        logger.warning("Named set preview HTTP error: %s", exc)
         return TurnOutcome(
-            answer_text=f"Could not preview the named set: {exc}",
+            answer_text=(
+                "The named set preview service is temporarily unavailable. "
+                "Please try again shortly."
+            ),
             status="error",
             plan=plan,
             semantic_query=None,
@@ -2954,9 +3483,16 @@ async def _run_preview_named_set_branch(
         )
 
     if resp.status_code >= 400:
-        detail = resp.text[:200]
+        # Bug-5957 — do not expose HTTP status or internal response body.
+        logger.warning(
+            "Named set preview failed (HTTP %d): %s",
+            resp.status_code, resp.text[:500],
+        )
         return TurnOutcome(
-            answer_text=f"Named set preview failed (HTTP {resp.status_code}): {detail}",
+            answer_text=(
+                "The named set could not be previewed at this time. "
+                "Please try again or contact your administrator."
+            ),
             status="error",
             plan=plan,
             semantic_query=None,
@@ -3070,8 +3606,15 @@ async def _run_create_aggregate_branch(
                 headers={"Authorization": f"Bearer {jwt_token}"},
             )
         if resp.status_code != 200:
-            error_detail = resp.text[:200]
-            narration = f"Failed to create aggregate: {error_detail}"
+            # Bug-5957 — do not expose HTTP status or optimizer response.
+            logger.warning(
+                "create_aggregate failed (HTTP %d): %s",
+                resp.status_code, resp.text[:500],
+            )
+            narration = (
+                "The aggregate could not be created at this time. "
+                "Please try again or contact your administrator."
+            )
         else:
             data = resp.json()
             created = data.get("aggregates_created", 0)
@@ -3085,7 +3628,13 @@ async def _run_create_aggregate_branch(
                 errors = data.get("errors", [])
                 candidates = data.get("candidates_found", 0)
                 if errors:
-                    narration = f"No aggregates created: {'; '.join(errors)}"
+                    # Bug-5957 — log optimizer errors; show safe message.
+                    logger.warning("No aggregates created: %s", "; ".join(errors))
+                    narration = (
+                        "No aggregates were created. The optimizer could not "
+                        "find suitable candidates. Try running more queries "
+                        "first or contact your administrator."
+                    )
                 elif candidates == 0:
                     narration = (
                         "No aggregate candidates found. The optimizer requires "
@@ -3095,8 +3644,12 @@ async def _run_create_aggregate_branch(
                 else:
                     narration = "Optimizer ran but did not create any new aggregates."
     except Exception as exc:
+        # Bug-5957 — do not expose raw exception to the user.
         logger.exception("create_aggregate branch failed")
-        narration = f"Error contacting optimizer: {exc}"
+        narration = (
+            "The aggregate creation service is temporarily unavailable. "
+            "Please try again shortly."
+        )
 
     # Review R1 5279-F1 — create_aggregate must apply output guardrails
     # (disclosure text, content rules) like every other tool branch.

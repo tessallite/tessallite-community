@@ -89,7 +89,7 @@ An additive measure can be correctly re-aggregated from a coarser pre-aggregated
 
 Click the measure name in the Toolbelt Measures list. The Drawer opens with the current values. Change any field and click **Save**.
 
-> **Warning:** Renaming a measure changes the column identifier exposed to BI tools. Saved reports or dashboards that reference the old name will break. Coordinate with BI tool users before renaming a measure that is already in production use.
+> **Warning:** Renaming a measure updates model-owned calculated-measure, KPI, scratchpad, saved SQL query, same-model cross-model-recipe step/combine, and model alias-map references in the same transaction. Recipe steps for other models remain unchanged. A rename is rejected with the blocking object and JSON path if Tessallite cannot safely rewrite a stored name-based reference. Stable-ID consumers do not need rewriting. Quantile proof rows for that measure are invalidated so queries fail back to the source until the aggregate is refreshed or rebuilt. Deployed snapshots and external BI reports remain immutable, so reports or dashboards that reference the old name can still break; coordinate the rename and redeploy the model.
 
 ---
 

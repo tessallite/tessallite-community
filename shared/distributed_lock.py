@@ -12,58 +12,48 @@ Usage::
                 logger.info("Skipping — another instance holds the lock")
                 return
             await _do_daily_sweep(db)
+
+Bug-6604 (Fable F-1, same root cause as the refresh locks Bug-6570/6548/6104):
+this guard previously took the session-scoped ``pg_try_advisory_lock`` on the
+pooled system-DB ORM session and then committed that session (F-012-17) to avoid
+``idle_in_transaction`` — but a pooled ``AsyncSession.commit()`` RETURNS the
+lock-bearing connection to the pool, and a PostgreSQL session advisory lock is
+held by the CONNECTION. The sweeps share the ``SystemSessionLocal`` pool with
+the every-minute webhook drain and co-firing hourly jobs, so another task could
+check out the lock-bearing connection between the post-acquire commit and the
+sweep's next statement; the exit unlock then ran on a different connection,
+returned False, and was swallowed — the sweep lock leaked for up to
+``pool_recycle`` seconds, making every subsequent refresh/pocket/SLA sweep skip
+("another instance holds the lock") platform-wide.
+
+Fix: the lock now lives on a DEDICATED connection checked out from the session's
+engine and held open for the whole ``async with`` body, released only on exit
+(``shared.refresh_lock_core.dedicated_advisory_lock_optional``). It is decoupled
+from the ORM session's commit-driven connection churn; the dedicated connection
+commits once after acquiring so it never sits idle-in-transaction (preserving the
+F-012-17 intent) without touching the caller's session.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.refresh_lock_core import dedicated_advisory_lock_optional, lock_id as _lock_id
+
 logger = logging.getLogger(__name__)
-
-
-def _lock_id(name: str) -> int:
-    return int(hashlib.sha256(name.encode()).hexdigest()[:15], 16)
 
 
 @asynccontextmanager
 async def advisory_lock(
     session: AsyncSession, name: str,
 ) -> AsyncIterator[bool]:
-    lock_id = _lock_id(name)
-    result = await session.execute(
-        text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id},
-    )
-    acquired = result.scalar()
-    if not acquired:
-        logger.debug("advisory_lock(%s) not acquired — another holder", name)
-        yield False
-        return
-    # F-012-17: ``pg_try_advisory_lock`` is SESSION-scoped (not transaction-
-    # scoped), so the lock outlives a commit. Commit immediately after acquiring
-    # it so the session sits IDLE rather than IDLE IN TRANSACTION while the
-    # multi-tenant sweep runs its per-tenant work on other sessions. A metadata
-    # DB hardened with ``idle_in_transaction_session_timeout`` would otherwise
-    # kill this session mid-sweep, silently dropping the lock and allowing a
-    # second instance to start the same sweep. An idle (committed) session is
-    # not affected by that timeout.
-    try:
-        await session.commit()
-    except Exception:  # pragma: no cover - defensive; lock is still held
-        logger.debug("advisory_lock(%s): post-acquire commit failed", name)
-    logger.debug("advisory_lock(%s) acquired (id=%d)", name, lock_id)
-    try:
-        yield True
-    finally:
-        try:
-            await session.execute(
-                text("SELECT pg_advisory_unlock(:id)"), {"id": lock_id},
-            )
-            await session.commit()
-            logger.debug("advisory_lock(%s) released", name)
-        except Exception:  # pragma: no cover - session may already be closed
-            logger.debug("advisory_lock(%s): unlock failed (session closed?)", name)
+    key = _lock_id(name)
+    async with dedicated_advisory_lock_optional(session, key) as acquired:
+        if acquired:
+            logger.debug("advisory_lock(%s) acquired (id=%d)", name, key)
+        else:
+            logger.debug("advisory_lock(%s) not acquired — another holder", name)
+        yield acquired

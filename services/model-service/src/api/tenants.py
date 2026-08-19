@@ -8,17 +8,19 @@ GET  /tenants/me — tenant user: get own tenant info from JWT.
 from __future__ import annotations
 
 from cryptography.fernet import InvalidToken
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from shared.audit.system import system_audit
 from shared.config.settings import get_settings
 from shared.db.models import SystemTenant
 from shared.db.session import get_system_db, normalize_tenant_db_url, evict_tenant_engine
 from shared.schemas.pydantic_models import TenantCreate, TenantResponse, TenantUpdate
 from shared.security.credential_crypto import decrypt_str, encrypt_str
-from src.auth.middleware import CurrentUser, forbid_embed_user, get_current_user, require_system_admin
+from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
+from src.auth.middleware import CurrentUser, require_human_user, require_system_admin
 from src.licensing_guard import enforce_create_cap, get_license_manager
 
 settings = get_settings()
@@ -33,6 +35,7 @@ def _encrypt_db_url(url: str) -> bytes:
 @router.post("", response_model=TenantResponse, status_code=status.HTTP_201_CREATED)
 async def create_tenant(
     body: TenantCreate,
+    request: Request,
     sys_db: AsyncSession = Depends(get_system_db),
     _admin: CurrentUser = Depends(require_system_admin),
 ) -> TenantResponse:
@@ -51,7 +54,9 @@ async def create_tenant(
             1 for s in rows.scalars().all() if mgr.classify_tenant(str(s)) != "demo"
         )
 
-    await enforce_create_cap("tenant", _count_own_tenants)
+    # Bug-6567: pass sys_db so the count-then-create is serialised with an
+    # advisory lock, preventing two concurrent tenant creates at cap-1.
+    await enforce_create_cap("tenant", _count_own_tenants, db=sys_db)
 
     # Validate slug uniqueness
     result = await sys_db.execute(
@@ -108,7 +113,20 @@ async def create_tenant(
         is_active=True,
     )
     sys_db.add(tenant)
+    client_ip = request.client.host if request.client else None
     try:
+        await system_audit(
+            sys_db,
+            action="tenant.create",
+            severity="critical",
+            actor_email=_admin.email,
+            target_type="tenant",
+            target_id=tenant.id,
+            target_name=tenant.slug,
+            tenant_slug=tenant.slug,
+            ip_address=client_ip,
+            detail={"display_name": tenant.display_name},
+        )
         await sys_db.commit()
     except IntegrityError:
         await sys_db.rollback()
@@ -138,8 +156,7 @@ async def list_tenants(
 @router.get("/me", response_model=TenantResponse)
 async def get_my_tenant(
     sys_db: AsyncSession = Depends(get_system_db),
-    current_user: CurrentUser = Depends(get_current_user),
-    _: None = Depends(forbid_embed_user),
+    current_user: CurrentUser = Depends(require_human_user),
 ) -> TenantResponse:
     """Tenant user: get info about own tenant (from JWT tenant_id)."""
     from sqlalchemy import select
@@ -173,6 +190,7 @@ async def get_tenant(
 async def update_tenant(
     tenant_id: str,
     body: TenantUpdate,
+    request: Request,
     sys_db: AsyncSession = Depends(get_system_db),
     _admin: CurrentUser = Depends(require_system_admin),
 ) -> TenantResponse:
@@ -195,6 +213,19 @@ async def update_tenant(
     updates = body.model_dump(exclude_unset=True)
     for key, value in updates.items():
         setattr(tenant, key, value)
+    client_ip = request.client.host if request.client else None
+    await system_audit(
+        sys_db,
+        action="tenant.update",
+        severity="critical",
+        actor_email=_admin.email,
+        target_type="tenant",
+        target_id=tenant.id,
+        target_name=tenant.slug,
+        tenant_slug=tenant.slug,
+        ip_address=client_ip,
+        detail={"display_name": tenant.display_name, "updates": sorted(updates.keys())},
+    )
     await sys_db.commit()
     await sys_db.refresh(tenant)
     return TenantResponse.model_validate(tenant)
@@ -203,6 +234,7 @@ async def update_tenant(
 @router.delete("/{tenant_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_tenant(
     tenant_id: str,
+    request: Request,
     sys_db: AsyncSession = Depends(get_system_db),
     _admin: CurrentUser = Depends(require_system_admin),
 ) -> None:
@@ -214,6 +246,22 @@ async def delete_tenant(
     tenant = result.scalar_one_or_none()
     if tenant is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
+
+    client_ip = request.client.host if request.client else None
+    await system_audit(
+        sys_db,
+        action="tenant.delete",
+        severity="critical",
+        actor_email=_admin.email,
+        target_type="tenant",
+        target_id=tenant.id,
+        target_name=tenant.slug,
+        tenant_slug=tenant.slug,
+        ip_address=client_ip,
+        detail={"display_name": tenant.display_name},
+    )
+    await emit_webhook(tenant.slug, "tenant.deleted", {"slug": tenant.slug})
+    await sys_db.commit()
 
     db_url = normalize_tenant_db_url(decrypt_str(tenant.encrypted_db_url), tenant.slug)
 

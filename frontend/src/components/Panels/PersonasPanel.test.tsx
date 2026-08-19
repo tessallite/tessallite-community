@@ -1,9 +1,10 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, waitFor, cleanup, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ConfirmProvider } from "../Confirm";
+import { parseFilterRows, serializeFilterRows } from "./PersonasPanel";
 
 const usePersonasMock = vi.fn();
 const useMeasuresMock = vi.fn();
@@ -59,7 +60,14 @@ function renderPanel() {
 }
 
 describe("PersonasPanel", () => {
+  // Bug-6677: MUI Dialog/Select transitions fire real setTimeout callbacks at
+  // unpredictable times under full-suite CPU contention. This causes async
+  // setState calls to leak across test boundaries, producing intermittent
+  // failures (pass in isolation, fail under parallel vitest). Fake timers give
+  // deterministic control; afterEach flushes remaining timers before React
+  // cleanup to prevent setState-after-unmount.
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     usePersonasMock.mockReset();
     useMeasuresMock.mockReset();
     useDimensionsMock.mockReset();
@@ -77,6 +85,16 @@ describe("PersonasPanel", () => {
     useDimensionsMock.mockReturnValue({ data: [], isLoading: false });
     useHierarchiesMock.mockReturnValue({ data: [], isLoading: false });
     useDataTagsMock.mockReturnValue({ data: [], isLoading: false });
+    // F-026-04: authoring controls now require an editor role (and not
+    // read-only). These tests exercise the modeller authoring path.
+    window.localStorage.setItem("user_role", "modeler");
+  });
+
+  afterEach(() => {
+    act(() => { vi.runOnlyPendingTimers(); });
+    cleanup();
+    vi.useRealTimers();
+    window.localStorage.removeItem("user_role");
   });
 
   it("shows empty-state when there are no personas", () => {
@@ -277,6 +295,7 @@ describe("PersonasPanel — column restriction persistence (F-008-07)", () => {
   };
 
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     usePersonasMock.mockReset();
     createMock.mockReset();
     updateMock.mockReset();
@@ -289,9 +308,18 @@ describe("PersonasPanel — column restriction persistence (F-008-07)", () => {
     useDimensionsMock.mockReturnValue({ data: [], isLoading: false });
     useHierarchiesMock.mockReturnValue({ data: [], isLoading: false });
     useDataTagsMock.mockReturnValue({ data: [TAG], isLoading: false });
+    // F-026-04: authoring controls now require an editor role.
+    window.localStorage.setItem("user_role", "modeler");
   });
 
-  it("persists ticked restrictions when creating a persona", async () => {
+  afterEach(() => {
+    act(() => { vi.runOnlyPendingTimers(); });
+    cleanup();
+    vi.useRealTimers();
+    window.localStorage.removeItem("user_role");
+  });
+
+  it("persists ticked restrictions atomically when creating a persona (Bug-7051)", async () => {
     const user = userEvent.setup();
     usePersonasMock.mockReturnValue({ data: [], isLoading: false });
     createMock.mockResolvedValue({ ...PERSONA, id: "new-id" });
@@ -305,21 +333,22 @@ describe("PersonasPanel — column restriction persistence (F-008-07)", () => {
     await user.click(screen.getByRole("button", { name: /^create$/i }));
 
     await waitFor(() => expect(createMock).toHaveBeenCalledTimes(1));
-    await waitFor(() =>
-      expect(setRestrictionsMock).toHaveBeenCalledWith(
-        "proj-1",
-        "model-1",
-        "new-id",
-        { tag_ids: ["tag-1"] },
-      ),
+    // Bug-7051: restricted_tag_ids is sent in the single atomic payload,
+    // NOT via a separate setPersonaRestrictions call.
+    expect(createMock).toHaveBeenCalledWith(
+      "proj-1",
+      "model-1",
+      expect.objectContaining({ restricted_tag_ids: ["tag-1"] }),
     );
+    expect(setRestrictionsMock).not.toHaveBeenCalled();
   });
 
-  it("surfaces an error when the restriction save fails on update", async () => {
+  it("surfaces a backend error when the atomic save fails on update (Bug-7051)", async () => {
     const user = userEvent.setup();
     usePersonasMock.mockReturnValue({ data: [PERSONA], isLoading: false });
-    updateMock.mockResolvedValue({});
-    setRestrictionsMock.mockRejectedValue(new Error("boom"));
+    // Bug-7051: the backend validates restricted_tag_ids atomically and
+    // returns an error in the same response — no separate restriction call.
+    updateMock.mockRejectedValue(new Error("Invalid tag IDs"));
 
     renderPanel();
 
@@ -327,10 +356,11 @@ describe("PersonasPanel — column restriction persistence (F-008-07)", () => {
     await user.click(await screen.findByRole("checkbox", { name: /PII/ }));
     await user.click(screen.getByRole("button", { name: /^save$/i }));
 
-    await waitFor(() => expect(setRestrictionsMock).toHaveBeenCalled());
+    await waitFor(() => expect(updateMock).toHaveBeenCalled());
     expect(
-      await screen.findByText(/column restrictions could not be saved/i),
+      await screen.findByText(/Invalid tag IDs/i),
     ).toBeInTheDocument();
+    expect(setRestrictionsMock).not.toHaveBeenCalled();
   });
 
   it("locks the restrictions section when loading current restrictions fails", async () => {
@@ -350,7 +380,121 @@ describe("PersonasPanel — column restriction persistence (F-008-07)", () => {
 
     await user.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
-    // The unloaded restriction set must never be written back.
-    expect(setRestrictionsMock).not.toHaveBeenCalled();
+    // Bug-7051: when restrictions could not be loaded, the body must NOT
+    // include restricted_tag_ids — otherwise the backend would silently
+    // wipe the persona's column security.
+    const updateBody = updateMock.mock.calls[0][3];
+    expect(updateBody).not.toHaveProperty("restricted_tag_ids");
+  });
+});
+
+describe("PersonasPanel empty-audience warning (F-008-12)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    usePersonasMock.mockReset();
+    useMeasuresMock.mockReset();
+    useDimensionsMock.mockReset();
+    useHierarchiesMock.mockReset();
+    useDataTagsMock.mockReset();
+    getRestrictionsMock.mockReset();
+    getRestrictionsMock.mockResolvedValue([]);
+    useMeasuresMock.mockReturnValue({
+      data: [{ id: "m1", name: "Revenue" }],
+      isLoading: false,
+    });
+    useDimensionsMock.mockReturnValue({ data: [], isLoading: false });
+    useHierarchiesMock.mockReturnValue({ data: [], isLoading: false });
+    useDataTagsMock.mockReturnValue({ data: [], isLoading: false });
+    window.localStorage.setItem("user_role", "modeler");
+  });
+
+  afterEach(() => {
+    act(() => { vi.runOnlyPendingTimers(); });
+    cleanup();
+    vi.useRealTimers();
+    window.localStorage.removeItem("user_role");
+  });
+
+  it("warns when a narrowing persona has no audience role", async () => {
+    const user = userEvent.setup();
+    usePersonasMock.mockReturnValue({
+      data: [{
+        id: "p-sales",
+        model_id: "model-1",
+        slug: "sales",
+        name: "Sales",
+        description: null,
+        included_measure_ids: ["m1"],
+        included_dimension_ids: [],
+        included_hierarchy_ids: [],
+        audience_roles: [],
+        default_filters: {},
+        bypass_row_security: false,
+        includes_hidden_columns: false,
+        created_at: "2026-04-24T00:00:00Z",
+        updated_at: "2026-04-24T00:00:00Z",
+      }],
+      isLoading: false,
+    });
+
+    renderPanel();
+    await user.click(screen.getByRole("button", { name: /edit/i }));
+    expect(
+      await screen.findByText(/empty audience would apply it to everyone/i),
+    ).toBeInTheDocument();
+  });
+
+  it("offers a structured default-filters editor (G-008-02)", async () => {
+    const user = userEvent.setup();
+    usePersonasMock.mockReturnValue({
+      data: [{
+        id: "p-sales",
+        model_id: "model-1",
+        slug: "sales",
+        name: "Sales",
+        description: null,
+        included_measure_ids: ["m1"],
+        included_dimension_ids: [],
+        included_hierarchy_ids: [],
+        audience_roles: ["sales"],
+        default_filters: {},
+        bypass_row_security: false,
+        includes_hidden_columns: false,
+        created_at: "2026-04-24T00:00:00Z",
+        updated_at: "2026-04-24T00:00:00Z",
+      }],
+      isLoading: false,
+    });
+    useDimensionsMock.mockReturnValue({
+      data: [{ id: "d1", name: "region", display_name: "Region" }],
+      isLoading: false,
+    });
+
+    renderPanel();
+    await user.click(screen.getByRole("button", { name: /edit/i }));
+    expect(await screen.findByRole("button", { name: /add filter/i })).toBeInTheDocument();
+    expect(screen.getByLabelText(/advanced json/i)).toBeInTheDocument();
+  });
+});
+
+describe("default_filters serialize/parse round-trip (INTEG-09)", () => {
+  it("preserves the not_in operator across a reload", () => {
+    // not_in previously serialised to a bare array, which parseFilterRows reads
+    // back as `in` — silently losing the operator. It must survive the round trip.
+    const rows = [{ dim: "region", op: "not_in", value: "EMEA, APAC" }];
+    const json = serializeFilterRows(rows);
+    // Typed object form (the shape the backend maps to not_in).
+    expect(JSON.parse(json)).toEqual({ region: { not_in: ["EMEA", "APAC"] } });
+    const back = parseFilterRows(json);
+    expect(back).toEqual([{ dim: "region", op: "not_in", value: "EMEA, APAC" }]);
+  });
+
+  it("keeps in as a bare array and round-trips it", () => {
+    const rows = [{ dim: "region", op: "in", value: "EMEA, APAC" }];
+    const json = serializeFilterRows(rows);
+    expect(JSON.parse(json)).toEqual({ region: ["EMEA", "APAC"] });
+    expect(parseFilterRows(json)).toEqual([
+      { dim: "region", op: "in", value: "EMEA, APAC" },
+    ]);
   });
 });

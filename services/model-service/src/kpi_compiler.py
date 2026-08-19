@@ -207,21 +207,85 @@ def _transpile_to_dialect(sql: str, dialect: str) -> str:
 # Semi-additive SQL builders
 # ---------------------------------------------------------------------------
 
+class KPIUnsupportedAggregationError(ValueError):
+    """A KPI names a semi-additive reducer this compiler cannot honour.
+
+    Bug-6252 (deep-review finding 2). A DEDICATED type, not a bare ValueError,
+    because the only production caller of ``compile_expression``
+    (``api/kpis._evaluate_expression_via_sql``) wraps it in
+    ``except Exception: return _COMPILER_UNSUPPORTED`` — which routes the KPI to
+    the PYTHON evaluator. That evaluator applies no ``at_grain`` bucketing and
+    no semi-additive reduction at all, so it serves the plain model-wide SUM:
+    the exact silent wrong number this raise exists to prevent, merely produced
+    one frame further out (a daily-balance KPI reporting 310 instead of the 90
+    closing balance). Callers must let this type past the generic catch and
+    fail the KPI closed, the same disposition the sibling
+    ``has_ungrouped_window`` check already uses for the same reason.
+    """
+
+
+def _canonical_non_additive_agg(non_additive_agg: str | None) -> str:
+    """Canonicalise a persisted ``non_additive_agg`` token, or fail loud.
+
+    Bug-6252 [silent wrong numbers]. The API boundary
+    (``_validate_kpi_non_additive_agg``) now gates this field, but rows
+    persisted BEFORE that gate — and any writer that bypasses the Pydantic
+    layer — can still carry an unrecognised token. This is the read-coercion
+    backstop, following the same shape as the measure-enum backstop in
+    ``model_snapshot/rehydrator``: a known legacy token maps to its canonical
+    form, and anything else raises instead of falling through.
+
+    Failing loud is the correct trade here, not a defensive default. The
+    previous ``return SUM(col_expr)`` fallback answered every unknown token by
+    SUMMING a column of per-period balances, which is the precise number a
+    semi-additive KPI exists to avoid: a daily-balance or inventory-level KPI
+    reported the sum of every day's balance rather than the closing/average
+    balance, with no error anywhere. A KPI that cannot be compiled correctly
+    must not compile at all.
+    """
+    from shared.schemas.domains.governance_advanced import (
+        _KPI_NON_ADDITIVE_AGG_SYNONYMS,
+        _KPI_NON_ADDITIVE_AGGS,
+    )
+
+    token = str(non_additive_agg or "").strip().lower()
+    token = _KPI_NON_ADDITIVE_AGG_SYNONYMS.get(token, token)
+    if token not in _KPI_NON_ADDITIVE_AGGS:
+        raise KPIUnsupportedAggregationError(
+            f"KPI semi-additive aggregation {non_additive_agg!r} is not "
+            f"supported. Use one of {sorted(_KPI_NON_ADDITIVE_AGGS)}. "
+            "Compiling it would silently SUM the per-period values instead of "
+            "reducing them, which reports (for example) the sum of every day's "
+            "balance instead of the closing balance."
+        )
+    return token
+
+
 def _semi_additive_expr(non_additive_agg: str, col_expr: str, time_col: str) -> str:
     """Build a semi-additive aggregation expression.
 
-    For min/max/sum, uses standard aggregate functions (portable).
-    For first/last, returns None — handled by _build_semi_additive_sql
-    using ORDER BY + LIMIT 1 (portable across all dialects via sqlglot).
+    For min/max/sum/avg, uses standard aggregate functions (portable).
+    For first/last, ``_build_semi_additive_sql`` handles the reduction itself
+    with ORDER BY + LIMIT 1 (portable across all dialects via sqlglot) and
+    never calls this function.
+
+    The caller has already canonicalised the token via
+    ``_canonical_non_additive_agg``, so ``sum`` here is an EXPLICIT choice, not
+    a fallback for an unrecognised value (Bug-6252).
     """
     agg = non_additive_agg.lower()
     if agg == "min":
         return f"MIN({col_expr})"
     if agg == "max":
         return f"MAX({col_expr})"
-    # first/last handled by _build_semi_additive_sql directly
-    # Fallback: SUM
-    return f"SUM({col_expr})"
+    if agg == "avg":
+        return f"AVG({col_expr})"
+    if agg == "sum":
+        return f"SUM({col_expr})"
+    raise ValueError(
+        f"Unreachable: uncanonicalised semi-additive aggregation {agg!r} "
+        "reached _semi_additive_expr"
+    )
 
 
 def _build_semi_additive_sql(
@@ -229,24 +293,30 @@ def _build_semi_additive_sql(
 ) -> str:
     """Wrap a compiled expression in a semi-additive subquery.
 
-    The inner query groups by ``at_grain`` (a time grain column) and
-    computes the base expression per grain bucket.  The outer query
-    picks the correct value (last, first, min, max) across grain buckets.
+    Reducing aggregations group the inner query by ``at_grain`` only, producing
+    one row per requested grain bucket.  ``first`` / ``last`` also keep the raw
+    time column so the outer query can order the candidate points.
 
     For first/last, uses ORDER BY + LIMIT 1 which is portable across
     all dialects (sqlglot transpiles LIMIT to TOP/FETCH as needed).
     """
+    raw_grain = ctx.at_grain or "date"
     time_col = _safe_ident(ctx.time_column or "date")
-    grain_col = _safe_ident(ctx.at_grain)
-    agg = (ctx.non_additive_agg or "last").lower()
-
-    inner_sql = (
-        f"SELECT {grain_col}, {select_expr} AS inner_val, {time_col} "
-        f"FROM {_safe_ident(ctx.model_slug)} "
-        f"GROUP BY {grain_col}, {time_col}"
-    )
+    if raw_grain.lower() in _GRAIN_KEYWORDS:
+        grain_expr = f"DATE_TRUNC('{raw_grain.lower()}', {time_col})"
+    else:
+        grain_expr = _safe_ident(raw_grain)
+    # Bug-6252: canonicalise (and reject an unsupported token) BEFORE choosing
+    # the SQL shape, so a legacy/free-form value cannot select the generic
+    # else-branch below and then be SUMmed by the old fallback.
+    agg = _canonical_non_additive_agg(ctx.non_additive_agg or "last")
 
     if agg in ("first", "last"):
+        inner_sql = (
+            f"SELECT {grain_expr} AS grain_key, {select_expr} AS inner_val, {time_col} "
+            f"FROM {_safe_ident(ctx.model_slug)} "
+            f"GROUP BY {grain_expr}, {time_col}"
+        )
         order_dir = "DESC" if agg == "last" else "ASC"
         return (
             f"SELECT inner_val AS value "
@@ -256,7 +326,20 @@ def _build_semi_additive_sql(
             f"LIMIT 1"
         )
 
-    # min/max/sum use standard aggregate functions
+    if agg in ("avg", "min", "max"):
+        inner_sql = (
+            f"SELECT {grain_expr} AS grain_key, {select_expr} AS inner_val "
+            f"FROM {_safe_ident(ctx.model_slug)} "
+            f"GROUP BY {grain_expr}"
+        )
+    else:
+        inner_sql = (
+            f"SELECT {grain_expr} AS grain_key, {select_expr} AS inner_val, {time_col} "
+            f"FROM {_safe_ident(ctx.model_slug)} "
+            f"GROUP BY {grain_expr}, {time_col}"
+        )
+
+    # min/max/avg/sum use standard aggregate functions
     agg_expr = _semi_additive_expr(agg, "inner_val", time_col)
     return (
         f"SELECT {agg_expr} AS value "
@@ -431,7 +514,30 @@ def compile_scalar_kpi_sql(
         )
 
     n = ti_n_periods or 3
+
+    # Bug-6831 [correctness]: COUNT_DISTINCT is NON-ADDITIVE. The
+    # trailing_sum and moving_avg paths aggregate per-period values with
+    # SUM/AVG, so summing/averaging per-period distinct counts produces an
+    # inflated, incorrect result (a customer active in two months is
+    # counted twice). This mirrors the guard in source_sql.py (Bug-6229).
+    # Detect count_distinct ANYWHERE in the rendered base expression (not
+    # just at the start — composite expressions like
+    # SUM(revenue) + COUNT(DISTINCT customer_id) must also be caught)
+    # OR from the context's default aggregation.
+    _is_cd = (
+        "COUNT(DISTINCT" in base_select_expr.upper()
+        or (ctx.default_agg or "").upper() == "COUNT_DISTINCT"
+    )
+
     if ti_type == "moving_avg":
+        if _is_cd:
+            raise ValueError(
+                "COUNT(DISTINCT) measures cannot use the moving_avg time "
+                "intelligence function. Averaging per-period distinct counts "
+                "double-counts values that recur across periods and produces "
+                "an incorrect result. Use a prior-period or lag variant "
+                "instead, or base the computation on an additive measure."
+            )
         return (
             f"WITH period_values AS ("
             f"SELECT DATE_TRUNC('{grain}', {time_col}) AS period, "
@@ -446,6 +552,15 @@ def compile_scalar_kpi_sql(
         )
 
     if ti_type == "trailing_sum":
+        if _is_cd:
+            raise ValueError(
+                "COUNT(DISTINCT) measures cannot use the trailing_sum time "
+                "intelligence function. Summing per-period distinct counts "
+                "double-counts values that recur across periods and produces "
+                "an inflated, incorrect running total. Use a prior-period or "
+                "lag variant instead, or base the computation on an additive "
+                "measure (sum/count)."
+            )
         return (
             f"WITH period_values AS ("
             f"SELECT DATE_TRUNC('{grain}', {time_col}) AS period, "
@@ -1026,6 +1141,7 @@ class _Compiler:
                 calendar_type=cal_type,
                 fiscal_year_start_month=self.ctx.fiscal_year_start_month,
                 n=n_val,
+                time_grain=grain,  # Bug-6645: forward grain so CAGR/etc can validate
             )
             result = emit_variant_expression(variant_name, binding)
             return result.sql
@@ -1075,6 +1191,15 @@ class _Compiler:
         return False
 
     def _extract_grain(self, node: FunctionCall) -> Optional[str]:
+        # For functions where n and grain can appear in any order after the
+        # inner expression (cagr, moving_avg, trailing_sum, lag, lead), scan
+        # all post-expression args for the first StringLiteral.
+        if node.name in ("cagr", "moving_avg", "trailing_sum", "lag", "lead"):
+            for arg in node.args[1:]:
+                if isinstance(arg, StringLiteral):
+                    return arg.value.lower()
+            return None
+        # Default: grain at position 1 (period_to_date, prior_period, etc.)
         if len(node.args) >= 2 and isinstance(node.args[1], StringLiteral):
             return node.args[1].value.lower()
         return None
@@ -1333,7 +1458,23 @@ def compile_expression(
         if where_suffix and " FROM " in sql:
             sql = _inject_where(sql, effective_where)
     # Semi-additive: subquery with GROUP BY at_grain.
-    elif ctx.non_additive_agg and ctx.at_grain:
+    #
+    # Bug-6252 (deep-review R5 finding 1): dispatch on OR, not AND. Every guard
+    # this lane added sits on the FALLBACK path and states the invariant as
+    # ``non_additive_agg or at_grain``; this dispatch used ``and``, so a
+    # HALF-configured KPI -- one of the two set, which nothing validates against
+    # and which the REST API, project import and the agent all accept -- fell
+    # straight through to the plain single-SELECT path below and served
+    # ``SELECT SUM(balance) FROM model``: 310 for daily balances 100/120/90
+    # where the closing balance is 90.
+    #
+    # Filling the missing half is not a guess: ``_build_semi_additive_sql``
+    # already documents and applies its own defaults for exactly this case
+    # (``ctx.at_grain or "date"``, ``ctx.non_additive_agg or "last"``), and
+    # "last value by date" / "last value per <grain>" is the natural reading of
+    # each half on its own. There is no input for which the old ``and`` gave a
+    # better answer -- it only ever substituted an un-reduced SUM.
+    elif ctx.non_additive_agg or ctx.at_grain:
         sql = _build_semi_additive_sql(select_expr, ctx)
         if where_suffix and " FROM " in sql:
             sql = _inject_where(sql, effective_where)

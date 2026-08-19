@@ -2,7 +2,7 @@
 title: "Configure Pocket Tables"
 audience: modeller
 area: modelling
-updated: 2026-04-22
+updated: 2026-08-11
 ---
 
 ![Model Builder — Pocket Drawer in create mode, Query tab.](../assets/screencaps/pocket-drawer.png)
@@ -48,7 +48,28 @@ The pocket's source table list is not a stored field. It is parsed from the defi
 
 The default refresh strategy is **full refresh** — the pocket is rebuilt from scratch on each run. Optional incremental mode kicks in when `incremental_column` is set on the pocket.
 
-Incremental refresh re-reads only the rows whose incremental column changed inside the look-back window and adds or replaces them. It is fast, but it has blind spots you must understand: it does **not** remove rows that were *deleted* at the source, and it misses any update that leaves the incremental column unchanged or that falls outside the window. Treat incremental refresh as a quick top-up *between* full rebuilds, not a replacement for them — schedule a periodic full refresh as well, so deletes and stragglers are reconciled.
+Incremental refresh re-reads only the rows whose incremental column changed since the last successful refresh and replaces those rows in the cache. It also checks which rows the source still produces at all, so a row that was deleted at the source — or that stopped matching the pocket's `WHERE` clause — is removed from the cache too. The one thing it still cannot see is an update that leaves the incremental column unchanged: if your source edits a row without touching its `updated_at`, that edit is invisible to every incremental run. Choose an incremental column your source genuinely bumps on every change.
+
+Two things have to be true before an incremental top-up is even attempted, and if either is missing the pocket is simply rebuilt in full instead. You do not have to do anything; it is automatic, and a full rebuild is always correct.
+
+- **The pocket must expose a row key.** To replace a row, the refresh has to be able to find the copy already in the cache. It uses the primary key you declared on the model's fact table — but only if that column is actually visible in the pocket's columns. If the key column is hidden in the model, or the pocket exposes renamed business columns instead of the physical ones, there is no way to tell one cached row from another and the whole table is rebuilt. (Most models hide their fact key, so a full rebuild every run is the normal, expected behaviour.)
+- **The pocket must have refreshed successfully at least once before.** The window to re-read is measured from the previous successful run, not from the current time, so a pocket with no previous success has nothing to measure from.
+
+Measuring the window from the last successful run is what makes a top-up safe after an outage. If the Scheduler was paused for a week, the next run re-reads a week's worth of changes, not just the last few hours — nothing that changed while it was away is skipped. The look-back hours you set are an extra cushion on top of that, for data that arrives at the source slightly late.
+
+Before every top-up, Tessallite checks one thing about your source: *for every row the source has right now, does the cache already hold that row unchanged, or is the row inside the window we are about to re-read?* If the answer is no for even one row, it quietly rebuilds the whole pocket instead of patching. You see a slower run; you do not see a wrong number.
+
+That check is what catches the awkward cases a "recently changed" window cannot: a row that only *starts* matching because a table it joins to was loaded later, and a correction file that restates an existing row but stamps it with an old business date. Both are invisible to the window itself, and both are caught.
+
+Three honest limits remain, so you know what a top-up does and does not promise:
+
+- **If your source changes a row without changing its incremental column, nothing can see it.** That is not a Tessallite limitation — no incremental refresh anywhere can detect a change its own change-marker did not record, and the check above cannot either, because the row still looks unchanged. The same applies to a row whose incremental column is empty: there is nothing to compare, so the row is treated as unchanged. Pick a column your source genuinely fills in and updates on every write.
+- **For a pocket that joins multiple tables, incremental refresh only ever detects changes to the table the incremental column belongs to.** A model is typically a fact table joined to one or more dimensions, and the incremental column is a single column that lives on one of those tables. When a different table changes — for example, a dimension attribute such as a region name or an exchange rate is corrected — the row carrying the incremental column does not change, so the top-up treats the cached result as current. Choosing a column from a different table does not solve this; it simply shifts the blind spot to the other tables. This is a structural limitation of tracking changes with a single column when the cached result comes from multiple tables. If your dimensions change independently of your fact table, schedule full rebuilds frequently enough that the cached pocket never drifts beyond an acceptable window, or use manual refreshes after known dimension updates.
+- **If a top-up runs while your source is halfway through a bulk reload**, it can briefly disagree with the source. Tessallite detects that on the very next run and repairs it then, so the disagreement lasts one refresh cycle rather than persisting. If your loads are large and non-atomic, schedule pocket refreshes outside the load window.
+
+One thing to keep in mind about speed: a top-up still reads the source twice (once for the changed rows, once to check which rows still exist). What it saves is the *writing*, not the reading. Do not expect it to be dramatically faster than a full rebuild on a small pocket.
+
+One exception is automatic, and you do not have to think about it. If the model has been deployed or reverted since the pocket was last built, or the pocket is currently marked stale or failed, the very next refresh is always a **full** rebuild even when an incremental column is set. The reason is worth understanding: a top-up only re-reads the recent window, so every older row in the cache would still hold numbers calculated from the *previous* version of the model. You would end up with one table holding two different definitions of the same measure, and nothing on screen would tell you. Rebuilding the whole table is slower for that one run, and it is the only way to guarantee every row in the cache means the same thing. After that run, incremental top-ups resume as normal.
 
 ---
 
@@ -106,6 +127,24 @@ Closing the drawer with the **X**, **Cancel**, or a click outside after you have
 
 ---
 
+## When the checker cannot be reached
+
+Every one of those steps — **Validate**, **Dry run**, and **Save** — asks the query service to read your SQL first. If that service is briefly unavailable (it is being upgraded, or the network hiccups), Tessallite will **not** guess. It stops and shows:
+
+> The query validator could not be reached, so your SQL could not be checked. It has not been rejected. Try again in a moment.
+
+Read that message carefully, because it is saying something different from a normal failure:
+
+- **"Not checked"** is not the same as **"wrong"**. Your SQL has not been judged at all. Nothing is wrong with it as far as anyone knows.
+- **Nothing was saved.** The pocket was not created and the old one was not changed.
+- **The fix is to wait and click again.** These outages are usually seconds long. If it keeps happening for more than a few minutes, tell your administrator — the query service is down, not your model.
+
+Why does Tessallite refuse instead of just saving it? Because a pocket table is a stored copy of some of your data, and the check is what proves the copy really matches the model. If Tessallite saved an unchecked pocket, the mistake would not appear now — it would appear later, as a report quietly showing the wrong numbers, with nothing on screen to say anything went wrong. A message you can see and retry is much cheaper than a wrong number nobody notices. This is the same reason Tessallite will not save an unchecked scratchpad measure.
+
+A message that names an actual problem in your SQL — a misspelled column, a table that is not part of the model — is the other case entirely. That one is a real verdict, and re-clicking will not change it; fix the SQL.
+
+---
+
 ## Edit mode
 
 Editing an existing pocket is scoped to scheduling. The target and defining SQL are read-only after creation — delete and recreate the pocket if the SQL needs to change. The drawer exposes a **Refresh now** button in the header to trigger an immediate full rebuild without waiting for the scheduled window.
@@ -114,9 +153,9 @@ Editing an existing pocket is scoped to scheduling. The target and defining SQL 
 
 ## Drift handling
 
-When the underlying model changes — a referenced dimension is removed, the slug is renamed, a JOIN is taken out — the next refresh re-runs the model-subset validator before touching the target. If the pocket no longer fits the model, it is flagged `status='invalid'` with a `failure_reason` carrying the structured violation list. Invalid pockets are no longer routed to. Once the model is fixed, the next refresh clears the flag back to `stale` and rebuilds the materialised table. No manual intervention is required.
+When the underlying model changes — a referenced dimension is removed, the slug is renamed, a JOIN is taken out — the next refresh re-runs the model-subset validator before touching the target. If the pocket no longer fits the model, it is flagged `status='failed'` with a `failure_reason` carrying the structured violation list. Failed pockets are no longer routed to. Once the model is fixed, the next refresh retries the pocket and rebuilds the materialised table. No manual intervention is required.
 
-The Pocket Tables list shows the `invalid` status alongside `stale` so you can see drifted pockets at a glance and either fix the model or delete the pocket.
+The Pocket Tables list shows the `failed` status alongside `stale` so you can see drifted pockets at a glance and either fix the model or delete the pocket.
 
 ---
 

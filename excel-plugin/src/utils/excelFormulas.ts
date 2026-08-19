@@ -139,6 +139,13 @@ export const CUBE_KPI_PROPERTIES: Record<string, CubeKpiProperty> = {
 /**
  * Generate a CUBEKPIMEMBER formula for a KPI property.
  * property: 1=Value, 2=Goal, 3=Status, 4=Trend, 5=Weight
+ *
+ * NOTE: a bare CUBEKPIMEMBER returns the KPI MEMBER OBJECT, which Excel
+ * renders as the member's CAPTION text (e.g. "Shipping Cost"), NOT the
+ * numeric value. To obtain the actual number, wrap CUBEKPIMEMBER inside
+ * CUBEVALUE -- see `buildCubeKpiValueFormula`. Use the bare form only
+ * when the member reference itself is needed (e.g. as a filter argument
+ * to another CUBE function).
  */
 export function buildCubeKpiFormula(
   connectionName: string,
@@ -150,6 +157,63 @@ export function buildCubeKpiFormula(
   // made Excel resolve a KPI literally named "[aa]". Emit the bare caption,
   // Excel-string-escaped only (no MDX bracket escaping).
   return `=CUBEKPIMEMBER("${escapeExcelString(connectionName)}","${escapeExcelString(kpiName)}",${property})`;
+}
+
+/**
+ * Bug-6729: wrap a CUBEKPIMEMBER inside CUBEVALUE so Excel resolves the KPI
+ * property's NUMERIC VALUE instead of rendering the member's caption text.
+ *
+ * A bare =CUBEKPIMEMBER("conn","kpi",1) displays the caption "Shipping Cost";
+ * =CUBEVALUE("conn",CUBEKPIMEMBER("conn","kpi",1)) displays the number.
+ * Same pattern for Status (property 3): bare CUBEKPIMEMBER shows
+ * "Shipping Cost Status"; the wrapped form shows the normalised -1/0/1 value.
+ *
+ * This is the canonical KPI-property formula for every Value / Status cell
+ * emitted by the scorecard, full row, and single-cell insert paths.
+ */
+export function buildCubeKpiValueFormula(
+  connectionName: string,
+  kpiName: string,
+  property: CubeKpiProperty,
+): string {
+  const conn = escapeExcelString(connectionName);
+  const name = escapeExcelString(kpiName);
+  return `=CUBEVALUE("${conn}",CUBEKPIMEMBER("${conn}","${name}",${property}))`;
+}
+
+/**
+ * Bug-6714 / Bug-6729: the formula for a KPI's Value cell, for ANY KPI shape.
+ * A measure-backed KPI resolves through CUBEVALUE on its value measure; a
+ * custom/expression KPI (value_measure_id null -- every KPI in the acme-demo
+ * seed) has no measure to reference, so the Value comes from the KPI's own
+ * Value property via CUBEVALUE(CUBEKPIMEMBER(...)) -- the CUBEVALUE wrap is
+ * essential: a bare CUBEKPIMEMBER shows the member CAPTION text, not the
+ * number (Bug-6729). Previously every multi-cell KPI insert (full row,
+ * value+goal, scorecard) guarded the Value cell behind
+ * `if (valueMeasureName)` and silently left it EMPTY for custom KPIs.
+ * Single source so all Value cells stay consistent.
+ */
+export function kpiValueCellFormula(
+  connectionName: string,
+  kpiTechnicalName: string,
+  valueMeasureName: string | null,
+): string {
+  return valueMeasureName
+    ? generateCubeValue(connectionName, measureMemberRef(valueMeasureName))
+    : buildCubeKpiValueFormula(connectionName, kpiTechnicalName, CUBE_KPI_PROPERTIES.Value);
+}
+
+/**
+ * Bug-6729: the formula for a KPI's Status cell. Wraps CUBEKPIMEMBER Status
+ * inside CUBEVALUE so Excel shows the normalised -1/0/1 numeric value the
+ * icon-set conditional format needs, not the caption text
+ * "Shipping Cost Status".
+ */
+export function kpiStatusCellFormula(
+  connectionName: string,
+  kpiTechnicalName: string,
+): string {
+  return buildCubeKpiValueFormula(connectionName, kpiTechnicalName, CUBE_KPI_PROPERTIES.Status);
 }
 
 /**

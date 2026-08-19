@@ -9,8 +9,8 @@ automatically.  These tests verify that:
    unchanged.
 3. When ``principal`` is None (legacy callers), no error is raised.
 
-The actual row-security wrap logic is tested in the execute pipeline's
-own test suite.
+The actual row-security predicate-injection logic is tested in the execute
+pipeline's own test suite.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import pytest
 
 from shared.security import Principal
 from src.api.drill_routes import DrillThroughRequest, _handle_drill_through
-from src.drill.semantic_builder import encode_cursor
+from src.drill.cursor import CursorOrderTerm, DrillCursorSpec
 
 pytestmark = pytest.mark.asyncio
 
@@ -35,7 +35,11 @@ def _build_sql_return(**overrides):
     defaults = dict(
         sql='SELECT "month", SUM("amount") AS "amount" FROM "modely" GROUP BY "month" LIMIT 101',
         model_id_str=str(_uuid()),
-        offset=0,
+        cursor_spec=DrillCursorSpec.build(
+            scope={"fixture": "row-security"},
+            order_terms=[CursorOrderTerm("month")],
+            stable=True,
+        ),
         effective_limit=100,
         drill_dim=None,
         drill_mode="leaf",
@@ -48,7 +52,7 @@ def _build_sql_return(**overrides):
     return (
         defaults["sql"],
         defaults["model_id_str"],
-        defaults["offset"],
+        defaults["cursor_spec"],
         defaults["effective_limit"],
         defaults["drill_dim"],
         defaults["drill_mode"],

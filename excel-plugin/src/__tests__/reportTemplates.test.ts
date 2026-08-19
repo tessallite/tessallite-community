@@ -20,6 +20,14 @@ describe('reportTemplates', () => {
         expect(t.icon).toBeTruthy();
       }
     });
+
+    // Bug-6365: the Top N Breakdown template must declare a topN cap so the
+    // applying component actually ranks + limits (rather than producing an
+    // unranked, unbounded list). The description promises a top-10 filter.
+    it('Top N Breakdown declares a topN cap of 10', () => {
+      const topN = REPORT_TEMPLATES.find(t => t.id === 'top-n');
+      expect(topN?.topN).toBe(10);
+    });
   });
 
   describe('checkTemplatePrerequisites', () => {

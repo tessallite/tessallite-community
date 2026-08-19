@@ -3,6 +3,7 @@ import {
   getJwt, setJwt, removeJwt,
   getProfiles, saveProfile, removeProfile,
   getActiveProfile, setActiveProfile,
+  getModelContext, setModelContext, clearModelContext,
   clearAllAuthData,
   ConnectionProfile,
 } from '../utils/storage';
@@ -123,5 +124,27 @@ describe('active profile', () => {
     const profiles = await getProfiles();
     expect(jwt).toBeNull();
     expect(profiles).toEqual([]);
+  });
+});
+
+describe('model context storage', () => {
+  it('stores project/model ids with model slug and display name', async () => {
+    await setModelContext('project-1', 'model-1', 'inventory', 'Inventory');
+
+    await expect(getModelContext()).resolves.toEqual({
+      projectId: 'project-1',
+      modelId: 'model-1',
+      modelSlug: 'inventory',
+      modelName: 'Inventory',
+    });
+  });
+
+  it('clears all model context labels', async () => {
+    await setModelContext('project-1', 'model-1', 'inventory', 'Inventory');
+    await clearModelContext();
+
+    await expect(getModelContext()).resolves.toBeNull();
+    expect(mockStorage).not.toHaveProperty('tessallite_model_slug');
+    expect(mockStorage).not.toHaveProperty('tessallite_model_name');
   });
 });

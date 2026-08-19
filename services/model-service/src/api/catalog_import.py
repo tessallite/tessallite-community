@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-import re
 import socket
 import uuid as _uuid
 from typing import Any
@@ -22,10 +21,18 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from shared.auth.middleware import CurrentUser, require_tenant_admin
+from shared.config.settings import get_settings
 from shared.db.models import Model, Project, ProjectConnection
 from shared.db.session import get_tenant_db
 from shared.model_snapshot.importer import prepare_snapshot_for_import
+from shared.db.model_write_lock_guard import model_write_lock_exempt
 from shared.model_snapshot.rehydrator import rehydrate_into_live
+from src.api.personas import seed_technical_persona
+from shared.model_snapshot.slug_utils import (
+    insert_model_with_slug_retry,
+    slugify as _shared_slugify,
+)
+from src.licensing_guard import enforce_demo_source_locked, enforce_import_model_cap
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -39,12 +46,53 @@ def _validate_catalog_url(url: str) -> str:
     parsed = urlparse(url)
     if parsed.scheme not in ("https", "http"):
         raise ValueError(f"Catalog URL must use http(s), got {parsed.scheme!r}")
+    # Bug-5937: every caller of this function goes on to send an
+    # Authorization token (DataHub/OpenMetadata/Alation) to `url`. Plain
+    # `http://` would put that token on the wire in cleartext, observable
+    # or tamperable by any network intermediary. Require HTTPS by default;
+    # CATALOG_IMPORT_ALLOW_HTTP is an explicit, off-by-default operator
+    # opt-in for self-hosted deployments with a genuinely unencrypted
+    # internal catalog service. SSRF host/IP checks below still apply
+    # either way — this flag only affects the transport-encryption gate.
+    if parsed.scheme == "http" and not get_settings().CATALOG_IMPORT_ALLOW_HTTP:
+        raise ValueError(
+            "Catalog URL must use https:// (the request sends your API "
+            "token as a bearer header). Set CATALOG_IMPORT_ALLOW_HTTP=true "
+            "on the model-service to allow http:// for a trusted internal "
+            "catalog service."
+        )
     hostname = parsed.hostname or ""
     if not hostname:
         raise ValueError("Catalog URL has no hostname")
     if hostname.lower().rstrip(".") in _BLOCKED_HOSTS:
         raise ValueError(f"Catalog URL host {hostname!r} is not allowed")
     return url
+
+
+def _is_ssrf_blocked(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
+    """Return a human-readable reason if *addr* must not be contacted, else None.
+
+    Bug-5724 defence-in-depth: check every property that could indicate
+    a non-public address, including IPv6-mapped IPv4 (``::ffff:127.0.0.1``).
+    """
+    # Unwrap IPv6-mapped IPv4 so the checks below use the real IPv4 address.
+    effective = addr
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        effective = addr.ipv4_mapped
+
+    if effective.is_loopback:
+        return f"loopback address {addr}"
+    if effective.is_private:
+        return f"private address {addr}"
+    if effective.is_reserved:
+        return f"reserved address {addr}"
+    if effective.is_multicast:
+        return f"multicast address {addr}"
+    if effective.is_link_local:
+        return f"link-local address {addr}"
+    if not effective.is_global:
+        return f"non-global address {addr}"
+    return None
 
 
 class _SSRFSafeBackend(httpcore.AsyncNetworkBackend):
@@ -62,14 +110,19 @@ class _SSRFSafeBackend(httpcore.AsyncNetworkBackend):
         validated_ip: str | None = None
         for _fam, _type, _proto, _canon, sockaddr in infos:
             addr = ipaddress.ip_address(sockaddr[0])
-            if not addr.is_global or addr.is_multicast:
+            reason = _is_ssrf_blocked(addr)
+            if reason:
                 raise httpcore.ConnectError(
-                    f"SSRF blocked: {host!r} resolves to non-global address {addr}"
+                    f"SSRF blocked: {host!r} resolves to {reason}"
                 )
             if validated_ip is None:
                 validated_ip = sockaddr[0]
         if validated_ip is None:
             raise httpcore.ConnectError(f"SSRF: host {host!r} has no usable address")
+        # Bug-5724: connect to the *validated* IP directly, not the hostname.
+        # This pins the resolved address for the actual TCP connection,
+        # preventing DNS rebinding attacks where a second resolution could
+        # return a different (internal) IP.
         return await self._inner.connect_tcp(
             validated_ip, port, timeout=timeout,
             local_address=local_address, socket_options=socket_options,
@@ -83,10 +136,22 @@ class _SSRFSafeBackend(httpcore.AsyncNetworkBackend):
 
 
 def _ssrf_safe_client(timeout: float = 60.0) -> httpx.AsyncClient:
+    """Build an httpx client that validates every TCP connection against SSRF.
+
+    Bug-5724 hardening:
+    - follow_redirects=False prevents redirect-based SSRF bypass.
+    - The _SSRFSafeBackend validates resolved IPs at connection time (not
+      just at resolution time) and pins the validated IP for the actual
+      TCP connection, closing the DNS rebinding window.
+    """
     pool = httpcore.AsyncConnectionPool(network_backend=_SSRFSafeBackend())
     transport = httpx.AsyncHTTPTransport()
     transport._pool = pool  # type: ignore[attr-defined]
-    return httpx.AsyncClient(timeout=timeout, transport=transport)
+    return httpx.AsyncClient(
+        timeout=timeout,
+        transport=transport,
+        follow_redirects=False,
+    )
 
 
 class CatalogImportRequest(BaseModel):
@@ -383,19 +448,15 @@ def _catalog_to_bundle(
 
 
 def _slugify(name: str) -> str:
-    """Slugify and bound to the 64-char column (F-020-20)."""
-    slug = re.sub(r"[^a-z0-9]+", "_", (name or "").lower().strip()).strip("_")
-    return (slug or "catalog_model")[:64]
+    """Slugify and bound to the 64-char column (F-020-20).
 
-
-def _slug_with_headroom(slug: str, n: int) -> str:
-    """Reserve headroom for the ``_{n}`` collision suffix (F-020-19).
-
-    The slug column is ``String(64)``; a 64-char slug plus ``_{n}`` would
-    overflow. Truncate the base so the final ``slug_n`` fits in 64 chars.
+    Bug-7622: delegate to the shared BI-safe generator so digit-leading and
+    symbol-only catalog names (e.g. a table named ``123_orders`` or ``$$$``)
+    produce a valid slug rather than one that trips validate_bi_safe_slug and
+    500s the catalog import endpoint.
     """
-    suffix_len = len(f"_{n}")
-    return slug[: 64 - suffix_len]
+    return _shared_slugify(name, fallback="catalog_model", separator="_")
+
 
 
 @router.post(
@@ -408,6 +469,8 @@ async def import_from_catalog(
     body: CatalogImportRequest,
     current_user: CurrentUser = Depends(require_tenant_admin),
 ) -> CatalogImportResponse:
+    enforce_demo_source_locked(current_user.tenant_id)
+
     fetcher = _FETCHERS.get(body.catalog_type)
     if not fetcher:
         raise HTTPException(
@@ -470,34 +533,37 @@ async def import_from_catalog(
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
-        # Bind the placeholder data source to a project connection. Reuse the
-        # first existing connection; create a placeholder if the project has
-        # none (mirrors the dbt/cube importer pattern). Without this the
-        # NOT NULL data_sources.project_connection_id FK would violate.
-        conn_q = await db.execute(
-            select(ProjectConnection.id)
-            .where(ProjectConnection.project_id == project_id)
-            .limit(1)
+        # Bug-7468: enforce the licensed model cap BEFORE creating the model.
+        from sqlalchemy import func as sa_func
+
+        async def _count_models() -> int:
+            r = await db.execute(select(sa_func.count()).select_from(Model))
+            return int(r.scalar() or 0)
+
+        # Bug-6567: pass db so imports and direct creates serialise via
+        # the same advisory lock, preventing concurrent cap bypass.
+        await enforce_import_model_cap(1, _count_models, db=db)
+
+        # Bug-7307: always create a clearly unconfigured placeholder
+        # connection for imported models instead of silently binding to an
+        # arbitrary existing project connection.  See dbt_import.py for the
+        # full rationale.
+        from shared.security.credential_crypto import encrypt_json
+        placeholder_conn = ProjectConnection(
+            project_id=project_id,
+            display_name="(catalog import — configure me)",
+            connection_type="postgresql",
+            encrypted_credentials=encrypt_json({}),
+            config={"unconfigured": True, "import_placeholder": True},
         )
-        conn_row = conn_q.first()
-        if conn_row is not None:
-            default_conn_id = str(conn_row[0])
-        else:
-            from shared.security.credential_crypto import encrypt_json
-            placeholder_conn = ProjectConnection(
-                project_id=project_id,
-                display_name="(imported — configure me)",
-                connection_type="postgresql",
-                encrypted_credentials=encrypt_json({}),
-                config={},
-            )
-            db.add(placeholder_conn)
-            await db.flush()
-            default_conn_id = str(placeholder_conn.id)
-            warnings = warnings + [
-                "No project connection found — created a placeholder. "
-                "Configure it with real credentials before querying."
-            ]
+        db.add(placeholder_conn)
+        await db.flush()
+        default_conn_id = str(placeholder_conn.id)
+        warnings = warnings + [
+            "Created an unconfigured placeholder connection for imported "
+            "models. Configure it with real credentials and rebind data "
+            "sources before querying."
+        ]
 
         model_snap = bundle["models"][0]
         slug = model_snap["model"]["slug"]
@@ -506,51 +572,48 @@ async def import_from_catalog(
             if not ds.get("project_connection_id"):
                 ds["project_connection_id"] = default_conn_id
 
-        # Bug-5266: slug allocation is check-then-insert which is racy under
-        # concurrent imports. Use an optimistic approach: pick the best
-        # candidate, try to flush, and retry with a bumped suffix on
-        # unique-constraint violation (up to a reasonable bound).
-        _MAX_SLUG_RETRIES = 5
         existing_q = await db.execute(
             select(Model.slug).where(Model.project_id == project_id)
         )
         existing_slugs = {r[0] for r in existing_q.all()}
-        candidate = slug
-        n = 2
-        while candidate in existing_slugs:
-            candidate = f"{_slug_with_headroom(slug, n)}_{n}"
-            n += 1
 
-        for _retry in range(_MAX_SLUG_RETRIES):
-            new_model_id = _uuid.uuid4()
-            rewritten, _missing = prepare_snapshot_for_import(
-                model_snap, new_model_id=new_model_id,
-            )
-            rewritten.setdefault("model", {})
-            rewritten["model"]["slug"] = candidate
-            rewritten["model"]["display_name"] = model_display
+        new_model_id = _uuid.uuid4()
+        rewritten, _missing = prepare_snapshot_for_import(
+            model_snap, new_model_id=new_model_id,
+        )
+        rewritten.setdefault("model", {})
+        rewritten["model"]["display_name"] = model_display
 
-            new_model = Model(
-                id=new_model_id,
+        # Bug-5561: use the shared slug utility (50-attempt, SAVEPOINT-safe)
+        # instead of the private 5-attempt retry loop.
+        try:
+            new_model, candidate = await insert_model_with_slug_retry(
+                db,
                 project_id=project_id,
-                slug=candidate,
+                base_slug=slug,
+                existing_slugs=existing_slugs,
                 display_name=model_display,
-                seed=str(_uuid.uuid4()),
+                new_model_id=new_model_id,
             )
-            db.add(new_model)
-            # Bug-5266: wrap in a SAVEPOINT so an IntegrityError on the
-            # model flush rolls back only the nested block, preserving the
-            # placeholder ProjectConnection flushed earlier.  A bare
-            # db.rollback() would discard the entire transaction including
-            # default_conn_id, leaving dangling FK references on retry.
-            try:
-                async with db.begin_nested():
-                    await db.flush()
-            except IntegrityError:
-                candidate = f"{_slug_with_headroom(slug, n)}_{n}"
-                n += 1
-                continue
+        except IntegrityError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Could not allocate a unique model slug after retries",
+            )
+        except ValueError as exc:
+            # Bug-7622: validate_bi_safe_slug (inside insert_model_with_slug_retry)
+            # raises ValueError for a non-BI-safe slug. Surface it as a clean 422
+            # like the YAML/project import path, never an uncaught 500.
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid model slug for imported catalog model: {exc}",
+            ) from exc
+        rewritten["model"]["slug"] = candidate
 
+        # Bug-7982 R7: DELIBERATE non-holder. This rehydrates into a model created in THIS transaction, so no other writer can reference it yet and there is nothing to serialise against. Declared explicitly so the runtime write guard does not report (and thereby drown out) a benign wholesale rebuild.
+        async with model_write_lock_exempt(
+            db, "import: wholesale rebuild into a model created in this transaction"
+        ):
             await rehydrate_into_live(
                 new_model_id,
                 rewritten,
@@ -561,18 +624,16 @@ async def import_from_catalog(
                 force_pocket_stale=True,
                 preserve_destination_seed=True,
             )
-            await db.commit()
+        # Bug-6138: importer-created models bypass create_model, so seed the
+        # canonical Technical persona here too (idempotent).
+        await seed_technical_persona(db, new_model_id)
+        await db.commit()
 
-            return CatalogImportResponse(
-                models_created=1,
-                model_names=[candidate],
-                tables_imported=tbl_count,
-                dimensions_imported=dim_count,
-                measures_imported=meas_count,
-                warnings=warnings,
-            )
-
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Could not allocate a unique model slug after retries",
+        return CatalogImportResponse(
+            models_created=1,
+            model_names=[candidate],
+            tables_imported=tbl_count,
+            dimensions_imported=dim_count,
+            measures_imported=meas_count,
+            warnings=warnings,
         )

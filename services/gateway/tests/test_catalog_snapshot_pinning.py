@@ -172,12 +172,18 @@ async def test_catalog_updates_after_save_and_deploy(monkeypatch):
     assert names == {"Net Revenue", "Cost", "Profit", "Region", "Product", "Channel"}
 
 
-async def test_empty_deployed_snapshot_falls_back_to_live(monkeypatch):
-    """A seed-v1 / empty deployed snapshot must NOT empty the catalog.
+async def test_empty_deployed_snapshot_must_not_leak_draft_fields(monkeypatch):
+    """CONTRACT (fail-closed, Bug-7979): an empty deployed snapshot must NOT
+    expose drafts.
 
-    Mirrors resolve_deployed_shape's None fallback in the binder: if the
-    deployed snapshot has no measures/dimensions/columns, fall back to the
-    live field list rather than advertising nothing.
+    For a DEPLOYED model, the published catalog field list is the deployed
+    contract. If the deployed snapshot is missing/empty/corrupt, the correct
+    behaviour is to fail CLOSED -- advertise the empty deployed field set, never
+    fall back to live draft metadata. This prevents unpublished renames/additions
+    from leaking into Excel / Power BI field lists.
+
+    Wave 2 Lane A1 fix: the gateway catalogue now ALWAYS uses the deployed
+    snapshot content when a deploy pointer exists, even when empty.
     """
     _patch_clients(
         monkeypatch,
@@ -190,9 +196,11 @@ async def test_empty_deployed_snapshot_falls_back_to_live(monkeypatch):
     result = await router_client.fetch_model_metadata(MODEL_ID, "acme", "jwt")
     names = _field_names(result[1])
 
-    # Falls back to the live draft list (non-empty) — catalog not emptied.
-    assert "Net Revenue" in names
-    assert "Profit" in names
+    # Fail-closed: draft-only edits that were never deployed must NOT leak into
+    # the published catalog, even when the deployed snapshot is empty.
+    assert "Net Revenue" not in names, "draft rename leaked via empty-snapshot fallback"
+    assert "Profit" not in names, "draft-added measure leaked via empty-snapshot fallback"
+    assert "Channel" not in names, "draft-added dimension leaked via empty-snapshot fallback"
 
 
 async def test_undeployed_model_uses_live_list(monkeypatch):

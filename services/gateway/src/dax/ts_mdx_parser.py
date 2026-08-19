@@ -15,30 +15,47 @@ import os
 import re
 import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+from .tree_sitter_artifacts import resolve_grammar_artifact
 
 logger = logging.getLogger(__name__)
 
-_GRAMMAR_DIR = os.path.join(os.path.dirname(__file__), "grammars", "tree-sitter-mdx")
-_SO_PATH = os.path.join(os.path.dirname(__file__), "grammars", "mdx.so")
+_GRAMMARS_ROOT = Path(__file__).resolve().parent / "grammars"
+_ARTIFACT = resolve_grammar_artifact(grammar_name="mdx", base_dir=_GRAMMARS_ROOT)
+_GRAMMAR_DIR = str(_ARTIFACT.grammar_dir)
+_LIBRARY_PATH = str(_ARTIFACT.library_path)
+_SO_PATH = _LIBRARY_PATH
 
 _parser_cache: dict[str, Any] = {}
+
+
+class MDXParserUnavailableError(RuntimeError):
+    """Raised when the Tree-sitter MDX parser cannot be loaded."""
 
 
 def _load_parser():
     """Build and cache the Tree-sitter MDX parser."""
     if "parser" in _parser_cache:
         return _parser_cache["parser"]
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=FutureWarning)
-        from tree_sitter import Language, Parser
-        if not os.path.exists(_SO_PATH):
-            Language.build_library(_SO_PATH, [_GRAMMAR_DIR])
-        lang = Language(_SO_PATH, "mdx")
-        parser = Parser()
-        parser.set_language(lang)
-        _parser_cache["parser"] = parser
-        return parser
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            from tree_sitter import Language, Parser
+            if not os.path.exists(_LIBRARY_PATH):
+                os.makedirs(os.path.dirname(_LIBRARY_PATH), exist_ok=True)
+                Language.build_library(_LIBRARY_PATH, [_GRAMMAR_DIR])
+            lang = Language(_LIBRARY_PATH, "mdx")
+            parser = Parser()
+            parser.set_language(lang)
+            _parser_cache["parser"] = parser
+            return parser
+    except (ImportError, OSError, AttributeError) as exc:
+        raise MDXParserUnavailableError(
+            "Tree-sitter MDX parser is unavailable; install tree_sitter and "
+            "ensure the MDX grammar can be built."
+        ) from exc
 
 
 @dataclass
@@ -85,6 +102,12 @@ class ParsedMDX:
     is_drillthrough: bool = False
     maxrows: int | None = None
     return_columns: list[list[str]] = field(default_factory=list)
+    # Wave C #3: True when the Tree-sitter CST carries a syntax/ERROR/MISSING node
+    # anywhere under the root. The XMLA Execute admission gate
+    # (xmla_server._parse_mdx_for_execute) FAILS CLOSED on this — a statement the
+    # structured parser could not cleanly parse must never reach the regex/SQL
+    # translator (a fallback interpretation is not an admissible answer).
+    has_error: bool = False
 
     def axis_expr(self, axis_name: str) -> str:
         """Get the raw expression for a named axis (COLUMNS/ROWS or 0/1)."""
@@ -106,6 +129,10 @@ def parse_mdx(mdx: str) -> ParsedMDX:
     result = ParsedMDX(raw_mdx=mdx)
 
     if root.has_error:
+        # Wave C #3: record the structured-parse failure as an authoritative flag,
+        # not merely an advisory warning. The Execute admission gate reads this to
+        # fail closed; the warning string is retained for diagnostics/logging.
+        result.has_error = True
         result.warnings.append("Tree-sitter parse error in MDX")
 
     _walk_source_file(root, result, mdx.encode("utf-8"))
@@ -178,6 +205,35 @@ def _walk_with_clause(node, result: ParsedMDX, source: bytes) -> None:
             _walk_with_set_def(child, result, source)
 
 
+def _named_children(node) -> list:
+    """Named children of a CST node (tolerant of tree_sitter API differences)."""
+    nc = getattr(node, "named_children", None)
+    if nc is not None:
+        return list(nc)
+    return [c for c in node.children if getattr(c, "is_named", False)]
+
+
+def _calc_expression_text(node, source: bytes) -> str:
+    """Text of a WITH MEMBER/SET body, stripping the SSAS single-quote delimiters.
+
+    SSAS writes ``... AS '<expression>'``; the single quotes delimit the body and
+    are NOT part of the expression. The quotes are stripped ONLY when the ENTIRE
+    body is a SINGLE single-quoted string literal (the CST is one calc_atom whose
+    only content is a ``string_literal`` token). A multi-atom expression that
+    merely begins and ends with a quote — ``'pre' + [M].[X] + 'post'`` — is
+    returned verbatim, NOT mangled (WC3-U1). A bare, unquoted body is unchanged.
+    """
+    raw = _node_text(node, source).strip()
+    named = _named_children(node)
+    if len(named) == 1 and named[0].type == "calc_atom":
+        atom_named = _named_children(named[0])
+        if len(atom_named) == 1 and atom_named[0].type == "string_literal":
+            tok = _node_text(atom_named[0], source).strip()
+            if len(tok) >= 2 and tok[0] == "'" and tok[-1] == "'":
+                return tok[1:-1].strip()
+    return raw
+
+
 def _walk_with_member_def(node, result: ParsedMDX, source: bytes) -> None:
     """Walk with_member_def → MEMBER name AS expression [, property]*."""
     name = ""
@@ -189,7 +245,7 @@ def _walk_with_member_def(node, result: ParsedMDX, source: bytes) -> None:
             if not name:
                 name = _node_text(child, source)
         elif child.type == "calc_expression":
-            expression = _node_text(child, source).strip()
+            expression = _calc_expression_text(child, source)
         elif child.type == "member_property":
             _walk_member_property(child, properties, source)
 
@@ -198,7 +254,7 @@ def _walk_with_member_def(node, result: ParsedMDX, source: bytes) -> None:
     if name_field:
         name = _node_text(name_field, source)
     if expr_field:
-        expression = _node_text(expr_field, source).strip()
+        expression = _calc_expression_text(expr_field, source)
 
     result.with_members.append(WithMemberDef(
         name=name,
@@ -232,7 +288,7 @@ def _walk_with_set_def(node, result: ParsedMDX, source: bytes) -> None:
     if name_field:
         name = _node_text(name_field, source)
     if expr_field:
-        expression = _node_text(expr_field, source).strip()
+        expression = _calc_expression_text(expr_field, source)
 
     result.with_sets.append(WithSetDef(name=name, expression=expression))
 
@@ -323,19 +379,27 @@ def _walk_where_clause(node, result: ParsedMDX, source: bytes) -> None:
 
 
 def _walk_where_tuple(node, result: ParsedMDX, source: bytes) -> None:
-    """Walk where_tuple → ( dotted_ref | set_literal, ... )."""
+    """Walk where_tuple → ( member | set | paren_group | func_call | ... ).
+
+    dotted_ref and set_literal are the common slicer shapes. A nested-paren tuple
+    ``(([geo]...), ([time]...))`` (newly admissible after the WHERE widening) wraps
+    its members in ``paren_group`` nodes — recurse into those so every slicer
+    member reaches ``where_members`` and the downstream fail-loud filter audit
+    (Bug-3622) can see it. Function-call slicers (KPIValue/STRTOSET/...) are opaque
+    and are NOT descended into as tuple members.
+    """
     for child in node.children:
         if child.type == "dotted_ref":
             parts = _dotted_ref_parts(child, source)
             result.where_members.append(WhereMember(parts=parts))
-        elif child.type == "set_literal":
+        elif child.type in ("set_literal", "paren_group"):
             for sc in child.children:
                 if sc.type == "dotted_ref" or (sc.type == "axis_token" and sc.children):
                     _extract_where_set_members(sc, result, source)
 
 
 def _extract_where_set_members(node, result: ParsedMDX, source: bytes) -> None:
-    """Extract dotted_ref members from set literals in WHERE clause."""
+    """Extract dotted_ref members from set literals / paren-groups in a WHERE."""
     if node.type == "dotted_ref":
         parts = _dotted_ref_parts(node, source)
         result.where_members.append(WhereMember(parts=parts))
@@ -345,7 +409,7 @@ def _extract_where_set_members(node, result: ParsedMDX, source: bytes) -> None:
                 parts = _dotted_ref_parts(child, source)
                 result.where_members.append(WhereMember(parts=parts))
     for child in node.children:
-        if child.type in ("dotted_ref", "axis_token", "set_literal"):
+        if child.type in ("dotted_ref", "axis_token", "set_literal", "paren_group"):
             _extract_where_set_members(child, result, source)
 
 

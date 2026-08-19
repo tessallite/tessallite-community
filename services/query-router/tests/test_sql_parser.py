@@ -7,7 +7,7 @@ Run from tessallite/services/query-router/:
 import pytest
 
 from src.parsing.sql_parser import GroupByError, SyntaxErrorInSQL, parse_sql_to_ir
-from src.ir.logical_query import LogicalQuery
+from src.ir.logical_query import LogicalQuery, UnsupportedSQL
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +131,373 @@ def test_limit_and_offset():
     )
     assert q.limit == 100
     assert q.offset == 20
+
+
+# Bug-6083 / F-003-17: ``FETCH FIRST/NEXT n ROWS ONLY`` (ANSI, emitted by JDBC
+# tooling) parses into an ``exp.Fetch`` node, not ``exp.Limit`` — the row count
+# lives in ``args["count"]`` with ``limit.expression`` absent. The old
+# extractor returned ``limit=None`` and the source rewriter emitted no LIMIT,
+# returning EVERY row where the user asked for n.
+
+def test_fetch_first_n_rows_only_maps_to_limit():
+    q = parse_sql_to_ir(
+        "SELECT region FROM sales FETCH FIRST 5 ROWS ONLY",
+        "model-1",
+    )
+    assert q.limit == 5
+
+
+def test_fetch_next_n_rows_only_with_offset():
+    q = parse_sql_to_ir(
+        "SELECT region FROM sales ORDER BY region OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY",
+        "model-1",
+    )
+    assert q.offset == 5
+    assert q.limit == 10
+
+
+def test_fetch_first_with_ties_rejected_loudly():
+    # WITH TIES can return more than n rows — not representable as LIMIT n;
+    # must fail loud, never silently bound or drop.
+    with pytest.raises(UnsupportedSQL):
+        parse_sql_to_ir(
+            "SELECT region FROM sales ORDER BY region FETCH FIRST 5 ROWS WITH TIES",
+            "model-1",
+        )
+
+
+def test_fetch_first_percent_rejected_loudly():
+    with pytest.raises(UnsupportedSQL):
+        parse_sql_to_ir(
+            "SELECT region FROM sales FETCH FIRST 5 PERCENT ROWS ONLY",
+            "model-1",
+        )
+
+
+def test_fetch_first_row_only_no_count_defaults_to_one():
+    # FETCH FIRST ROW ONLY == FETCH FIRST 1 ROW ONLY; a missing count must not
+    # silently become an unbounded result.
+    q = parse_sql_to_ir("SELECT region FROM sales FETCH FIRST ROW ONLY", "model-1")
+    assert q.limit == 1
+
+
+def test_fetch_next_row_only_no_count_defaults_to_one():
+    q = parse_sql_to_ir(
+        "SELECT region FROM sales ORDER BY region OFFSET 2 ROWS FETCH NEXT ROW ONLY",
+        "model-1",
+    )
+    assert q.offset == 2
+    assert q.limit == 1
+
+
+def test_fetch_first_decimal_count_rejected_loudly():
+    # A decimal count is not a valid LIMIT n; fail closed rather than silently
+    # returning an unbounded result.
+    with pytest.raises(UnsupportedSQL):
+        parse_sql_to_ir(
+            "SELECT region FROM sales FETCH FIRST 2.5 ROWS ONLY",
+            "model-1",
+        )
+
+
+def test_fetch_first_parameter_count_rejected_loudly():
+    # A bind-parameter count ($1) must fail closed (typed error), never raise
+    # an uncaught TypeError (500) or return unbounded.
+    with pytest.raises(UnsupportedSQL):
+        parse_sql_to_ir(
+            "SELECT region FROM sales FETCH FIRST $1 ROWS ONLY",
+            "model-1",
+        )
+
+
+# Bug-6569: the plain ``LIMIT`` branch had the same silent-drop class as the
+# FETCH branch (Bug-6083). A non-integer LIMIT literal (``LIMIT 2.5``) hit
+# ``int("2.5")`` -> ValueError -> caught -> ``limit=None`` -> UNBOUNDED result
+# where the user asked to cap the rows. Fail closed instead.
+
+def test_limit_decimal_rejected_loudly():
+    with pytest.raises(UnsupportedSQL):
+        parse_sql_to_ir(
+            "SELECT region FROM sales GROUP BY region LIMIT 2.5",
+            "model-1",
+        )
+
+
+def test_limit_parameter_rejected_loudly():
+    # A bind-parameter LIMIT ($1) previously raised an uncaught TypeError
+    # (500). It must fail closed with a typed error instead.
+    with pytest.raises(UnsupportedSQL):
+        parse_sql_to_ir(
+            "SELECT region FROM sales GROUP BY region LIMIT $1",
+            "model-1",
+        )
+
+
+def test_limit_all_means_unbounded():
+    # ``LIMIT ALL`` (Postgres) is an explicit request for no limit; it must
+    # resolve to limit=None (not fail loud, not raise TypeError).
+    q = parse_sql_to_ir(
+        "SELECT region FROM sales GROUP BY region LIMIT ALL",
+        "model-1",
+    )
+    assert q.limit is None
+
+
+def test_limit_null_means_unbounded():
+    # ``LIMIT NULL`` (Postgres) is also an explicit request for no limit; it
+    # must resolve to limit=None, not a typed rejection.
+    q = parse_sql_to_ir(
+        "SELECT region FROM sales GROUP BY region LIMIT NULL",
+        "model-1",
+    )
+    assert q.limit is None
+
+
+def test_limit_integer_still_extracted():
+    q = parse_sql_to_ir(
+        "SELECT region FROM sales GROUP BY region LIMIT 25",
+        "model-1",
+    )
+    assert q.limit == 25
+
+
+# Bug-6082 / F-003-16: positional GROUP BY (``GROUP BY 1``) must resolve against
+# the SELECT list exactly as ORDER BY positional refs do — otherwise the
+# aggregate form falsely raises GroupByError and the non-aggregate form silently
+# rebuilds without GROUP BY (duplicate rows).
+
+def test_group_by_positional_resolves_to_column_with_aggregate():
+    q = parse_sql_to_ir(
+        "SELECT region, SUM(amount) FROM sales GROUP BY 1",
+        "model-1",
+    )
+    assert q.grain == ["region"]
+    assert "amount" in q.requested_measures
+    assert q.has_function_grain is False
+
+
+def test_group_by_positional_resolves_without_aggregate():
+    q = parse_sql_to_ir(
+        "SELECT region FROM sales GROUP BY 1",
+        "model-1",
+    )
+    assert q.grain == ["region"]
+
+
+def test_group_by_positional_multi_column():
+    q = parse_sql_to_ir(
+        "SELECT region, city, SUM(amount) FROM sales GROUP BY 1, 2",
+        "model-1",
+    )
+    assert q.grain == ["region", "city"]
+
+
+def test_group_by_positional_resolves_paren_wrapped_select_item():
+    # SELECT (region) — a transparent Paren column — must resolve positionally
+    # exactly as an explicit GROUP BY region groups it; no false GroupByError.
+    q = parse_sql_to_ir(
+        "SELECT (region), SUM(amount) FROM sales GROUP BY 1",
+        "model-1",
+    )
+    assert q.grain == ["region"]
+    assert q.has_function_grain is False
+
+
+def test_group_by_parenthesised_positional_resolves():
+    # GROUP BY (1) — the grouping item itself is Paren-wrapped — must resolve
+    # positionally just like GROUP BY 1.
+    q = parse_sql_to_ir(
+        "SELECT region, SUM(amount) FROM sales GROUP BY (1)",
+        "model-1",
+    )
+    assert q.grain == ["region"]
+    assert q.has_function_grain is False
+
+
+def test_group_by_parenthesised_column_resolves():
+    # GROUP BY (region) must group exactly as GROUP BY region.
+    q = parse_sql_to_ir(
+        "SELECT region, SUM(amount) FROM sales GROUP BY (region)",
+        "model-1",
+    )
+    assert q.grain == ["region"]
+    assert q.has_function_grain is False
+
+
+# Bug-6084: GROUP BY <output alias> is valid PostgreSQL (GROUP BY may reference
+# a SELECT-list output column name). The strict JDBC GROUP BY gate must not
+# reject it as a bare-column-not-in-GROUP-BY error.
+def test_group_by_output_alias_not_rejected():
+    q = parse_sql_to_ir(
+        "SELECT region AS r, SUM(amount) FROM sales GROUP BY r",
+        "model-1",
+    )
+    # No false GroupByError; region is recognised as grouped via its alias.
+    assert q.grain == ["region"]
+    assert "amount" in q.requested_measures
+
+
+def test_group_by_alias_input_column_ambiguity_still_rejected():
+    # PostgreSQL ambiguity rule: GROUP BY b binds to the INPUT column b, not the
+    # alias of a. So a (aliased b) is ungrouped and PG rejects the query — the
+    # alias-resolution leniency must NOT mask this.
+    with pytest.raises(GroupByError) as exc:
+        parse_sql_to_ir(
+            "SELECT amount AS region, region, SUM(qty) FROM sales GROUP BY region",
+            "model-1",
+        )
+    assert "amount" in str(exc.value)
+
+
+# F-2 (Fable sensitive-worktree review): the Bug-6084 output-alias
+# normalization must apply to BARE-COLUMN aliases only. An alias over an
+# AGGREGATE is not a valid GROUP BY target in PostgreSQL — it must NOT resolve
+# to the measure's inner column, otherwise the invalid query binds the measure
+# column as a dimension and executes garbage grouping instead of failing.
+def test_group_by_aggregate_alias_not_normalized_to_measure_column():
+    # Bug-6858: GROUP BY on an aggregate alias (e.g. ``GROUP BY total`` where
+    # ``total`` is ``SUM(amount)``) must fail at parse time with a GroupByError,
+    # matching PostgreSQL semantics ("aggregate functions are not allowed in
+    # GROUP BY"). Previously this silently injected the aggregate alias as a
+    # grain dimension and executed garbage grouping.
+    with pytest.raises(GroupByError, match="aggregate or expression alias"):
+        parse_sql_to_ir(
+            "SELECT SUM(amount) AS total, region FROM sales GROUP BY total, region",
+            "model-1",
+        )
+
+
+def test_group_by_expression_alias_not_normalized_to_inner_column():
+    # An alias over a scalar expression (UPPER/CASE/DATE_TRUNC) is likewise not a
+    # bare-column GROUP BY target; the grain records the alias, not the inner
+    # column. Results stay correct via the passthrough raw-preservation path;
+    # this just stops the grain metadata from claiming a grain the query does not
+    # actually have (F-6).
+    q = parse_sql_to_ir(
+        "SELECT UPPER(region) AS r, SUM(amount) FROM sales GROUP BY r",
+        "model-1",
+    )
+    assert "region" not in q.grain
+    assert "r" in q.grain
+    assert "amount" in q.requested_measures
+
+
+def test_group_by_bare_column_alias_still_normalized():
+    # Guard against over-restriction: a BARE-column alias must STILL resolve so
+    # ``SELECT region AS r ... GROUP BY r`` groups by ``region`` (Bug-6084 path
+    # preserved).
+    q = parse_sql_to_ir(
+        "SELECT region AS r, SUM(amount) FROM sales GROUP BY r",
+        "model-1",
+    )
+    assert q.grain == ["region"]
+    assert "amount" in q.requested_measures
+
+
+def test_group_by_output_alias_with_extra_bare_still_rejected():
+    # Leniency must not mask a genuinely ungrouped column: city is neither
+    # grouped nor aliased into the GROUP BY, so PostgreSQL rejects it too.
+    with pytest.raises(GroupByError) as exc:
+        parse_sql_to_ir(
+            "SELECT region AS r, city, SUM(amount) FROM sales GROUP BY r",
+            "model-1",
+        )
+    assert "city" in str(exc.value)
+
+
+# Bug-6093: COUNT(DISTINCT a, b) counts distinct (a, b) tuples. It must NOT
+# collapse to COUNT(DISTINCT a) — doing so lets it match an ``a__count_distinct``
+# aggregate column and serve a wrong number. Multi-column distinct is
+# passthrough (source-only), never an analytical/routable single-column stat.
+def test_count_distinct_multi_column_not_collapsed_to_first():
+    q = parse_sql_to_ir(
+        "SELECT COUNT(DISTINCT customer_id, product_id) AS c FROM sales",
+        "model-1",
+    )
+    se = q.select_expressions[0]
+    assert se.classification == "passthrough"
+    assert se.agg_function == "count_distinct"
+    # No single physical measure/stat column serves distinct tuples.
+    assert se.inner_column is None
+    assert "customer_id" not in q.requested_measures
+    assert getattr(se, "composable", False) is False
+
+
+def test_count_distinct_single_column_still_routable():
+    # Guard against over-correction: single-column distinct stays analytical.
+    q = parse_sql_to_ir(
+        "SELECT COUNT(DISTINCT customer_id) AS c FROM sales",
+        "model-1",
+    )
+    se = q.select_expressions[0]
+    assert se.classification == "analytical"
+    assert se.agg_function == "count_distinct"
+    assert se.inner_column == "customer_id"
+    assert "customer_id" in q.requested_measures
+
+
+# Bug-6085: unquoted identifiers fold to lower-case in PostgreSQL, so
+# SELECT Region ... GROUP BY region groups correctly. The strict gate must
+# compare case-insensitively rather than falsely rejecting the query.
+def test_group_by_case_insensitive_fold_not_rejected():
+    q = parse_sql_to_ir(
+        "SELECT Region, SUM(amount) FROM sales GROUP BY region",
+        "model-1",
+    )
+    assert "amount" in q.requested_measures
+
+
+def test_group_by_cast_still_function_grain():
+    # Regression guard: GROUP BY x::text keeps its existing behaviour — the
+    # underlying column joins the grain but the cast marks function grain.
+    q = parse_sql_to_ir(
+        "SELECT success_flag, SUM(amount) FROM sales GROUP BY success_flag::text",
+        "model-1",
+    )
+    assert "success_flag" in q.grain
+    assert q.has_function_grain is True
+
+
+def test_group_by_positional_to_expression_is_function_grain():
+    # GROUP BY 1 pointing at an expression SELECT item is function grain,
+    # not a bare-column grain (mirrors GROUP BY DATE_TRUNC(...)).
+    q = parse_sql_to_ir(
+        "SELECT DATE_TRUNC('month', ts) AS m, SUM(amount) FROM sales GROUP BY 1",
+        "model-1",
+    )
+    assert q.grain == []
+    assert q.has_function_grain is True
+
+
+# Bug-6081 / F-003-15: a bare boolean column / boolean literal WHERE conjunct is
+# not extractable, so it MUST flag has_unresolvable_where (fail-closed audit).
+
+def test_bare_boolean_column_where_flags_unresolvable():
+    q = parse_sql_to_ir("SELECT region FROM sales WHERE is_active", "model-1")
+    assert q.has_unresolvable_where is True
+    assert q.filters == []
+
+
+def test_boolean_literal_where_flags_unresolvable():
+    q = parse_sql_to_ir("SELECT region FROM sales WHERE FALSE", "model-1")
+    assert q.has_unresolvable_where is True
+
+
+def test_boolean_comparison_literal_where_flags_unresolvable():
+    q = parse_sql_to_ir("SELECT region FROM sales WHERE 1=0", "model-1")
+    assert q.has_unresolvable_where is True
+    assert q.filters == []
+
+
+def test_bare_boolean_and_comparison_keeps_flag_and_extracts_comparison():
+    q = parse_sql_to_ir(
+        "SELECT region FROM sales WHERE is_active AND region = 'EU'",
+        "model-1",
+    )
+    # The region comparison is still extracted faithfully...
+    assert any(f.dimension_name == "region" and f.operator == "eq" for f in q.filters)
+    # ...but the unresolvable bare boolean forces raw-WHERE preservation.
+    assert q.has_unresolvable_where is True
 
 
 # ---------------------------------------------------------------------------
@@ -498,20 +865,24 @@ def test_jdbc_rejects_extra_token_in_from_clause():
     assert "malformed sql" in msg or "unexpected token" in msg
 
 
-def test_xmla_keeps_unexpected_token_as_warning():
-    # XMLA protocol stays permissive — the malformed FROM does not
-    # raise; the parse recovers and emits the tree it could build.
-    q = parse_sql_to_ir(
-        "SELECT * FROM modely modelx m",
-        "m1",
-        protocol="xmla",
-    )
-    assert isinstance(q, LogicalQuery)
+def test_xmla_rejects_meaning_changing_recovery():
+    # Bug-7916: XMLA protocol is now strict for meaning-changing parse
+    # recoveries. When sqlglot produces errors during recovery (token
+    # dropped with altered semantics), XMLA raises SyntaxErrorInSQL.
+    # The "modelx m" after "modely" triggers a parse error.
+    with pytest.raises(SyntaxErrorInSQL):
+        parse_sql_to_ir(
+            "SELECT * FROM modely modelx m",
+            "m1",
+            protocol="xmla",
+        )
 
 
 def test_xmla_keeps_consecutive_commas_as_warning():
-    # XMLA protocol stays permissive — the warning is surfaced but the
-    # query still parses so the trace can see the problem.
+    # XMLA protocol stays permissive for harmless syntactic quirks
+    # (consecutive commas, stray semicolons) that XMLA/DAX clients
+    # commonly send. These are not meaning-changing recoveries.
+    # The pre-scan fires only for JDBC.
     q = parse_sql_to_ir(
         "SELECT a,, b FROM t",
         "m1",
@@ -1224,3 +1595,216 @@ def test_left_join_is_complex_sql():
         "m1", protocol="xmla",
     )
     assert q.has_complex_sql
+
+
+# ---------------------------------------------------------------------------
+# Bug-6958: from_tables must capture ALL set-operation branches
+# ---------------------------------------------------------------------------
+
+def test_union_from_tables_captures_all_branches():
+    """Bug-6958: UNION ALL -- from_tables must include tables from the second
+    branch, not just the first."""
+    q = parse_sql_to_ir(
+        "SELECT region FROM modelx UNION ALL SELECT c FROM secret_tbl",
+        "m1", protocol="jdbc",
+    )
+    assert "modelx" in q.from_tables
+    assert "secret_tbl" in q.from_tables
+
+
+def test_intersect_from_tables_captures_both_branches():
+    """Bug-6958: INTERSECT -- second branch tables must appear."""
+    q = parse_sql_to_ir(
+        "SELECT region FROM modelx INTERSECT SELECT region FROM other_tbl",
+        "m1", protocol="jdbc",
+    )
+    assert "modelx" in q.from_tables
+    assert "other_tbl" in q.from_tables
+
+
+def test_except_from_tables_captures_both_branches():
+    """Bug-6958: EXCEPT -- second branch tables must appear in from_tables."""
+    q = parse_sql_to_ir(
+        "SELECT region FROM modelx EXCEPT SELECT region FROM another_tbl",
+        "m1", protocol="jdbc",
+    )
+    assert "modelx" in q.from_tables
+    assert "another_tbl" in q.from_tables
+
+
+# ---------------------------------------------------------------------------
+# Derived-grain routing — typed expression capture (spec §5.1, §14.1)
+# ---------------------------------------------------------------------------
+# These go through the REAL parser producer path (spec §14.1: not a synthetic
+# BoundQuery). They pin that capture is purely additive and diagnostic:
+# ordinary queries capture nothing and keep their exact fingerprint, while a
+# function-grain query captures occurrences and folds an expression-aware shape.
+
+
+def test_ordinary_query_captures_no_expression_occurrences():
+    q = parse_sql_to_ir(
+        "SELECT region, SUM(rev) FROM modelx GROUP BY region",
+        "m1", protocol="jdbc",
+    )
+    assert q.expression_occurrences == []
+    assert q.has_function_grain is False
+
+
+def test_ordinary_query_fingerprint_is_byte_identical_to_pre_feature():
+    # An ordinary query must produce EXACTLY the expression-blind fingerprint,
+    # i.e. omitting the derived-expression key. We reconstruct that hash directly
+    # from fingerprint_shape with no expr_fingerprints and require equality.
+    from shared.pocket.fingerprint import fingerprint_shape
+
+    q = parse_sql_to_ir(
+        "SELECT region, SUM(rev) FROM modelx WHERE country = 'GB' GROUP BY region",
+        "m1", protocol="jdbc",
+    )
+    expected = fingerprint_shape(
+        measures=q.requested_measures,
+        dimensions=q.requested_dimensions,
+        grain=q.grain,
+        filter_cols=[f.dimension_name for f in q.filters],
+        having_cols=q.having_columns or [],
+    )
+    assert q.query_fingerprint == expected
+
+
+def test_function_grain_query_captures_group_and_select_occurrences():
+    q = parse_sql_to_ir(
+        "SELECT DATE_TRUNC('month', order_date), SUM(rev) FROM modelx "
+        "GROUP BY DATE_TRUNC('month', order_date)",
+        "m1", protocol="jdbc",
+    )
+    roles = {o.role for o in q.expression_occurrences}
+    assert "GROUP_KEY" in roles
+    assert "SELECT" in roles
+    assert q.has_function_grain is True
+
+
+def test_date_trunc_and_extract_month_fingerprints_are_distinct():
+    """The January-2025 / January-2026 collapse defence at the query-shape level
+    (spec §13): DATE_TRUNC month and EXTRACT month must not collide despite both
+    being function grain."""
+    dt = parse_sql_to_ir(
+        "SELECT DATE_TRUNC('month', order_date), SUM(rev) FROM modelx "
+        "GROUP BY DATE_TRUNC('month', order_date)",
+        "m1", protocol="jdbc",
+    )
+    ex = parse_sql_to_ir(
+        "SELECT EXTRACT(month FROM order_date), SUM(rev) FROM modelx "
+        "GROUP BY EXTRACT(month FROM order_date)",
+        "m1", protocol="jdbc",
+    )
+    assert dt.query_fingerprint != ex.query_fingerprint
+
+
+def test_composable_aggregate_select_does_not_perturb_fingerprint():
+    """Codex R1 finding 1 regression: a composable aggregate SELECT item
+    (SUM(a)/SUM(b)) has has_function_grain=False and is aggregate-routable. It
+    must NOT be captured as a derived group-key expression, so an ordinary
+    aggregate-routable composable query keeps its byte-identical, expression-blind
+    fingerprint (spec I10)."""
+    from shared.pocket.fingerprint import fingerprint_shape
+
+    q = parse_sql_to_ir(
+        "SELECT region, SUM(rev) / SUM(cost) FROM modelx GROUP BY region",
+        "m1", protocol="jdbc",
+    )
+    # No derived-expression occurrence should be captured for the composable.
+    assert q.expression_occurrences == []
+    assert q.has_function_grain is False
+    expected = fingerprint_shape(
+        measures=q.requested_measures,
+        dimensions=q.requested_dimensions,
+        grain=q.grain,
+        filter_cols=[f.dimension_name for f in q.filters],
+        having_cols=q.having_columns or [],
+    )
+    assert q.query_fingerprint == expected
+
+
+def test_same_expression_in_select_vs_order_does_not_collide():
+    """Codex R1 finding 5 regression: role-tagged fingerprints mean a derived
+    expression in SELECT vs ORDER BY produces distinct shapes (projection vs sort
+    semantics differ)."""
+    sel = parse_sql_to_ir(
+        "SELECT UPPER(region), SUM(rev) FROM modelx GROUP BY UPPER(region)",
+        "m1", protocol="jdbc",
+    )
+    sel_ord = parse_sql_to_ir(
+        "SELECT UPPER(region), SUM(rev) FROM modelx GROUP BY UPPER(region) "
+        "ORDER BY UPPER(region)",
+        "m1", protocol="jdbc",
+    )
+    assert sel.query_fingerprint != sel_ord.query_fingerprint
+
+
+# ---------------------------------------------------------------------------
+# F-003-01 / F-003-08 / F-003-11 — NOT IN extract, EXTRACT grain, ORDER BY alias
+# ---------------------------------------------------------------------------
+
+def test_f003_01_sql_not_in_extracts_not_in_operator():
+    """JDBC ``NOT IN ('US')`` must extract LogicalFilter.operator not_in."""
+    q = parse_sql_to_ir(
+        "SELECT SUM(revenue) FROM orders WHERE region NOT IN ('US') GROUP BY region",
+        "model-1", protocol="jdbc",
+    )
+    assert q.has_unresolvable_where is False
+    assert len(q.filters) == 1
+    assert q.filters[0].operator == "not_in"
+    assert q.filters[0].dimension_name == "region"
+    assert q.filters[0].value == ["US"]
+
+
+def test_f003_01_not_in_and_eq_both_extract():
+    q = parse_sql_to_ir(
+        "SELECT SUM(revenue) FROM orders "
+        "WHERE region NOT IN ('US') AND country = 'FR' GROUP BY region",
+        "model-1", protocol="jdbc",
+    )
+    ops = {(f.dimension_name, f.operator) for f in q.filters}
+    assert ("region", "not_in") in ops
+    assert ("country", "eq") in ops
+    assert q.has_unresolvable_where is False
+
+
+def test_f003_01_subquery_not_in_stays_unresolvable():
+    q = parse_sql_to_ir(
+        "SELECT SUM(revenue) FROM orders "
+        "WHERE region NOT IN (SELECT code FROM banned) GROUP BY region",
+        "model-1", protocol="jdbc",
+    )
+    assert q.has_unresolvable_where is True
+    assert all(f.operator != "not_in" for f in q.filters)
+
+
+def test_f003_08_extract_month_year_quarter_are_time_period_grains():
+    for unit in ("month", "year", "quarter"):
+        q = parse_sql_to_ir(
+            f"SELECT EXTRACT({unit} FROM business_date), SUM(rev) FROM modelx "
+            f"GROUP BY EXTRACT({unit} FROM business_date)",
+            "m1", protocol="jdbc",
+        )
+        assert q.time_period_grains == [(f"extract_{unit}", "business_date")], q.time_period_grains
+        assert q.has_function_grain is True
+
+
+def test_f003_11_order_by_aggregate_alias_is_tagged_not_grain():
+    q = parse_sql_to_ir(
+        "SELECT region, SUM(rev) AS n FROM orders GROUP BY region ORDER BY n DESC",
+        "model-1", protocol="jdbc",
+    )
+    assert q.has_unresolvable_order is False
+    assert "n" in q.order_by_alias_names
+    assert q.order_by == [("n", "desc")]
+
+
+def test_f003_11_order_by_alias_shadowing_grain_is_unresolvable():
+    # GROUP BY 1 (not GROUP BY region): a colliding aggregate alias still
+    # trips Bug-6858 if grouped by name. F-003-11 is the ORDER BY shadow.
+    q = parse_sql_to_ir(
+        "SELECT region, SUM(rev) AS region FROM orders GROUP BY 1 ORDER BY region",
+        "model-1", protocol="jdbc",
+    )
+    assert q.has_unresolvable_order is True

@@ -25,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.auth.middleware import CurrentUser
-from shared.db.models import Persona
+from shared.db.models import Persona, PersonaTagRestriction
 
 logger = logging.getLogger(__name__)
 
@@ -52,20 +52,148 @@ def _explicit_audience_match(persona: Persona, roles: set[str]) -> bool:
     return bool(persona.audience_roles and set(persona.audience_roles) & roles)
 
 
-def is_in_audience(persona: Persona, roles: set[str]) -> bool:
+def widens_visibility(persona: Persona) -> bool:
+    """True when the persona WIDENS access rather than narrowing it.
+
+    Two persona flags widen visibility past the model's default surface,
+    so both are privilege-granting rather than voluntary filters:
+
+    * ``includes_hidden_columns`` — the technical view exposes columns the
+      modeller curated away (F-008-04).
+    * ``bypass_row_security`` — skips the row-level-security predicate
+      entirely, so the holder reads every row regardless of RLS rules
+      (F-008-30 / Bug-6136).
+
+    A widening persona is a privileged surface: it is granted only on an
+    explicit, non-empty audience-role match, is never "available to
+    everyone" via an empty audience list, and is never a legitimate
+    voluntary pick for a non-privileged caller.
+    """
+    return bool(
+        getattr(persona, "includes_hidden_columns", False)
+        or getattr(persona, "bypass_row_security", False)
+    )
+
+
+def narrows_visibility(
+    persona: Persona, *, has_tag_restrictions: bool = False,
+) -> bool:
+    """True when the persona NARROWING access rather than being a filter-only
+    or unrestricted surface.
+
+    F-008-03: an empty ``audience_roles`` list historically meant "available
+    to everyone". Combined with a measure/dimension/hierarchy allow-list,
+    default filters, or CLS tag restrictions, that assigned a locking
+    persona to every caller and could deny the whole tenant (complex SQL
+    403, hidden measures). Narrowing personas require an explicit role
+    match, the same way widening personas already do.
+    """
+    if persona.included_measure_ids:
+        return True
+    if persona.included_dimension_ids:
+        return True
+    if persona.included_hierarchy_ids:
+        return True
+    if persona.default_filters:
+        return True
+    return bool(has_tag_restrictions)
+
+
+class PersonaAudienceNarrowingError(ValueError):
+    """A narrowing persona was persisted (or imported) with an empty audience.
+
+    F-008-03 / Bug-9266: after explicit-audience assignment, an allow-listed
+    persona with no ``audience_roles`` is assigned to nobody, so the
+    restriction never applies. Reject at every writer instead.
+    """
+
+
+def payload_narrows_visibility(
+    *,
+    included_measure_ids=None,
+    included_dimension_ids=None,
+    included_hierarchy_ids=None,
+    default_filters=None,
+    restricted_tag_ids=None,
+) -> bool:
+    """True when a persona payload would narrow visibility (F-008-03).
+
+    Filter-only empty everything (no allow-lists, no default filters, no
+    tag restrictions) is unrestricted and may keep an empty audience.
+    """
+    if included_measure_ids:
+        return True
+    if included_dimension_ids:
+        return True
+    if included_hierarchy_ids:
+        return True
+    if default_filters:
+        return True
+    if restricted_tag_ids:
+        return True
+    return False
+
+
+def reject_empty_audience_narrowing(
+    audience_roles,
+    *,
+    included_measure_ids=None,
+    included_dimension_ids=None,
+    included_hierarchy_ids=None,
+    default_filters=None,
+    restricted_tag_ids=None,
+) -> None:
+    """Refuse a narrowing persona that names no audience role (F-008-03).
+
+    Shared by REST create/update, YAML import, and snapshot ``_insert_personas``.
+    """
+    if audience_roles:
+        return
+    if not payload_narrows_visibility(
+        included_measure_ids=included_measure_ids,
+        included_dimension_ids=included_dimension_ids,
+        included_hierarchy_ids=included_hierarchy_ids,
+        default_filters=default_filters,
+        restricted_tag_ids=restricted_tag_ids,
+    ):
+        return
+    raise PersonaAudienceNarrowingError(
+        "A persona that narrows visibility (allow-lists, default "
+        "filters, or column-tag restrictions) must name at least "
+        "one audience role. An empty audience would leave the "
+        "restriction unassigned after F-008-03, so the imported "
+        "allow-list would never apply."
+    )
+
+
+def is_in_audience(
+    persona: Persona,
+    roles: set[str],
+    *,
+    has_tag_restrictions: bool = False,
+) -> bool:
     """Single audience predicate shared by resolution and listing (I-1).
 
     Regular personas: an empty ``audience_roles`` list means "available
     to everyone"; a non-empty list requires an intersection with the
     caller's roles.
 
-    Hidden-columns personas (the technical view, F-008-04): privileged
-    surfaces — they require an explicit, non-empty audience-role match
-    and are never "for everyone" via an empty audience list. The grant
+    Visibility-widening personas (hidden-columns technical view, or
+    ``bypass_row_security``; F-008-04 / F-008-30): privileged surfaces —
+    they require an explicit, non-empty audience-role match and are never
+    "for everyone" via an empty audience list. Otherwise an empty-audience
+    bypass/technical persona would be silently assigned to every regular
+    user, skipping RLS or exposing hidden columns tenant-wide. The grant
     role is :data:`shared.auth.roles.MODEL_TECHNICAL_ROLE` for seeded
     Technical personas.
+
+    Visibility-narrowing personas (F-008-03): allow-lists, default
+    filters, or CLS tag restrictions also require an explicit role match.
+    Filter-only empty everything + empty audience stays "everyone".
     """
-    if getattr(persona, "includes_hidden_columns", False):
+    if widens_visibility(persona) or narrows_visibility(
+        persona, has_tag_restrictions=has_tag_restrictions,
+    ):
         return _explicit_audience_match(persona, roles)
     return not persona.audience_roles or bool(
         set(persona.audience_roles) & roles
@@ -81,20 +209,63 @@ async def get_assigned_personas(
     the user's roles, OR when ``audience_roles`` is empty (available to
     everyone).
 
-    Exception (F-008-04): personas that expose hidden columns
-    (``includes_hidden_columns=True``, e.g. the seeded Technical
-    persona) are privileged surfaces. They are assigned ONLY on an
-    explicit, non-empty audience-role match — an empty audience list on
-    a hidden-columns persona must never make it "available to everyone",
-    which would force-lock every regular user to the technical view and
-    expose hidden columns to all viewers.
+    Exception (F-008-04 / F-008-30): visibility-widening personas —
+    those that expose hidden columns (``includes_hidden_columns=True``,
+    e.g. the seeded Technical persona) OR bypass row-level security
+    (``bypass_row_security=True``) — are privileged surfaces. They are
+    assigned ONLY on an explicit, non-empty audience-role match. An empty
+    audience list on a widening persona must never make it "available to
+    everyone", which would force-lock every regular user into it and
+    either expose hidden columns or skip RLS for all viewers.
     """
     result = await db.execute(
         select(Persona).where(Persona.model_id == model_id)
     )
     all_personas = list(result.scalars().all())
     roles = caller_roles(user)
-    return [p for p in all_personas if is_in_audience(p, roles)]
+    tagged: set = set()
+    if all_personas:
+        # Bug-9263: a failed tag-restriction lookup used to treat every
+        # persona as untagged. A CLS-only empty-audience persona then
+        # looked unrestricted and was assigned to everyone (tenant lock)
+        # while the failure was hidden. Fail the request instead.
+        try:
+            raw = (
+                await db.execute(
+                    select(PersonaTagRestriction.persona_id).where(
+                        PersonaTagRestriction.persona_id.in_(
+                            [p.id for p in all_personas]
+                        )
+                    )
+                )
+            ).scalars().all()
+            tagged = set()
+            for item in raw:
+                pid = getattr(item, "id", item)
+                tagged.add(UUID(str(pid)))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception(
+                "Bug-9263: PersonaTagRestriction lookup failed; "
+                "refusing persona assignment rather than treating every "
+                "persona as untagged"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "error_code": "PERSONA_ASSIGNMENT_UNAVAILABLE",
+                    "message": (
+                        "Persona assignment could not be determined "
+                        "because a tag-restriction lookup failed. Retry "
+                        "the request."
+                    ),
+                },
+            )
+    return [
+        p for p in all_personas
+        if is_in_audience(p, roles, has_tag_restrictions=p.id in tagged)
+    ]
 
 
 async def load_persona_or_fail(
@@ -171,16 +342,18 @@ async def resolve_effective_persona(
     if len(assigned) == 0:
         if requested_persona_id is not None:
             persona = await load_persona_or_fail(db, requested_persona_id, model_id)
-            # F-008-04: a voluntary pick narrows visibility; a
-            # hidden-columns persona WIDENS it. Non-privileged callers
-            # may only use a technical persona via an explicit
-            # audience-role grant.
-            if getattr(persona, "includes_hidden_columns", False):
+            # F-008-04 / F-008-30: a voluntary pick may only NARROW
+            # visibility. A hidden-columns or bypass_row_security persona
+            # WIDENS it (exposes hidden columns / skips RLS), so a
+            # non-privileged caller with no assignment may never select
+            # one — that is a privilege escalation. Such personas require
+            # an explicit audience-role grant.
+            if widens_visibility(persona):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=(
-                        "The technical persona requires an explicit "
-                        "audience-role assignment"
+                        "This persona widens data access and requires an "
+                        "explicit audience-role assignment"
                     ),
                 )
             return persona

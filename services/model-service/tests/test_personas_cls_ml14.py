@@ -177,6 +177,7 @@ async def test_create_persona_accepts_valid_filter(client):
             json={
                 "name": "Sales", "slug": "sales",
                 "default_filters": {"amount": {"gte": 100}},
+                "audience_roles": ["sales_analyst"],
             },
         )
     assert resp.status_code == 201, resp.text
@@ -253,3 +254,128 @@ async def test_resolution_measure_legacy_fields_preserved(client):
     assert body["measure_allowed"] is True
     assert body["allowed"] is True
     assert body["object_kind"] == "measure"
+
+
+def test_yaml_import_narrowing_persona_validated():
+    """Bug-9266 / F-008-03: YAML import of an allow-listed audience-less
+    persona is refused. After explicit-audience assignment the allow-list
+    would otherwise never apply (unrestricted model).
+    """
+    from shared.model_snapshot.yaml_deserialiser import (
+        YamlImportError,
+        parse_model_yaml,
+    )
+
+    yaml_doc = """
+model:
+  name: sales
+  display_name: Sales
+tables:
+  - name: orders
+    source_table: public.orders
+    columns:
+      - name: amount
+        type: number
+measures:
+  - name: revenue
+    table: orders
+    column: amount
+    aggregation: sum
+personas:
+  - name: regional
+    allowed_measures: [revenue]
+"""
+    with pytest.raises(YamlImportError) as exc:
+        parse_model_yaml(yaml_doc)
+    joined = " ".join(exc.value.errors).lower()
+    assert "regional" in joined
+    assert "audience" in joined
+
+
+def test_yaml_import_narrowing_persona_with_audience_is_accepted():
+    """Bug-9266: snapshot/YAML round-trips that already name audience_roles
+    still import; filter-only empty everything stays allowed without roles.
+    """
+    from shared.model_snapshot.yaml_deserialiser import parse_model_yaml
+
+    yaml_doc = """
+model:
+  name: sales
+  display_name: Sales
+tables:
+  - name: orders
+    source_table: public.orders
+    columns:
+      - name: amount
+        type: number
+measures:
+  - name: revenue
+    table: orders
+    column: amount
+    aggregation: sum
+personas:
+  - name: regional
+    allowed_measures: [revenue]
+    audience_roles: [analyst]
+  - name: everyone
+"""
+    snap = parse_model_yaml(yaml_doc)
+    by_slug = {p["slug"]: p for p in snap["personas"]}
+    assert by_slug["regional"]["audience_roles"] == ["analyst"]
+    assert by_slug["regional"]["included_measure_ids"]
+    assert by_slug["everyone"]["audience_roles"] == []
+    assert not by_slug["everyone"]["included_measure_ids"]
+
+
+@pytest.mark.asyncio
+async def test_cls_base_reuse_gives_identical_block_sets():
+    """personas.py N-scan -> single-load refactor must not change any CLS
+    authorization decision: the per-call load path (base=None) and the
+    request-level base-reuse path must return identical blocked measure/dimension
+    sets for the same underlying data (Bucket D / CodeRabbit CLS closure)."""
+    from types import SimpleNamespace
+
+    from src.api.personas import (
+        ClsClosureBase,
+        _cls_blocked_object_ids,
+    )
+
+    col_id = uuid.uuid4()
+    other_id = uuid.uuid4()
+    m = SimpleNamespace(
+        id=uuid.uuid4(), name="revenue",
+        source_column_id=col_id, display_column_id=None,
+    )
+    d = SimpleNamespace(
+        id=uuid.uuid4(), name="region",
+        source_column_id=other_id, display_column_id=None,
+    )
+    col_rows = [(col_id, "salary", "employees"), (other_id, "region", "dim_region")]
+
+    def _measures_res():
+        r = MagicMock(); r.scalars.return_value.all.return_value = [m]; return r
+
+    def _dims_res():
+        r = MagicMock(); r.scalars.return_value.all.return_value = [d]; return r
+
+    def _cols_res():
+        r = MagicMock(); r.all.return_value = col_rows; return r
+
+    def _uda_res():
+        r = MagicMock(); r.all.return_value = []; return r
+
+    restricted = [col_id]
+
+    # Path A: base=None loads measures, dims, cols, uda in order.
+    db_a = make_mock_db()
+    db_a.execute = _execute_queue(_measures_res(), _dims_res(), _cols_res(), _uda_res())
+    a_m, a_d = await _cls_blocked_object_ids(db_a, TEST_MODEL_ID, restricted, base=None)
+
+    # Path B: a pre-loaded base runs only the scoped uda query.
+    base = ClsClosureBase([m], [d], list(col_rows))
+    db_b = make_mock_db()
+    db_b.execute = _execute_queue(_uda_res())
+    b_m, b_d = await _cls_blocked_object_ids(db_b, TEST_MODEL_ID, restricted, base=base)
+
+    assert (a_m, a_d) == (b_m, b_d)
+    assert a_m == [m.id] and a_d == []

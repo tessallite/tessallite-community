@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from shared.db.models import ModelAliasMap
 from shared.db.session import get_tenant_db
 from src.api._scope import ensure_model_in_project
+from src.api._model_lock import acquire_model_definition_lock
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 
@@ -65,7 +66,7 @@ def _validate_pairs(pairs: dict[str, Any]) -> dict[str, str]:
     return cleaned
 
 
-@router.get("", response_model=AliasMapResponse)
+@router.get("", response_model=AliasMapResponse, dependencies=[require_role("viewer")])
 async def get_alias_map(
     project_id: UUID,
     model_id: UUID,
@@ -94,6 +95,9 @@ async def replace_alias_map(
     cleaned = _validate_pairs(body.alias_map)
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        # Bug-7982 finding 7 then 3: auth before lock; ModelAliasMap is
+        # snapshot-owned (truncate-reinserted on revert).
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         record = await db.get(ModelAliasMap, model_id)
         if record is None:
             record = ModelAliasMap(model_id=model_id, alias_map=cleaned)
@@ -120,6 +124,9 @@ async def import_alias_map(
     incoming = _validate_pairs(body.alias_map)
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        # Bug-7982 finding 7 then 3: auth before lock; ModelAliasMap is
+        # snapshot-owned (truncate-reinserted on revert).
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         record = await db.get(ModelAliasMap, model_id)
         if record is None:
             record = ModelAliasMap(model_id=model_id, alias_map=incoming)

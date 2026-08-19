@@ -56,14 +56,14 @@ If you open the **Predictive** tab on a model that has no source statistics yet,
 The scorer (`predictive_scorer.py`) is a pure function. Given the statistics plus your model metadata (dimensions and measures), it ranks plausible aggregates — single dimensions, pairs, and triples — by a benefit-over-cost formula:
 
 ```
-expected_hit_rate × row_reduction
-─────────────────────────────────
-   build_cost × storage_cost
+heuristic_reuse_score × row_reduction
+─────────────────────────────────────
+     build_cost × storage_cost
 ```
 
 `row_reduction` is the ratio of source rows to the aggregate's estimated rows — a *multiplier* (for example, ten million rows collapsing to two hundred is a 50,000× reduction). The preview shows it with a `×` suffix, not as a percentage. Candidates whose grain would exceed 50% of the source cardinality are rejected outright (there is no worthwhile reduction there). Each candidate carries a rationale string that explains why it ranked where it did.
 
-The displayed `score` is a small benefit-density number, useful for *ranking* candidates relative to one another rather than as an absolute percentage. The `expected_hit_rate` shown is a heuristic assumption (it rises with the number of measures sharing the grain), not a measured hit rate — treat it as a planning estimate, not evidence.
+The displayed `score` is a small benefit-density number, useful for *ranking* candidates relative to one another rather than as an absolute percentage. The `heuristic_reuse_score` shown (labelled **Reuse heuristic** in the preview) is a cardinality-based assumption — it rises with the number of measures sharing the grain — **not** a measured or predicted hit rate. Treat it as a planning estimate, not evidence.
 
 ### 3. Auto-build sweep (hourly cron)
 

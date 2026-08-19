@@ -110,6 +110,7 @@
   "publicGlossary.downloadPdf": "PDF herunterladen",
   "publicGlossary.entryCount": "{{visible}} von {{total}} Einträgen",
   "publicGlossary.invalidLink": "Dieser Freigabelink ist ungültig oder abgelaufen. Bitte bitten Sie den Glossar-Inhaber, einen neuen zu generieren.",
+  "publicGlossary.loadError": "Das Glossar konnte nicht geladen werden. Bitte versuchen Sie es später erneut oder wenden Sie sich an den Modellbesitzer.",
   "publicGlossary.noResults": "Keine Glossareinträge entsprechen Ihrer Suche.",
   "publicGlossary.overline": "Tessallite-Glossar",
   "publicGlossary.searchPlaceholder": "Begriffe, Definitionen, Synonyme suchen…",

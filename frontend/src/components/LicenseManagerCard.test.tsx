@@ -67,6 +67,108 @@ describe("LicenseManagerCard", () => {
     expect(await screen.findByRole("alert")).toBeInTheDocument();
   });
 
+  it("maps a structured install-reject error_code to a localized hint (Bug-8164)", async () => {
+    licenseStatus.mockResolvedValue(STATUS);
+    // The backend now rejects with { detail: { error_code, message } }.
+    installLicense.mockRejectedValue({
+      response: { data: { detail: { error_code: "license_expired", message: "License rejected: expired" } } },
+    });
+    const { container } = renderCard();
+    await screen.findByText("community");
+
+    const doc = { license_id: "lic_exp", edition: "community" };
+    fireEvent.change(fileInput(container), {
+      target: { files: [fileStub("license.json", JSON.stringify(doc))] },
+    });
+
+    // The localized, code-specific hint is shown (not "[object Object]" and not
+    // the raw server message when a mapping exists).
+    expect(await screen.findByText(/This license has expired/i)).toBeInTheDocument();
+  });
+
+  it("falls back to the server message for an unmapped install-reject code (Bug-8164)", async () => {
+    licenseStatus.mockResolvedValue(STATUS);
+    installLicense.mockRejectedValue({
+      response: { data: { detail: { error_code: "some_future_code", message: "License rejected: nope" } } },
+    });
+    const { container } = renderCard();
+    await screen.findByText("community");
+
+    fireEvent.change(fileInput(container), {
+      target: { files: [fileStub("license.json", JSON.stringify({ license_id: "x" }))] },
+    });
+
+    expect(await screen.findByText("License rejected: nope")).toBeInTheDocument();
+  });
+
+  // L21-R1-F02: a PERSISTED rejected licence arrives via GET /admin/license with a
+  // machine-readable code under status.error_code. The card must render the
+  // code-specific localized hint, not the generic "invalid" banner text.
+  const PERSISTED_CODE_HINTS: Array<[string, RegExp]> = [
+    ["malformed_license", /missing required fields/i],
+    ["invalid_signature", /signature does not match/i],
+    ["unknown_key_id", /key this instance does not recognize/i],
+    ["unsupported_algorithm", /signature method this build does not support/i],
+    ["license_expired", /this license has expired/i],
+  ];
+  it.each(PERSISTED_CODE_HINTS)(
+    "L21-R1-F02 renders persisted error_code hint for %s",
+    async (code, pattern) => {
+      licenseStatus.mockResolvedValue({
+        edition: "community",
+        enforcement_enabled: true,
+        has_license: true,
+        status: {
+          edition: "community",
+          activated: false,
+          license_state: "invalid",
+          error_code: code,
+        },
+      });
+      renderCard();
+      const banner = await screen.findByTestId("license-manager-invalid-banner");
+      expect(banner).toHaveTextContent(pattern);
+    },
+  );
+
+  it("surfaces an invalid-licence banner when an installed licence fails verification (Bug-7680)", async () => {
+    licenseStatus.mockResolvedValue({
+      edition: "community",
+      enforcement_enabled: true,
+      has_license: true,
+      status: { edition: "community", activated: false, license_state: "invalid" },
+    });
+    renderCard();
+    expect(
+      await screen.findByTestId("license-manager-invalid-banner"),
+    ).toBeInTheDocument();
+  });
+
+  it("does not show the invalid banner for a healthy installed licence (Bug-7680)", async () => {
+    licenseStatus.mockResolvedValue({
+      edition: "community",
+      enforcement_enabled: true,
+      has_license: true,
+      status: { edition: "community", activated: true },
+    });
+    renderCard();
+    await screen.findByText("community");
+    expect(
+      screen.queryByTestId("license-manager-invalid-banner"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows a retryable load error when the status read fails (Bug-7470)", async () => {
+    licenseStatus.mockRejectedValue(new Error("network"));
+    renderCard();
+    // Must surface an explicit error rather than rendering nothing / no-status.
+    expect(await screen.findByTestId("license-manager-load-error")).toBeInTheDocument();
+    // Retry re-invokes the status query.
+    licenseStatus.mockResolvedValue(STATUS);
+    fireEvent.click(screen.getByText("Retry"));
+    expect(await screen.findByText("community")).toBeInTheDocument();
+  });
+
   it("rejects an invalid (non-JSON) file without calling the API", async () => {
     licenseStatus.mockResolvedValue(STATUS);
     const { container } = renderCard();

@@ -36,7 +36,7 @@
 <tr><td><code>persona_id</code></td><td>string</td><td>no</td><td>null</td><td>Lock to this persona's permissions</td></tr>
 <tr><td><code>project_ids</code></td><td>string[]</td><td>no</td><td>null</td><td>Restrict access to these project IDs only</td></tr>
 <tr><td><code>model_ids</code></td><td>string[]</td><td>no</td><td>null</td><td>Restrict visible models</td></tr>
-<tr><td><code>capabilities</code></td><td>string[]</td><td>no</td><td>all</td><td>Allowed features: query, chat, explore</td></tr>
+<tr><td><code>capabilities</code></td><td>string[]</td><td>no</td><td><code>[]</code> (deny-all)</td><td>Allowed features: query, chat, explore. Omit or pass an empty list for no capabilities.</td></tr>
 <tr><td><code>expiry_minutes</code></td><td>integer</td><td>no</td><td>180</td><td>Token lifetime (min 5, max 1440)</td></tr>
 </tbody>
 </table>
@@ -64,14 +64,16 @@
 <li><code>chat</code> — use the conversational agent</li>
 <li><code>explore</code> — browse model metadata (dimensions, measures, hierarchies)</li>
 </ul>
-<p>If a capability is excluded, API calls to the corresponding service return 403.</p>
+<p>If omitted or an empty list is sent, no capabilities are granted (deny-all). Pass an explicit list such as query, chat, explore to enable features. If a capability is excluded, API calls to the corresponding service return 403.</p>
 <h2>Token lifetime</h2>
 <p>The default token lifetime is 3 hours (180 minutes), long enough for demos and presentations without interruption. The maximum is 24 hours (1440 minutes). The minimum is 5 minutes.</p>
 <p>For production embedding, set the expiry shorter (30-60 minutes) and implement token refresh via the <code>onTokenExpiring</code> callback in the embed component.</p>
 <h2>Revoking a token early</h2>
 <p>A token normally stays valid until it expires. If a token leaks, or you simply want to cut a session short before its expiry, you can revoke it:</p>
 <p><strong>Endpoint:</strong> <code>DELETE /api/v1/auth/embed-token/{jti}</code></p>
-<p>The <code>{jti}</code> is the token's unique ID — the <code>jti</code> claim inside the signed JWT you minted. Only a tenant admin may revoke. Once revoked, the token stops working within about a minute (the platform refreshes its revocation list roughly once a minute), and every query or chat call made with it returns 403. The revocation is recorded in the Audit Log as <code>embed_token.revoked</code>. The platform cleans up the revocation record automatically once the token would have expired anyway (at most 24 hours, the maximum token lifetime), so the blocklist never grows without bound.</p>
+<p>The <code>{jti}</code> is the token's unique ID — the <code>jti</code> claim inside the signed JWT you minted. Only a tenant admin may revoke. Once revoked, the token stops working within about a minute (the platform refreshes its revocation list roughly once a minute), and every query or chat call made with it is rejected as unauthorised (401). The revocation is recorded in the Audit Log as <code>embed_token.revoked</code>.</p>
+<p>A revocation only applies to tokens belonging to your own tenant, so naming a token id that is not yours does nothing. If you are signed in as a <strong>system administrator</strong> — whose account is not itself inside any tenant — add <code>?tenant_id=&lt;tenant-slug&gt;</code> to say which tenant's token you are revoking; without it the request is rejected rather than quietly having no effect.</p>
+<p>The platform deletes the revocation record automatically once the token would have expired anyway (at most 24 hours, the maximum token lifetime), so the blocklist does not grow without bound.</p>
 <p>Revocation fails safe: if the platform cannot confirm a token is still valid, it refuses the request rather than letting it through. Build a revoke call into your "sign out" or "rotate credentials" flow so a leaked link can be cut off immediately rather than waiting out its expiry.</p>
 <h2>CORS configuration</h2>
 <p>Embedded components load from the ISV's domain. Set the <code>ALLOWED_EMBED_ORIGINS</code> environment variable (comma-separated):</p>

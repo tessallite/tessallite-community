@@ -41,11 +41,19 @@ COLLIBRA_RELATION_TYPE_MAP: dict[str, str] = {
     "governed_by_term": "is defined by",
     "produces_aggregate": "produces",
     "materialized_to": "is stored in",
-    "consumed_by": "is consumed by",
+    "consumed_by": "is consumed by",  # deprecated, kept for backward compat
+    "consumed_by_model": "is consumed by",
+    "consumed_by_column": "uses column from",
     "feeds_semantic_field": "is source of",
     "uses_measure": "is based on",
     "classified_by": "is classified by",
 }
+
+# Default responsibility role labels. The per-connection
+# ``responsibility_mapping`` config overrides these by key ("owner",
+# "steward"); the GovernanceNode carries both an owner and a steward.
+DEFAULT_OWNER_ROLE = "Business Owner"
+DEFAULT_STEWARD_ROLE = "Data Steward"
 
 COLLIBRA_STATUS_MAP: dict[str | None, str] = {
     "active": "Accepted",
@@ -88,6 +96,12 @@ class CollibraResponsibility:
     asset_external_id: str
     role: str
     user_or_group: str
+    # Bug-6496/Codex-R2: a stable discriminator ("owner"/"steward") for the
+    # responsibility's identity. Two responsibilities on the same asset can
+    # share a role LABEL (if the config maps owner and steward to the same
+    # Collibra role), so the incremental-diff key must key on kind, not role,
+    # or one assignee is silently dropped / collides on the unique constraint.
+    kind: str = "owner"
 
 
 @dataclass
@@ -127,9 +141,13 @@ def map_graph_to_collibra(
         **COLLIBRA_RELATION_TYPE_MAP,
         **(relation_type_mapping or {}),
     }
-    effective_responsibility_role = (
-        responsibility_mapping or {}
-    ).get("owner", responsibility_role)
+    # Bug-6497: honor the full responsibility mapping config. Previously only
+    # the literal "owner" key was read and stewards were never exported. The
+    # GovernanceNode carries both an owner and a steward; map each to its
+    # configured role label (falling back to sensible defaults).
+    resp_mapping = responsibility_mapping or {}
+    owner_role = resp_mapping.get("owner", responsibility_role or DEFAULT_OWNER_ROLE)
+    steward_role = resp_mapping.get("steward", DEFAULT_STEWARD_ROLE)
 
     assets = [
         CollibraAsset(
@@ -172,8 +190,18 @@ def map_graph_to_collibra(
             responsibilities.append(
                 CollibraResponsibility(
                     asset_external_id=node.stable_key,
-                    role=effective_responsibility_role,
+                    role=owner_role,
                     user_or_group=node.owner,
+                    kind="owner",
+                )
+            )
+        if node.steward:
+            responsibilities.append(
+                CollibraResponsibility(
+                    asset_external_id=node.stable_key,
+                    role=steward_role,
+                    user_or_group=node.steward,
+                    kind="steward",
                 )
             )
 

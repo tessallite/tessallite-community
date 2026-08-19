@@ -28,11 +28,11 @@ describe("EditionBadge", () => {
     expect(screen.getByTestId("edition-badge")).toHaveTextContent("Community");
   });
 
-  it("shows the Enterprise label when enforcement is off", () => {
+  it("shows Internal unlimited when the hatch is on", () => {
     mockEdition.mockReturnValue({
-      data: { edition: "enterprise", activated: true, enforcement: false },
+      data: { edition: "internal-unlimited", activated: false, enforcement: false },
     });
     render(<EditionBadge />);
-    expect(screen.getByTestId("edition-badge")).toHaveTextContent("Enterprise");
+    expect(screen.getByTestId("edition-badge")).toHaveTextContent("Internal unlimited");
   });
 });

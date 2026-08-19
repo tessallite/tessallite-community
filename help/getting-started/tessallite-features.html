@@ -94,7 +94,7 @@
 <tr><td>Column-level security</td><td>Tag-based column restrictions via personas</td><td>Personas &gt; Tag restrictions</td></tr>
 <tr><td>Personas</td><td>Named audience subsets with allow lists and default filters</td><td>Personas panel</td></tr>
 <tr><td>Persona row-security bypass</td><td>Elevated audiences bypass RLS</td><td>Personas &gt; Bypass toggle</td></tr>
-<tr><td>Embed tokens</td><td>Signed JWTs for iframe embedding with scope control</td><td>API: POST /auth/embed-token</td></tr>
+<tr><td>Embed tokens</td><td>Signed JWTs for iframe embedding with scope control</td><td>Workspace Settings (project drawer) &gt; Embed tokens; API: POST /auth/embed-token</td></tr>
 </tbody>
 </table>
 
@@ -103,10 +103,11 @@
 <thead><tr><th>Feature</th><th>Description</th><th>Where to use it</th></tr></thead>
 <tbody>
 <tr><td>Local auth</td><td>Email/password with httpOnly cookie JWT and CSRF protection</td><td>Login page</td></tr>
-<tr><td>SSO: SAML 2.0</td><td>SP-initiated SSO for Auth0, Google Workspace, generic SAML</td><td>Admin &gt; SSO Configuration</td></tr>
-<tr><td>SSO: OIDC</td><td>Authorization-code flow for generic OIDC providers</td><td>Admin &gt; SSO Configuration</td></tr>
-<tr><td>SSO group mappings</td><td>Map IdP groups to project/model roles</td><td>Admin &gt; SSO Group Mappings</td></tr>
-<tr><td>LDAP authentication</td><td>Bind-and-search with configurable DN and filter</td><td>Admin &gt; Workspace Settings</td></tr>
+<tr><td>SSO: SAML 2.0</td><td>SP-initiated SSO for Auth0, Google Workspace, generic SAML</td><td>Workspace Settings (project drawer) &gt; Identity provider</td></tr>
+<tr><td>SSO: OIDC</td><td>Authorization-code flow for generic OIDC providers</td><td>Workspace Settings (project drawer) &gt; Identity provider</td></tr>
+<tr><td>SSO group mappings</td><td>Map IdP groups to project/model roles</td><td>Workspace Settings (project drawer) &gt; SSO Mappings</td></tr>
+<tr><td>LDAP authentication</td><td>Bind-and-search with configurable DN and filter</td><td>Workspace Settings (project drawer) &gt; Identity provider (status only)</td></tr>
+<tr><td>GCP IAM OIDC</td><td>Google IAM backend with audience and domain validation</td><td>Workspace Settings (project drawer) &gt; Identity provider (status only)</td></tr>
 <tr><td>User management</td><td>Create, edit, delete, reset password, role assignment</td><td>Admin &gt; Users tab</td></tr>
 </tbody>
 </table>
@@ -199,7 +200,7 @@
   <footer class="page-nav">
     <a href="connect-excel.html">&larr; Connect Excel via XMLA</a> |
     <a href="../index.html">Home</a> |
-    <a href="../concepts/workspaces-and-tenants.html">Workspaces and Tenants &rarr;</a>
+    <a href="../analyst-guides/choosing-your-connection.html">Choose Your Connection &rarr;</a>
   </footer>
 </body>
 </html>

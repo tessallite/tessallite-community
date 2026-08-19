@@ -149,9 +149,15 @@ def _measure(id_, name, *, measure_type="standard", default_agg="sum",
 
 def _bound_query(resolved_measures, *, raw_sql):
     mid = str(uuid4())
+    # Bug-7803: the calc-dependency load resolves referenced base measures from
+    # the DEPLOYED SNAPSHOT (fail-closed) for a deployed model; this fixture
+    # seeds base measures into a fake DB with no ModelVersion snapshot. Model
+    # the world as UNDEPLOYED so the live measures ARE the authority (correct
+    # for an undeployed model). Deploy-authority is covered separately by
+    # test_bug_7803_calc_dependency_snapshot_authority.py.
     model = types.SimpleNamespace(
         id=mid, slug="sales", display_name="sales",
-        deployed_version_id="v1", status="active", aggregations_enabled=True,
+        deployed_version_id=None, status="active", aggregations_enabled=True,
     )
     lq = LogicalQuery(
         model_id=mid, protocol="jdbc",

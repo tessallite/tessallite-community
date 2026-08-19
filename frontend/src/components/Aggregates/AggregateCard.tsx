@@ -70,6 +70,9 @@ interface Props {
   scheduleCron?: string | null;
   onEdit: () => void;
   onDelete: () => void;
+  /** F-026-04: when false, hide every mutation affordance (edit, rebuild,
+   *  delete) so a viewer / read-only share link sees an inspect-only card. */
+  canEdit?: boolean;
 }
 
 export default function AggregateCard({
@@ -82,6 +85,7 @@ export default function AggregateCard({
   scheduleCron,
   onEdit,
   onDelete,
+  canEdit = true,
 }: Props) {
   const t = useT();
   const [showHistory, setShowHistory] = useState(false);
@@ -128,12 +132,23 @@ export default function AggregateCard({
               />
             </Tooltip>
           )}
-          {roi && (
-            <Tooltip title={t("aggCard.usageScore", { score: String(roi.roi_score), hits: String(roi.hit_count) })}>
+          {roi && roi.net_value_per_day != null && (
+            <Tooltip title={t("aggCard.netValueTooltip", { value: String(roi.net_value_per_day) })}>
               <Chip
-                label={t("aggCard.score", { score: String(roi.roi_score) })}
+                label={t("aggCard.netValue", { value: String(roi.net_value_per_day) })}
                 size="small"
-                color={roi.roi_score >= 1 ? "success" : "default"}
+                color={roi.net_value_per_day > 0 ? "success" : "error"}
+                variant="outlined"
+                data-testid={`agg-netvalue-${agg.id}`}
+              />
+            </Tooltip>
+          )}
+          {roi && (
+            <Tooltip title={t("aggCard.usageScore", { score: String(roi.storage_efficiency ?? roi.roi_score), hits: String(roi.hit_count) })}>
+              <Chip
+                label={t("aggCard.score", { score: String(roi.storage_efficiency ?? roi.roi_score) })}
+                size="small"
+                color={(roi.storage_efficiency ?? roi.roi_score) >= 1 ? "success" : "default"}
                 variant="outlined"
               />
             </Tooltip>
@@ -182,11 +197,13 @@ export default function AggregateCard({
               sx={{ fontSize: 10, height: 18 }}
             />
           )}
+          {canEdit && (
           <Tooltip title={t("aggCard.editTooltip")}>
             <IconButton size="small" onClick={onEdit} data-testid={`agg-edit-${agg.id}`}>
               <EditIcon fontSize="small" />
             </IconButton>
           </Tooltip>
+          )}
         </Box>
 
         {/* Row 2: grain + measures */}
@@ -229,17 +246,19 @@ export default function AggregateCard({
 
         {/* Action buttons */}
         <Stack direction="row" spacing={0.5} mt={1} alignItems="center">
-          <RefreshTriggerButton
-            entityId={agg.id}
-            modelId={modelId}
-            projectId={projectId}
-            entityType="aggregate"
-            mode="full"
-            label={t("aggCard.rebuildNow")}
-            size="small"
-            variant="outlined"
-            onResult={(ok, msg) => setFeedback({ ok, msg })}
-          />
+          {canEdit && (
+            <RefreshTriggerButton
+              entityId={agg.id}
+              modelId={modelId}
+              projectId={projectId}
+              entityType="aggregate"
+              mode="full"
+              label={t("aggCard.rebuildNow")}
+              size="small"
+              variant="outlined"
+              onResult={(ok, msg) => setFeedback({ ok, msg })}
+            />
+          )}
           <Button
             size="small"
             onClick={() => setShowHistory(!showHistory)}
@@ -249,11 +268,13 @@ export default function AggregateCard({
             {t("aggCard.history")}
           </Button>
           <Box flexGrow={1} />
+          {canEdit && (
           <Tooltip title={t("aggCard.deleteTooltip")}>
             <IconButton size="small" onClick={onDelete} data-testid={`agg-delete-${agg.id}`}>
               <DeleteIcon fontSize="small" />
             </IconButton>
           </Tooltip>
+          )}
         </Stack>
 
         {/* Feedback */}

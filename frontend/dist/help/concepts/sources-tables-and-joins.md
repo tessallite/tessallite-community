@@ -15,7 +15,7 @@ This article explains what a source is in Tessallite, how tables are classified 
 
 ## Sources
 
-A source is the data warehouse or query engine that a project connects to. Tessallite supports three source types: **PostgreSQL**, **Google BigQuery**, and **Hadoop/Spark Thrift Server**. The source connection is configured at the workspace level and is shared by all models in that workspace.
+A source is the database, analytics engine, or managed query service that a project connects to. Tessallite supports three source types: **PostgreSQL**, **Google BigQuery**, and **Hadoop/Spark Thrift Server**. The source connection is configured at the workspace level and is shared by all models in that workspace.
 
 When you add a table to a model, you are selecting a table or view that exists in the connected source. Tessallite reads the schema from the source to populate column lists. The source itself is never modified. Pre-computed aggregate tables are written to a separate target schema, which may be in the same source or a different one.
 

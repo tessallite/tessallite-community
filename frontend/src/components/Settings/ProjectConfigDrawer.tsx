@@ -25,6 +25,8 @@ import GroupWorkIcon from "@mui/icons-material/GroupWork";
 import VerifiedUserIcon from "@mui/icons-material/VerifiedUser";
 import PaletteIcon from "@mui/icons-material/Palette";
 import ScienceIcon from "@mui/icons-material/Science";
+import VpnKeyIcon from "@mui/icons-material/VpnKey";
+import LockIcon from "@mui/icons-material/Lock";
 import type { Project } from "../../api/types";
 import ConnectionsPanel from "../Panels/ConnectionsPanel";
 import ProjectLLMScreen from "./ProjectLLMScreen";
@@ -33,6 +35,8 @@ import DemoTenantPanel from "./DemoTenantPanel";
 import ProjectAgentTabs, { type AgentTabKey } from "./ProjectAgentTabs";
 import UsersAccessPanel from "../Admin/UsersAccessPanel";
 import SecurityAuditPanel from "../Admin/SecurityAuditPanel";
+import SsoSettingsPanel from "../Admin/SsoSettingsPanel";
+import EmbedTokensPanel from "../Admin/EmbedTokensPanel";
 import AuditLog from "../../pages/AuditLog";
 import Webhooks from "../../pages/Webhooks";
 import GroupMappings from "../../pages/GroupMappings";
@@ -44,6 +48,8 @@ type AdminKey =
   | "audit-log"
   | "webhooks"
   | "sso-mappings"
+  | "sso-idp"
+  | "embed-tokens"
   | "security-audit"
   | "demo-tenant";
 type SectionKey = "connections" | "llm-providers" | "branding" | AgentTabKey | AdminKey;
@@ -53,6 +59,8 @@ const ADMIN_KEYS = new Set<string>([
   "audit-log",
   "webhooks",
   "sso-mappings",
+  "sso-idp",
+  "embed-tokens",
   "security-audit",
   "demo-tenant",
 ]);
@@ -122,6 +130,8 @@ export default function ProjectConfigDrawer({
       { key: "audit-log", label: t("projectNav.auditLog"), icon: <HistoryIcon fontSize="small" /> },
       { key: "webhooks", label: t("projectNav.webhooks"), icon: <WebhookIcon fontSize="small" /> },
       { key: "sso-mappings", label: t("projectNav.ssoMappings"), icon: <GroupWorkIcon fontSize="small" /> },
+      { key: "sso-idp", label: t("projectNav.ssoIdp"), icon: <VpnKeyIcon fontSize="small" /> },
+      { key: "embed-tokens", label: t("projectNav.embedTokens"), icon: <LockIcon fontSize="small" /> },
       { key: "security-audit", label: t("projectNav.securityAudit"), icon: <VerifiedUserIcon fontSize="small" /> },
       { key: "demo-tenant", label: t("projectNav.demoTenant"), icon: <ScienceIcon fontSize="small" /> },
     ],
@@ -253,6 +263,10 @@ export default function ProjectConfigDrawer({
               <Webhooks embedded />
             ) : section === "sso-mappings" ? (
               <GroupMappings embedded />
+            ) : section === "sso-idp" ? (
+              <SsoSettingsPanel />
+            ) : section === "embed-tokens" ? (
+              <EmbedTokensPanel />
             ) : section === "security-audit" ? (
               <SecurityAuditPanel />
             ) : section === "demo-tenant" ? (

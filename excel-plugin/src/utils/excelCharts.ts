@@ -36,6 +36,54 @@ export function getChartTypeEnum(type: ChartTypeRecommendation): Excel.ChartType
   }
 }
 
+interface ChartAnnotation {
+  measures?: Record<string, { title: string; type: string }>;
+  dimensions?: Record<string, { title: string; type: string }>;
+  timeDimensions?: Record<string, { title: string; type: string }>;
+}
+
+/**
+ * Bug-7416: the query-router's plugin-execute annotation always returns an
+ * empty `timeDimensions` map (`_build_annotation` hardcodes `{}`), so a
+ * time-series result was classified as an ordinary categorical dimension and
+ * `recommendChartType` never chose a line chart.
+ *
+ * The plugin already knows which dimensions are time dimensions
+ * (`Dimension.is_time_dimension`, loaded for the model). This pure helper
+ * reclassifies any annotation `dimensions` entry whose dimension name is a
+ * known time dimension into `timeDimensions`, so the downstream chart
+ * recommender and axis logic (which already read `timeDimensions`) see the
+ * time axis. Idempotent and non-mutating: returns a new annotation object.
+ *
+ * `timeDimensionNames` is the set of technical dimension names the model marks
+ * `is_time_dimension`. Matching is on the annotation KEY (the technical name),
+ * not the display title, since the backend keys `dimensions` by name.
+ */
+export function enrichAnnotationTimeDimensions(
+  annotation: ChartAnnotation | undefined,
+  timeDimensionNames: Iterable<string>,
+): ChartAnnotation | undefined {
+  if (!annotation) return annotation;
+  const timeNames = new Set(timeDimensionNames);
+  if (timeNames.size === 0 || !annotation.dimensions) return annotation;
+
+  const remainingDims: Record<string, { title: string; type: string }> = {};
+  const timeDims: Record<string, { title: string; type: string }> = {
+    ...(annotation.timeDimensions || {}),
+  };
+  let moved = false;
+  for (const [key, d] of Object.entries(annotation.dimensions)) {
+    if (timeNames.has(key)) {
+      timeDims[key] = d;
+      moved = true;
+    } else {
+      remainingDims[key] = d;
+    }
+  }
+  if (!moved) return annotation;
+  return { ...annotation, dimensions: remainingDims, timeDimensions: timeDims };
+}
+
 export function recommendChartType(
   headers: string[],
   rows: (string | number)[][],
@@ -175,7 +223,16 @@ export function separateColumns(
   return { chartHeaders, chartRows };
 }
 
-export async function insertChartFromRange(
+/**
+ * Bug-6733: chart creation is split into a critical core (data range, chart
+ * object, position, title) and non-critical axis formatting. The core is
+ * synced first so the chart exists regardless of whether axis-title writes
+ * fail on certain Excel hosts / chart types. The caller
+ * (`useExcel.insertChart`) syncs the core, then applies axis formatting in
+ * a separate non-fatal sync -- so a post-insert axis error never propagates
+ * as "Insert failed" when the chart was actually created.
+ */
+export function createChartOnSheet(
   chartType: Excel.ChartType,
   sheet: Excel.Worksheet,
   headers: string[],
@@ -186,7 +243,7 @@ export async function insertChartFromRange(
     timeDimensions?: Record<string, { title: string; type: string }>;
   },
   title?: string,
-): Promise<void> {
+): { chart: Excel.Chart; chartHeaders: string[] } {
   const { chartHeaders, chartRows } = separateColumns(headers, rows, annotation);
 
   const dataRowCount = chartRows.length + 1;
@@ -200,6 +257,32 @@ export async function insertChartFromRange(
   chart.setPosition(`A${chartTop + 1}`, `K${chartTop + 21}`);
   chart.title.text = title || 'Tessallite Result';
 
+  return { chart, chartHeaders };
+}
+
+/**
+ * Bug-6733: non-critical axis formatting extracted from the chart creation
+ * path. If this throws on `context.sync()` (e.g. pie charts that do not
+ * support category axes in some Excel hosts), the chart itself is already
+ * persisted. Called by `useExcel.insertChart` inside a try-catch after the
+ * core chart sync succeeds.
+ *
+ * R1 Finding 2: `fallbackMeasureHeaders` restores the pre-refactor
+ * behaviour where the value-axis title fell back to `chartHeaders.slice(1)`
+ * (the actual column names from the data range) when `annotation.measures`
+ * is absent. Without it, the Ask-Tessallite and KPI-panel chart paths
+ * (which pass no annotation) would show a generic "Value" axis title
+ * instead of the real measure name.
+ */
+export function applyChartAxisFormatting(
+  chart: Excel.Chart,
+  annotation?: {
+    measures?: Record<string, { title: string; type: string }>;
+    dimensions?: Record<string, { title: string; type: string }>;
+    timeDimensions?: Record<string, { title: string; type: string }>;
+  },
+  fallbackMeasureHeaders?: string[],
+): void {
   const dimNames: string[] = [];
   if (annotation?.dimensions) {
     for (const d of Object.values(annotation.dimensions)) dimNames.push(d.title);
@@ -209,7 +292,7 @@ export async function insertChartFromRange(
   }
   const measureNames = annotation?.measures
     ? Object.values(annotation.measures).map(m => m.title)
-    : chartHeaders.slice(1);
+    : (fallbackMeasureHeaders ?? []);
 
   const categoryAxis = chart.axes.getItem(Excel.ChartAxisType.category);
   categoryAxis.title.text = dimNames.join(' / ') || 'Category';

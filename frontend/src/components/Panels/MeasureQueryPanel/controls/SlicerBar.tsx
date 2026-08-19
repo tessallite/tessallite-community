@@ -25,6 +25,7 @@ import CloseIcon from "@mui/icons-material/Close";
 import AddIcon from "@mui/icons-material/Add";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import { queryRouterApiClient } from "../../../../api/client";
+import { rowSecurityDeniedAll } from "../../../../utils/rowSecurity";
 import type { Dimension } from "../../../../api/types";
 import {
   SLICER_OP_LABELS,
@@ -32,6 +33,8 @@ import {
   type Slicer,
   type SlicerOp,
 } from "../types";
+import PivotErrorAlert from "../PivotErrorAlert";
+import { toPivotError, type PivotPanelError } from "../pivotErrors";
 
 function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
@@ -97,7 +100,12 @@ function SlicerEditor({
   const [options, setOptions] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [truncated, setTruncated] = useState(false);
-  const [fetchError, setFetchError] = useState<string | null>(null);
+  // Bug-8182 (review B4): a member-lookup failure leads with a friendly message
+  // and keeps raw backend/transport text behind the collapsed accordion. This is
+  // a QUERY, so the friendly message is the generic lookup-failed one — not a
+  // pivot-config-invalid message (toPivotError's membership gate ensures a
+  // query-router code such as OBJECT_NOT_AVAILABLE is not mislabeled).
+  const [fetchError, setFetchError] = useState<PivotPanelError | null>(null);
 
   const dt = (dim.data_type ?? "").toUpperCase();
   const isDate = !!dim.is_time_dim &&
@@ -132,15 +140,28 @@ function SlicerEditor({
     }
     sql += ` ORDER BY ${col} LIMIT ${limit}`;
 
+    // Bug-7277: removed the hardcoded force_route: "source" that forced every
+    // slicer distinct-value lookup to bypass aggregates/pockets. The router's
+    // grain matching already guarantees a dimension-bearing aggregate contains
+    // the member set, so let it choose the fastest route.
     queryRouterApiClient
       .execute({
         model_id: modelId,
         raw_query: sql,
         dialect: "postgresql",
-        force_route: "source",
       }, personaId)
       .then((r) => {
         if (cancelled) return;
+        // Bug-8453 / R3 finding B-2: a row-security deny-all returns HTTP 200
+        // with zero rows, which rendered as an empty member list -- i.e. "this
+        // dimension has no members" -- when the truth is that the caller may
+        // not see any of them. Report the restriction instead of an empty set.
+        if (rowSecurityDeniedAll(r)) {
+          setFetchError({ message: t("query.rowSecurityDeniedBody") });
+          setOptions([]);
+          setTruncated(false);
+          return;
+        }
         const strs = r.rows
           .map((row) => {
             const rec = row as Record<string, unknown>;
@@ -153,9 +174,7 @@ function SlicerEditor({
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        const detail = (err as { response?: { data?: { detail?: string } } })
-          ?.response?.data?.detail;
-        setFetchError(detail || (err instanceof Error ? err.message : t("errors.requestFailed")));
+        setFetchError(toPivotError(err, t, t("slicer.lookupFailed")));
         setOptions([]);
         setTruncated(false);
       })
@@ -288,13 +307,11 @@ function SlicerEditor({
               {...params}
               label={multi ? t("slicer.valuesLabel") : t("slicer.valueLabel")}
               helperText={
-                fetchError
-                  ? fetchError
-                  : truncated
-                    ? t("slicer.first50")
-                    : multi
-                      ? t("slicer.typeToAdd")
-                      : undefined
+                truncated
+                  ? t("slicer.first50")
+                  : multi
+                    ? t("slicer.typeToAdd")
+                    : undefined
               }
               InputProps={{
                 ...params.InputProps,
@@ -320,6 +337,8 @@ function SlicerEditor({
           onChange={(e) => onChange({ ...slicer, values: [e.target.value] })}
         />
       )}
+
+      {fetchError && <PivotErrorAlert error={fetchError} />}
 
       <Stack direction="row" justifyContent="space-between">
         <Button size="small" onClick={onRemove}>

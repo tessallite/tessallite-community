@@ -39,12 +39,16 @@ TRUST_META = {
 # ---------------------------------------------------------------------------
 
 def test_rows_dimensions_skips_hidden_and_marks_visible():
-    rows = mdschema._rows_dimensions(CATALOG, DIMS, {})
-    dim_names = {r["DIMENSION_NAME"] for r in rows}
-    assert "Region" in dim_names
-    assert "account_type_code" not in dim_names
-    region_row = next(r for r in rows if r["DIMENSION_NAME"] == "Region")
-    assert region_row["DIMENSION_IS_VISIBLE"] == "true"
+    # Bug-6603: standalone attribute dims collapse into the visible [Dimensions]
+    # group node; the per-dimension hidden cascade shows on the hierarchies rowset
+    # (each visible attribute keeps its own [Name].[Name] hierarchy).
+    drows = mdschema._rows_dimensions(CATALOG, DIMS, {})
+    group = next(r for r in drows if r["DIMENSION_NAME"] == "Dimensions")
+    assert group["DIMENSION_IS_VISIBLE"] == "true"
+    hrows = mdschema._rows_hierarchies(CATALOG, DIMS)
+    hier_names = {r["HIERARCHY_NAME"] for r in hrows}
+    assert "Region" in hier_names
+    assert "account_type_code" not in hier_names
 
 
 def test_rows_measures_skips_hidden_and_keeps_folder():
@@ -205,8 +209,11 @@ def test_xmla_trust_footer_matches_jdbc_format():
 
 
 def test_xmla_dimension_description_carries_footer():
-    rows = mdschema._rows_dimensions(CATALOG, DIMS, {}, trust_meta=TRUST_META)
-    region_row = next(r for r in rows if r["DIMENSION_NAME"] == "Region")
+    # Bug-6603: a standalone dimension's own description now lives on its hierarchy
+    # row (the DIMENSIONS rowset emits the shared [Dimensions] group node); the
+    # trust footer must still reach it.
+    rows = mdschema._rows_hierarchies(CATALOG, DIMS, trust_meta=TRUST_META)
+    region_row = next(r for r in rows if r["HIERARCHY_NAME"] == "Region")
     assert "source: bigquery" in region_row["DESCRIPTION"]
 
 
@@ -214,6 +221,25 @@ def test_xmla_measure_description_carries_footer():
     rows = mdschema._rows_measures(CATALOG, MEASURES, trust_meta=TRUST_META)
     rev = next(r for r in rows if r["MEASURE_NAME"] == "Revenue")
     assert "source: bigquery" in rev["DESCRIPTION"]
+
+
+def test_named_list_refresh_vintage_is_available_in_gateway_set_catalogue():
+    """2026-08-11 named-list refresh vintage gap: named-set catalogue
+    descriptions consume the same trust metadata as tables and measures."""
+    rows = mdschema._rows_sets(
+        CATALOG,
+        [{
+            "name": "FocusRegions",
+            "display_name": "Focus Regions",
+            "description": "Regions used by the sales team",
+            "list_type": "advanced_mdx",
+            "expression": "{ [Region].[Region].Members }",
+            "trust_meta": TRUST_META,
+        }],
+    )
+    assert len(rows) == 1
+    assert "last refreshed 2026-04-13 14:00:00" in rows[0]["SET_DESCRIPTION"]
+    assert "source: bigquery" in rows[0]["SET_DESCRIPTION"]
 
 
 # ---------------------------------------------------------------------------
@@ -290,18 +316,51 @@ def test_schema_per_project_information_schema_tables():
     )
     assert result is not None
     _, rows = result
-    # Tables are registered under both project-specific schema AND public
-    # for compatibility with tools like Looker Studio
+    # Since Bug-5552/5553 (e865ce70) tables are registered ONLY under their
+    # project schema -- the old duplicate 'public' registration made Power BI
+    # show every table twice.
     from collections import defaultdict
     schemas_by_table = defaultdict(set)
     for row in rows:
         schemas_by_table[row[1]].add(row[0])
-    assert "warehouse" in schemas_by_table["inventory"]
-    assert "public" in schemas_by_table["inventory"]
-    assert "ecommerce" in schemas_by_table["orders"]
-    assert "public" in schemas_by_table["orders"]
-    assert "ecommerce" in schemas_by_table["orders_technical"]
-    assert "public" in schemas_by_table["orders_technical"]
+    assert schemas_by_table["inventory"] == {"warehouse"}
+    assert schemas_by_table["orders"] == {"ecommerce"}
+    assert schemas_by_table["orders_technical"] == {"ecommerce"}
+    cat.close()
+
+
+def test_schema_per_project_public_filter_finds_project_tables():
+    """Compatibility: BI clients that probe public explicitly still discover
+    project-scoped semantic tables without broad catalogue duplication."""
+    cat = _make_project_catalogue()
+    result = cat.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = 'public' ORDER BY table_name"
+    )
+    assert result is not None
+    _, rows = result
+    table_names = {row[0] for row in rows}
+    assert {"inventory", "orders", "orders_technical"}.issubset(table_names)
+    cat.close()
+
+
+def test_information_schema_tables_are_derived_from_model_names_only():
+    """A source relation in column metadata must not become a BI catalogue table."""
+    cat = CatalogueDB(
+        model_names=["sales"],
+        table_columns={
+            "sales": [{"name": "revenue", "data_type": "numeric"}],
+            "source_payment_transaction": [{"name": "amount", "data_type": "numeric"}],
+        },
+    )
+    result = cat.execute(
+        "SELECT table_name FROM information_schema.tables ORDER BY table_name"
+    )
+    assert result is not None
+    _, rows = result
+    table_names = {row[0] for row in rows}
+    assert "sales" in table_names
+    assert "source_payment_transaction" not in table_names
     cat.close()
 
 
@@ -313,15 +372,27 @@ def test_schema_per_project_information_schema_columns():
     )
     assert result is not None
     _, rows = result
-    # Tables are registered under both project-specific schema AND public
+    # Project-schema-only registration (see Bug-5552/5553 note above).
     from collections import defaultdict
     schemas_by_table = defaultdict(set)
     for row in rows:
         schemas_by_table[row[1]].add(row[0])
-    assert "warehouse" in schemas_by_table["inventory"]
-    assert "public" in schemas_by_table["inventory"]
-    assert "ecommerce" in schemas_by_table["orders"]
-    assert "public" in schemas_by_table["orders"]
+    assert schemas_by_table["inventory"] == {"warehouse"}
+    assert schemas_by_table["orders"] == {"ecommerce"}
+    cat.close()
+
+
+def test_schema_per_project_public_filter_finds_project_columns():
+    cat = _make_project_catalogue()
+    result = cat.execute(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = 'public' ORDER BY table_name, column_name"
+    )
+    assert result is not None
+    _, rows = result
+    columns_by_table = {row[0]: row[1] for row in rows}
+    assert columns_by_table["inventory"] == "sku"
+    assert columns_by_table["orders"] == "order_id"
     cat.close()
 
 
@@ -332,15 +403,13 @@ def test_schema_per_project_pg_tables_uses_project_slug():
     )
     assert result is not None
     _, rows = result
-    # Tables are registered under both project-specific schema AND public
+    # Project-schema-only registration (see Bug-5552/5553 note above).
     from collections import defaultdict
     schemas_by_table = defaultdict(set)
     for row in rows:
         schemas_by_table[row[1]].add(row[0])
-    assert "warehouse" in schemas_by_table["inventory"]
-    assert "public" in schemas_by_table["inventory"]
-    assert "ecommerce" in schemas_by_table["orders"]
-    assert "public" in schemas_by_table["orders"]
+    assert schemas_by_table["inventory"] == {"warehouse"}
+    assert schemas_by_table["orders"] == {"ecommerce"}
     cat.close()
 
 

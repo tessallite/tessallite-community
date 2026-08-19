@@ -2,7 +2,7 @@
 title: "Manage Users"
 audience: tenant-admin
 area: Admin
-updated: 2026-04-17
+updated: 2026-08-11
 ---
 
 ![Admin panel Users tab listing tenant users.](../assets/screencaps/admin-users-tab.png)
@@ -59,6 +59,25 @@ A Tenant Admin cannot remove another Tenant Admin. Only the System Admin can rem
 3. Confirm in the dialog.
 
 The user receives a password reset link valid for 24 hours. Their current password remains active until they complete the reset.
+
+---
+
+### Password rules
+
+Where you type a password directly — creating a user, or setting a new one for
+someone — Tessallite requires at least **8 characters**, with at least one
+**capital letter**, one **small letter**, and one **number**. The form states
+this under the password box and the Save button stays greyed out until the
+password satisfies it, so you find out before you submit rather than after.
+
+## How quickly access changes take effect
+
+Changes to a user's access are enforced by the length of their sign-in session:
+
+- **Web app sessions** end as soon as you remove a user or change their role.
+- **BI-tool connections** (Excel, Power BI, and other tools connected over XMLA or JDBC) hold a signed session token. After you disable a user or reset their password, an already-connected BI tool can keep working on its existing token until that token expires — up to the session lifetime, **60 minutes by default**. New connections are refused right away, but a live one is not cut off mid-session.
+
+If you need to be certain a disabled account cannot query at all, wait out the session lifetime (default 60 minutes) after disabling, or rotate the connection credentials the BI tool uses. Immediate token cut-off on disable is a planned enhancement.
 
 ---
 

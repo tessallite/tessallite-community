@@ -145,6 +145,15 @@ async def test_analyze_endpoint_returns_200():
     scalar_result.scalar_one_or_none.return_value = table
     db.execute = AsyncMock(return_value=scalar_result)
 
+    async def _get(entity, pk):
+        # Bug-8862: the analyze route now proves project -> model before it
+        # loads the table.
+        if entity.__name__ == "Model":
+            return types.SimpleNamespace(id=pk, project_id=project_id)
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+
     async def _fake_db(*args, **kwargs):
         yield db
 

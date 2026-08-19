@@ -80,6 +80,106 @@ async def test_missing_measure_returns_none():
 
 
 # ---------------------------------------------------------------------------
+# F-015-01 (Fable gate C1-1): window variant with an explicit divergent anchor
+# must NOT be served from an aggregate (route to source) so it cannot return a
+# window ordered by a different date than the source route.
+# ---------------------------------------------------------------------------
+
+async def test_window_variant_with_explicit_anchor_skips_aggregate():
+    m = make_measure("sales_lag", variant_kind="lag")
+    # Modeller selected an explicit ORDER BY date column for this window.
+    m.date_dimension_column_id = "col-ship-date"
+    agg = make_aggregate(["order_month"], [make_agg_col(m)])
+    bq = make_bound_query([make_dimension("order_month")], [m])
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    # Fail closed to source — no aggregate served.
+    assert result.aggregate is None
+    assert AggregateSkipReason.VARIANT_ANCHOR_UNPROVEN in (result.skip_reasons or [])
+
+
+async def test_window_variant_without_explicit_anchor_still_eligible():
+    m = make_measure("sales_lag", variant_kind="lag")
+    # No explicit anchor: orders by the grain time column on both routes.
+    agg = make_aggregate(["order_month"], [make_agg_col(m)])
+    bq = make_bound_query([make_dimension("order_month")], [m])
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    # No anchor divergence -> the variant is not force-skipped by the anchor gate.
+    assert AggregateSkipReason.VARIANT_ANCHOR_UNPROVEN not in (result.skip_reasons or [])
+
+
+@pytest.mark.parametrize("kind", ["pct_change", "cagr"])
+async def test_bug_8293_mismatched_resolved_anchor_refuses_admission(kind):
+    """Bug-8293/F-01: legacy mismatched artifacts fail closed at serve time."""
+    measure = make_measure(f"sales_{kind}", variant_kind=kind)
+    measure.resolved_date_col_id = "ship-date-col"
+    measure.date_dimension_column_id = None
+    time_dim = make_dimension("order_day")
+    time_dim.is_time_dim = True
+    time_dim.time_grain = "day"
+    time_dim.source_column_id = "order-date-col"
+    agg = make_aggregate(["order_day"], [make_agg_col(measure)])
+    bound = make_bound_query([time_dim], [measure])
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bound, AsyncMock())
+    assert result.aggregate is None
+    assert AggregateSkipReason.VARIANT_ANCHOR_UNPROVEN in result.skip_reasons
+
+
+@pytest.mark.parametrize("kind", ["pct_change", "cagr"])
+async def test_bug_8293_matching_resolved_anchor_keeps_admission(kind):
+    """Bug-8293/F-01: a proven matching anchor keeps acceleration enabled."""
+    measure = make_measure(f"sales_{kind}", variant_kind=kind)
+    measure.resolved_date_col_id = "order-date-col"
+    measure.date_dimension_column_id = None
+    time_dim = make_dimension("order_day")
+    time_dim.is_time_dim = True
+    time_dim.time_grain = "day"
+    time_dim.source_column_id = "order-date-col"
+    agg = make_aggregate(["order_day"], [make_agg_col(measure)])
+    bound = make_bound_query([time_dim], [measure])
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bound, AsyncMock())
+    assert AggregateSkipReason.VARIANT_ANCHOR_UNPROVEN not in result.skip_reasons
+
+
+@pytest.mark.parametrize("kind", ["pct_change", "cagr"])
+async def test_bug_8293_missing_physical_anchor_refuses_admission(kind):
+    """Bug-8293/F-01: an unproven anchor refuses the aggregate route.
+
+    Test escape: when the measure's anchor identity and the selected time
+    dimension's source column were both absent, ``matches_grain`` treated
+    the two Nones as a proven match and the aggregate was admitted even
+    though nothing proved its window ordering matches the source route.
+    Guard: conservative refusal with VARIANT_ANCHOR_UNPROVEN. Tier: T3.
+    """
+    measure = make_measure(f"sales_{kind}", variant_kind=kind)
+    measure.resolved_date_col_id = None
+    measure.date_dimension_column_id = None
+    time_dim = make_dimension("order_day")
+    time_dim.is_time_dim = True
+    time_dim.time_grain = "day"
+    time_dim.source_column_id = None  # expression-derived: no physical column
+    agg = make_aggregate(["order_day"], [make_agg_col(measure)])
+    bound = make_bound_query([time_dim], [measure])
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bound, AsyncMock())
+    assert result.aggregate is None
+    assert AggregateSkipReason.VARIANT_ANCHOR_UNPROVEN in result.skip_reasons
+
+
+# ---------------------------------------------------------------------------
 # Freshness checks
 # ---------------------------------------------------------------------------
 
@@ -111,7 +211,12 @@ async def test_no_last_refreshed_at_skipped():
 # ---------------------------------------------------------------------------
 
 async def test_non_additive_exact_grain_passes():
-    m = make_measure("user_id", is_additive=False)
+    # Bug-5892: default_agg must match the aggregate's stored stat_type
+    # ("count_distinct") — a realistic COUNT DISTINCT measure has
+    # default_agg="count_distinct" (mirrors production: matcher Rule 2 now
+    # requires the exact (measure, stat) pair for standard non-additive
+    # measures, not just a name-level presence check).
+    m = make_measure("user_id", default_agg="count_distinct", is_additive=False)
     agg = make_aggregate(["country"], [make_agg_col(m, "count_distinct")])
     bq = make_bound_query([make_dimension("country")], [m])   # exact match
 
@@ -121,8 +226,30 @@ async def test_non_additive_exact_grain_passes():
     assert result.aggregate is agg
 
 
+async def test_non_additive_wrong_stat_column_falls_back_to_source():
+    """Bug-5892 (F-004-02) regression: a candidate aggregate that stores a
+    DIFFERENT stat for a non-additive measure (e.g. only a legacy/incorrect
+    ``user_id__sum`` column instead of ``user_id__count_distinct``) must be
+    REJECTED, not matched by name alone. Before the fix, this matched
+    (``STAT_TYPE_MISMATCH`` was never raised) and the rewriter emitted NULL
+    for the business metric instead of falling back to source."""
+    m = make_measure("user_id", default_agg="count_distinct", is_additive=False)
+    # Aggregate has the measure NAME present but the WRONG stat column.
+    agg = make_aggregate(["country"], [make_agg_col(m, "sum")])
+    bq = make_bound_query([make_dimension("country")], [m])   # exact grain
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is None
+    assert AggregateSkipReason.STAT_TYPE_MISMATCH in result.skip_reasons
+
+
 async def test_non_additive_extra_grain_rejected():
-    m = make_measure("user_id", is_additive=False)
+    # Bug-5892: default_agg="count_distinct" matches the stored stat so the
+    # rejection below is proven to come from the EXACT-GRAIN rule this test
+    # targets, not an incidental stat-type mismatch from the fixture.
+    m = make_measure("user_id", default_agg="count_distinct", is_additive=False)
     agg = make_aggregate(["country", "region"], [make_agg_col(m, "count_distinct")])
     bq = make_bound_query([make_dimension("country")], [m])   # agg has extra "region"
 
@@ -130,6 +257,7 @@ async def test_non_additive_extra_grain_rejected():
         mock_load.return_value = [agg]
         result = await find_best_aggregate(bq, AsyncMock())
     assert result.aggregate is None
+    assert AggregateSkipReason.EXACT_GRAIN_MISMATCH in result.skip_reasons
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +608,57 @@ async def test_having_over_expression_falls_to_source():
     assert result.aggregate is None
 
 
+async def test_having_stddev_matches_when_stddev_samp_column_present():
+    """Bug-6094: HAVING STDDEV(x) must match an aggregate storing the canonical
+    ``x__stddev_samp`` column. sqlglot emits the aggregate key ``stddev`` while
+    the stored stat_type is ``stddev_samp``; the matcher must normalize the
+    HAVING key (mirroring the SELECT path) so a servable dispersion-stat HAVING
+    keeps the aggregate route instead of always losing it."""
+    m = make_measure("x")
+    agg = make_aggregate(
+        ["country"],
+        [make_agg_col(m, "sum"), make_agg_col(m, "stddev_samp")],
+    )
+    bq = make_bound_query([make_dimension("country")], [m])
+    bq.logical_query.having_raw = "HAVING STDDEV(x) > 5"
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is agg
+
+
+async def test_having_variance_matches_when_var_samp_column_present():
+    """Bug-6094: HAVING VARIANCE(x) (sqlglot key 'variance') must match the
+    stored ``x__var_samp`` column via the same normalization."""
+    m = make_measure("x")
+    agg = make_aggregate(
+        ["country"],
+        [make_agg_col(m, "sum"), make_agg_col(m, "var_samp")],
+    )
+    bq = make_bound_query([make_dimension("country")], [m])
+    bq.logical_query.having_raw = "HAVING VARIANCE(x) > 5"
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is agg
+
+
+async def test_having_stddev_requires_stddev_column():
+    """Bug-6094: without the stored stddev_samp column, HAVING STDDEV(x) must
+    fall to source — a sum column cannot serve a standard deviation."""
+    m = make_measure("x")
+    agg = make_aggregate(["country"], [make_agg_col(m, "sum")])
+    bq = make_bound_query([make_dimension("country")], [m])
+    bq.logical_query.having_raw = "HAVING STDDEV(x) > 5"
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is None
+
+
 # ---------------------------------------------------------------------------
 # M1: Inactive aggregate produces FRESHNESS skip reason
 # ---------------------------------------------------------------------------
@@ -604,7 +783,11 @@ async def test_avg_with_sum_count_matches_at_coarser_grain():
 
 async def test_canonical_dim_list_cached_per_version():
     """The canonical dimension list is built once per (model_id, version) and
-    reused on the next routed query — without changing the routing decision."""
+    reused on the next routed query -- without changing the routing decision.
+
+    Bug-6977: deployed models now use the snapshot-based builder, so the
+    caching assertion counts calls to build_canonical_dimension_list_from_snapshot.
+    """
     from src.routing import aggregate_matcher as am
 
     am.invalidate_canonical_dim_cache()
@@ -614,15 +797,15 @@ async def test_canonical_dim_list_cached_per_version():
 
     calls = {"n": 0}
 
-    async def _fake_build(model_id, db):
+    def _fake_snapshot_build(dims, hier_rows):
         calls["n"] += 1
         return []
 
     with (
         patch(_PATCH, new_callable=AsyncMock) as mock_load,
         patch(
-            "shared.semantic.canonical_dimensions.build_canonical_dimension_list",
-            new=_fake_build,
+            "shared.semantic.canonical_dimensions.build_canonical_dimension_list_from_snapshot",
+            new=_fake_snapshot_build,
         ),
     ):
         mock_load.return_value = [agg]
@@ -635,7 +818,10 @@ async def test_canonical_dim_list_cached_per_version():
 
 
 async def test_canonical_dim_cache_keyed_by_version():
-    """A re-deploy (new deployed_version_id) forces a fresh canonical build."""
+    """A re-deploy (new deployed_version_id) forces a fresh canonical build.
+
+    Bug-6977: deployed models now use the snapshot-based builder.
+    """
     from src.routing import aggregate_matcher as am
 
     am.invalidate_canonical_dim_cache()
@@ -645,15 +831,15 @@ async def test_canonical_dim_cache_keyed_by_version():
 
     calls = {"n": 0}
 
-    async def _fake_build(model_id, db):
+    def _fake_snapshot_build(dims, hier_rows):
         calls["n"] += 1
         return []
 
     with (
         patch(_PATCH, new_callable=AsyncMock) as mock_load,
         patch(
-            "shared.semantic.canonical_dimensions.build_canonical_dimension_list",
-            new=_fake_build,
+            "shared.semantic.canonical_dimensions.build_canonical_dimension_list_from_snapshot",
+            new=_fake_snapshot_build,
         ),
     ):
         mock_load.return_value = [agg]
@@ -720,3 +906,250 @@ async def test_resolvable_where_still_matches_aggregate():
         result = await find_best_aggregate(bq, AsyncMock())
 
     assert result.aggregate is agg
+
+
+# ---------------------------------------------------------------------------
+# Bug-6973: SELECT MIN(x), MAX(x) multi-stat column matching
+# ---------------------------------------------------------------------------
+
+async def test_select_min_max_same_measure_matches_with_both_columns():
+    """Bug-6973: SELECT MIN(x), MAX(x) -- two analytical select expressions on
+    the same measure with different agg_functions.  The aggregate matcher must
+    accept an aggregate that stores both x__min and x__max columns."""
+    from src.ir.logical_query import SelectExpression
+
+    m = make_measure("x")
+    agg = make_aggregate(
+        ["country"],
+        [make_agg_col(m, "sum"), make_agg_col(m, "min"), make_agg_col(m, "max")],
+    )
+    bq = make_bound_query([make_dimension("country")], [m])
+    bq.logical_query.select_expressions = [
+        SelectExpression(
+            raw_text="MIN(x)", alias=None, classification="analytical",
+            agg_function="min", inner_column="x", inner_literal=None,
+        ),
+        SelectExpression(
+            raw_text="MAX(x)", alias=None, classification="analytical",
+            agg_function="max", inner_column="x", inner_literal=None,
+        ),
+    ]
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is agg
+
+
+async def test_select_min_max_same_measure_rejects_without_both_columns():
+    """Bug-6973: SELECT MIN(x), MAX(x) must reject an aggregate that stores
+    only x__max -- without x__min, the MIN column cannot be served."""
+    from src.ir.logical_query import SelectExpression
+
+    m = make_measure("x")
+    agg = make_aggregate(
+        ["country"],
+        [make_agg_col(m, "sum"), make_agg_col(m, "max")],  # no x__min
+    )
+    bq = make_bound_query([make_dimension("country")], [m])
+    bq.logical_query.select_expressions = [
+        SelectExpression(
+            raw_text="MIN(x)", alias=None, classification="analytical",
+            agg_function="min", inner_column="x", inner_literal=None,
+        ),
+        SelectExpression(
+            raw_text="MAX(x)", alias=None, classification="analytical",
+            agg_function="max", inner_column="x", inner_literal=None,
+        ),
+    ]
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is None
+    assert AggregateSkipReason.STAT_TYPE_MISMATCH in (result.skip_reasons or [])
+
+
+# ---------------------------------------------------------------------------
+# F-013-02 (Bug-8250) -- artifact-to-version compatibility gate
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_version_mismatch_skips_aggregate():
+    """F-013-02: an aggregate built for a DIFFERENT version/epoch must not serve.
+
+    Test escape: no coverage asserted a fresh aggregate built under a previous
+    definition would be refused after deploy.
+    Guard: VERSION_MISMATCH skip reason. Tier: T1 (producer/consumer contract).
+    """
+    m = make_measure("revenue")
+    agg = make_aggregate(["country"], [make_agg_col(m)],
+                         built_for_version_id="old-version", built_for_epoch=1)
+    bq = make_bound_query([make_dimension("country")], [m])
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is None
+    assert AggregateSkipReason.VERSION_MISMATCH in (result.skip_reasons or [])
+
+
+@pytest.mark.asyncio
+async def test_null_built_for_skips_aggregate_for_deployed_model():
+    """F-013-02: NULL built_for (unmaterialised/import-cleared) must not serve.
+    Guard: VERSION_MISMATCH. Tier: T1."""
+    m = make_measure("revenue")
+    agg = make_aggregate(["country"], [make_agg_col(m)],
+                         built_for_version_id=None, built_for_epoch=None)
+    bq = make_bound_query([make_dimension("country")], [m])
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is None
+    assert AggregateSkipReason.VERSION_MISMATCH in (result.skip_reasons or [])
+
+
+@pytest.mark.asyncio
+async def test_epoch_only_mismatch_skips_aggregate():
+    """F-013-02 / Bug-7140: revert-to-same-version bumps epoch only. An aggregate
+    built for the SAME version_id but a DIFFERENT epoch must not serve.
+    Guard: VERSION_MISMATCH. Tier: T1."""
+    m = make_measure("revenue")
+    agg = make_aggregate(["country"], [make_agg_col(m)],
+                         built_for_version_id="v1", built_for_epoch=0)
+    bq = make_bound_query([make_dimension("country")], [m])
+    # Simulate epoch bump: model now at epoch=1 (revert-to-same-version).
+    bq.model.deploy_epoch = 1
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is None
+    assert AggregateSkipReason.VERSION_MISMATCH in (result.skip_reasons or [])
+
+
+@pytest.mark.asyncio
+async def test_matching_built_for_serves_aggregate():
+    """F-013-02: aggregate built for CURRENT version/epoch must serve.
+    Guard: positive-path proof. Tier: T1."""
+    m = make_measure("revenue")
+    agg = make_aggregate(["country"], [make_agg_col(m)],
+                         built_for_version_id="v1", built_for_epoch=0)
+    bq = make_bound_query([make_dimension("country")], [m])
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is agg
+
+
+@pytest.mark.asyncio
+async def test_f003_01_not_in_on_kept_grain_hits_aggregate():
+    """F-003-01 / G-004-01 / F-102-04: NOT IN on a stored grain column HITs."""
+    m = make_measure("revenue")
+    agg = make_aggregate(["region"], [make_agg_col(m)])
+    filters = [LogicalFilter("region", "not_in", ["US"])]
+    bq = make_bound_query([make_dimension("region")], [m], filters=filters)
+    bq.resolved_dimensions_by_name = {"region": make_dimension("region")}
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is agg
+
+
+@pytest.mark.asyncio
+async def test_f004_02_date_trunc_unresolvable_where_is_not_passthrough():
+    """F-004-02: DATE_TRUNC + unresolvable WHERE reports UNRESOLVABLE_WHERE."""
+    m = make_measure("revenue")
+    agg = make_aggregate(["business_date"], [make_agg_col(m)])
+    bq = make_bound_query([make_dimension("business_date")], [m], grain=[])
+    bq.has_passthrough_expressions = True
+    bq.logical_query.time_period_grains = [("month", "business_date")]
+    bq.logical_query.has_unresolvable_where = True
+    bq.logical_query.has_function_grain = True
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is None
+    assert AggregateSkipReason.UNRESOLVABLE_WHERE in result.skip_reasons
+    assert AggregateSkipReason.PASSTHROUGH not in result.skip_reasons
+
+
+@pytest.mark.asyncio
+async def test_f004_08_invalid_reason_refuses_active_aggregate():
+    m = make_measure("revenue")
+    agg = make_aggregate(["country"], [make_agg_col(m)])
+    agg.invalid_reason = "coverage mismatch"
+    agg.is_stale = False
+    bq = make_bound_query([make_dimension("country")], [m])
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is None
+    assert AggregateSkipReason.STALE in result.skip_reasons
+
+
+@pytest.mark.asyncio
+async def test_f004_05_filter_column_missing_is_named():
+    m = make_measure("revenue")
+    agg = make_aggregate(["country"], [make_agg_col(m)])
+    filters = [LogicalFilter("channel", "eq", "web")]
+    bq = make_bound_query(
+        [make_dimension("country")], [m], filters=filters,
+        all_dimensions=[make_dimension("country"), make_dimension("channel")],
+    )
+    bq.resolved_dimensions_by_name = {
+        "country": make_dimension("country"),
+        "channel": make_dimension("channel"),
+    }
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is None
+    assert AggregateSkipReason.GRAIN_MISSING in result.skip_reasons
+    assert "channel" in result.filter_columns_missing
+
+
+@pytest.mark.asyncio
+async def test_f003_08_extract_month_grain_hits_date_aggregate():
+    m = make_measure("revenue")
+    agg = make_aggregate(["business_date"], [make_agg_col(m)])
+    bq = make_bound_query([make_dimension("business_date")], [m], grain=[])
+    bq.has_passthrough_expressions = True
+    bq.logical_query.time_period_grains = [("extract_month", "business_date")]
+    bq.logical_query.has_function_grain = True
+    bq.resolved_dimensions_by_name = {"business_date": make_dimension("business_date")}
+
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is agg
+
+
+@pytest.mark.asyncio
+async def test_f004_07_two_hundred_mocked_candidates_matched_in_one_load():
+    """F-004-07: N=200 candidates must be matched from a SINGLE candidate load,
+    in-memory — never a per-candidate DB round-trip.
+
+    Bug-9240: this used to assert wall-clock ``elapsed < 5.0``, which flaked under
+    CPU contention and proved nothing deterministic. The property the gate exists
+    to protect is that candidate volume does not multiply the DB work: assert the
+    loader is awaited exactly once regardless of N (the deterministic proxy for
+    "adding candidates does not blow up") and that the best aggregate is still
+    selected."""
+    m = make_measure("revenue")
+    aggs = [
+        make_aggregate(["country"], [make_agg_col(m)], agg_id=f"agg-{i}")
+        for i in range(200)
+    ]
+    bq = make_bound_query([make_dimension("country")], [m])
+    with patch(_PATCH, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = aggs
+        result = await find_best_aggregate(bq, AsyncMock())
+    assert result.aggregate is not None
+    mock_load.assert_awaited_once()

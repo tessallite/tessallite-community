@@ -23,7 +23,8 @@ def decode_access_token(token: str) -> dict:
     HTTPException 401 at the FastAPI dependency layer.
 
     Regular access tokens carry no ``aud`` claim. Embed tokens carry
-    ``aud=embed``. Any other audience value is rejected.
+    ``aud=embed``. Internal service principals carry ``aud=service`` and are
+    validated by the shared middleware before bypassing LocalUser checks.
     """
     payload = jwt.decode(
         token,
@@ -34,6 +35,6 @@ def decode_access_token(token: str) -> dict:
     aud = payload.get("aud")
     if aud is not None:
         from jose import JWTError
-        if isinstance(aud, list) or aud != "embed":
+        if isinstance(aud, list) or aud not in ("embed", "service"):
             raise JWTError(f"Unexpected audience: {aud}")
     return payload

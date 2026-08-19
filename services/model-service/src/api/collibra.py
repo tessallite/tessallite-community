@@ -9,10 +9,9 @@ Tokens are Fernet-encrypted before storage and never returned in responses.
 from __future__ import annotations
 
 import logging
-import uuid as _uuid
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 
 from shared.audit.logger import audit
@@ -43,6 +42,7 @@ from src.governance_helpers import (
     encrypt_credentials,
     get_model,
     not_found,
+    validate_governance_graph,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,16 +210,16 @@ async def update_collibra_config(
             conn.auth_type = body.auth_type
         if body.token is not None:
             conn.encrypted_credentials = encrypt_credentials({"token": body.token})
-        if body.community_id is not None:
+        if "community_id" in body.model_fields_set:
             conn.community_id = body.community_id
-        if body.domain_id is not None:
+        if "domain_id" in body.model_fields_set:
             conn.domain_id = body.domain_id
-        if body.asset_type_mapping is not None:
-            conn.asset_type_mapping = body.asset_type_mapping
-        if body.relation_type_mapping is not None:
-            conn.relation_type_mapping = body.relation_type_mapping
-        if body.responsibility_mapping is not None:
-            conn.responsibility_mapping = body.responsibility_mapping
+        if "asset_type_mapping" in body.model_fields_set:
+            conn.asset_type_mapping = body.asset_type_mapping or {}
+        if "relation_type_mapping" in body.model_fields_set:
+            conn.relation_type_mapping = body.relation_type_mapping or {}
+        if "responsibility_mapping" in body.model_fields_set:
+            conn.responsibility_mapping = body.responsibility_mapping or {}
         if body.sync_scope is not None:
             conn.sync_scope = body.sync_scope
         if body.sync_mode is not None:
@@ -298,7 +298,16 @@ async def validate_collibra_connection(
         creds = decrypt_credentials(conn.encrypted_credentials)
         token = creds.get("token", "")
 
-        client = CollibraClient(base_url=conn.base_url, token=token)
+        # Bug-7718: pass connection config to the client.
+        client = CollibraClient(
+            base_url=conn.base_url,
+            token=token,
+            community_id=conn.community_id or "",
+            domain_id=conn.domain_id or "",
+            asset_type_mapping=conn.asset_type_mapping or {},
+            relation_type_mapping=conn.relation_type_mapping or {},
+            responsibility_mapping=conn.responsibility_mapping or {},
+        )
         status_result = await client.validate_connection()
 
         return CollibraValidateResponse(
@@ -323,16 +332,60 @@ async def validate_collibra_connection(
 async def get_collibra_asset_types(
     project_id: UUID,
     model_id: UUID,
+    connection_id: UUID | None = Query(default=None),
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> dict:
-    """Return the default Collibra asset type and relation type mappings."""
-    async for db in get_tenant_db(current_user.tenant_id):
-        await get_model(db, project_id, model_id)
-    from src.collibra_mapper import COLLIBRA_ASSET_TYPE_MAP, COLLIBRA_RELATION_TYPE_MAP
-    return {
+    """Return the Collibra mapping reference for the mapping-config UI.
+
+    Bug-6498: this endpoint previously returned ONLY the built-in defaults,
+    ignoring per-connection overrides, so a mapping UI had no way to show the
+    effective configuration. It now returns the defaults AND, when a
+    ``connection_id`` is supplied, the effective (defaults merged with the
+    connection's saved overrides) asset-type, relation-type, and
+    responsibility mappings plus the status map — the same precedence the
+    mapper and sync apply.
+    """
+    from src.collibra_mapper import (
+        COLLIBRA_ASSET_TYPE_MAP,
+        COLLIBRA_RELATION_TYPE_MAP,
+        COLLIBRA_STATUS_MAP,
+        DEFAULT_OWNER_ROLE,
+        DEFAULT_STEWARD_ROLE,
+    )
+
+    default_responsibility_map = {
+        "owner": DEFAULT_OWNER_ROLE,
+        "steward": DEFAULT_STEWARD_ROLE,
+    }
+
+    result: dict = {
         "asset_types": COLLIBRA_ASSET_TYPE_MAP,
         "relation_types": COLLIBRA_RELATION_TYPE_MAP,
+        "responsibilities": default_responsibility_map,
+        "status_map": COLLIBRA_STATUS_MAP,
     }
+
+    async for db in get_tenant_db(current_user.tenant_id):
+        await get_model(db, project_id, model_id)
+        if connection_id is not None:
+            conn = await db.get(CollibraConnection, connection_id)
+            if conn is None or conn.model_id != model_id:
+                raise not_found("Collibra connection not found")
+            result["effective"] = {
+                "asset_types": {
+                    **COLLIBRA_ASSET_TYPE_MAP,
+                    **(conn.asset_type_mapping or {}),
+                },
+                "relation_types": {
+                    **COLLIBRA_RELATION_TYPE_MAP,
+                    **(conn.relation_type_mapping or {}),
+                },
+                "responsibilities": {
+                    **default_responsibility_map,
+                    **(conn.responsibility_mapping or {}),
+                },
+            }
+    return result
 
 # ---------------------------------------------------------------------------
 # Sync
@@ -356,6 +409,47 @@ async def collibra_sync(
         conn = await db.get(CollibraConnection, body.connection_id)
         if conn is None or conn.model_id != model_id:
             raise not_found("Collibra connection not found")
+        # Bug-6027 (sibling of Bug-5987/F-030-03): live push always fails —
+        # CollibraClient's push path raises NotImplementedError
+        # unconditionally (the real Collibra API contract is unavailable;
+        # see collibra_client.py). dry_run defaults to False here, so an
+        # API caller who simply omits dry_run would otherwise trigger a
+        # doomed live-push attempt. Reject it at the boundary, same as the
+        # analogous Solidatus fix, rather than run the full
+        # graph-build/hash/diff cycle only to fail at the final push step.
+        if not body.dry_run:
+            # Bug-7527: a rejected live-push attempt must leave an audit trail.
+            # Emit a SANITIZED event (no credentials, no full payload — only the
+            # target connection and the rejection reason) and COMMIT it before
+            # raising, so the caller's rollback on the 501 cannot lose it (the
+            # durable-rejection pattern used by auth.login_failure).
+            await audit(
+                db,
+                action="collibra.sync.rejected",
+                severity="warn",
+                actor_email=current_user.email,
+                target_type="collibra_connection",
+                target_id=conn.id,
+                target_name=conn.display_name,
+                detail={
+                    "reason": "push_not_implemented",
+                    "dry_run": body.dry_run,
+                    "deprecate_missing": body.deprecate_missing,
+                    "export_draft": body.export_draft,
+                },
+            )
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail={
+                    "code": "collibra_push_not_implemented",
+                    "message": (
+                        "Live push to Collibra is not implemented yet — "
+                        "only dry_run=true (preview) is supported. The real "
+                        "Collibra API contract is unavailable."
+                    ),
+                },
+            )
         await audit(
             db,
             action="collibra.sync.trigger",
@@ -406,16 +500,26 @@ async def collibra_sync(
                 assets_updated=run.assets_updated,
                 relations_created=run.relations_created,
                 relations_updated=run.relations_updated,
-                warnings=[],
+                # Bug-7522: surface warnings from the run row.
+                warnings=run.warnings_json or [],
                 error_message=run.error_message,
             )
         except Exception as exc:
-            logger.exception("Collibra sync failed")
-            return CollibraSyncResponse(
-                run_id=_uuid.UUID("00000000-0000-0000-0000-000000000000"),
-                status="failed",
-                error_message=str(exc),
-            )
+            # Bug-6027: run_collibra_sync now returns (rather than raises)
+            # any failure after the CollibraSyncRun row is persisted — see
+            # the CollibraSyncResponse built from `run` above, which
+            # carries the real run_id. Reaching this block means the
+            # failure happened BEFORE a run row could be created; there is
+            # no persisted run to report, so fail the request instead of
+            # returning a zero-UUID response that claims one exists.
+            logger.exception("Collibra sync failed before a run could be persisted")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "code": "collibra_sync_failed_before_run_created",
+                    "message": f"Collibra sync could not start: {exc}",
+                },
+            ) from exc
 
 # ---------------------------------------------------------------------------
 # Export preview
@@ -485,7 +589,8 @@ async def collibra_export_preview(
                 len(payload.responsibilities) if body.include_responsibilities else 0
             ),
             by_asset_type=by_type,
-            warnings=[],
+            # Bug-7522: governance-quality warnings.
+            warnings=validate_governance_graph(graph),
         )
 
 # ---------------------------------------------------------------------------

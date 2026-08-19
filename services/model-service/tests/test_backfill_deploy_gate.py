@@ -17,6 +17,7 @@ import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from .result_fakes import FakeScalarResult
 
 from scripts.migrate_existing_models_to_versioned import backfill_tenant
 
@@ -28,7 +29,7 @@ class _ScalarResult:
         self._items = items
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return self._items

@@ -84,8 +84,9 @@ describe("KpiThresholdEditor (render)", () => {
   it("basis switch to Percent of target on higher_is_better emits ratio-scale bands (R3-H001)", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
-    // Start with absolute_value to test switching TO percentage
-    const meta = createDefaultPresentationMeta(200, "higher_is_better");
+    // Start with absolute_value to test switching TO percentage (F-017-20 made
+    // percentage_of_target the default, so absolute_value must be forced here).
+    const meta = createDefaultPresentationMeta(200, "higher_is_better", "absolute_value");
     expect(meta.evaluation_type).toBe("absolute_value");
 
     render(
@@ -114,7 +115,9 @@ describe("KpiThresholdEditor (render)", () => {
   it("basis switch to Percent of target on lower_is_better emits On Track at high end (R3-M001)", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
-    const meta = createDefaultPresentationMeta(100, "lower_is_better");
+    // Start on absolute_value so switching TO percentage_of_target actually
+    // fires (percentage_of_target is now the default basis — F-017-20).
+    const meta = createDefaultPresentationMeta(100, "lower_is_better", "absolute_value");
 
     render(
       <KpiThresholdEditor

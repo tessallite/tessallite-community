@@ -79,6 +79,89 @@ describe("LicenseAndEdition", () => {
     expect(screen.getAllByText("Unlimited").length).toBeGreaterThan(0);
   });
 
+  it("shows an explicit, retryable error when the edition read fails (Bug-7470)", () => {
+    const refetch = vi.fn();
+    mockEdition.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      refetch,
+    });
+    mockLimits.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    });
+    render(<LicenseAndEdition />);
+    // Must NOT fall back to the plausible "unactivated" chip / unlimited caps.
+    expect(screen.queryByTestId("license-edition-chip")).not.toBeInTheDocument();
+    expect(screen.getByTestId("license-load-error")).toBeInTheDocument();
+    screen.getByText("Retry").click();
+    expect(refetch).toHaveBeenCalled();
+  });
+
+  it("shows the error state when the limits read fails (Bug-7470)", () => {
+    mockEdition.mockReturnValue({
+      data: { edition: "community", activated: true },
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    });
+    mockLimits.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      refetch: vi.fn(),
+    });
+    render(<LicenseAndEdition />);
+    expect(screen.getByTestId("license-load-error")).toBeInTheDocument();
+  });
+
+  // Bug-7680: an installed-but-invalid licence (verifier rejected an expired or
+  // untrusted document) must render distinctly from both "activated" and the
+  // plain unactivated state — otherwise an invalid licence looks normal.
+  it("renders a distinct invalid-licence banner and chip, not 'Activated'", () => {
+    mockEdition.mockReturnValue({
+      data: {
+        edition: "community",
+        activated: false,
+        enforcement: true,
+        license_state: "invalid",
+      },
+      isLoading: false,
+    });
+    mockLimits.mockReturnValue({
+      data: { entitlements: { models: 2 }, usage: {} },
+      isLoading: false,
+    });
+    render(<LicenseAndEdition />);
+    // Distinct invalid banner + chip are shown.
+    expect(screen.getByTestId("license-invalid-banner")).toBeInTheDocument();
+    expect(screen.getByTestId("license-invalid-chip")).toHaveTextContent("Invalid");
+    expect(
+      screen.getByText(
+        "The installed license is invalid. It may be expired or its signature is not trusted, so it is not active. Install a current, valid license to activate this instance.",
+      ),
+    ).toBeInTheDocument();
+    // Must NOT read as a normal, active licence.
+    expect(screen.queryByText("Activated")).not.toBeInTheDocument();
+  });
+
+  it("does not show the invalid banner for a normal activated licence", () => {
+    mockEdition.mockReturnValue({
+      data: { edition: "community", activated: true },
+      isLoading: false,
+    });
+    mockLimits.mockReturnValue({
+      data: { entitlements: { models: 2 }, usage: {} },
+      isLoading: false,
+    });
+    render(<LicenseAndEdition />);
+    expect(screen.queryByTestId("license-invalid-banner")).not.toBeInTheDocument();
+    expect(screen.getByText("Activated")).toBeInTheDocument();
+  });
+
   it("shows the manage CTA on enterprise instead of upgrade", () => {
     mockEdition.mockReturnValue({
       data: { edition: "enterprise", activated: true },

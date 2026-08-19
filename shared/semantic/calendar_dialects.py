@@ -60,6 +60,15 @@ CALENDAR_TYPES = frozenset({
 #   retail_445     — NRF 4-5-4 week/period grid (Sunday nearest Feb 1 anchor).
 #   hijri          — lunar calendar (library-computed per-date mapping).
 #
+# IMPORTANT: this constant governs the QUERY-TIME expression path only
+# (query-router preflight and the variant emitter in time_variants_sql.py).
+# It does NOT constrain the DDL emitter.  The DDL emitter creates a
+# physical reference calendar table and may use row-materialised output
+# (e.g. iso_week — Bug-6240) even for expression-capable types, because
+# the DDL path and the query-time path are independent: the DDL path
+# must produce correct SQL on every dialect for table creation, while the
+# query-time path computes period boundaries inline on the fact query.
+#
 # F-016-04 / F-016-09: this is the single source of truth for the
 # expression-vs-table decision. Callers (the query-router preflight and the
 # variant emitter) import it rather than maintaining parallel literal sets.
@@ -133,7 +142,10 @@ def _transpile_expr(pg_expr: str, dialect: str) -> str:
 class _DialectConfig:
     """Encapsulates dialect-specific DDL patterns that sqlglot cannot transpile."""
 
-    __slots__ = ("ctas_prefix", "supports_pk", "quote_connector", "date_source_fn", "row_table_emitter")
+    __slots__ = (
+        "ctas_prefix", "supports_pk", "connector_name", "date_source_fn",
+        "row_table_emitter", "iso_week_unit",
+    )
 
     def __init__(
         self,
@@ -141,31 +153,101 @@ class _DialectConfig:
         supports_pk: bool,
         date_source_fn: "type[_DateSource]",
         row_table_emitter: "type[_RowTableEmitter]",
-        quote_connector: str | None = None,
+        connector_name: str = "postgresql",
+        iso_week_unit: str = "WEEK",
     ):
         self.ctas_prefix = ctas_prefix
         self.supports_pk = supports_pk
-        self.quote_connector = quote_connector
+        # Bug-7206: connector name used for identifier quoting via
+        # quote_table_ref. Every dialect must quote identifiers to prevent
+        # SQL injection through table names containing semicolons or other
+        # SQL metacharacters.
+        self.connector_name = connector_name
         self.date_source_fn = date_source_fn
         self.row_table_emitter = row_table_emitter
+        # Bug-6568: the EXTRACT unit that yields an ISO-8601 week number on this
+        # dialect. PostgreSQL/Redshift/Spark ``WEEK`` is already ISO (Monday-
+        # anchored, week 1 = the week with the first Thursday), but BigQuery /
+        # Snowflake ``WEEK`` is Sunday-anchored and non-ISO — those must use the
+        # ``ISOWEEK`` unit (sqlglot renders it as BigQuery ``EXTRACT(ISOWEEK …)``
+        # and Snowflake ``DATE_PART(WEEKISO, …)``). This keeps the materialised
+        # ``week_no`` column ISO-consistent across every source dialect instead
+        # of silently diverging on BigQuery/Snowflake.
+        self.iso_week_unit = iso_week_unit
 
-    def ddl_wrapper(self, table_name: str, select_sql: str, pk_col: str | None = "date_key") -> str:
-        ddl = f"DROP TABLE IF EXISTS {table_name};\n{self.ctas_prefix.format(table=table_name)}\n{select_sql};\n"
+    def ddl_wrapper(
+        self,
+        table_name: str,
+        select_sql: str,
+        pk_col: str | None = "date_key",
+        cte_prefix: str = "",
+    ) -> str:
+        # F-016-06: ``cte_prefix`` (a top-level ``WITH`` clause) is injected
+        # between ``CREATE TABLE t AS`` and the SELECT so a dialect whose day
+        # spine is a recursive CTE (Redshift) renders valid SQL. It is empty for
+        # every dialect whose source is a plain FROM-clause subquery.
+        ddl = (
+            f"DROP TABLE IF EXISTS {table_name};\n"
+            f"{self.ctas_prefix.format(table=table_name)}\n"
+            f"{cte_prefix}{select_sql};\n"
+        )
         if pk_col and self.supports_pk:
             ddl += f"ALTER TABLE {table_name} ADD PRIMARY KEY ({pk_col});\n"
         return ddl
+
+    def iso_week_expr(self, date_alias: str, dialect: str) -> str:
+        """Return the target-dialect ISO-8601 week-number expression.
+
+        Built from the dialect's ISO week unit and transpiled through sqlglot so
+        the ``::int`` cast and function form match the sibling period columns.
+        """
+        pg_expr = f"EXTRACT({self.iso_week_unit} FROM {date_alias})::int"
+        return _transpile_expr(pg_expr, dialect)
 
 
 class _DateSource:
     @staticmethod
     def generate(s: str, e: str) -> tuple[str, str]:
+        """Return ``(date_alias, from_clause)``: the SELECT-list date reference
+        and the FROM-clause source that yields one row per day in ``[s, e]``."""
         raise NotImplementedError
+
+    @staticmethod
+    def cte(s: str, e: str) -> str:
+        """Optional top-level ``WITH`` prefix a dialect needs before the
+        SELECT (e.g. a recursive CTE date spine). Empty for dialects whose
+        source is a plain FROM-clause subquery. F-016-06."""
+        return ""
 
 
 class _PgDateSource(_DateSource):
     @staticmethod
     def generate(s: str, e: str) -> tuple[str, str]:
         return "d::date", f"generate_series('{s}'::date, '{e}'::date, '1 day'::interval) d"
+
+
+class _RedshiftDateSource(_DateSource):
+    # F-016-06: Redshift's ``generate_series`` is a LEADER-NODE-ONLY function
+    # and cannot be used in ``CREATE TABLE AS`` (which runs on the compute
+    # nodes) — the previous config reused ``_PgDateSource`` and every
+    # standard/fiscal/thai calendar DDL failed on Redshift. The portable
+    # replacement is a recursive CTE, which Redshift supports (``WITH
+    # RECURSIVE``) but only at the TOP of the query, so the day spine is emitted
+    # as a ``cte()`` prefix and the FROM clause simply references it.
+    @staticmethod
+    def generate(s: str, e: str) -> tuple[str, str]:
+        return "date_key", "date_seq"
+
+    @staticmethod
+    def cte(s: str, e: str) -> str:
+        return (
+            "WITH RECURSIVE date_seq (date_key) AS (\n"
+            f"    SELECT CAST('{s}' AS DATE)\n"
+            "    UNION ALL\n"
+            f"    SELECT DATEADD(day, 1, date_key) FROM date_seq "
+            f"WHERE date_key < CAST('{e}' AS DATE)\n"
+            ")\n"
+        )
 
 
 class _BqDateSource(_DateSource):
@@ -190,19 +272,28 @@ class _SnowflakeDateSource(_DateSource):
 
 
 class _SqlServerDateSource(_DateSource):
-    # F-016-20: GENERATE_SERIES is SQL Server 2022+ (compatibility level 160).
-    # On older servers this DDL fails; the returned script carries the note so
-    # a modeller running it manually knows the minimum version.
-    SQL_SERVER_VERSION_NOTE = (
-        "-- Requires SQL Server 2022+ (compatibility level 160) for "
-        "GENERATE_SERIES.\n"
-    )
-
+    # F-016-10: GENERATE_SERIES is SQL Server 2022+ (compatibility level 160)
+    # only, so the previous emitter failed on the still-common 2017/2019
+    # servers. Replace it with a catalogue-derived numbers spine that works on
+    # every supported version (2012+) without a recursive CTE or an
+    # ``OPTION (MAXRECURSION ...)`` hint: ``sys.all_objects`` has thousands of
+    # rows, so the self cross join yields far more than
+    # MAX_ROW_MATERIALISED_DAYS (~150 years), and ``ROW_NUMBER() - 1`` bounded
+    # by ``DATEDIFF`` gives contiguous 0..N day offsets. This is a plain
+    # FROM-clause subquery, so it slots into the existing SELECT ... INTO wrapper
+    # unchanged.
     @staticmethod
     def generate(s: str, e: str) -> tuple[str, str]:
         return "date_key", (
-            f"(\n    SELECT DATEADD(DAY, value, CAST('{s}' AS DATE)) AS date_key\n"
-            f"    FROM GENERATE_SERIES(0, DATEDIFF(DAY, '{s}', '{e}'))\n)"
+            "(\n"
+            f"    SELECT DATEADD(DAY, n.num, CAST('{s}' AS DATE)) AS date_key\n"
+            "    FROM (\n"
+            "        SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1 AS num\n"
+            "        FROM sys.all_objects a CROSS JOIN sys.all_objects b\n"
+            "    ) AS n\n"
+            f"    WHERE n.num <= DATEDIFF(DAY, CAST('{s}' AS DATE), "
+            f"CAST('{e}' AS DATE))\n"
+            ") AS d"
         )
 
 
@@ -248,44 +339,225 @@ class _PgRowTableEmitter(_RowTableEmitter):
         )
 
 
+# F-016-04: the previous BigQuery row emitter wrote one ``SELECT ... UNION ALL``
+# arm per day into a single monolithic ``CREATE TABLE AS`` statement. Over a
+# 100-year retail range that produced a ~4.8 MB statement (36,524 arms) that is
+# slow to parse and can be rejected by the connector's statement-size limit.
+# Like the T-SQL and Snowflake emitters, we now CREATE the table with an
+# explicit schema and load rows with bounded, chunked ``INSERT ... VALUES``
+# statements so no single statement grows without bound. BigQuery's documented
+# ceiling is 10,000 rows per VALUES; a conservative chunk keeps each statement
+# well under the query-length limit while preserving every row (no gaps, no
+# duplicates).
+_BQ_MAX_VALUES_ROWS = 1_000
+
+
 class _BqRowTableEmitter(_RowTableEmitter):
     @staticmethod
     def emit(table_name: str, int_columns: list[str], rows: list[RowTableRow]) -> str:
-        def _select(row: RowTableRow) -> str:
-            date_iso, ints = row
-            parts = [f"DATE '{date_iso}' AS date_key"]
-            parts += [f"{val} AS {col}" for col, val in zip(int_columns, ints)]
-            return "SELECT " + ", ".join(parts)
-
-        selects = " UNION ALL\n    ".join(_select(r) for r in rows)
-        return (
-            f"DROP TABLE IF EXISTS {table_name};\n"
-            f"CREATE TABLE {table_name} AS\n"
-            f"    {selects};\n"
+        col_defs = ",\n    ".join(
+            ["date_key DATE", *[f"{c} INT64 NOT NULL" for c in int_columns]]
         )
+        col_list = ", ".join(["date_key", *int_columns])
+
+        def _row_values(row: RowTableRow) -> str:
+            date_iso, ints = row
+            return (
+                "(" + ", ".join([f"DATE '{date_iso}'", *[str(i) for i in ints]]) + ")"
+            )
+
+        parts: list[str] = [
+            f"DROP TABLE IF EXISTS {table_name};\n"
+            f"CREATE TABLE {table_name} (\n"
+            f"    {col_defs}\n"
+            f");\n"
+        ]
+        for chunk_start in range(0, len(rows), _BQ_MAX_VALUES_ROWS):
+            chunk = rows[chunk_start:chunk_start + _BQ_MAX_VALUES_ROWS]
+            values = ",\n    ".join(_row_values(r) for r in chunk)
+            parts.append(
+                f"INSERT INTO {table_name} ({col_list}) VALUES\n"
+                f"    {values};\n"
+            )
+        return "".join(parts)
+
+
+# F-016-09: Spark row-materialised calendars must not emit one unbounded
+# ``VALUES`` clause. Row-materialised types (iso_week, retail_445, hijri) allow
+# up to MAX_ROW_MATERIALISED_DAYS (~150 years) of rows; a single monolithic
+# VALUES over that range can exceed the driver/parser statement-size limit and
+# fail auto-create. Chunk the rows like the BigQuery / T-SQL / Snowflake
+# emitters: the first chunk creates the table via ``CREATE TABLE ... AS SELECT
+# ... FROM VALUES``; each later chunk appends via ``INSERT INTO ... SELECT ...
+# FROM VALUES``. Every chunk keeps the Bug-7207 ``TO_DATE`` cast so date_key is
+# typed DATE, not STRING.
+_SPARK_MAX_VALUES_ROWS = 1_000
 
 
 class _SparkRowTableEmitter(_RowTableEmitter):
     @staticmethod
     def emit(table_name: str, int_columns: list[str], rows: list[RowTableRow]) -> str:
+        # Bug-7207: Spark infers bare string literals as STRING type.
+        # Use TO_DATE() in the outer SELECT to ensure DATE typing.
         col_list = ", ".join(["date_key", *int_columns])
-        values = ",\n    ".join(_row_values_literal(r) for r in rows)
-        return (
-            f"DROP TABLE IF EXISTS {table_name};\n"
-            f"CREATE TABLE {table_name} USING parquet AS\n"
-            f"SELECT {col_list} FROM VALUES\n"
-            f"    {values}\n"
-            f"AS t({col_list});\n"
+        select_cols = ", ".join(
+            ["TO_DATE(date_key) AS date_key", *int_columns]
         )
+
+        parts: list[str] = [f"DROP TABLE IF EXISTS {table_name};\n"]
+        for chunk_start in range(0, len(rows), _SPARK_MAX_VALUES_ROWS):
+            chunk = rows[chunk_start:chunk_start + _SPARK_MAX_VALUES_ROWS]
+            values = ",\n    ".join(_row_values_literal(r) for r in chunk)
+            if chunk_start == 0:
+                parts.append(
+                    f"CREATE TABLE {table_name} USING parquet AS\n"
+                    f"SELECT {select_cols} FROM VALUES\n"
+                    f"    {values}\n"
+                    f"AS t({col_list});\n"
+                )
+            else:
+                parts.append(
+                    f"INSERT INTO {table_name}\n"
+                    f"SELECT {select_cols} FROM VALUES\n"
+                    f"    {values}\n"
+                    f"AS t({col_list});\n"
+                )
+        return "".join(parts)
+
+
+# Bug-7619: T-SQL limits VALUES clauses to 1000 rows. Row-materialised
+# calendars (iso_week, retail_445, hijri) over multi-year date ranges easily
+# exceed this. This emitter batches the INSERT into chunks of at most
+# _TSQL_MAX_VALUES_ROWS rows each, emitting one INSERT statement per chunk.
+# Bug-7768: Snowflake caps VALUES clauses at 16,384 rows. Redshift and
+# PostgreSQL have no practical VALUES row limit for these volumes.
+_TSQL_MAX_VALUES_ROWS = 999
+_SNOWFLAKE_MAX_VALUES_ROWS = 16_384
+
+
+class _SqlServerRowTableEmitter(_RowTableEmitter):
+    """Emit CREATE TABLE + batched INSERT statements for SQL Server.
+
+    T-SQL restricts a single ``INSERT ... VALUES`` to at most 1000 rows. For
+    multi-year calendar date ranges the row count regularly exceeds this limit,
+    so the emitter splits rows into chunks of ``_TSQL_MAX_VALUES_ROWS`` and
+    emits one INSERT per chunk. This guarantees valid T-SQL regardless of the
+    date range size while keeping every row present (no gaps, no duplicates).
+    """
+
+    @staticmethod
+    def emit(table_name: str, int_columns: list[str], rows: list[RowTableRow]) -> str:
+        col_defs = ",\n    ".join(
+            ["date_key DATE PRIMARY KEY", *[f"{c} INT NOT NULL" for c in int_columns]]
+        )
+        col_list = ", ".join(["date_key", *int_columns])
+
+        parts: list[str] = [
+            f"DROP TABLE IF EXISTS {table_name};\n"
+            f"CREATE TABLE {table_name} (\n"
+            f"    {col_defs}\n"
+            f");\n"
+        ]
+
+        # Batch rows into chunks that respect the T-SQL 1000-row VALUES limit.
+        for chunk_start in range(0, len(rows), _TSQL_MAX_VALUES_ROWS):
+            chunk = rows[chunk_start:chunk_start + _TSQL_MAX_VALUES_ROWS]
+            values = ",\n    ".join(_row_values_literal(r) for r in chunk)
+            parts.append(
+                f"INSERT INTO {table_name} ({col_list}) VALUES\n"
+                f"    {values};\n"
+            )
+
+        return "".join(parts)
+
+
+# Bug-7768: Snowflake caps a single VALUES clause at 16,384 rows. For 45+
+# year calendar date ranges (16,000+ days) the row count can exceed this
+# limit. This emitter uses the same batched-INSERT approach as the T-SQL
+# emitter but with a 16,384-row threshold.
+class _SnowflakeRowTableEmitter(_RowTableEmitter):
+    """Emit CREATE TABLE + batched INSERT statements for Snowflake.
+
+    Snowflake restricts a single ``INSERT ... VALUES`` to at most 16,384 rows.
+    For very wide date ranges the emitter splits rows into chunks and emits
+    one INSERT per chunk, identical in structure to the T-SQL batching.
+    """
+
+    @staticmethod
+    def emit(table_name: str, int_columns: list[str], rows: list[RowTableRow]) -> str:
+        col_defs = ",\n    ".join(
+            ["date_key DATE PRIMARY KEY", *[f"{c} INT NOT NULL" for c in int_columns]]
+        )
+        col_list = ", ".join(["date_key", *int_columns])
+
+        parts: list[str] = [
+            f"DROP TABLE IF EXISTS {table_name};\n"
+            f"CREATE TABLE {table_name} (\n"
+            f"    {col_defs}\n"
+            f");\n"
+        ]
+
+        for chunk_start in range(0, len(rows), _SNOWFLAKE_MAX_VALUES_ROWS):
+            chunk = rows[chunk_start:chunk_start + _SNOWFLAKE_MAX_VALUES_ROWS]
+            values = ",\n    ".join(_row_values_literal(r) for r in chunk)
+            parts.append(
+                f"INSERT INTO {table_name} ({col_list}) VALUES\n"
+                f"    {values};\n"
+            )
+
+        return "".join(parts)
+
+
+class _SqlServerDialectConfig(_DialectConfig):
+    """SQL Server uses ``SELECT ... INTO`` instead of ``CREATE TABLE ... AS SELECT``.
+
+    T-SQL does not support the ANSI ``CREATE TABLE t AS SELECT ...`` form.
+    The equivalent is ``SELECT columns INTO t FROM source``.  This subclass
+    overrides ``ddl_wrapper`` to inject the ``INTO <table>`` clause between
+    the column list and the ``FROM`` keyword of the emitted SELECT.
+    """
+
+    def ddl_wrapper(
+        self,
+        table_name: str,
+        select_sql: str,
+        pk_col: str | None = "date_key",
+        cte_prefix: str = "",
+    ) -> str:
+        from_pos = select_sql.find("\nFROM ")
+        if from_pos == -1:
+            raise ValueError(
+                "Cannot locate FROM clause in SELECT for SQL Server "
+                "INTO rewrite"
+            )
+        select_part = select_sql[:from_pos]
+        from_part = select_sql[from_pos:]  # includes leading \n
+        # cte_prefix is empty for SQL Server (its numbers spine is a FROM-clause
+        # subquery, not a top-level CTE); accepted for signature parity.
+        ddl = (
+            f"DROP TABLE IF EXISTS {table_name};\n"
+            f"{cte_prefix}{select_part}\n"
+            f"INTO {table_name}{from_part};\n"
+        )
+        if pk_col and self.supports_pk:
+            ddl += f"ALTER TABLE {table_name} ADD PRIMARY KEY ({pk_col});\n"
+        return ddl
+
+    def iso_week_expr(self, date_alias: str, dialect: str) -> str:
+        # Bug-6568: sqlglot renders the ISOWEEK extract unit as
+        # ``DATEPART(ISOWEEK, …)``, which T-SQL rejects — SQL Server's ISO week
+        # datepart token is ``ISO_WEEK``. Emit the native form directly (CAST for
+        # parity with the sibling ::int columns).
+        return f"CAST(DATEPART(ISO_WEEK, {date_alias}) AS INT)"
 
 
 _DIALECT_CONFIGS: dict[str, _DialectConfig] = {
-    "postgresql": _DialectConfig("CREATE TABLE {table} AS", True, _PgDateSource, _PgRowTableEmitter),
-    "redshift": _DialectConfig("CREATE TABLE {table} AS", True, _PgDateSource, _PgRowTableEmitter),
-    "bigquery": _DialectConfig("CREATE TABLE {table} AS", False, _BqDateSource, _BqRowTableEmitter, quote_connector="bigquery"),
-    "hadoop_spark": _DialectConfig("CREATE TABLE {table} USING parquet AS", False, _SparkDateSource, _SparkRowTableEmitter),
-    "snowflake": _DialectConfig("CREATE TABLE {table} AS", False, _SnowflakeDateSource, _PgRowTableEmitter),
-    "sqlserver": _DialectConfig("CREATE TABLE {table} AS", False, _SqlServerDateSource, _PgRowTableEmitter),
+    "postgresql": _DialectConfig("CREATE TABLE {table} AS", True, _PgDateSource, _PgRowTableEmitter, connector_name="postgresql"),
+    "redshift": _DialectConfig("CREATE TABLE {table} AS", True, _RedshiftDateSource, _PgRowTableEmitter, connector_name="redshift"),
+    "bigquery": _DialectConfig("CREATE TABLE {table} AS", False, _BqDateSource, _BqRowTableEmitter, connector_name="bigquery", iso_week_unit="ISOWEEK"),
+    "hadoop_spark": _DialectConfig("CREATE TABLE {table} USING parquet AS", False, _SparkDateSource, _SparkRowTableEmitter, connector_name="hadoop_spark"),
+    "snowflake": _DialectConfig("CREATE TABLE {table} AS", False, _SnowflakeDateSource, _SnowflakeRowTableEmitter, connector_name="snowflake", iso_week_unit="ISOWEEK"),
+    "sqlserver": _SqlServerDialectConfig("", True, _SqlServerDateSource, _SqlServerRowTableEmitter, connector_name="sqlserver"),
 }
 
 
@@ -296,13 +568,48 @@ def _get_dialect_config(dialect: str) -> _DialectConfig:
     return config
 
 
-def _date_source(dialect: str, start: date, end: date) -> tuple[str, str]:
+def _date_source(dialect: str, start: date, end: date) -> tuple[str, str, str]:
+    """Return ``(date_alias, from_clause, cte_prefix)`` for *dialect*.
+
+    ``cte_prefix`` is a top-level ``WITH`` clause (empty unless the dialect's
+    day spine is a recursive CTE — Redshift, F-016-06).
+    """
     s, e = start.isoformat(), end.isoformat()
-    return _get_dialect_config(dialect).date_source_fn.generate(s, e)
+    fn = _get_dialect_config(dialect).date_source_fn
+    alias, from_clause = fn.generate(s, e)
+    return alias, from_clause, fn.cte(s, e)
 
 
-def _ddl_wrapper(dialect: str, table_name: str, select_sql: str, pk_col: str | None = "date_key") -> str:
-    return _get_dialect_config(dialect).ddl_wrapper(table_name, select_sql, pk_col)
+def _ddl_wrapper(
+    dialect: str,
+    table_name: str,
+    select_sql: str,
+    pk_col: str | None = "date_key",
+    cte_prefix: str = "",
+) -> str:
+    return _get_dialect_config(dialect).ddl_wrapper(
+        table_name, select_sql, pk_col, cte_prefix
+    )
+
+
+# F-016-04: preflight row budget for ROW-MATERIALISED calendars (iso_week /
+# retail_445 / hijri). Even with batched INSERTs, a runaway date range would
+# emit thousands of statements and load millions of rows. Expression-capable
+# DDL calendars (standard / fiscal / thai_buddhist) are a single CTAS and are
+# not bounded here. ~150 years of daily rows is a generous ceiling for a real
+# analytics calendar while refusing an accidental millennia-wide range.
+#
+# NOTE: ``iso_week`` is in EXPRESSION_CAPABLE_CALENDAR_TYPES for the QUERY-TIME
+# path but its DDL is ROW-MATERIALISED (``_emit_iso_week`` computes ISO parts in
+# Python because ISO date-part value semantics differ across dialects). The row
+# budget must therefore key on the DDL-materialisation shape (the emitters that
+# build a per-day ``rows`` list), NOT on EXPRESSION_CAPABLE_CALENDAR_TYPES —
+# otherwise iso_week would slip the budget and emit ~146k INSERTs over a
+# millennia-wide range.
+ROW_MATERIALISED_CALENDAR_TYPES: frozenset[str] = frozenset({
+    "iso_week", "retail_445", "hijri",
+})
+MAX_ROW_MATERIALISED_DAYS = 55_000
 
 
 def emit_calendar_ddl(
@@ -318,6 +625,22 @@ def emit_calendar_ddl(
     if calendar_type not in CALENDAR_TYPES:
         raise ValueError(f"Unsupported calendar_type: {calendar_type}")
 
+    # F-016-04: bound row-materialised calendar generation up front so a valid
+    # but enormous range fails loud with an actionable message instead of
+    # producing an oversized, slow-loading DDL payload. Keyed on the DDL
+    # row-materialisation shape (iso_week is expression-capable at query time
+    # but row-materialised in DDL — see ROW_MATERIALISED_CALENDAR_TYPES).
+    if calendar_type in ROW_MATERIALISED_CALENDAR_TYPES:
+        span_days = (end_date - start_date).days + 1
+        if span_days > MAX_ROW_MATERIALISED_DAYS:
+            raise ValueError(
+                f"Calendar type {calendar_type!r} is row-materialised and the "
+                f"requested range spans {span_days} days, exceeding the "
+                f"{MAX_ROW_MATERIALISED_DAYS}-day limit "
+                f"(~{MAX_ROW_MATERIALISED_DAYS // 365} years). Narrow the "
+                "date range."
+            )
+
     if calendar_type in ("standard", "fiscal"):
         if not 1 <= fiscal_year_start_month <= 12:
             raise ValueError("fiscal_year_start_month must be between 1 and 12")
@@ -326,8 +649,10 @@ def emit_calendar_ddl(
         fys = 1
 
     config = _get_dialect_config(dialect)
-    if config.quote_connector:
-        table_name = quote_table_ref(config.quote_connector, table_name)
+    # Bug-7206: quote identifiers for ALL dialects, not just BigQuery.
+    # Prevents SQL injection via table names containing semicolons or other
+    # SQL metacharacters (e.g. "cal; DELETE FROM sales.orders; --").
+    table_name = quote_table_ref(config.connector_name, table_name)
 
     emitters = {
         "standard": _emit_standard,
@@ -343,7 +668,7 @@ def emit_calendar_ddl(
 def _emit_standard(
     dialect: str, table_name: str, start: date, end: date, fys: int
 ) -> str:
-    date_alias, from_clause = _date_source(dialect, start, end)
+    date_alias, from_clause, cte_prefix = _date_source(dialect, start, end)
 
     if fys == 1:
         year_pg = f"EXTRACT(YEAR FROM {date_alias})::int"
@@ -359,7 +684,7 @@ def _emit_standard(
             f"CASE WHEN ((EXTRACT(MONTH FROM {date_alias})::int - {fys} + 12) % 12) < 6 THEN 1 ELSE 2 END"
         )
         quarter_pg = (
-            f"(((EXTRACT(MONTH FROM {date_alias})::int - {fys} + 12) % 12) / 3 + 1)::int"
+            f"(FLOOR(((EXTRACT(MONTH FROM {date_alias})::int - {fys} + 12) % 12) / 3.0) + 1)::int"
         )
     # F-016-16: month_no is the CALENDAR month (1-12) for both standard and
     # fiscal calendars — the fiscal offset is applied to year/half/quarter but
@@ -368,7 +693,6 @@ def _emit_standard(
     # store a separate fiscal-period column. Documented in
     # architecture_multi-calendar.md.
     month_pg = f"EXTRACT(MONTH FROM {date_alias})::int"
-    week_pg = f"EXTRACT(WEEK FROM {date_alias})::int"
     day_pg = f"EXTRACT(DAY FROM {date_alias})::int"
 
     columns = [
@@ -377,32 +701,52 @@ def _emit_standard(
         (_transpile_expr(half_pg, dialect), "half_no"),
         (_transpile_expr(quarter_pg, dialect), "quarter_no"),
         (_transpile_expr(month_pg, dialect), "month_no"),
-        (_transpile_expr(week_pg, dialect), "week_no"),
+        # Bug-6568: dialect-aware ISO week (non-ISO EXTRACT(WEEK) on BigQuery).
+        (_get_dialect_config(dialect).iso_week_expr(date_alias, dialect), "week_no"),
         (_transpile_expr(day_pg, dialect), "day_no"),
     ]
     col_sql = ",\n    ".join(f"{expr} AS {alias}" for expr, alias in columns)
     select_sql = f"SELECT\n    {col_sql}\nFROM {from_clause}"
-    return _ddl_wrapper(dialect, table_name, select_sql)
+    return _ddl_wrapper(dialect, table_name, select_sql, cte_prefix=cte_prefix)
 
 
 def _emit_iso_week(
     dialect: str, table_name: str, start: date, end: date, _fys: int
 ) -> str:
-    date_alias, from_clause = _date_source(dialect, start, end)
+    """ISO 8601 week calendar -- iso_year, iso_week, iso_day_of_week.
 
-    year_pg = f"EXTRACT(ISOYEAR FROM {date_alias})::int"
-    week_pg = f"EXTRACT(WEEK FROM {date_alias})::int"
-    dow_pg = f"EXTRACT(ISODOW FROM {date_alias})::int"
+    Bug-6240 / F-016-25: ISO date parts (ISOYEAR, ISODOW) have incompatible
+    value semantics across SQL dialects -- ISODOW is 1=Mon..7=Sun in
+    PostgreSQL but BigQuery DAYOFWEEK is 1=Sun..7=Sat, and Snowflake /
+    SQL Server lack ISOYEAR entirely.  sqlglot DATE_PART_MAPPING can
+    rename parts but cannot adjust value ranges, so transpilation alone
+    cannot produce correct materialised ISO day-of-week values on all
+    dialects.
 
-    columns = [
-        (f"{date_alias}", "date_key"),
-        (_transpile_expr(year_pg, dialect), "iso_year"),
-        (_transpile_expr(week_pg, dialect), "iso_week"),
-        (_transpile_expr(dow_pg, dialect), "iso_day_of_week"),
-    ]
-    col_sql = ",\n    ".join(f"{expr} AS {alias}" for expr, alias in columns)
-    select_sql = f"SELECT\n    {col_sql}\nFROM {from_clause}"
-    return _ddl_wrapper(dialect, table_name, select_sql)
+    To guarantee correct ISO 8601 values on every dialect, the columns
+    are computed in Python via ``date.isocalendar()`` and materialised as
+    row data -- the same sanctioned approach used for retail_445 and hijri
+    calendars whose period math also cannot be faithfully transpiled.
+
+    iso_week remains in EXPRESSION_CAPABLE_CALENDAR_TYPES because the
+    query-time path (time_variants_sql.py) handles ISO date parts
+    correctly with proper dialect mappings for equality-based operations
+    (PARTITION BY / GROUP BY).  The DDL emitter and the query-time path
+    are independent concerns; see the EXPRESSION_CAPABLE_CALENDAR_TYPES
+    comment block.
+    """
+    from datetime import timedelta
+
+    rows: list[RowTableRow] = []
+    current = start
+    while current <= end:
+        iso_year, iso_week_no, iso_dow = current.isocalendar()
+        rows.append((current.isoformat(), [iso_year, iso_week_no, iso_dow]))
+        current += timedelta(days=1)
+
+    return _get_dialect_config(dialect).row_table_emitter.emit(
+        table_name, ["iso_year", "iso_week", "iso_day_of_week"], rows
+    )
 
 
 # NRF 4-5-4 retail calendar columns (in emit order, after date_key).
@@ -490,13 +834,12 @@ def _emit_retail_445(
 def _emit_thai_buddhist(
     dialect: str, table_name: str, start: date, end: date, _fys: int
 ) -> str:
-    date_alias, from_clause = _date_source(dialect, start, end)
+    date_alias, from_clause, cte_prefix = _date_source(dialect, start, end)
 
     thai_year_pg = f"(EXTRACT(YEAR FROM {date_alias})::int + 543)"
     half_pg = f"CASE WHEN EXTRACT(MONTH FROM {date_alias}) <= 6 THEN 1 ELSE 2 END"
     quarter_pg = f"EXTRACT(QUARTER FROM {date_alias})::int"
     month_pg = f"EXTRACT(MONTH FROM {date_alias})::int"
-    week_pg = f"EXTRACT(WEEK FROM {date_alias})::int"
     day_pg = f"EXTRACT(DAY FROM {date_alias})::int"
 
     columns = [
@@ -505,12 +848,13 @@ def _emit_thai_buddhist(
         (_transpile_expr(half_pg, dialect), "half_no"),
         (_transpile_expr(quarter_pg, dialect), "quarter_no"),
         (_transpile_expr(month_pg, dialect), "month_no"),
-        (_transpile_expr(week_pg, dialect), "week_no"),
+        # Bug-6568: dialect-aware ISO week (non-ISO EXTRACT(WEEK) on BigQuery).
+        (_get_dialect_config(dialect).iso_week_expr(date_alias, dialect), "week_no"),
         (_transpile_expr(day_pg, dialect), "day_no"),
     ]
     col_sql = ",\n    ".join(f"{expr} AS {alias}" for expr, alias in columns)
     select_sql = f"SELECT\n    {col_sql}\nFROM {from_clause}"
-    return _ddl_wrapper(dialect, table_name, select_sql)
+    return _ddl_wrapper(dialect, table_name, select_sql, cte_prefix=cte_prefix)
 
 
 def _emit_hijri(

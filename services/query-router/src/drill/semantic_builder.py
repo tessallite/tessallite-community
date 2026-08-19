@@ -19,8 +19,6 @@ snapshot exists, falls back to the live tables (undeployed models).
 """
 from __future__ import annotations
 
-import base64
-import json
 import types
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -29,11 +27,14 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.drill_limits import DRILL_MAX_ROW_LIMIT
+from shared.semantic.join_keyword import edge_cardinality
 from shared.db.models import (
     Dimension,
     DrillThroughSet,
     HierarchyDefinition,
     HierarchyLevel,
+    Join,
     Measure,
     Model,
     ModelColumn,
@@ -42,9 +43,17 @@ from shared.db.models import (
     UserDefinedAttribute,
 )
 
+from sqlglot import expressions as exp
+
+from src.drill.cursor import (
+    CursorOrderTerm,
+    CursorValidationError,
+    CursorValue,
+    DrillCursorSpec,
+)
 from src.drill.predicate import (
     DrillPredicateError,
-    compile_where,
+    compile_where_expression,
     quote_ident,
 )
 
@@ -83,24 +92,8 @@ class HierarchyPathEntry:
 
 
 
-def encode_cursor(offset: int) -> str:
-    raw = json.dumps({"o": int(offset)}, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-
-def decode_cursor(cursor: str | None) -> int:
-    if not cursor:
-        return 0
-    try:
-        padding = "=" * (-len(cursor) % 4)
-        raw = base64.urlsafe_b64decode(cursor + padding)
-        return int(json.loads(raw)["o"])
-    except (ValueError, TypeError, json.JSONDecodeError, KeyError) as exc:
-        raise DrillSemanticError("INVALID_CURSOR", f"Invalid cursor: {exc}") from exc
-
-
 _DEFAULT_LIMIT = 1000
-_MAX_LIMIT = 10_000
+_MAX_LIMIT = DRILL_MAX_ROW_LIMIT
 
 
 def _clamp_limit(n: int | None) -> int:
@@ -116,6 +109,112 @@ def _quote(name: str) -> str:
     return quote_ident(name)
 
 
+def _cursor_literal(value: CursorValue) -> exp.Expression:
+    """Render a verified typed cursor value as a sqlglot expression."""
+    if value.kind == "null":
+        return exp.Null()
+    if value.kind == "bool":
+        return exp.Boolean(this=bool(value.value))
+    if value.kind in {"int", "decimal", "float"}:
+        return exp.Literal.number(str(value.value))
+    literal = exp.Literal.string(str(value.value))
+    if value.kind == "date":
+        return exp.Cast(this=literal, to=exp.DataType.build("DATE"))
+    if value.kind == "datetime":
+        return exp.Cast(this=literal, to=exp.DataType.build("TIMESTAMP"))
+    return literal
+
+
+def _cursor_column(name: str) -> exp.Column:
+    return exp.Column(this=exp.Identifier(this=name, quoted=True))
+
+
+def _keyset_continuation_expression(
+    spec: DrillCursorSpec,
+    values: Sequence[CursorValue],
+) -> exp.Expression:
+    """Build a NULLS-LAST lexicographic continuation predicate.
+
+    Every branch fixes the preceding order terms and advances the current
+    term. The complete key ends in a projectable unique dimension whenever a
+    leaf result can be continued, so no OFFSET-relative position remains to be
+    shifted by inserts or deletes before the continuation point.
+    """
+    branches: list[exp.Expression] = []
+    for index, (term, value) in enumerate(zip(spec.order_terms, values)):
+        if value.kind == "null":
+            # NULLS LAST: no value sorts after NULL at this term. A later term
+            # can still advance under the equality-prefix branch below.
+            continue
+        column = _cursor_column(term.name)
+        literal = _cursor_literal(value)
+        comparison: exp.Expression
+        if term.descending:
+            comparison = exp.LT(this=column, expression=literal)
+        else:
+            comparison = exp.GT(this=column, expression=literal)
+        # Explicit NULLS LAST means NULL follows every non-null value.
+        comparison = exp.Or(
+            this=comparison,
+            expression=exp.Is(
+                this=_cursor_column(term.name), expression=exp.Null()
+            ),
+        )
+        branch = comparison
+        for prior_term, prior_value in reversed(
+            list(zip(spec.order_terms[:index], values[:index]))
+        ):
+            if prior_value.kind == "null":
+                equality = exp.Is(
+                    this=_cursor_column(prior_term.name), expression=exp.Null()
+                )
+            else:
+                equality = exp.EQ(
+                    this=_cursor_column(prior_term.name),
+                    expression=_cursor_literal(prior_value),
+                )
+            branch = exp.And(this=equality, expression=branch)
+        branches.append(branch)
+
+    if not branches:
+        return exp.Boolean(this=False)
+    combined = branches[0]
+    for branch in branches[1:]:
+        combined = exp.Or(this=combined, expression=branch)
+    return combined
+
+
+# Bug-6273: aggregate functions allowed as a drill-through per-column override.
+# Mirrors the measure ``default_agg`` vocabulary. The chosen token is
+# interpolated into the drill SQL (``<AGG>(...)``), so anything outside this
+# set is rejected loudly rather than emitted — a validated allow-list, never a
+# pass-through of caller text.
+_DRILL_SUPPORTED_AGGS: frozenset[str] = frozenset({
+    "SUM", "COUNT", "COUNT_DISTINCT", "AVG", "MIN", "MAX",
+})
+
+
+def _resolve_drill_agg(override_agg: str | None, default_agg: str | None) -> str:
+    """Resolve the aggregate for a hierarchy step-down.
+
+    Returns the uppercased override when supplied and supported; otherwise the
+    measure's ``default_agg`` (defaulting to SUM). An unsupported override is a
+    hard ``DrillSemanticError`` (surfaced as a 400) — it must never fall back
+    silently to the default, which would return a number that disagrees with
+    the clicked pivot cell, nor be interpolated unvalidated into SQL.
+    """
+    if override_agg is None or str(override_agg).strip() == "":
+        return (default_agg or "SUM").upper()
+    normalized = str(override_agg).strip().upper()
+    if normalized not in _DRILL_SUPPORTED_AGGS:
+        raise DrillSemanticError(
+            "UNSUPPORTED_AGG",
+            f"Unsupported drill-through aggregate {override_agg!r}; "
+            f"supported: {', '.join(sorted(_DRILL_SUPPORTED_AGGS))}.",
+        )
+    return normalized
+
+
 @dataclass
 class DrillCuration:
     """Resolved drill-through curation for a measure.
@@ -129,26 +228,24 @@ class DrillCuration:
     joined_dim_names: list[str]
     row_limit_override: int | None
     fact_table: str | None
-    # Name of a dimension over a primary-key column on the effective source
-    # table, projectable through the semantic binder. When present it is a
-    # guaranteed-unique tie-breaker that makes the leaf ORDER BY a TOTAL order
-    # (Bug-1108); None when the source table has no PK-backed dimension.
+    # Dimensions over every component of the effective source table's primary
+    # key, in canonical schema order. The complete tuple is a guaranteed-unique
+    # tie-breaker that makes the leaf ORDER BY a TOTAL order (Bug-8048 R1).
+    # Empty when the table has no PK or any PK component is not projectable.
     #
-    # 3546 — RESIDUAL: when tiebreaker_dim_name is None, the leaf ORDER BY
+    # 3546 — RESIDUAL: when tiebreaker_dim_names is empty, the leaf ORDER BY
     # orders by the full projection (all detail/joined dims + the measure
     # value). This is NOT a strict total order when two contributing fact rows
-    # have identical values across the entire projection — LIMIT/OFFSET pages
-    # may non-deterministically skip or duplicate such rows. The residual
+    # have identical values across the entire projection. In that case the
+    # endpoint returns the first page but refuses to mint a continuation token.
     # cannot be closed within the semantic SQL path because connector-specific
     # pseudo-columns (PostgreSQL ctid, BigQuery _TABLE_SUFFIX, Snowflake
     # METADATA$ROW_ID) are physical identifiers not projectable through the
     # semantic binder's FROM-slug resolution. Mitigations:
     #   (1) Model a PK dimension on the source table — the builder detects
     #       it automatically and the sort becomes total.
-    #   (2) Accept the residual — identical-projection rows are rare in
-    #       practice; the sort is deterministic for all rows with any
-    #       distinguishing value across the projection.
-    tiebreaker_dim_name: str | None
+    #   (2) Keep the result single-page when no unique key is projectable.
+    tiebreaker_dim_names: tuple[str, ...]
     source_join_path: list[str]
 
 
@@ -184,6 +281,7 @@ class _SnapshotMeta:
     drill_sets_by_measure: dict[UUID, Any]  # measure_id -> drill-set namespace
     columns_by_id: dict[UUID, Any]  # column id -> column namespace
     tables_by_id: dict[UUID, Any]  # table id -> table namespace
+    joins_by_id: dict[UUID, Any]  # join id -> join namespace (F-019-01 cardinality)
     hierarchy_defs: list[Any]  # hierarchy definition namespaces
     hierarchy_levels: list[Any]  # hierarchy level namespaces
     levels_by_hier: dict[UUID, list[Any]]  # hierarchy_id -> ordered levels
@@ -274,6 +372,25 @@ def _hydrate_snapshot(model_id: UUID, snapshot: dict[str, Any]) -> _SnapshotMeta
             physical_name=t.get("physical_name", ""),
         )
 
+    # Joins (F-019-01): needed to detect an EXPANDING (one-to-many) source-table
+    # override, which would multiply the parent fact measure across child rows.
+    joins_by_id: dict[UUID, Any] = {}
+    for j in snapshot.get("joins", []) or []:
+        jid = _coerce_uuid(j.get("id"))
+        if jid is None:
+            continue
+        joins_by_id[jid] = types.SimpleNamespace(
+            id=jid,
+            left_table_id=_coerce_uuid(j.get("left_table_id")),
+            right_table_id=_coerce_uuid(j.get("right_table_id")),
+            join_type=j.get("join_type", "inner"),
+            # Carried so ``_path_cardinality_from`` can read the declared
+            # fan-out. Absent on a snapshot written before the
+            # orientation/cardinality split, in which case ``edge_cardinality``
+            # falls back to a legacy token in ``join_type``.
+            cardinality=j.get("cardinality"),
+        )
+
     # Hierarchies
     hier_defs: list[Any] = []
     hier_levels: list[Any] = []
@@ -310,6 +427,7 @@ def _hydrate_snapshot(model_id: UUID, snapshot: dict[str, Any]) -> _SnapshotMeta
         drill_sets_by_measure=drill_sets,
         columns_by_id=cols_by_id,
         tables_by_id=tables_by_id,
+        joins_by_id=joins_by_id,
         hierarchy_defs=hier_defs,
         hierarchy_levels=hier_levels,
         levels_by_hier=levels_by_hier,
@@ -425,31 +543,32 @@ def _snap_intrinsic_source_table(
     return None
 
 
-def _snap_pk_tiebreaker_dim(
+def _snap_pk_tiebreaker_dims(
     snap: _SnapshotMeta, fact_table: Any | None,
-) -> str | None:
-    """Resolve PK-backed tiebreaker dimension from snapshot."""
+) -> tuple[str, ...]:
+    """Resolve the complete projectable PK tuple from a deployed snapshot."""
     if fact_table is None:
-        return None
-    # Find PK columns on this table
-    pk_col_ids = [
-        c.id for c in snap.columns_by_id.values()
-        if c.model_table_id == fact_table.id and c.is_primary_key
-    ]
-    if not pk_col_ids:
-        return None
-    # Find a dimension over a PK column, ordered by column_name for stability
-    pk_dims = []
-    for cid in pk_col_ids:
-        dim = snap.dimensions_by_source_col.get(cid)
-        if dim is not None and dim.name:
-            col = snap.columns_by_id.get(cid)
-            col_name = col.column_name if col else ""
-            pk_dims.append((col_name, dim.name))
-    if pk_dims:
-        pk_dims.sort()
-        return pk_dims[0][1]
-    return None
+        return ()
+    # Column name is the stable schema-level order available in both the live
+    # metadata and deployed snapshot. UUID is a deterministic final tie-break.
+    pk_columns = sorted(
+        (
+            c for c in snap.columns_by_id.values()
+            if c.model_table_id == fact_table.id and c.is_primary_key
+        ),
+        key=lambda c: (c.column_name, str(c.id)),
+    )
+    if not pk_columns:
+        return ()
+    names: list[str] = []
+    for column in pk_columns:
+        dim = snap.dimensions_by_source_col.get(column.id)
+        if dim is None or not dim.name:
+            # A prefix of a composite key is not unique. Fail closed to an
+            # unstable first page rather than pretending it is a tie-breaker.
+            return ()
+        names.append(dim.name)
+    return tuple(names)
 
 
 async def _load_curation(
@@ -488,9 +607,9 @@ async def _load_curation(
 
     if drill_set is None:
         if snap is not None:
-            tiebreaker = _snap_pk_tiebreaker_dim(snap, fact_table)
+            tiebreaker = _snap_pk_tiebreaker_dims(snap, fact_table)
         else:
-            tiebreaker = await _resolve_pk_tiebreaker_dim(db, measure.model_id, fact_table)
+            tiebreaker = await _resolve_pk_tiebreaker_dims(db, measure.model_id, fact_table)
         return DrillCuration([], [], None, fact_table_name, tiebreaker, [])
 
     # --- resolve detail columns -> dimension names ---
@@ -536,9 +655,9 @@ async def _load_curation(
 
     # --- tiebreaker ---
     if snap is not None:
-        tiebreaker = _snap_pk_tiebreaker_dim(snap, fact_table)
+        tiebreaker = _snap_pk_tiebreaker_dims(snap, fact_table)
     else:
-        tiebreaker = await _resolve_pk_tiebreaker_dim(db, measure.model_id, fact_table)
+        tiebreaker = await _resolve_pk_tiebreaker_dims(db, measure.model_id, fact_table)
 
     source_join_path = [str(jid) for jid in (drill_set.source_join_path or [])]
 
@@ -558,12 +677,87 @@ async def _load_curation(
             "This drill-through source-table override has no executable join path. "
             "Choose and save a source join path before drilling.",
         )
+
+    # --- F-019-01: reject an EXPANDING (one-to-many) source-table override that
+    # would silently multiply the parent fact measure. When the effective source
+    # table is an override that differs from the measure's intrinsic table, the
+    # leaf projection reuses the parent fact measure's raw value column
+    # un-aggregated. If traversing the saved join path from the intrinsic (fact)
+    # table to the override table crosses a one-to-many edge, every child row
+    # repeats the same parent measure value, so SUM of the projected column
+    # multiplies the clicked cell — a silent wrong-number on the feature's core
+    # reconciliation promise. The measure only reconciles when its value column
+    # physically lives on the (leaf) override table; otherwise reject with a coded
+    # error rather than return a non-reconciling detail set.
+    #
+    # Fable-R1-F2: when the intrinsic table is unresolvable (UDA-backed measure
+    # on the deployed-snapshot path — snapshot doesn't embed UDA table IDs), we
+    # cannot determine cardinality. Fail CLOSED rather than accept an unknowable
+    # expanding path that would silently multiply the measure.
+    if (
+        drill_set.source_table_id is not None
+        and intrinsic_table is None
+        and source_join_path
+    ):
+        raise DrillSemanticError(
+            "DRILL_INTRINSIC_TABLE_UNRESOLVABLE",
+            "The measure's intrinsic source table could not be resolved from "
+            "the deployed snapshot. The drill-through source-table override "
+            "cannot be verified as non-multiplying. Redeploy the model to "
+            "refresh the snapshot, or remove the source-table override.",
+        )
+    if (
+        drill_set.source_table_id is not None
+        and intrinsic_table is not None
+        and drill_set.source_table_id != intrinsic_table.id
+        and source_join_path
+    ):
+        measure_value_table_id = _measure_value_table_id(measure, snap) if snap is not None \
+            else await _measure_value_table_id_live(db, measure)
+        # Defensive guard: when the measure's value column is confirmed to live
+        # on the override (leaf) table itself, each leaf row carries its own
+        # detail value and summing reconciles — skip the cardinality check.
+        # Today source_column_id-based measures always have their value column on
+        # the intrinsic table (so this is always True when the outer block fires),
+        # but the guard protects against future measure types whose value column
+        # could live on a different table than intrinsic_table.
+        if measure_value_table_id != drill_set.source_table_id:
+            path_joins = _resolve_path_joins(source_join_path, snap) if snap is not None \
+                else await _resolve_path_joins_live(db, measure.model_id, source_join_path)
+            # Opus-R1-F2: if the saved join path references stale/garbage IDs
+            # that don't resolve, path_joins is shorter than source_join_path.
+            # An unresolvable path has unknowable cardinality — fail toward
+            # rejection (wrong number is worse than a refused drill).
+            if len(path_joins) < len(source_join_path):
+                raise DrillSemanticError(
+                    "DRILL_JOIN_PATH_UNRESOLVABLE",
+                    "The saved source join path references join(s) that no longer "
+                    "exist in the deployed model. Redeploy the model or reconfigure "
+                    "the drill-through source join path.",
+                )
+            # Fable-R1-F1: the persisted source_join_path is ordered
+            # override→fact (model-service _enumerate_join_paths DFSes from the
+            # override to the fact). We need the cardinality FROM the fact
+            # (intrinsic) table TOWARD the override, so reverse the path.
+            cardinality = _path_cardinality_from(
+                intrinsic_table.id, list(reversed(path_joins)),
+            )
+            if cardinality in ("one-to-many", "mixed"):
+                raise DrillSemanticError(
+                    "DRILL_EXPANDING_OVERRIDE_MULTIPLIES_MEASURE",
+                    "This drill-through uses a finer-grained source table reached "
+                    "by a one-to-many join, so the clicked measure value would be "
+                    "repeated on every child row and its sum would not reconcile "
+                    "with the cell. Add a detail measure on the override table or "
+                    "choose a non-expanding source join path.",
+                )
+
     return DrillCuration(
         detail_dim_names=detail_dim_names,
         joined_dim_names=joined_dim_names,
         row_limit_override=drill_set.row_limit_override,
         fact_table=fact_table_name,
-        tiebreaker_dim_name=tiebreaker,
+        tiebreaker_dim_names=tiebreaker,
         source_join_path=source_join_path,
     )
 
@@ -595,35 +789,167 @@ async def _resolve_intrinsic_source_table(
     return None
 
 
-async def _resolve_pk_tiebreaker_dim(
-    db: AsyncSession, model_id: UUID, fact_table: ModelTable | None,
-) -> str | None:
-    """Resolve a unique tie-breaker dimension for the leaf ORDER BY (Bug-1108).
+# ---------------------------------------------------------------------------
+# F-019-01 — expanding-override multiplication guard helpers
+# ---------------------------------------------------------------------------
 
-    Returns the *name* of a model dimension that sits over a primary-key
-    column of the effective source table, so it is projectable through the
-    semantic binder (``FROM "slug"``) and guaranteed distinct per fact row.
-    Appending it to the leaf ORDER BY turns the sort into a TOTAL order, so
-    LIMIT/OFFSET pagination cannot skip or duplicate rows on any engine
+
+def _measure_value_table_id(measure: Any, snap: _SnapshotMeta) -> UUID | None:
+    """Table id of the measure's own value column, resolved from the snapshot."""
+    col_id = getattr(measure, "source_column_id", None)
+    if col_id is not None:
+        col = snap.columns_by_id.get(col_id)
+        if col is not None:
+            return getattr(col, "model_table_id", None)
+    return None
+
+
+async def _measure_value_table_id_live(db: AsyncSession, measure: Any) -> UUID | None:
+    """Table id of the measure's own value column, resolved from live tables."""
+    col_id = getattr(measure, "source_column_id", None)
+    if col_id is not None:
+        col = await db.get(ModelColumn, col_id)
+        if col is not None:
+            return getattr(col, "model_table_id", None)
+    return None
+
+
+def _resolve_path_joins(join_ids: list[str], snap: _SnapshotMeta) -> list[Any]:
+    """Resolve a saved source_join_path (join id strings) to snapshot joins."""
+    out: list[Any] = []
+    for jid in join_ids:
+        j = _coerce_uuid(jid)
+        if j is None:
+            continue
+        join = snap.joins_by_id.get(j)
+        if join is not None:
+            out.append(join)
+    return out
+
+
+async def _resolve_path_joins_live(
+    db: AsyncSession, model_id: UUID, join_ids: list[str],
+) -> list[Any]:
+    """Resolve a saved source_join_path (join id strings) to live Join rows,
+    preserving the saved path order."""
+    ids = [_coerce_uuid(j) for j in join_ids]
+    ids = [j for j in ids if j is not None]
+    if not ids:
+        return []
+    rows = await db.execute(
+        select(Join).where(Join.model_id == model_id, Join.id.in_(ids))
+    )
+    by_id = {j.id: j for j in rows.scalars().all()}
+    return [by_id[j] for j in ids if j in by_id]
+
+
+def _path_cardinality_from(start_table_id: UUID, path_joins: list[Any]) -> str:
+    """Summarise join-path cardinality traversed FROM ``start_table_id``.
+
+    Uses the same edge-inversion logic as model-service
+    ``_cardinality_hint_from_path``: walk the ordered join edges from
+    ``start_table_id``, inverting each edge's CARDINALITY when traversed
+    right-to-left, and classify the whole path.
+
+    The cardinality is read through
+    ``shared.semantic.join_keyword.edge_cardinality``, which reads
+    ``Join.cardinality`` and falls back to a legacy cardinality token still
+    parked in ``join_type``. Before the join-orientation contract split those
+    two fields this classified straight from ``join_type``, so any join
+    carrying a real orientation token (``inner``/``left``/``right``/``full``)
+    classified as "mixed" whatever the actual fan-out was.
+
+    IMPORTANT: the persisted ``source_join_path`` is ordered override→fact
+    (model-service's DFS walks from the override to the fact). The caller
+    must reverse the list before passing it here when ``start_table_id`` is
+    the fact/intrinsic table, so the walk traverses fact→override.
+
+    Returns ``"one-to-many"`` (the fact is the "one" side and each hop
+    expands), ``"many-to-one"`` (each hop collapses), ``"one-to-one"``,
+    ``"mixed"`` (inconsistent or disconnected), or ``"none"`` (empty path).
+    A one-to-many or mixed result means the parent fact measure value would
+    be repeated across child rows, so summing the projected measure would
+    multiply the clicked cell.
+    """
+    if not path_joins:
+        return "none"
+    types: set[str] = set()
+    cursor = start_table_id
+    for j in path_joins:
+        left = getattr(j, "left_table_id", None)
+        right = getattr(j, "right_table_id", None)
+        # UNDECLARED stays unknown, which classifies the path as "mixed".
+        # Not knowing whether a hop expands is not the same as knowing it does
+        # not, and an expanding hop repeats the parent measure across child
+        # rows — so the conservative reading is the correct one.
+        jt = edge_cardinality(j) or "unknown"
+        if cursor == left:
+            types.add(jt)
+            cursor = right
+        elif cursor == right:
+            inverted = {
+                "many_to_one": "one_to_many",
+                "one_to_many": "many_to_one",
+            }.get(jt, jt)
+            types.add(inverted)
+            cursor = left
+        else:
+            # The path does not connect at the current cursor (disjoint or
+            # out-of-order). Fail loud upstream by reporting an expanding shape
+            # so the guard rejects rather than silently reconciles.
+            return "mixed"
+    if types == {"many_to_one"}:
+        return "many-to-one"
+    if types == {"one_to_many"}:
+        return "one-to-many"
+    if types == {"one_to_one"}:
+        return "one-to-one"
+    return "mixed"
+
+
+async def _resolve_pk_tiebreaker_dims(
+    db: AsyncSession, model_id: UUID, fact_table: ModelTable | None,
+) -> tuple[str, ...]:
+    """Resolve every projectable primary-key component for leaf ordering.
+
+    Returns dimension names over every primary-key column of the effective
+    source table. Appending the complete tuple to the leaf ORDER BY turns the
+    sort into a TOTAL order, so keyset pagination cannot skip or duplicate rows
+    on any engine
     (PostgreSQL/BigQuery/Spark/Snowflake/Redshift) regardless of scan order.
 
-    Returns ``None`` when the source table is unknown or has no PK-backed
-    dimension; the caller then falls back to ordering by the full projection.
+    Returns an empty tuple when the source table is unknown, has no primary
+    key, or any component lacks a projectable dimension. A composite-key prefix
+    is never treated as unique.
     """
     if fact_table is None:
-        return None
+        return ()
     result = await db.execute(
-        select(Dimension.name)
-        .join(ModelColumn, Dimension.source_column_id == ModelColumn.id)
+        select(ModelColumn.id, ModelColumn.column_name, Dimension.name)
+        .outerjoin(
+            Dimension,
+            (Dimension.source_column_id == ModelColumn.id)
+            & (Dimension.model_id == model_id),
+        )
         .where(
-            Dimension.model_id == model_id,
             ModelColumn.model_table_id == fact_table.id,
             ModelColumn.is_primary_key.is_(True),
         )
-        .order_by(ModelColumn.column_name)
+        .order_by(ModelColumn.column_name, ModelColumn.id, Dimension.name)
     )
-    name = result.scalars().first()
-    return name or None
+    rows = result.all()
+    if not rows:
+        return ()
+    names: list[str] = []
+    seen_columns: set[UUID] = set()
+    for column_id, _column_name, dimension_name in rows:
+        if column_id in seen_columns:
+            continue
+        seen_columns.add(column_id)
+        if not dimension_name:
+            return ()
+        names.append(dimension_name)
+    return tuple(names)
 
 
 async def resolve_drill_options(
@@ -662,8 +988,13 @@ async def build_drill_sql(
     cursor: str | None = None,
     limit: int | None = None,
     db: AsyncSession,
+    allowed_hierarchy_ids: set[str] | None = None,
+    override_agg: str | None = None,
+    tenant_id: str = "",
+    security_context: dict[str, Any] | None = None,
+    request_context: dict[str, Any] | None = None,
 ) -> tuple[
-    str, str, int, int, DrillDimension | None, str,
+    str, str, DrillCursorSpec, int, DrillDimension | None, str,
     list[HierarchyPathEntry], list[DrillableHierarchy], str | None, list[str],
 ]:
     """Build semantic SQL for a drill-through.
@@ -695,7 +1026,7 @@ async def build_drill_sql(
     builder and the binder. When no deployed snapshot exists (undeployed
     model), falls back to the live tables.
 
-    Returns (sql, model_id_str, offset, effective_limit, drill_dimension,
+    Returns (sql, model_id_str, cursor_spec, effective_limit, drill_dimension,
              drill_mode, hierarchy_path, drillable_hierarchies, fact_table,
              source_join_path).
     """
@@ -725,18 +1056,37 @@ async def build_drill_sql(
         db, measure.model_id, dims_by_name, snap=snap,
     )
 
+    # Bug-6274 [SECURITY]: honour the persona hierarchy allow-list the same way
+    # ``/drill-options`` does. Filter the drillable set to the persona's
+    # ``included_hierarchy_ids`` BEFORE selection so neither an explicit
+    # ``hierarchy_id`` nor the single-hierarchy auto-select can step down a
+    # hierarchy the persona is not permitted to see. An empty/None allow-list
+    # imposes no restriction (mirrors the ``if hier_allow:`` gate in the route).
+    if allowed_hierarchy_ids:
+        drillable = [
+            h for h in drillable if str(h.hierarchy_id) in allowed_hierarchy_ids
+        ]
+
     drill_target: DrillableHierarchy | None = None
     if hierarchy_id is not None:
         # Pick the deepest level for this hierarchy — when grouping_levels
         # contain Year+Month from the same hierarchy, we need Month→Day,
         # not Year→Month.
         candidates = [h for h in drillable if h.hierarchy_id == hierarchy_id]
-        if candidates:
-            drill_target = max(candidates, key=lambda h: h.current_level_ordinal)
+        if not candidates:
+            # Bug-6277: an explicit hierarchy_id that is not drillable from the
+            # current cell (wrong hierarchy, already at leaf, or filtered out by
+            # the persona allow-list) must fail loudly rather than silently
+            # falling through to leaf detail mode — which returns a different
+            # product than the caller asked for.
+            raise DrillSemanticError(
+                "HIERARCHY_NOT_DRILLABLE",
+                f"Hierarchy {hierarchy_id} is not drillable from the current cell",
+            )
+        drill_target = max(candidates, key=lambda h: h.current_level_ordinal)
     elif len(drillable) == 1:
         drill_target = drillable[0]
 
-    offset = decode_cursor(cursor)
     # Row-limit precedence: explicit request limit > curated override >
     # global default. All clamped to the 10k ceiling.
     effective_limit = _clamp_limit(limit if limit is not None else curation.row_limit_override)
@@ -756,7 +1106,12 @@ async def build_drill_sql(
 
     if drill_target is not None:
         # Hierarchy step-down: aggregate the measure at the next level.
-        agg = (measure.default_agg or "SUM").upper()
+        # Bug-6273: honour a per-column aggregate override travelling with the
+        # drill (the pivot column may have been shown with a non-default
+        # aggregate). Validate against the supported set — the value is
+        # interpolated into the SQL, so an unvalidated token would be an
+        # injection surface — and fail loud (400) on anything else.
+        agg = _resolve_drill_agg(override_agg, measure.default_agg)
         measure_expr = (
             f"COUNT(DISTINCT {_quote(measure.name)})"
             if agg == "COUNT_DISTINCT"
@@ -765,7 +1120,7 @@ async def build_drill_sql(
         target_dim_name = drill_target.next_level_dimension_name
         select_cols = f"{_quote(target_dim_name)}, {measure_expr} AS {_quote(measure.name)}"
         group_by = _quote(target_dim_name)
-        order_cols = [target_dim_name]
+        order_terms = [CursorOrderTerm(target_dim_name)]
     else:
         # Leaf detail mode (F-019-02): project the contributing rows, NOT a
         # restated aggregate. Projection = curated detail dimensions (else the
@@ -788,7 +1143,7 @@ async def build_drill_sql(
         # Bug-1108 + 3546 — TOTAL-ORDER leaf ORDER BY. ``leaf_dims`` are the
         # cell's grouping coordinates, which are CONSTANT for a given cell
         # (e.g. account_type='WALLET'), so ordering by them alone sorts by a
-        # constant and LIMIT/OFFSET pages are only stable by accident of the
+        # constant and scan pages are only stable by accident of the
         # engine's scan order. To make the sort a total order we order by:
         #   1. the full projection (leaf detail dims + joined dims + the
         #      un-aggregated measure value) — every projected attribute breaks
@@ -799,33 +1154,95 @@ async def build_drill_sql(
         # Both are dialect-neutral (sqlglot quoting; downstream transpile).
         # 3546 RESIDUAL: when no PK-backed dimension exists, two fact rows
         # with identical values across the full projection share the same
-        # sort position and LIMIT/OFFSET may non-deterministically skip or
-        # duplicate them. Connector pseudo-columns (ctid, ROW_ID) are not
-        # projectable through the semantic binder. The modeller can close
-        # this gap by adding a PK dimension to the source table.
+        # sort position. No continuation cursor is minted in that case.
+        # Connector pseudo-columns (ctid, ROW_ID) are not projectable through
+        # the semantic binder. The modeller can enable continuation by adding
+        # a PK dimension to the source table.
         order_cols = list(cols)
-        tb = curation.tiebreaker_dim_name
-        if tb:
+        for tb in curation.tiebreaker_dim_names:
             if tb not in cols:
                 cols.append(tb)
             if tb not in order_cols:
                 order_cols.append(tb)
+        order_terms = [
+            CursorOrderTerm(c, descending=(c == measure.name))
+            for c in order_cols
+        ]
         select_cols = ", ".join(_quote(c) for c in cols)
         group_by = ""
 
-    # Predicate compilation via sqlglot (F-019-05): type-safe literals,
-    # escaped identifiers, supported operators. Cell coordinates default to
-    # equality; slicer ``filters`` carry their own operators.
+    cursor_scope = {
+        "tenant_id": tenant_id,
+        "project_id": (
+            str(model.project_id) if getattr(model, "project_id", None) else None
+        ),
+        "model_id": str(model.id),
+        "deployed_version_id": (
+            str(model.deployed_version_id) if model.deployed_version_id else None
+        ),
+        "deploy_epoch": int(getattr(model, "deploy_epoch", 0) or 0),
+        "data_epoch": int(getattr(model, "data_epoch", 0) or 0),
+        "measure_id": str(measure_id),
+        "hierarchy_id": str(hierarchy_id) if hierarchy_id else None,
+        "grouping_levels": list(grouping_levels),
+        "filters": list(filters or []),
+        "override_agg": override_agg,
+        "page_size": effective_limit,
+        "security": security_context or {},
+        "request": request_context or {},
+    }
+    # Hierarchy output is grouped by its only order key, so it is unique at
+    # that grain. Leaf output needs a projectable PK-backed tail; without one,
+    # returning a continuation token would make a stability promise the model
+    # cannot prove.
+    cursor_spec = DrillCursorSpec.build(
+        scope=cursor_scope,
+        order_terms=order_terms,
+        stable=(drill_mode == "hierarchy" or bool(curation.tiebreaker_dim_names)),
+    )
     try:
-        coord_where = compile_where(list(grouping_levels))
-        filter_where = compile_where(list(filters or []))
+        cursor_values = cursor_spec.decode(cursor)
+    except CursorValidationError as exc:
+        raise DrillSemanticError(exc.code, str(exc)) from exc
+
+    # Bug-7285: predicate compilation via sqlglot expression trees (F-019-05).
+    # Predicates are composed as sqlglot AST nodes (typed literals, escaped
+    # identifiers) and combined as a single expression tree before rendering.
+    # The WHERE clause is rendered once from the combined AST; the full SQL
+    # is still string-composed (SELECT/GROUP BY/ORDER BY/LIMIT are built
+    # separately). Values are escaped typed sqlglot literals, not driver
+    # bound parameters — the downstream parse->bind->rewrite pipeline
+    # transpiles the canonical postgres SQL to the target dialect via
+    # sqlglot, and the source executor handles driver-level execution.
+    try:
+        coord_expr = compile_where_expression(list(grouping_levels))
+        filter_expr = compile_where_expression(list(filters or []))
     except DrillPredicateError as exc:
         raise DrillSemanticError(exc.error_code, str(exc)) from exc
 
-    where_clauses = [w for w in (coord_where, filter_where) if w]
-    where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    # Combine coordinate and filter predicates with AND.
+    where_expr: exp.Expression | None = None
+    if coord_expr is not None and filter_expr is not None:
+        where_expr = exp.And(this=coord_expr, expression=filter_expr)
+    elif coord_expr is not None:
+        where_expr = coord_expr
+    elif filter_expr is not None:
+        where_expr = filter_expr
+
+    if cursor_values is not None:
+        continuation_expr = _keyset_continuation_expression(
+            cursor_spec, cursor_values
+        )
+        where_expr = (
+            exp.And(this=where_expr, expression=continuation_expr)
+            if where_expr is not None
+            else continuation_expr
+        )
+
+    # Build WHERE, GROUP BY, ORDER BY SQL fragments from the AST.
+    where_sql = f" WHERE {where_expr.sql(dialect='postgres')}" if where_expr else ""
     group_sql = f" GROUP BY {group_by}" if group_by else ""
-    # Deterministic ORDER BY (F-019-04): without it, LIMIT/OFFSET pagination
+    # Deterministic ORDER BY (F-019-04): without it, continuation pagination
     # can repeat or skip rows between pages on PostgreSQL / BigQuery / Spark.
     # Bug-5344: in LEAF-detail mode the un-aggregated measure VALUE is sorted
     # DESCENDING so the first page surfaces the biggest contributing rows
@@ -838,27 +1255,27 @@ async def build_drill_sql(
     # measure value is valid SQL; the antipattern is a measure in GROUP BY,
     # which this builder never emits — GROUP BY is the next-level dimension in
     # hierarchy mode and absent in leaf mode.)
-    def _order_term(col: str) -> str:
-        if drill_mode == "leaf" and col == measure.name:
-            return f"{_quote(col)} DESC"
-        return _quote(col)
-
     order_sql = (
-        f" ORDER BY {', '.join(_order_term(c) for c in order_cols)}"
-        if order_cols
+        " ORDER BY "
+        + ", ".join(
+            f"{_quote(term.name)} "
+            f"{'DESC' if term.descending else 'ASC'} NULLS LAST"
+            for term in order_terms
+        )
+        if order_terms
         else ""
     )
     fetch_limit = effective_limit + 1
     sql = (
         f"SELECT {select_cols} FROM {_quote(model.slug)}"
         f"{where_sql}{group_sql}{order_sql}"
-        f" LIMIT {fetch_limit} OFFSET {offset}"
+        f" LIMIT {fetch_limit}"
     )
 
     return (
         sql,
         str(measure.model_id),
-        offset,
+        cursor_spec,
         effective_limit,
         drill_dim,
         drill_mode,

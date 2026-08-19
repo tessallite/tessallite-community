@@ -43,6 +43,27 @@ import type {
   PersonaUpdate,
 } from "../../api/types";
 import { useConfirm } from "../Confirm";
+import { useCanAuthorModel } from "../../auth/useCanAuthorModel";
+import { recordCreate, recordUpdate, recordDelete } from "../Builder/emitDrawerHistory";
+
+/** Map a persisted persona to a create-shaped body for undo/redo restore
+ *  (Bug-8227). `priorRestrictedTagIds` is the restriction set loaded when the
+ *  editor opened (the Persona list object does not carry it). */
+function personaToBody(p: Persona, priorRestrictedTagIds: string[]): PersonaCreate {
+  return {
+    slug: p.slug,
+    name: p.name,
+    description: p.description ?? null,
+    included_measure_ids: p.included_measure_ids,
+    included_dimension_ids: p.included_dimension_ids,
+    included_hierarchy_ids: p.included_hierarchy_ids,
+    audience_roles: p.audience_roles,
+    default_filters: p.default_filters,
+    bypass_row_security: p.bypass_row_security,
+    includes_hidden_columns: p.includes_hidden_columns,
+    restricted_tag_ids: priorRestrictedTagIds,
+  };
+}
 
 interface EditorState {
   open: boolean;
@@ -59,9 +80,81 @@ interface EditorState {
   bypassRowSecurityInitial: boolean;
   includesHiddenColumns: boolean;
   restrictedTagIds: string[];
+  // Bug-8227: the restriction set loaded when the editor opened, so an undo of
+  // a persona update restores the prior restrictions faithfully.
+  restrictedTagIdsInitial: string[];
   // F-008-07: when loading the persona's current restrictions fails we
   // must not silently overwrite them with an empty set on save.
   restrictionsLoaded: boolean;
+}
+
+const FILTER_OPERATORS = [
+  "eq", "neq", "gt", "gte", "lt", "lte",
+  "in", "not_in", "between", "like", "not_like",
+  "is_null", "is_not_null",
+] as const;
+
+export type FilterRow = { dim: string; op: string; value: string };
+
+function coerceFilterValue(raw: string): string | number | boolean {
+  const trimmed = raw.trim();
+  if (trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  if (trimmed !== "" && !Number.isNaN(Number(trimmed))) return Number(trimmed);
+  return raw;
+}
+
+export function parseFilterRows(json: string): FilterRow[] {
+  if (!json.trim()) return [];
+  try {
+    const obj = JSON.parse(json) as Record<string, unknown>;
+    if (!obj || Array.isArray(obj) || typeof obj !== "object") return [];
+    return Object.entries(obj).map(([dim, raw]) => {
+      if (Array.isArray(raw)) {
+        return { dim, op: "in", value: raw.map(String).join(", ") };
+      }
+      if (raw != null && typeof raw === "object") {
+        const [op, val] = Object.entries(raw as Record<string, unknown>)[0] ?? ["eq", ""];
+        // in/not_in carry a list payload — the typed object form
+        // ``{ not_in: [...] }`` is how not_in round-trips (a bare array reads
+        // back as ``in`` above, which silently loses the not_in operator).
+        if (Array.isArray(val)) {
+          return { dim, op, value: val.map(String).join(", ") };
+        }
+        return {
+          dim,
+          op,
+          value: val == null || val === true ? "" : String(val),
+        };
+      }
+      return { dim, op: "eq", value: String(raw) };
+    });
+  } catch {
+    return [];
+  }
+}
+
+export function serializeFilterRows(rows: FilterRow[]): string {
+  const obj: Record<string, unknown> = {};
+  for (const r of rows) {
+    const dim = r.dim.trim();
+    if (!dim) continue;
+    if (r.op === "eq") {
+      obj[dim] = coerceFilterValue(r.value);
+    } else if (r.op === "in") {
+      // ``in`` serialises as a bare array (its canonical default_filters form).
+      obj[dim] = r.value.split(",").map((s) => coerceFilterValue(s.trim()));
+    } else if (r.op === "not_in") {
+      // ``not_in`` MUST use the typed object form so it survives a reload — a
+      // bare array is indistinguishable from ``in`` on the way back in.
+      obj[dim] = { not_in: r.value.split(",").map((s) => coerceFilterValue(s.trim())) };
+    } else if (r.op === "is_null" || r.op === "is_not_null") {
+      obj[dim] = { [r.op]: true };
+    } else {
+      obj[dim] = { [r.op]: coerceFilterValue(r.value) };
+    }
+  }
+  return Object.keys(obj).length ? JSON.stringify(obj, null, 2) : "";
 }
 
 const EMPTY_EDITOR: EditorState = {
@@ -79,6 +172,7 @@ const EMPTY_EDITOR: EditorState = {
   bypassRowSecurityInitial: false,
   includesHiddenColumns: false,
   restrictedTagIds: [],
+  restrictedTagIdsInitial: [],
   restrictionsLoaded: true,
 };
 
@@ -90,6 +184,8 @@ export default function PersonasPanel() {
   const qc = useQueryClient();
   const confirm = useConfirm();
   const t = useT();
+  // F-026-04: gate every mutation entry point on the shared author capability.
+  const canEdit = useCanAuthorModel();
 
   const personas = usePersonas(projectId!, modelId!);
   const measures = useMeasures(projectId!, modelId!);
@@ -103,48 +199,40 @@ export default function PersonasPanel() {
   const refresh = () =>
     qc.invalidateQueries({ queryKey: ["personas", projectId, modelId] });
 
-  // F-008-07: persona save and restriction save are one logical operation.
-  // The mutation chains both calls so a restriction failure is surfaced in
-  // the editor instead of dying in the developer console, and the create
-  // path persists the ticked restrictions against the new persona id.
+  // Bug-7051: persona + restrictions are now a single atomic request.
+  // The backend accepts restricted_tag_ids in the create/update payload,
+  // so we no longer need the separate dataTagsApi.setPersonaRestrictions
+  // two-step call that could leave a persona without its intended
+  // restrictions on partial failure.
   const saveMutation = useMutation({
     mutationFn: async ({
       personaId,
       body,
-      restrictedTagIds,
-      saveRestrictions,
+      priorBody,
     }: {
       personaId: string | null;
       body: PersonaCreate;
-      restrictedTagIds: string[];
-      saveRestrictions: boolean;
+      priorBody: PersonaCreate | null;
     }) => {
-      let targetId = personaId;
-      if (targetId) {
-        await personasApi.update(projectId!, modelId!, targetId, body as PersonaUpdate);
-      } else {
-        const created = await personasApi.create(projectId!, modelId!, body);
-        targetId = created.id;
+      if (personaId) {
+        await personasApi.update(projectId!, modelId!, personaId, body as PersonaUpdate);
+        return { kind: "update" as const, id: personaId, body, priorBody };
       }
-      if (saveRestrictions) {
-        try {
-          await dataTagsApi.setPersonaRestrictions(
-            projectId!, modelId!, targetId,
-            { tag_ids: restrictedTagIds },
-          );
-        } catch (e: any) {
-          // The persona itself saved — report the restriction failure
-          // explicitly so the modeler knows the security control did
-          // not persist.
-          throw new Error(
-            t("personas.restrictionsSaveFailed", {
-              error: extractError(e) || t("errors.requestFailed"),
-            }),
-          );
-        }
-      }
+      const created = await personasApi.create(projectId!, modelId!, body);
+      return { kind: "create" as const, id: created.id, body, priorBody };
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
+      // Bug-8227: record the create/update so it can be undone/redone.
+      if (result.kind === "create") {
+        recordCreate("persona", result.id, result.body as unknown as Record<string, unknown>);
+      } else if (result.priorBody) {
+        recordUpdate(
+          "persona",
+          result.id,
+          result.priorBody as unknown as Record<string, unknown>,
+          result.body as unknown as Record<string, unknown>,
+        );
+      }
       refresh();
       setEditor(EMPTY_EDITOR);
       setError(null);
@@ -153,9 +241,29 @@ export default function PersonasPanel() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (id: string) =>
-      personasApi.delete(projectId!, modelId!, id),
-    onSuccess: () => refresh(),
+    mutationFn: async (persona: Persona) => {
+      // Load the persona's restrictions before deleting so undo can re-create
+      // it with them (the list object does not carry restricted_tag_ids).
+      let priorTagIds: string[] = [];
+      try {
+        const restrictions = await dataTagsApi.getPersonaRestrictions(
+          projectId!, modelId!, persona.id,
+        );
+        priorTagIds = restrictions.map((r) => r.tag_id);
+      } catch {
+        priorTagIds = [];
+      }
+      await personasApi.delete(projectId!, modelId!, persona.id);
+      return { persona, priorTagIds };
+    },
+    onSuccess: ({ persona, priorTagIds }) => {
+      recordDelete(
+        "persona",
+        persona.id,
+        personaToBody(persona, priorTagIds) as unknown as Record<string, unknown>,
+      );
+      refresh();
+    },
     onError: (e: any) => setError(extractError(e) || t("errors.requestFailed")),
   });
 
@@ -198,6 +306,7 @@ export default function PersonasPanel() {
       bypassRowSecurityInitial: Boolean(p.bypass_row_security),
       includesHiddenColumns: Boolean(p.includes_hidden_columns),
       restrictedTagIds: tagIds,
+      restrictedTagIdsInitial: tagIds,
       restrictionsLoaded,
     });
   }
@@ -212,7 +321,7 @@ export default function PersonasPanel() {
         throw new Error(t("personas.errorJsonInvalid"));
       }
     }
-    return {
+    const body: PersonaCreate = {
       slug: editor.slug.trim(),
       name: editor.name.trim(),
       description: editor.description.trim() || null,
@@ -224,6 +333,17 @@ export default function PersonasPanel() {
       bypass_row_security: editor.bypassRowSecurity,
       includes_hidden_columns: editor.includesHiddenColumns,
     };
+    // Bug-7051: include restricted_tag_ids in the payload for atomic
+    // persistence. Only include when restrictions were successfully loaded
+    // (or on create) so we never silently wipe restrictions we could not
+    // read. On create with no tags ticked, omit the field entirely so the
+    // backend does not wastefully persist an empty set.
+    if (editor.restrictionsLoaded) {
+      if (editor.personaId !== null || editor.restrictedTagIds.length > 0) {
+        body.restricted_tag_ids = editor.restrictedTagIds;
+      }
+    }
+    return body;
   }
 
   async function handleSave() {
@@ -261,16 +381,26 @@ export default function PersonasPanel() {
       });
       if (!ok) return;
     }
+    // Bug-8227: capture the prior persona definition for an update so undo can
+    // restore it (core fields from the list object + the restriction set loaded
+    // when the editor opened).
+    const priorPersona = editor.personaId
+      ? (personas.data ?? []).find((x) => x.id === editor.personaId)
+      : undefined;
+    // When restrictions failed to load, the forward body omits
+    // restricted_tag_ids (F-008-07 safety). The prior body must mirror that
+    // so an undo PATCH does not silently wipe restrictions to [] (review
+    // finding 8 — security-relevant silent wipe in a degraded flow).
+    const priorBody = priorPersona
+      ? personaToBody(priorPersona, editor.restrictedTagIdsInitial)
+      : null;
+    if (priorBody && !editor.restrictionsLoaded) {
+      delete priorBody.restricted_tag_ids;
+    }
     saveMutation.mutate({
       personaId: editor.personaId,
       body,
-      restrictedTagIds: editor.restrictedTagIds,
-      // Skip the restriction write when the current restrictions could
-      // not be loaded (would wipe them) — and on create, skip the extra
-      // call when nothing was ticked.
-      saveRestrictions:
-        editor.restrictionsLoaded
-        && (editor.personaId !== null || editor.restrictedTagIds.length > 0),
+      priorBody: priorBody as PersonaCreate | null,
     });
   }
 
@@ -281,7 +411,7 @@ export default function PersonasPanel() {
       confirmLabel: t("personas.deleteConfirmButton"),
       destructive: true,
     });
-    if (ok) deleteMutation.mutate(p.id);
+    if (ok) deleteMutation.mutate(p);
   }
 
   const measureOptions = measures.data ?? [];
@@ -310,6 +440,7 @@ export default function PersonasPanel() {
         <Typography variant="h6" sx={{ flexGrow: 1 }}>
           {t("personas.title")}
         </Typography>
+        {canEdit && (
         <Button
           variant="contained"
           size="small"
@@ -318,6 +449,7 @@ export default function PersonasPanel() {
         >
           {t("personas.newPersona")}
         </Button>
+        )}
       </Box>
 
       {error && (
@@ -387,6 +519,8 @@ export default function PersonasPanel() {
                     )}
                   </TableCell>
                   <TableCell align="right">
+                    {canEdit && (
+                    <>
                     <Tooltip title={t("personas.editTooltip")}>
                       <IconButton size="small" onClick={() => openEdit(p)}>
                         <EditIcon fontSize="small" />
@@ -400,6 +534,8 @@ export default function PersonasPanel() {
                         <DeleteIcon fontSize="small" />
                       </IconButton>
                     </Tooltip>
+                    </>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}
@@ -514,8 +650,103 @@ export default function PersonasPanel() {
             )}
           />
 
+          {(editor.measureIds.length > 0
+            || editor.dimensionIds.length > 0
+            || editor.hierarchyIds.length > 0
+            || editor.defaultFiltersJson.trim().length > 0
+            || editor.restrictedTagIds.length > 0)
+            && editor.audienceRoles.length === 0 && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              {t("personas.emptyAudienceNarrowingWarning")}
+            </Alert>
+          )}
+
+          <Typography variant="caption" sx={{ display: "block", mb: 0.5, fontWeight: 600 }}>
+            {t("personas.fieldDefaultFilters")}
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
+            {t("personas.fieldDefaultFiltersHelp")}
+          </Typography>
+          {parseFilterRows(editor.defaultFiltersJson).map((row, idx) => (
+            <Stack direction="row" spacing={1} key={`${row.dim}-${idx}`} sx={{ mb: 1 }} alignItems="center">
+              <TextField
+                select
+                label={t("personas.fieldDefaultFiltersDimension")}
+                size="small"
+                value={row.dim}
+                onChange={(e) => {
+                  const rows = parseFilterRows(editor.defaultFiltersJson);
+                  rows[idx] = { ...rows[idx], dim: e.target.value };
+                  setEditor({ ...editor, defaultFiltersJson: serializeFilterRows(rows) });
+                }}
+                sx={{ minWidth: 160 }}
+              >
+                {dimensionOptions.map((d) => (
+                  <MenuItem key={d.id} value={d.name}>
+                    {d.display_name || d.name}
+                  </MenuItem>
+                ))}
+                {row.dim && !dimensionOptions.some((d) => d.name === row.dim) && (
+                  <MenuItem value={row.dim}>{row.dim}</MenuItem>
+                )}
+              </TextField>
+              <TextField
+                select
+                label={t("personas.fieldDefaultFiltersOperator")}
+                size="small"
+                value={row.op}
+                onChange={(e) => {
+                  const rows = parseFilterRows(editor.defaultFiltersJson);
+                  rows[idx] = { ...rows[idx], op: e.target.value };
+                  setEditor({ ...editor, defaultFiltersJson: serializeFilterRows(rows) });
+                }}
+                sx={{ minWidth: 120 }}
+              >
+                {FILTER_OPERATORS.map((op) => (
+                  <MenuItem key={op} value={op}>{op}</MenuItem>
+                ))}
+              </TextField>
+              {row.op !== "is_null" && row.op !== "is_not_null" && (
+                <TextField
+                  label={t("personas.fieldDefaultFiltersValue")}
+                  size="small"
+                  value={row.value}
+                  onChange={(e) => {
+                    const rows = parseFilterRows(editor.defaultFiltersJson);
+                    rows[idx] = { ...rows[idx], value: e.target.value };
+                    setEditor({ ...editor, defaultFiltersJson: serializeFilterRows(rows) });
+                  }}
+                />
+              )}
+              <IconButton
+                size="small"
+                aria-label={t("personas.fieldDefaultFiltersRemove")}
+                onClick={() => {
+                  const rows = parseFilterRows(editor.defaultFiltersJson).filter((_, i) => i !== idx);
+                  setEditor({ ...editor, defaultFiltersJson: serializeFilterRows(rows) });
+                }}
+              >
+                <DeleteIcon fontSize="small" />
+              </IconButton>
+            </Stack>
+          ))}
+          <Button
+            size="small"
+            sx={{ mb: 1 }}
+            onClick={() => {
+              const rows = parseFilterRows(editor.defaultFiltersJson);
+              rows.push({
+                dim: dimensionOptions[0]?.name ?? "",
+                op: "eq",
+                value: "",
+              });
+              setEditor({ ...editor, defaultFiltersJson: serializeFilterRows(rows) });
+            }}
+          >
+            {t("personas.fieldDefaultFiltersAdd")}
+          </Button>
           <TextField
-            label={t("personas.fieldDefaultFilters")}
+            label={t("personas.fieldDefaultFiltersAdvanced")}
             value={editor.defaultFiltersJson}
             onChange={(e) =>
               setEditor({ ...editor, defaultFiltersJson: e.target.value })
@@ -523,7 +754,7 @@ export default function PersonasPanel() {
             size="small"
             fullWidth
             multiline
-            minRows={3}
+            minRows={2}
             maxRows={8}
             placeholder={t("personas.fieldDefaultFiltersPlaceholder")}
             sx={{ mb: 2, fontFamily: "monospace" }}

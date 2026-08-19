@@ -26,6 +26,9 @@ type Props = {
   personaId?: string | null;
   // F-019-03: active-slicer predicates forwarded to each mini panel.
   filters?: DrillThroughFilter[];
+  // Bug-6278: Force Live forwarded so decomposition mini-drills also pin to
+  // source data instead of being silently served from an aggregate/pocket.
+  forceLive?: boolean;
   onClose: () => void;
 };
 
@@ -37,6 +40,7 @@ export default function CalcDrillThroughDrawer({
   allMeasures,
   personaId,
   filters,
+  forceLive,
   onClose,
 }: Props) {
   const t = useT();
@@ -78,13 +82,13 @@ export default function CalcDrillThroughDrawer({
           </IconButton>
         </Stack>
 
-        {context && calcMeasure && (
+        {context && calcMeasure && (context.coord.rowKey.length > 0 || context.coord.colKey.length > 0) && (
           <Stack direction="row" spacing={0.5} sx={{ flexWrap: "wrap" }}>
-            {rowDims.map((d, i) => (
-              <Chip key={`r-${d.id}`} size="small" label={`${d.name} = ${context.coord.rowKey[i] ?? ""}`} />
+            {rowDims.slice(0, context.coord.rowKey.length).map((d, i) => (
+              <Chip key={`r-${d.id}`} size="small" label={`${d.name} = ${context.coord.rowKey[i]}`} />
             ))}
-            {colDims.map((d, i) => (
-              <Chip key={`c-${d.id}`} size="small" label={`${d.name} = ${context.coord.colKey[i] ?? ""}`} />
+            {colDims.slice(0, context.coord.colKey.length).map((d, i) => (
+              <Chip key={`c-${d.id}`} size="small" label={`${d.name} = ${context.coord.colKey[i]}`} />
             ))}
           </Stack>
         )}
@@ -136,6 +140,7 @@ export default function CalcDrillThroughDrawer({
                 colDims={colDims}
                 personaId={personaId}
                 filters={filters}
+                forceLive={forceLive}
               />
             ))}
         </Box>

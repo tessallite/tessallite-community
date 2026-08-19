@@ -10,9 +10,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, UploadFi
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select, delete
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.auth.middleware import CurrentUser, get_current_user
 from src.auth.rbac import require_role
+from src.api._model_lock import acquire_model_definition_lock
 from shared.db.models import (
     Dimension,
     EntityTranslation,
@@ -60,6 +62,12 @@ def resolve_locale(
             return tag
     return "en"
 SUPPORTED_ENTITY_TYPES = {"glossary_entry", "measure", "dimension", "model"}
+SUPPORTED_FIELD_NAMES = {
+    "dimension": {"display_name", "description"},
+    "measure": {"display_name", "description"},
+    "glossary_entry": {"term", "definition"},
+    "model": {"display_name", "description"},
+}
 
 
 class TranslationCreate(BaseModel):
@@ -99,6 +107,72 @@ async def _verify_model_in_project(db, model_id: UUID, project_id: UUID) -> None
     model = await db.get(Model, model_id)
     if not model or model.project_id != project_id:
         raise HTTPException(status_code=404, detail="Model not found in project")
+
+
+_ENTITY_TYPE_MODEL_CLASS = {
+    "dimension": Dimension,
+    "measure": Measure,
+    # "glossary_entry" is NOT here — it needs an extra superseded_by check
+    # (see _validate_translation_target's dedicated branch below).
+}
+
+
+async def _validate_translation_target(
+    db, model_id: UUID, entity_type: str, entity_id: UUID,
+) -> bool:
+    """True when *entity_id* refers to a live entity of *entity_type*
+    scoped to *model_id*, i.e. a valid target for ``EntityTranslation``.
+
+    Bug-5981 (F-029-02): ``EntityTranslation.entity_id`` is a polymorphic
+    soft reference with no database foreign key — create/bulk/import
+    previously validated only the ``entity_type``/``locale`` enum strings,
+    never that ``entity_id`` actually resolves. An orphan translation
+    (typo'd id, id from a different model, id of a since-deleted entity)
+    silently inflates translation coverage while never rendering anywhere
+    (``useModelTranslations.ts`` matches by exact entity id). Call this
+    from every write path before persisting a translation row.
+    """
+    if entity_type == "model":
+        # A model translates its own display_name/description; the
+        # convention is entity_id == the model itself.
+        return entity_id == model_id
+    if entity_type == "glossary_entry":
+        # Bug-5981 review round 1 (M3): translation_coverage's numerator
+        # and denominator both exclude superseded glossary entries
+        # (superseded_by IS NOT NULL) — a superseded entry is being
+        # actively replaced and its own text is no longer live. Accepting
+        # a translation for one here would create exactly the write/read
+        # asymmetry this bug is about: accepted at write time, never
+        # counted or rendered.
+        row = await db.get(GlossaryEntry, entity_id)
+        return (
+            row is not None
+            and row.model_id == model_id
+            and row.superseded_by is None
+        )
+    model_class = _ENTITY_TYPE_MODEL_CLASS.get(entity_type)
+    if model_class is None:
+        return False
+    row = await db.get(model_class, entity_id)
+    return row is not None and row.model_id == model_id
+
+
+def _validate_translation_field(entity_type: str, field_name: str) -> bool:
+    return field_name in SUPPORTED_FIELD_NAMES.get(entity_type, set())
+
+
+def _coverage_live_entity_filter(dim_ids, meas_ids, glossary_ids):
+    """Rows that count in the translation coverage numerator.
+
+    Bug-6418: model-level translations are valid write targets, but the coverage
+    denominator is dimension/measure/glossary fields only. Excluding model rows
+    here keeps numerator and denominator aligned.
+    """
+    return (
+        ((EntityTranslation.entity_type == "dimension") & EntityTranslation.entity_id.in_(dim_ids))
+        | ((EntityTranslation.entity_type == "measure") & EntityTranslation.entity_id.in_(meas_ids))
+        | ((EntityTranslation.entity_type == "glossary_entry") & EntityTranslation.entity_id.in_(glossary_ids))
+    )
 
 
 @router.get(
@@ -157,9 +231,27 @@ async def create_translation(
         raise HTTPException(status_code=400, detail=f"Unsupported locale: {body.locale}")
     if body.entity_type not in SUPPORTED_ENTITY_TYPES:
         raise HTTPException(status_code=400, detail=f"Unsupported entity type: {body.entity_type}")
+    if not _validate_translation_field(body.entity_type, body.field_name):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported field for {body.entity_type}: {body.field_name}",
+        )
 
     async for db in get_tenant_db(current_user.tenant_id):
         await _verify_model_in_project(db, model_id, project_id)
+        # Bug-7982 finding 7 then 3: auth before lock; EntityTranslation is
+        # snapshot-owned (truncate-reinserted on revert).
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
+        # Bug-5981: reject an orphan entity_id before it can ever be
+        # persisted — see _validate_translation_target for why.
+        if not await _validate_translation_target(db, model_id, body.entity_type, body.entity_id):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No {body.entity_type} with id {body.entity_id} exists "
+                    "on this model; cannot create a translation for it."
+                ),
+            )
         existing = await db.execute(
             select(EntityTranslation).where(
                 EntityTranslation.model_id == model_id,
@@ -226,6 +318,7 @@ async def bulk_upsert_translations(
     results: list[TranslationResponse] = []
     async for db in get_tenant_db(current_user.tenant_id):
         await _verify_model_in_project(db, model_id, project_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
 
         skipped: list[str] = []
         upserted_rows: list[EntityTranslation] = []
@@ -236,6 +329,16 @@ async def bulk_upsert_translations(
                 continue
             if item.entity_type not in SUPPORTED_ENTITY_TYPES:
                 skipped.append(f"[{idx}] unsupported entity type: {item.entity_type}")
+                continue
+            if not _validate_translation_field(item.entity_type, item.field_name):
+                skipped.append(f"[{idx}] unsupported field for {item.entity_type}: {item.field_name}")
+                continue
+            # Bug-5981: same orphan-reference guard as create_translation.
+            if not await _validate_translation_target(db, model_id, item.entity_type, item.entity_id):
+                skipped.append(
+                    f"[{idx}] no {item.entity_type} with id {item.entity_id} "
+                    "exists on this model"
+                )
                 continue
 
             existing = await db.execute(
@@ -301,6 +404,7 @@ async def delete_translation(
 ) -> None:
     async for db in get_tenant_db(current_user.tenant_id):
         await _verify_model_in_project(db, model_id, project_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         result = await db.execute(
             delete(EntityTranslation).where(
                 EntityTranslation.id == translation_id,
@@ -405,6 +509,7 @@ async def import_translations(
     """Import translations from a CSV or JSON file."""
     async for db in get_tenant_db(current_user.tenant_id):
         await _verify_model_in_project(db, model_id, project_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
 
         raw = await file.read()
         text = raw.decode("utf-8-sig")
@@ -416,9 +521,29 @@ async def import_translations(
             import json as _json
 
             try:
-                items = _json.loads(text)
+                parsed = _json.loads(text)
             except _json.JSONDecodeError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+            # Bug-7664: validate the parsed JSON is a list of dicts with the
+            # required keys. Before this fix, a top-level object (e.g.
+            # ``{"translations": [...]}``), a non-dict item, or a missing key
+            # raised an unhandled 500 (AttributeError/KeyError) instead of
+            # using the endpoint's own ``errors`` report.
+            if not isinstance(parsed, list):
+                raise HTTPException(
+                    status_code=400,
+                    detail="JSON must be a top-level array of translation objects",
+                )
+            _json_required = {"entity_type", "entity_id", "field_name", "locale", "translated_text"}
+            for idx, entry in enumerate(parsed):
+                if not isinstance(entry, dict):
+                    errors.append(f"[{idx}] item is not an object")
+                    continue
+                missing = _json_required - entry.keys()
+                if missing:
+                    errors.append(f"[{idx}] missing keys: {sorted(missing)}")
+                    continue
+                items.append(entry)
         else:
             reader = csv.DictReader(io.StringIO(text))
             for idx, row in enumerate(reader):
@@ -441,10 +566,21 @@ async def import_translations(
                 errors.append(f"[{idx}] unsupported entity type: {etype}")
                 skipped += 1
                 continue
+            if not _validate_translation_field(etype, item["field_name"]):
+                errors.append(f"[{idx}] unsupported field for {etype}: {item['field_name']}")
+                skipped += 1
+                continue
             try:
                 eid = UUID(item["entity_id"])
             except (ValueError, KeyError):
                 errors.append(f"[{idx}] invalid entity_id")
+                skipped += 1
+                continue
+            # Bug-5981: same orphan-reference guard as create_translation —
+            # a file can claim any UUID shape; validate it resolves to a
+            # live entity on this model before importing it as "successful".
+            if not await _validate_translation_target(db, model_id, etype, eid):
+                errors.append(f"[{idx}] no {etype} with id {eid} exists on this model")
                 skipped += 1
                 continue
 
@@ -510,32 +646,35 @@ async def translation_coverage(
     async for db in get_tenant_db(current_user.tenant_id):
         await _verify_model_in_project(db, model_id, project_id)
 
-        dim_count = (
+        dim_ids = (
+            await db.execute(select(Dimension.id).where(Dimension.model_id == model_id))
+        ).scalars().all()
+        meas_ids = (
+            await db.execute(select(Measure.id).where(Measure.model_id == model_id))
+        ).scalars().all()
+        glossary_ids = (
             await db.execute(
-                select(func.count()).select_from(Dimension).where(Dimension.model_id == model_id)
-            )
-        ).scalar() or 0
-        meas_count = (
-            await db.execute(
-                select(func.count()).select_from(Measure).where(Measure.model_id == model_id)
-            )
-        ).scalar() or 0
-        glossary_count = (
-            await db.execute(
-                select(func.count())
-                .select_from(GlossaryEntry)
-                .where(
+                select(GlossaryEntry.id).where(
                     GlossaryEntry.model_id == model_id,
                     GlossaryEntry.superseded_by.is_(None),
                 )
             )
-        ).scalar() or 0
+        ).scalars().all()
 
-        total_translatable = (dim_count + meas_count + glossary_count) * 2
+        total_translatable = (len(dim_ids) + len(meas_ids) + len(glossary_ids)) * 2
 
+        # Bug-5981: count only translations that resolve to a live entity —
+        # an orphan row (deleted entity, cross-model id, typo'd import id)
+        # must not inflate the "translated" numerator. Write paths now
+        # reject orphans at creation time (_validate_translation_target),
+        # but this defends against any that predate the fix or slip
+        # through a path this pass didn't cover.
         locale_stats = await db.execute(
             select(EntityTranslation.locale, func.count())
-            .where(EntityTranslation.model_id == model_id)
+            .where(
+                EntityTranslation.model_id == model_id,
+                _coverage_live_entity_filter(dim_ids, meas_ids, glossary_ids),
+            )
             .group_by(EntityTranslation.locale)
         )
         locales = []
@@ -699,22 +838,35 @@ async def bootstrap_translations(
             logger.error("Bootstrap translations LLM call failed: %s", exc, exc_info=True)
             errors.append(f"LLM call failed: {exc}")
 
+        # Bug-7982 finding 3 + finding (d) lesson: EntityTranslation is
+        # snapshot-owned, so the WRITE must serialise with deploy/revert — but the
+        # lock is acquired HERE, after the (slow, up-to-600s) LLM call above, not
+        # at the top of the handler, so it is never held across the external call
+        # (the calendar-DDL-under-lock mistake). Auth (_verify_model_in_project)
+        # already ran before this point.
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         proposed = 0
         for idx, item in enumerate(items):
             text = translations.get(idx)
             if not text:
                 continue
-            db.add(
-                EntityTranslation(
-                    model_id=model_id,
-                    entity_type=item["entity_type"],
-                    entity_id=UUID(item["entity_id"]),
-                    field_name=item["field_name"],
-                    locale=body.target_locale,
-                    translated_text=text,
-                    source="llm",
-                )
+            eid = UUID(item["entity_id"])
+            # Bug-5838: use INSERT ... ON CONFLICT DO UPDATE so concurrent
+            # or retried bootstrap calls upsert atomically instead of racing
+            # through a SELECT-then-INSERT window.
+            stmt = pg_insert(EntityTranslation).values(
+                model_id=model_id,
+                entity_type=item["entity_type"],
+                entity_id=eid,
+                field_name=item["field_name"],
+                locale=body.target_locale,
+                translated_text=text,
+                source="llm",
+            ).on_conflict_do_update(
+                constraint="uq_entity_translation",
+                set_={"translated_text": text, "source": "llm"},
             )
+            await db.execute(stmt)
             proposed += 1
 
         await db.commit()

@@ -58,7 +58,7 @@
 </tbody>
 </table>
 
-<blockquote><strong>By Account is not yet available.</strong> You may see a <strong>By Account</strong> behaviour listed in the semi-additive dropdown shown as <em>(not yet supported)</em> and greyed out. This mode would let each account in an account dimension carry its own additivity rule (some accounts sum over time, some take the last balance). The per-account aggregation engine is not implemented yet, so the option is disabled and a query that uses it is rejected with a clear message rather than returning a wrong number. Use <strong>last_non_empty</strong> for balance-style accounts in the meantime.</blockquote>
+<blockquote><strong>By Account is not a supported behaviour.</strong> You may have seen a <strong>By Account</strong> option in older versions. It would have let each account in an account dimension carry its own additivity rule (some accounts sum over time, some take the last balance), but the per-account aggregation engine was never built, so the option has been removed from the semi-additive dropdown. Use <strong>last_non_empty</strong> for balance-style accounts instead. If an older model still has a measure set to By Account, that measure is flagged as invalid until you pick a supported behaviour and re-enable it.</blockquote>
 
 <h2>How to configure a semi-additive measure</h2>
 <ol>

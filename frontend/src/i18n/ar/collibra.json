@@ -1,4 +1,5 @@
 {
+  "collibra.activate": "تفعيل",
   "collibra.addConnection": "إضافة اتصال",
   "collibra.assets": "الأصول",
   "collibra.assetsCount": "{{count}} من الأصول",
@@ -8,6 +9,7 @@
   "collibra.baseUrlPlaceholder": "https://your-company.collibra.com",
   "collibra.communityChip": "المجتمع: {{value}}",
   "collibra.communityId": "معرف المجتمع",
+  "collibra.deactivate": "إلغاء التفعيل",
   "collibra.delete": "حذف",
   "collibra.deleteFailed": "تعذر الحذف.",
   "collibra.details": "التفاصيل",

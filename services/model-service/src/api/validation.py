@@ -22,6 +22,7 @@ from sqlalchemy.orm import selectinload
 from shared.db.models import AggregateDefinition, Dimension, Measure, ModelTable
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import MeasureWarningResponse
+from shared.semantic.graph_order import FACT_TABLE_TYPE
 from shared.semantic.model_validator import (
     _load_model_structure,
     validate_aggregate,
@@ -29,6 +30,7 @@ from shared.semantic.model_validator import (
     validate_measure,
 )
 from shared.semantic.table_analyzer import validate_measures
+from src.api._scope import ensure_model_in_project
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 
@@ -65,6 +67,13 @@ async def validate_model(
     all_measure_warnings: list[MeasureWarningResponse] = []
 
     async for db in get_tenant_db(current_user.tenant_id):
+        # Bug-8862: require_role gates the caller's ROLE on the PATH project;
+        # it never proves the model named in the path belongs to it. Without
+        # this, a modeler in project A could enumerate every dimension,
+        # measure and aggregate NAME of a model in project B via the violation
+        # payload.
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+
         structure = await _load_model_structure(model_id, db)
 
         # Validate dimensions
@@ -104,7 +113,7 @@ async def validate_model(
         # Only run on fact tables — dimension tables should not have measures
         tables_result = await db.execute(
             select(ModelTable)
-            .where(ModelTable.model_id == model_id, ModelTable.table_type == "fact")
+            .where(ModelTable.model_id == model_id, ModelTable.table_type == FACT_TABLE_TYPE)
             .options(selectinload(ModelTable.columns))
         )
         fact_tables = {str(t.id): t for t in tables_result.scalars().all()}

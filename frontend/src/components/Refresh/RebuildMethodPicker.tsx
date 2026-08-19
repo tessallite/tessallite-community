@@ -1,4 +1,5 @@
 import {
+  Alert,
   FormControl,
   InputLabel,
   MenuItem,
@@ -18,6 +19,8 @@ interface Props {
   onIncrementalColumnChange?: (col: string) => void;
   lookbackDays?: number;
   onLookbackChange?: (days: number) => void;
+  fullRebuildIntervalDays?: number | null;
+  onFullRebuildIntervalChange?: (days: number | null) => void;
   disabled?: boolean;
   size?: "small" | "medium";
 }
@@ -29,6 +32,8 @@ export default function RebuildMethodPicker({
   onIncrementalColumnChange,
   lookbackDays = 1,
   onLookbackChange,
+  fullRebuildIntervalDays = null,
+  onFullRebuildIntervalChange,
   disabled,
   size = "small",
 }: Props) {
@@ -51,6 +56,9 @@ export default function RebuildMethodPicker({
 
       {method === "incremental" && (
         <>
+          <Alert severity="info" data-testid="append-only-contract-notice">
+            {t("rebuildMethod.appendOnlyNotice")}
+          </Alert>
           <TextField
             label={t("rebuildMethod.dateColumnLabel")}
             size={size}
@@ -72,6 +80,20 @@ export default function RebuildMethodPicker({
           <Typography variant="caption" color="text.secondary">
             {t("rebuildMethod.lookbackHelp")}
           </Typography>
+          <TextField
+            label={t("rebuildMethod.fullRebuildIntervalLabel")}
+            type="number"
+            size={size}
+            fullWidth
+            value={fullRebuildIntervalDays ?? ""}
+            onChange={(e) => {
+              const raw = e.target.value;
+              onFullRebuildIntervalChange?.(raw === "" ? null : Number(raw));
+            }}
+            disabled={disabled}
+            inputProps={{ min: 1 }}
+            helperText={t("rebuildMethod.fullRebuildIntervalHelp")}
+          />
         </>
       )}
     </Stack>

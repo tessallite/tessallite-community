@@ -10,6 +10,8 @@ from __future__ import annotations
 import types
 from datetime import datetime, timezone
 
+import pytest
+
 from src.rewrite.query_rewriter import rewrite_for_aggregate
 from src.ir.logical_query import LogicalFilter
 
@@ -88,3 +90,16 @@ def test_rewriter_preserves_numeric_grain_filter_type_for_bigquery():
 
     assert "`fiscal_year` = 2024" in sql
     assert "`fiscal_year` = '2024'" not in sql
+
+
+def test_f006_02_length_mismatched_physical_grain_raises():
+    """F-006-02: grain ['active_flag'] + two physical names must not emit active_flag."""
+    from src.rewrite.aggregate import AggregateRewriteUnsupported
+
+    m = make_measure("base_amount")
+    d = make_dimension("active_flag")
+    agg = make_aggregate(["active_flag"], [make_agg_col(m)])
+    _attach_physical_cols(agg, ["account_type_active_flag", "extra"])
+    bq = make_bound_query([d], [m], grain=["active_flag"], order_by=[("active_flag", "asc")])
+    with pytest.raises(AggregateRewriteUnsupported):
+        rewrite_for_aggregate(bq, agg)

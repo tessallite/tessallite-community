@@ -8,6 +8,7 @@ import type { LoginFormData } from '../../hooks/useAuth';
 import type { ConnectionProfile } from '../../utils/storage';
 import { getProfiles } from '../../utils/storage';
 import { tokens } from '../../theme';
+import { strings } from '../../i18n/strings';
 
 interface LoginScreenProps {
   onLogin: (data: LoginFormData, remember: boolean) => Promise<void>;
@@ -60,8 +61,8 @@ export default function LoginScreen({ onLogin, loading, error }: LoginScreenProp
   // F-41: Validate server URL format
   const serverUrlError = useMemo(() => {
     if (!serverUrl) return '';
-    if (!/^https?:\/\//i.test(serverUrl)) return 'Must start with https:// or http://';
-    try { new URL(serverUrl); return ''; } catch { return 'Invalid URL format'; }
+    if (!/^https?:\/\//i.test(serverUrl)) return strings.login.serverUrlMustStart;
+    try { new URL(serverUrl); return ''; } catch { return strings.login.serverUrlInvalid; }
   }, [serverUrl]);
 
   const isValid = serverUrl && !serverUrlError && tenantId && email && password;
@@ -70,7 +71,7 @@ export default function LoginScreen({ onLogin, loading, error }: LoginScreenProp
     <Box
       component="form"
       onSubmit={handleSubmit}
-      aria-label="Connect to Tessallite"
+      aria-label={strings.login.formAria}
       sx={{
         display: 'flex',
         flexDirection: 'column',
@@ -85,17 +86,17 @@ export default function LoginScreen({ onLogin, loading, error }: LoginScreenProp
         <TessalliteLogo />
         <Box>
           <Typography sx={{ fontSize: 14, fontWeight: 600, color: tokens.colorCharcoal, lineHeight: 1.2 }}>
-            Tessallite
+            {strings.login.brandName}
           </Typography>
           <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>
-            Governed analytics
+            {strings.login.tagline}
           </Typography>
         </Box>
       </Box>
 
       <TextField
-        label="Server URL"
-        placeholder="https://your-tessallite.io"
+        label={strings.login.serverUrl}
+        placeholder={strings.login.serverUrlPlaceholder}
         value={serverUrl}
         onChange={e => setServerUrl(e.target.value)}
         error={!!serverUrlError}
@@ -104,16 +105,16 @@ export default function LoginScreen({ onLogin, loading, error }: LoginScreenProp
         size="small"
       />
       <TextField
-        label="Tenant"
-        placeholder="Tenant slug"
+        label={strings.login.tenant}
+        placeholder={strings.login.tenantPlaceholder}
         value={tenantId}
         onChange={e => setTenantId(e.target.value)}
         fullWidth
         size="small"
       />
       <TextField
-        label="Email"
-        placeholder="Email address"
+        label={strings.login.email}
+        placeholder={strings.login.emailPlaceholder}
         type="email"
         value={email}
         onChange={e => setEmail(e.target.value)}
@@ -121,8 +122,8 @@ export default function LoginScreen({ onLogin, loading, error }: LoginScreenProp
         size="small"
       />
       <TextField
-        label="Password"
-        placeholder="Password"
+        label={strings.login.password}
+        placeholder={strings.login.passwordPlaceholder}
         type={showPassword ? 'text' : 'password'}
         value={password}
         onChange={e => setPassword(e.target.value)}
@@ -131,7 +132,7 @@ export default function LoginScreen({ onLogin, loading, error }: LoginScreenProp
         InputProps={{
           endAdornment: (
             <InputAdornment position="end">
-              <IconButton size="small" onClick={() => setShowPassword(!showPassword)} aria-label={showPassword ? 'Hide password' : 'Show password'}>
+              <IconButton size="small" onClick={() => setShowPassword(!showPassword)} aria-label={showPassword ? strings.login.hidePassword : strings.login.showPassword}>
                 {showPassword ? <VisibilityOff fontSize="small" /> : <Visibility fontSize="small" />}
               </IconButton>
             </InputAdornment>
@@ -147,7 +148,7 @@ export default function LoginScreen({ onLogin, loading, error }: LoginScreenProp
             onChange={e => setRemember(e.target.checked)}
           />
         }
-        label={<Typography sx={{ fontSize: 12, color: tokens.colorTextSecondary }}>Remember this profile</Typography>}
+        label={<Typography sx={{ fontSize: 12, color: tokens.colorTextSecondary }}>{strings.login.rememberProfile}</Typography>}
         sx={{ mr: 0, '.MuiFormControlLabel-label': { fontSize: 12 } }}
       />
 
@@ -164,7 +165,7 @@ export default function LoginScreen({ onLogin, loading, error }: LoginScreenProp
         disabled={!isValid || loading}
         sx={{ mt: 0.5 }}
       >
-        {loading ? <CircularProgress size={18} sx={{ color: 'white' }} /> : 'Connect'}
+        {loading ? <CircularProgress size={18} sx={{ color: 'white' }} /> : strings.login.connect}
       </Button>
     </Box>
   );

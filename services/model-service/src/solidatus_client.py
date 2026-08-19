@@ -39,10 +39,21 @@ class SolidatusPushNotImplementedError(NotImplementedError):
 class SolidatusClient:
     """Solidatus client shell used until a tenant-specific API contract is wired."""
 
-    def __init__(self, base_url: str, token: str, timeout_seconds: int = 30):
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        timeout_seconds: int = 30,
+        *,
+        workspace_id: str = "",
+        model_ref: str = "",
+    ):
+        # Bug-7718: accept connection config for validate contract.
         self._base_url = base_url
         self._token = token
         self._timeout = timeout_seconds
+        self._workspace_id = workspace_id
+        self._model_ref = model_ref
 
     async def validate_connection(self) -> SolidatusConnectionStatus:
         # No real HTTP client yet: do not assert a pass we cannot prove.
@@ -80,4 +91,16 @@ class SolidatusClient:
         raise SolidatusPushNotImplementedError(
             "Solidatus non-dry-run sync is not implemented for this deployment; "
             "configure a real Solidatus client before running push mode."
+        )
+
+    async def deprecate_nodes(self, external_ids: list[str]) -> int:
+        """Bug-7526: placeholder for remote deprecation."""
+        raise SolidatusPushNotImplementedError(
+            "Remote Solidatus deprecation is not implemented for this deployment."
+        )
+
+    async def deprecate_edges(self, external_ids: list[str]) -> int:
+        """Bug-7526: placeholder for remote deprecation."""
+        raise SolidatusPushNotImplementedError(
+            "Remote Solidatus deprecation is not implemented for this deployment."
         )

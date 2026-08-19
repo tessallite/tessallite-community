@@ -16,7 +16,8 @@
     <h1>Collibra Integration</h1>
 
     <h2>What it is</h2>
-    <p>The Collibra integration lets you push your Tessallite semantic model metadata into <strong>Collibra</strong>, the enterprise data governance and catalog platform. When connected, Collibra becomes the governed catalog for your metrics, dimensions, KPIs, glossary terms, and downstream reports — complete with ownership, classifications, and relationships.</p>
+    <p>The Collibra integration builds a Collibra-shaped picture of your Tessallite semantic model — your metrics, dimensions, KPIs, glossary terms, and downstream reports, complete with ownership, classifications, and relationships — so you can preview exactly what would land in <strong>Collibra</strong>, the enterprise data governance and catalog platform.</p>
+    <p>In this build the integration is a <strong>preview / dry-run</strong> tool. It reads your model and computes the Collibra payload locally; it does not send anything to Collibra. Live push (writing the assets into your Collibra instance) is not yet available — see the "Not available yet: live connector" section below.</p>
 
     <h2>Who it is for</h2>
     <ul>
@@ -26,7 +27,7 @@
     </ul>
 
     <h2>What gets exported</h2>
-    <p>When you sync a model to Collibra, Tessallite exports these objects as governed assets with attributes, relations, and responsibilities:</p>
+    <p>When you preview or dry-run a model export, Tessallite maps these objects into governed Collibra assets with attributes, relations, and responsibilities (computed locally — nothing is written to Collibra yet):</p>
     <div class="table-wrapper"><table>
       <thead><tr><th>Tessallite object</th><th>Collibra asset type</th></tr></thead>
       <tbody>
@@ -117,37 +118,47 @@
     <h3>Step 8 — Live push (not yet available)</h3>
     <p>Live push to Collibra is not implemented in this build, so the <strong>Sync</strong> button is disabled. The dry run in Step 7 lets you confirm exactly what would be created. When a live Collibra client is wired in, this button will push the previewed assets, relations, and responsibilities and record the result in run history.</p>
 
-    <h2>How sync works (under the hood)</h2>
-    <p>Same incremental sync engine as Solidatus:</p>
+    <h2>Available now: preview and dry run</h2>
+    <p>Everything here works today. It reads your model and computes the governance payload locally — nothing is sent to Collibra.</p>
     <ol>
       <li><strong>Build governance graph</strong> — reads all model objects from the snapshot.</li>
       <li><strong>Map to Collibra format</strong> — converts to assets (with attributes + status), relations, and responsibilities.</li>
-      <li><strong>Hash every object</strong> — SHA256 fingerprint for diffing.</li>
-      <li><strong>Compare with previous sync</strong> — identifies new, changed, and unchanged objects.</li>
-      <li><strong>Push only changes</strong> — sends only new and updated assets/relations to Collibra.</li>
-      <li><strong>Persist mappings</strong> — saves Tessallite→Collibra ID mappings for incremental sync.</li>
+      <li><strong>Hash every object</strong> — SHA256 fingerprint, ready to drive an incremental diff once live push exists.</li>
+      <li><strong>Record the run</strong> — saves the run in history with the exact model snapshot it was built from, the asset/relation counts, and any governance warnings.</li>
     </ol>
+    <p>The dry run computes what a push <em>would</em> do; it does not contact Collibra and does not create, update, or deprecate anything remotely.</p>
+    <p><strong>Incremental diff is not available yet.</strong> Live push is not implemented in this build, so no remote mapping is ever saved. With no saved baseline to compare against, every dry run reports all objects as <em>new</em> — it cannot yet show which objects changed or stayed the same since a previous sync. When live push lands, the fingerprints above will drive an incremental create/update/deprecate diff.</p>
+
+    <h2>Not available yet: live connector</h2>
+    <p>Live validation and live push are <strong>not implemented</strong> in this build. Until a tenant-specific Collibra client is wired in, the following do NOT happen:</p>
+    <ul>
+      <li><strong>Live push</strong> — the Sync button is disabled and the API returns "not implemented". No asset, relation, or responsibility is created or updated in Collibra.</li>
+      <li><strong>Remote deprecation</strong> — when you remove objects from your model, the dry run records them as removed locally, but nothing is marked Deprecated inside Collibra, because no remote call is made.</li>
+      <li><strong>Live connection checks</strong> — Test Connection is simulated (see Step 5); a wrong URL, expired token, or missing Community/Domain is not caught until live validation exists.</li>
+    </ul>
+    <p>When the live client lands, this page will be updated with the remote push, deprecation, and troubleshooting behaviour it introduces.</p>
 
     <h2>Tips and best practices</h2>
     <ul>
-      <li><strong>Sync after deploy</strong> — The sync exports the deployed model state. Draft changes won't appear until deployed.</li>
-      <li><strong>Community and Domain matter</strong> — Make sure the Community and Domain IDs are correct. If they don't exist in Collibra, the sync will fail.</li>
-      <li><strong>Ownership flows through</strong> — KPIs with an owner and downstream assets with an owner become Collibra responsibilities automatically. Measures and dimensions have no owner field, so they export without a responsibility.</li>
-      <li><strong>Deprecate, don't delete</strong> — Removed objects are marked Deprecated in Collibra, preserving audit history.</li>
+      <li><strong>Export the deployed version</strong> — Preview and dry run use the deployed model state by default. Draft changes won't appear until deployed (or unless you enable "export draft").</li>
+      <li><strong>Ownership flows through</strong> — KPIs with an owner and downstream assets with an owner become Collibra responsibilities in the payload. Measures and dimensions have no owner field, so they export without a responsibility.</li>
+      <li><strong>Read the governance warnings</strong> — A dry run flags objects missing a description or owner, and KPIs / calculated measures whose expression could not be fully resolved.</li>
+      <li><strong>Check the recorded snapshot</strong> — Each run records the exact model snapshot it was built from.</li>
       <li><strong>Business vs Technical</strong> — The export supports separate business and technical views. Hidden columns are included in technical exports.</li>
       <li><strong>Asset type mappings</strong> — The default asset type names work with standard Collibra installations. Custom setups can configure the mapping.</li>
     </ul>
 
-    <h2>Troubleshooting</h2>
+    <h2>Troubleshooting (preview / dry run)</h2>
+    <p>These cover the preview and dry-run surfaces that work today. There is no live troubleshooting yet because no remote call is made.</p>
     <div class="table-wrapper"><table>
       <thead><tr><th>Problem</th><th>Likely cause</th><th>Solution</th></tr></thead>
       <tbody>
         <tr><td>"Connection not found"</td><td>No connection configured</td><td>Click Add Connection first</td></tr>
         <tr><td>"Model not found"</td><td>Not inside a model</td><td>Open a model in Model Builder</td></tr>
-        <tr><td>Community/Domain not found</td><td>Wrong IDs</td><td>Verify with your Collibra admin</td></tr>
-        <tr><td>Sync fails with auth error</td><td>Invalid token</td><td>Edit connection and update the API token</td></tr>
-        <tr><td>Assets don't appear in Collibra</td><td>Wrong Community/Domain</td><td>Check the IDs in your connection settings</td></tr>
+        <tr><td>Preview shows 0 assets</td><td>Model has no objects yet</td><td>Add tables, measures, dimensions first</td></tr>
+        <tr><td>Preview warns about unresolved KPI/measure lineage</td><td>A KPI or calculated-measure expression references a measure that is missing or misspelled</td><td>Open the measure/KPI and fix the reference</td></tr>
         <tr><td>"Model not deployed" warning</td><td>Model has no deployed version</td><td>Deploy the model first</td></tr>
+        <tr><td>Missing asset types</td><td>Custom Collibra setup</td><td>Use the asset type mapping config to match your Collibra operating model</td></tr>
       </tbody>
     </table></div>
 

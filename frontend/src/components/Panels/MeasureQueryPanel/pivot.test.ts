@@ -475,3 +475,25 @@ describe("computeTotals", () => {
     },
   );
 });
+
+describe("computePivot — business display labels (Bug-6285)", () => {
+  it("exposes display names alongside technical names, in order", () => {
+    const region: Dimension = { ...dim("region"), display_name: "Sales Region" };
+    const year: Dimension = { ...dim("year"), display_name: "Fiscal Year" };
+    const rows = [{ region: "EMEA", year: "2024", revenue: 10 }];
+    const pivot = computePivot(exec(rows), measure("revenue"), [region], [year]);
+    // Technical names still drive result lookup.
+    expect(pivot.rowCols).toEqual(["region"]);
+    expect(pivot.colCols).toEqual(["year"]);
+    // Row display labels are what headers/exports render. (The column axis
+    // renders member values, so there is no colLabels array.)
+    expect(pivot.rowLabels).toEqual(["Sales Region"]);
+  });
+
+  it("falls back to the technical name when a dimension has no display name", () => {
+    const region: Dimension = { ...dim("region"), display_name: "" };
+    const rows = [{ region: "EMEA", revenue: 10 }];
+    const pivot = computePivot(exec(rows), measure("revenue"), [region], []);
+    expect(pivot.rowLabels).toEqual(["region"]);
+  });
+});

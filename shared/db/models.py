@@ -12,8 +12,8 @@ from datetime import date, datetime
 from typing import Optional
 
 from sqlalchemy import (
-    BigInteger, Boolean, Column, Date, ForeignKey, Index, Integer, Float, LargeBinary,
-    Numeric, String, Table, Text, UniqueConstraint, func, text,
+    BigInteger, Boolean, CheckConstraint, Column, Date, ForeignKey, Index, Integer,
+    Float, LargeBinary, Numeric, String, Table, Text, UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -74,12 +74,75 @@ class SystemRestartPending(SystemBase):
     written_by: Mapped[Optional[str]] = mapped_column(String(255))
 
 
+class SystemAuditEvent(SystemBase):
+    """Platform-plane audit (licence, tenant lifecycle, system-admin session).
+
+    CP-08 / G-022-01: tenant ``audit_events`` cannot survive tenant-schema drop
+    and cannot record system-admin actions that have no tenant session.
+    """
+
+    __tablename__ = "system_audit_events"
+    __table_args__ = {"schema": "tess_system"}
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    timestamp: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, index=True)
+    actor_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    actor_email: Mapped[Optional[str]] = mapped_column(Text)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    target_type: Mapped[Optional[str]] = mapped_column(Text)
+    target_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    target_name: Mapped[Optional[str]] = mapped_column(Text)
+    tenant_slug: Mapped[Optional[str]] = mapped_column(String(64))
+    severity: Mapped[str] = mapped_column(Text, nullable=False)
+    detail: Mapped[Optional[dict]] = mapped_column(JSONB)
+    ip_address: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class LoginLockout(SystemBase):
+    """Per-account login lockout (G-021-04). System-schema so discover can lock
+    unknown-email probes without a tenant session.
+    """
+
+    __tablename__ = "login_lockouts"
+    __table_args__ = (
+        UniqueConstraint("scope_key", "email_canonical", name="uq_login_lockout_scope_email"),
+        {"schema": "tess_system"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    scope_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    email_canonical: Mapped[str] = mapped_column(String(255), nullable=False)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    locked_until: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class RevokedEmbedToken(SystemBase):
+    """One revocation record per (token, revoking tenant).
+
+    Bug-6306 / Bug-6352 R2: ``jti`` alone was the primary key, which made the
+    row a shared slot two tenants could fight over. A jti is plaintext in any
+    embed JWT that has ever leaked, so a stranger could overwrite the owning
+    tenant's revocation and bring a killed token back to life (last-writer-wins
+    upsert), or pre-claim the jti so the owner's own revoke collided forever
+    (plain insert). The composite key gives each tenant its own row: revocations
+    are independent and no tenant can observe or overwrite another's. See
+    migration 0189.
+    """
+
     __tablename__ = "revoked_embed_tokens"
     __table_args__ = {"schema": "tess_system"}
 
     jti: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, nullable=False, index=True,
+    )
     revoked_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
     revoked_by: Mapped[Optional[str]] = mapped_column(String(255))
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False)
@@ -105,8 +168,122 @@ class SsoState(SystemBase):
     # F-021-09: OIDC id_token replay defence — the nonce sent in the auth
     # request and verified against the id_token's ``nonce`` claim on callback.
     oidc_nonce: Mapped[Optional[str]] = mapped_column(String(128))
+    # F-021-03 / Bug-7993: the SAML AuthnRequest ID issued when this flow was
+    # started. The ACS callback supplies it to python3-saml as the expected
+    # ``request_id`` so the IdP's ``InResponseTo`` is validated (request-binding),
+    # rejecting an assertion that was not produced for this exact login attempt.
+    request_id: Mapped[Optional[str]] = mapped_column(String(128))
+    # Bug-8142: PKCE (RFC 7636) code_verifier for an in-flight OIDC
+    # authorization-code flow. The S256 challenge derived from it is sent on the
+    # authorization request; the verifier itself is replayed on the back-channel
+    # token exchange, so an intercepted authorization code cannot be redeemed
+    # without it. Nullable — SAML flows and pre-existing rows carry no verifier.
+    code_verifier: Mapped[Optional[str]] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, index=True)
+
+
+class SamlAssertionReplay(SystemBase):
+    """F-021-03 / Bug-7993: durable SAML assertion-ID replay ledger.
+
+    A signed, still-valid SAML assertion could otherwise be captured and
+    replayed against the ACS (paired with a freshly minted RelayState) to forge
+    a second session for the victim. Each processed assertion's unique ID is
+    recorded here atomically; a second ACS POST carrying the same assertion ID
+    is rejected. Rows are reaped after ``not_on_or_after`` (the assertion's own
+    validity horizon) — once an assertion is expired the library rejects it on
+    time grounds, so the ledger only needs to cover the live window.
+    """
+
+    __tablename__ = "saml_assertion_replay"
+    __table_args__ = {"schema": "tess_system"}
+
+    assertion_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    not_on_or_after: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, server_default=func.now()
+    )
+
+
+class SchedulerJobExecution(SystemBase):
+    """Durable scheduler job-execution ledger (F-012-05 / Bug-8132).
+
+    A platform-wide OPERATOR ledger, not tenant-scoped: every registered
+    APScheduler job runs system-wide (the sweeps iterate all tenants inside one
+    fire), so its execution history belongs in the system DB alongside
+    ``SystemTenant`` / ``SystemSetting``. It therefore inherits ``SystemBase``
+    and lives in ``tess_system`` — never ``TenantBase``. (The v5 predecessor
+    inherited ``TenantBase`` while writing to the system DB and shipped NO
+    migration, so the table never existed and every write was swallowed into a
+    debug log — a dead ledger that read as populated. This model exists in a
+    real migration on the SYSTEM branch and its writers never swallow.)
+
+    One row per job execution, keyed for correlation by ``job_id`` +
+    ``scheduled_fire_time``:
+
+    - A scheduled run writes ``started`` on APScheduler ``EVENT_JOB_SUBMITTED``
+      and is updated to ``success`` / ``error`` on ``EVENT_JOB_EXECUTED`` /
+      ``EVENT_JOB_ERROR``; a dropped tick writes ``misfire`` on
+      ``EVENT_JOB_MISSED``.
+    - A manual trigger (``POST /scheduler/trigger/{job_id}``, Bug-8133) writes
+      its own ``started`` -> ``success`` / ``error`` pair with
+      ``trigger_source='manual'`` and ``scheduled_fire_time`` = the trigger
+      time, so operator-initiated runs share one durable, queryable ledger with
+      the scheduled ones.
+    """
+
+    __tablename__ = "scheduler_job_executions"
+    __table_args__ = (
+        # B02: the correlation key is UNIQUE, so the start (SUBMITTED) and the
+        # terminal (EXECUTED/ERROR/MISSED) events for ONE run collapse to ONE
+        # row via an atomic upsert (execution_ledger.record_*), even when the
+        # async event writes reorder — a fast/lock-busy job can no longer leave
+        # two rows and make /scheduler/jobs show a completed job as running.
+        UniqueConstraint(
+            "job_id",
+            "scheduled_fire_time",
+            "trigger_source",
+            name="uq_scheduler_job_executions_correlation",
+        ),
+        # Powers the per-job last-run lookup that GET /scheduler/jobs reads back.
+        Index(
+            "ix_scheduler_job_executions_job_started",
+            "job_id",
+            "started_at",
+        ),
+        {"schema": "tess_system"},
+    )
+
+    # Durable execution id returned to a manual trigger caller.
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    job_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # The scheduled fire time this row records. NULL is not used in practice —
+    # scheduled runs carry the APScheduler fire time and manual runs carry the
+    # trigger instant — but kept nullable so a future non-scheduled writer is
+    # not forced to invent one.
+    scheduled_fire_time: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ)
+    # 'scheduled' (APScheduler listener) or 'manual' (trigger endpoint).
+    trigger_source: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'scheduled'")
+    )
+    # 'started' | 'success' | 'error' | 'misfire'.
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ)
+    # Short human outcome summary for a success/misfire ('completed', etc.).
+    outcome: Mapped[Optional[str]] = mapped_column(Text)
+    # Failure message for an error row (bounded by the writer).
+    error_text: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, server_default=func.now()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +390,27 @@ class Model(TenantBase):
     predictive_built_for_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
+    # Bug-8395 [FIXED]: the deploy_epoch the predictive stamp was made under.
+    # A revert may target the version that is ALREADY deployed
+    # ("revert-to-same-version", Bug-7140): it retires + drops every predictive
+    # aggregate absent from the reverted-to snapshot (rehydrator
+    # `drop_orphan_aggregates`) and bumps deploy_epoch while leaving
+    # deployed_version_id unchanged. A version-id-only comparison therefore
+    # reported "already built" for a model that had just lost every predictive
+    # aggregate, and never rebuilt it.
+    # Both columns are now written together and compared together through the
+    # single shared rule in
+    # `optimizer/src/lifecycle/predictive_build.py`
+    # (`predictive_build_is_current` / `stamp_predictive_build`), used by the
+    # auto-sweep (`lifecycle/predictive_sweep.py`), the cold-start kickoff
+    # (`api/cold_start_routes.py`) and the manual build route
+    # (`api/predictive_routes.py`). A NULL epoch (rows stamped before migration
+    # 0204 added the column) counts as NOT built — one cheap, self-terminating
+    # rebuild, because the planner already excludes materialised
+    # (grain, measure-set) pairs.
+    predictive_built_for_epoch: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
     # FK enforced at the DB level by migration 0021; we don't repeat it
     # in the ORM because doing so makes SQLAlchemy try to wire an
     # implicit relationship to ModelVersion at mapper-configuration time,
@@ -222,6 +420,35 @@ class Model(TenantBase):
         UUID(as_uuid=True)
     )
     last_deployed_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ)
+    # Bug-7140: monotonically increasing counter bumped on every deploy,
+    # undeploy, and revert. The query-router cache uses (model_id,
+    # deployed_version_id, deploy_epoch) as its cache key so that
+    # undeploy (pointer -> NULL) and revert-to-same-version (pointer
+    # unchanged but content changed) invalidate stale entries across all
+    # replicas without relying on a fan-out eviction HTTP call.
+    deploy_epoch: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    # F-017-03 (Bug-7989): monotonically increasing counter bumped on every
+    # successful DATA refresh (aggregate full/incremental refresh, pocket
+    # refresh, manual source refresh). Distinct from deploy_epoch (which tracks
+    # DEFINITION deploy/undeploy/revert). The KPI evaluation cache folds
+    # data_epoch into its key so a scorecard is never stale past the DB read
+    # after a refresh, on every model-service replica, without a cross-process
+    # event bus. Bumped via shared.model_refresh_epoch.bump_data_epoch.
+    data_epoch: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    # Bug-7787: monotonically increasing counter bumped by the shared
+    # ``dependency_mutation`` helper on every mutation that can add, remove,
+    # rename, or rebind a model dependency edge. The impact-analysis preview
+    # returns it as an optimistic token; the destructive request sends the
+    # expected value and the server recomputes under lock, returning
+    # IMPACT_REVISION_STALE on mismatch. Draft control metadata — distinct from
+    # ``deployed_version_id``/``deploy_epoch`` (the deployed runtime pointer).
+    dependency_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
     # KPI v2 model-level settings
     expose_kpis_inline: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     fiscal_year_start_month: Mapped[Optional[int]] = mapped_column(Integer)
@@ -250,6 +477,7 @@ class Model(TenantBase):
     lineage_mappings: Mapped[list[LineageMapping]] = relationship(back_populates="model", cascade="all, delete-orphan")
     named_sets: Mapped[list["NamedSet"]] = relationship(back_populates="model", cascade="all, delete-orphan")
     kpis: Mapped[list["KPI"]] = relationship(back_populates="model", cascade="all, delete-orphan")
+    named_queries: Mapped[list["NamedQuery"]] = relationship(back_populates="model", cascade="all, delete-orphan")
 
 
 class ModelVersion(TenantBase):
@@ -264,6 +492,17 @@ class ModelVersion(TenantBase):
     summary: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
     created_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Bug-6295: an imported version row carries history metadata (number,
+    # summary) but NOT a faithful historical snapshot — the export bundle
+    # deliberately omits each version's snapshot_json (Bug-7623), so the
+    # source-tenant shapes are genuinely unrecoverable on import. When True,
+    # ``snapshot_json`` is a placeholder ({}) and MUST NOT be treated as the
+    # version's real shape: reverting to it would rehydrate an empty/wrong
+    # definition, silently serving today's shape (or nothing) under an old
+    # label. False/NULL means the snapshot is authentic (native Save path).
+    snapshot_unavailable: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     __table_args__ = (UniqueConstraint("model_id", "version_number"),)
 
@@ -464,17 +703,30 @@ class HierarchyDefinition(TenantBase):
         UUID(as_uuid=True), ForeignKey("models.id", ondelete="CASCADE"), nullable=False
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Bug-7195: the ``type`` domain is enforced application-side by
+    # ``hierarchies.py::_normalize_hierarchy_type`` (ALLOWED_HIERARCHY_TYPES).
+    # A DB-level CHECK is the fail-closed backstop so an out-of-band writer
+    # (import/rehydrate, a script, a future endpoint that forgets the helper)
+    # can never persist an unroutable type. Kept in lock-step with
+    # ALLOWED_HIERARCHY_TYPES in the API layer.
     type: Mapped[str] = mapped_column(String(20), nullable=False)  # explicit | date_embedded | segment
     dimension_kind: Mapped[Optional[str]] = mapped_column(Text)  # time | geo | entity | None
     description: Mapped[Optional[str]] = mapped_column(Text)
     segment_config: Mapped[Optional[dict]] = mapped_column(JSONB)
     date_config: Mapped[Optional[dict]] = mapped_column(JSONB)
-    calendar_type: Mapped[Optional[str]] = mapped_column(String(20))  # standard | fiscal | hijri | iso
+    calendar_type: Mapped[Optional[str]] = mapped_column(String(20))  # standard | fiscal | iso_week | retail_445 | hijri | thai_buddhist
     fiscal_year_start_month: Mapped[Optional[int]] = mapped_column(Integer)  # 1-12, only when calendar_type = "fiscal"
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now(), onupdate=func.now())
 
-    __table_args__ = (UniqueConstraint("model_id", "name"),)
+    __table_args__ = (
+        UniqueConstraint("model_id", "name"),
+        # Bug-7195: fail-closed backstop mirroring ALLOWED_HIERARCHY_TYPES.
+        CheckConstraint(
+            "type IN ('explicit', 'date_embedded', 'segment')",
+            name="ck_hierarchy_definitions_type",
+        ),
+    )
 
     model: Mapped[Model] = relationship(back_populates="hierarchies")
     levels: Mapped[list[HierarchyLevel]] = relationship(
@@ -577,12 +829,187 @@ class Dimension(TenantBase):
     calc_expression_tables: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
     is_invalid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     invalid_reason: Mapped[Optional[str]] = mapped_column(Text)
+    # Provenance: when a dimension was auto-added as a detail of another
+    # dimension's bijection relationship, these two nullable FKs record which
+    # relationship and which owning dimension created it. A non-null value
+    # means the dimension is a provenance-linked "detail of [X]" entry in the
+    # dimension list, managed through the attribute-relationships section and
+    # referentially locked (cannot be deleted independently while active).
+    detail_of_relationship_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dimension_attribute_relationships.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    detail_of_dimension_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dimensions.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (UniqueConstraint("model_id", "name"),)
 
     model: Mapped[Model] = relationship(back_populates="dimensions")
+
+
+class DimensionAttributeRelationship(TenantBase):
+    """A modeller-declared key-to-detail relationship on a dimension.
+
+    Spec: architecture_derived-grain-aggregate-routing.md §5.3. This is EXPLICIT,
+    model-managed declaration content and is multi-row because one dimension key
+    may govern several details (name, ISO code, phone key). It is distinct from
+    ``Dimension.display_column_id`` (a caption choice) — the presence of a display
+    column never declares 1:1 and never creates one of these rows (§2.5).
+
+    Phase 1b persists and round-trips the declaration only. No serving, no
+    verification: those are Phase 2+. Runtime verification evidence lives in a
+    SEPARATE table (``DimensionAttributeVerification``, Phase 2) because it is
+    live operational state, not pinned model content.
+
+    ``key_column_id`` is pinned even though it normally equals the owning
+    dimension's current ``source_column_id``: a key rebind changes the
+    declaration hash and stales evidence instead of silently retargeting a
+    trusted edge. V1 accepts physical columns in the same governed model relation;
+    calculated/UDA details are source-only (a future expression-plus-data proof).
+    """
+
+    __tablename__ = "dimension_attribute_relationships"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    model_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("models.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    dimension_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dimensions.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    # Pinned key column (see class docstring). SET NULL on physical column delete
+    # so the declaration survives as a broken/stale edge rather than vanishing.
+    key_column_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("model_columns.id", ondelete="SET NULL"), index=True,
+    )
+    detail_column_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("model_columns.id", ondelete="SET NULL"), index=True,
+    )
+    # BIJECTION | FUNCTIONAL_N_TO_1 (spec §5.3). Determines the safe measure set
+    # once serving lands (I14): a bijection is an exact partition relabel; an N:1
+    # edge is a real coarsening. Never opportunistically upgraded N:1 -> exact.
+    cardinality: Mapped[str] = mapped_column(String(32), nullable=False)
+    # REJECT_NULL is fixed in v1 (spec §5.3): NULL key/detail endpoints are
+    # excluded from any relationship proof (I16). Stored so a future policy can
+    # widen it without a migration.
+    null_policy: Mapped[str] = mapped_column(String(32), nullable=False, default="REJECT_NULL")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Stable hash over the declaration's meaning (key/detail column ids,
+    # cardinality, null policy). Any edit that changes meaning changes the hash,
+    # which stales all Phase-2 verification evidence for this row.
+    declaration_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now(), onupdate=func.now())
+
+    # One declaration per (dimension, detail, cardinality) pairing — the same
+    # detail may be declared once per dimension. Different details on the same
+    # dimension are distinct rows.
+    __table_args__ = (
+        UniqueConstraint(
+            "dimension_id", "detail_column_id", "cardinality",
+            name="uq_dim_attr_rel_dimension_detail_cardinality",
+        ),
+    )
+
+    model: Mapped[Model] = relationship()
+    dimension: Mapped[Dimension] = relationship(foreign_keys=[dimension_id])
+
+
+class DimensionAttributeVerification(TenantBase):
+    """Mostly-append-only complete-data verification evidence for a declared
+    attribute relationship (spec §5.3 / §7.6; see the upsert carve-out below).
+
+    This is LIVE OPERATIONAL STATE, not model content: it is tied to an immutable
+    deployed version and (for artifact checks) a physical refresh run. It is
+    therefore deliberately EXCLUDED from model snapshots — a rehydrated model must
+    be re-verified against its reverted/imported deployed version before any edge
+    can serve. The current status is the newest row per relationship (the API
+    projects a denormalised current-status view); rows are append-only except for
+    the one deliberate in-place upsert path documented below.
+
+    Phase 2 writes these rows but authorises NO serving route — the router trust
+    predicate (§7.6.4) is a later phase. A row is written ``VERIFIED`` only when
+    every directional + NULL check passed for the SAME declaration hash, deployed
+    version, and (for artifacts) active refresh run; any failure/timeout/
+    counterexample/unsupported-type writes ``BROKEN`` or ``ERROR`` and never
+    ``VERIFIED``.
+
+    Mostly append-only, with ONE deliberate in-place update path: the periodic
+    relationship health sweep (scheduler ``derived_relationship_sweep``) re-proves
+    each edge over the served data on a cadence and UPSERTS its artifact-local
+    evidence — it UPDATES the existing row for the SAME idempotency key
+    (relationship_id, artifact_refresh_run_id, declaration_hash, verifier_version),
+    refreshing ``status`` / ``violation_count`` / ``error_code`` / ``checked_at``
+    rather than inserting a duplicate (the unique constraint below forbids the
+    duplicate). Newest-wins semantics are preserved (``checked_at`` is bumped), so
+    the trust predicate still reads the current verdict; the trade-off is that the
+    build-time row's prior status for the active run is overwritten by the latest
+    re-check.
+    """
+
+    __tablename__ = "dimension_attribute_verifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    relationship_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dimension_attribute_relationships.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # VERIFIED | BROKEN | STALE | ERROR | PENDING (spec §5.3; PENDING = Bug-7894:
+    # a text BIJECTION relabel checked 1:1 at source but awaiting artifact-build
+    # serve-collation certification — non-serving, clears to VERIFIED on build).
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    verifier_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The declaration hash this evidence was produced for. The router trust
+    # predicate (§7.6.4) requires it to equal the deployed declaration's hash;
+    # an edit that changes the hash strands this evidence as non-matching (stale).
+    declaration_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    deployed_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("model_versions.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    # The deploy epoch (Model.deploy_epoch) at verification time. A deploy/revert
+    # advances the epoch, so losing/older evidence cannot satisfy the predicate.
+    deploy_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # TENANT_GLOBAL (mandatory deploy check) | PERSONA_ARTIFACT (additional).
+    scope_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="TENANT_GLOBAL")
+    scope_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Immutable source version/watermark when the connector exposes one; else the
+    # successful refresh run is the artifact data version (§7.6.4 rule 6).
+    source_data_version: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # DEPLOY_CHECK | AGGREGATE | POCKET (spec §5.3). Deploy-check evidence is
+    # model-health only; artifact evidence names the exact physical run/manifest.
+    artifact_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="DEPLOY_CHECK")
+    artifact_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    artifact_refresh_run_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    artifact_manifest_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    checked_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
+    violation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # A failed-direction / unsupported-type / timeout code. Counterexample VALUES
+    # are never persisted (they may be sensitive) — only counts and a code.
+    error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (
+        # Idempotency key for artifact evidence (§7.6.3): relationship + artifact
+        # + refresh run + declaration hash + verifier version uniquely identify a
+        # verification attempt, so retries are idempotent.
+        UniqueConstraint(
+            "relationship_id", "artifact_refresh_run_id", "declaration_hash", "verifier_version",
+            name="uq_dim_attr_verif_run_decl_verifier",
+        ),
+        Index(
+            "ix_dim_attr_verif_relationship_checked",
+            "relationship_id", "checked_at",
+        ),
+    )
+
+    relationship: Mapped[DimensionAttributeRelationship] = relationship()
 
 
 class Measure(TenantBase):
@@ -777,7 +1204,13 @@ class KPI(TenantBase):
     # Target
     target_type: Mapped[Optional[str]] = mapped_column(String(32))  # static|measure|prior_period|expression|null
     target_value: Mapped[Optional[float]] = mapped_column(Numeric)
-    target_measure_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    # Bug-6673: FK + ondelete=SET NULL so deleting the referenced measure
+    # NULLs this column instead of leaving a dangling UUID.
+    target_measure_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("measures.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     target_expression: Mapped[Optional[str]] = mapped_column(Text)
     target_period: Mapped[Optional[str]] = mapped_column(String(32))
 
@@ -804,7 +1237,13 @@ class KPI(TenantBase):
     evaluation_order: Mapped[Optional[int]] = mapped_column(Integer)
 
     # Time dimension binding
-    time_dimension_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    # Bug-6673: FK + ondelete=SET NULL so deleting the referenced dimension
+    # NULLs this column instead of leaving a dangling UUID.
+    time_dimension_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dimensions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     # Business builder definition (v3)
     business_definition: Mapped[Optional[dict]] = mapped_column(JSONB)
@@ -878,6 +1317,80 @@ class KPILatest(TenantBase):
     trend_pct: Mapped[Optional[float]] = mapped_column(Numeric)
     formatted_value: Mapped[Optional[str]] = mapped_column(String(128))
     evaluated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, server_default=func.now())
+    # Bug-7982 (Codex re-gate residual 2): the deployed-version + deploy-epoch the
+    # cached value was evaluated AGAINST. $KPIs must serve a row only when these
+    # match the model's CURRENT deployed pointer/epoch — otherwise a
+    # definition-changing revert (which bumps deploy_epoch) would keep serving the
+    # stale value computed under the OLD definition (mixed-version wrong number).
+    # NULL means "epoch unknown" and is treated as incompatible (fail-closed).
+    evaluated_for_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    evaluated_for_epoch: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Bug-7982 (Codex re-gate R6, finding 1): within-epoch write ordering. The
+    # epoch guard (evaluated_for_epoch) only orders writes ACROSS epochs; two
+    # writers evaluating the SAME epoch race, and whichever COMMITS last wins
+    # regardless of which read fresher source data. ``eval_started_at`` is
+    # captured ONCE when an evaluation begins (before any source read), so the
+    # upsert guard can order by the tuple (evaluated_for_epoch, eval_started_at):
+    # a later-STARTING evaluation is never overwritten by an earlier-starting one
+    # that merely commits after it. NULL = legacy/unstamped row, treated as the
+    # oldest (any stamped write may overwrite it within the same epoch).
+    eval_started_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMPTZ, nullable=True
+    )
+    # Bug-7982 (Codex re-gate R7, finding 2): ``eval_started_at`` came from
+    # ``clock_timestamp()``, which is NOT unique (82,242 duplicates in 100k live
+    # samples) — an exact tie let the ``<=`` ordering comparison admit both
+    # writers, so last-commit-wins resurfaced. ``eval_generation`` is a strictly
+    # increasing, never-repeating value from the tenant-schema sequence
+    # ``kpi_eval_generation_seq``, allocated ONCE at evaluation start: a TOTAL
+    # order over evaluations. Equal generations mean the SAME logical evaluation
+    # (the sweep threads its token into evaluate-batch so both writes share one),
+    # which is exactly the case the ordering guard must admit. NULL = legacy row
+    # written before migration 0183, treated as the oldest. ``eval_started_at``
+    # remains as metadata and as the documented fallback order.
+    eval_generation: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+
+
+class PendingKpiReeval(TenantBase):
+    """Durable outbox for post-deploy/revert KPI re-evaluation (Bug-7982 finding 6).
+
+    A deploy/revert bumps ``deploy_epoch``; the ``$KPIs`` serve predicate then
+    withholds every ``kpi_latest`` row stamped with the OLD epoch until it is
+    re-evaluated under the new epoch. The in-process fire-and-forget re-eval
+    trigger closes that gap in seconds on the happy path, but it is NON-DURABLE:
+    if the process exits between the deploy/revert commit and the background task
+    actually running, the trigger is silently lost and ``$KPIs`` stays withheld
+    until the next hourly sweep, with no operator-visible signal.
+
+    This row is written INSIDE the deploy/revert transaction (so it commits
+    atomically with the epoch bump). On the happy path the trigger deletes it
+    after a successful re-eval. If it survives (process died / trigger failed),
+    the scheduler sweep drains it: it logs a WARNING that a re-eval is overdue,
+    fires the re-eval, and deletes the row.
+    """
+    __tablename__ = "pending_kpi_reeval"
+    __table_args__ = (
+        UniqueConstraint("model_id", name="uq_pending_kpi_reeval_model"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    model_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("models.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # The deploy epoch this re-eval was requested for. Lets the sweep skip a row
+    # that a later deploy has already superseded (a newer epoch is pending).
+    requested_for_epoch: Mapped[int] = mapped_column(Integer, nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
 
 
 class NamedSetVersion(TenantBase):
@@ -999,12 +1512,136 @@ class Join(TenantBase):
     model_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("models.id", ondelete="CASCADE"), nullable=False, index=True)
     left_table_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("model_tables.id", ondelete="CASCADE"), nullable=False, index=True)
     right_table_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("model_tables.id", ondelete="CASCADE"), nullable=False, index=True)
-    join_type: Mapped[str] = mapped_column(String(32), nullable=False, default="many_to_one")
+    # Join ORIENTATION — which rows survive: inner / left / right / full.
+    #
+    # This field used to default to ``many_to_one``, which is a CARDINALITY
+    # label, not a join type. Rendering an undeclared token as an un-flipped
+    # LEFT JOIN makes the preserved relation depend on the compiler's base
+    # table rather than on the model, so no route can prove two plans over the
+    # same model hold the same rows. The default is now ``inner`` — the value
+    # ``JoinCreate`` has always applied on the write path and the value the
+    # JoinsPanel preselects — so the two orthogonal properties can no longer be
+    # conflated by any new row. Existing rows may still carry a legacy token;
+    # ``shared.semantic.join_keyword.join_keyword`` keeps coercing those to
+    # their historical rendering (contract invariant 4) rather than raising.
+    # See docs/architecture/architecture_join-orientation-and-cardinality.md.
+    join_type: Mapped[str] = mapped_column(String(32), nullable=False, default="inner")
+    # Join CARDINALITY — how many rows on each side match:
+    # one_to_one / one_to_many / many_to_one / many_to_many. NULL means the
+    # modeller has not declared it. Orthogonal to ``join_type`` (invariant 3):
+    # cardinality NEVER changes the rendered SQL keyword. It is fan-out
+    # metadata. Consumers today, all through
+    # ``shared.semantic.join_keyword.edge_cardinality``: the many-to-many
+    # compatibility guard (``semantic/field_compatibility.py``), the two
+    # drill-through join-path classifiers (``model-service api/measures.py``,
+    # ``query-router drill/semantic_builder.py``), and the LookML export's
+    # ``relationship`` derivation (``scripts/lookml_export/model.py``, which
+    # also inverts it when the traversal reaches this edge from its declared
+    # RIGHT endpoint — Bug-8654/Bug-8641). It also round-trips through the
+    # YAML snapshot as its own ``cardinality`` key. No FROM-clause builder
+    # reads this field.
+    cardinality: Mapped[Optional[str]] = mapped_column(String(32))
     left_column_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("model_columns.id", ondelete="CASCADE"), nullable=False, index=True)
     right_column_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("model_columns.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Join POPULATION PARTICIPATION — Bug-8615, governance phase G1. The
+    # modeller-declared answer to "is this join's row-filtering / row-
+    # multiplying effect part of what this model MEANS?". Orthogonal to both
+    # ``join_type`` (which rows survive the join) and ``cardinality`` (how many
+    # rows match): those describe the join, this declares the modeller's
+    # INTENT about the model's row population. Contract:
+    # docs/architecture/architecture_join-population-governance.md (contract 2).
+    #
+    #   preserve_base_rows  (DEFAULT) may still be elided — historical behaviour
+    #   population_defining           must never be elided (wired in phase G3)
+    #   enrichment_only               may be elided; fan-out accepted
+    #   undeclared                    no modeller decision; the deploy-time
+    #                                 validator reports a non-neutral one
+    #
+    # Vocabulary lives in ``shared.schemas.domains.aggregates_security``
+    # (``POPULATION_PARTICIPATION_VALUES``); it is deliberately NOT imported
+    # here so this module stays dependency-free, exactly like ``join_type``.
+    #
+    # The default is what every pre-existing row gets (migration 0190 applies
+    # the same server default), so adding this column changes NO served
+    # numbers. ``server_default`` is permanent on purpose: the snapshot
+    # rehydrate path issues a raw ``insert(Join).values(**row)`` whose row
+    # omits this key for any snapshot saved before the column existed.
+    population_participation: Mapped[str] = mapped_column(
+        String(32), nullable=False,
+        default="preserve_base_rows",
+        server_default=text("'preserve_base_rows'"),
+    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
 
     model: Mapped[Model] = relationship(back_populates="joins")
+
+
+class JoinPopulationCheck(TenantBase):
+    """Deploy-time row-loss / row-multiplication evidence for ONE join.
+
+    Bug-8615 phase G1. LIVE OPERATIONAL STATE, not model content: it describes
+    the SOURCE data's current shape under a specific deployed version + deploy
+    epoch, so it is deliberately EXCLUDED from model snapshots (registered as
+    such in ``model_snapshot/tests/test_snapshot_coverage_guard.py``) and is
+    re-established by the next deploy after a revert/import.
+
+    Exactly one CURRENT row per join (``join_id`` unique — the same shape
+    ``source_join_statistics`` uses). The deploy hook replaces the whole
+    model's set inside the deploy transaction, so "no row for a join" honestly
+    means "not evaluated at the last deploy" rather than "evaluated clean".
+
+    Rows cascade-delete with their ``Join`` (which the canonical model delete
+    removes explicitly before ``models``) and with their ``Model``, so no extra
+    step is required in ``shared/model_snapshot/cascade_delete.py``.
+
+    WARN-ONLY in this phase: a ``BLOCKED`` row is computed and surfaced but
+    never prevents a deploy (governance plan phase G5 owns block mode).
+    """
+
+    __tablename__ = "join_population_checks"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    join_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("joins.id", ondelete="CASCADE"),
+        nullable=False, unique=True,
+    )
+    # Denormalised so the health read and the deploy-time replace need no
+    # sub-select through ``joins``. CASCADE from both sides keeps it consistent.
+    model_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("models.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    deployed_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("model_versions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    deploy_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # neutral | filtering | multiplying (shared.semantic.join_population_validator)
+    classification: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The join's declared population_participation AT CHECK TIME, so a reader
+    # can see what the verdict was computed against.
+    population_participation: Mapped[str] = mapped_column(String(32), nullable=False)
+    # OK | WARNING | BLOCKED — this join's contribution to the model rollup.
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    # True only when the source probe actually returned numbers. False means the
+    # ratios below are NULL and the verdict was reached conservatively.
+    measured: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    row_loss_ratio: Mapped[Optional[float]] = mapped_column(Float)
+    row_mult_ratio: Mapped[Optional[float]] = mapped_column(Float)
+    # max(row_loss_ratio, row_mult_ratio) — the value compared to the threshold.
+    row_effect_ratio: Mapped[Optional[float]] = mapped_column(Float)
+    # Stable machine reason code (the validator's REASON_* constants).
+    reason: Mapped[Optional[str]] = mapped_column(String(64))
+    # Hash of EVERY join attribute the classification was computed from
+    # (``join_population_validator.join_definition_fingerprint``). A verdict is
+    # only current while the join it measured is unchanged, and the deploy
+    # epoch alone does not say that: ``PATCH /joins/{id}`` can change
+    # ``join_type`` or a join column — direct classifier inputs — without
+    # bumping the epoch. Comparing one hand-picked field is how that gap first
+    # appeared, so the health surface compares this instead. NULL only for a
+    # row written before this column existed.
+    inputs_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
+    checked_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
 
 
 class AggregateDefinition(TenantBase):
@@ -1018,6 +1655,78 @@ class AggregateDefinition(TenantBase):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     grain: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     grain_physical_cols: Mapped[Optional[list]] = mapped_column(JSONB)
+    # --- Derived-grain routing manifests (Bug-7359, spec §5.2/§5.3, Phase 3) ---
+    # These are IMMUTABLE build metadata describing what was actually materialised
+    # (I8): they are written in the SAME lifecycle transaction as the physical
+    # artifact and its verified evidence. Descriptive only in Phase 3 — no route
+    # reads them yet (serving is shadow-only through Phase 4).
+    #   grain_keys        ordered list of MaterializedGrainKey dicts (spec §5.2).
+    #   attribute_edges   list of MaterializedAttributeEdge dicts naming each
+    #                     carried key->detail relationship, evidence + run + hash.
+    #   passenger_columns list of passenger column descriptors (detail carried
+    #                     beside its key; NOT an independent grain key).
+    grain_keys: Mapped[Optional[list]] = mapped_column(JSONB)
+    attribute_edges: Mapped[Optional[list]] = mapped_column(JSONB)
+    passenger_columns: Mapped[Optional[list]] = mapped_column(JSONB)
+    # LIVE pointer to the refresh run whose built rows the current manifest +
+    # verified edges describe (spec §5.3). Set ATOMICALLY only after the
+    # artifact-local check passes over the built artifact. Deliberately EXCLUDED
+    # from the snapshot serialiser and CLEARED on import/clone/rehydrate — a
+    # rehydrated definition has no physical run and must re-earn trust (§5.3, I8).
+    active_refresh_run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("aggregate_refresh_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # F-013-02 (Bug-8250): IMMUTABLE artifact-to-version binding. The exact
+    # deployed model version + epoch this physical artifact was BUILT FOR,
+    # written atomically at successful refresh from the model's then-current
+    # deploy pointer. The runtime matcher REQUIRES an exact match against the
+    # model's current (deployed_version_id, deploy_epoch); a fresh artifact
+    # built under a previous definition must NOT serve after a deploy/revert.
+    # Freshness is not compatibility. Like active_refresh_run_id these are LIVE
+    # build metadata: snapshot-EXCLUDED and CLEARED on import/clone/rehydrate,
+    # so a rehydrated artifact has no build for the current version and stays
+    # non-servable until a rebuild re-earns the binding. NULL = never built for
+    # any deployed version (unmaterialised, or built while undeployed).
+    built_for_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    built_for_epoch: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Bug-8481: LIVE physical-build storage identity. Records the exact
+    # ``{target_id, project_connection_id, routing_fingerprint}`` captured before
+    # CTAS/DELETE+INSERT began. A completion re-proves the live target and
+    # connection under row locks before it may restore ACTIVE; mismatch leaves
+    # the aggregate stale and non-serving. Snapshot-EXCLUDED/import-CLEARED like
+    # the version binding because an exported definition carries no physical
+    # table at the recorded database.
+    built_for_storage_binding: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # Bug-8602: LIVE physical-build SOURCE identity — the sibling of
+    # ``built_for_storage_binding`` for the other side of the build. Records the
+    # ``{model_id, source_connection_id, source_connection_project_id,
+    # routing_fingerprint}`` captured before the CTAS read its first row, i.e.
+    # WHICH database these rows came FROM. The project id carries the Bug-5325
+    # cross-project refusal through to serve time, where the source connection
+    # is never dialled and nothing else would re-check it.
+    # A cross-database aggregate (source connection A, target connection B) has
+    # no DataTarget on A, so the target binding cannot speak for it at all: an
+    # admin editing A's host/database would otherwise leave the aggregate
+    # serving rows materialised from the OLD database while the source-route
+    # fallback for the same query reads the NEW one. Snapshot-EXCLUDED and
+    # import-CLEARED like the other build bindings.
+    built_for_source_binding: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # Bug-7903: DURABLE pre-refresh status snapshot. The uniform refresh
+    # pending-guard flips a servable aggregate to "pending" (committed,
+    # non-servable) BEFORE any physical change and restores it AFTER the new
+    # run + manifest + VERIFIED evidence commit. Because a process crash loses
+    # any in-memory snapshot, the prior status is persisted here in the SAME
+    # committed transaction as the pending flip, so recovery (the sweep re-running
+    # a stuck-"pending" aggregate) restores it to EXACTLY its prior state — never
+    # re-activating one that was "disabled"/"retired". Also set by the rehydrator
+    # when it forces active/disabled aggregates to pending on import, so the first
+    # rebuild restores the imported state faithfully. NULL when no refresh is in
+    # flight; cleared on the terminal restore.
+    refresh_prior_status: Mapped[Optional[str]] = mapped_column(String(32))
     invalid_reason: Mapped[Optional[str]] = mapped_column(Text)
     source_row_count: Mapped[Optional[int]] = mapped_column(BigInteger)
     agg_row_count: Mapped[Optional[int]] = mapped_column(BigInteger)
@@ -1061,7 +1770,13 @@ class AggregateDefinition(TenantBase):
     target: Mapped[DataTarget] = relationship(back_populates="aggregate_definitions")
     columns: Mapped[list[AggregateColumn]] = relationship(back_populates="aggregate", cascade="all, delete-orphan")
     refresh_policy: Mapped[Optional[AggregateRefreshPolicy]] = relationship(back_populates="aggregate", uselist=False, cascade="all, delete-orphan")
-    refresh_runs: Mapped[list[AggregateRefreshRun]] = relationship(back_populates="aggregate", cascade="all, delete-orphan")
+    # Bug-7359: active_refresh_run_id adds a SECOND FK path between
+    # aggregate_definitions and aggregate_refresh_runs, so the historical
+    # runs relationship must name its FK explicitly to stay unambiguous.
+    refresh_runs: Mapped[list[AggregateRefreshRun]] = relationship(
+        back_populates="aggregate", cascade="all, delete-orphan",
+        foreign_keys="AggregateRefreshRun.aggregate_definition_id",
+    )
 
 
 class AggregateColumn(TenantBase):
@@ -1077,6 +1792,111 @@ class AggregateColumn(TenantBase):
 
     aggregate: Mapped[AggregateDefinition] = relationship(back_populates="columns")
     measure: Mapped[Optional["Measure"]] = relationship(foreign_keys=[measure_id])
+    quantile_coverage: Mapped[Optional["QuantileCoverage"]] = relationship(
+        back_populates="aggregate_column",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class QuantileCoverage(TenantBase):
+    """Versioned semantic identity of one materialised pNN aggregate column.
+
+    Spec §4.2 (Bug-6969/5891). A ``pNN`` physical-name suffix proves only a
+    conventional fraction — NOT continuous vs discrete method, ASC vs DESC order,
+    null policy, input expression, value type, or build exactness (Gap D). This
+    row is the AUTHORITATIVE proof input the router's ``QuantileServeProof``
+    consumes; a pNN ``AggregateColumn`` WITHOUT a coverage row is treated as
+    ``exactness='unknown'`` and is never served in exact mode (I8).
+
+    One-to-one with the pNN ``AggregateColumn`` it describes. Written in the same
+    lifecycle transaction as the physical column (I8: build evidence is recorded
+    at materialisation, never inferred later from the current connection).
+    Fractions are stored as exact decimal TEXT (never a float) so
+    ``PERCENTILE_CONT(0.3333333333)`` can never alias a column through binary
+    rounding (§16.14).
+    """
+    __tablename__ = "quantile_coverage"
+    __table_args__ = (
+        UniqueConstraint(
+            "aggregate_column_id", name="uq_quantile_coverage_column"
+        ),
+        CheckConstraint(
+            "method IN ('continuous', 'discrete')",
+            name="ck_quantile_coverage_method",
+        ),
+        CheckConstraint(
+            "order_direction IN ('asc', 'desc')",
+            name="ck_quantile_coverage_direction",
+        ),
+        CheckConstraint(
+            "exactness IN ('exact', 'bounded_approximate', 'unknown')",
+            name="ck_quantile_coverage_exactness",
+        ),
+        CheckConstraint(
+            "null_policy IN ('ignore_nulls', 'respect_nulls')",
+            name="ck_quantile_coverage_null_policy",
+        ),
+        # Fraction is exact decimal TEXT in [0,1]; a simple format guard so a
+        # malformed producer write cannot persist a non-numeric fraction that the
+        # loader would then have to reject at query time.
+        CheckConstraint(
+            r"fraction ~ '^[0-9]+(\.[0-9]+)?$'",
+            name="ck_quantile_coverage_fraction_format",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    aggregate_column_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("aggregate_columns.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Denormalised aggregate FK so the router can load all coverage for a
+    # candidate in one query without joining through columns.
+    aggregate_definition_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("aggregate_definitions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    measure_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("measures.id", ondelete="SET NULL"), index=True
+    )
+    semantic_measure_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    input_expression_fingerprint: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Exact decimal TEXT, e.g. '0.5', '0.95', '0.3333333333'. NEVER a float.
+    fraction: Mapped[str] = mapped_column(String(64), nullable=False)
+    method: Mapped[str] = mapped_column(String(16), nullable=False)  # continuous | discrete
+    order_direction: Mapped[str] = mapped_column(String(4), nullable=False, default="asc")
+    null_policy: Mapped[str] = mapped_column(String(16), nullable=False, default="ignore_nulls")
+    value_type: Mapped[Optional[str]] = mapped_column(String(64))
+    # Physical column is "value_collation" (bare "collation" is a reserved
+    # keyword in PostgreSQL and breaks CREATE TABLE — Bug-7858); the Python
+    # attribute stays `collation` so contract/producer/consumer code is unchanged.
+    collation: Mapped[Optional[str]] = mapped_column("value_collation", String(64))
+    timezone: Mapped[Optional[str]] = mapped_column(String(64))
+    # exact | bounded_approximate | unknown. Legacy/backfilled rows are 'unknown'
+    # and never served in exact mode until rebuilt with certified evidence (I8).
+    exactness: Mapped[str] = mapped_column(String(24), nullable=False, default="unknown")
+    algorithm: Mapped[Optional[str]] = mapped_column(String(32))
+    algorithm_version: Mapped[Optional[str]] = mapped_column(String(32))
+    build_source_dialect: Mapped[Optional[str]] = mapped_column(String(32))
+    build_model_version: Mapped[Optional[str]] = mapped_column(String(64))
+    refresh_run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("aggregate_refresh_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    coverage_schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now(), onupdate=func.now())
+
+    aggregate_column: Mapped[AggregateColumn] = relationship(
+        back_populates="quantile_coverage",
+        foreign_keys=[aggregate_column_id],
+    )
 
 
 class AggregateRefreshPolicy(TenantBase):
@@ -1088,6 +1908,10 @@ class AggregateRefreshPolicy(TenantBase):
     cron_expression: Mapped[Optional[str]] = mapped_column(String(128))
     incremental_column: Mapped[Optional[str]] = mapped_column(String(255))
     incremental_lookback: Mapped[Optional[int]] = mapped_column(Integer)
+    incremental_append_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    full_rebuild_interval_days: Mapped[Optional[int]] = mapped_column(Integer)
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now(), onupdate=func.now())
@@ -1143,7 +1967,10 @@ class AggregateRefreshRun(TenantBase):
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     triggered_by: Mapped[str] = mapped_column(String(32), nullable=False, default="scheduler")
 
-    aggregate: Mapped[AggregateDefinition] = relationship(back_populates="refresh_runs")
+    aggregate: Mapped[AggregateDefinition] = relationship(
+        back_populates="refresh_runs",
+        foreign_keys=[aggregate_definition_id],
+    )
 
 
 class AggregateLifecycleEvent(TenantBase):
@@ -1181,6 +2008,71 @@ class AggregateLifecycleEvent(TenantBase):
     )
 
 
+class PhysicalCleanupTask(TenantBase):
+    """Detached durable outbox for aggregate/pocket target-table cleanup.
+
+    The row is created in the same tenant-metadata transaction that deletes a
+    model or replaces a project, but target DDL runs only after that transaction
+    commits.  Every correlation identifier is deliberately a plain UUID rather
+    than a foreign key: model/project/connection/definition rows may all be
+    deleted by the owning transaction, while this retry and audit evidence must
+    survive.  ``encrypted_credentials`` remains inside the platform's existing
+    Fernet credential envelope; ``connection_config`` is the validated
+    non-secret ProjectConnection config snapshot.
+    """
+
+    __tablename__ = "physical_cleanup_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            # F-013-07: named_query is the third materialised family whose
+            # physical table is dropped through this outbox (migration 0214).
+            "artifact_kind IN ('aggregate', 'pocket', 'named_query')",
+            name="ck_physical_cleanup_tasks_artifact_kind",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'failed', 'succeeded')",
+            name="ck_physical_cleanup_tasks_status",
+        ),
+        Index(
+            "ix_physical_cleanup_tasks_due",
+            "status", "next_attempt_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    artifact_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    artifact_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    model_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    connection_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connection_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    connection_display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    encrypted_credentials: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    connection_config: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    target_schema: Mapped[str] = mapped_column(String(512), nullable=False)
+    qualified_table_name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default=text("'pending'")
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    requested_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ)
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMPTZ, nullable=True, index=True
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+
+
 class PocketDefinition(TenantBase):
     __tablename__ = "pocket_definitions"
     __table_args__ = (
@@ -1212,6 +2104,15 @@ class PocketDefinition(TenantBase):
     refresh_cron: Mapped[Optional[str]] = mapped_column(String(128))
     incremental_column: Mapped[Optional[str]] = mapped_column(String(255))
     incremental_lookback_hours: Mapped[Optional[int]] = mapped_column(Integer)
+    # Bug-8719: when True the fact table primary key is included in the pocket's
+    # materialised output even though it is hidden in the model. Required for
+    # incremental refresh (the row-key DELETE needs the PK to match rows). Auto-set
+    # when incremental_column + incremental_lookback_hours are both configured and
+    # the fact PK is hidden. Not user-facing — the Pocket drawer shows an
+    # informational message instead of a checkbox.
+    include_fact_key: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     ttl_days: Mapped[int] = mapped_column(Integer, nullable=False, default=14)
     # F-005-19 (Bug-2260): a freshly constructed pocket has NO materialised
     # table yet, so the ORM default must be "stale" (unmaterialised) not "fresh".
@@ -1220,6 +2121,47 @@ class PocketDefinition(TenantBase):
     # exist. Both current writers set status="stale" explicitly; this aligns the
     # default with that contract.
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="stale")
+    # --- Derived-grain routing row manifest (Bug-7359, spec §5.2/§5.3, Phase 3) ---
+    # Row-preserving pockets get a SEPARATE versioned manifest rather than reusing
+    # aggregate grain_keys (spec §5.2): deployed model/version, exact row-population
+    # definition + fingerprint, ordered materialised column IDs with physical
+    # names/types/nullability, source semantic context, build/refresh id + edge
+    # descriptors, and manifest hash. A pocket without this manifest keeps its
+    # legacy routes but cannot accept a derived-expression route.
+    #
+    # SECURITY-LOAD-BEARING since Bug-8018/Bug-8393 — no longer descriptive, and
+    # pockets ARE routable under active row-level security when it proves them
+    # safe. ``row_manifest["columns"]`` is the authoritative record of the output
+    # columns the built pocket table exposes; the query-router serves a pocket
+    # under RLS ONLY when every security dimension column appears there (matched
+    # EXACTLY, case-sensitive, as ``logical_name or physical_column``). Written by
+    # ``shared/pocket/row_manifest.write_pocket_row_manifest`` on every completed
+    # pocket refresh, in the same transaction as ``active_refresh_run_id``.
+    row_manifest: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # LIVE pointer to the pocket refresh run whose rows the manifest describes.
+    # Snapshot-EXCLUDED + import-CLEARED, same contract as the aggregate pointer.
+    # Unlike the aggregate pointer this is NOT an attribute-edge trust pointer: it
+    # is advanced on EVERY completed pocket refresh and cleared on a failed one
+    # (Bug-8393), which is what makes ``(status, active_refresh_run_id)`` a sound
+    # generation stamp for the pocket's physical table (Bug-8392).
+    active_refresh_run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pocket_refresh_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # F-013-03 / F-005-01 (Bug-8250): IMMUTABLE artifact-to-version binding, same
+    # contract as the aggregate columns above. A fresh pocket built under a
+    # previous model definition must NOT serve after a deploy/revert — the
+    # matcher requires an exact match against the model's current
+    # (deployed_version_id, deploy_epoch). Snapshot-EXCLUDED + import-CLEARED, so
+    # a rehydrated pocket must rebuild before re-entry. NULL = never built for a
+    # deployed version. Distinct from row_manifest: that one proves what the
+    # build MATERIALISED (and gates row-security serving — see above); these
+    # columns are the mandatory, always-written, indexed VERSION gate.
+    built_for_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    built_for_epoch: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     failure_reason: Mapped[Optional[str]] = mapped_column(Text)
     last_refresh_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ)
     last_access_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ)
@@ -1240,7 +2182,12 @@ class PocketDefinition(TenantBase):
     model: Mapped[Model] = relationship(back_populates="pockets")
     target: Mapped[DataTarget] = relationship(back_populates="pocket_definitions")
     predicates: Mapped[list[PocketPredicate]] = relationship(back_populates="pocket", cascade="all, delete-orphan")
-    refresh_runs: Mapped[list[PocketRefreshRun]] = relationship(back_populates="pocket", cascade="all, delete-orphan")
+    # Bug-7359: active_refresh_run_id adds a SECOND FK path between
+    # pocket_definitions and pocket_refresh_runs; name the historical-runs FK.
+    refresh_runs: Mapped[list[PocketRefreshRun]] = relationship(
+        back_populates="pocket", cascade="all, delete-orphan",
+        foreign_keys="PocketRefreshRun.pocket_definition_id",
+    )
     refresh_policy_row: Mapped[Optional["PocketRefreshPolicy"]] = relationship(
         back_populates="pocket", cascade="all, delete-orphan", uselist=False
     )
@@ -1282,7 +2229,10 @@ class PocketRefreshRun(TenantBase):
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     triggered_by: Mapped[str] = mapped_column(String(32), nullable=False, default="scheduler")
 
-    pocket: Mapped[PocketDefinition] = relationship(back_populates="refresh_runs")
+    pocket: Mapped[PocketDefinition] = relationship(
+        back_populates="refresh_runs",
+        foreign_keys=[pocket_definition_id],
+    )
 
 
 class PocketRefreshPolicy(TenantBase):
@@ -1312,6 +2262,169 @@ class PocketRefreshPolicy(TenantBase):
 
 
 # ---------------------------------------------------------------------------
+# Named Queries (governed modeler-authored semantic queries)
+# ---------------------------------------------------------------------------
+
+class NamedQuery(TenantBase):
+    """A governed, named semantic query against a base model.
+
+    The DEFINITION half of a Named Query: model-bound logical SQL
+    (``definition_sql``, never raw dialect SQL), a derived output-column
+    schema, a serving shape, caps, and ownership. Serialised into the
+    deployed snapshot (invariant 7). The MATERIALISATION half lives on
+    :class:`NamedQueryArtifact`, on the shared artifact substrate — it is NOT
+    a pocket or aggregate subtype.
+
+    ``shape`` is derived at validate time: ``projection`` (row-slice; no
+    GROUP BY, no aggregate function in the projection) or ``aggregated``.
+    It drives which existing security proof is reused at serve time.
+    """
+
+    __tablename__ = "named_queries"
+    __table_args__ = (
+        Index(
+            "uq_named_queries_model_lower_name",
+            "model_id",
+            func.lower(text("name")),
+            unique=True,
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    model_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("models.id", ondelete="CASCADE"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[Optional[str]] = mapped_column(String(255))
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    display_folder: Mapped[Optional[str]] = mapped_column(String(255))
+    definition_sql: Mapped[str] = mapped_column(Text, nullable=False)
+    # [{"name": str, "type": "string|number|boolean|date|timestamp"}] —
+    # derived at validate time from the bound select list. The authoritative
+    # physical column types are recorded in the artifact's row_manifest on
+    # every completed refresh.
+    output_columns: Mapped[Optional[list]] = mapped_column(JSONB)
+    shape: Mapped[str] = mapped_column(String(16), nullable=False, default="projection")
+    row_cap: Mapped[Optional[int]] = mapped_column(Integer)
+    column_cap: Mapped[Optional[int]] = mapped_column(Integer)
+    certification_status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    created_by: Mapped[Optional[str]] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now(), onupdate=func.now())
+
+    model: Mapped["Model"] = relationship(back_populates="named_queries")
+    artifact: Mapped[Optional["NamedQueryArtifact"]] = relationship(
+        back_populates="named_query", cascade="all, delete-orphan", uselist=False
+    )
+    refresh_policy_row: Mapped[Optional["NamedQueryRefreshPolicy"]] = relationship(
+        back_populates="named_query", cascade="all, delete-orphan", uselist=False
+    )
+    refresh_runs: Mapped[list["NamedQueryRefreshRun"]] = relationship(
+        back_populates="named_query", cascade="all, delete-orphan",
+        foreign_keys="NamedQueryRefreshRun.named_query_id",
+    )
+
+
+class NamedQueryArtifact(TenantBase):
+    """The materialisation half of a Named Query (shared artifact substrate).
+
+    Mirrors the :class:`PocketDefinition` artifact columns: physical result
+    table on the target, an output-column manifest, target/build/version
+    bindings, lifecycle status and refresh state. Lifecycle CHECK is the same
+    ``fresh|stale|invalidating|failed`` set as pockets.
+    """
+
+    __tablename__ = "named_query_artifacts"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('fresh', 'stale', 'invalidating', 'failed')",
+            name="ck_named_query_artifacts_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    named_query_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("named_queries.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    target_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("data_targets.id"), nullable=False, index=True)
+    physical_table_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    target_schema: Mapped[Optional[str]] = mapped_column(String(255))
+    # Output-column manifest, same shape as the pocket row manifest
+    # (``shared/semantic/artifact_manifest.RowManifest``). SECURITY-LOAD-BEARING:
+    # the query-router serves a projection-shaped Named Query to an RLS
+    # principal ONLY when every security dimension column appears in
+    # ``row_manifest.columns`` (matched case-sensitively).
+    row_manifest: Mapped[Optional[dict]] = mapped_column(JSONB)
+    row_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="stale")
+    failure_reason: Mapped[Optional[str]] = mapped_column(Text)
+    active_refresh_run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("named_query_refresh_runs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    last_refresh_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ)
+    retired_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ)
+    # Immutable artifact-to-version binding — same contract as pocket/aggregate
+    # columns. A fresh artifact built under a previous model definition must
+    # not serve after a deploy/revert. Snapshot-EXCLUDED as a live pointer;
+    # the snapshot carries only the artifact identity pointer.
+    built_for_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    built_for_epoch: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    named_query: Mapped[NamedQuery] = relationship(back_populates="artifact")
+    target: Mapped[DataTarget] = relationship()
+
+
+class NamedQueryRefreshPolicy(TenantBase):
+    """1:1 schedule policy for a Named Query (mirror PocketRefreshPolicy).
+
+    v1 policy types: ``schedule`` (cron) and ``manual``. ``is_enabled`` lives
+    here, not on the definition, so "query exists" and "schedule active" stay
+    independent.
+    """
+
+    __tablename__ = "named_query_refresh_policies"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    named_query_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("named_queries.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    cron_expression: Mapped[Optional[str]] = mapped_column(String(128))
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now(), onupdate=func.now())
+
+    named_query: Mapped[NamedQuery] = relationship(back_populates="refresh_policy_row")
+
+
+class NamedQueryRefreshRun(TenantBase):
+    """Run history for a Named Query refresh (mirror PocketRefreshRun)."""
+
+    __tablename__ = "named_query_refresh_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    named_query_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("named_queries.id", ondelete="CASCADE"), nullable=False,
+        index=True,
+    )
+    refresh_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    started_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
+    completed_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ)
+    rows_written: Mapped[Optional[int]] = mapped_column(BigInteger)
+    bytes_processed: Mapped[Optional[int]] = mapped_column(BigInteger)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+    triggered_by: Mapped[str] = mapped_column(String(32), nullable=False, default="scheduler")
+
+    named_query: Mapped[NamedQuery] = relationship(
+        back_populates="refresh_runs",
+        foreign_keys=[named_query_id],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Row security (Phase 5.1)
 # ---------------------------------------------------------------------------
 
@@ -1328,9 +2441,22 @@ class RowSecurityRule(TenantBase):
       ``dimension_col IN (SELECT value_col FROM mapping_table WHERE
       user_col = :user_id)``, compiled by the router.
 
-    Enforcement is a subquery wrap applied as the final pass in
-    ``query_rewriter.py``. Any active rule also disables aggregate + pocket
-    matching for that execution.
+    Enforcement (F-007-01) injects the compiled predicate into the ``WHERE`` of
+    EVERY ``SELECT`` that scans a physical table -- each UNION branch, scalar
+    subquery, subquery-first FROM and CTE body -- so it always applies before
+    any ``LIMIT``. It is NOT the outer ``SELECT * FROM (<planned>) AS __ts_sec``
+    subquery wrap this docstring used to describe; two query-router tests assert
+    that alias is absent from the rewritten query.
+
+    An active rule does NOT disable the aggregate and pocket matchers
+    (Bug-7033 / Bug-8018, corrected here by Bug-8397). Each candidate must
+    instead PROVE it can carry the same predicate -- an aggregate needs every
+    security dimension column in its grain
+    (``router._aggregate_is_rls_safe``), a pocket needs a row-preserving
+    ``SELECT *`` whose ``row_manifest`` records every security column, matched
+    case-sensitively (``router._pocket_is_rls_safe``) -- and anything unproven
+    routes to source with the predicate injected there. A shape that cannot be
+    proved fully constrained is rejected, never run unfiltered.
     """
 
     __tablename__ = "row_security_rules"
@@ -1388,6 +2514,19 @@ class QueryLog(TenantBase):
     execution_ms: Mapped[Optional[int]] = mapped_column(Integer)
     rows_returned: Mapped[Optional[int]] = mapped_column(BigInteger)
     bytes_processed: Mapped[Optional[int]] = mapped_column(BigInteger)
+    # Bug-6426: how this row's result was served.
+    #   "live"      — the route (source/aggregate/pocket) actually executed and
+    #                 its measured execution_ms / bytes_processed are real.
+    #   "cache_hit" — the result was re-served from the in-TTL result cache; no
+    #                 route executed, so execution_ms / bytes_processed are 0 and
+    #                 are NOT real measurements.
+    # ``route_type`` still records the ORIGINAL route the cached value took (so a
+    # cached aggregate hit keeps route_type="aggregate" for volume/top-user
+    # analytics), but acceleration-rate and cost-savings rollups MUST separate
+    # cache_hit rows from live acceleration — a cache re-serve is not a new
+    # acceleration event and its zeros must never be averaged into savings.
+    # NULL is treated as "live" for backfilled historical rows.
+    cache_status: Mapped[Optional[str]] = mapped_column(String(16), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="success", server_default="success", index=True)
     error_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     error_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -1430,6 +2569,22 @@ class QueryMissLog(TenantBase):
     # Additive and pocket-specific: the aggregate optimizer (which groups by
     # grain/measures and intentionally sums across literals) ignores this column.
     predicate_variants_json: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    # Bug-8071: this row is a ROLLUP keyed on the literal-free fingerprint, and
+    # the conflict-update OVERWRITES ``miss_reason`` on every repeat. One row was
+    # therefore serving as both cumulative candidate state and event history,
+    # and only the last event survived: a pattern that missed 400 times for a
+    # missing grain and 3 times for staleness read as "stale". A modeller could
+    # not prove why a query kept missing, and the optimizer could not tell an
+    # ABSENT aggregate (build one) from an existing-but-unservable one (a new
+    # aggregate fixes nothing).
+    #
+    # Bounded per-reason history: reason entries plus an optional
+    # ``{"class_totals": {"build": n, "repair": n, "ineligible": n}, ...}``
+    # summary preserving remediation counts for evicted or legacy events.
+    # ``miss_reason`` KEEPS its meaning (the most recent reason) so existing
+    # readers are unaffected. NULL means "no history recorded yet"; consumers
+    # fall back to ``miss_reason`` (see shared/miss_reason_taxonomy.py).
+    miss_reason_counts_json: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
     has_unresolvable_where: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     has_complex_sql: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
@@ -1509,6 +2664,11 @@ class ModelAlert(TenantBase):
     detail: Mapped[Optional[str]] = mapped_column(Text)
     related_object_type: Mapped[Optional[str]] = mapped_column(String(32))
     related_object_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    # Bug-7453: when both related_object_type and related_object_id are NULL
+    # (model-wide alerts), the NULLS NOT DISTINCT dedup index collapses
+    # distinct alerts of the same category. detail_hash discriminates by
+    # content so e.g. two different "refresh_failure" reasons stay separate.
+    detail_hash: Mapped[Optional[str]] = mapped_column(String(64))
     first_seen_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
     last_seen_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
     occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -1524,9 +2684,22 @@ class UserAccessBinding(TenantBase):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_identity: Mapped[str] = mapped_column(String(255), nullable=False)
-    role: Mapped[str] = mapped_column(String(32), nullable=False)  # admin | modeler | viewer
+    role: Mapped[str] = mapped_column(String(32), nullable=False)  # admin | modeler | viewer | model_viewer
     project_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     model_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("models.id", ondelete="CASCADE"), index=True)
+    # Bug-6303: provenance of the binding, used to make SSO group grants
+    # revocable without ever disturbing manual grants.
+    #   "manual"    (default) — granted via the access API, project import, or
+    #                any pre-existing row (server_default). NEVER touched by the
+    #                SSO group sync.
+    #   "sso_group"           — materialised from an IdP group-role mapping on
+    #                SSO login. Reconciled on every login: revoked when the user
+    #                is de-provisioned from the mapped IdP group.
+    # New/legacy rows default to "manual" so no historical grant is ever
+    # auto-revoked when this column is introduced (fail-closed).
+    source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="manual", server_default="manual"
+    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
 
     # F-021-11: a user has at most one role per (project, model) scope. Role is
@@ -1554,11 +2727,64 @@ class LocalUser(TenantBase):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     role: Mapped[str] = mapped_column(String(32), nullable=False, server_default="member")
     auth_source: Mapped[str] = mapped_column(String(32), nullable=False, server_default="local")
+    # Bug-6597: provenance of the CURRENT ``role`` value.
+    #   "manual" — set by an operator (user-management API) or a pre-existing
+    #              row via the server_default. NEVER auto-downgraded by SSO.
+    #   "sso"    — assigned by the JIT/SSO group-mapping machinery. An SSO-
+    #              elevated ``tenant_admin`` carrying this source is reconciled
+    #              DOWN when its IdP admin group disappears (jit_adopt_user).
+    # Fail-closed default is "manual" so a manually-promoted admin is never
+    # silently demoted, and legacy rows are treated as operator intent.
+    role_source: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="manual"
+    )
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     has_completed_onboarding: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now(), onupdate=func.now())
+
+
+class PersonalAccessToken(TenantBase):
+    """Personal Access Token (PAT) for BI-client authentication (Bug-7314).
+
+    SSO (SAML/OIDC) users have no password to present to a JDBC/XMLA client.
+    A PAT is a long-lived bearer secret the user mints in the web UI and pastes
+    as the PASSWORD in Excel (XMLA Basic) / Power BI (PostgreSQL :5433). The
+    plaintext token is shown ONCE at creation; only ``token_hash`` (a bcrypt
+    hash — never the plaintext) and a short ``token_prefix`` for lookup/display
+    are stored. Validation resolves the token to its owning ``local_users`` row;
+    tenant + role are taken LIVE from that row at each use, never stamped onto
+    the token, so a role change or deactivation takes effect immediately
+    (subject to the gateway's short session-validation TTL).
+    """
+    __tablename__ = "personal_access_tokens"
+    __table_args__ = (
+        Index("ix_personal_access_tokens_user_id", "user_id"),
+        Index("ix_personal_access_tokens_token_prefix", "token_prefix"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("local_users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # bcrypt hash of the full plaintext token. Never store the plaintext.
+    token_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Public, non-secret lookup key: the fixed scheme prefix plus a short random
+    # public id (e.g. "tesspat_ab12cd34"). Indexed so verification narrows to a
+    # small candidate set before the constant-time bcrypt compare. NOT a secret
+    # on its own — it never authenticates without the full token's hash match.
+    token_prefix: Mapped[str] = mapped_column(String(32), nullable=False)
+    label: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
+    expires_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ, nullable=True)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ, nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ, nullable=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1627,9 +2853,22 @@ class AIOptimizerRun(TenantBase):
         UUID(as_uuid=True), ForeignKey("model_telemetry_snapshots.id"),
         index=True,
     )
+    # Bug-8034: durable worker claim fields — which scheduler process claimed
+    # this run out of the queue, and when. NULL while the run is ``queued``;
+    # set by the dispatcher's committed ``queued -> running`` flip, and left in
+    # place after the run terminates as the audit record of who dispatched it.
+    # Cleared only when a failed hand-off returns the run to the queue.
+    # Spec: docs/architecture/architecture_ai-advisor-durable-dispatch.md.
+    claimed_by: Mapped[Optional[str]] = mapped_column(String(256), nullable=True, default=None)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ, nullable=True, default=None)
     recommendations_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     aggregates_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     aggregates_skipped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # F-011-04: provider-reported usage for per-run spend attribution. Populated
+    # from the adapter's last_usage after the provider call; NULL when the run
+    # failed before the call or the provider reported no usage.
+    input_tokens: Mapped[Optional[int]] = mapped_column(Integer)
+    output_tokens: Mapped[Optional[int]] = mapped_column(Integer)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     raw_llm_response: Mapped[Optional[str]] = mapped_column(Text)
     diagnostics_log: Mapped[Optional[list]] = mapped_column(JSONB)
@@ -1853,8 +3092,12 @@ class Persona(TenantBase):
     default_filters: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
-    # Phase 8.C.1 — X2: when true, the Query Router skips the Phase 5.1
-    # row-security wrap for any execution bound to this persona.
+    # Phase 8.C.1 — X2: when true, the Query Router skips row-security
+    # filtering entirely for any execution bound to this persona -- no rule is
+    # compiled and no predicate is injected, so the aggregate and pocket fast
+    # paths become available unconditionally rather than only to the candidates
+    # that can prove they carry the predicate. (Bug-8397: there is no outer
+    # subquery to skip -- enforcement is per-scan WHERE injection.)
     bypass_row_security: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
@@ -2006,6 +3249,20 @@ class SourceJoinStatistics(TenantBase):
 
 class ProjectAgentConfig(TenantBase):
     __tablename__ = "project_agent_configs"
+    __table_args__ = (
+        # judge_mode is a two-value enum: "sync" (validated-first, the default —
+        # the verdict resolves before the answer is exposed) or "async" (answer
+        # shown, then validated). The API already constrains it
+        # (agent_config.py, pattern ^(async|sync)$), but the column is the
+        # producer/consumer boundary for the snapshot serialiser, the rehydrator
+        # and guardrails/block._should_block, so a DB-level guard stops any
+        # out-of-band writer persisting a value those consumers cannot interpret.
+        # See migration 0208.
+        CheckConstraint(
+            "judge_mode IN ('sync', 'async')",
+            name="ck_project_agent_configs_judge_mode",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -2041,6 +3298,16 @@ class ProjectAgentConfig(TenantBase):
     disclosure_text: Mapped[Optional[str]] = mapped_column(Text)
     webhook_url: Mapped[Optional[str]] = mapped_column(Text)
     webhook_signing_secret: Mapped[Optional[bytes]] = mapped_column(LargeBinary)
+    # Bug-8411 — which agent events this project's webhook subscribes to.
+    # Values are validated against shared/webhooks/agent_event_types.py;
+    # ``["*"]`` (the default, and the behaviour every project had before
+    # filters existed) means every event. Nullable on purpose: a row written
+    # before this column existed reads as NULL and
+    # ``agent_event_subscribed`` treats NULL as "deliver everything", so no
+    # existing receiver silently stops getting events on upgrade.
+    webhook_event_filters: Mapped[Optional[list]] = mapped_column(
+        JSONB, server_default=text("'[\"*\"]'::jsonb")
+    )
     primary_model_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("models.id", ondelete="SET NULL"),
         index=True,
@@ -2071,8 +3338,14 @@ class ProjectAgentConfig(TenantBase):
     judge_mode: Mapped[str] = mapped_column(
         String(16),
         nullable=False,
-        default="async",
-        server_default=text("'async'"),
+        # F-023-29 / Bug-8148 — the DEFAULT is validated-first ("sync"): the
+        # judge verdict is resolved BEFORE the answer is exposed, so an
+        # unvetted answer is never shown by default. "async" (answer shown,
+        # then validated) remains an explicit per-project lower-assurance
+        # override. See migration 0178 and
+        # docs/questions/questions_f023-29-default-judge-mode.md.
+        default="sync",
+        server_default=text("'sync'"),
     )
     judge_rubric_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
@@ -2468,6 +3741,11 @@ class AgentTurn(TenantBase):
     rendered_output: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     chart_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     calculation_steps: Mapped[Optional[list]] = mapped_column(JSONB)
+    # Bug-6521 — per-send idempotency key. Set on the reserved placeholder so a
+    # retried stream/sync POST carrying the same key dedupes to the existing
+    # turn instead of minting a duplicate. NULL for keyless callers (multiple
+    # NULLs allowed via the partial unique index below).
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMPTZ, server_default=func.now(), index=True
     )
@@ -2477,6 +3755,15 @@ class AgentTurn(TenantBase):
             "conversation_id",
             "turn_index",
             name="uq_agent_turns_conversation_turn_index",
+        ),
+        # Bug-6521 — atomic dedup anchor: one turn per (conversation, key).
+        # Partial so NULL keys (keyless callers) are exempt and never collide.
+        Index(
+            "uq_agent_turns_conversation_idempotency_key",
+            "conversation_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
         ),
     )
 
@@ -2507,7 +3794,26 @@ class AgentWebhookDlq(TenantBase):
         index=True,
     )
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    target_url: Mapped[str] = mapped_column(Text, nullable=False)
+    # Bug-8350 — the raw destination URL is never persisted: it commonly
+    # embeds bearer tokens / API keys in userinfo, query params, OR path
+    # segments (the reported repro used a path segment), and this table is
+    # copied into backups and returned verbatim by GET /dlq. `target_host` is
+    # a sanitised `scheme://host[:port]` hint only -- path is dropped too
+    # (see shared.webhooks.redact.redact_url_for_display). A manual retry
+    # reloads the live URL from ProjectAgentConfig, so the plaintext is never
+    # needed again once a row exists here.
+    #
+    # Bug-8407 -- there used to be a `target_url_hash` column here too,
+    # described as "a one-way fingerprint of the full URL for
+    # dedup/correlation". It was first an unsalted SHA-256 (offline-brute-
+    # forceable: 42,001 candidates in 0.07s), then hardened to bcrypt. Both
+    # versions shared the real defect: NOTHING ever read the column. Salted
+    # bcrypt cannot correlate rows, so it could not serve the stated purpose
+    # either. It was a persisted, per-row derivative of a secret-bearing URL
+    # that bought the product nothing and cost a ~0.3s bcrypt call on every
+    # DLQ write. Dropped in migration 0188; coarse correlation uses
+    # `target_host`. Do not reintroduce a hash here without a reader.
+    target_host: Mapped[Optional[str]] = mapped_column(Text)
     payload: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
@@ -2578,6 +3884,30 @@ class WebhookDelivery(TenantBase):
     next_attempt_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ, index=True)
     response_code: Mapped[Optional[int]] = mapped_column(Integer)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
+    # F-022-06: encrypted snapshot of the endpoint signing secret captured when
+    # this delivery was enqueued. Retries sign with THIS pinned secret, not the
+    # endpoint's current one, so rotating the endpoint secret never invalidates
+    # a queued (in-flight) delivery's signature. NULL only for legacy rows
+    # created before this column existed — those fall back to the endpoint's
+    # current secret exactly as before.
+    signing_secret_snapshot: Mapped[Optional[bytes]] = mapped_column(LargeBinary)
+    # Bug-8557: the destination URL snapshotted at enqueue time (migration
+    # 0202). The dispatcher reads THIS frozen URL, never the live
+    # `endpoint.url`: `shared/webhooks/dispatcher.py::rebuild_signed_body`
+    # returns it, and every dispatch site
+    # (`_dispatch_queued_deliveries`, `drain_pending_deliveries`,
+    # `model-service/src/api/webhooks.py::retry_dlq`) sends to it. Pinning the
+    # secret without the destination was incoherent: an admin repointing an
+    # endpoint at receiver B sent rows queued for A to B, carrying A's payload
+    # under A's pinned secret — and, since a URL change also rotates the
+    # secret, handing B an HMAC computed under a key B does not hold.
+    # NULL only for rows enqueued before this column existed. Those are NOT
+    # sent to a guessed URL: they fail to the DLQ on dispatch with
+    # `INCOHERENT_DELIVERY_ROW_REASON` (reason token
+    # `incoherent_delivery_row`). A manual DLQ retry re-pins the destination
+    # from the endpoint and is the recovery path for them, because a manual
+    # retry IS an explicit operator decision about where to send.
+    destination_url_snapshot: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
 
 
@@ -2597,6 +3927,25 @@ class AuditEvent(TenantBase):
     severity: Mapped[str] = mapped_column(Text, nullable=False)
     detail: Mapped[Optional[dict]] = mapped_column(JSONB)
     ip_address: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class EmbedTokenMint(TenantBase):
+    """Ledger of issued embed tokens (F-021-08). Revocation still uses
+    ``tess_system.revoked_embed_tokens``; this row is the tenant inventory.
+    """
+
+    __tablename__ = "embed_token_mints"
+
+    jti: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    actor_email: Mapped[str] = mapped_column(String(255), nullable=False)
+    user_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    persona_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    project_ids: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    model_ids: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    capabilities: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
 
 
 class DataQualityRule(TenantBase):
@@ -2802,12 +4151,27 @@ class RefreshSLAConfig(TenantBase):
     grace_period_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=15, server_default="15")
     max_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     alert_on_breach: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
-    # Breach-episode tracking (B17 round 2, Finding 1): one alert per breach
-    # episode (model + UTC day). ``last_breach_alerted_on`` is the day the
-    # episode's single alert was emitted; ``last_breach_resolved_at`` is set
-    # when every aggregate has a successful refresh for that day (recovery)
-    # and cleared when a new episode alerts. Written only by the SLA monitor.
+    # Breach-episode tracking (B17 round 2, Finding 1): one episode per model
+    # per UTC day. Bug-8146 split the two markers below because they answer
+    # different questions and one of them used to answer both wrongly.
+    #
+    # ``last_breach_alerted_on`` is DELIVERY EVIDENCE: the day at least one
+    # notification channel confirmed it accepted this model's breach alert.
+    # It used to be stamped unconditionally on the first breach observation,
+    # so a dispatch in which every channel failed still recorded the breach as
+    # alerted and nobody was ever told. It now gates re-attempt: the SLA
+    # monitor re-dispatches on each sweep of the open episode until this is
+    # set, and stops once it is.
     last_breach_alerted_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    # ``last_breach_episode_opened_on`` (migration 0203) is EPISODE STATE: the
+    # day the episode opened, stamped on the first breach observation whatever
+    # the alert flag and whatever the delivery outcome. It is what dedups the
+    # episode, so one breach never opens a second episode on the same day.
+    # Written and read by `services/scheduler/src/jobs/sla_monitor.py`; rows
+    # written before 0203 carry NULL and fall back to
+    # ``last_breach_alerted_on`` there so an episode in flight across an
+    # upgrade is not re-alerted.
+    last_breach_episode_opened_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     last_breach_resolved_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -2853,6 +4217,53 @@ class NotificationDispatchDedup(TenantBase):
     dedup_key: Mapped[str] = mapped_column(String(512), primary_key=True)
     last_dispatched_at: Mapped[datetime] = mapped_column(
         TIMESTAMPTZ, server_default=func.now(), nullable=False
+    )
+
+
+class NotificationDelivery(TenantBase):
+    """Durable, operator-visible record of one email/Slack notification attempt.
+
+    Bug-8053 (F-022-04): before this table the alerting dispatcher persisted
+    routes and dedup claims but NO record of whether a notification actually
+    reached its destination. An email or Slack send that failed left only an
+    application-log line — invisible in the product, impossible for an operator
+    to see, retry, or prove. A broken SMTP/Slack configuration could fail
+    indefinitely with nothing surfaced.
+
+    One row is written per delivery attempt with a terminal outcome:
+    ``status='sent'`` for a genuine successful send, ``status='failed'`` for a
+    send that raised or a channel that was skipped because it was misconfigured
+    (SMTP unset, no recipients, no webhook URL). ``target`` is a NON-SECRET
+    destination hint — joined recipients for email, a non-reversible hash of the
+    webhook URL for Slack (mirroring the dedup key, never the plaintext secret).
+    Exposed to operators through the tenant-scoped notification-deliveries API.
+    """
+
+    __tablename__ = "notification_deliveries"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # Keep the record even if the route is later deleted (SET NULL): a failed
+    # delivery is evidence that must outlive the route configuration.
+    route_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("notification_routes.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    project_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Non-secret destination hint (email recipients / hashed Slack URL).
+    target: Mapped[Optional[str]] = mapped_column(Text)
+    # 'sent' | 'failed' — 'sent' ONLY on a genuine successful send.
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, server_default=func.now(), nullable=False, index=True
     )
 
 
@@ -3057,6 +4468,13 @@ class SolidatusSyncRun(TenantBase):
 
 class SolidatusObjectMapping(TenantBase):
     __tablename__ = "solidatus_object_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "connection_id",
+            "tessallite_object_type",
+            "tessallite_object_id",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     connection_id: Mapped[uuid.UUID] = mapped_column(
@@ -3148,6 +4566,14 @@ class CollibraSyncRun(TenantBase):
 
 class CollibraObjectMapping(TenantBase):
     __tablename__ = "collibra_object_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "connection_id",
+            "tessallite_object_type",
+            "tessallite_object_id",
+            "collibra_resource_type",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     connection_id: Mapped[uuid.UUID] = mapped_column(
@@ -3165,3 +4591,6 @@ class CollibraObjectMapping(TenantBase):
         UUID(as_uuid=True), ForeignKey("collibra_sync_runs.id", ondelete="SET NULL"), nullable=True
     )
     is_deprecated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Bug-7515: match SolidatusObjectMapping's connection relationship.
+    connection: Mapped[CollibraConnection] = relationship()

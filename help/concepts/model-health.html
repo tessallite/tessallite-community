@@ -40,6 +40,9 @@
 <p>A source table&#x27;s schema has changed since the model was last synced. Tessallite detected the drift during a scheduled schema sync.</p>
 <p>To resolve: open the Model Builder and run a schema sync from the table&#x27;s context menu. After syncing, review dimensions and joins that reference the changed table — any that reference a removed column will appear as additional errors.</p>
 <p>Running a schema sync only refreshes the available column list. You must manually update any dimension, measure, or join definitions that reference columns that no longer exist.</p>
+<h3>What Re-check covers</h3>
+<p><strong>Re-check model</strong> reruns structural validation and combines it with unresolved hierarchy issues, failed pockets, and unacknowledged schema-drift events already recorded by the Scheduler. The panel displays these recorded-signal counts and the latest recorded drift time.</p>
+<p>Re-check does not connect to the live source. A source change that occurred after the latest scheduled drift scan will not appear until that scan runs; the result explicitly says that live source introspection was not performed.</p>
 <h3>Aggregate refresh overdue</h3>
 <p><strong>Severity: Warning</strong></p>
 <p>An aggregate has not been refreshed within the expected window defined by its refresh schedule. Queries may be served from stale data or may fall through to raw data.</p>

@@ -69,8 +69,28 @@ def test_scalar_fields_exclude_identity_and_deploy_pointer():
     fields = set(_model_scalar_fields())
     assert _MODEL_SCALAR_EXCLUDE.isdisjoint(fields)
     for excluded in ("id", "project_id", "deployed_version_id",
-                     "last_deployed_at", "created_at", "updated_at"):
+                     "last_deployed_at", "created_at", "updated_at",
+                     "deploy_epoch"):
         assert excluded not in fields
+
+
+def test_deploy_epoch_is_excluded_from_rehydration():
+    """opus5 completion-round R2 (finding 3.5): ``deploy_epoch`` must NEVER be
+    rehydrated from a snapshot (import or revert) — it is a MONOTONIC counter
+    the KPILatest epoch-monotonicity guard (Bug-7982;
+    ``kpi_latest.py``/``sweep.py`` ``on_conflict_do_update(where=...)``)
+    structurally depends on. If a revert ever restored an older snapshot
+    value here, the epoch would move BACKWARDS and that guard's
+    ``existing.evaluated_for_epoch <= eval_epoch`` condition would then
+    suppress every subsequent kpi_latest write for the model permanently —
+    worse than having no guard at all, and silently (see
+    ``SnapshotSweepResult.latest_suppressed``, which only reports a COUNT, not
+    the root cause). Standalone, dedicated assertion (in addition to the
+    general exclude-set test above) so this specific precondition cannot
+    silently regress if the general test is ever relaxed or reworded.
+    """
+    assert "deploy_epoch" in _MODEL_SCALAR_EXCLUDE
+    assert "deploy_epoch" not in _model_scalar_fields()
 
 
 def test_scalar_fields_track_every_non_excluded_orm_column():

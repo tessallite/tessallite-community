@@ -17,18 +17,29 @@ from shared.importers.dbt_parser import (
     DbtSavedQuery,
     DbtSemanticModel,
 )
+from shared.importers.import_warnings import (
+    ImportWarningResponse,
+    extend_known_import_warnings,
+    make_import_warning,
+)
+from shared.model_snapshot.slug_utils import slugify
 
 
 _AGG_MAP: dict[str, str] = {
     "sum": "sum",
     "count": "count",
     "count_distinct": "count_distinct",
-    "average": "average",
-    "avg": "average",
+    # Bug-6591: emit CANONICAL default_agg tokens (VALID_DEFAULT_AGGS:
+    # sum/avg/min/max/count/count_distinct + pNN). "average"/"median"/
+    # "percentile" saved cleanly but failed LATE at query time (no such SQL
+    # function). median == exact 50th percentile → p50. A bare "percentile"
+    # has no fraction here so it is intentionally absent — _map_measures then
+    # imports it as a disabled measure rather than guessing a percentile.
+    "average": "avg",
+    "avg": "avg",
     "min": "min",
     "max": "max",
-    "median": "median",
-    "percentile": "percentile",
+    "median": "p50",
 }
 
 # F-020-08: dbt sum_boolean counts only rows where the boolean is TRUE; the
@@ -67,7 +78,7 @@ _SIMPLE_IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 @dataclass
 class MapResult:
     bundle: dict[str, Any]
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[ImportWarningResponse] = field(default_factory=list)
 
 
 def map_dbt_to_tessallite(
@@ -75,13 +86,14 @@ def map_dbt_to_tessallite(
     project_name: str = "dbt-import",
     project_display_name: str = "dbt Import",
 ) -> MapResult:
-    warnings: list[str] = list(parsed.warnings)
+    warnings: list[ImportWarningResponse] = []
+    extend_known_import_warnings(warnings, parsed.warnings)
 
     models: list[dict[str, Any]] = []
     for sm in parsed.semantic_models:
         snap, sm_warnings = _map_semantic_model(sm)
         models.append(snap)
-        warnings.extend(sm_warnings)
+        extend_known_import_warnings(warnings, sm_warnings)
 
     _apply_derived_metrics(parsed.metrics, models, warnings)
     _apply_metric_filters(parsed.metrics, models, warnings)
@@ -105,8 +117,8 @@ def map_dbt_to_tessallite(
 
 def _map_semantic_model(
     sm: DbtSemanticModel,
-) -> tuple[dict[str, Any], list[str]]:
-    warnings: list[str] = []
+) -> tuple[dict[str, Any], list[ImportWarningResponse]]:
+    warnings: list[ImportWarningResponse] = []
     gen = _id_gen()
 
     model_id = gen()
@@ -157,10 +169,14 @@ def _map_semantic_model(
                 "validated": False,
                 "validation_error": None,
             })
-            warnings.append(
-                f"Dimension '{dim.name}' has SQL expression "
-                f"'{col_name}' — imported as unvalidated UDA"
-            )
+            warnings.append(make_import_warning(
+                code="dbt.expression_unvalidated",
+                params={"element_type": "dimension", "element_name": dim.name},
+                detail=(
+                    f"Dimension '{dim.name}' has SQL expression "
+                    f"'{col_name}' — imported as unvalidated UDA"
+                ),
+            ))
 
     for measure in sm.measures:
         col_name = measure.expr or measure.name
@@ -187,10 +203,14 @@ def _map_semantic_model(
                 "validated": False,
                 "validation_error": None,
             })
-            warnings.append(
-                f"Measure '{measure.name}' has SQL expression "
-                f"'{col_name}' — imported as unvalidated UDA"
-            )
+            warnings.append(make_import_warning(
+                code="dbt.expression_unvalidated",
+                params={"element_type": "measure", "element_name": measure.name},
+                detail=(
+                    f"Measure '{measure.name}' has SQL expression "
+                    f"'{col_name}' — imported as unvalidated UDA"
+                ),
+            ))
 
     dims_out: list[dict[str, Any]] = []
     for dim in sm.dimensions:
@@ -216,7 +236,11 @@ def _map_semantic_model(
         invalid_reason: str | None = None
         if raw_agg in _UNREPRESENTABLE_AGGS:
             invalid_reason = _UNREPRESENTABLE_AGGS[raw_agg] % m.name
-            warnings.append(invalid_reason)
+            warnings.append(make_import_warning(
+                code="dbt.measure_disabled",
+                params={"measure": m.name, "reason": raw_agg},
+                detail=invalid_reason,
+            ))
             agg = "sum"
         else:
             agg = _AGG_MAP.get(raw_agg)
@@ -226,7 +250,11 @@ def _map_semantic_model(
                     f"in model '{sm.name}' — imported as a disabled measure "
                     f"(defaulted to 'sum')."
                 )
-                warnings.append(invalid_reason)
+                warnings.append(make_import_warning(
+                    code="dbt.measure_disabled",
+                    params={"measure": m.name, "reason": raw_agg or "unknown"},
+                    detail=invalid_reason,
+                ))
                 agg = "sum"
 
         semi_additive = None
@@ -236,11 +264,15 @@ def _map_semantic_model(
             if nad_name and nad_agg:
                 semi_additive = _NAD_AGG_TO_SEMI_ADDITIVE.get(nad_agg)
                 if semi_additive is None:
-                    warnings.append(
-                        f"Non-additive dimension agg '{nad_agg}' on measure "
-                        f"'{m.name}' has no Tessallite semi-additive equivalent "
-                        f"— imported as fully additive. Set it manually."
-                    )
+                    warnings.append(make_import_warning(
+                        code="dbt.semi_additive_omitted",
+                        params={"measure": m.name, "behavior": nad_agg},
+                        detail=(
+                            f"Non-additive dimension agg '{nad_agg}' on measure "
+                            f"'{m.name}' has no Tessallite semi-additive equivalent "
+                            "— imported as fully additive. Set it manually."
+                        ),
+                    ))
 
         measure_entry: dict[str, Any] = {
             "id": gen(),
@@ -264,10 +296,14 @@ def _map_semantic_model(
     joins_out: list[dict[str, Any]] = []
     for entity in sm.entities:
         if entity.entity_type == "foreign":
-            warnings.append(
-                f"Foreign entity '{entity.name}' in model '{sm.name}' "
-                f"detected — join will need manual configuration in Tessallite"
-            )
+            warnings.append(make_import_warning(
+                code="dbt.join_manual",
+                params={"entity": entity.name, "model": sm.name},
+                detail=(
+                    f"Foreign entity '{entity.name}' in model '{sm.name}' "
+                    "detected — join will need manual configuration in Tessallite"
+                ),
+            ))
 
     hier_out: list[dict[str, Any]] = []
     time_dims = [d for d in sm.dimensions if d.dim_type == "time"]
@@ -365,7 +401,7 @@ def _map_semantic_model(
 def _apply_derived_metrics(
     metrics: list[DbtMetric],
     models: list[dict[str, Any]],
-    warnings: list[str],
+    warnings: list[ImportWarningResponse],
 ) -> None:
     measure_map: dict[str, dict[str, Any]] = {}
     for model in models:
@@ -384,146 +420,112 @@ def _apply_derived_metrics(
                 if metric.description:
                     m["description"] = metric.description
             else:
-                warnings.append(
-                    f"Simple metric '{metric.name}' references unknown "
-                    f"measure '{measure_name}'"
-                )
+                warnings.append(make_import_warning(
+                    code="dbt.metric_reference_missing",
+                    params={"metric": metric.name, "reference": str(measure_name)},
+                    detail=(
+                        f"Simple metric '{metric.name}' references unknown "
+                        f"measure '{measure_name}'"
+                    ),
+                ))
 
         elif metric.metric_type == "derived":
-            warnings.append(
-                f"Derived metric '{metric.name}' imported as a note — "
-                f"create a calculated measure manually if needed"
-            )
+            warnings.append(make_import_warning(
+                code="dbt.metric_manual",
+                params={"metric": metric.name, "metric_type": "derived"},
+                detail=(
+                    f"Derived metric '{metric.name}' imported as a note — "
+                    "create a calculated measure manually if needed"
+                ),
+            ))
 
         elif metric.metric_type == "cumulative":
-            warnings.append(
-                f"Cumulative metric '{metric.name}' — Tessallite represents "
-                f"time-variant measures differently; review after import"
-            )
+            warnings.append(make_import_warning(
+                code="dbt.metric_manual",
+                params={"metric": metric.name, "metric_type": "cumulative"},
+                detail=(
+                    f"Cumulative metric '{metric.name}' — Tessallite represents "
+                    "time-variant measures differently; review after import"
+                ),
+            ))
 
         elif metric.metric_type in ("ratio", "conversion"):
-            warnings.append(
-                f"{metric.metric_type.title()} metric '{metric.name}' "
-                f"requires manual setup as a calculated measure"
-            )
+            warnings.append(make_import_warning(
+                code="dbt.metric_manual",
+                params={"metric": metric.name, "metric_type": metric.metric_type},
+                detail=(
+                    f"{metric.metric_type.title()} metric '{metric.name}' "
+                    "requires manual setup as a calculated measure"
+                ),
+            ))
 
         else:
-            warnings.append(
-                f"Unknown metric type '{metric.metric_type}' for '{metric.name}'"
-            )
+            warnings.append(make_import_warning(
+                code="dbt.metric_type_unknown",
+                params={"metric": metric.name, "metric_type": metric.metric_type},
+                detail=(
+                    f"Unknown metric type '{metric.metric_type}' for '{metric.name}'"
+                ),
+            ))
 
 
 def _apply_metric_filters(
     metrics: list[DbtMetric],
     models: list[dict[str, Any]],
-    warnings: list[str],
+    warnings: list[ImportWarningResponse],
 ) -> None:
-    """Translate dbt metric filters into the real persona ``default_filters``.
+    """Report dbt metric filters — never persist them as persona defaults.
 
-    F-020-16: the persona ``default_filters`` column is a JSONB *dict* keyed by
-    dimension name (``{dim_name: value | {op: value}}``) — the shape the query
-    router's ``merge_default_filters`` reads. The previous implementation
-    appended ``{source_metric, filter_sql}`` dicts and turned the field into a
-    list, which no consumer reads (junk accepted at the API, ignored at query
-    time). We now parse only simple ``{{ Dimension('x') }} <op> <value>``
-    equality/comparison predicates into the real shape; anything richer is
-    reported as a warning and *not* stored, so we never persist data the model
-    cannot use.
+    Bug-7301 [WRONG NUMBERS]: a dbt metric ``filter`` is scoped to that ONE
+    metric (it constrains the rows that metric aggregates over). The previous
+    implementation (F-020-16) wrote every parsed filter into EVERY persona's
+    ``default_filters`` dict. Persona ``default_filters`` apply to the whole
+    persona — to every measure and dimension it exposes — so a filter meant for
+    a single metric silently changed the numbers for every other measure, for
+    everyone using that persona. That is a wrong-numbers / data-scope defect,
+    not a shape mismatch, so correcting the JSONB *shape* did not fix it.
+
+    Tessallite's import model has no per-metric row-filter store, so there is
+    nowhere correct to land a metric-scoped filter on import. Rather than
+    mis-scope it to the persona, we persist NOTHING and surface each filter as a
+    per-metric warning instructing the modeller to recreate it deliberately
+    (e.g. as a calculated measure with an explicit predicate, or a scoped
+    persona filter if that persona genuinely should be constrained). Fail loud,
+    not silently wrong.
+
+    ``models`` is intentionally left untouched — no persona ``default_filters``
+    are written here.
     """
-    parsed_filters: dict[str, Any] = {}
-    unparseable: list[str] = []
+    _ = models  # deliberately not mutated (see docstring)
+    described: list[str] = []
 
     for metric in metrics:
         if not metric.filter:
             continue
-        if metric.metric_type != "simple":
-            continue
-        dim_name, op, value = _parse_simple_filter(metric.filter)
-        if dim_name is None:
-            unparseable.append(f"{metric.name}: {metric.filter}")
-            continue
-        # eq collapses to a bare scalar; other operators carry {op: value}.
-        parsed_filters[dim_name] = value if op == "=" else {_OP_MAP[op]: value}
+        described.append(f"{metric.name}: {metric.filter}")
 
-    if parsed_filters:
-        for model in models:
-            for persona in model.get("personas", []):
-                existing = persona.get("default_filters") or {}
-                if not isinstance(existing, dict):
-                    existing = {}
-                # New keys do not clobber an existing persona filter.
-                merged = {**parsed_filters, **existing}
-                persona["default_filters"] = merged
-        warnings.append(
-            f"{len(parsed_filters)} dbt metric filter(s) translated into "
-            f"persona default filters."
-        )
-
-    if unparseable:
-        warnings.append(
-            f"{len(unparseable)} dbt metric filter(s) were too complex to "
-            f"translate and were skipped (recreate as persona filters "
-            f"manually): " + "; ".join(unparseable[:5])
-        )
-
-
-# Bug-2700: map to the canonical operator tokens the query-router consumer
-# accepts (persona_gate._SUPPORTED_OPERATORS / rewrite/conditions.py). The
-# not-equal token is "neq" — "ne" is silently rejected by _coerce_filter,
-# dropping the persona scope-exclusion at query time (wrong data scope).
-_OP_MAP = {"=": "eq", "!=": "neq", ">": "gt", ">=": "gte", "<": "lt", "<=": "lte"}
-
-# dbt filters reference dimensions/entities as Jinja:
-#   {{ Dimension('order__status') }} = 'completed'
-#   {{ Dimension('customer__tier') }} >= 3
-_FILTER_RE = re.compile(
-    r"""\{\{\s*(?:Dimension|Entity|TimeDimension)\(\s*['"]([^'"]+)['"]\s*\)\s*\}\}"""
-    r"""\s*(!=|>=|<=|=|>|<)\s*(.+?)\s*$""",
-    re.IGNORECASE,
-)
-
-
-def _parse_simple_filter(filter_sql: str) -> tuple[str | None, str | None, Any]:
-    """Parse a single ``{{ Dimension('x') }} <op> <value>`` predicate.
-
-    Returns ``(dimension_name, operator, value)`` or ``(None, None, None)`` if
-    the filter is compound (AND/OR), references multiple columns, or otherwise
-    is not a single simple comparison.
-    """
-    text = (filter_sql or "").strip()
-    # Reject obviously compound predicates — we only translate single ones.
-    lowered = text.lower()
-    if " and " in lowered or " or " in lowered:
-        return None, None, None
-    m = _FILTER_RE.match(text)
-    if not m:
-        return None, None, None
-    raw_ref, op, raw_value = m.group(1), m.group(2), m.group(3).strip()
-    # dbt qualifies as entity__column; the dimension name is the last segment.
-    dim_name = raw_ref.split("__")[-1]
-    value = _coerce_filter_value(raw_value)
-    return dim_name, op, value
-
-
-def _coerce_filter_value(raw: str) -> Any:
-    raw = raw.strip()
-    if len(raw) >= 2 and raw[0] in "'\"" and raw[-1] == raw[0]:
-        return raw[1:-1]
-    low = raw.lower()
-    if low in ("true", "false"):
-        return low == "true"
-    try:
-        if "." in raw:
-            return float(raw)
-        return int(raw)
-    except ValueError:
-        return raw
+    if described:
+        # Name EVERY skipped metric filter (do not truncate) so the modeller can
+        # recreate each one — a silently dropped filter is the wrong-numbers trap
+        # this fix exists to close.
+        warnings.append(make_import_warning(
+            code="dbt.metric_filters_omitted",
+            params={"count": len(described)},
+            detail=(
+                f"{len(described)} dbt metric filter(s) were NOT imported because a "
+                "dbt metric filter is scoped to its own metric only; applying it "
+                "as a persona-wide filter would change results for every other "
+                "measure. Recreate each one manually (as a calculated measure "
+                "predicate, or a scoped persona filter if intended): "
+                + "; ".join(described)
+            ),
+        ))
 
 
 def _apply_saved_queries(
     saved_queries: list[DbtSavedQuery],
     models: list[dict[str, Any]],
-    warnings: list[str],
+    warnings: list[ImportWarningResponse],
 ) -> None:
     """Record saved_queries as informational notes on the bundle."""
     for sq in saved_queries:
@@ -535,10 +537,14 @@ def _apply_saved_queries(
             parts.append(f"group_by: {', '.join(dims)}")
         if sq.where:
             parts.append(f"filters: {len(sq.where)}")
-        warnings.append(
-            f"{' | '.join(parts)} — "
-            f"create a Tessallite report template or saved view to replicate"
-        )
+        warnings.append(make_import_warning(
+            code="dbt.saved_query_manual",
+            params={"saved_query": sq.name},
+            detail=(
+                f"{' | '.join(parts)} — "
+                "create a Tessallite report template or saved view to replicate"
+            ),
+        ))
 
 
 def _extract_model_ref(ref_str: str) -> str:
@@ -549,8 +555,11 @@ def _extract_model_ref(ref_str: str) -> str:
 
 
 def _slugify(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", name.lower().strip())
-    return slug.strip("_")
+    # Bug-7622: delegate to the shared BI-safe generator so digit-leading and
+    # symbol-only names produce a valid slug (fallback + leading-underscore +
+    # 64-char bound) instead of a slug that later trips validate_bi_safe_slug
+    # and raises an uncaught 500 in the import endpoint.
+    return slugify(name, fallback="dbt_model", separator="_")
 
 
 def _humanize(name: str) -> str:

@@ -9,11 +9,14 @@ import {
 import { tokens } from '../../theme';
 import type { NamedSet, NamedSetPreviewResponse } from '../../types/tessallite';
 import { previewNamedSet } from '../../api/modelService';
+import { ApiError } from '../../api/client';
+import { strings } from '../../i18n/strings';
 
 interface NamedSetCardProps {
   namedSet: NamedSet;
   projectId: string;
   modelId: string;
+  personaId?: string;
   onAddToRows: () => void;
   onAddToColumns: () => void;
   onAddToFilter: () => void;
@@ -59,6 +62,7 @@ export default function NamedSetCard({
   namedSet,
   projectId,
   modelId,
+  personaId,
   onAddToRows,
   onAddToColumns,
   onAddToFilter,
@@ -67,6 +71,11 @@ export default function NamedSetCard({
   const [previewOpen, setPreviewOpen] = useState(false);
   const [preview, setPreview] = useState<NamedSetPreviewResponse | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  // Bug-8712: the preview used to swallow every failure and render the generic
+  // "No preview data available", which is indistinguishable from a genuinely
+  // empty set. The fail-closed 409 and the not-published 404 both need to say
+  // what happened and what to do about it.
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
 
   const typeLabel =
@@ -84,11 +93,20 @@ export default function NamedSetCard({
     setPreviewOpen(true);
     if (!preview) {
       setPreviewLoading(true);
+      setPreviewError(null);
       try {
-        const result = await previewNamedSet(projectId, modelId, namedSet.id);
+        const result = await previewNamedSet(projectId, modelId, namedSet.id, personaId);
         setPreview(result);
-      } catch {
+      } catch (e) {
         setPreview(null);
+        // The add-in previews the PUBLISHED definition. 404 here means the set
+        // exists but is not in the deployed version; 409 means the deployed
+        // version itself cannot be read. Neither may fall back to the draft.
+        setPreviewError(
+          e instanceof ApiError && (e.status === 404 || e.status === 409)
+            ? strings.namedSetLibrary.previewNotPublished
+            : strings.namedSetLibrary.previewFailed,
+        );
       } finally {
         setPreviewLoading(false);
       }
@@ -294,7 +312,7 @@ export default function NamedSetCard({
             </>
           ) : (
             <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>
-              No preview data available.
+              {previewError ?? 'No preview data available.'}
             </Typography>
           )}
         </Box>

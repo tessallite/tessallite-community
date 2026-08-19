@@ -2,7 +2,7 @@
 title: "JDBC Connection Guide"
 audience: analyst
 area: Integrations
-updated: 2026-05-25
+updated: 2026-07-02
 ---
 
 ![DBeaver New Database Connection dialog (PostgreSQL).](../assets/screencaps/connect-jdbc-dbeaver.png)
@@ -21,7 +21,7 @@ This article is a detailed connection reference. For a shorter walkthrough, see 
 |-----------|-------|-------|
 | Host | Hostname or IP of the Tessallite Gateway | Use `localhost` for local installs. Obtain from your System Admin for cloud deployments. |
 | Port | `5433` | Fixed. Not the standard PostgreSQL port (5432). |
-| Database | Workspace slug (e.g., `acme`) | Case-sensitive. This is not a real database name — it routes to the correct workspace. |
+| Database | Workspace slug, optionally with a model or project (e.g., `acme`, `acme/sales`, `acme/finance/sales`) | Case-sensitive. This is not a real database name — it routes to the correct workspace and, optionally, scopes the connection to one model. See "Scoping to one model or project" below. |
 | Username | Your Tessallite email address | |
 | Password | Your Tessallite password | |
 | SSL | Strongly recommended for internet-facing clients; required for the optional Looker-hosted path | Add `?sslmode=require` whenever the server or client policy requires SSL. |
@@ -55,12 +55,26 @@ jdbc:postgresql://analytics.example.com:5433/acme?sslmode=require
 
 ---
 
+## Scoping to one model or project
+
+By default the Database field takes just the workspace slug, and the connection browses every published model in the workspace as a separate table. To open the connection directly on one model, add it to the Database field:
+
+| Form | Example | Scope |
+|------|---------|-------|
+| `WORKSPACE_SLUG` | `acme` | Every published model in the workspace |
+| `WORKSPACE_SLUG/MODEL_SLUG` | `acme/sales` | One model |
+| `WORKSPACE_SLUG/PROJECT_SLUG/MODEL_SLUG` | `acme/finance/sales` | One model, disambiguated by project — use this form when two projects have a model with the same name |
+
+The scoped forms are useful when a workspace has many models and you only need one, or when you are connecting a tool (such as Superset or a hand-written script) to a single dataset. If the model or project you name does not exist, the connection is refused immediately with a message listing the accepted formats — you will not get a confusing error later when you run a query.
+
+---
+
 ## Connect with DBeaver
 
 1. Open DBeaver.
 2. Click **New Database Connection** (plug icon in toolbar).
 3. Select **PostgreSQL** and click **Next**.
-4. Fill in Host, Port (`5433`), Database (workspace slug), Username, and Password.
+4. Fill in Host, Port (`5433`), Database (workspace slug, or workspace/model to scope to one model), Username, and Password.
 5. Click **Test Connection**. A "Connected" dialog confirms success.
 6. Click **Finish**.
 7. Expand the connection in the left panel to see schemas and columns.
@@ -108,6 +122,7 @@ Tessallite uses the PostgreSQL wire protocol. Use the standard `org.postgresql.D
 |---------|-------------|------------|
 | Connection refused on port 5433 | Gateway not running or wrong host | Verify Gateway service is up with your System Admin |
 | `FATAL: database "X" does not exist` | Wrong workspace slug | Verify slug with Tenant Admin (case-sensitive) |
+| `Unknown model 'X' in ...` or `Invalid database name` at connect time | Model or project slug in a scoped Database field is wrong | Check the model/project slugs with your Modeller; the error message lists the accepted formats |
 | Authentication failed | Wrong username or password | Use Tessallite email and password, not source DB credentials |
 | SSL error | Server requires SSL | Append `?sslmode=require` to the JDBC URL |
 | No tables visible | No published models | A Modeller must publish at least one model |

@@ -167,6 +167,35 @@ describe("ProjectImportPanel dry-run plan", () => {
     ).not.toBeDisabled();
   });
 
+  // F-020-05 / G-020-02: persona slug overrides are enumerated from the bundle
+  // and sent to the API (the SPA never exposed them before).
+  it("enumerates persona slugs and sends persona_slugs on preview", async () => {
+    mockImport.mockResolvedValueOnce(planResponse(replacePlan()));
+    renderPanel();
+    const withPersona = {
+      ...bundle(),
+      models: [{ model: { slug: "sales" }, personas: [{ slug: "analyst" }] }],
+    };
+    const file = new File([JSON.stringify(withPersona)], "acme.json", {
+      type: "application/json",
+    });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await userEvent.upload(input, file);
+    await screen.findByText(/Bundle summary/i);
+
+    // The persona override field is reachable.
+    await userEvent.click(
+      screen.getByRole("button", { name: /Show persona slug overrides/i }),
+    );
+    expect(screen.getByLabelText(/Persona: analyst/i)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Preview plan" }));
+    await waitFor(() => expect(mockImport).toHaveBeenCalledTimes(1));
+    expect(mockImport.mock.calls[0][0]).toMatchObject({
+      persona_slugs: { analyst: "analyst" },
+    });
+  });
+
   it("invalidates the plan when the import mode changes, forcing a re-preview", async () => {
     mockImport.mockResolvedValueOnce(planResponse(replacePlan()));
     renderPanel();

@@ -12,7 +12,10 @@ frontend label (via the API) so all stay consistent.
 """
 from __future__ import annotations
 
-# Confirmed canonical set.
+# Confirmed canonical set. This is the FULL set the query-router's recognition
+# and fraction<->suffix mapping understand (so existing materialised columns keep
+# being recognised for refresh/skip logic and MEDIAN keeps mapping to p50). It is
+# NOT the set new aggregates materialise — see ROUTABLE_QUANTILE_PERCENTILES.
 QUANTILE_PERCENTILES: list[int] = [1, 5, 10, 25, 50, 75, 90, 95, 99]
 
 
@@ -26,8 +29,82 @@ QUANTILE_STAT_TYPES: list[str] = [quantile_suffix(p) for p in QUANTILE_PERCENTIL
 _SUFFIX_TO_PCT: dict[str, int] = {quantile_suffix(p): p for p in QUANTILE_PERCENTILES}
 
 
+# ---------------------------------------------------------------------------
+# Bug-5891 (DEC-PERCENTILE, user decision Option B, 2026-07-07): the percentile
+# columns that new aggregates actually MATERIALISE, narrowed to the ones SQL
+# routing can reach today.
+#
+# Only MEDIAN (p50) is routable: the query-router maps MEDIAN(col) -> the p50
+# column, but does NOT route PERCENTILE_CONT/DISC(other fraction) WITHIN GROUP
+# to the matching pNN column. That routing fix needs parsing/sql_parser.py +
+# semantic/binder.py changed together (it was attempted once and reverted — see
+# docs/execution/execution_issue-registry.md Bug-5891 and F-003-07). Until that
+# lands, materialising p01/p05/p10/p25/p75/p90/p95/p99 produces DEAD columns:
+# storage + refresh cost with zero acceleration (every non-median percentile
+# query falls back to source anyway).
+#
+# So NEW aggregates materialise only the routable subset below. Existing p90/p95
+# columns are left untouched (no deletion / no routing change). This is a
+# deliberately reversible block: when the sql_parser/binder routing fix lands,
+# restore the full set with the single line
+#     ROUTABLE_QUANTILE_PERCENTILES = list(QUANTILE_PERCENTILES)
+# and drop this note.
+#
+# Backfill note for whoever re-enables it: aggregates created during this
+# median-only window carry only the p50 coverage row, and scheduler refresh is
+# coverage-driven, so they will NOT auto-gain p90/p95/... after the flip. To
+# backfill them, toggle include_quantiles off then on (re-registers the full
+# coverage set) or rebuild the aggregate, so the next refresh materialises the
+# restored columns.
+ROUTABLE_QUANTILE_PERCENTILES: list[int] = [50]
+ROUTABLE_QUANTILE_STAT_TYPES: list[str] = [
+    quantile_suffix(p) for p in ROUTABLE_QUANTILE_PERCENTILES
+]
+
+
+def is_routable_quantile_percentile(pct: int) -> bool:
+    """Whether percentile ``pct`` is one new aggregates should materialise
+    (i.e. one SQL routing can currently serve). See ROUTABLE_QUANTILE_PERCENTILES.
+    """
+    return pct in ROUTABLE_QUANTILE_PERCENTILES
+
+
 def is_quantile_stat_type(stat_type: str | None) -> bool:
     return (stat_type or "") in _SUFFIX_TO_PCT
+
+
+# Aggregate/function tokens that denote a scalar quantile but are NOT the
+# canonical pNN suffix: the legacy ``median`` default_agg synonym (canonicalised
+# to p50 at rehydration, but a live/legacy ORM row may still carry the raw
+# token) and the sqlglot function keys emitted when a percentile appears in a
+# HAVING clause (``median`` / ``percentilecont`` / ``percentiledisc``, with and
+# without underscores). Kept here as the single source of truth so the router's
+# exactness gate and the matcher's non-additive gate agree (Bug-7779/Bug-7782).
+_QUANTILE_ALIAS_TOKENS: frozenset[str] = frozenset(
+    {"median", "percentilecont", "percentiledisc", "percentile_cont", "percentile_disc"}
+)
+
+
+def is_quantile_agg_token(token: str | None) -> bool:
+    """True when ``token`` denotes a scalar quantile through ANY spelling.
+
+    Covers the canonical pNN suffixes (``p01``..``p99``) AND the non-suffix
+    aliases: the legacy ``median`` default_agg synonym and the sqlglot HAVING
+    function keys. Use this — never a bare ``is_quantile_stat_type`` — wherever a
+    ``default_agg`` value or an aggregate-function name is tested for
+    quantile-ness, so a legacy ``median`` row or a HAVING ``MEDIAN()`` cannot slip
+    past the exactness/non-additive gates (a wrong-numbers escape).
+    """
+    t = (token or "").strip().lower()
+    return t in _SUFFIX_TO_PCT or t in _QUANTILE_ALIAS_TOKENS
+
+
+def quantile_suffix_to_percentile(suffix: str | None) -> int | None:
+    """Reverse of ``quantile_suffix``: 'p50' -> 50, 'p90' -> 90; None if not a
+    canonical quantile suffix. Used by the BigQuery refresh builder to turn an
+    existing pNN coverage row back into its ``APPROX_QUANTILES[OFFSET(pct)]``.
+    """
+    return _SUFFIX_TO_PCT.get(suffix or "")
 
 
 def fraction_to_quantile_suffix(fraction: float) -> str | None:

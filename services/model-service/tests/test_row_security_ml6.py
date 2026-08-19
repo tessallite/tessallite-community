@@ -20,6 +20,7 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
+from .result_fakes import FakeScalarResult
 from fastapi import HTTPException
 
 from src.api.row_security import (
@@ -80,47 +81,92 @@ class TestSaveTimeDslValidation:
 
 
 def _fake_db(*, source, connection):
-    """A minimal async DB stub: execute() returns the source row, get()
-    returns the connection."""
+    """A minimal async DB stub for the connector-resolution path.
+
+    Bug-7035: ``_resolve_model_connector`` now first queries the model's
+    enabled row-security rules (to resolve the protected-dimension source),
+    then falls back to the model's primary source. These tests exercise the
+    fallback with no RLS rules configured, so the rule query returns ``[]``
+    (via ``.all()``) and the primary-source query returns ``source`` (via
+    ``.scalar_one_or_none()``) — preserving the original F-007-07 intent that
+    the source's connector wins and missing source/connection falls back to
+    ``postgresql``.
+    """
     db = types.SimpleNamespace()
 
-    class _Result:
+    class _RuleResult:
+        def all(self_inner):
+            return []  # no enabled RLS rules -> no protected-dimension source
+
+    class _SourceResult:
         def scalar_one_or_none(self_inner):
             return source
 
-    db.execute = AsyncMock(return_value=_Result())
+        def scalars(self_inner):
+            return FakeScalarResult([source] if source is not None else [])
+
+        def all(self_inner):
+            return [source] if source is not None else []
+
+    async def _execute(stmt):
+        if "row_security_rules" in str(stmt).lower():
+            return _RuleResult()
+        return _SourceResult()
+
+    db.execute = _execute
     db.get = AsyncMock(return_value=connection)
     return db
 
 
 class TestSimulateConnectorResolution:
+    # Bug-8904: ``_resolve_model_connector`` now returns ``(connector, note)``.
+    # ``note`` is the warning surfaced to the modeller as
+    # ``RowSecuritySimulateResponse.connector_note`` when the resolution was not
+    # definitive. Every case in this class configures NO enabled RLS rules, so
+    # there is no protected dimension and nothing to compile a predicate for —
+    # the note must stay None rather than warning about the dialect of a preview
+    # that is empty by construction.
     @pytest.mark.asyncio
     async def test_resolves_bigquery_connector(self):
         source = types.SimpleNamespace(project_connection_id=uuid.uuid4())
         conn = types.SimpleNamespace(connection_type="BigQuery")
         db = _fake_db(source=source, connection=conn)
-        connector = await _resolve_model_connector(db, uuid.uuid4())
+        connector, note = await _resolve_model_connector(db, uuid.uuid4())
         assert connector == "bigquery"
+        # Bug-7027/Bug-8904: resolved definitively, so no fallback caveat.
+        assert note is None
 
     @pytest.mark.asyncio
     async def test_resolves_postgres_connector(self):
         source = types.SimpleNamespace(project_connection_id=uuid.uuid4())
         conn = types.SimpleNamespace(connection_type="postgresql")
         db = _fake_db(source=source, connection=conn)
-        connector = await _resolve_model_connector(db, uuid.uuid4())
+        connector, note = await _resolve_model_connector(db, uuid.uuid4())
         assert connector == "postgresql"
+        assert note is None
 
     @pytest.mark.asyncio
     async def test_no_source_falls_back_to_postgresql(self):
         # A freshly-created model with no source still previews — default to
         # the compiler's own default rather than erroring.
         db = _fake_db(source=None, connection=None)
-        connector = await _resolve_model_connector(db, uuid.uuid4())
+        connector, note = await _resolve_model_connector(db, uuid.uuid4())
         assert connector == "postgresql"
+        # Bug-7027/Bug-8904: no enabled rules means no predicate is compiled at
+        # all, so there is no quoting for a caveat to be about. The default is
+        # benign here and must stay silent.
+        assert note is None
 
     @pytest.mark.asyncio
     async def test_missing_connection_falls_back_to_postgresql(self):
         source = types.SimpleNamespace(project_connection_id=uuid.uuid4())
         db = _fake_db(source=source, connection=None)
-        connector = await _resolve_model_connector(db, uuid.uuid4())
+        connector, note = await _resolve_model_connector(db, uuid.uuid4())
         assert connector == "postgresql"
+        # Bug-8904: the source's connection is unreachable, but this fixture has
+        # NO enabled rules, so the preview is empty by construction and the
+        # caveat is suppressed. The same unreachable-source state WITH enabled
+        # rules does disclose — pinned by
+        # test_resolve_model_connector_warns_when_source_connector_unresolvable_bug7027
+        # in test_row_security_api.py.
+        assert note is None

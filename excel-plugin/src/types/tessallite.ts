@@ -68,8 +68,26 @@ export interface Hierarchy {
   id: string;
   name: string;
   display_name?: string;
-  type: 'date' | 'explicit' | 'segment';
-  levels: HierarchyLevel[];
+  /**
+   * Producer values are `explicit` | `date_embedded` | `segment`
+   * (model-service ALLOWED_HIERARCHY_TYPES). The old `'date'` literal never
+   * matched the backend; kept out of the union so a stale comparison fails
+   * type-check instead of silently never matching.
+   */
+  type: 'explicit' | 'date_embedded' | 'segment' | string;
+  /**
+   * Full level objects. The LIST endpoint (HierarchySummaryResponse) does
+   * NOT send this field -- it sends `level_count` + `level_names` only, so
+   * this is absent for every hierarchy in the library. Only code paths that
+   * fetched the detail endpoint may populate it. Consumers must fall back
+   * to `level_names` for display (see HierarchyCard).
+   */
+  levels?: HierarchyLevel[];
+  /** Ordinal-ordered level names from the summary endpoint. */
+  level_names?: string[];
+  level_count?: number;
+  calendar_type?: string | null;
+  dimension_kind?: string | null;
 }
 
 export interface HierarchyLevel {
@@ -109,6 +127,29 @@ export interface Kpi {
   replacement_id: string | null;
   owner_user_id: string | null;
   updated_at: string;
+  /**
+   * Bug-6728: the KPI type from the model-service governance schema.
+   * Producer domain (shared/db/models.py:765):
+   *   simple_measure | ratio | variance | growth_rate | moving_window | composite
+   * 'simple_measure' = measure-backed (value_measure_id references a real
+   * measure, migration 0116 backfills all v1 KPIs as this type).
+   * All other types are expression-based and may or may not have a single
+   * executable XMLA member (the gateway's _kpi_single_measure_from_expression
+   * decides). The plugin uses this to route KPIs away from CUBE formulas
+   * that can never resolve.
+   */
+  kpi_type?: string | null;
+  /**
+   * Bug-6728: the KPI's formula expression (for composite/expression KPIs).
+   * Populated by the model-service; null for simple measure-backed KPIs.
+   */
+  expression?: string | null;
+  /**
+   * Bug-6728: whether the KPI is deployed to the XMLA gateway. MDSCHEMA_KPIS
+   * only serves deployed KPIs (F-017-05), so CUBE formulas for an undeployed
+   * KPI are permanently #N/A until a deploy is triggered.
+   */
+  is_deployed?: boolean;
 }
 
 export interface KpiEvaluateResponse {
@@ -219,7 +260,8 @@ export interface TimeDimension {
 }
 
 export interface QueryFilter {
-  member: string;
+  /** Bug-7386: aligned with the wire protocol field name (was 'member'). */
+  dimension: string;
   operator: string;
   values?: string[];
 }
@@ -230,6 +272,12 @@ export interface PluginRouteTrace {
   aggregate_id?: string | null;
   pocket_id?: string | null;
   rewritten_query?: string | null;
+  /**
+   * Bug-6389: true when the server WITHHELD the physical SQL because the
+   * caller's role is below modeller — distinct from a route that produced no
+   * SQL at all (both leave `rewritten_query` null).
+   */
+  rewritten_query_redacted?: boolean;
 }
 
 export interface ExecuteResponse {
@@ -243,6 +291,14 @@ export interface ExecuteResponse {
   // F-025-20: route decision (aggregate/pocket/source + rewritten SQL) for the
   // Query Trace modal.
   route?: PluginRouteTrace | null;
+  /**
+   * Bug-8453 / R3 finding S-1: the row-security rule ids the router applied to
+   * this execution. Carries `__deny_all__` when row security denied every row,
+   * so the add-in can tell "your policy grants you no rows" from "this slice is
+   * empty" instead of inserting a blank extract or a 0 into a workbook. Rule
+   * IDS only — never predicate SQL. Classify with utils/rowSecurity.ts.
+   */
+  security_rules_applied?: string[];
 }
 
 export interface AgentConfig {
@@ -288,6 +344,13 @@ export interface JudgeVerdict {
 
 export interface DiscoverMembersResponse {
   members: { name: string; key: string }[];
+  /**
+   * Bug-8453 / R4 finding 3: the row-security denial channel on member
+   * discovery. Carries `__deny_all__` when the caller may see no members at
+   * all, so the picker can say so instead of rendering an empty dimension.
+   * Classify with utils/rowSecurity.ts.
+   */
+  security_rules_applied?: string[];
 }
 
 export interface DrillOption {
@@ -303,6 +366,13 @@ export interface DrillThroughResponse {
   page: { cursor: string; next_cursor?: string; has_more: boolean };
   drill_mode: string;
   rows_returned: number;
+  /**
+   * Bug-8453 / R5 finding F2: the row-security denial channel on the drill
+   * grid. The producer shipped in R4 with NO consumer on any client, so a
+   * drill into a cell whose detail rows are all RLS-denied still read as
+   * "no detail rows" -- a statement about the business, not about access.
+   */
+  security_rules_applied?: string[];
 }
 
 export interface AliasMapEntry {

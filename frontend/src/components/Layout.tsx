@@ -171,6 +171,13 @@ export default function Layout() {
             onClose={handleMenuClose}
           >
             <MenuItem onClick={handleMenuClose}>{t("nav.profile")}</MenuItem>
+            {!isSystemAdmin && (
+              <MenuItem
+                onClick={() => { handleMenuClose(); navigate("/account/tokens"); }}
+              >
+                {t("nav.accessTokens")}
+              </MenuItem>
+            )}
             <MenuItem onClick={() => { handleMenuClose(); navigate("/welcome"); }}>
               {t("nav.welcomeTour")}
             </MenuItem>

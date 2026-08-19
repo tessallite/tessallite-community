@@ -54,7 +54,7 @@ async def test_record_query_cache_hit_logs_with_zero_ms_and_no_miss(monkeypatch)
         client_kind="looker_cloud",
     )
 
-    # The cache hit is logged as a real query of the cached route_type ...
+    # The cache hit keeps the cached route_type for volume/top-user analytics ...
     assert captured["decision"].route_type == "aggregate"
     assert captured["decision"].aggregate_id == "agg-1"
     # ... with execution_ms=0 (no execution happened on a cache hit) ...
@@ -67,6 +67,10 @@ async def test_record_query_cache_hit_logs_with_zero_ms_and_no_miss(monkeypatch)
     assert captured["client_kind"] == "looker_cloud"
     # ... and NO miss row (a hit is never a miss, even for a source-cached row).
     assert captured["log_miss"] is False
+    # Bug-6426: the row is stamped cache_status="cache_hit" so acceleration and
+    # cost-savings rollups can EXCLUDE it — a cache re-serve is not counted as a
+    # new acceleration hit and its zeros are not averaged into savings.
+    assert captured["cache_status"] == "cache_hit"
 
 
 @pytest.mark.asyncio

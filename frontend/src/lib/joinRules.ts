@@ -11,6 +11,18 @@
 
 export type TableTypeish = string | undefined | null;
 
+/**
+ * Whether a table_type value is a dimension type. The API domain is
+ * "fact" | "dim_aggregate" | "dim_detail" | "unclassified" | "calendar";
+ * a table is a dimension if its type starts with "dim" (Bug-7635).
+ * JoinsPanel already used this pattern inline -- centralised here so
+ * Canvas edge-data construction and the same-type warning share one rule.
+ */
+export function isDimTableType(t: TableTypeish): boolean {
+  if (!t) return false;
+  return t.toLowerCase().startsWith("dim");
+}
+
 export interface JoinCombinationCheck {
   /** true when the pair is the canonical fact<->dim edge. */
   isFactDim: boolean;
@@ -27,10 +39,15 @@ export function classifyJoinEndpoints(
 ): JoinCombinationCheck {
   const l = (left ?? "").toLowerCase();
   const r = (right ?? "").toLowerCase();
+  const lIsDim = isDimTableType(l);
+  const rIsDim = isDimTableType(r);
   const isFactDim =
     (l === "fact" && r !== "fact" && r !== "") ||
     (r === "fact" && l !== "fact" && l !== "");
-  const isSameType = l !== "" && l === r;
+  // Same-type: both fact, or both dim (even if different dim subtypes like
+  // dim_detail and dim_aggregate -- those are still dimension-to-dimension).
+  const isSameType =
+    (l !== "" && l === r) || (lIsDim && rIsDim);
   let sameTypeLabel: string | null = null;
   if (isSameType) {
     // Translatable labels for the two same-type combinations the canvas can
@@ -38,10 +55,10 @@ export function classifyJoinEndpoints(
     // `t` is supplied (non-React call sites / tests).
     if (l === "fact") {
       sameTypeLabel = t ? t("joins.factToFact") : "fact-to-fact";
-    } else if (l === "dimension") {
+    } else if (lIsDim && rIsDim) {
       sameTypeLabel = t ? t("joins.dimensionToDimension") : "dimension-to-dimension";
     } else {
-      // Any other matching type (defensive — table_type is fact|dimension).
+      // Any other matching type (defensive).
       sameTypeLabel = t ? t("joins.sameTypeGeneric", { type: l }) : `${l}-to-${l}`;
     }
   }
@@ -52,7 +69,7 @@ export function classifyJoinEndpoints(
  * Whether a join_type denotes an outer join (left / right / full) and should
  * therefore render with a dashed edge. The API stores short names
  * ("inner" | "left" | "right" | "full"), none of which contain the substring
- * "outer" — the previous `includes("outer")` test was always false, so outer
+ * "outer" -- the previous `includes("outer")` test was always false, so outer
  * joins never rendered dashed (F-026-05). Centralised here so the edge and any
  * other consumer share one definition.
  */

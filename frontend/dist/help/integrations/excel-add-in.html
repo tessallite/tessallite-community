@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Tessallite Excel Add-in — Tessallite Help</title>
+  <title>Tessallite Excel Add-in - Tessallite Help</title>
   <link rel="stylesheet" href="../assets/help.css">
 </head>
 <body>
@@ -12,98 +12,170 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Tessallite Excel Add-in</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-05-31</span></div>
-<h1>Tessallite Excel Add-in</h1>
-<h2>What this covers</h2>
-<p>The Tessallite Excel add-in brings the semantic layer directly into Excel as a task pane. You build reports by dragging governed measures and dimensions, ask the conversational agent questions, insert live <code>CUBE</code> formulas, drill through to detail rows, and switch personas — all without leaving the workbook. Every number comes from the same deployed model that powers the web app, so the figures match exactly.</p>
-<h2>When to use the add-in</h2>
-<p>Excel can also connect to Tessallite as a native PivotTable over XMLA (see <a href="excel-pivottable-features.html">Excel PivotTable Features</a>). Use whichever fits the task:</p>
-<ul><li><strong>Add-in</strong> — guided report building, the conversational agent inside Excel, persona switching, and one-click insert of answers, tables, and charts. Best for analysts who want help assembling a report.</li><li><strong>Native XMLA PivotTable</strong> — the familiar PivotTable field list with slicers, Show Values As, and timelines. Best when you already think in PivotTables.</li></ul>
-<p>Both read the same governed models and honour the same row security and persona rules.</p>
-<h2>Install the add-in</h2>
-<p>The add-in is an Office.js task pane served over HTTPS. Office refuses to load task panes over plain HTTP, so the add-in must be reached over <code>https://</code> with a certificate Excel trusts.</p>
-<ol><li>Obtain the add-in manifest (<code>manifest.xml</code>) from your administrator. It points at your Tessallite deployment's add-in host (port <code>3443</code> in local installs).</li><li>In Excel, go to <strong>Insert → Get Add-ins → My Add-ins → Upload My Add-in</strong>, and select the <code>manifest.xml</code> file. (On Excel for the web, use <strong>Insert → Office Add-ins → Upload My Add-in</strong>.)</li><li>Open the add-in from the <strong>Home</strong> tab. The Tessallite task pane appears on the right.</li><li>Sign in with your tenant slug, email, and password — the same credentials you use for the web app.</li></ol>
-<p>Administrators download the manifest from <strong>Settings → Endpoints</strong> in the web app, where there are two buttons:</p>
-<ul><li><strong>Download Deployed Manifest</strong> — the server-generated manifest, already pointed at the live deployment. This is the one to hand out: it is always current, so you do not have to hand-edit any URLs.</li><li><strong>Download Custom Manifest</strong> — generates a manifest for a <em>different</em> server URL (for example a local-dev host or a custom domain). Use this only when the add-in must point somewhere other than the deployment you are signed in to.</li></ul>
-<p>Prefer the deployed manifest unless you have a specific reason to retarget it.</p>
-<p>The add-in supports Excel 2016 and later. On older builds it uses a simplified manifest and a local-storage fallback for session state.</p>
-<h2>Report Builder</h2>
-<p>Report Builder assembles a query from governed objects and writes the result to the sheet:</p>
-<ol><li>Pick a model. The measure, dimension, and hierarchy libraries populate with the objects you are allowed to see.</li><li>Drag objects into the <strong>Rows</strong>, <strong>Columns</strong>, <strong>Values</strong>, and <strong>Filters</strong> zones, or start from a layout in the template picker.</li><li>Click <strong>Run</strong>. The result range is written to the active sheet with friendly display names as headers.</li></ol>
-<p>Because the add-in queries the deployed model, aggregate routing, calculated measures, and time variants all apply automatically.</p>
-<h3>Filtering inside Report Builder</h3>
-<p>An object you drag into the <strong>Filters</strong> zone starts as a plain "equals" match. Click the filter chip to open the small editor and choose an <strong>Operator</strong> that fits what you are trying to do:</p>
-<ul><li><strong>Equals / Not Equals</strong> — keep (or drop) rows matching the values you type. Separate several values with commas to match any of them.</li><li><strong>Contains</strong> — keep rows whose text <em>includes</em> what you type, anywhere in the value. Typing <code>VI</code> keeps both "VISA" and "VIP". Good for partial text matches.</li><li><strong>Greater Than / Less Than</strong> — compare against a single value (a number or a date). These use one value only: if you type several, the add-in keeps the first and tells you so with a short notice, so you are never left wondering which value it used.</li><li><strong>Date Range</strong> — keep rows between a start date and an end date. Type the two dates in either order — if you enter them high-to-low, the add-in quietly swaps them so you still get the range you meant, and shows a notice saying it did.</li></ul>
-<p>The small label under the value box tells you what kind of value the column expects (a date, a number, or text), so you can pick a sensible operator. If you change your mind, press <strong>Cancel</strong> and the filter snaps back to exactly how it was when you opened the editor. If the model rejects a filter — for example an operator that does not fit the column — the add-in shows the reason in plain words instead of failing silently.</p>
-<h3>Using a named list in a zone</h3>
-<p>A saved <strong>named list</strong> (named set) can be used two ways, and the difference matters:</p>
-<ul><li><strong>Drag it into a zone</strong> (Rows, Columns, or Filters). The add-in resolves the list's members <em>at that moment</em> and writes those exact members into the query. This is a snapshot — simple, but frozen.</li><li><strong>Insert as formulas.</strong> This writes a live <code>CUBESET</code> formula into the sheet instead of a fixed list. The set is re-evaluated every time the workbook refreshes.</li></ul>
-<p>Prefer <strong>Insert as formulas</strong> whenever the list is large or changes over time:</p>
-<ul><li>A <strong>large</strong> list may be <em>truncated</em> in the preview the add-in fetched. Dropping it would silently use only the members that came back, under-counting your result. A <code>CUBESET</code> formula keeps the full membership.</li><li>A <strong>dynamic</strong> list — Top N or Filtered — decides its members each time it runs. Dropping it freezes today's members into the sheet, so it would stop updating. A formula re-evaluates on every refresh and stays correct.</li></ul>
-<p>For a fixed, short list that never changes, a plain drop is fine. See <a href="named-list-mdx-composition.html">Named-list MDX composition</a> for how the formulas are built.</p>
-<h2>KPIs tab</h2>
-<p>The <strong>KPIs</strong> tab is the middle tab in the task pane. It shows all KPIs defined in the active model, evaluated live with their current value, status (green/amber/red), and trend direction (up/flat/down).</p>
-<h3>What you see</h3>
-<ul>
-  <li><strong>Summary bar</strong> &mdash; total KPI count with coloured chips showing how many are Good, Warning, and Poor.</li>
-  <li><strong>Filter row</strong> &mdash; switch between &ldquo;All&rdquo; and &ldquo;Certified only&rdquo;, or type a search term.</li>
-  <li><strong>KPI cards</strong> &mdash; one card per KPI, grouped by display folder. Each card shows the KPI name, colour status dot, formatted value, target, and trend arrow.</li>
-</ul>
-<h3>Inserting KPIs to the worksheet</h3>
-<p>Every KPI card has two buttons:</p>
-<ul>
-  <li><strong>Insert Table</strong> &mdash; writes a mini-table at the active cell showing the KPI name, value, goal, status, and trend.</li>
-  <li><strong>Insert Chart</strong> &mdash; creates a column chart comparing the current value against the target.</li>
-</ul>
-<p>The scorecard button in the header inserts <strong>all</strong> KPIs as a live formula-based scorecard table with traffic-light status icons and trend arrows.</p>
-<h3>When data refreshes</h3>
-<p>KPI values refresh each time you switch to the KPIs tab or press the refresh button. Behind the scenes, the add-in calls the model&rsquo;s batch evaluation endpoint and caches the results for the session.</p>
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-07-09</span></div>
+    <h1>Tessallite Excel Add-in</h1>
 
-<h2>Ask Tessallite</h2>
-<p>The <strong>Ask Tessallite</strong> panel is the conversational agent inside Excel. Type a question in plain language; the answer streams back as it is generated, with the supporting query and a judge verdict on answer quality. Use the <strong>insert</strong> action to drop the answer text, the result table, or a chart onto the sheet.</p>
-<p>The agent honours the model's glossary, row security, and the persona you have selected, so it will not surface data you are not permitted to see.</p>
-<h2>CUBE formula wizard</h2>
-<p>The CUBE formula wizard generates live-connection cube formulas (the <code>CUBEVALUE</code> / <code>CUBEMEMBER</code> family) for a measure sliced by chosen dimension members. Live formulas recalculate on refresh, so a workbook built this way stays current against the deployed model. Pick the measure and members in the wizard and it writes the formulas into the selected cells.</p>
-<h2>Drill-through</h2>
-<p>Select a result cell and open the <strong>Drill-through</strong> panel to see the contributing fact rows. The drill-path picker lets you choose which detail columns and joined dimensions to include, then writes the detail rows to the sheet. Drill-through respects row security and persona scope — you only ever see rows you are authorised to see.</p>
-<h2>Persona switcher</h2>
-<p>The persona switcher sets the active persona for everything the add-in does. Selecting a persona applies that audience's allowed measures and dimensions, default filters, and row-level security. Queries run through the persona-scoped execution path, so an excluded measure or dimension is hidden or returns a clear authorisation error rather than leaking data.</p>
-<h2>Trace, diagnostics, and glossary</h2>
-<ul><li><strong>Query trace</strong> shows the route a query took (aggregate, pocket, or source) and the rewritten SQL, so you can confirm where a number came from.</li><li><strong>Diagnostics</strong> reports the add-in's connection and authentication state — useful when a query fails.</li><li><strong>Glossary</strong> looks up the business definition of any measure or dimension without leaving Excel.</li></ul>
-<h2>Custom Excel Functions (TESS namespace)</h2>
-<p>The add-in registers four custom worksheet functions under the <code>TESS</code> namespace. These functions live in a separate runtime from the task pane and share authentication through <code>OfficeRuntime.storage</code>, so the task pane must be signed in and a model selected before custom functions will work.</p>
-<h3>TESS.LISTBYID</h3>
-<pre><code>=TESS.LISTBYID("named_set_id")</code></pre>
-<p>Returns the members of a named set as a spilled array. On Excel 365 and later (builds that support dynamic arrays) the result spills into adjacent cells automatically — each member fills its own row below the formula cell. On older Excel versions (Excel 2016, Excel 2019, or Office 365 builds before the dynamic-array update), spilling is not supported; the formula cell shows only the first member of the set. If you need all members on an older version, use the <strong>Insert as CUBESET</strong> action from the Named Sets panel instead, which writes individual <code>CUBERANKEDMEMBER</code> formulas into separate cells.</p>
-<p>The function streams — Excel shows a spinner while the list loads, and the result appears once complete.</p>
-<ul><li><strong>named_set_id</strong> (string) — the UUID of the named set, shown in the Named Sets panel.</li></ul>
-<h3>TESS.KPIVALUE</h3>
-<pre><code>=TESS.KPIVALUE("kpi_id")</code></pre>
-<p>Returns the current evaluated value of a KPI. The value is the live result from the KPI's underlying measure expression.</p>
-<ul><li><strong>kpi_id</strong> (string) — the UUID of the KPI, shown in the KPIs panel.</li></ul>
-<h3>TESS.KPIGOAL</h3>
-<pre><code>=TESS.KPIGOAL("kpi_id")</code></pre>
-<p>Returns the goal (target) value of a KPI. If no goal is defined, the cell shows <code>#N/A</code>.</p>
-<h3>TESS.KPISTATUS</h3>
-<pre><code>=TESS.KPISTATUS("kpi_id")</code></pre>
-<p>Returns the status code of a KPI: <code>1</code> = Good, <code>0</code> = Warning, <code>-1</code> = Poor. Use conditional formatting with the traffic-light icon set to visualise the result.</p>
-<h3>Older Excel versions</h3>
-<p>Custom functions require Excel 2016 or later with the custom functions runtime. The three KPI functions (<code>TESS.KPIVALUE</code>, <code>TESS.KPIGOAL</code>, <code>TESS.KPISTATUS</code>) return scalar values and work identically on all supported versions. <code>TESS.LISTBYID</code> returns a matrix — on Excel versions without dynamic array support, only the first member appears in the formula cell. To see all members on older Excel, use the <strong>Insert as CUBESET</strong> action from the Named Sets panel, which writes <code>CUBERANKEDMEMBER</code> formulas into individual cells.</p>
-<h3>Caching and refresh</h3>
-<p>All custom functions cache results for 60 seconds. To force a fresh evaluation, wait for the cache to expire or re-enter the formula. <code>TESS.LISTBYID</code> is a streaming function and can be cancelled by Excel when the cell is cleared.</p>
-<h3>Error messages</h3>
-<table><thead><tr><th>Cell text</th><th>Meaning</th></tr></thead><tbody>
-<tr><td><code>#ERROR: Not signed in…</code></td><td>Open the Tessallite task pane and sign in first.</td></tr>
-<tr><td><code>#ERROR: No model selected…</code></td><td>Select a project and model in the task pane.</td></tr>
-<tr><td><code>#ERROR: Session expired…</code></td><td>Your JWT has expired. Re-open the task pane and sign in again.</td></tr>
-<tr><td><code>#N/A</code></td><td>The KPI property (goal, status) is not defined.</td></tr>
-</tbody></table>
-<h2>Troubleshooting</h2>
-<table><thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead><tbody><tr><td>Add-in icons appear black or the pane is blank</td><td>Loaded over plain HTTP, or the certificate is not trusted</td><td>Reach the add-in over <code>https://</code> (port <code>3443</code> locally) and trust the development certificate, then reload</td></tr><tr><td>"Sign in failed"</td><td>Wrong tenant slug, or the deployment URL in the manifest is unreachable</td><td>Confirm the tenant slug and that the add-in host URL in the manifest resolves from your machine</td></tr><tr><td>A measure is missing from the library</td><td>Your persona or role excludes it</td><td>Switch to a persona that includes the measure, or ask your modeller to grant access</td></tr><tr><td>Numbers differ from the web app</td><td>An older sheet result predates a model change</td><td>Re-run the report; the add-in always queries the currently deployed model</td></tr></tbody></table>
-<h2>Related</h2>
-<ul><li><a href="excel-pivottable-features.html">Excel PivotTable Features</a></li><li><a href="../getting-started/connect-excel.html">Connect Excel via XMLA</a></li><li><a href="../agent/agent-chat.html">Agent Chat</a></li><li><a href="../modelling/configure-personas.html">Configure Personas</a></li></ul>
-<nav class="page-nav"><a href="excel-pivottable-features.html" class="page-nav-btn prev">&larr; Excel PivotTable Features</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="named-list-mdx-composition.html" class="page-nav-btn next">Named List MDX Composition &rarr;</a></nav>
+    <h2>What This Covers</h2>
+    <p>The Tessallite Excel add-in brings the semantic layer directly into Excel as a task pane. You build reports by dragging governed measures and dimensions, ask the conversational agent questions, insert values, charts, and PivotTables, drill through to detail rows, and switch personas without leaving the workbook. Every number comes from the same deployed model that powers the web app, so the figures match exactly.</p>
+
+    <h2>When To Use The Add-in</h2>
+    <p>Excel can also connect to Tessallite as a native PivotTable over XMLA (see <a href="excel-pivottable-features.html">Excel PivotTable Features</a>). Use whichever fits the task:</p>
+    <ul>
+      <li><strong>Add-in</strong> - guided report building, the conversational agent inside Excel, persona switching, connectionless value functions, local PivotTables, and one-click insert of answers, tables, and charts. Best for analysts who want help assembling a report without creating a workbook data connection.</li>
+      <li><strong>Native XMLA PivotTable</strong> - the familiar PivotTable field list with slicers, Show Values As, and timelines. Best when you already think in PivotTables.</li>
+    </ul>
+    <p>Both read the same governed models and honour the same row security and persona rules.</p>
+
+    <h2>Install The Add-in</h2>
+    <p>The add-in is an Office.js task pane served over HTTPS. Office refuses to load task panes over plain HTTP, so the add-in must be reached over <code>https://</code> with a certificate Excel trusts.</p>
+    <ol>
+      <li>Obtain the add-in manifest (<code>manifest.xml</code>) from your administrator. It points at your Tessallite deployment's add-in host (port <code>3443</code> in local installs).</li>
+      <li>In Excel, go to <strong>Insert &gt; Get Add-ins &gt; My Add-ins &gt; Upload My Add-in</strong>, and select the <code>manifest.xml</code> file. On Excel for the web, use <strong>Insert &gt; Office Add-ins &gt; Upload My Add-in</strong>.</li>
+      <li>Open the add-in from the <strong>Home</strong> tab. The Tessallite task pane appears on the right.</li>
+      <li>Sign in with your tenant slug, email, and password. These are the same credentials you use for the web app.</li>
+    </ol>
+
+    <h3>Install From A Trusted Shared-folder Catalogue</h3>
+    <p>For local development or an internal pilot, your administrator may give you a shared-folder catalogue URL instead of asking you to upload a manifest file manually. The catalogue folder contains the add-in manifest. Excel must trust that folder before it can show the add-in.</p>
+    <ol>
+      <li>Copy the shared-folder URL from your administrator.</li>
+      <li>In Excel, open <strong>File &gt; Options &gt; Trust Center</strong>.</li>
+      <li>Click <strong>Trust Center Settings</strong>.</li>
+      <li>Open <strong>Trusted Add-in Catalogs</strong>.</li>
+      <li>Paste the shared-folder URL into <strong>Catalog URL</strong>.</li>
+      <li>Click <strong>Add catalog</strong>.</li>
+      <li>Tick <strong>Show in Menu</strong> for the catalogue.</li>
+      <li>Click <strong>OK</strong>, then close and restart Excel.</li>
+      <li>Open the blue <strong>Add-ins</strong> button, open <strong>Shared Folder</strong>, refresh, and add the Tessallite add-in.</li>
+    </ol>
+
+    <h2>Report Builder</h2>
+    <p>Report Builder assembles a query from governed objects and writes the result to the sheet.</p>
+    <ol>
+      <li>Pick a model. The measure, dimension, and hierarchy libraries populate with the objects you are allowed to see.</li>
+      <li>Drag objects into the <strong>Rows</strong>, <strong>Columns</strong>, <strong>Values</strong>, and <strong>Filters</strong> zones, or start from a layout in the template picker.</li>
+      <li>Click <strong>Run</strong>. The result range is written to the active sheet with friendly display names as headers.</li>
+    </ol>
+    <p>Because the add-in queries the deployed model, aggregate routing, calculated measures, and time variants all apply automatically.</p>
+
+    <h3>Connectionless Values And Local PivotTables</h3>
+    <p>The normal add-in insert path does not require a workbook-level OLAP connection named <code>Tessallite</code>.</p>
+    <ul>
+      <li>Clicking the measure value insert action writes a <code>TESSALLITE.VALUE</code> custom function, for example <code>=TESSALLITE.VALUE("inventory","shipping_cost")</code>. The function uses the same sign-in session and selected model as the task pane.</li>
+      <li>Single-cell KPI value and status inserts write <code>TESSALLITE.KPI</code>, for example <code>=TESSALLITE.KPI("inventory","Shipping Cost","status")</code>.</li>
+      <li>Local PivotTable inserts run the Report Builder query through Tessallite, write a flat grouped result into a hidden backing sheet, create a namespaced <code>_tsl_data_*</code> Excel Table, and build a native Excel PivotTable over that table using the Rows, Columns, Filters, and Values zones.</li>
+      <li>Local PivotTable inserts only accept additive standard measures. Use <strong>Insert Table</strong> or the advanced CUBE formula path for calculated, variant, semi-additive, or non-additive measures so Excel does not re-aggregate a value that must stay at its governed grain.</li>
+    </ul>
+    <p>If a workbook is opened while a different model is selected in the task pane, the <code>TESSALLITE.*</code> functions fail with a clear model-mismatch message instead of returning a number from the wrong model. Select the model named in the formula and refresh values.</p>
+    <p>Hidden PivotTable backing sheets are still workbook data. Anyone with workbook edit access can unhide them, so do not share a workbook with people who should not see the data behind the pivot.</p>
+
+    <h3>Filtering Inside Report Builder</h3>
+    <p>An object in the <strong>Filters</strong> zone starts as a plain equals match. Click the filter chip to choose an operator such as Equals, Contains, Greater Than, Less Than, or Date Range. If the model rejects a filter, the add-in shows the reason in plain words.</p>
+
+    <h3>Using A Named List In A Zone</h3>
+    <p>A saved named list can be dragged into a zone as a snapshot, or inserted as formulas when you need a live <code>CUBESET</code>. Prefer formulas for large or dynamic lists. See <a href="named-list-mdx-composition.html">Named-list MDX composition</a> for how the formulas are built.</p>
+
+    <h2>KPIs Tab</h2>
+    <p>The <strong>KPIs</strong> tab shows all KPIs defined in the active model, evaluated live with their current value, status, and trend direction. Single-cell KPI value and status inserts in Report Builder use <code>TESSALLITE.KPI</code> by default. Multi-cell KPI layouts and named-list formula inserts may still use the advanced CUBE path when they deliberately need workbook OLAP formulas.</p>
+
+    <h2>You Always See The Published Model</h2>
+    <p>The add-in shows you the <strong>published</strong> version of the model — the version someone deployed on purpose. It never shows work that is still in progress.</p>
+    <p>This matters most when a modeller is halfway through changing something. Imagine a colleague is rewriting the "Top 10 Customers" list and has it down to three names while they experiment. Nothing in your workbook changes. You keep seeing the ten names from the published version, because a half-finished edit is not a decision anyone has made yet. When they finish and deploy, your next refresh picks up the new list.</p>
+    <p>The same rule covers KPI names, descriptions, and definitions, and it applies everywhere the add-in reads: the KPIs tab, the named lists in the Report Builder, and the <code>TESSALLITE.*</code> formulas in your cells. It is the same rule Power BI, Tableau, and any SQL tool already follow, which is why the same number matches across all of them.</p>
+    <p><strong>If you are the modeller</strong>, your own drafts will not appear in Excel either. That is deliberate — the add-in is where people consume the model, not where you build it. To check work in progress, use the <strong>model builder</strong> in the Tessallite web app, which shows live drafts. When the change is ready for everyone, <strong>Save and then Deploy</strong> the model; it appears in Excel on the next refresh.</p>
+    <p>There is a practical reason beyond tidiness. A formula for something unpublished cannot return a number anyway: the gateway that resolves it also serves the published version only, so a draft KPI offered in the pane would insert a formula that shows <code>#N/A</code> forever.</p>
+    <h3>If you see "the published version of this model is unavailable"</h3>
+    <p>This message means the add-in could not read the model's published version — not that your connection is down. The add-in stops rather than showing you unpublished figures, because a number nobody approved is worse than no number. Ask a modeller to deploy the model again in the web app, then refresh the pane.</p>
+
+    <h2>Ask Tessallite</h2>
+    <p>The <strong>Ask Tessallite</strong> panel is the conversational agent inside Excel. The agent honours the model's glossary, row security, and the persona you have selected.</p>
+
+    <h2>CUBE Formula Wizard</h2>
+    <p>The CUBE formula wizard is the advanced OLAP path. It generates live-connection cube formulas, such as <code>CUBEVALUE</code> and <code>CUBEMEMBER</code>, for a measure sliced by chosen dimension members. These formulas require the workbook to have an Analysis Services connection named <code>Tessallite</code>. Use this mode when you deliberately want Excel's native XMLA engine. For normal add-in inserts, use the connectionless value and local PivotTable paths.</p>
+
+    <h2>Drill-through</h2>
+    <p>Select a result cell and open the <strong>Drill-through</strong> panel to see the contributing fact rows. Drill-through respects row security and persona scope.</p>
+
+    <h2>Persona Switcher</h2>
+    <p>The persona switcher sets the active persona for everything the add-in does. Selecting a persona applies that audience's allowed measures and dimensions, default filters, and row-level security.</p>
+
+    <h2>Custom Excel Functions</h2>
+    <p>The add-in registers connectionless worksheet functions under the <code>TESSALLITE</code> namespace, plus older compatibility functions under the <code>TESS</code> namespace. These functions use the add-in sign-in session, so the task pane must be signed in and a model selected before custom functions will work.</p>
+
+    <h3>TESSALLITE.VALUE</h3>
+    <pre><code>=TESSALLITE.VALUE("model_slug", "measure_name")
+=TESSALLITE.VALUE("model_slug", "measure_name", "region_code", "EU")</code></pre>
+    <p>Returns a governed measure value, optionally filtered by dimension member values. Calls are batched for recalculation, so a sheet with many value cells does not send one request per cell.</p>
+
+    <h3>TESSALLITE.KPI</h3>
+    <pre><code>=TESSALLITE.KPI("model_slug", "kpi_name", "value")
+=TESSALLITE.KPI("model_slug", "kpi_name", "goal")
+=TESSALLITE.KPI("model_slug", "kpi_name", "status")</code></pre>
+    <p>Returns one KPI property. Status returns <code>1</code>, <code>0</code>, or <code>-1</code>, so Excel icon-set formatting can use it.</p>
+
+    <h3>TESSALLITE.MEMBERVALUE</h3>
+    <pre><code>=TESSALLITE.MEMBERVALUE("model_slug", "measure_name", "dimension_name", "member_value")</code></pre>
+    <p>Returns one measure for one dimension member.</p>
+
+    <h3>Older TESS Namespace</h3>
+    <ul>
+      <li><code>=TESS.LISTBYID("named_set_id")</code> returns the members of a named set as a spilled array where the Excel version supports dynamic arrays.</li>
+      <li><code>=TESS.KPIVALUE("kpi_id")</code>, <code>=TESS.KPIGOAL("kpi_id")</code>, and <code>=TESS.KPISTATUS("kpi_id")</code> are retained for older workbooks.</li>
+    </ul>
+
+    <h3>Caching And Refresh</h3>
+    <p>Custom functions cache results for 60 seconds. To force a fresh evaluation, click <strong>Refresh</strong> in the Report Builder footer. This clears all caches and triggers a full workbook recalculation so every <code>TESSALLITE.*</code> formula fetches a fresh value immediately. Switching personas, switching connection profiles, and signing out also clear the caches automatically.</p>
+
+    <h3>Refresh Sheet Data</h3>
+    <p>The <strong>Refresh sheet data</strong> button (next to the Refresh button in the Report Builder footer) re-runs every Tessallite-inserted table on the active worksheet. It reads each table's stored query and re-executes it against the current session and persona. Tables that belong to a different project or model than the one currently selected are skipped with a reason. Tables whose column structure has changed since insertion are also skipped to prevent data corruption.</p>
+
+    <p>When a table grows or shrinks, its attribution line (the small grey &quot;Source: Tessallite ...&quot; row underneath it) moves with it and picks up the new refresh time.</p>
+
+    <p>If a table needs to grow but the cells directly beneath it are not empty &mdash; your own note, a subtotal, or a second block of data &mdash; Tessallite does <strong>not</strong> refresh that table. It leaves everything exactly as it was and tells you which table was affected, so nothing of yours is overwritten. Clear or move those cells and refresh again.</p>
+
+    <p><strong>Show details.</strong> If any table was skipped, or refreshed with a warning, a <strong>Show details</strong> link appears under the buttons. Open it to see exactly which table was affected and why. Some reasons are temporary &mdash; for example, if something else in Excel was still working on the same cells, or if Excel would not hand back a table's saved query details that time, the table is left untouched and simply clicking <strong>Refresh sheet data</strong> again will usually pick it up. A temporary problem is always named in the list; a table is never dropped from the count without a reason. A table listed under <strong>Skipped</strong> was not changed. A table listed under <strong>Refreshed with warnings</strong> needs a look: it may have its new numbers with something else left incomplete, or &mdash; rarely, if Excel reported an error part-way through &mdash; a mix of old and new rows. The reason next to each table says which.</p>
+
+    <h3>Insert Mode (Live vs Static)</h3>
+    <p>A <strong>Live / Static</strong> toggle in the Report Builder footer controls how single-value inserts behave:</p>
+    <ul>
+      <li><strong>Live</strong> (default): inserts a <code>TESSALLITE.VALUE(...)</code> or <code>TESSALLITE.KPI(...)</code> formula. The value refreshes automatically on workbook recalculation.</li>
+      <li><strong>Static</strong>: fetches the current value once and writes it as a plain number. The cell does not update automatically.</li>
+    </ul>
+    <p>This setting applies only to the default single-value insert actions (the sigma icon on measures, and the value/status KPI inserts). Table inserts, chart inserts, CUBE formula inserts, and scorecard inserts are not affected by the toggle.</p>
+
+    <h3>Error Messages</h3>
+    <table><thead><tr><th>Cell text</th><th>Meaning</th></tr></thead><tbody>
+      <tr><td><code>#ERROR: Not signed in...</code></td><td>Open the Tessallite task pane and sign in first.</td></tr>
+      <tr><td><code>#ERROR: No model selected...</code></td><td>Select a project and model in the task pane.</td></tr>
+      <tr><td><code>#ERROR: Formula model does not match...</code></td><td>The formula names one model while the task pane has another model selected. Select the formula's model and refresh.</td></tr>
+      <tr><td><code>#ERROR: Session expired...</code></td><td>Your JWT has expired. Re-open the task pane and sign in again.</td></tr>
+      <tr><td><code>#N/A</code></td><td>The measure or KPI property is not available for that cell.</td></tr>
+    </tbody></table>
+
+    <h2>Troubleshooting</h2>
+    <table><thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead><tbody>
+      <tr><td>Add-in icons appear black or the pane is blank</td><td>Loaded over plain HTTP, or the certificate is not trusted</td><td>Reach the add-in over <code>https://</code> and trust the development certificate, then reload.</td></tr>
+      <tr><td>"Sign in failed"</td><td>Wrong tenant slug, or the deployment URL in the manifest is unreachable</td><td>Confirm the tenant slug and that the add-in host URL in the manifest resolves from your machine.</td></tr>
+      <tr><td>A measure is missing from the library</td><td>Your persona or role excludes it</td><td>Switch to a persona that includes the measure, or ask your modeller to grant access.</td></tr>
+      <tr><td>Numbers differ from the web app</td><td>An older sheet result predates a model change, or a formula was calculated while another model was selected</td><td>Re-run the report, or select the model named in the formula and click <strong>Refresh values</strong>.</td></tr>
+      <tr><td><code>#NAME?</code> for every TESSALLITE formula</td><td>The custom functions runtime did not register this Excel session (common on Office 2019/2021 perpetual)</td><td>Re-insert the add-in from <strong>Insert &gt; My Add-ins &gt; Shared Folder</strong>. A plain Excel restart is not always enough.</td></tr>
+      <tr><td>The pane works but every formula shows <code>#VALUE!</code> after a few seconds, and the server is on <code>localhost</code></td><td>The custom functions sandbox is blocked from local network access, or it does not trust the server certificate</td><td>Ask your administrator to apply the one-time machine setup described in the plugin README (loopback exemption plus installing the certificate authority into the machine store).</td></tr>
+      <tr><td>The add-in half-works: formulas respond but the ribbon button is gone, or the reverse</td><td>The Office add-in cache has become inconsistent after repeated add and remove cycles</td><td>Close Excel, delete the contents of <code>%LOCALAPPDATA%\Microsoft\Office\16.0\Wef</code>, reopen Excel, and re-insert the add-in. Sign in again afterwards &mdash; clearing the cache also clears the saved session.</td></tr>
+      <tr><td>A KPI or named list you just created is not in the pane</td><td>It has not been deployed yet. The add-in shows the published model only</td><td>Save and Deploy the model in the web app, then refresh the pane. To check the draft itself, use the model builder.</td></tr>
+      <tr><td>A cell shows "Published model unavailable"</td><td>The model's published version could not be read</td><td>Ask a modeller to deploy the model again, then refresh. The add-in stops here on purpose rather than showing unpublished figures.</td></tr>
+    </tbody></table>
+    <p>Tip: type <code>=TESSALLITE.DIAG()</code> in any cell to see the add-in's own health report &mdash; whether storage works, which model is selected, which server it talks to, and whether the server answers. Include this text when you contact support.</p>
+
+    <h2>Related</h2>
+    <ul>
+      <li><a href="excel-pivottable-features.html">Excel PivotTable Features</a></li>
+      <li><a href="../getting-started/connect-excel.html">Connect Excel via XMLA</a></li>
+      <li><a href="../agent/agent-chat.html">Agent Chat</a></li>
+      <li><a href="../modelling/configure-personas.html">Configure Personas</a></li>
+    </ul>
+
+    <nav class="page-nav"><a href="excel-pivottable-features.html" class="page-nav-btn prev">&larr; Excel PivotTable Features</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="named-list-mdx-composition.html" class="page-nav-btn next">Named List MDX Composition &rarr;</a></nav>
   </main>
-  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+  <footer class="site-footer"><p>Tessallite Help - <a href="../index.html">Back to contents</a></p></footer>
 </body>
 </html>

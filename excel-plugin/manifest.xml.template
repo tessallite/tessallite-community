@@ -7,7 +7,7 @@
   xsi:type="TaskPaneApp">
 
   <Id>e3ae536b-1d2f-44fd-bdc4-e01b5a7597d2</Id>
-  <Version>1.0.0.1</Version>
+  <Version>1.0.0.9</Version>
   <ProviderName>Tessallite</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
   <DisplayName DefaultValue="Tessallite"/>
@@ -26,29 +26,44 @@
     <Host Name="Workbook"/>
   </Hosts>
 
+  <Requirements>
+    <Sets DefaultMinVersion="1.1">
+      <Set Name="CustomFunctionsRuntime" MinVersion="1.1"/>
+    </Sets>
+  </Requirements>
+
   <DefaultSettings>
     <SourceLocation DefaultValue="${PLUGIN_BASE_URL}/excel-plugin/index.html"/>
   </DefaultSettings>
 
   <Permissions>ReadWriteDocument</Permissions>
 
+  <!--
+    VersionOverridesV1_0 is REQUIRED for custom functions on perpetual Office
+    (2019/2021): those hosts ignore a V1_1 CustomFunctions extension point for
+    sideloaded add-ins (Bug-6905). The Script URL must be a classic-script
+    (IIFE) bundle; an ES module crashes the JS-only runtime. Registration
+    happens via the Page URL, which loads the CDN custom-functions-runtime.js.
+  -->
   <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
     <Hosts>
       <Host xsi:type="Workbook">
         <AllFormFactors>
           <ExtensionPoint xsi:type="CustomFunctions">
-            <CustomFunctions>
-              <Page>
-                <SourceLocation resid="Functions.Page.Url"/>
-              </Page>
-              <Metadata>
-                <SourceLocation resid="Functions.Metadata.Url"/>
-              </Metadata>
-              <Namespace resid="Functions.Namespace"/>
-            </CustomFunctions>
+            <Script>
+              <SourceLocation resid="Functions.Script.Url"/>
+            </Script>
+            <Page>
+              <SourceLocation resid="Functions.Page.Url"/>
+            </Page>
+            <Metadata>
+              <SourceLocation resid="Functions.Metadata.Url"/>
+            </Metadata>
+            <Namespace resid="Functions.Namespace"/>
           </ExtensionPoint>
         </AllFormFactors>
         <DesktopFormFactor>
+          <FunctionFile resid="Functions.Page.Url"/>
           <ExtensionPoint xsi:type="PrimaryCommandSurface">
             <OfficeTab id="TabHome">
               <Group id="Tessallite.Group">
@@ -89,13 +104,14 @@
       </bt:Images>
       <bt:Urls>
         <bt:Url id="Taskpane.Url" DefaultValue="${PLUGIN_BASE_URL}/excel-plugin/index.html"/>
+        <bt:Url id="Functions.Script.Url" DefaultValue="${PLUGIN_BASE_URL}/excel-plugin/functions.iife.js"/>
         <bt:Url id="Functions.Page.Url" DefaultValue="${PLUGIN_BASE_URL}/excel-plugin/functions.html"/>
         <bt:Url id="Functions.Metadata.Url" DefaultValue="${PLUGIN_BASE_URL}/excel-plugin/functions.json"/>
       </bt:Urls>
       <bt:ShortStrings>
         <bt:String id="GroupLabel" DefaultValue="Tessallite"/>
         <bt:String id="OpenPane.Label" DefaultValue="Tessallite"/>
-        <bt:String id="Functions.Namespace" DefaultValue="TESS"/>
+        <bt:String id="Functions.Namespace" DefaultValue="TESSALLITE"/>
       </bt:ShortStrings>
       <bt:LongStrings>
         <bt:String id="OpenPane.Tooltip" DefaultValue="Open Tessallite panel."/>

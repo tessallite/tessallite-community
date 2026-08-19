@@ -1,5 +1,5 @@
 # SQL Server ODBC driver requires amd64 — arm64 builds must omit msodbcsql17
-FROM python:3.12-slim AS builder
+FROM python:3.13-slim AS builder
 
 WORKDIR /app
 
@@ -23,26 +23,18 @@ COPY services/query-router/src/ /app/src/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
-# ── compile closed modules to native .so, drop source (Phase 6) ──
-# query-router's closed IP (aggregate/pocket matchers + exactness validator +
-# rewrite-to-aggregate/pocket) and the shared closed license policy ship compiled,
-# not as readable Python. Compile-only (no logic change). Image layout is flattened
-# (src -> /app/src). Kept in sync with build_closed.py CLOSED_MODULES (leak-check).
-RUN pip install --no-cache-dir cython && \
-    inc="$(python3 -c 'import sysconfig; print(sysconfig.get_path("include"))')" && \
-    for m in /app/shared/licensing/closed/manager_impl \
-             /app/src/routing/aggregate_matcher \
-             /app/src/routing/pocket_matcher \
-             /app/src/routing/exactness_validator \
-             /app/src/rewrite/aggregate \
-             /app/src/rewrite/pocket; do \
-        cython -3 -X annotation_typing=False "$m.py" -o "$m.c" && \
-        gcc -shared -fPIC -I"$inc" "$m.c" -o "$m.so" && \
-        rm -f "$m.py" "$m.c"; \
-    done
+# calendar_type="hijri" needs hijri-converter (shared/semantic/calendar_dialects.py
+# imports `from hijri_converter import Gregorian`). It is not in uv.lock because
+# `shared/` is copied onto the pythonpath rather than installed as a locked package,
+# so install it into the synced venv explicitly. Pinned to the 2.x line whose import
+# name is `hijri_converter` (3.x renames it to `hijridate`).
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /app/.venv/bin/python "hijri-converter==2.3.1"
+
+# Source-only export: closed modules removed; native compilation is not required.
 
 # ── runtime stage ──
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsasl2-2 unixodbc curl gnupg && \
@@ -61,6 +53,9 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/shared /app/shared
 COPY --from=builder /app/src /app/src
 
+# Bug-6441: remove private license-issuer source (PRIVATE_REMOVE_PATHS)
+RUN rm -rf /app/shared/licensing/issuer
+
 ENV PATH="/app/.venv/bin:$PATH"
 ENV VIRTUAL_ENV="/app/.venv"
 ENV PYTHONPATH="/app"
@@ -71,4 +66,20 @@ USER appuser
 
 EXPOSE 8000
 
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Bug-7759: embed the source-tree commit SHA so release_bundle provenance
+# checks (Bug-7483/7495) can verify image-to-source alignment.
+ARG GIT_REVISION=""
+LABEL org.opencontainers.image.revision=$GIT_REVISION
+
+# Bug-8041 R7 HIGH-2: uvicorn MUST be given an explicit graceful-shutdown
+# timeout. With the default (unset) uvicorn's shutdown does
+# `asyncio.wait_for(self._wait_tasks_to_complete(), timeout=None)` -- it waits
+# INDEFINITELY for in-flight requests/connections and only AFTER that runs
+# `self.lifespan.shutdown()`, the hook that calls close_all_pools(). One
+# long-running query therefore meant the pool manager's whole shutdown budget
+# never started before the platform SIGKILLed the container.
+# The value is DERIVED from the single shutdown-budget source of truth
+# (shared/config/shutdown_budget.py) so this flag, the compose/Cloud-Run
+# stop grace and SOURCE_POOL_SHUTDOWN_GRACE_SECONDS cannot drift apart.
+# `exec` keeps uvicorn as PID 1 so it still receives SIGTERM directly.
+CMD ["sh", "-c", "python -m shared.config.shutdown_budget --check; exec uvicorn src.main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown \"$(python -m shared.config.shutdown_budget request_drain_seconds 2>/dev/null || echo 6)\""]

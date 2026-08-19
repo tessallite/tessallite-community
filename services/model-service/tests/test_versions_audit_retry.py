@@ -45,13 +45,21 @@ async def _rehydrate_noop(*_args, **_kwargs):
     return None
 
 
+# F-021-04: the zero-binding bootstrap-admin grant is removed; _ensure_model_access
+# now admits ONLY a caller that actually holds a binding. Supply an authorizing
+# binding for its ``select(UserAccessBinding)... .scalars().first()`` lookup so
+# these Save/version tests exercise the endpoint's behaviour, not the RBAC deny
+# path (which is covered by the dedicated binding-only RBAC tests).
+_AUTHZ_BINDING = types.SimpleNamespace(role="admin", model_id=None, project_id=None)
+
+
 def _result(scalar=None):
     """A MagicMock that mimics a SQLAlchemy Result for both access shapes:
-    ``.scalar_one_or_none()`` and ``.scalars().first()`` (bootstrap-admin
-    binding probe in _ensure_model_access)."""
+    ``.scalar_one_or_none()`` and ``.scalars().first()`` (the caller's
+    authorizing binding for _ensure_model_access — binding-only, no bootstrap)."""
     r = MagicMock()
     r.scalar_one_or_none.return_value = scalar
-    r.scalars.return_value.first.return_value = None  # no binding -> bootstrap
+    r.scalars.return_value.first.return_value = _AUTHZ_BINDING  # caller has a binding
     r.scalars.return_value.all.return_value = []
     return r
 
@@ -119,12 +127,16 @@ async def test_save_emits_audit_event(client):
     mock_db = make_mock_db()
     mock_db.get = AsyncMock(return_value=model)
     # 1st execute = _ensure_model_access binding probe (None -> bootstrap);
-    # 2nd execute = last-version lookup (v4 -> next v5).
-    mock_db.execute = AsyncMock(side_effect=[_result(None), _result(4)])
+    # 2nd execute = advisory lock (Bug-7150/Bug-7982);
+    # 3rd execute = last-version lookup (v4 -> next v5).
+    mock_db.execute = AsyncMock(side_effect=[_result(None), _result(None), _result(4)])
 
-    async def _refresh(version):
-        version.id = uuid.uuid4()
-        version.created_at = NOW
+    async def _refresh(obj, *args, **kwargs):
+        # opus5 finding 5: Save now also refreshes model.deployed_version_id under
+        # the lock; only stamp id/created_at on the ModelVersion.
+        if hasattr(obj, "version_number"):
+            obj.id = uuid.uuid4()
+            obj.created_at = NOW
 
     mock_db.refresh = _refresh
 
@@ -135,7 +147,7 @@ async def test_save_emits_audit_event(client):
 
     with (
         patch("src.api.versions.get_tenant_db", async_gen_from(mock_db)),
-        patch("src.api.versions.snapshot_model", new=AsyncMock(return_value={})),
+        patch("src.api.versions._consistent_snapshot", new=AsyncMock(return_value={})),
         patch("src.api.versions.audit", new=_capture_audit),
     ):
         resp = await client.post(f"{PREFIX}/versions", json={"summary": "edit"})
@@ -165,9 +177,12 @@ async def test_concurrent_save_retries_then_succeeds(client):
 
     mock_db = make_mock_db()
     mock_db.get = AsyncMock(return_value=model)
-    # binding probe, then a version lookup per attempt (2 attempts).
+    # binding probe, advisory lock, version lookup (attempt 1), re-lock after the
+    # collision rollback (opus5 finding 6), version lookup (attempt 2).
     mock_db.execute = AsyncMock(
-        side_effect=[_result(None), _result(1), _result(1)]
+        side_effect=[
+            _result(None), _result(None), _result(1), _result(None), _result(1),
+        ]
     )
     # First flush raises (race lost), second flush succeeds.
     mock_db.flush = AsyncMock(side_effect=[_unique_violation(), None])
@@ -181,15 +196,16 @@ async def test_concurrent_save_retries_then_succeeds(client):
 
     mock_db.rollback = _rollback_with_expiration
 
-    async def _refresh(version):
-        version.id = uuid.uuid4()
-        version.created_at = NOW
+    async def _refresh(obj, *args, **kwargs):
+        if hasattr(obj, "version_number"):
+            obj.id = uuid.uuid4()
+            obj.created_at = NOW
 
     mock_db.refresh = _refresh
 
     with (
         patch("src.api.versions.get_tenant_db", async_gen_from(mock_db)),
-        patch("src.api.versions.snapshot_model", new=AsyncMock(return_value={})),
+        patch("src.api.versions._consistent_snapshot", new=AsyncMock(return_value={})),
         patch("src.api.versions.audit", new=AsyncMock()),
         # F-013-17: retention prune runs after a successful Save; this test
         # asserts the retry/commit behaviour, not retention, so stub it out
@@ -203,13 +219,16 @@ async def test_concurrent_save_retries_then_succeeds(client):
     assert mock_db.flush.await_count == 2
     # Verify rollback was called (expiring the model's identity-map state).
     assert _original_rollback.await_count == 1
-    # After rollback, the retry path accessed the model's attributes
-    # (display_name in audit, deployed_version_id in _to_item); those
-    # accesses triggered simulated lazy-loads on the expired model.
-    assert model._refresh_count > 0, (
-        "model attributes were never accessed after rollback-expiration; "
-        "the retry path should read model.display_name / "
-        "model.deployed_version_id after the rollback"
+    # Bug-6202 regression guard: the retry path must NOT read any model ORM
+    # attribute after the rollback-expiration. A real AsyncSession raises
+    # MissingGreenlet on such an implicit lazy-load (turning the handled 409
+    # into a 500); this mock instead counts the access. The fix captures
+    # display_name / deployed_version_id into locals BEFORE the retry loop, so
+    # zero expired accesses occur after rollback.
+    assert model._refresh_count == 0, (
+        "the retry path read an expired model attribute after rollback; "
+        "capture the needed scalars before the loop to avoid a lazy-load "
+        "that 500s on a real async session"
     )
 
 
@@ -224,8 +243,12 @@ async def test_concurrent_save_double_collision_returns_409(client):
 
     mock_db = make_mock_db()
     mock_db.get = AsyncMock(return_value=model)
+    # binding probe, advisory lock, version lookup (attempt 1), re-lock after the
+    # collision rollback (opus5 finding 6), version lookup (attempt 2).
     mock_db.execute = AsyncMock(
-        side_effect=[_result(None), _result(1), _result(1)]
+        side_effect=[
+            _result(None), _result(None), _result(1), _result(None), _result(1),
+        ]
     )
     mock_db.flush = AsyncMock(
         side_effect=[_unique_violation(), _unique_violation()]
@@ -243,7 +266,7 @@ async def test_concurrent_save_double_collision_returns_409(client):
 
     with (
         patch("src.api.versions.get_tenant_db", async_gen_from(mock_db)),
-        patch("src.api.versions.snapshot_model", new=AsyncMock(return_value={})),
+        patch("src.api.versions._consistent_snapshot", new=AsyncMock(return_value={})),
         patch("src.api.versions.audit", new=AsyncMock()),
     ):
         resp = await client.post(f"{PREFIX}/versions", json={})

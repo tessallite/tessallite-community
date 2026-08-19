@@ -6,6 +6,7 @@ import {
 import { PersonOutline } from '@mui/icons-material';
 import { tokens } from '../../theme';
 import type { ConnectionProfile } from '../../utils/storage';
+import { strings } from '../../i18n/strings';
 
 interface ProfileSwitcherProps {
   profiles: ConnectionProfile[];
@@ -33,8 +34,8 @@ export default function ProfileSwitcher({
     <>
       <IconButton
         size="small"
-        title="Connection Profiles"
-        aria-label="Switch profile"
+        title={strings.profileSwitcher.title}
+        aria-label={strings.profileSwitcher.switchProfileAria}
         onClick={e => setAnchorEl(e.currentTarget)}
       >
         <PersonOutline sx={{ fontSize: 20, color: tokens.colorTextSecondary }} />
@@ -49,14 +50,14 @@ export default function ProfileSwitcher({
       >
         <Box sx={{ px: 2, py: 0.5 }}>
           <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, textTransform: 'uppercase' }}>
-            Connection Profiles
+            {strings.profileSwitcher.title}
           </Typography>
         </Box>
 
         {profiles.length === 0 && (
           <MenuItem disabled>
             <ListItemText
-              primary="No saved connections"
+              primary={strings.profileSwitcher.noSaved}
               primaryTypographyProps={{ fontSize: 12 }}
             />
           </MenuItem>
@@ -99,7 +100,7 @@ export default function ProfileSwitcher({
           sx={{ color: tokens.colorRed }}
         >
           <ListItemText
-            primary="Sign Out"
+            primary={strings.profileSwitcher.signOut}
             primaryTypographyProps={{ fontSize: 13 }}
           />
         </MenuItem>
@@ -107,16 +108,16 @@ export default function ProfileSwitcher({
 
       <Dialog open={Boolean(removeTarget)} onClose={() => setRemoveTarget(null)}>
         <DialogTitle sx={{ fontSize: 14, fontWeight: 700 }}>
-          Remove Profile
+          {strings.profileSwitcher.removeTitle}
         </DialogTitle>
         <DialogContent>
           <Typography sx={{ fontSize: 13 }}>
-            This will remove the saved connection. You can log in again to restore it. Continue?
+            {strings.profileSwitcher.removeConfirmation}
           </Typography>
         </DialogContent>
         <DialogActions>
           <Button size="small" onClick={() => setRemoveTarget(null)} sx={{ textTransform: 'none' }}>
-            Cancel
+            {strings.profileSwitcher.cancel}
           </Button>
           <Button
             size="small"
@@ -128,7 +129,7 @@ export default function ProfileSwitcher({
             }}
             sx={{ textTransform: 'none' }}
           >
-            Remove
+            {strings.profileSwitcher.remove}
           </Button>
         </DialogActions>
       </Dialog>

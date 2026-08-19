@@ -2,9 +2,13 @@ import { useState } from "react";
 import {
   Box,
   Button,
+  FormControl,
   FormControlLabel,
   IconButton,
+  InputLabel,
+  MenuItem,
   Popover,
+  Select,
   Switch,
   TextField,
   Tooltip,
@@ -17,6 +21,7 @@ import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
 import { useT } from "../../i18n";
 import type { KpiThresholdBand } from "../../api/types";
 import type { KpiWizardFormState } from "./types";
+import { createDefaultPresentationMeta } from "../KpiBusinessBuilder/KpiThresholdEditor";
 
 const DEFAULT_BANDS: KpiThresholdBand[] = [
   { label: "Off Target", color: "#D32F2F", min: 0, max: 50 },
@@ -102,15 +107,23 @@ export default function KpiWizardStep3Thresholds({ form, onChange }: Props) {
   const t = useT();
 
   const meta = form.presentation_meta ?? {};
+  const direction = form.direction;
+  // Bug-6248 / F-017-20: derive the evaluation type from the existing meta;
+  // default to the spec basis percentage_of_target so wizard-authored KPIs match
+  // seed KPIs (null meta also evaluates as percentage_of_target on the backend).
+  const evaluationType: string = meta.evaluation_type ?? "percentage_of_target";
   const bands: KpiThresholdBand[] = meta.bands ?? DEFAULT_BANDS;
   const colorblind = meta.colorblind ?? false;
 
   const [pickerAnchor, setPickerAnchor] = useState<HTMLElement | null>(null);
   const [pickerBandIdx, setPickerBandIdx] = useState<number>(0);
 
+  // Bug-6248: updateMeta now preserves the current evaluationType instead of
+  // forcing absolute_value. Every call writes the type that is already selected
+  // (or that the caller explicitly overrides via the patch).
   function updateMeta(patch: Record<string, unknown>) {
     onChange({
-      presentation_meta: { ...meta, evaluation_type: "absolute_value", ...patch },
+      presentation_meta: { ...meta, evaluation_type: evaluationType, ...patch },
     });
   }
 
@@ -122,11 +135,12 @@ export default function KpiWizardStep3Thresholds({ form, onChange }: Props) {
   function addBand() {
     if (bands.length >= 5) return;
     const last = bands[bands.length - 1];
+    const increment = evaluationType === "percentage_of_target" ? 0.2 : 20;
     const newBand: KpiThresholdBand = {
       label: "",
       color: "#9E9E9E",
       min: last.max ?? 0,
-      max: (last.max ?? 0) + 20,
+      max: (last.max ?? 0) + increment,
     };
     updateMeta({ bands: [...bands, newBand] });
   }
@@ -151,12 +165,56 @@ export default function KpiWizardStep3Thresholds({ form, onChange }: Props) {
     updateMeta({ bands: ordered });
   }
 
+  // Parse the target value from the form for default-band scaling.
+  const targetNum = form.target_value ? Number(form.target_value) : null;
+
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 2.5 }}>
       <Typography variant="h6">{t("kpis.wizard.v2.thresholdsTitle")}</Typography>
       <Typography variant="body2" color="text.secondary">
         {t("kpis.wizard.v2.thresholdsSubtitle")}
       </Typography>
+
+      <FormControl size="small">
+        <InputLabel id="kpi-wizard-evaluation-basis-label">
+          {t("kpiBusiness.evaluationBasis")}
+        </InputLabel>
+        <Select
+          labelId="kpi-wizard-evaluation-basis-label"
+          value={evaluationType}
+          label={t("kpiBusiness.evaluationBasis")}
+          onChange={(e) => {
+            const newType = e.target.value;
+            const fresh = createDefaultPresentationMeta(
+              newType === "absolute_value" ? (targetNum ?? null) : null,
+              direction,
+              newType,
+            );
+            updateMeta({ evaluation_type: newType, bands: fresh.bands });
+          }}
+        >
+          {direction !== "closer_is_better" && (
+            <MenuItem value="absolute_value">
+              {t("kpiBusiness.evaluationBasisValue")}
+            </MenuItem>
+          )}
+          <MenuItem value="percentage_of_target">
+            {t("kpiBusiness.evaluationBasisTargetPct")}
+          </MenuItem>
+          <MenuItem value="absolute_variance">
+            {t("kpiBusiness.evaluationBasisAbsVariance")}
+          </MenuItem>
+          <MenuItem value="percentage_variance">
+            {t("kpiBusiness.evaluationBasisPctVariance")}
+          </MenuItem>
+          <MenuItem value="z_score">
+            {t("kpiBusiness.evaluationBasisZScore")}
+          </MenuItem>
+          <MenuItem value="percentile_rank">
+            {t("kpiBusiness.evaluationBasisPercentile")}
+          </MenuItem>
+        </Select>
+      </FormControl>
 
       <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
         {bands.map((band, idx) => (

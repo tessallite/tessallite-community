@@ -1,4 +1,4 @@
-﻿"""Pocket table CRUD + refresh routes."""
+"""Pocket table CRUD + refresh routes."""
 from __future__ import annotations
 
 import logging
@@ -17,6 +17,11 @@ from sqlalchemy.orm import selectinload
 
 from shared.config.resolver import get_setting
 from shared.config.settings import get_settings
+# Bug-8453: the single definition of the /execute row-security contract.
+from shared.security.execute_contract import (
+    RowSecurityDeniedError,
+    execute_response_denied_all,
+)
 from shared.db.models import (
     DataTarget,
     Model,
@@ -24,12 +29,19 @@ from shared.db.models import (
     PocketPredicate,
     PocketRefreshPolicy,
     PocketRefreshRun,
+    Project,
     ProjectConnection,
     QueryLog,
     RouteLog,
 )
 from shared.schemas.connection_type import normalize_connection_type
 from shared.db.session import get_tenant_db
+# Bug-8581: the ONE cache-eviction helper. It mints a short-lived internal
+# tenant-admin service token carrying only SCOPE_CACHE_EVICT — forwarding the
+# caller's bearer would silently 403 for a project-scoped modeler (Bug-6204),
+# which is how an eviction call can appear wired and do nothing. Imported rather
+# than re-implemented so a pocket delete cannot drift from what deploy does.
+from src.api.versions import _evict_query_router_cache
 from shared.aggregate_connection import is_same_database, resolve_source_connection
 from shared.pocket.fingerprint import predicate_set_hash
 from shared.pocket.refresh import (
@@ -52,6 +64,7 @@ from shared.schemas.pydantic_models import (
     PocketValidateResponse,
     PocketViolationItem,
 )
+from src.api._validator_unavailable import validator_unavailable
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 
@@ -121,13 +134,74 @@ async def _get_scoped_model(db, project_id: UUID, model_id: UUID) -> Model:
     return model
 
 
+async def _resolve_effective_pocket_budget(db, model: Model) -> int | None:
+    """Bug-7005: the effective pocket size budget for a model.
+
+    Model budget overrides project; NULL on the model means inherit from the
+    project; both NULL means unlimited. Mirrors
+    ``optimizer/src/advisor/pocket_suggester.resolve_effective_budget`` so the
+    manual-create path and the optimizer auto-create path agree on the same
+    authoritative budget fields (Model/Project ``pocket_size_budget_bytes``).
+    """
+    model_budget = getattr(model, "pocket_size_budget_bytes", None)
+    if model_budget is not None:
+        return int(model_budget)
+    project = await db.get(Project, model.project_id)
+    project_budget = getattr(project, "pocket_size_budget_bytes", None)
+    if project is not None and project_budget is not None:
+        return int(project_budget)
+    return None
+
+
+async def _current_pocket_usage_bytes(db, model_id: UUID) -> int:
+    """Bug-7005: live pocket storage for a model (retired pockets excluded).
+
+    Retirement is signalled by ``retired_at IS NOT NULL`` (the eviction janitor
+    never sets a ``retired`` status — the DB CHECK forbids it), so only live
+    pockets count toward the budget. Mirrors
+    ``pocket_suggester._current_pocket_usage``.
+    """
+    result = await db.execute(
+        select(func.coalesce(func.sum(PocketDefinition.storage_bytes), 0)).where(
+            PocketDefinition.model_id == model_id,
+            PocketDefinition.retired_at.is_(None),
+        )
+    )
+    return int(result.scalar_one())
+
+
+class RouterUnavailableError(RuntimeError):
+    """Bug-8162: the query-router could not answer at all.
+
+    Deliberately NOT a ``ValueError``. ``ValueError`` from this helper means
+    "the router examined your SQL and rejected it"; this means "the router was
+    unreachable, so the SQL is UNKNOWN". Callers must keep the two apart —
+    reporting an outage as a rejection tells a modeller their correct SQL is
+    wrong. See ``scratchpad_measures._validator_unavailable`` for the sibling
+    contract this mirrors.
+    """
+
+
+def _router_unavailable_http(exc: Exception) -> HTTPException:
+    """Bug-8162: the 503 a router outage surfaces as (never a 400/422)."""
+    return validator_unavailable("pocket", exc)
+
+
 async def _validate_via_router(
     model_id: UUID,
     sql: str,
     bearer: str,
     timeout_s: float = 30.0,
 ) -> dict:
-    """POST the SQL to the query-router's /validate endpoint."""
+    """POST the SQL to the query-router's /validate endpoint.
+
+    Raises ``ValueError`` when the router returns a client-level (4xx)
+    rejection — a verdict on the SQL — and ``RouterUnavailableError`` when it
+    could not answer at all (network error, or a 5xx from the router/proxy).
+    Bug-8162: before that split, a 5xx surfaced to the user as "Pocket SQL
+    failed validation" (blaming correct SQL for the router being down) and a
+    network error escaped uncaught as a 500.
+    """
     url = f"{_settings.QUERY_ROUTER_URL}/api/v1/validate"
     headers = {"Authorization": f"Bearer {bearer}"}
     body = {
@@ -136,18 +210,24 @@ async def _validate_via_router(
         "protocol": "jdbc",
         "dialect": "postgres",
     }
-    async with httpx.AsyncClient(timeout=timeout_s) as client:
-        resp = await client.post(url, json=body, headers=headers)
-        if resp.status_code >= 400:
-            try:
-                payload = resp.json()
-                detail = payload.get("detail") if isinstance(payload, dict) else None
-                if not isinstance(detail, str) or not detail:
-                    detail = resp.text
-            except Exception:
-                detail = resp.text or f"Query router returned HTTP {resp.status_code}"
-            raise ValueError(detail)
-        return resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            resp = await client.post(url, json=body, headers=headers)
+    except httpx.HTTPError as exc:
+        raise RouterUnavailableError(f"{type(exc).__name__}: {exc}") from exc
+
+    if resp.status_code >= 500:
+        raise RouterUnavailableError(f"router returned HTTP {resp.status_code}")
+    if resp.status_code >= 400:
+        try:
+            payload = resp.json()
+            detail = payload.get("detail") if isinstance(payload, dict) else None
+            if not isinstance(detail, str) or not detail:
+                detail = resp.text
+        except Exception:
+            detail = resp.text or f"Query router returned HTTP {resp.status_code}"
+        raise ValueError(detail)
+    return resp.json()
 
 
 def _predicates_from_validation(validation: dict) -> list[dict]:
@@ -162,19 +242,41 @@ def _predicates_from_validation(validation: dict) -> list[dict]:
     payload is ignored — it can under-describe the SQL and make a narrowed
     pocket over-claim coverage. The extraction is never branched on database
     type; it reuses the validation response verbatim.
+
+    Bug-6989: deduplicate by (column_name, operator, value_json) before
+    returning. A query with redundant predicates (``WHERE x = 1 AND x = 1``)
+    produces duplicate filter entries; inserting those as PocketPredicate rows
+    violates the UNIQUE constraint and surfaces a misleading 409 "already
+    exists" error instead of succeeding.
     """
     normalised: list[dict] = []
+    seen: set[tuple] = set()
     for f in (validation.get("filters") or []):
         column_name = str(f.get("dimension_name") or "").strip()
         operator = str(f.get("operator") or "eq").strip().lower()
         if not column_name:
             continue
+        value = f.get("value")
+        # Build a hashable dedup key. value may be a list, so convert to tuple.
+        dedup_key = (column_name, operator, _hashable_value(value))
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
         normalised.append({
             "column_name": column_name,
             "operator": operator,
-            "value": f.get("value"),
+            "value": value,
         })
     return normalised
+
+
+def _hashable_value(val: object) -> object:
+    """Convert a predicate value to a hashable form for deduplication."""
+    if isinstance(val, list):
+        return tuple(val)
+    if isinstance(val, dict):
+        return tuple(sorted(val.items()))
+    return val
 
 
 def _check_pocket_structure(
@@ -263,8 +365,8 @@ async def pocket_metrics(
             .order_by(PocketDefinition.hit_count.desc(), PocketDefinition.last_access_at.desc().nullslast())
         )
         pockets = list(result.scalars().all())
-        total = len(pockets)
         active = [p for p in pockets if p.retired_at is None]
+        total = len(active)
         fresh = sum(1 for p in active if p.status == "fresh")
         stale = sum(1 for p in active if p.status == "stale")
         invalidating = sum(1 for p in active if p.status == "invalidating")
@@ -273,7 +375,7 @@ async def pocket_metrics(
         # F-005-08 (Bug-2251): `time_saved_ms_total` is now the per-pocket sum of
         # (source baseline − pocket execution) recorded at route time, so this
         # total is genuine time SAVED, not time spent on pockets.
-        time_saved = sum(int(p.time_saved_ms_total or 0) for p in pockets)
+        time_saved = sum(int(p.time_saved_ms_total or 0) for p in active)
         storage = sum(int(p.storage_bytes or 0) for p in active)
         day_ago = datetime.now(timezone.utc) - timedelta(hours=24)
         evictions_24h = sum(
@@ -349,7 +451,7 @@ async def pocket_metrics(
                 "ttl_days": int(p.ttl_days or 0),
                 "matched_since_refresh": _matched_since_refresh(p),
             }
-            for p in pockets[:10]
+            for p in active[:10]
         ]
         return PocketMetricsResponse(
             total_pockets=total,
@@ -393,6 +495,26 @@ async def get_pocket(
         return PocketDefinitionResponse.model_validate(pocket)
 
 
+async def _pocket_combo_error(db, model_id: UUID, target: DataTarget) -> str | None:
+    """Return an error string if `target`'s connector cannot pair with the
+    model's source connector for pocket materialisation, else None.
+
+    Bug-5898: shared by create/update and by validate/dry-run so "validated"
+    always means "this target combination can actually be created and
+    refreshed" — see unsupported_pocket_combo_reason for the authoritative
+    rule (mirrored from shared/pocket/refresh.py).
+    """
+    target_conn_id = getattr(target, "project_connection_id", None)
+    target_conn = await db.get(ProjectConnection, target_conn_id) if target_conn_id else None
+    if target_conn is None:
+        return None
+    target_connector = normalize_connection_type((target_conn.connection_type or "").lower())
+    source_conn = await resolve_source_connection(model_id, db)
+    source_connector = await resolve_connector_type(source_conn)
+    cross_db = not is_same_database(source_conn, target_conn)
+    return unsupported_pocket_combo_reason(source_connector, target_connector, cross_db)
+
+
 @router.post(
     "",
     response_model=PocketDefinitionResponse,
@@ -412,6 +534,10 @@ async def create_pocket(
             validation = await _validate_via_router(
                 model_id, body.defining_sql, current_user.raw_token
             )
+        except RouterUnavailableError as exc:
+            # Bug-8162: unreachable validator — refuse, but as 503 ("unknown,
+            # retry"), never 400 ("your SQL is wrong").
+            raise _router_unavailable_http(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -435,6 +561,24 @@ async def create_pocket(
                 },
             )
 
+        # Bug-6995: reject a user-authored LIMIT clause in the defining SQL.
+        # The validate endpoint handles LIMIT for its LIMIT-1 probe, but the
+        # create path previously accepted LIMIT silently. A pocket with LIMIT
+        # materialises an arbitrarily capped subset — semantically wrong for a
+        # cache that claims full-slice coverage, so the pocket matcher may
+        # serve a query whose result set is incomplete.
+        sql_text = (body.defining_sql or "").strip().rstrip(";").strip()
+        if re.search(r"\bLIMIT\b", sql_text, re.IGNORECASE):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Pocket SQL must not contain a LIMIT clause. A pocket "
+                    "materialises a full subset; LIMIT would produce an "
+                    "incomplete cache that the matcher incorrectly treats "
+                    "as complete."
+                ),
+            )
+
         target = await db.get(DataTarget, body.target_id)
         if target is None or target.model_id != model_id:
             raise HTTPException(status_code=400, detail="Invalid target_id for model")
@@ -447,20 +591,32 @@ async def create_pocket(
         # CREATE OR REPLACE), and cross-database streaming is PG-family only.
         # The authoritative validation lives in shared/pocket/refresh.py
         # (unsupported_pocket_combo_reason); this is the create-time mirror.
-        target_conn_id = getattr(target, "project_connection_id", None)
-        target_conn = await db.get(ProjectConnection, target_conn_id) if target_conn_id else None
-        if target_conn is not None:
-            target_connector = normalize_connection_type(
-                (target_conn.connection_type or "").lower()
-            )
-            source_conn = await resolve_source_connection(model_id, db)
-            source_connector = await resolve_connector_type(source_conn)
-            cross_db = not is_same_database(source_conn, target_conn)
-            combo_error = unsupported_pocket_combo_reason(
-                source_connector, target_connector, cross_db
-            )
-            if combo_error is not None:
-                raise HTTPException(status_code=400, detail=combo_error)
+        combo_error = await _pocket_combo_error(db, model_id, target)
+        if combo_error is not None:
+            raise HTTPException(status_code=400, detail=combo_error)
+
+        # Bug-7005: enforce the effective pocket size budget on manual/UI create.
+        # The optimizer auto-create path
+        # (services/optimizer/src/lifecycle/pocket_creator.py) refuses a new
+        # pocket once the model's resolved budget is exhausted, but manual creation
+        # bypassed it entirely — a modeler could add pockets past the configured
+        # cap. A manual pocket is not materialised at create time (status="stale",
+        # storage_bytes NULL), so we cannot size the new slice here; the faithful
+        # mirror of the optimizer's "budget exhausted" guard is to refuse a new
+        # pocket when live usage already meets or exceeds the budget. The refresh
+        # path (shared/pocket/refresh.py) remains the post-materialisation check.
+        budget = await _resolve_effective_pocket_budget(db, model)
+        if budget is not None:
+            used = await _current_pocket_usage_bytes(db, model_id)
+            if used >= budget:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Pocket storage budget exhausted "
+                        f"({used} of {budget} bytes used); retire a pocket or "
+                        f"raise the budget before creating another."
+                    ),
+                )
 
         allowed = await get_setting("pocket.allowed_refresh_policies", tenant_session=db)
         if body.refresh_policy not in set(allowed or []):
@@ -469,9 +625,12 @@ async def create_pocket(
                 detail=f"refresh_policy must be one of {allowed}",
             )
 
+        # Bug-6993: PocketDefinitionCreate.ttl_days now carries a schema-level
+        # gt=0 constraint, so a non-positive value 422s before this handler
+        # ever runs — the previous "silently substitute the tenant's
+        # pocket.ttl_days config default for a caller-supplied 0" fallback is
+        # unreachable and has been removed rather than left as dead code.
         ttl_days = int(body.ttl_days)
-        if ttl_days <= 0:
-            ttl_days = int(await get_setting("pocket.ttl_days", tenant_session=db))
 
         seed = model.seed or secrets.token_hex(6)
         suffix = secrets.token_hex(4)
@@ -527,15 +686,26 @@ async def create_pocket(
                 value_json={"value": pred["value"]},
             ))
 
-        # Bug-5199: when the create payload requests a scheduled refresh,
-        # also create the PocketRefreshPolicy child row so the scheduler's
-        # refresh_due_pockets query (which filters on enabled
-        # PocketRefreshPolicy rows with a cron) actually picks it up.
-        if body.refresh_policy == "scheduled" and body.refresh_cron:
+        # Bug-5199 / Bug-7007: when the create payload requests a scheduled
+        # refresh, create the PocketRefreshPolicy child row IN THE SAME
+        # transaction so the scheduler's refresh_due_pockets query (which
+        # filters on enabled PocketRefreshPolicy rows with a cron) picks it up.
+        # Bug-7007: the complete initial policy travels in the create payload so
+        # this is the ONLY transaction — the caller no longer needs a second
+        # PUT .../refresh/policy request to finish configuring the pocket (which
+        # could fail and leave the pocket persisted with a mismatched policy).
+        # ``refresh_policy_enabled`` defaults to enabled for a scheduled pocket
+        # when the caller omits it (the prior always-enabled behaviour).
+        if body.refresh_policy == "schedule" and body.refresh_cron:
+            policy_enabled = (
+                body.refresh_policy_enabled
+                if body.refresh_policy_enabled is not None
+                else True
+            )
             db.add(PocketRefreshPolicy(
                 pocket_definition_id=pocket.id,
                 cron_expression=body.refresh_cron,
-                is_enabled=True,
+                is_enabled=policy_enabled,
             ))
 
         await db.commit()
@@ -550,6 +720,48 @@ async def create_pocket(
         )
         persisted = result.scalar_one()
         return PocketDefinitionResponse.model_validate(persisted)
+
+
+# Cron fields cannot contain whitespace-free garbage; the structural fallback
+# accepts only cron-legal characters (digits, ``* / , -`` and month/day names).
+_CRON_FIELD_RE = re.compile(r"[0-9*/,\-A-Za-z]+")
+
+
+def _validate_pocket_cron(value: str) -> str:
+    """Bug-6108: reject an unparseable ``refresh_cron`` so a PATCH cannot write a
+    schedule the sweep can never fire.
+
+    Bug-6593: this is now defense-in-depth. The authoritative gate is the
+    ``PocketDefinitionUpdate`` schema validator (``_check_refresh_cron``), which
+    rejects an unparseable cron at the request-body boundary with a Pydantic 422
+    — the same status ``PocketDefinitionCreate`` returns for the same malformed
+    input, keeping create and update consistent. By the time this handler runs
+    the cron has already passed that check, so this call only ever sees a valid,
+    trimmed value; it stays as a guard for any internal caller that constructs
+    ``updates`` without going through the schema.
+
+    Uses ``croniter`` for exact validation when it is importable, and falls back
+    to a structural 5/6-field check otherwise. ``croniter`` is a transitive dep
+    of the shared package (pythonpath-wired, not pip-installed into the
+    model-service image), so it may be absent at runtime — the import must never
+    hard-fail the request (the scheduler's is_due check is the ultimate safety
+    net for a subtly-invalid cron; this guard catches obvious garbage).
+    """
+    cron = value.strip()
+    try:
+        from croniter import croniter  # type: ignore
+
+        ok = bool(croniter.is_valid(cron))
+    except ImportError:
+        parts = cron.split()
+        ok = len(parts) in (5, 6) and all(
+            _CRON_FIELD_RE.fullmatch(p) for p in parts
+        )
+    if not ok:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid cron expression: {value!r}"
+        )
+    return cron
 
 
 @router.patch(
@@ -574,11 +786,38 @@ async def update_pocket(
         rebuild_predicate_rows = False
         rebuilt_predicates: list[dict] = []
 
+        # Bug-6108: PATCH previously accepted any refresh_policy string with no
+        # allowed-list check and wrote refresh_cron to the deprecated, unread
+        # column only — silently inert. Validate both like create, and (below)
+        # sync the authoritative PocketRefreshPolicy child row.
+        #
+        # Bug-6593 (two-layer contract): a token OUTSIDE the policy universe
+        # ({schedule, manual, event}) is already rejected by the
+        # PocketDefinitionUpdate schema validator with a Pydantic 422 before this
+        # handler runs — the same status create returns for the same input. The
+        # check below is the DISTINCT per-tenant rule: a universe-valid token
+        # that this tenant has narrowed out of ``pocket.allowed_refresh_policies``
+        # is a business-rule rejection (400), not a malformed-body rejection.
+        if "refresh_policy" in updates and updates["refresh_policy"] is not None:
+            allowed = await get_setting(
+                "pocket.allowed_refresh_policies", tenant_session=db
+            )
+            if updates["refresh_policy"] not in set(allowed or []):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"refresh_policy must be one of {allowed}",
+                )
+        if "refresh_cron" in updates and updates["refresh_cron"]:
+            updates["refresh_cron"] = _validate_pocket_cron(updates["refresh_cron"])
+
         if "defining_sql" in updates and updates["defining_sql"]:
             try:
                 validation = await _validate_via_router(
                     model_id, updates["defining_sql"], current_user.raw_token
                 )
+            except RouterUnavailableError as exc:
+                # Bug-8162: see create_pocket — an outage is 503, not 422.
+                raise _router_unavailable_http(exc) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc))
 
@@ -632,6 +871,51 @@ async def update_pocket(
                     operator=pred["operator"],
                     value_json={"value": pred["value"]},
                 ))
+
+        # Bug-6108: the scheduler's refresh_due_pockets query reads the
+        # PocketRefreshPolicy child row (enabled + cron), NOT pocket.refresh_cron
+        # (a deprecated column). A PATCH that changed the schedule must therefore
+        # update the policy row, mirroring create (Bug-5199) and the PUT
+        # /refresh/policy endpoint — otherwise the schedule change never takes
+        # effect. Sync only when the schedule fields were actually touched.
+        #
+        # Bug-6811: the child PocketRefreshPolicy row is the single source of
+        # truth for schedule state (the scheduler reads it, PUT /refresh/policy
+        # writes it). A PATCH that sets refresh_policy="schedule" without also
+        # supplying refresh_cron must NOT overwrite the child row's cron with
+        # the parent's stale/None value. Use the child row's existing cron when
+        # the PATCH did not supply a new one.
+        if "refresh_policy" in updates or "refresh_cron" in updates:
+            policy_row = (
+                await db.execute(
+                    select(PocketRefreshPolicy).where(
+                        PocketRefreshPolicy.pocket_definition_id == pocket_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if pocket.refresh_policy == "schedule":
+                # Determine the effective cron: prefer the PATCH-supplied value,
+                # fall back to the child row's existing value, then the
+                # deprecated parent column (last resort).
+                effective_cron = (
+                    updates.get("refresh_cron")
+                    or (policy_row.cron_expression if policy_row else None)
+                    or pocket.refresh_cron
+                )
+                if effective_cron:
+                    if policy_row is None:
+                        db.add(PocketRefreshPolicy(
+                            pocket_definition_id=pocket_id,
+                            cron_expression=effective_cron,
+                            is_enabled=True,
+                        ))
+                    else:
+                        policy_row.cron_expression = effective_cron
+                        policy_row.is_enabled = True
+            elif policy_row is not None:
+                # Switched away from a scheduled refresh — stop the sweep from
+                # firing on the stale cron instead of leaving it enabled.
+                policy_row.is_enabled = False
 
         # F-005-02 (residual): a defining_sql edit can recompute an identity
         # (query_fingerprint + predicate_set_hash) that collides with another
@@ -759,6 +1043,16 @@ async def delete_pocket(
 
         await db.delete(pocket)
         await db.commit()
+        # Bug-8581: mechanism 2 of the result-cache invalidation contract
+        # (shared/cache/result_cache.py) — clear the receiving replica NOW so the
+        # operator who just deleted a pocket does not keep seeing route_type=pocket
+        # with its id on the very next query. Mechanism 1 (the pocket_generation
+        # component of the cache key) is what makes the invalidation correct
+        # across replicas; this call is the immediate single-replica half, exactly
+        # as deploy/undeploy/revert and the row-security mutations do it.
+        # Best-effort by contract: the delete has already committed and must not
+        # fail on an unreachable query-router.
+        await _evict_query_router_cache(model_id, current_user.tenant_id)
         return None
 
 
@@ -840,7 +1134,14 @@ async def _route_query(
     bearer: str,
     timeout_s: float = 60.0,
 ) -> dict:
-    """POST the SQL to the query-router's /execute endpoint."""
+    """POST the SQL to the query-router's /execute endpoint.
+
+    Bug-8453: raises :class:`RowSecurityDeniedError` on the deny-all sentinel.
+    A denial rewrites the query to ``... WHERE 0 = 1``, over which the dry-run's
+    ``SELECT COUNT(*)`` still returns a row containing **0** — so without this
+    the modeller is shown an authoritative "this pocket would hold 0 rows" that
+    is not a measurement at all, and could size or reject a pocket on it.
+    """
     url = f"{_settings.QUERY_ROUTER_URL}/api/v1/execute"
     headers = {"Authorization": f"Bearer {bearer}"}
     body = {
@@ -860,7 +1161,14 @@ async def _route_query(
             except Exception:
                 detail = resp.text or f"Query router returned HTTP {resp.status_code}"
             raise ValueError(detail)
-        return resp.json()
+        payload = resp.json()
+        # Bug-8453: classify through the shared execute contract, never by
+        # inspecting the returned rows.
+        if execute_response_denied_all(payload):
+            raise RowSecurityDeniedError(
+                "Row-level security denied access to every row for this query."
+            )
+        return payload
 
 
 @router.post(
@@ -881,10 +1189,31 @@ async def validate_pocket_sql(
         if not sql:
             return PocketValidateResponse(ok=False, stage="parse", error="SQL is empty")
 
+        # Bug-5898: validate target_id when supplied — same checks as create
+        # (target ownership + source/target connector compatibility), so a
+        # "validated" pocket cannot be rejected later by save for a reason
+        # validate never looked at.
+        if body.target_id is not None:
+            target = await db.get(DataTarget, body.target_id)
+            if target is None or target.model_id != model_id:
+                return PocketValidateResponse(
+                    ok=False, stage="parse",
+                    error="Invalid target_id for this model.",
+                )
+            combo_error = await _pocket_combo_error(db, model_id, target)
+            if combo_error is not None:
+                return PocketValidateResponse(ok=False, stage="parse", error=combo_error)
+
         try:
             validation = await _validate_via_router(
                 model_id, sql, current_user.raw_token
             )
+        except RouterUnavailableError as exc:
+            # Bug-8162: ``ok=false, stage="parse"`` states a verdict on the
+            # user's SQL. An unreachable validator has no verdict, so this
+            # leaves the 200 envelope entirely and answers 503 — the same
+            # "unknown, retry" signal create/update give.
+            raise _router_unavailable_http(exc) from exc
         except ValueError as exc:
             return PocketValidateResponse(ok=False, stage="parse", error=str(exc))
 
@@ -914,6 +1243,22 @@ async def validate_pocket_sql(
         try:
             result = await _route_query(model_id, probe_sql, current_user.raw_token)
             columns = result.get("columns")
+        except RowSecurityDeniedError:
+            # Bug-8453 [fail closed]: do NOT certify the SQL as validated when
+            # the probe never actually read a row. Certifying here would let a
+            # pocket be authored and saved on the strength of a read that row
+            # security refused.
+            return PocketValidateResponse(
+                ok=False,
+                stage="row_security",
+                error=(
+                    "Row-level security denies your account access to every row "
+                    "of this model, so the validation probe could not read any "
+                    "data. This is a permissions restriction, not a problem with "
+                    "the SQL. Ask an administrator to grant access, or validate "
+                    "from an account with access to this data."
+                ),
+            )
         except Exception as exc:
             return PocketValidateResponse(ok=False, stage="probe", error=str(exc))
 
@@ -932,11 +1277,45 @@ async def dry_run_pocket_sql(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> PocketDryRunResponse:
     async for db in get_tenant_db(current_user.tenant_id):
-        await _get_scoped_model(db, project_id, model_id)
+        model = await _get_scoped_model(db, project_id, model_id)
 
         sql = (body.defining_sql or "").strip().rstrip(";").strip()
         if not sql:
             return PocketDryRunResponse(ok=False, error="SQL is empty")
+
+        # Bug-5898: validate target_id when supplied — same checks as create.
+        if body.target_id is not None:
+            target = await db.get(DataTarget, body.target_id)
+            if target is None or target.model_id != model_id:
+                return PocketDryRunResponse(ok=False, error="Invalid target_id for this model.")
+            combo_error = await _pocket_combo_error(db, model_id, target)
+            if combo_error is not None:
+                return PocketDryRunResponse(ok=False, error=combo_error)
+
+        # Bug-5898: run subset validation before the count probe so dry-run
+        # rejects SQL that create/update would also reject.
+        try:
+            validation = await _validate_via_router(
+                model_id, sql, current_user.raw_token
+            )
+        except RouterUnavailableError as exc:
+            # Bug-8162: same as the validate endpoint — no verdict to report.
+            raise _router_unavailable_http(exc) from exc
+        except ValueError as exc:
+            return PocketDryRunResponse(ok=False, error=str(exc))
+        if not validation.get("ok"):
+            errors = validation.get("errors") or []
+            return PocketDryRunResponse(
+                ok=False,
+                error="; ".join(errors) if errors else "SQL validation failed.",
+            )
+        slug = (getattr(model, "slug", "") or "").lower()
+        violations = _check_pocket_structure(validation, slug)
+        if violations:
+            return PocketDryRunResponse(
+                ok=False,
+                error="; ".join(v.message for v in violations),
+            )
 
         count_sql = f"SELECT COUNT(*) AS __c FROM ({sql}) AS __t"
 
@@ -947,6 +1326,20 @@ async def dry_run_pocket_sql(
         started = time.monotonic()
         try:
             result = await _route_query(model_id, count_sql, current_user.raw_token, timeout_s)
+        except RowSecurityDeniedError:
+            # Bug-8453 [wrong-number guard]: COUNT(*) over `WHERE 0 = 1`
+            # returns 0. Reporting ok=True/row_count=0 would present a
+            # permissions denial as a measured pocket size.
+            return PocketDryRunResponse(
+                ok=False,
+                error=(
+                    "Row-level security denies your account access to every row "
+                    "of this model, so the pocket size could not be measured. "
+                    "The result is NOT zero rows — it is unknown from your "
+                    "account. Ask an administrator to grant access, or dry-run "
+                    "from an account with access to this data."
+                ),
+            )
         except Exception as exc:
             return PocketDryRunResponse(ok=False, error=str(exc))
 

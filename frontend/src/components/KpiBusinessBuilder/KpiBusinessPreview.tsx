@@ -115,13 +115,19 @@ export function KpiBusinessPreview({ result, loading, onPreview }: Props) {
               <Stack direction="row" spacing={1} flexWrap="wrap">
                 <StatusChip status={result.status} label={result.status_label} />
                 <TrendChip trend={result.trend} label={result.trend_label} />
-                {result.trend_pct !== null && (
-                  <Chip
-                    size="small"
-                    label={`${result.trend_pct > 0 ? "+" : ""}${(result.trend_pct * 100).toFixed(1)}%`}
-                    variant="outlined"
-                  />
-                )}
+                {/* F-017-02 (Opus-R1): render the direction-normalised percent
+                    so the sign matches the improving/declining intent, matching
+                    the scorecard chip fix. Fall back to raw for legacy responses. */}
+                {(() => {
+                  const pct = result.trend_pct_normalised ?? result.trend_pct;
+                  return pct !== null && pct !== undefined ? (
+                    <Chip
+                      size="small"
+                      label={`${pct > 0 ? "+" : ""}${(pct * 100).toFixed(1)}%`}
+                      variant="outlined"
+                    />
+                  ) : null;
+                })()}
               </Stack>
 
               <Collapse in={showSql}>

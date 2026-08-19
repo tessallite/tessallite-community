@@ -380,6 +380,150 @@ describe("goalThreshold (Bug-5345 bullet target marker)", () => {
       ]),
     ).toBe(1.0);
   });
+
+  // Bug-7239 — good band at the LOW end of the scale (lower-is-better /
+  // deviation / variance). The good "On Track" green band sits first; the goal
+  // marker is its UPPER edge (the good→warning boundary), not a top-band min.
+  it("returns the good-band upper edge for descending (lower-is-better) bands", () => {
+    expect(
+      goalThreshold([
+        { label: "On Track", color: "#388E3C", min: 0, max: 0.9 },
+        { label: "Near Target", color: "#F57C00", min: 0.9, max: 1.0 },
+        { label: "Off Target", color: "#D32F2F", min: 1.0, max: 1.5 },
+      ]),
+    ).toBe(0.9);
+  });
+
+  it("returns the good-band upper edge for variance/deviation bands", () => {
+    expect(
+      goalThreshold([
+        { label: "On Track", color: "#388E3C", min: 0, max: 0.1 },
+        { label: "Near Target", color: "#F57C00", min: 0.1, max: 0.2 },
+        { label: "Off Target", color: "#D32F2F", min: 0.2, max: 0.4 },
+      ]),
+    ).toBe(0.1);
+  });
+
+  it("locates the good band by colour, not by scale position", () => {
+    // Green band in the middle: marker is its lower edge (climb into it).
+    expect(
+      goalThreshold([
+        { label: "Bad", color: "#D32F2F", min: 0, max: 30 },
+        { label: "Good", color: "#388E3C", min: 30, max: 70 },
+        { label: "Bad hi", color: "#D32F2F", min: 70, max: 100 },
+      ]),
+    ).toBe(30);
+  });
+
+  it("falls back to top-band min when no good-coloured band is present", () => {
+    // Top band is near-grayscale (#888) — not classifiable as good — so the
+    // colour-blind-aware good-band detection returns nothing and the legacy
+    // ascending top-band-min fallback applies.
+    expect(
+      goalThreshold([
+        { label: "Poor", color: "#f00", min: 0, max: 40 },
+        { label: "Warn", color: "#fa0", min: 40, max: 70 },
+        { label: "Best", color: "#888", min: 70, max: 100 },
+      ]),
+    ).toBe(70);
+  });
+
+  // Bug-7239 R2: the colour-blind presets (Bug-7240) mark the good band BLUE
+  // (#1565C0 / #0D47A1), not green. The marker must resolve identically to the
+  // standard (green) palette, at the good-region entry — not the legacy fallback.
+  it("resolves the marker for the colour-blind variance preset (blue good, low end)", () => {
+    expect(
+      goalThreshold([
+        { label: "On Track", color: "#1565C0", min: null, max: 0.1 },
+        { label: "Near Target", color: "#F57C00", min: 0.1, max: 0.2 },
+        { label: "Off Target", color: "#D32F2F", min: 0.2, max: null },
+      ]),
+    ).toBe(0.1);
+  });
+
+  it("resolves the marker for the colour-blind higher-is-better preset (blue good, high end)", () => {
+    expect(
+      goalThreshold([
+        { label: "Off Target", color: "#D32F2F", min: null, max: 0.8 },
+        { label: "Near Target", color: "#F57C00", min: 0.8, max: 1.0 },
+        { label: "On Track", color: "#1565C0", min: 1.0, max: null },
+      ]),
+    ).toBe(1.0);
+  });
+
+  // Bug-7239 R2: 4-band presets have TWO contiguous good bands (On Track +
+  // Exceeding). The marker is the ENTRY into the good region (On Track's lower
+  // edge), NOT the Exceeding boundary. Verified for both palettes.
+  it("returns the good-region ENTRY for a 4-band preset (green On Track + blue Exceeding)", () => {
+    expect(
+      goalThreshold([
+        { label: "Critical", color: "#D32F2F", min: null, max: 0.7 },
+        { label: "Warning", color: "#F57C00", min: 0.7, max: 0.9 },
+        { label: "On Track", color: "#388E3C", min: 0.9, max: 1.1 },
+        { label: "Exceeding", color: "#1565C0", min: 1.1, max: null },
+      ]),
+    ).toBe(0.9);
+  });
+
+  it("returns the good-region ENTRY for a colour-blind 4-band preset (blue On Track + blue Exceeding)", () => {
+    expect(
+      goalThreshold([
+        { label: "Critical", color: "#D32F2F", min: null, max: 0.7 },
+        { label: "Warning", color: "#F57C00", min: 0.7, max: 0.9 },
+        { label: "On Track", color: "#1565C0", min: 0.9, max: 1.1 },
+        { label: "Exceeding", color: "#0D47A1", min: 1.1, max: null },
+      ]),
+    ).toBe(0.9);
+  });
+
+  // Bug-7239 R1 finding 1: the CANONICAL band sets emitted by the backend and
+  // the frontend defaults are OPEN-ENDED (first band min=null, last band
+  // max=null). The marker must still resolve — interiorness is judged against
+  // the plotted deriveScale axis, not the concrete-boundary span. These mirror
+  // the real presets in KpiThresholdEditor.tsx / backend kpi_threshold.py.
+  it("resolves the marker for the open-ended variance default (green at low end)", () => {
+    // BANDS_VARIANCE: On Track (green) [null, 0.10] / Near [0.10, 0.20] / Off [0.20, null]
+    expect(
+      goalThreshold([
+        { label: "On Track", color: "#388E3C", min: null, max: 0.1 },
+        { label: "Near Target", color: "#F57C00", min: 0.1, max: 0.2 },
+        { label: "Off Target", color: "#D32F2F", min: 0.2, max: null },
+      ]),
+    ).toBe(0.1);
+  });
+
+  it("resolves the marker for the open-ended lower-is-better default", () => {
+    // BANDS_LOWER: On Track (green) [null, 0.90] / Near [0.90, 1.0001] / Off [1.0001, null]
+    expect(
+      goalThreshold([
+        { label: "On Track", color: "#388E3C", min: null, max: 0.9 },
+        { label: "Near Target", color: "#F57C00", min: 0.9, max: 1.0001 },
+        { label: "Off Target", color: "#D32F2F", min: 1.0001, max: null },
+      ]),
+    ).toBe(0.9);
+  });
+
+  it("resolves the marker for the open-ended higher-is-better default (green at high end)", () => {
+    // BANDS_HIGHER: Off [null, 0.80] / Near [0.80, 1.00] / On Track (green) [1.00, null]
+    expect(
+      goalThreshold([
+        { label: "Off Target", color: "#D32F2F", min: null, max: 0.8 },
+        { label: "Near Target", color: "#F57C00", min: 0.8, max: 1.0 },
+        { label: "On Track", color: "#388E3C", min: 1.0, max: null },
+      ]),
+    ).toBe(1.0);
+  });
+
+  it("resolves the marker for the open-ended z-score default", () => {
+    // BANDS_ZSCORE: Off [null, -1.0] / Near [-1.0, 1.0] / On Track (green) [1.0, null]
+    expect(
+      goalThreshold([
+        { label: "Off Target", color: "#D32F2F", min: null, max: -1.0 },
+        { label: "Near Target", color: "#F57C00", min: -1.0, max: 1.0 },
+        { label: "On Track", color: "#388E3C", min: 1.0, max: null },
+      ]),
+    ).toBe(1.0);
+  });
 });
 
 describe("cross-layer status agreement (R3-M001b)", () => {

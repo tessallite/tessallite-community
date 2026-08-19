@@ -36,6 +36,7 @@ class KPINode:
     kpi_id: UUID
     name: str
     expression: Optional[str] = None
+    target_expression: Optional[str] = None
     depends_on: list[str] = field(default_factory=list)  # KPI names
     evaluation_order: Optional[int] = None
 
@@ -120,13 +121,16 @@ def build_graph(
     """Build a dependency graph from a list of KPI dicts.
 
     Each dict must have at minimum ``id`` (UUID), ``name`` (str), and
-    ``expression`` (str | None). The ``expression`` is parsed to extract
-    ``kpi()`` references.
+    ``expression`` (str | None). ``expression`` and the optional
+    ``target_expression`` are both parsed to extract ``kpi()`` references.
+    Composite ownership is represented by an optional ``parent_kpi_id`` on a
+    child: the parent depends on that child and must be ordered after it.
 
     Parameters
     ----------
     kpis : list[dict]
-        List of KPI dicts with ``id``, ``name``, and ``expression`` keys.
+        List of KPI dicts with ``id``, ``name``, ``expression``, and optional
+        ``target_expression`` keys.
 
     Returns
     -------
@@ -138,12 +142,15 @@ def build_graph(
     for kpi in kpis:
         name = kpi["name"]
         expr = kpi.get("expression")
+        target_expr = kpi.get("target_expression")
         deps: list[str] = []
 
-        if expr:
+        for dependency_expression in (expr, target_expr):
+            if not dependency_expression:
+                continue
             try:
-                ast = parse_kpi_expression(expr)
-                deps = _collect_kpi_refs(ast)
+                ast = parse_kpi_expression(dependency_expression)
+                deps.extend(_collect_kpi_refs(ast))
             except Exception:
                 # Expression fails to parse — skip dependency extraction.
                 # The expression validator will report the error separately.
@@ -153,8 +160,20 @@ def build_graph(
             kpi_id=kpi["id"],
             name=name,
             expression=expr,
+            target_expression=target_expr,
             depends_on=list(dict.fromkeys(deps)),  # dedupe, preserve order
         )
+
+    names_by_id = {kpi["id"]: kpi["name"] for kpi in kpis}
+    for child in kpis:
+        parent_name = names_by_id.get(child.get("parent_kpi_id"))
+        if parent_name is None:
+            continue
+        parent = nodes[parent_name]
+        parent.depends_on = list(dict.fromkeys([
+            *parent.depends_on,
+            child["name"],
+        ]))
 
     return nodes
 

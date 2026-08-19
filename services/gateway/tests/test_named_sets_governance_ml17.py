@@ -19,7 +19,8 @@ def test_rows_sets_marks_certified_in_description():
     assert "Top sellers" in by_name["A"]["SET_DESCRIPTION"]
     # Drafts carry no marker.
     assert "[Certified]" not in by_name["B"]["SET_DESCRIPTION"]
-    # shared also marked, even with an empty base description.
+    # Bug-6264 (authority named_sets.py:238-241): "shared" is certified-
+    # equivalent and MUST carry the marker, even with an empty base description.
     assert by_name["C"]["SET_DESCRIPTION"].startswith("[Certified]")
 
 

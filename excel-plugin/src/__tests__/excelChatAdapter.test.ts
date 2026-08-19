@@ -23,9 +23,11 @@ beforeEach(() => {
 
 import { configureApiClient } from '../api/client';
 import { createExcelAdapter } from '../api/agentChatAdapter';
+import { getDiagnosticsReport, clearDiagnostics } from '../utils/diagnostics';
 
 beforeEach(() => {
   configureApiClient('https://test.example.com');
+  clearDiagnostics();
 });
 
 type FetchMock = MockInstance<Parameters<typeof fetch>, ReturnType<typeof fetch>>;
@@ -124,6 +126,77 @@ describe('createExcelAdapter', () => {
 
       const [, init] = fetchMock.mock.calls[0];
       expect(init?.signal).toBe(controller.signal);
+    });
+
+    it('forwards the idempotency key as the Idempotency-Key header (Bug-6596)', async () => {
+      const adapter = createExcelAdapter(() => null);
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response('data: {}\n\n', { status: 200 }),
+      );
+
+      await adapter.streamMessageRaw('p1', 'conv-1', 'hello', undefined, 'idem-key-123');
+
+      const [, init] = fetchMock.mock.calls[0];
+      const headers = init?.headers as Record<string, string>;
+      expect(headers['Idempotency-Key']).toBe('idem-key-123');
+      // JWT auth injected by streamRequest is preserved alongside the new header.
+      expect(headers['Authorization']).toBe('Bearer test-jwt');
+    });
+
+    it('omits the Idempotency-Key header when no key is supplied (backward-compatible)', async () => {
+      const adapter = createExcelAdapter(() => null);
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response('data: {}\n\n', { status: 200 }),
+      );
+
+      await adapter.streamMessageRaw('p1', 'conv-1', 'hello');
+
+      const [, init] = fetchMock.mock.calls[0];
+      const headers = init?.headers as Record<string, string>;
+      expect(headers['Idempotency-Key']).toBeUndefined();
+    });
+
+    it('logs an SSE stream drop (HTTP error) to diagnostics before rethrowing (Bug-7388)', async () => {
+      const adapter = createExcelAdapter(() => null);
+      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: 'rate_limited' }), { status: 429 }),
+      );
+
+      await expect(
+        adapter.streamMessageRaw('p1', 'conv-1', 'hello'),
+      ).rejects.toThrow();
+
+      const report = getDiagnosticsReport();
+      expect(report).toContain('SSE stream drop');
+      expect(report).toContain('429');
+    });
+
+    it('logs an SSE stream drop (network error) to diagnostics before rethrowing (Bug-7388)', async () => {
+      const adapter = createExcelAdapter(() => null);
+      vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(
+        new TypeError('Failed to fetch'),
+      );
+
+      await expect(
+        adapter.streamMessageRaw('p1', 'conv-1', 'hello'),
+      ).rejects.toThrow();
+
+      const report = getDiagnosticsReport();
+      expect(report).toContain('SSE stream drop');
+      expect(report).toContain('Failed to fetch');
+    });
+
+    it('does not log a user-initiated abort as a stream drop (Bug-7388)', async () => {
+      const adapter = createExcelAdapter(() => null);
+      const abortErr = new DOMException('The operation was aborted.', 'AbortError');
+      vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(abortErr);
+
+      await expect(
+        adapter.streamMessageRaw('p1', 'conv-1', 'hello'),
+      ).rejects.toThrow();
+
+      const report = getDiagnosticsReport();
+      expect(report).not.toContain('SSE stream drop');
     });
   });
 });

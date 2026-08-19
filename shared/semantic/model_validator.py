@@ -47,10 +47,17 @@ from shared.db.models import (
     AggregateColumn,
     AggregateDefinition,
     Dimension,
-    Join,
     Measure,
     ModelColumn,
-    ModelTable,
+)
+from shared.semantic.graph_order import (
+    canonical_join_order,
+    canonical_table_order,
+    is_fact_table,
+    order_model_columns,
+    pick_anchor_table,
+    select_model_joins,
+    select_model_tables,
 )
 
 
@@ -79,25 +86,31 @@ async def _load_model_structure(
     )
     dim_by_name = {d.name: d for d in dims_result.scalars().all()}
 
-    tables_result = await db.execute(
-        select(ModelTable).where(ModelTable.model_id == model_id)
-    )
-    tables = {t.id: t for t in tables_result.scalars().all()}
+    # Bug-8605 (round-1 review, finding 2): this validator is the SEVENTH site
+    # of the positional-anchor pattern and the only one whose verdict is
+    # PERSISTED. On a zero-fact model with a disconnected join graph, the
+    # anchor decides which component ``reachable_from_anchor`` covers, and
+    # every dimension/measure outside it is written ``is_invalid=true`` and
+    # its aggregates refused. Over an unordered read that verdict flipped with
+    # nothing but the storage engine's row order.
+    tables_result = await db.execute(select_model_tables(model_id))
+    ordered_tables = canonical_table_order(tables_result.scalars().all())
+    tables = {t.id: t for t in ordered_tables}
 
     if tables:
         cols_result = await db.execute(
-            select(ModelColumn).where(
-                ModelColumn.model_table_id.in_(list(tables.keys()))
+            order_model_columns(
+                select(ModelColumn).where(
+                    ModelColumn.model_table_id.in_(list(tables.keys()))
+                )
             )
         )
         columns = {c.id: c for c in cols_result.scalars().all()}
     else:
         columns = {}
 
-    joins_result = await db.execute(
-        select(Join).where(Join.model_id == model_id)
-    )
-    joins = list(joins_result.scalars().all())
+    joins_result = await db.execute(select_model_joins(model_id))
+    joins = canonical_join_order(joins_result.scalars().all())
 
     measures_result = await db.execute(
         select(Measure).where(Measure.model_id == model_id)
@@ -109,8 +122,7 @@ async def _load_model_structure(
     anchor_id: Optional[UUID] = None
     reachable: set[UUID] = set()
     if tables:
-        facts = [t for t in tables.values() if (t.table_type or "").lower() == "fact"]
-        anchor = facts[0] if facts else next(iter(tables.values()))
+        anchor = pick_anchor_table(ordered_tables)
         anchor_id = anchor.id
         reachable = {anchor.id}
         changed = True
@@ -142,9 +154,10 @@ def detect_chasm_trap(structure: _ModelStructure) -> Optional[str]:
 
     Returns a warning message if detected, or None.
     """
+    # Bug-8605 R2 review (finding 1): one shared fact test, so this cannot
+    # disagree with the anchor rule about what a fact table is.
     fact_ids = [
-        tid for tid, t in structure.tables.items()
-        if (t.table_type or "").lower() == "fact"
+        tid for tid, t in structure.tables.items() if is_fact_table(t)
     ]
     if len(fact_ids) < 2:
         return None
@@ -300,6 +313,7 @@ def validate_measure(
             return f"Invalid expression: {exc}"
         missing: list[str] = []
         non_simple: list[str] = []
+        variant_refs: list[str] = []
         for name in parsed.referenced_names:
             ref = structure.measures_by_name.get(name)
             if ref is None:
@@ -307,6 +321,16 @@ def validate_measure(
                 continue
             if ref.measure_type == "calculated":
                 non_simple.append(name)
+                continue
+            # Bug-6226 (fail-closed): a calculated measure may not reference a
+            # time-variant measure. Save-time validation (measures.py, F-015-04)
+            # and the rewriter (source_sql.py:1264-1270) both reject such
+            # references — the rewriter would otherwise compute against the
+            # variant's BASE and return a silently wrong number. A pre-gate row
+            # referencing a variant must therefore report is_invalid=true, not a
+            # false is_invalid=false in the catalog.
+            if getattr(ref, "variant_kind", None) is not None:
+                variant_refs.append(name)
         if missing:
             return f"Referenced measure(s) no longer exist: {', '.join(sorted(set(missing)))}"
         if non_simple:
@@ -314,11 +338,42 @@ def validate_measure(
                 "Calculated measures cannot reference other calculated "
                 f"measures: {', '.join(sorted(set(non_simple)))}"
             )
+        if variant_refs:
+            return (
+                "Calculated measures cannot reference time-variant "
+                f"measures: {', '.join(sorted(set(variant_refs)))}"
+            )
         return None
+    # Variant measures derive their value from a base measure and legitimately
+    # carry no own source column. Hard-deleting the base cascade-deletes the
+    # variant (measures.variant_of_measure_id ON DELETE CASCADE), so a dangling
+    # variant cannot persist; treat it as structurally valid here.
+    if getattr(measure, "variant_of_measure_id", None) is not None:
+        return None
+    # Cross-model measures resolve their value from another model in the same
+    # project and carry no local source binding by design. Only a FULLY
+    # specified cross-model reference (both the source model AND the source
+    # measure) is exempt. A half-populated row (exactly one FK set) has no
+    # resolvable source — the API enforces both-or-neither, but a persisted or
+    # imported row can bypass that — so it must fail closed, not report a false
+    # is_invalid=false. (Bug-6226 fail-closed contract.)
+    has_cm_model = getattr(measure, "cross_model_source_model_id", None) is not None
+    has_cm_measure = getattr(measure, "cross_model_source_measure_id", None) is not None
+    if has_cm_model and has_cm_measure:
+        return None
+    if has_cm_model or has_cm_measure:
+        return (
+            "Cross-model measure is half-configured: it needs both a source "
+            "model and a source measure"
+        )
     if measure.source_column_id is None and measure.user_defined_attribute_id is None:
-        if not measure.expression:
-            return None
-        return None
+        # Bug-6226 (fail-closed): a standard, non-variant, non-cross-model
+        # measure with neither a source column nor a UDA has no way to resolve
+        # a value — the rewriter raises on every query (source_sql.py:1441-1445).
+        # The previous conditional here returned None on both branches (dead
+        # code), reporting a false is_invalid=false. Mark it invalid so the
+        # catalog, gateway, and Model Health tab surface the broken mapping.
+        return "Measure has no source mapping (no source column or attribute)"
     if measure.source_column_id is not None:
         col = structure.columns.get(measure.source_column_id)
         if col is None:
@@ -381,6 +436,20 @@ async def _revalidate_aggregates_with_structure(
         reason = await validate_aggregate(agg, db, structure=structure)
         if reason is None:
             if agg.status == "invalid":
+                # Bug-7903 (Fable R2 #2): a STRUCTURAL revalidation must NOT
+                # resurrect an aggregate whose invalid state is REFRESH-owned. The
+                # uniform refresh pending-guard sets ``refresh_prior_status`` (its
+                # durable pre-refresh snapshot) and degrades to "invalid" on a
+                # refresh failure where the physical table is in doubt (e.g. an
+                # incremental DELETE committed without its INSERT — a missing data
+                # slice). Flipping such an aggregate to "active" here would serve
+                # UNDERSTATED totals over incomplete data, and would slow recovery
+                # (active is not sweep-always-due while invalid is). Leave it
+                # invalid so the refresh engine (sweep, always-due) rebuilds it and
+                # restores it to its true prior status. Only a purely STRUCTURAL
+                # invalid (no refresh-owned snapshot) self-heals to active here.
+                if getattr(agg, "refresh_prior_status", None) in ("active", "disabled"):
+                    continue
                 agg.status = "active"
                 agg.invalid_reason = None
                 newly_valid.append(agg.id)

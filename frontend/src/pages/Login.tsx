@@ -16,6 +16,7 @@ import LockOpenIcon from "@mui/icons-material/LockOpen";
 import PlayCircleOutlineIcon from "@mui/icons-material/PlayCircleOutline";
 import { authApi, ssoApi } from "../api/client";
 import { setSessionExpiry } from "../api/auth";
+import { BRANDING_CHANGED_EVENT } from "../utils/brandingEvents";
 import { useT } from "../i18n";
 
 const DEMO_ENABLED = import.meta.env.VITE_ENABLE_DEMO_LOGIN === "true";
@@ -38,14 +39,15 @@ export default function Login() {
   }>({ saml: false, oidc: false });
 
   useEffect(() => {
-    ssoApi.getBackends().then((data) => {
+    ssoApi.getBackends(tenantId || undefined).then((data) => {
       setSsoEnabled({ saml: data.saml_enabled, oidc: data.oidc_enabled });
     }).catch((e) => console.warn("SSO backend check failed:", e));
-  }, []);
+  }, [tenantId]);
 
   async function signInTenant(slug: string, emailAddr: string, pw: string) {
     const result = await authApi.login({ tenant_id: slug, email: emailAddr, password: pw });
     localStorage.setItem("tenant_id", slug);
+    window.dispatchEvent(new Event(BRANDING_CHANGED_EVENT));
     if (result.expires_in) setSessionExpiry(result.expires_in);
     // Bug-837 fix: resolve role from /users/me (server authority) instead of
     // trusting the login response role directly into localStorage.

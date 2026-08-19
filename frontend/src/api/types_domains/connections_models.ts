@@ -86,5 +86,13 @@ export interface Model {
   predictive_eviction_policy?: EvictionPolicy;
   predictive_requires_approval?: boolean;
   pocket_size_budget_bytes?: number | null;
+  // Bug-8101 / F-104-01: whether the current caller may author (mutate) this
+  // model. False for a read-only consumer role (model_viewer / viewer), which
+  // makes the Model Builder open read-only. Absent on list responses.
+  caller_can_author?: boolean | null;
+  // G-013-02: whether the caller holds project ADMIN for this model (the
+  // revert route's require_role("admin") precedence). Drives the Versions
+  // dialog Revert button so a project-scoped admin sees it. Absent on lists.
+  caller_can_admin?: boolean | null;
 }
 

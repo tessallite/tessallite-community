@@ -268,11 +268,29 @@ class TestTimeIntelligence:
         assert result.has_time_intelligence is True
         assert "LEAD" in result.select_expr
 
-    def test_cagr_compiles(self):
+    def test_cagr_compiles_at_year_grain(self):
+        # Bug-6645: CAGR requires month or coarser grain. When no grain is
+        # derivable from the expression, the emitter rejects the variant
+        # (VariantSqlError) and the compiler falls back to NULL (the
+        # Python-side evaluator handles it instead). Supply an explicit year
+        # grain via the third argument to prove the SQL path works.
+        ctx = CompilerContext(time_column="order_date")
+        result = compile_expression(
+            'cagr(measure("Revenue"), literal(3), "year")', ctx
+        )
+        assert result.has_time_intelligence is True
+        assert "POWER" in result.select_expr
+
+    def test_cagr_without_grain_returns_null(self):
+        # Bug-6645: CAGR with no derivable grain defaults to day, which is
+        # rejected by the emitter (VariantSqlError). The compiler catches it
+        # and returns "NULL" as the select expression. The compiled query
+        # still carries has_time_intelligence=True so KPI metadata is correct,
+        # but the SQL evaluates to NULL (no value displayed).
         ctx = CompilerContext(time_column="order_date")
         result = compile_expression('cagr(measure("Revenue"), literal(3))', ctx)
         assert result.has_time_intelligence is True
-        assert "POWER" in result.select_expr
+        assert result.select_expr == "NULL"
 
     def test_period_to_date_ytd(self):
         ctx = CompilerContext(time_column="order_date")
@@ -415,6 +433,10 @@ class TestEdgeCases:
 # ---------------------------------------------------------------------------
 
 class TestSemiAdditive:
+    @staticmethod
+    def _inner_sql(sql: str) -> str:
+        return sql.split("FROM (", 1)[1].split(") AS sub", 1)[0]
+
     def test_last_non_additive_uses_order_limit(self):
         ctx = CompilerContext(
             non_additive_agg="last",
@@ -428,6 +450,9 @@ class TestSemiAdditive:
         # sqlglot may normalize "IS NOT NULL" to "NOT x IS NULL"
         assert "IS NOT NULL" in result.sql or "NOT" in result.sql and "IS NULL" in result.sql
         assert "GROUP BY" in result.sql
+        inner_sql = self._inner_sql(result.sql)
+        assert 'AS inner_val, "order_date"' in inner_sql
+        assert 'GROUP BY DATE_TRUNC(\'MONTH\', "order_date"), "order_date"' in inner_sql
 
     def test_first_non_additive(self):
         ctx = CompilerContext(
@@ -460,6 +485,64 @@ class TestSemiAdditive:
         assert "MAX(" in result.sql
         assert "GROUP BY" in result.sql
 
+    def test_avg_non_additive_uses_outer_avg(self):
+        """Bug-6252: avg must average per-grain values, not fall through to
+        the unknown-aggregation SUM fallback."""
+        ctx = CompilerContext(
+            non_additive_agg="avg",
+            at_grain="month",
+            time_column="order_date",
+        )
+        result = compile_expression('measure("Balance")', ctx)
+        outer_select = result.sql.upper().split(" FROM ", 1)[0]
+        assert "AVG(" in outer_select
+        assert "SUM(" not in outer_select
+
+    @pytest.mark.parametrize("agg, outer_func", [
+        ("avg", "AVG"),
+        ("min", "MIN"),
+        ("max", "MAX"),
+    ])
+    def test_reducing_non_additive_groups_by_bucket_not_raw_time(
+        self, agg, outer_func
+    ):
+        """Bug-6252: reducing semi-additive aggregations must reduce one
+        inner value per requested grain bucket. Grouping by the raw time column
+        would average/min/max time-points inside the bucket instead."""
+        ctx = CompilerContext(
+            non_additive_agg=agg,
+            at_grain="month",
+            time_column="order_date",
+        )
+        result = compile_expression('measure("Balance")', ctx)
+        outer_select = result.sql.upper().split(" FROM ", 1)[0]
+        assert f"{outer_func}(INNER_VAL)" in outer_select
+        inner_sql = self._inner_sql(result.sql)
+        assert 'AS inner_val, "order_date"' not in inner_sql
+        assert inner_sql.endswith('GROUP BY DATE_TRUNC(\'MONTH\', "order_date")')
+
+    def test_at_grain_keyword_date_truncs_time_column(self):
+        """Bug-6252: at_grain is a grain keyword, not a required physical
+        column named "month"."""
+        ctx = CompilerContext(
+            non_additive_agg="avg",
+            at_grain="month",
+            time_column="business_date",
+        )
+        sql = compile_expression('measure("Balance")', ctx).sql.upper()
+        assert "DATE_TRUNC('MONTH'" in sql
+        assert '"MONTH"' not in sql
+
+    def test_at_grain_real_column_not_truncated(self):
+        ctx = CompilerContext(
+            non_additive_agg="avg",
+            at_grain="reporting_bucket",
+            time_column="business_date",
+        )
+        sql = compile_expression('measure("Balance")', ctx).sql
+        assert '"reporting_bucket"' in sql
+        assert "DATE_TRUNC" not in sql.upper()
+
     def test_semi_additive_has_subquery(self):
         ctx = CompilerContext(
             non_additive_agg="last",
@@ -479,10 +562,34 @@ class TestSemiAdditive:
         result = compile_expression('measure("Balance")', ctx)
         assert '"date"' in result.sql
 
-    def test_semi_additive_fallback_sum(self):
-        """Unknown non_additive_agg falls back to SUM."""
+    def test_semi_additive_unknown_agg_fails_loud(self):
+        """Bug-6252: an unknown non_additive_agg must FAIL, not fall back to SUM.
+
+        This test previously asserted the opposite ("Unknown non_additive_agg
+        falls back to SUM") and so pinned the defect as intended behaviour. The
+        fallback was a silent wrong-numbers bug: summing a column of per-period
+        balances reports the sum of every day's balance instead of the closing
+        balance, which is the exact failure semi-additive support exists to
+        prevent. ``non_additive_agg`` is now a closed enum at the API boundary
+        and is re-checked here, so an unrecognised token cannot compile at all.
+
+        Test escape (recorded per policy): the escape was not missing coverage —
+        existing coverage ENSHRINED the defect. Guard: this assertion plus
+        ``test_bug6252_kpi_semi_additive_vocabulary.py``. Tier: T1.
+        """
         ctx = CompilerContext(
             non_additive_agg="unknown_agg",
+            at_grain="month",
+            time_column="order_date",
+        )
+        with pytest.raises(ValueError, match="not supported"):
+            compile_expression('measure("Balance")', ctx)
+
+    def test_semi_additive_explicit_sum_still_sums(self):
+        """``sum`` remains a legitimate EXPLICIT choice — Bug-6252 removed the
+        silent fallback, not the option."""
+        ctx = CompilerContext(
+            non_additive_agg="sum",
             at_grain="month",
             time_column="order_date",
         )
@@ -979,3 +1086,50 @@ class TestCteScalarKpi:
         assert "BETWEEN 'A' AND 'M'" in result.sql
         after_ranked = result.sql.split("FROM ranked")[1]
         assert "BETWEEN" in after_ranked
+
+
+# ---------------------------------------------------------------------------
+# Bug-9385 / F-103-02: a period-to-date (YTD) KPI must compile to a
+# YEAR-BOUNDED query, never an unrestricted all-time SUM. This pins the
+# year-bounding so a "Revenue (YTD)" KPI can never silently regress to all-time.
+# ---------------------------------------------------------------------------
+
+class TestPeriodToDateIsYearBounded:
+    def test_ytd_compiles_to_current_year_window(self):
+        from src.kpi_compiler import compile_scalar_kpi_sql
+        ctx = CompilerContext(model_slug="acme_sales", time_column="business_date")
+        sql = compile_scalar_kpi_sql(
+            'SUM("base_amount")', ctx,
+            ti_type="period_to_date", ti_grain="year",
+        )
+        assert sql is not None
+        # Year-bounded: filters from the start of the CURRENT year up to today.
+        assert "DATE_TRUNC('year', CURRENT_DATE)" in sql
+        assert "business_date" in sql
+        # A WHERE time window is present — this is what makes YTD differ from
+        # all-time (an all-time SUM has no time predicate at all).
+        assert "WHERE" in sql
+
+    def test_ytd_query_differs_from_all_time(self):
+        from src.kpi_compiler import compile_scalar_kpi_sql, compile_expression
+        ctx = CompilerContext(model_slug="acme_sales", time_column="business_date")
+        ytd_sql = compile_scalar_kpi_sql(
+            'SUM("base_amount")', ctx,
+            ti_type="period_to_date", ti_grain="year",
+        )
+        # The all-time compile of the same measure has NO time window — the two
+        # queries are structurally different, so their results differ whenever
+        # data exists outside the current year (the F-103-02 regression: a YTD
+        # KPI showing all-time).
+        all_time = compile_expression('measure("base_amount")').select_expr
+        assert "DATE_TRUNC('year', CURRENT_DATE)" in ytd_sql
+        assert "DATE_TRUNC('year', CURRENT_DATE)" not in all_time
+        assert "CURRENT_DATE" not in all_time
+
+    def test_mtd_and_qtd_bound_to_their_grain(self):
+        from src.kpi_compiler import compile_scalar_kpi_sql
+        ctx = CompilerContext(model_slug="m", time_column="d")
+        mtd = compile_scalar_kpi_sql('SUM("x")', ctx, ti_type="period_to_date", ti_grain="month")
+        qtd = compile_scalar_kpi_sql('SUM("x")', ctx, ti_type="period_to_date", ti_grain="quarter")
+        assert "DATE_TRUNC('month', CURRENT_DATE)" in mtd
+        assert "DATE_TRUNC('quarter', CURRENT_DATE)" in qtd

@@ -22,15 +22,15 @@ Installing Tessallite Community Edition on a local machine from the signed relea
 
 1. Register at https://tessallite.io and download your signed Community licence.
 2. Download the current Tessallite Community release bundle from the website.
-3. Unpack the bundle and open a terminal in the release directory.
-4. Verify `SHA256SUMS` and `SHA256SUMS.sig` before running anything. The full commands are in `docs/guides/guides_community-install.md`.
+3. Before unpacking, verify the archive with its detached companion files `tessallite-community-<version>.tar.gz.SHA256SUMS` and `.tar.gz.SHA256SUMS.sig` (named after the full archive so the checksum covers the `.tar.gz` itself). The full commands are on the website Download page and in `docs/guides/guides_community-install.md`.
+4. Unpack the bundle and open a terminal in the release directory.
 5. Copy your signed licence into the bundle root as `license.json`.
 6. Run:
    ```bash
    chmod +x ./install.sh
    ./install.sh
    ```
-7. The installer checks Docker, ports, disk space, the licence file, and the public verification key. It creates `.env` from `.env.example` if needed, generates strong secrets, loads bundled images when present, starts the stack, runs the system schema migration, and seeds the demo tenant.
+7. The installer checks Docker, ports, disk space, the licence file, and the public verification key. It creates `.env` from `.env.example` if needed, generates strong secrets, loads bundled images when present, starts the stack, and runs the system schema migration. It does **not** seed the demo tenant by default: a fresh install starts empty so it never exposes the demo's fixed, publicly known credentials on a reachable port. To include the demo dataset, set `SEED_DEMO_TENANT=true` in `.env` before running `./install.sh` (or seed it later from the in-app demo-reseed control).
 8. When the installer completes, open `http://localhost:3000`.
 
 ## What starts

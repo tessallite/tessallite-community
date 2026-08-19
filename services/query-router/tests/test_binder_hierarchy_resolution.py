@@ -29,27 +29,29 @@ def _query(*, dims: list[str], measures: list[str], filters: list[LogicalFilter]
 
 
 async def test_bind_query_resolves_hierarchy_level_when_dimension_missing():
+    from src.semantic.snapshot_resolver import DeployedShape
+
     model = types.SimpleNamespace(id="model-1", slug="m", deployed_version_id="v1")
     measure = types.SimpleNamespace(name="Amount", default_agg="sum", is_additive=True)
-    hierarchy_level = types.SimpleNamespace(
-        name="Region",
-        source_column_id="col-region",
-        user_defined_attribute_id=None,
+    shape = DeployedShape(
+        measures=[measure], dimensions=[],
+        hidden_column_ids=set(),
+        physical_columns_all=set(), physical_columns_visible=set(),
+        hierarchy_rows=[{
+            "id": "h1", "name": "GeoHierarchy", "dimension_kind": None,
+            "levels": [{
+                "id": "lv1", "name": "Region", "ordinal": 0,
+                "key_attribute_source": "physical_column",
+                "key_attribute_id": "col-region",
+            }],
+        }],
     )
     db = AsyncMock()
 
     with (
         patch("src.semantic.binder._load_model", new=AsyncMock(return_value=model)),
-        patch("src.semantic.binder._load_measures", new=AsyncMock(return_value=[measure])),
-        patch("src.semantic.binder._load_dimensions", new=AsyncMock(return_value=[])),
-        patch(
-            "src.semantic.binder._load_hidden_column_ids",
-            new=AsyncMock(return_value=set()),
-        ),
-        patch(
-            "src.semantic.binder._load_hierarchy_level_dimensions",
-            new=AsyncMock(return_value=[hierarchy_level]),
-        ),
+        patch("src.semantic.binder.resolve_deployed_shape",
+              new=AsyncMock(return_value=shape)),
     ):
         bound = await bind_query_to_model(
             _query(dims=["Region"], measures=["Amount"]),
@@ -63,26 +65,28 @@ async def test_bind_query_resolves_hierarchy_level_when_dimension_missing():
 
 
 async def test_bind_query_keeps_filter_only_hierarchy_level_in_dimension_map():
+    from src.semantic.snapshot_resolver import DeployedShape
+
     model = types.SimpleNamespace(id="model-1", slug="m", deployed_version_id="v1")
-    hierarchy_level = types.SimpleNamespace(
-        name="fx_segment",
-        source_column_id=None,
-        user_defined_attribute_id="uda-segment",
+    shape = DeployedShape(
+        measures=[], dimensions=[],
+        hidden_column_ids=set(),
+        physical_columns_all=set(), physical_columns_visible=set(),
+        hierarchy_rows=[{
+            "id": "h2", "name": "FxHierarchy", "dimension_kind": None,
+            "levels": [{
+                "id": "lv2", "name": "fx_segment", "ordinal": 0,
+                "key_attribute_source": "user_defined_attribute",
+                "key_attribute_id": "uda-segment",
+            }],
+        }],
     )
     db = AsyncMock()
 
     with (
         patch("src.semantic.binder._load_model", new=AsyncMock(return_value=model)),
-        patch("src.semantic.binder._load_measures", new=AsyncMock(return_value=[])),
-        patch("src.semantic.binder._load_dimensions", new=AsyncMock(return_value=[])),
-        patch(
-            "src.semantic.binder._load_hidden_column_ids",
-            new=AsyncMock(return_value=set()),
-        ),
-        patch(
-            "src.semantic.binder._load_hierarchy_level_dimensions",
-            new=AsyncMock(return_value=[hierarchy_level]),
-        ),
+        patch("src.semantic.binder.resolve_deployed_shape",
+              new=AsyncMock(return_value=shape)),
     ):
         bound = await bind_query_to_model(
             _query(

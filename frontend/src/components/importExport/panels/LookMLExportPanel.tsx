@@ -28,17 +28,27 @@ export default function LookMLExportPanel({ projectId, onDone }: Props) {
     queryFn: () => modelsApi.list(projectId),
   });
 
+  // F-020-04: the LookML emitter SKIPS calculated / time-variant measures Looker
+  // cannot represent. The download used to close the dialog silently, so the
+  // modeller never learned their Looker project is missing measure math. Show
+  // the skipped-measure count and DO NOT auto-close when anything was skipped.
+  const [warningCount, setWarningCount] = useState<number | null>(null);
   const exportMut = useMutation({
     mutationFn: (model: { id: string; slug: string }) =>
       lookmlExportApi.exportModel(projectId, model.id, connection.trim()),
-    onSuccess: (blob, model) => {
+    onSuccess: ({ blob, warningCount: n }, model) => {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
       a.download = `${model.slug}-lookml.zip`;
       a.click();
       URL.revokeObjectURL(url);
-      onDone();
+      if (n > 0) {
+        setWarningCount(n); // keep the dialog open so the warning is seen
+      } else {
+        setWarningCount(null);
+        onDone();
+      }
     },
   });
 
@@ -77,6 +87,11 @@ export default function LookMLExportPanel({ projectId, onDone }: Props) {
             </ListItem>
           ))}
         </List>
+      )}
+      {warningCount !== null && warningCount > 0 && (
+        <Alert severity="warning" onClose={() => setWarningCount(null)}>
+          {t("exportDialog.lookmlSkippedMeasures", { count: String(warningCount) })}
+        </Alert>
       )}
       {exportMut.isError && (
         <Alert severity="error">

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from .result_fakes import FakeScalarResult
 
 from src.auth.middleware import CurrentUser, get_current_user
 from src.main import app
@@ -21,7 +22,9 @@ from .conftest import (
     make_mock_db,
 )
 
-pytestmark = pytest.mark.unit
+# F-017-12: shim caller_has_role to the token-role decision for these mocked-db
+# unit tests (see conftest.kpi_effective_role).
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("kpi_effective_role")]
 
 PREFIX = f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/kpis"
 
@@ -31,7 +34,7 @@ class _ScalarResult:
         self._items = items
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return list(self._items)

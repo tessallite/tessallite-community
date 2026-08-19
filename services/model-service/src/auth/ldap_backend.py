@@ -93,6 +93,12 @@ class LdapAuthBackend:
 
         user_email = str(getattr(entry, self._email_attr, email))
         display_name = str(getattr(entry, self._display_attr, ""))
+        # F-021-04: the directory search authoritatively returns the group
+        # attribute on the entry. When the attribute is present (even empty) the
+        # membership is authoritative — an LDAP user removed from every group is
+        # a real de-provisioning signal. When the attribute is entirely absent
+        # from the entry, treat it as indeterminate (fail closed, no revoke).
+        groups_claim_present = hasattr(entry, self._group_attr)
         groups_raw = getattr(entry, self._group_attr, [])
         groups = [str(g) for g in groups_raw] if groups_raw else []
 
@@ -102,6 +108,7 @@ class LdapAuthBackend:
             groups=groups,
             source_backend=self.name,
             raw_claims={"ldap_dn": user_dn},
+            groups_claim_present=groups_claim_present,
         )
 
     async def authenticate(

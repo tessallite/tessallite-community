@@ -2,7 +2,7 @@
 title: "Workspace Explorer"
 audience: all
 area: getting-started
-updated: 2026-05-15
+updated: 2026-08-11
 ---
 
 ![Live Explorer workspace showing the acme-demo project list, agent card, and deployed model cards.](../assets/screencaps/explorer-workspace.png)
@@ -34,11 +34,33 @@ The main area shows the selected project. At the top are project-level controls:
 - **Project settings** opens the drawer for agent configuration, LLM providers, users, audit settings, webhooks, and SSO mappings.
 - **Start a conversation** opens the project agent, scoped to models enabled for the agent.
 
+## Pinning the models you use most
+
+A project can hold many models, and the ones you actually work with are usually
+a handful. The star on a model card pins it: pinned models sort to the front of
+the list so they are the first thing you see when you open the project. Click
+the star again to unpin.
+
+A pin belongs to **you**, not to the browser. It is stored against your user
+account, so the same models are pinned when you sign in from a different
+computer, a different browser, or after clearing your browsing data. Nobody else
+in the workspace sees or is affected by your pins — a colleague opening the same
+project sees their own.
+
+**Tip.** Pinning does not change anything about the model itself. It does not
+deploy it, hide the others, or alter what BI tools and the agent can see. It is
+purely about the order the cards appear in for you.
+
+**Scenario.** You are the analyst for the payments domain, in a project with
+twelve models. Pin `payments` and `chargebacks`. Every time you open the
+project — from your laptop, or from a shared machine in the office — those two
+cards sit at the top and you stop scrolling for them.
+
 ## How to use it well
 
 Create one project per business domain, not one project per table. A project can contain multiple one-fact models, such as payments, settlements, and chargebacks. Keep model display names business-readable because they surface in the Explorer, BI catalogues, and agent context.
 
-Before deleting or renaming a model, check whether it is deployed and whether downstream assets reference it. Use [Impact Analysis](../modelling/impact-analysis.md) for column-level dependencies and [Audit Log](../admin/audit-log.md) for recent administrative changes.
+Before deleting or renaming a model, check whether it is deployed and whether downstream assets reference it. Use [Usage & Downstream Assets](../modelling/usage-downstream-assets.md) to see recorded downstream consumers and observed table usage, and [Audit Log](../admin/audit-log.md) for recent administrative changes.
 
 ## Related
 

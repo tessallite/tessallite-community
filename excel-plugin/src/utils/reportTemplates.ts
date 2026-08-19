@@ -14,6 +14,13 @@ export interface ReportTemplate {
   requiresTimeDimension?: boolean;
   requiresCategoricalDimension?: boolean;
   requiresComparisonMeasure?: boolean;
+  /**
+   * Bug-6365: when set, applying the template ranks the result by its primary
+   * measure (descending) and caps it to this many rows — the actual "top-N"
+   * behaviour the Top N Breakdown template promises. The zone-query builder
+   * receives the sort selection and row limit from the applying component.
+   */
+  topN?: number;
 }
 
 export const REPORT_TEMPLATES: ReportTemplate[] = [
@@ -32,6 +39,7 @@ export const REPORT_TEMPLATES: ReportTemplate[] = [
     icon: 'Leaderboard',
     requiresMeasure: true,
     requiresCategoricalDimension: true,
+    topN: 10,
   },
   {
     id: 'period-comparison',

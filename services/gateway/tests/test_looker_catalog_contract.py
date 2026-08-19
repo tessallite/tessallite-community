@@ -38,8 +38,18 @@ def test_pg_proc_lists_supported_aggregate_functions() -> None:
         row["proname"]: row
         for row in (_row_as_dict(columns, values) for values in rows)
     }
-    assert set(by_name) == {"sum", "avg", "min", "max", "count", "count_distinct"}
-    assert all(row["pronargs"] == "1" and row["proisagg"] == "t" for row in by_name.values())
+    aggregates = {"sum", "avg", "min", "max", "count", "count_distinct"}
+    assert aggregates <= set(by_name)
+    # Beyond the aggregates, pg_proc also carries per-type *recv functions
+    # (Bug-5552/5553: Npgsql resolves typreceive by joining pg_proc) — but
+    # nothing else.
+    extras = set(by_name) - aggregates
+    assert extras and all(name.endswith("recv") for name in extras)
+    assert all(
+        row["pronargs"] == "1" and row["proisagg"] == "t"
+        for name, row in by_name.items()
+        if name in aggregates
+    )
     assert by_name["sum"]["prorettype"] == "1700"
     assert by_name["count"]["prorettype"] == "20"
     cat.close()

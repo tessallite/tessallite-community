@@ -1,10 +1,10 @@
-import { lazy, Suspense, useEffect, useRef } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef } from "react";
 import { safeLocalGet } from "../utils/safeLocalStorage";
 import PanelErrorBoundary from "../components/Builder/PanelErrorBoundary";
 import { useT } from "../i18n";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Alert, Box, Chip, CircularProgress, FormControlLabel, IconButton, Snackbar, Switch, Tab, Tabs, Tooltip, Typography } from "@mui/material";
+import { Alert, Box, Button, Chip, CircularProgress, FormControlLabel, IconButton, Snackbar, Switch, Tab, Tabs, Tooltip, Typography } from "@mui/material";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import SettingsIcon from "@mui/icons-material/Settings";
 import HelpIconButton from "../components/HelpIconButton";
@@ -85,6 +85,7 @@ const MeasureQueryPanel = lazy(() => import("../components/Panels/MeasureQueryPa
 const DataQualityPanel = lazy(() => import("../components/Panels/DataQualityPanel"));
 const DataTagsPanel = lazy(() => import("../components/Panels/DataTagsPanel"));
 const ImpactPanel = lazy(() => import("../components/Panels/ImpactPanel"));
+const ImpactAnalysisPanel = lazy(() => import("../components/Panels/ImpactAnalysisPanel"));
 const ModelConfigDrawer = lazy(() => import("../components/Settings/ModelConfigDrawer"));
 const SourcesPanel = lazy(() => import("../components/Panels/SourcesPanel"));
 const ParametersPanel = lazy(
@@ -238,12 +239,15 @@ export default function ModelBuilder() {
     return () => reset();
   }, [modelId, reset]);
 
-  // Propagate readOnly share-link mode to the store so all panels can
-  // check it and disable editing controls (Bug-5301).
-  const isReadOnly = searchParams.get("readonly") === "1";
-  useEffect(() => {
-    setReadOnly(isReadOnly);
-  }, [isReadOnly, setReadOnly]);
+  // Propagate readOnly mode to the store so all panels can check it and
+  // disable editing controls. Two independent sources force read-only:
+  //  - the ?readonly=1 share-link parameter (Bug-5301);
+  //  - a consumer role (model_viewer / viewer) that cannot author this model
+  //    (Bug-8101 / F-104-01): the backend model detail returns
+  //    caller_can_author=false, so the Model Builder opens read-only and the
+  //    SAVE/DEPLOY/authoring controls are hidden. The backend remains
+  //    authoritative — this only aligns the UI with the server gate.
+  const isShareLinkReadOnly = searchParams.get("readonly") === "1";
 
   // Honour ?panel=<id> deep-links (e.g. Explorer "Lifecycle log" entry).
   // Runs after the reset effect on mount, opens the requested panel, then
@@ -296,9 +300,24 @@ export default function ModelBuilder() {
   const aggregates = useAggregates(projectId!, modelId!);
   const pockets = usePockets(projectId!, modelId!);
 
+  // Bug-8101 / F-104-01: a consumer role that cannot author this model
+  // (backend caller_can_author=false) forces the builder read-only, exactly
+  // like the ?readonly=1 share link. Undefined (still loading, or a legacy
+  // backend that omits the field) does NOT force read-only, so authoring users
+  // are never blocked by a slow/absent field — the backend gate still governs
+  // every mutation regardless.
+  const roleForcesReadOnly = model.data?.caller_can_author === false;
+  const isReadOnly = isShareLinkReadOnly || roleForcesReadOnly;
+  useEffect(() => {
+    setReadOnly(isReadOnly);
+  }, [isReadOnly, setReadOnly]);
+
+  // Bug-7405: include allTables.isLoading so the canvas doesn't flash empty
+  // while the dependent table query is still in flight.
   const isLoading =
     model.isLoading ||
     sources.isLoading ||
+    allTables.isLoading ||
     targets.isLoading ||
     hierarchies.isLoading ||
     dimensions.isLoading ||
@@ -306,6 +325,13 @@ export default function ModelBuilder() {
     joins.isLoading ||
     aggregates.isLoading ||
     pockets.isLoading;
+
+  // Bug-7404: detect when any required query has failed. A completed 4xx/5xx
+  // or network failure exits the loading state but leaves the data as
+  // undefined -- the ?? [] fallbacks make it indistinguishable from a genuinely
+  // empty model. Block the builder and show an error instead.
+  const requiredQueries = [model, sources, allTables, targets, hierarchies, dimensions, measures, joins, aggregates, pockets];
+  const hasError = requiredQueries.some((q) => q.isError);
 
   // Validation tray producer (F-026-01): merges the structural validator's
   // model alerts with client-side structural rules into the builder store.
@@ -348,6 +374,15 @@ export default function ModelBuilder() {
     zoomOut: () => void;
     fitView: () => void;
   } | null>(null);
+  // Stable identity (Bug-6375): the ref target never changes, so this callback
+  // has no reactive deps. A fresh identity each render would churn the Canvas's
+  // publish/cleanup effect and null out the live zoom/fit controls.
+  const handleViewControlsReady = useCallback(
+    (c: { zoomIn: () => void; zoomOut: () => void; fitView: () => void } | null) => {
+      canvasViewControls.current = c;
+    },
+    [],
+  );
   const globalMessage = useBuilderStore((s) => s.globalMessage);
   const clearGlobalMessage = useBuilderStore((s) => s.clearGlobalMessage);
   const setGlobalMessage = useBuilderStore((s) => s.setGlobalMessage);
@@ -395,6 +430,36 @@ export default function ModelBuilder() {
     );
   }
 
+  // Bug-7404: block the builder and show an actionable error when any
+  // required dataset failed to load, instead of rendering as a valid empty
+  // model that masks auth failures, network errors, and 500s.
+  if (hasError) {
+    return (
+      <Box
+        display="flex"
+        flexDirection="column"
+        alignItems="center"
+        justifyContent="center"
+        height="60vh"
+        gap={2}
+      >
+        <Alert severity="error" sx={{ maxWidth: 600 }}>
+          {t("modelBuilder.loadFailed")}
+        </Alert>
+        <Button
+          variant="outlined"
+          onClick={() => {
+            for (const q of requiredQueries) {
+              if (q.isError) q.refetch();
+            }
+          }}
+        >
+          {t("modelBuilder.retry")}
+        </Button>
+      </Box>
+    );
+  }
+
   // Summary bar counts
   const sourceCount = sources.data?.length ?? 0;
   const tableCount = allTables.data?.length ?? 0;
@@ -415,11 +480,12 @@ export default function ModelBuilder() {
         overflow: "hidden",
       }}
     >
-      {/* Header row */}
+      {/* Header row -- wraps on narrow viewports (Bug-7406) */}
       <Box
         sx={{
           display: "flex",
           alignItems: "center",
+          flexWrap: "wrap",
           px: 1.5,
           py: 0.5,
           borderBottom: 1,
@@ -444,7 +510,7 @@ export default function ModelBuilder() {
               size="small"
               checked={modelEnabled}
               onChange={(e) => toggleModelEnabled.mutate(e.target.checked)}
-              disabled={toggleModelEnabled.isPending}
+              disabled={toggleModelEnabled.isPending || isReadOnly}
             />
           }
           label={
@@ -461,6 +527,7 @@ export default function ModelBuilder() {
           modelId={modelId!}
           isDeployed={Boolean(model.data?.deployed_version_id)}
           lastDeployedAt={model.data?.last_deployed_at as string | null | undefined}
+          readOnly={isReadOnly}
         />
         <HelpIconButton
           href="/help/modelling/model-canvas-tour.html"
@@ -523,7 +590,7 @@ export default function ModelBuilder() {
                 joins={joins.data ?? []}
                 canvasLayout={model.data?.canvas_layout}
                 readOnly={isReadOnly}
-                onViewControlsReady={(c) => { canvasViewControls.current = c; }}
+                onViewControlsReady={handleViewControlsReady}
               />
             )}
           </Box>
@@ -575,6 +642,7 @@ export default function ModelBuilder() {
           {activePanel === "row-security" && <RowSecurityPanel />}
           {activePanel === "data-tags" && <DataTagsPanel />}
           {activePanel === "impact" && <ImpactPanel />}
+          {activePanel === "impact-analysis" && <ImpactAnalysisPanel />}
           {activePanel === "lineage" && <LineagePanel />}
           {activePanel === "alerts" && <AlertsPanel />}
           {activePanel === "diagnostics" && <DiagnosticsPanel />}
@@ -669,18 +737,20 @@ function resolveSelectedName(
 // Toolbar actions: Save, Deploy/Undeploy, Versions
 // ---------------------------------------------------------------------------
 
-function ModelToolbarActions({
+export function ModelToolbarActions({
   projectId,
   projectSlug,
   modelId,
   isDeployed,
   lastDeployedAt,
+  readOnly = false,
 }: {
   projectId: string;
   projectSlug: string;
   modelId: string;
   isDeployed: boolean;
   lastDeployedAt?: string | null;
+  readOnly?: boolean;
 }) {
   const navigate = useNavigate();
   const tenantSlug = safeLocalGet("tenant_id", "");
@@ -717,7 +787,18 @@ function ModelToolbarActions({
   const deployMut = useMutation({
     mutationFn: () => versionsApi.deploy(projectId, modelId),
     onSuccess: (data) => {
-      markClean({ lastDeployedAt: data.last_deployed_at });
+      // F-026-13: deploy publishes the last-saved version, but DeployResponse
+      // carries no version number, so advance the deployed pointer to the
+      // last-saved version optimistically. Without this the chip compares a
+      // stale deployedVersion against lastSavedVersion and shows "deployed
+      // outdated" until useModel refetches — a modeller may Deploy twice or
+      // think Deploy failed. Read the freshest saved version from the store so
+      // a save-before-deploy is reflected (avoids a stale closure).
+      const savedVersion = useModelEditorStore.getState().lastSavedVersion;
+      markClean({
+        lastDeployedAt: data.last_deployed_at,
+        ...(savedVersion != null ? { deployedVersion: savedVersion } : {}),
+      });
       qc.invalidateQueries({ queryKey: ["models", projectId, modelId] });
       qc.invalidateQueries({ queryKey: ["versions", projectId, modelId] });
     },
@@ -771,8 +852,22 @@ function ModelToolbarActions({
     if (ok) undeployMut.mutate();
   }
 
-  const saveDisabled = !isDirty || saveMut.isPending;
-  const deployDisabled = isDirty || deployMut.isPending;
+  const layoutFlushMut = useMutation({
+    mutationFn: () => {
+      const flushFn = useBuilderStore.getState().flushCanvasLayoutNow;
+      if (flushFn) return flushFn();
+      return Promise.reject(new Error("Canvas is not active"));
+    },
+    onSuccess: () => {
+      setGlobalMessage(t("versions.layoutSaved"), "success");
+    },
+    onError: (err) => {
+      setGlobalMessage(extractApiError(err, t("builder.layoutSaveFailed")), "error");
+    },
+  });
+
+  const saveDisabled = readOnly || saveMut.isPending || layoutFlushMut.isPending;
+  const deployDisabled = readOnly || isDirty || deployMut.isPending;
   const isStaleDeployment =
     isDeployed &&
     !isDirty &&
@@ -814,7 +909,7 @@ function ModelToolbarActions({
           }
         />
       </Tooltip>
-      <Tooltip title={isDirty ? t("builder.saveTooltip") : t("builder.nothingToSave")}>
+      <Tooltip title={t("builder.saveTooltip")}>
         <span>
           <IconButton
             size="small"
@@ -834,7 +929,9 @@ function ModelToolbarActions({
             size="small"
             onClick={handleUndeploy}
             color="warning"
-            disabled={undeployMut.isPending}
+            disabled={readOnly || undeployMut.isPending}
+            aria-label={t("builder.undeploy")}
+            data-testid="btn-undeploy"
           >
             <StopCircleIcon fontSize="small" />
           </IconButton>
@@ -860,6 +957,10 @@ function ModelToolbarActions({
           <HistoryIcon fontSize="small" />
         </IconButton>
       </Tooltip>
+      {/* F-026-04: import mutates the model, so the import/export entry point
+          must respect read-only share-link mode like Save/Deploy/Undeploy
+          rather than staying always enabled. */}
+      {!readOnly && (
       <Tooltip title={t("modelBuilder.importExport")}>
         <IconButton
           size="small"
@@ -869,6 +970,7 @@ function ModelToolbarActions({
           <ImportExportIcon fontSize="small" />
         </IconButton>
       </Tooltip>
+      )}
       <VersionsDialog
         open={versionsOpen}
         onClose={() => setVersionsOpen(false)}
@@ -877,11 +979,22 @@ function ModelToolbarActions({
       />
       <SaveVersionDialog
         open={saveDialogOpen}
-        busy={saveMut.isPending}
+        busy={saveMut.isPending || layoutFlushMut.isPending}
+        isDirty={isDirty}
         onClose={() => setSaveDialogOpen(false)}
-        onSave={(summary) => {
+        onSave={async (mode, summary) => {
           setSaveDialogOpen(false);
-          saveMut.mutate(summary);
+          if (mode === "layout") {
+            layoutFlushMut.mutate();
+          } else {
+            // Flush pending canvas layout before snapshotting so the version
+            // captures the latest node positions (not a stale debounce state).
+            const flushFn = useBuilderStore.getState().flushCanvasLayoutNow;
+            if (flushFn) {
+              try { await flushFn(); } catch { /* non-fatal for version save */ }
+            }
+            saveMut.mutate(summary);
+          }
         }}
       />
       <ModelImportExportDialog

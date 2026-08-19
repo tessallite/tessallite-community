@@ -88,7 +88,7 @@ POSTGRES_PASSWORD=$(openssl rand -hex 24)
 CREDENTIAL_ENCRYPTION_KEY=$(python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
 JWT_SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")
 SYSTEM_ADMIN_EMAIL=admin@tessallite.local
-SYSTEM_ADMIN_PASSWORD=$(openssl rand -base64 18)
+SYSTEM_ADMIN_PASSWORD=$(openssl rand -base64 18)Aa1
 EOF
   chmod 600 "$SECRETS_ENV"
   echo "Wrote $SECRETS_ENV (chmod 600). Review it, then run: $0 install"
@@ -227,4 +227,4 @@ kind delete cluster --name tessallite-test     # clean up
 
 ---
 
-← [Deploy on GCP](deploy-gcp.md) | [Home](../index.md) | [Configure Environment Variables →](configure-environment-variables.md)
+← [Deploy on GCP](deploy-gcp.md) | [Home](../index.md) | [Create a Tenant →](create-a-tenant.md)

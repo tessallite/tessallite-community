@@ -379,6 +379,19 @@ def _s_distinct():  # shape 16
     return bq, _fact_db(dimensions=[region])
 
 
+def _s_dim_only_group_by():  # Bug-7015 regression
+    """Dimension-only GROUP BY (no measures) must preserve the GROUP BY."""
+    region = _dim("region", source_column_id="c-region")
+    bq = _bound(
+        measures=[], dimensions=[region], grain=["region"],
+        raw_query="SELECT region FROM sales GROUP BY region",
+        select_expressions=[
+            _se('region', classification="passthrough", inner_column="region"),
+        ],
+    )
+    return bq, _fact_db(dimensions=[region])
+
+
 def _s_having():  # shape 17
     region = _dim("region", source_column_id="c-region")
     amount = _meas("amount", source_column_id="c-amount")
@@ -781,6 +794,7 @@ SOURCE_SCENARIOS = {
     "count_star": (_s_count_star, ALL_DIALECTS, 4),
     "global_sum": (_s_global_sum, ALL_DIALECTS, 6),
     "distinct": (_s_distinct, ALL_DIALECTS, 16),
+    "dim_only_group_by": (_s_dim_only_group_by, ALL_DIALECTS, None),
     "having": (_s_having, ALL_DIALECTS, 17),
     "order_limit": (_s_order_limit, ALL_DIALECTS, 19),
     "filter_eq": (_s_filter_eq, ALL_DIALECTS, None),
@@ -855,6 +869,22 @@ def _check_golden(name: str, actual: str) -> None:
     )
 
 
+def _attach_deployed_shape(bq, db) -> None:
+    """Pin the FakeDB's graph rows on the BoundQuery as the deployed snapshot.
+
+    Bug-7981: a deployed model has no live-ORM graph fallback, so these render
+    fixtures must supply the same rows as the pinned deployed snapshot. The
+    golden SQL is unchanged — the identical rows now travel the production
+    deployed-snapshot path instead of the undeployed authoring path.
+    """
+    from conftest import deployed_shape_from_rows
+
+    bq.deployed_shape = deployed_shape_from_rows(
+        tables=db.tables, columns=db.columns, joins=db.joins, udas=db.udas,
+        measures=db.measures, dimensions=db.dimensions,
+    )
+
+
 def _common_assertions(sql: str, shape: str, dialect: str) -> None:
     assert isinstance(sql, str) and sql.strip()
     # Finding-1 negative invariant: the literal "(None)" must never leak.
@@ -873,6 +903,7 @@ def _common_assertions(sql: str, shape: str, dialect: str) -> None:
 async def test_render_golden_source(shape, dialect):
     """Source + passthrough + SELECT * shapes via ``rewrite_for_source``."""
     bq, db = RENDER_SCENARIOS[shape][0]()
+    _attach_deployed_shape(bq, db)
     sql = await rewrite_for_source(bq, db, target_dialect=dialect)
     _common_assertions(sql, shape, dialect)
 
@@ -883,6 +914,137 @@ def test_render_golden_aggregate(shape, dialect):
     bq, agg = AGGREGATE_SCENARIOS[shape][0]()
     sql = rewrite_for_aggregate(bq, agg, target_dialect=dialect)
     _common_assertions(sql, shape, dialect)
+
+
+# ---------------------------------------------------------------------------
+# Bug-6122 — HAVING references a SELECT alias
+# ---------------------------------------------------------------------------
+
+
+def _having_alias_bound():
+    region = _dim("region", source_column_id="c-region")
+    amount = _meas("amount", source_column_id="c-amount")
+    bq = _bound(
+        measures=[amount], dimensions=[region], grain=["region"],
+        having_raw="HAVING total > 100",
+        raw_query=("SELECT region, SUM(amount) AS total FROM sales "
+                   "GROUP BY region HAVING total > 100"),
+        select_expressions=[
+            _se('region', classification="passthrough", inner_column="region"),
+            _se('SUM(amount) AS total', classification="analytical",
+                agg_function="sum", inner_column="amount", alias="total"),
+        ],
+    )
+    return bq, _fact_db(dimensions=[region], measures=[amount])
+
+
+def _having_self_named_alias_bound():
+    # Alias equal to the measure name, referenced BOTH bare and inside SUM.
+    region = _dim("region", source_column_id="c-region")
+    amount = _meas("amount", source_column_id="c-amount")
+    bq = _bound(
+        measures=[amount], dimensions=[region], grain=["region"],
+        having_raw="HAVING amount > 100 AND SUM(amount) < 500",
+        raw_query=("SELECT region, SUM(amount) AS amount FROM sales "
+                   "GROUP BY region HAVING amount > 100 AND SUM(amount) < 500"),
+        select_expressions=[
+            _se('region', classification="passthrough", inner_column="region"),
+            _se('SUM(amount) AS amount', classification="analytical",
+                agg_function="sum", inner_column="amount", alias="amount"),
+        ],
+    )
+    return bq, _fact_db(dimensions=[region], measures=[amount])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialect", ALL_DIALECTS)
+async def test_having_alias_expands_to_aggregate(dialect):
+    """Bug-6122: a HAVING reference to a SELECT alias must render the underlying
+    aggregate, not the quoted alias (PostgreSQL / SQL Server reject aliases in
+    HAVING). The SELECT projection still carries the alias."""
+    bq, db = _having_alias_bound()
+    _attach_deployed_shape(bq, db)
+    sql = await rewrite_for_source(bq, db, target_dialect=dialect)
+    _assert_self_parses(sql, dialect)
+    having = sql.upper().split("HAVING", 1)[1]
+    assert "SUM(" in having, f"HAVING must contain the aggregate ({dialect}): {sql}"
+    # The alias identifier must not appear as a HAVING operand.
+    assert "TOTAL" not in having, (
+        f"HAVING must not reference the SELECT alias ({dialect}): {sql}"
+    )
+    # The projection keeps the alias.
+    assert "TOTAL" in sql.upper().split("HAVING", 1)[0]
+
+
+@pytest.mark.asyncio
+async def test_having_quoted_alias_with_space_expands():
+    """Bug-6122 (LOW): a quoted alias containing a space must still strip its
+    ``AS`` clause correctly so the HAVING inlines the aggregate, not a
+    malformed expression carrying a stray ``AS``."""
+    region = _dim("region", source_column_id="c-region")
+    amount = _meas("amount", source_column_id="c-amount")
+    bq = _bound(
+        measures=[amount], dimensions=[region], grain=["region"],
+        having_raw='HAVING "my total" > 100',
+        raw_query=('SELECT region, SUM(amount) AS "my total" FROM sales '
+                   'GROUP BY region HAVING "my total" > 100'),
+        select_expressions=[
+            _se('region', classification="passthrough", inner_column="region"),
+            _se('SUM(amount) AS "my total"', classification="analytical",
+                agg_function="sum", inner_column="amount", alias="my total"),
+        ],
+    )
+    db = _fact_db(dimensions=[region], measures=[amount])
+    _attach_deployed_shape(bq, db)
+    sql = await rewrite_for_source(bq, db, target_dialect="postgres")
+    _assert_self_parses(sql, "postgres")
+    having = sql.split("HAVING", 1)[1]
+    assert 'SUM("f"."amount") > 100' in having, f"alias not expanded: {sql}"
+    assert " AS " not in having.upper(), f"stray AS leaked into HAVING: {sql}"
+
+
+@pytest.mark.asyncio
+async def test_having_self_named_alias_no_double_aggregate():
+    """Bug-6122: when the alias equals the measure name, a bare HAVING
+    reference expands to SUM(col) while an explicit HAVING SUM(col) stays a
+    single SUM — never SUM(SUM(col))."""
+    bq, db = _having_self_named_alias_bound()
+    _attach_deployed_shape(bq, db)
+    sql = await rewrite_for_source(bq, db, target_dialect="postgres")
+    _assert_self_parses(sql, "postgres")
+    having = sql.split("HAVING", 1)[1]
+    assert "SUM(SUM(" not in having.upper(), f"double aggregation leaked: {sql}"
+    assert 'SUM("f"."amount") > 100' in having
+    assert 'SUM("f"."amount") < 500' in having
+
+
+@pytest.mark.asyncio
+async def test_having_self_named_alias_nested_in_arithmetic_no_double_aggregate():
+    """Bug-6122 (regression guard): a self-named alias column nested INSIDE
+    arithmetic within an aggregate (``SUM(amount * 2)``) must NOT trigger alias
+    expansion — the column has an AggFunc ancestor, so it stays a single
+    ``SUM("f"."amount" * 2)`` and never becomes ``SUM(SUM("f"."amount") * 2)``.
+    Guards against the ``node.parent``-only check that missed nested columns."""
+    region = _dim("region", source_column_id="c-region")
+    amount = _meas("amount", source_column_id="c-amount")
+    bq = _bound(
+        measures=[amount], dimensions=[region], grain=["region"],
+        having_raw="HAVING SUM(amount * 2) > 100",
+        raw_query=("SELECT region, SUM(amount) AS amount FROM sales "
+                   "GROUP BY region HAVING SUM(amount * 2) > 100"),
+        select_expressions=[
+            _se('region', classification="passthrough", inner_column="region"),
+            _se('SUM(amount) AS amount', classification="analytical",
+                agg_function="sum", inner_column="amount", alias="amount"),
+        ],
+    )
+    db = _fact_db(dimensions=[region], measures=[amount])
+    _attach_deployed_shape(bq, db)
+    sql = await rewrite_for_source(bq, db, target_dialect="postgres")
+    _assert_self_parses(sql, "postgres")
+    having = sql.split("HAVING", 1)[1]
+    assert "SUM(SUM(" not in having.upper(), f"nested double aggregation: {sql}"
+    assert 'SUM("f"."amount" * 2) > 100' in having, f"unexpected HAVING: {sql}"
 
 
 # ---------------------------------------------------------------------------
@@ -982,6 +1144,7 @@ async def test_f1_unresolved_uda_no_none_literal():
     db = _fact_db(dimensions=[cohort], measures=[amount], udas=[orphan_uda])
 
     with pytest.raises(SemanticBindingError, match="cohort") as excinfo:
+        _attach_deployed_shape(bq, db)
         await _build_source_sql(bq, db, target_dialect="postgres")
 
     # Bug-917 spirit: the diagnostic must never leak a None literal.
@@ -1012,10 +1175,89 @@ async def test_f6_passthrough_uses_input_dialect():
     )
     db = _fact_db(dimensions=[region])
 
+    _attach_deployed_shape(bq, db)
     sql = await _build_source_sql(bq, db, target_dialect="postgres")
 
     # Parsed via bigquery -> column resolved -> qualified physical reference.
     assert '"f"."region"' in sql, f"input_dialect not honored: {sql}"
+    _assert_self_parses(sql, "postgres")
+
+
+@pytest.mark.parametrize(
+    ("kind", "grain_unit"),
+    [("pct_change", "day"), ("cagr", "year")],
+)
+@pytest.mark.asyncio
+async def test_bug_8293_source_route_uses_effective_resolved_anchor(
+    kind: str,
+    grain_unit: str,
+) -> None:
+    """Bug-8293/F-01: source SQL consumes the shared effective anchor.
+
+    A deliberately divergent aggregate grain and resolved date anchor remains
+    valid on the source route, but its window must order by the resolved
+    ``ship_date``. The CTAS and admission regressions refuse this same identity
+    mismatch, proving the route split is conservative rather than silently
+    ordering the accelerated result by ``order_date``.
+
+    Test escape: source, build and admission each reimplemented anchor-field
+    precedence. Guard: this real source render plus the build/admission tests
+    consume the shared authority. Tier: T3.
+    """
+    grain_name = f"order_{grain_unit}"
+    order_dim = _dim(
+        grain_name, source_column_id="c-order-date", is_time_dim=True,
+    )
+    order_dim.time_grain = grain_unit
+    base = _meas("sales", source_column_id="c-amount")
+    variant = _meas(f"sales_{kind}")
+    variant.variant_kind = kind
+    variant.variant_of_measure_id = base.id
+    variant.variant_n = 1
+    variant.resolved_date_col_id = "c-ship-date"
+    variant.date_dimension_column_id = None
+    bound = _bound(
+        measures=[variant], dimensions=[order_dim], grain=[grain_name],
+        raw_query=(
+            f"SELECT {grain_name}, SUM({variant.name}) FROM sales "
+            f"GROUP BY {grain_name}"
+        ),
+        select_expressions=[
+            _se(
+                grain_name, classification="passthrough",
+                inner_column=grain_name,
+            ),
+            _se(
+                f"SUM({variant.name})", classification="analytical",
+                agg_function="sum", inner_column=variant.name,
+            ),
+        ],
+    )
+    fact = _tbl("t-fact", "demo.sales", "f")
+    db = FakeDB(
+        tables=[fact],
+        columns=[
+            _col("c-amount", "t-fact", "amount", data_type="numeric"),
+            _col("c-order-date", "t-fact", "order_date", data_type="date"),
+            _col("c-ship-date", "t-fact", "ship_date", data_type="date"),
+        ],
+        measures=[variant, base],
+        dimensions=[order_dim],
+    )
+    _attach_deployed_shape(bound, db)
+
+    sql = await _build_source_sql(bound, db, target_dialect="postgres")
+
+    assert 'MIN("f"."ship_date")' in sql
+    tree = sqlglot.parse_one(sql, read="postgres")
+    window_orders = [
+        window.args["order"].sql(dialect="postgres")
+        for window in tree.find_all(sqlglot.exp.Window)
+        if window.args.get("order") is not None
+    ]
+    assert window_orders
+    assert all('"f"."ship_date"' in order for order in window_orders)
+    assert all('"f"."order_date"' not in order for order in window_orders)
     _assert_self_parses(sql, "postgres")
 
 
@@ -1046,6 +1288,7 @@ async def test_f37_invalid_uda_raises():
     db = _fact_db(dimensions=[cohort], measures=[amount], udas=[bad_uda])
 
     with pytest.raises(ValueError, match="cohort_bucket"):
+        _attach_deployed_shape(bq, db)
         await _build_source_sql(bq, db, target_dialect="postgres")
 
 
@@ -1075,6 +1318,7 @@ async def test_p2_unresolved_dimension_raises():
     db = _fact_db(dimensions=[cohort], measures=[amount])
 
     with pytest.raises(SemanticBindingError, match="cohort"):
+        _attach_deployed_shape(bq, db)
         await _build_source_sql(bq, db, target_dialect="postgres")
 
 
@@ -1098,6 +1342,7 @@ async def test_p2_unresolved_measure_raises():
     db = _fact_db(dimensions=[region], measures=[score])
 
     with pytest.raises(SemanticBindingError, match="score"):
+        _attach_deployed_shape(bq, db)
         await _build_source_sql(bq, db, target_dialect="postgres")
 
 
@@ -1132,6 +1377,7 @@ async def test_f_order_by_expression_preserved_not_phantom():
     )
     db = _fact_db(dimensions=[region], measures=[amount])
 
+    _attach_deployed_shape(bq, db)
     sql = await _build_source_sql(bq, db, target_dialect="postgres")
 
     upper = sql.upper()
@@ -1166,6 +1412,7 @@ async def test_f_order_by_ratio_expression_preserved_with_limit():
     )
     db = _fact_db(dimensions=[region], measures=[amount])
 
+    _attach_deployed_shape(bq, db)
     sql = await _build_source_sql(bq, db, target_dialect="postgres")
 
     upper = sql.upper()
@@ -1220,6 +1467,7 @@ async def test_persona_star_expr_order_allowed_cols_preserves_topn():
     )
     db = _fact_db(dimensions=[region], measures=[amount])
 
+    _attach_deployed_shape(bq, db)
     sql = await _build_persona_star_sql(bq, db, "postgresql", "postgres")
 
     upper = sql.upper()
@@ -1249,6 +1497,7 @@ async def test_persona_star_expr_order_excluded_col_suppresses_limit():
     )
     db = _fact_db(dimensions=[region], measures=[amount])
 
+    _attach_deployed_shape(bq, db)
     sql = await _build_persona_star_sql(bq, db, "postgresql", "postgres")
 
     upper = sql.upper()
@@ -1276,6 +1525,7 @@ async def test_persona_star_expr_order_excluded_col_suppresses_offset():
     )
     db = _fact_db(dimensions=[region], measures=[amount])
 
+    _attach_deployed_shape(bq, db)
     sql = await _build_persona_star_sql(bq, db, "postgresql", "postgres")
 
     upper = sql.upper()
@@ -1349,6 +1599,7 @@ async def test_persona_star_where_on_joined_dim_explicit_projection():
     )
     db = _persona_star_join_db()
 
+    _attach_deployed_shape(bq, db)
     sql = await _build_persona_star_sql(bq, db, "postgresql", "postgres")
     upper = sql.upper()
 
@@ -1374,6 +1625,7 @@ async def test_persona_star_group_by_joined_dim_explicit_projection():
     )
     db = _persona_star_join_db()
 
+    _attach_deployed_shape(bq, db)
     sql = await _build_persona_star_sql(bq, db, "postgresql", "postgres")
     upper = sql.upper()
 
@@ -1398,6 +1650,7 @@ async def test_persona_star_order_by_joined_dim_explicit_projection():
     )
     db = _persona_star_join_db()
 
+    _attach_deployed_shape(bq, db)
     sql = await _build_persona_star_sql(bq, db, "postgresql", "postgres")
     upper = sql.upper()
 
@@ -1426,6 +1679,7 @@ async def test_cls_star_where_on_joined_dim_explicit_projection():
     )
     db = _persona_star_join_db()
 
+    _attach_deployed_shape(bq, db)
     sql = await _build_persona_star_sql(bq, db, "postgresql", "postgres")
     upper = sql.upper()
 
@@ -1452,6 +1706,7 @@ async def test_persona_star_where_on_unallowed_column_rejects_403():
     db = _persona_star_join_db()
 
     with pytest.raises(HTTPException) as exc:
+        _attach_deployed_shape(bq, db)
         await _build_persona_star_sql(bq, db, "postgresql", "postgres")
     assert exc.value.status_code == 403
     assert exc.value.detail["error_code"] == "COLUMN_RESTRICTED"
@@ -1473,6 +1728,7 @@ async def test_persona_star_no_projectable_column_rejects_403():
     db = _persona_star_join_db()
 
     with pytest.raises(HTTPException) as exc:
+        _attach_deployed_shape(bq, db)
         await _build_persona_star_sql(bq, db, "postgresql", "postgres")
     assert exc.value.status_code == 403
     assert exc.value.detail["error_code"] == "COLUMN_RESTRICTED"
@@ -1495,6 +1751,7 @@ async def test_non_narrowed_star_unchanged():
     assert getattr(bq, "persona_narrowed_star", False) is False
     db = _persona_star_join_db()
 
+    _attach_deployed_shape(bq, db)
     sql = await rewrite_for_source(bq, db, target_dialect="postgres")
     # The non-narrowed path keeps SELECT * (table-name substituted).
     assert "*" in sql, f"non-narrowed star unexpectedly rewritten: {sql}"

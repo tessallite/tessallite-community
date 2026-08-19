@@ -4,6 +4,12 @@ These tests exercise the consume_state function directly rather than via
 the SSO callback endpoints, verifying the atomic DELETE ... RETURNING logic,
 expiry checks, flow-type matching, browser-nonce enforcement (OIDC) vs
 intentional nonce-skip (SAML), and single-use consumption.
+
+Bug-8142: the RETURNING set now also carries ``code_verifier`` (the PKCE
+verifier), so each mock row is a 7-tuple in RETURNING column order
+(tenant_id, browser_nonce, oidc_nonce, flow_type, expires_at, request_id,
+code_verifier) and a successful consume returns a 4-tuple
+(tenant_id, oidc_nonce, request_id, code_verifier).
 """
 from __future__ import annotations
 
@@ -51,7 +57,7 @@ class TestConsumeStateExpired:
 
     @pytest.mark.asyncio
     async def test_expired_state_returns_none(self):
-        row = ("tenant-x", "stored-nonce", "oidc-nonce-val", "oidc", _past(60))
+        row = ("tenant-x", "stored-nonce", "oidc-nonce-val", "oidc", _past(60), None, "cv-1")
         gen, db = _make_db_yielding_row(row)
 
         with patch("src.auth.sso_state.get_system_db", gen):
@@ -67,7 +73,7 @@ class TestConsumeStateWrongFlowType:
 
     @pytest.mark.asyncio
     async def test_wrong_flow_type_returns_none(self):
-        row = ("tenant-x", "stored-nonce", "oidc-nonce-val", "saml", _future())
+        row = ("tenant-x", "stored-nonce", "oidc-nonce-val", "saml", _future(), None, "cv-2")
         gen, db = _make_db_yielding_row(row)
 
         with patch("src.auth.sso_state.get_system_db", gen):
@@ -82,7 +88,7 @@ class TestConsumeStateOidcNonceMismatch:
 
     @pytest.mark.asyncio
     async def test_oidc_mismatched_nonce_returns_none(self):
-        row = ("tenant-x", "correct-nonce", "oidc-nonce-val", "oidc", _future())
+        row = ("tenant-x", "correct-nonce", "oidc-nonce-val", "oidc", _future(), None, "cv-3")
         gen, _ = _make_db_yielding_row(row)
 
         with patch("src.auth.sso_state.get_system_db", gen):
@@ -97,14 +103,18 @@ class TestConsumeStateOidcNonceMatch:
 
     @pytest.mark.asyncio
     async def test_oidc_matching_nonce_succeeds(self):
-        row = ("tenant-x", "correct-nonce", "oidc-nonce-val", "oidc", _future())
+        row = (
+            "tenant-x", "correct-nonce", "oidc-nonce-val", "oidc",
+            _future(), None, "verifier-abc",
+        )
         gen, _ = _make_db_yielding_row(row)
 
         with patch("src.auth.sso_state.get_system_db", gen):
             from src.auth.sso_state import consume_state
             result = await consume_state("some-state", "oidc", "correct-nonce")
 
-        assert result == ("tenant-x", "oidc-nonce-val")
+        # Bug-8142: the persisted PKCE verifier is surfaced to the OIDC callback.
+        assert result == ("tenant-x", "oidc-nonce-val", None, "verifier-abc")
 
 
 class TestConsumeStateSamlNonceSkip:
@@ -118,25 +128,28 @@ class TestConsumeStateSamlNonceSkip:
 
     @pytest.mark.asyncio
     async def test_saml_absent_nonce_succeeds(self):
-        row = ("tenant-y", "stored-nonce", None, "saml", _future())
+        row = ("tenant-y", "stored-nonce", None, "saml", _future(), "req-abc", None)
         gen, _ = _make_db_yielding_row(row)
 
         with patch("src.auth.sso_state.get_system_db", gen):
             from src.auth.sso_state import consume_state
             result = await consume_state("some-state", "saml", None)
 
-        assert result == ("tenant-y", None)
+        # F-021-03: SAML flows carry the persisted AuthnRequest ID back so the
+        # ACS can enforce InResponseTo. Bug-8142: SAML rows carry no PKCE
+        # verifier (None), which the ACS ignores.
+        assert result == ("tenant-y", None, "req-abc", None)
 
     @pytest.mark.asyncio
     async def test_saml_mismatched_nonce_succeeds(self):
-        row = ("tenant-y", "stored-nonce", None, "saml", _future())
+        row = ("tenant-y", "stored-nonce", None, "saml", _future(), "req-xyz", None)
         gen, _ = _make_db_yielding_row(row)
 
         with patch("src.auth.sso_state.get_system_db", gen):
             from src.auth.sso_state import consume_state
             result = await consume_state("some-state", "saml", "totally-wrong")
 
-        assert result == ("tenant-y", None)
+        assert result == ("tenant-y", None, "req-xyz", None)
 
 
 class TestConsumeStateDoubleConsume:
@@ -149,7 +162,7 @@ class TestConsumeStateDoubleConsume:
     @pytest.mark.asyncio
     async def test_second_consume_returns_none(self):
         # First call returns the row
-        row = ("tenant-z", "nonce", "oidc-nonce", "oidc", _future())
+        row = ("tenant-z", "nonce", "oidc-nonce", "oidc", _future(), None, "verifier-z")
         first_result = MagicMock()
         first_result.first.return_value = row
         # Second call returns None (row already deleted)
@@ -173,6 +186,39 @@ class TestConsumeStateDoubleConsume:
             first = await consume_state("the-state", "oidc", "nonce")
             second = await consume_state("the-state", "oidc", "nonce")
 
-        assert first == ("tenant-z", "oidc-nonce")
+        assert first == ("tenant-z", "oidc-nonce", None, "verifier-z")
         assert second is None
         assert db.execute.await_count == 2
+
+
+class TestCreateStatePkceVerifier:
+    """Bug-8142: create_state generates and persists a PKCE code_verifier and
+    returns it as the 4th tuple element."""
+
+    @pytest.mark.asyncio
+    async def test_create_state_returns_and_persists_verifier(self):
+        added = {}
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=MagicMock())
+
+        def _add(obj):
+            added["row"] = obj
+
+        db.add = MagicMock(side_effect=_add)
+        db.commit = AsyncMock()
+
+        async def _gen():
+            yield db
+
+        with patch("src.auth.sso_state.get_system_db", _gen):
+            from src.auth.sso_state import create_state
+            state, nonce, oidc_nonce, code_verifier = await create_state(
+                "acme", "oidc",
+            )
+
+        # RFC 7636 §4.1: 43-128 chars of the unreserved set.
+        assert 43 <= len(code_verifier) <= 128
+        # The returned verifier is exactly what was persisted on the row.
+        assert added["row"].code_verifier == code_verifier
+        # Distinct high-entropy values, not aliased to the nonces.
+        assert len({nonce, oidc_nonce, code_verifier}) == 3

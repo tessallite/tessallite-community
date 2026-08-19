@@ -192,21 +192,39 @@ TIME_VARIANT_DEFAULT_TRAILING_N = 12
 TIME_VARIANT_DEFAULT_MOVING_AVG_N = 30
 
 
+# Bug-6222 (F-015-27): variant families that cumulate or window-aggregate
+# the base value.  These are semantically incorrect for semi-additive
+# measures (e.g. last_non_empty balances) because they sum per-period
+# balances instead of carrying the period-end balance forward.  Shared
+# constant so both the catalog gate (admissible_variant_kinds) and the
+# execution guard (source_sql.py) use the same set.
+SEMI_ADDITIVE_INELIGIBLE_FAMILIES: frozenset[str] = frozenset({
+    "period_to_date",   # ytd, qtd, mtd, wtd, ytd_prior_year
+    "moving_window",    # trailing_n, moving_avg_n
+})
+
+
 def admissible_variant_kinds(
     *,
     level_units: frozenset[str] | set[str],
     level_calcs: frozenset[str] | set[str],
     has_calendar_rules: bool = False,
     calendar_bound: bool | None = None,
+    semi_additive_behavior: str | None = None,
 ) -> list[str]:
     """Variant kinds admissible for a base measure under these capabilities.
 
     ``has_calendar_rules`` is True when the associated time hierarchy carries a
     calendar_type (NULL treated as 'standard').  Period-boundary variants
-    (YTD, QTD, prior_year, …) require this flag.
+    (YTD, QTD, prior_year, ...) require this flag.
 
     ``calendar_bound`` is the legacy alias kept for backward compatibility;
     when passed, it overrides ``has_calendar_rules``.
+
+    ``semi_additive_behavior`` (Bug-6222): when set, cumulation and
+    moving-window families are excluded because semi-additive measures
+    represent balances, not flows -- cumulating them produces incorrect
+    results.
     """
     if calendar_bound is not None:
         has_calendar_rules = calendar_bound
@@ -225,8 +243,28 @@ def admissible_variant_kinds(
             continue
         if variant in TIME_VARIANTS_NEEDING_CALENDAR and not has_calendar_rules:
             continue
+        # Bug-6222: reject cumulation/window variants for semi-additive measures.
+        if semi_additive_behavior and family in SEMI_ADDITIVE_INELIGIBLE_FAMILIES:
+            continue
         out.append(variant)
     return out
+
+
+# Window-family kinds (family ``lag`` or ``moving_window``). These operate
+# on the fact's own date column and need NEITHER a hierarchy NOR a calendar.
+# Their date anchor is the modeller-selected ``date_dimension_column_id``
+# (F-015-01), not the hierarchy-derived ``resolved_date_col_id``. Their
+# creation eligibility requires only a validated date column (F-015-02).
+WINDOW_VARIANT_FAMILIES: frozenset[str] = frozenset({"lag", "moving_window"})
+
+
+def is_window_variant(kind: str | None) -> bool:
+    """True when ``kind`` is a pure-window variant (lag / trailing_n /
+    moving_avg_n and their aliases). Window variants order by the fact's own
+    ``date_dimension_column_id`` and require no hierarchy or calendar."""
+    if kind is None:
+        return False
+    return TIME_VARIANT_FAMILY.get(kind) in WINDOW_VARIANT_FAMILIES
 
 
 # Variants that need a bound calendar table to resolve period boundaries.

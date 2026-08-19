@@ -110,6 +110,7 @@
   "publicGlossary.downloadPdf": "Télécharger au format PDF",
   "publicGlossary.entryCount": "{{visible}} sur {{total}} entrées",
   "publicGlossary.invalidLink": "Ce lien de partage est invalide ou a expiré. Demandez au propriétaire du modèle d'en générer un nouveau.",
+  "publicGlossary.loadError": "Le glossaire n'a pas pu être chargé. Veuillez réessayer plus tard ou contacter le propriétaire du modèle.",
   "publicGlossary.noResults": "Aucune entrée de glossaire ne correspond à votre recherche.",
   "publicGlossary.overline": "Glossaire Tessallite",
   "publicGlossary.searchPlaceholder": "Rechercher des termes, des définitions, des synonymes…",

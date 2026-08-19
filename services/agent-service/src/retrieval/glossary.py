@@ -2,7 +2,18 @@
 
 Token-overlap baseline (no vector store). For each allow-listed model we
 pull GlossaryEntry rows, score against the user question + conversation
-history, and return top K=20.
+history, and return matches with score > 0 (Bug-7931 — no zero-score
+padding; irrelevant cards are distractors, not context).
+
+The prompt assembler chooses between three glossary modes based on an
+attention budget (spec 3.4): the FULL glossary in the stable cacheable
+prefix when it fits, a compact TERM INDEX (always-on) plus score>0
+retrieved cards otherwise, or retrieval-only above the index budget. This
+module supplies the primitives — ``list_glossary_cards`` (full,
+deterministic order, the single DB load), plus the pure derivations
+``term_index_from_cards`` and ``score_cards`` (and the
+``retrieve_glossary_cards`` convenience wrapper) — and leaves the
+policy to the assembler.
 
 list_model_attributes() filters hidden columns at both the direct
 source_column_id level and transitively through UDA column_refs, so
@@ -25,6 +36,7 @@ from shared.db.models import (
     GlossaryEntry,
     GlossarySynonym,
     Measure,
+    Model,
     ModelAliasMap,
     ModelColumn,
     ModelTable,
@@ -44,6 +56,21 @@ class GlossaryCard:
     definition: str
     synonyms: list[str]
     sample_values: list[str] | None = None
+    # Bug-7931 rendering detail — carry the model slug so the assembler can
+    # prefix cards with the stable slug instead of the volatile UUID (which
+    # also makes the full-glossary prefix human-legible and cache-stable).
+    model_slug: str | None = None
+
+
+@dataclass
+class GlossaryTermIndexEntry:
+    """One line of the always-on compact term index (two-tier mode): the term,
+    its synonyms, and the model slug it belongs to. Definitions are NOT
+    included — the full card is retrieved on demand when relevant."""
+    model_id: UUID
+    model_slug: str | None
+    term: str
+    synonyms: list[str]
 
 
 @dataclass
@@ -62,22 +89,14 @@ def _score(query_tokens: set[str], entry_tokens: set[str]) -> int:
     return len(query_tokens & entry_tokens)
 
 
-async def retrieve_glossary_cards(
+async def _load_admissible_entries(
     db: AsyncSession,
-    model_ids: Iterable[UUID],
-    user_message: str,
-    conversation_context: str = "",
-    top_k: int = _TOP_K,
-) -> list[GlossaryCard]:
-    """Pull all glossary entries for the given models, rank by token overlap,
-    return top-K. Synonyms count toward the term's token bag."""
-
-    model_ids = list(model_ids)
-    if not model_ids:
-        return []
-
-    qtokens = _tokens(user_message) | _tokens(conversation_context)
-
+    model_ids: list[UUID],
+) -> tuple[list[GlossaryEntry], dict[UUID, list[str]], dict[UUID, str | None]]:
+    """Fetch approved, visible, medium/high-confidence glossary entries for the
+    given models, their synonyms, and a model_id -> slug map. Shared by the
+    full-glossary, term-index, and retrieval primitives so they all draw from
+    exactly the same admissible set."""
     entries_q = await db.execute(
         select(GlossaryEntry).where(
             GlossaryEntry.model_id.in_(model_ids),
@@ -90,7 +109,7 @@ async def retrieve_glossary_cards(
     )
     entries: list[GlossaryEntry] = list(entries_q.scalars().all())
     if not entries:
-        return []
+        return [], {}, {}
 
     syn_q = await db.execute(
         select(GlossarySynonym).where(
@@ -100,30 +119,124 @@ async def retrieve_glossary_cards(
     syn_by_entry: dict[UUID, list[str]] = {}
     for syn in syn_q.scalars().all():
         syn_by_entry.setdefault(syn.entry_id, []).append(syn.synonym)
+    for syns in syn_by_entry.values():
+        syns.sort()
 
-    scored: list[tuple[int, GlossaryEntry, list[str]]] = []
-    for e in entries:
-        synonyms = syn_by_entry.get(e.id, [])
-        bag = _tokens(e.term) | _tokens(e.definition) | _tokens(" ".join(synonyms))
-        if e.sample_values:
-            bag |= _tokens(" ".join(str(v) for v in e.sample_values))
-        scored.append((_score(qtokens, bag), e, synonyms))
+    slug_q = await db.execute(
+        select(Model.id, Model.slug).where(Model.id.in_(model_ids))
+    )
+    slug_by_model: dict[UUID, str | None] = {
+        mid: slug for mid, slug in slug_q.all()
+    }
+    return entries, syn_by_entry, slug_by_model
 
-    # Always include items with score>0; if too few, pad with highest-scoring zero-score
-    # entries up to top_k so the LLM still sees the shape of the model.
-    scored.sort(key=lambda t: (-t[0], t[1].term.lower()))
-    selected = scored[:top_k]
 
+def _card_token_bag(c: GlossaryCard) -> set[str]:
+    bag = (
+        _tokens(c.term)
+        | _tokens(c.definition)
+        | _tokens(" ".join(c.synonyms))
+    )
+    if c.sample_values:
+        bag |= _tokens(" ".join(str(v) for v in c.sample_values))
+    return bag
+
+
+def score_cards(
+    cards: list[GlossaryCard],
+    user_message: str,
+    conversation_context: str = "",
+    top_k: int = _TOP_K,
+) -> list[GlossaryCard]:
+    """Rank already-loaded cards by token overlap with the question (+ recent
+    history) and return ONLY cards with a positive score (Bug-7931 — no
+    zero-score padding), capped at ``top_k``. Pure function so the assembler's
+    budget policy can derive retrieval from a single glossary load."""
+    qtokens = _tokens(user_message) | _tokens(conversation_context)
+    scored = [
+        (_score(qtokens, _card_token_bag(c)), c)
+        for c in cards
+    ]
+    # Bug-7931 — drop zero-score cards entirely. A zero-overlap card is a
+    # candidate wrong term-resolution (distractor), not useful shape context;
+    # the always-on full glossary / term index (assembler policy) is the
+    # correct way to expose model shape.
+    positive = [(s, c) for s, c in scored if s > 0]
+    positive.sort(key=lambda t: (-t[0], t[1].term.lower()))
+    return [c for _s, c in positive[:top_k]]
+
+
+def term_index_from_cards(
+    cards: list[GlossaryCard],
+) -> list[GlossaryTermIndexEntry]:
+    """Derive the compact always-on term index (term + synonyms, no
+    definitions) from already-loaded cards (two-tier mode, spec 3.4.2): the
+    planner always knows THAT a term exists and what it maps to; full cards are
+    retrieved by relevance into the per-turn suffix. Order follows the cards'
+    (already deterministic) order."""
+    return [
+        GlossaryTermIndexEntry(
+            model_id=c.model_id,
+            model_slug=c.model_slug,
+            term=c.term,
+            synonyms=c.synonyms,
+        )
+        for c in cards
+    ]
+
+
+async def list_glossary_cards(
+    db: AsyncSession,
+    model_ids: Iterable[UUID],
+) -> list[GlossaryCard]:
+    """Return EVERY admissible glossary card for the given models in a
+    deterministic order (by model slug, then term, then entry id). Used for the
+    full-glossary-in-the-cacheable-prefix mode (spec 3.4.1): byte-stable across
+    turns so the stable prefix stays cache-eligible until the glossary is
+    edited. The entry-id tiebreaker matters — terms are not unique per model
+    (case variants / duplicates), and without it the order would fall back to
+    nondeterministic DB scan order, silently breaking the stable prefix."""
+    model_ids = list(model_ids)
+    if not model_ids:
+        return []
+    entries, syn_by_entry, slug_by_model = await _load_admissible_entries(
+        db, model_ids
+    )
+    entries.sort(
+        key=lambda e: (
+            slug_by_model.get(e.model_id) or str(e.model_id),
+            e.term.lower(),
+            str(e.id),
+        )
+    )
     return [
         GlossaryCard(
             model_id=e.model_id,
             term=e.term,
             definition=e.definition,
-            synonyms=syns,
+            synonyms=syn_by_entry.get(e.id, []),
             sample_values=e.sample_values,
+            model_slug=slug_by_model.get(e.model_id),
         )
-        for _score, e, syns in selected
+        for e in entries
     ]
+
+
+async def retrieve_glossary_cards(
+    db: AsyncSession,
+    model_ids: Iterable[UUID],
+    user_message: str,
+    conversation_context: str = "",
+    top_k: int = _TOP_K,
+) -> list[GlossaryCard]:
+    """Load admissible glossary cards and rank them by relevance — thin wrapper
+    over ``list_glossary_cards`` + ``score_cards`` for callers that want
+    retrieval in one call."""
+    model_ids = list(model_ids)
+    if not model_ids:
+        return []
+    cards = await list_glossary_cards(db, model_ids)
+    return score_cards(cards, user_message, conversation_context, top_k)
 
 
 async def retrieve_alias_maps(
@@ -133,8 +246,13 @@ async def retrieve_alias_maps(
     model_ids = list(model_ids)
     if not model_ids:
         return []
+    # Deterministic order (cache-prefix byte-stability): the alias-map blocks
+    # render into the stable GROUNDING system section, so an unordered read
+    # would reshuffle them between calls and break the cacheable prefix.
     q = await db.execute(
-        select(ModelAliasMap).where(ModelAliasMap.model_id.in_(model_ids))
+        select(ModelAliasMap)
+        .where(ModelAliasMap.model_id.in_(model_ids))
+        .order_by(ModelAliasMap.model_id)
     )
     out: list[AliasMapBlock] = []
     for row in q.scalars().all():

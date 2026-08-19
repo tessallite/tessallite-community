@@ -1,14 +1,21 @@
 /**
- * KPI DSL function catalog -- metadata for all 21 supported functions.
+ * KPI DSL function catalog -- metadata for all supported functions.
  *
  * Used by the function picker sidebar and autocomplete provider.
  * Pure data, no React imports.
+ *
+ * Bug-7243: this catalog is the consumer of the backend FUNCTION_REGISTRY
+ * (shared/semantic/kpi_expression.py). Every function the backend registers via
+ * _reg(...) must appear here or the advanced picker hides it from users. Keep the
+ * two in lockstep — functionCatalog.test.ts pins the full name set.
  */
 
 export type DslFunctionCategory =
   | "references"
   | "safe_division"
   | "arithmetic"
+  | "aggregation"
+  | "analytics"
   | "conditional"
   | "period_comparison"
   | "accumulation"
@@ -35,6 +42,8 @@ export const CATEGORY_ORDER: DslFunctionCategory[] = [
   "references",
   "safe_division",
   "arithmetic",
+  "aggregation",
+  "analytics",
   "conditional",
   "period_comparison",
   "accumulation",
@@ -45,6 +54,8 @@ export const CATEGORY_LABELS: Record<DslFunctionCategory, { key: string; fallbac
   references:        { key: "kpis.formula.categoryReferences",       fallback: "References" },
   safe_division:     { key: "kpis.formula.categorySafeDivision",     fallback: "Safe Division" },
   arithmetic:        { key: "kpis.formula.categoryArithmetic",       fallback: "Arithmetic" },
+  aggregation:       { key: "kpis.formula.categoryAggregation",      fallback: "Aggregation" },
+  analytics:         { key: "kpis.formula.categoryAnalytics",        fallback: "Analytics" },
   conditional:       { key: "kpis.formula.categoryConditional",      fallback: "Conditional" },
   period_comparison: { key: "kpis.formula.categoryPeriodComparison", fallback: "Period Comparison" },
   accumulation:      { key: "kpis.formula.categoryAccumulation",     fallback: "Accumulation" },
@@ -82,6 +93,16 @@ export const DSL_FUNCTIONS: DslFunctionDef[] = [
     parameters: [{ name: "value", type: "number", description: "Numeric constant" }],
     example: "literal(100)  ->  100",
     insertSnippet: "literal($1)",
+  },
+  {
+    name: "dimension",
+    category: "references",
+    signature: "dimension(name)",
+    descriptionKey: "kpis.formula.fn.dimension.desc",
+    descriptionFallback: "Reference a dimension attribute from the model by name.",
+    parameters: [{ name: "name", type: "string", description: "Dimension name" }],
+    example: 'dimension("Region")  ->  the Region dimension attribute',
+    insertSnippet: 'dimension("$1")',
   },
 
   // --- Safe Division ---
@@ -190,6 +211,98 @@ export const DSL_FUNCTIONS: DslFunctionDef[] = [
     insertSnippet: "coalesce($1, $2)",
   },
 
+  // --- Aggregation ---
+  {
+    name: "sum",
+    category: "aggregation",
+    signature: "sum(expression)",
+    descriptionKey: "kpis.formula.fn.sum.desc",
+    descriptionFallback: "Sum the expression across the current grouping.",
+    parameters: [{ name: "expression", type: "expression", description: "Value to sum" }],
+    example: 'sum(measure("Revenue"))  ->  total Revenue',
+    insertSnippet: "sum($1)",
+  },
+  {
+    name: "avg",
+    category: "aggregation",
+    signature: "avg(expression)",
+    descriptionKey: "kpis.formula.fn.avg.desc",
+    descriptionFallback: "Average the expression across the current grouping.",
+    parameters: [{ name: "expression", type: "expression", description: "Value to average" }],
+    example: 'avg(measure("Order Value"))  ->  average order value',
+    insertSnippet: "avg($1)",
+  },
+  {
+    name: "min",
+    category: "aggregation",
+    signature: "min(expression)",
+    descriptionKey: "kpis.formula.fn.min.desc",
+    descriptionFallback: "Smallest value of the expression across the current grouping.",
+    parameters: [{ name: "expression", type: "expression", description: "Value to reduce" }],
+    example: 'min(measure("Price"))  ->  lowest price',
+    insertSnippet: "min($1)",
+  },
+  {
+    name: "max",
+    category: "aggregation",
+    signature: "max(expression)",
+    descriptionKey: "kpis.formula.fn.max.desc",
+    descriptionFallback: "Largest value of the expression across the current grouping.",
+    parameters: [{ name: "expression", type: "expression", description: "Value to reduce" }],
+    example: 'max(measure("Price"))  ->  highest price',
+    insertSnippet: "max($1)",
+  },
+  {
+    name: "count",
+    category: "aggregation",
+    signature: "count(expression?)",
+    descriptionKey: "kpis.formula.fn.count.desc",
+    descriptionFallback: "Count rows, or non-blank values of the optional expression.",
+    parameters: [
+      { name: "expression", type: "expression", description: "Optional value to count" },
+    ],
+    example: 'count(measure("Orders"))  ->  number of orders',
+    insertSnippet: "count($1)",
+  },
+  {
+    name: "count_distinct",
+    category: "aggregation",
+    signature: "count_distinct(expression)",
+    descriptionKey: "kpis.formula.fn.count_distinct.desc",
+    descriptionFallback: "Count the distinct values of the expression.",
+    parameters: [
+      { name: "expression", type: "expression", description: "Value to count distinctly" },
+    ],
+    example: 'count_distinct(dimension("Customer"))  ->  unique customers',
+    insertSnippet: "count_distinct($1)",
+  },
+
+  // --- Analytics ---
+  {
+    name: "share_of_total",
+    category: "analytics",
+    signature: "share_of_total(expression)",
+    descriptionKey: "kpis.formula.fn.share_of_total.desc",
+    descriptionFallback: "The expression's share of the overall total (0-1).",
+    parameters: [
+      { name: "expression", type: "expression", description: "Value to compare to the total" },
+    ],
+    example: 'share_of_total(measure("Revenue"))  ->  0.18  (18% of total Revenue)',
+    insertSnippet: "share_of_total($1)",
+  },
+  {
+    name: "rank_over",
+    category: "analytics",
+    signature: "rank_over(expression)",
+    descriptionKey: "kpis.formula.fn.rank_over.desc",
+    descriptionFallback: "Rank of the expression within the current grouping (1 = highest).",
+    parameters: [
+      { name: "expression", type: "expression", description: "Value to rank" },
+    ],
+    example: 'rank_over(measure("Revenue"))  ->  1, 2, 3 ...',
+    insertSnippet: "rank_over($1)",
+  },
+
   // --- Conditional ---
   {
     name: "if_then_else",
@@ -204,6 +317,24 @@ export const DSL_FUNCTIONS: DslFunctionDef[] = [
     ],
     example: 'if_then_else(measure("X") > literal(0), measure("X"), literal(0))',
     insertSnippet: "if_then_else($1 > $2, $3, $4)",
+  },
+  {
+    name: "sla_condition",
+    category: "conditional",
+    signature: 'sla_condition(value, comparator, threshold, then_value, else_value)',
+    descriptionKey: "kpis.formula.fn.sla_condition.desc",
+    descriptionFallback:
+      "Compare a value against a threshold with an explicit comparator and return one of two values (used for SLA pass/fail scoring).",
+    parameters: [
+      { name: "value", type: "expression", description: "Value to test" },
+      { name: "comparator", type: "string", description: 'Comparator: ">=", "<=", ">", "<", "==", "!="' },
+      { name: "threshold", type: "expression", description: "Threshold to compare against" },
+      { name: "then_value", type: "expression", description: "Value when the comparison holds" },
+      { name: "else_value", type: "expression", description: "Value when it does not" },
+    ],
+    example:
+      'sla_condition(measure("Uptime"), ">=", literal(0.99), literal(1), literal(0))',
+    insertSnippet: 'sla_condition($1, "$2", $3, $4, $5)',
   },
 
   // --- Period Comparison ---

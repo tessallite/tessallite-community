@@ -10,7 +10,10 @@ from src.exec.query import (
     _trim_overfetch,
 )
 from src.tools.spec import QueryToolCall
-from src.narrate.narrate import _build_narrate_prompt
+from src.narrate.narrate import (
+    _build_compound_narrate_prompt,
+    _build_narrate_prompt,
+)
 
 
 def _call(dimensions, limit=100, sort=None, explicit=False):
@@ -176,6 +179,159 @@ def test_date_range_uses_full_result_not_sample():
     assert "2025-06-15" in prompt
 
 
+# ---------------------------------------------------------------------------
+# R10 — narrator truncation alignment: when the narration sample is capped
+# below the full result row count, the truncation disclosure guard must fire
+# even when execution.truncated is False (the DB did not hit its row cap).
+# ---------------------------------------------------------------------------
+
+def test_narrator_truncation_fires_when_sample_capped_below_full_result():
+    """R10 — 100 rows returned, narrator sees 25, execution.truncated=False.
+    The COMPLETE result is available to the user; only the narration prompt is
+    capped. The disclosure must (a) tell the narrator it sees a subset, (b)
+    forbid presenting sample-derived aggregates as exact, and (c) NOT falsely
+    claim the result was limited by a row cap (that wording is reserved for
+    real execution truncation, where rows beyond the cap do not exist)."""
+    rows = [{"country": f"c{i}", "amount": i} for i in range(100)]
+    execution = _execution(rows, ["country", "amount"], rows_returned=100, truncated=False)
+    _, prompt = _build_narrate_prompt("sys", "show data", execution)
+    lower = prompt.lower()
+    # (a) narrator is told it sees a subset — "first N of M" + "showing N of M"
+    assert "showing 25 of 100" in prompt
+    assert "first 25 of 100" in lower
+    # (b) the load-bearing aggregate prohibition — a reworded guard that drops
+    # the explicit sum/avg/max/min/count ban must fail here, not just lose a
+    # generic keyword.
+    assert (
+        "never present any total, sum, average, maximum, minimum, or count"
+        in lower
+    )
+    assert "exact" in lower
+    # (c) must NOT claim a row cap / truncation — the full result IS present
+    assert "row cap" not in lower
+    assert "do not claim the data was truncated" in lower
+
+
+def test_sampled_trend_does_not_command_absolute_extremes():
+    """R10 — for a SAMPLED trend (complete result, narrator sees 25 of 40
+    dated rows) the trend-summary rules must not order the narrator to state
+    'the absolute lowest and highest values' from rows it cannot see; the
+    qualified variant scopes extremes to the rows shown."""
+    rows = [{"business_date": f"2025-05-{d:02d}", "amount": d} for d in range(1, 26)]
+    rows += [{"business_date": f"2025-06-{d:02d}", "amount": d} for d in range(1, 16)]
+    execution = _execution(rows, ["business_date", "amount"], rows_returned=40, truncated=False)
+    _, prompt = _build_narrate_prompt("sys", "trend?", execution)
+    lower = prompt.lower()
+    # Sampled variant present, plain absolute-extremes command absent.
+    assert "among the rows shown" in lower
+    assert "the absolute lowest and highest values" not in lower
+    assert "never call them the absolute peak or valley" in lower
+
+
+def test_truncated_trend_with_full_sample_keeps_plain_trend_rules():
+    """Execution-truncated trend where the narrator sees EVERY materialized
+    row (25 rows, all shown): the plain trend rules are safe — extremes over
+    the shown rows ARE the extremes of the returned rows — and partiality
+    beyond the cap is disclosed by the row-cap guard."""
+    rows = [{"business_date": f"2025-05-{d:02d}", "amount": d} for d in range(1, 26)]
+    execution = _execution(rows, ["business_date", "amount"], rows_returned=25, truncated=True)
+    _, prompt = _build_narrate_prompt("sys", "trend?", execution)
+    lower = prompt.lower()
+    assert "row cap" in lower
+    assert "among the rows shown" not in lower
+    # No sample-scoped ban needed: the narrator sees all returned rows.
+    assert "read from the rows shown to you" not in lower
+
+
+def test_truncated_and_sample_capped_trend_scopes_extremes_to_shown_rows():
+    """Combined case on a trend — 100 materialized truncated rows, narrator
+    sees 25. Rows 26..100 exist and reach the user, so the trend rules must
+    scope extremes to the rows shown (sampled variant), never command
+    'the absolute lowest and highest values', and the shown-rows readings ban
+    must fire alongside the row-cap guard."""
+    rows = [{"business_date": f"2025-{(d // 28) + 1:02d}-{(d % 28) + 1:02d}", "amount": d}
+            for d in range(100)]
+    execution = _execution(rows, ["business_date", "amount"], rows_returned=100, truncated=True)
+    _, prompt = _build_narrate_prompt("sys", "trend?", execution)
+    lower = prompt.lower()
+    assert "row cap" in lower
+    assert "among the rows shown" in lower
+    assert "the absolute lowest and highest values" not in lower
+    assert "read from the rows shown to you" in lower
+    # The complete-result claims must not appear in the truncated case.
+    assert "complete result" not in lower
+    assert "do not claim the data was truncated" not in lower
+
+
+def test_sampled_guard_fires_when_rows_returned_exceeds_materialized_rows():
+    """R10 divergence guard — today rows_returned == len(rows) at the single
+    QueryExecution construction site, but the disclosure logic must not
+    silently trust that invariant. If a future producer pre-caps the rows
+    list while reporting a larger rows_returned, the sampled disclosure must
+    still fire (using the larger figure) rather than fall into an unguarded
+    'summarise the sample' path."""
+    rows = [{"country": f"c{i}", "amount": i} for i in range(30)]
+    execution = _execution(rows, ["country", "amount"], rows_returned=60, truncated=False)
+    _, prompt = _build_narrate_prompt("sys", "show data", execution)
+    lower = prompt.lower()
+    assert "showing 25 of 60" in prompt
+    assert "first 25 of 60" in lower
+    assert "do not claim the data was truncated" in lower
+    assert "all shown" not in lower
+
+
+def test_narrator_sampling_guard_fires_at_26_row_boundary():
+    """R10 boundary — one row past the 25-row narration cap is the smallest
+    sampled case. An off-by-one regression (e.g. ``showing + 1 < full``)
+    would disable the guard exactly here while the 10-row and 100-row tests
+    stay green."""
+    rows = [{"country": f"c{i}", "amount": i} for i in range(26)]
+    execution = _execution(rows, ["country", "amount"], rows_returned=26, truncated=False)
+    _, prompt = _build_narrate_prompt("sys", "show data", execution)
+    lower = prompt.lower()
+    assert "showing 25 of 26" in prompt
+    assert "first 25 of 26" in lower
+    assert "do not claim the data was truncated" in lower
+    assert "all shown" not in lower
+
+
+def test_narrator_truncation_not_fired_when_all_rows_fit_in_sample():
+    """When all rows fit in the narration sample and execution is not truncated,
+    no truncation guard should fire."""
+    rows = [{"country": f"c{i}", "amount": i} for i in range(10)]
+    execution = _execution(rows, ["country", "amount"], rows_returned=10, truncated=False)
+    _, prompt = _build_narrate_prompt("sys", "show data", execution)
+    assert "all shown" in prompt.lower()
+    # No truncation guard
+    assert "partial" not in prompt.lower()
+
+
+def test_narrator_truncation_combines_with_execution_truncation():
+    """Combined case — execution.truncated=True AND the narrator sees fewer
+    rows than were materialized (25 of 100). The DB caps (100/1000) sit far
+    above the 25-row narration cap, so rows 26..100 DO exist and DO reach the
+    user. The prompt must carry BOTH the row-cap disclosure and a shown-rows
+    readings ban (_GUARD_TRUNCATED_SAMPLED), but NOT the complete-result
+    sampled guard (its "do not claim the data was truncated" wording would
+    contradict the row-cap disclosure)."""
+    rows = [{"country": f"c{i}", "amount": i} for i in range(100)]
+    execution = _execution(rows, ["country", "amount"], rows_returned=100, truncated=True)
+    _, prompt = _build_narrate_prompt("sys", "show data", execution)
+    lower = prompt.lower()
+    # DB row cap disclosure fires
+    assert "row cap" in lower
+    # Narrator sample count still stated
+    assert "showing 25 of 100" in prompt
+    # The addendum: shown-row readings must not be presented as extremes of
+    # the returned rows (which extend to the cap and ARE user-visible).
+    assert "first 25 of the 100 returned rows" in lower
+    assert "read from the rows shown to you" in lower
+    assert "the returned rows extend beyond those you can see" in lower
+    # The complete-result sampled guard must NOT fire (no contradiction)
+    assert "do not claim the data was truncated" not in lower
+    assert "complete result" not in lower
+
+
 def test_shape_facts_are_included_in_direct_narration_prompt():
     execution = _execution(
         [{"period": "2026-01", "amount": 10}, {"period": "2026-02", "amount": 20}],
@@ -198,3 +354,187 @@ def test_shape_facts_are_included_in_direct_narration_prompt():
     assert "Deterministic shape facts for narration" in prompt
     assert "series ends early" in prompt
     assert "missing_monthly_periods" in prompt
+
+
+# ---------------------------------------------------------------------------
+# R10 (compound scope — Lane D review add) — the multi-row compound narrator
+# view (computed.result_rows) is capped at 25 while the full per-dimension
+# result reaches the user via the compound table/chart. When the true row count
+# exceeds the shown count the narrator must be told it sees a sample and must
+# not present a shown-row extreme as the overall extreme.
+# ---------------------------------------------------------------------------
+
+def _compound_computed(shown_rows, total, columns=("dim", "val")):
+    return {
+        "expression": {"const": 1},
+        "label": "share (%)",
+        "value": None,
+        "is_multi_row": True,
+        "result_rows": [
+            {columns[0]: f"d{i}", columns[1]: i} for i in range(shown_rows)
+        ],
+        "result_columns": list(columns),
+        "result_total_rows": total,
+    }
+
+
+def test_compound_multirow_sampled_discloses_and_scopes_extremes():
+    """40 per-dimension result rows computed, narrator sees 25. Disclosure must
+    fire and the extreme instruction must scope to the rows shown."""
+    computed = _compound_computed(shown_rows=25, total=40)
+    _, prompt = _build_compound_narrate_prompt("sys", "share by country?", [], computed)
+    lower = prompt.lower()
+    # narrator-sampled guard fired (reused Lane D machinery, not forked wording):
+    # the guard discloses the true total ("first N of M rows") and the data block
+    # states the real size vs the shown sample.
+    assert "first 25 of 40" in lower
+    assert "contains 40 rows" in lower
+    assert "only the first 25" in lower
+    assert (
+        "never present any total, sum, average, maximum, minimum, or count"
+        in lower
+    )
+    # extremes scoped to the shown rows, never the overall highest/lowest
+    assert "among the rows shown" in lower
+    # not a truncation claim — the full result IS delivered to the user
+    assert "row cap" not in lower
+    assert "do not claim the data was truncated" in lower
+
+
+def test_compound_multirow_not_capped_keeps_plain_extreme_instruction():
+    """25 result rows, narrator sees all 25 — no sampling. The plain 'highlight
+    the highest and lowest' instruction is safe and no sampled guard fires."""
+    computed = _compound_computed(shown_rows=25, total=25)
+    _, prompt = _build_compound_narrate_prompt("sys", "share by country?", [], computed)
+    lower = prompt.lower()
+    assert "among the rows shown" not in lower
+    assert "highlight the highest and lowest" in lower
+    assert "showing 25 of" not in prompt
+    assert "first 25 of" not in lower
+
+
+def test_compound_multirow_sampling_fires_at_26_row_boundary():
+    """Bug-7954 boundary: one row beyond the 25-row narration cap is the
+    smallest known-complete compound sample and must disclose 25 of 26."""
+    computed = _compound_computed(shown_rows=25, total=26)
+    _, prompt = _build_compound_narrate_prompt(
+        "sys", "share by country?", [], computed
+    )
+    lower = prompt.lower()
+    assert "first 25 of 26" in lower
+    assert "contains 26 rows" in lower
+    assert "only the first 25" in lower
+    assert "never present any total, sum, average, maximum, minimum, or count" in lower
+    assert "row cap" not in lower
+
+
+def test_compound_scalar_result_never_gets_sample_disclosure():
+    """A scalar compound result (single computed value) has no result_rows and
+    no sampling — the sampled disclosure must never fire."""
+    computed = {
+        "expression": {"const": 1},
+        "label": "germany share (%)",
+        "value": 11.1,
+        "is_multi_row": False,
+    }
+    _, prompt = _build_compound_narrate_prompt("sys", "germany share?", [], computed)
+    lower = prompt.lower()
+    assert "among the rows shown" not in lower
+    assert "first" not in lower or "first 25" not in lower
+    assert "showing" not in lower
+
+
+def test_compound_multirow_missing_total_defaults_to_shown_no_false_disclosure():
+    """When result_total_rows is absent (older producer), fall back to the shown
+    count so no false 'showing N of M' disclosure is emitted."""
+    computed = _compound_computed(shown_rows=10, total=0)
+    computed.pop("result_total_rows")
+    _, prompt = _build_compound_narrate_prompt("sys", "share?", [], computed)
+    lower = prompt.lower()
+    assert "among the rows shown" not in lower
+    assert "showing 10 of" not in prompt
+
+
+def test_compound_scalar_steps_truncated_carries_row_cap_guard():
+    """R1-2 review add: a scalar compound value computed from row-capped
+    sub-query data is a partial-data figure — the prompt must carry the
+    row-cap disclosure (Lane D _GUARD_TRUNCATED wording), and must NOT fire
+    any sampled disclosure (nothing was sampled)."""
+    computed = {
+        "expression": {"const": 1},
+        "label": "germany share (%)",
+        "value": 11.1,
+        "is_multi_row": False,
+        "steps_truncated": True,
+    }
+    _, prompt = _build_compound_narrate_prompt("sys", "germany share?", [], computed)
+    lower = prompt.lower()
+    assert "row cap" in lower
+    assert "partial view" in lower
+    assert "complete data extends further" in lower
+    # no sampling happened — the sampled guards must not fire
+    assert "among the rows shown" not in lower
+    assert "complete result" not in lower
+
+
+def test_compound_scalar_untruncated_steps_carries_no_row_cap_guard():
+    """Control: an untruncated scalar compound must not claim a row cap."""
+    computed = {
+        "expression": {"const": 1},
+        "label": "germany share (%)",
+        "value": 11.1,
+        "is_multi_row": False,
+        "steps_truncated": False,
+    }
+    _, prompt = _build_compound_narrate_prompt("sys", "germany share?", [], computed)
+    assert "row cap" not in prompt.lower()
+
+
+def test_compound_multirow_combined_truncated_and_sampled():
+    """R1-2 combined case: steps hit the DB row cap AND the narrator sees only
+    25 of the computed rows. Both Lane D guards fire (_GUARD_TRUNCATED +
+    _GUARD_TRUNCATED_SAMPLED); the 'COMPLETE result' wording of the pure
+    narrator-sampled guard would be FALSE and must be absent, as must its
+    'do not claim the data was truncated' order (it was truncated)."""
+    computed = _compound_computed(shown_rows=25, total=40)
+    computed["steps_truncated"] = True
+    _, prompt = _build_compound_narrate_prompt("sys", "share by country?", [], computed)
+    lower = prompt.lower()
+    # row-cap disclosure (real cap — _GUARD_TRUNCATED)
+    assert "row cap" in lower
+    assert "partial view" in lower
+    # shown-rows scoping on top (_GUARD_TRUNCATED_SAMPLED)
+    assert "first 25 of the 40 returned rows" in lower
+    assert "the returned rows extend beyond those you can see" in lower
+    assert "among the rows shown" in lower
+    # the pure-sampled wording would be false here
+    assert "complete result" not in lower
+    assert "do not claim the data was truncated" not in lower
+    # data block notes the sub-query cap
+    assert "one or more underlying sub-queries hit a row cap" in lower
+
+
+def test_compound_multirow_truncated_only_not_sampled_carries_row_cap_guard():
+    """Bug-8509 — the multi-row + steps_truncated=True + NOT sample-capped
+    branch (narrate.py multi-row ``else`` path). The narrator sees every
+    computed row (nothing sampled) but the computed rows themselves derive from
+    row-capped sub-query data, so the plain extreme instruction is safe AND the
+    row-cap guard (_GUARD_TRUNCATED) must fire. No pinning test covered this
+    branch: a regression that dropped _GUARD_TRUNCATED here would pass the rest
+    of the suite. Fails before the guard is present, passes with it."""
+    # shown == total -> not sample-capped; steps_truncated -> partial data.
+    computed = _compound_computed(shown_rows=25, total=25)
+    computed["steps_truncated"] = True
+    _, prompt = _build_compound_narrate_prompt("sys", "share by country?", [], computed)
+    lower = prompt.lower()
+    # row-cap disclosure (real cap — _GUARD_TRUNCATED)
+    assert "row cap" in lower
+    assert "partial view" in lower
+    assert "complete data extends further" in lower
+    # the plain (unscoped) extreme instruction — the narrator sees all rows
+    assert "highlight the highest and lowest" in lower
+    # nothing was sampled, so the sampled scoping/disclosure must NOT fire
+    assert "among the rows shown" not in lower
+    assert "first 25 of" not in lower
+    # data block notes the sub-query cap
+    assert "one or more underlying sub-queries hit a row cap" in lower

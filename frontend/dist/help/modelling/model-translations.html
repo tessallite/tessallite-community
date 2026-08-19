@@ -12,15 +12,16 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Model Translations (i18n)</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-24</span></div>
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-06-24</span></div>
 <h1>Model Translations (i18n)</h1>
 
 <h2>What this covers</h2>
-<p>Multi-language model metadata lets you provide translated display names for dimensions, measures, hierarchies, and other model entities. When a user selects a locale in the Explorer, all entity labels switch to that language.</p>
+<p>Model translations let teams use the same governed model in more than one business language. A finance analyst can see &ldquo;Revenue&rdquo; while a French-speaking team sees &ldquo;Chiffre d&rsquo;affaires&rdquo;; both labels point to the same measure, the same rules, and the same deployed model. This page explains what translations are for, how users choose a display language, and how an integration team can maintain translations safely.</p>
 
 <h2>How it works</h2>
-<p>Translations are stored in the <code>entity_translations</code> table, keyed by <strong>(model_id, entity_type, entity_id, field_name, locale)</strong>. Each row maps a specific field on a specific entity to a translated string in a specific locale.</p>
-<p>When a user sets their display locale via the <strong>Locale selector</strong> in the Explorer, the frontend fetches all translations for the active model and locale. Entity labels throughout the UI are resolved using a simple fallback: if a translation exists for the current locale, show it; otherwise, show the original name.</p>
+<p>Translations are stored in the <code>entity_translations</code> table, keyed by <strong>(model_id, entity_type, entity_id, field_name, locale)</strong>. Each row maps one field on one model object to one translated label.</p>
+<p>When a user sets their display locale with the <strong>Locale selector</strong>, Tessallite fetches the labels for the active model and locale. If a translation exists, the translated label is shown. If it does not, Tessallite falls back to the original model label. The fallback is deliberate: a partly translated model stays usable while the translation set is being completed.</p>
+<p>Translations change labels only. They do not change measure formulas, joins, security rules, aggregate routing, or API names. That is what makes them safe for multilingual reporting: the words can adapt to the audience without changing the numbers.</p>
 
 <h2>Setting the display locale</h2>
 <ol>
@@ -31,8 +32,9 @@
 </ol>
 <p>The selected locale is stored in the browser session and persists across page navigations within the same session but resets on logout.</p>
 
-<h2>Managing translations</h2>
-<p>Translations are managed via the REST API. There is no GUI editor yet.</p>
+<h2>Managing translations safely</h2>
+<p>Most teams should treat translations as reference content, not as day-to-day modelling work. The best workflow is to export a list of model objects, have a translator or local business owner review the labels, then load the approved translation set in bulk.</p>
+<p>There is no GUI translation editor yet. The REST API is mainly for controlled integration work: importing approved translation files, syncing from a terminology system, or correcting a label during a release. For one-off exploration, keep changes in a staging model first so reviewers can check the wording in context.</p>
 
 <h3>Upsert a single translation</h3>
 <pre><code>PUT /api/v1/projects/{project_id}/models/{model_id}/translations
@@ -52,8 +54,9 @@
 <h3>List translations</h3>
 <pre><code>GET /api/v1/projects/{project_id}/models/{model_id}/translations?locale=fr</code></pre>
 
-<h3>Delete a translation</h3>
+<h3>Retire a translation</h3>
 <pre><code>DELETE /api/v1/projects/{project_id}/models/{model_id}/translations/{id}</code></pre>
+<p>Use delete only as a cleanup operation: for example, when a label was imported for the wrong locale, an entity was renamed and the old wording would now mislead people, or a translation failed review. Do not delete a translation simply because a user wants to see the original English label; changing their locale is safer and reversible.</p>
 
 <h2>Supported entity types</h2>
 <table>
@@ -68,6 +71,7 @@
 
 <h2>Security</h2>
 <p>All translation endpoints verify that the specified model belongs to the specified project. Attempting to manage translations for a model in a different project returns <strong>404 Not Found</strong>.</p>
+<p>Translation access should be limited to modellers or controlled automation. A bad translation can create a business misunderstanding even though it cannot change the underlying calculation.</p>
 
 <h2>Related</h2>
 <ul>

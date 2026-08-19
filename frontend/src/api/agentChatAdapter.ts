@@ -122,7 +122,7 @@ export const mainAppAdapter: AgentChatAdapter = {
     return turns.map(toTurnResponse);
   },
 
-  streamMessageRaw: async (projectId, conversationId, text, signal) => {
+  streamMessageRaw: async (projectId, conversationId, text, signal, idempotencyKey) => {
     const csrf = getCsrfToken();
     const url =
       `${agentServiceBaseUrl()}/api/v1/projects/${projectId}` +
@@ -134,6 +134,9 @@ export const mainAppAdapter: AgentChatAdapter = {
         "Content-Type": "application/json",
         Accept: "text/event-stream",
         ...(csrf ? { "X-CSRF-Token": csrf } : {}),
+        // Bug-6521 — forward the per-send idempotency key so the backend
+        // dedupes the turn reservation across streaming retries.
+        ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
       },
       body: JSON.stringify({ text }),
       signal,

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Understanding Window Functions — Tessallite Help</title>
+  <link rel="stylesheet" href="../assets/help.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="../index.html" class="logo">Tessallite Help</a>
+    <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Understanding Window Functions</span></nav>
+  </header>
+  <main class="article">
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-08-14</span></div>
+    <h1>Understanding Window Functions</h1>
+<h2>What this covers</h2>
+<p>Tessallite&#x27;s window variants — <code>trailing_n</code>, <code>moving_avg_n</code>, and <code>lag</code> — compute values over ordered sequences. Each variant is a window function applied at query time. When a semantic time grain is resolved, the source and aggregate routes use the same period key and reject sparse frames rather than silently widening them. This article explains what the window sees, what happens when data has gaps, and how partial windows behave.</p>
+<h2>Which variants use windows</h2>
+<div class="table-wrapper"><table><thead><tr><th>Variant</th><th>Window type</th><th>Window size</th></tr></thead><tbody><tr><td><code>trailing_n</code></td><td>Sum over preceding rows</td><td>N rows (default 12)</td></tr><tr><td><code>moving_avg_n</code></td><td>Average over preceding rows</td><td>N rows (default 30)</td></tr><tr><td><code>lag</code></td><td>Single row N places earlier</td><td>N (default 1)</td></tr></tbody></table></div>
+<p>These variants do not require a calendar type or a time hierarchy. They only need a date dimension in the query grain to order rows.</p>
+<h2>How windows are measured</h2>
+<p>Window variants use a <code>ROWS</code> frame, but at a resolved time grain the period key must also be contiguous. For a query grouped by month:</p>
+<ul><li><code>trailing_3</code> on revenue sums the current month plus the two immediately preceding months when all three periods are present — regardless of whether those months have the same number of days.</li><li><code>moving_avg_30</code> on a daily query averages the current day and the 29 preceding contiguous days; a gap inside the frame returns <code>NULL</code> for that row.</li><li><code>lag(2)</code> on orders returns a value only when the preceding row sequence reaches the immediately prior period key.</li></ul>
+<p>The physical frame is <code>ROWS BETWEEN N-1 PRECEDING AND CURRENT ROW</code>. A period-key span/count guard makes that row frame period-safe after grouping and filtering; it does not insert zero-valued rows for empty periods.</p>
+<p>The period key follows the selected calendar rather than assuming Gregorian months. Hourly rows use a contiguous hour index. Standard, Hijri, and retail 4-4-5 calendars use the actual period number on a 12-period year scale; a retail 53rd week remains part of period 12, so period 12 to period 1 is adjacent. Fiscal calendars derive period 1 from the configured fiscal start month, so March to April is adjacent for an April-start year.</p>
+<h2>Partial windows at series boundaries</h2>
+<p>A window variant needs the full N rows to compute its advertised value. At the start of a series, fewer than N rows exist. This is a partial window.</p>
+<h3>What happens</h3>
+<p>Tessallite does not pad missing rows with zeros. The window function only sees the rows that are actually present relative to the current row. The result is a best-effort computation over however many rows are available:</p>
+<ul><li><strong>Row 1 of a query grouped by month with <code>moving_avg_3</code></strong>: only one row exists, so the &quot;3-month moving average&quot; is simply that month&#x27;s value. It is not the average of one month and two phantom zeros — but it is also not a genuine 3-month average.</li><li><strong>Row 2</strong>: two rows exist, so the value is the average of two months.</li><li><strong>Row 3 onward</strong>: three rows exist, so the value is a genuine 3-month average.</li></ul>
+<p>The label &quot;3-month moving average&quot; describes the window size, not a guarantee that every data point at the start of the series is backed by three full months. Tools that chart these values should consider annotating or de-emphasising the leading partial-window points.</p>
+<h3>Lag at boundaries</h3>
+<p><code>lag(N)</code> at the boundary returns <code>NULL</code> because there is no row N positions earlier. Tessallite does not substitute zero — zero is a real value and would silently distort the comparison. A missing lag means the comparison cannot be made, and the absence is explicit.</p>
+<h2>Gaps in data</h2>
+<p>If the source data has no rows for a period inside a requested frame, the window does not reach farther back to compensate. The affected <code>trailing_n</code>, <code>moving_avg_n</code>, or <code>lag</code> value is <code>NULL</code>; it does not insert a zero for the missing period.</p>
+<h3>Sparse data</h3>
+<p>If most periods are missing, window variants produce explicit <code>NULL</code> values until the retained frame is contiguous:</p>
+<ul><li>A <code>moving_avg_30</code> on a series with a missing day inside the frame returns <code>NULL</code> at that row rather than averaging across the gap.</li><li>A <code>trailing_12</code> on a series with a missing quarter returns <code>NULL</code> while that gap remains inside the twelve-row frame; an initial frame with fewer than twelve contiguous rows remains a valid partial result.</li></ul>
+<p>The window size remains a ceiling at the start of a series: an initial frame may contain fewer than N contiguous rows. A gap inside that frame is different and is returned as <code>NULL</code>.</p>
+<h3>Empty periods are skipped, not counted as zero</h3>
+<p>Tessallite does not count an empty period as zero. A <code>moving_avg_3</code> on a series where January has data, February is missing, and March has data returns <code>NULL</code> for March rather than producing (Jan + 0 + Mar)/3 or reaching back to an earlier row. This makes the missing-period condition explicit without inventing a value.</p>
+<p>The trade-off is that an initial &quot;N-period window&quot; can contain fewer than N periods. If you need zero-filled calendar windows, use a calendar table or a hand-rolled expression with date filters; the window guard intentionally returns <code>NULL</code> rather than fabricating zeros.</p>
+<h2>Example — sparse trailing sum</h2>
+<p>Consider a query grouped by month with <code>trailing_3</code> on a measure whose source data has gaps:</p>
+<div class="table-wrapper"><table><thead><tr><th>Month</th><th>Revenue</th><th>trailing_3</th></tr></thead><tbody><tr><td>Jan</td><td>100</td><td>100</td></tr><tr><td>Feb</td><td>120</td><td>220</td></tr><tr><td>Mar</td><td>(no data)</td><td>(no row)</td></tr><tr><td>Apr</td><td>90</td><td>(NULL — March gap is inside the frame)</td></tr><tr><td>May</td><td>110</td><td>(NULL — March gap is inside the frame)</td></tr><tr><td>Jun</td><td>130</td><td>330</td></tr><tr><td>Jul</td><td>80</td><td>420</td></tr></tbody></table></div>
+<p><strong>March has no row at all</strong> — the source data for March is missing. April&#x27;s <code>trailing_3</code> is <code>NULL</code> because the frame&#x27;s period-key span includes a missing month. The window does not silently substitute an older existing row.</p>
+<p>June is the first shown row whose retained frame is contiguous after the March gap leaves the frame; its partial result is Apr + May + Jun = 330. July continues that contiguous sequence with May + Jun + Jul = 420.</p>
+<p>The period guard keeps the physical positional frame honest: rows are still not padded, and a missing period is visible as <code>NULL</code>. If you need a zero-filled calendar window, model the calendar rows explicitly.</p>
+<h2>Period-to-date vs. window — the distinction</h2>
+<div class="table-wrapper"><table><thead><tr><th>Behaviour</th><th>Period-to-date (<code>ytd</code>, <code>qtd</code>, <code>mtd</code>, <code>wtd</code>)</th><th>Window (<code>trailing_n</code>, <code>moving_avg_n</code>, <code>lag</code>)</th></tr></thead><tbody><tr><td>Calendar awareness</td><td>Yes — resets at period boundaries</td><td>Period-key adjacency is enforced when a time grain is resolved</td></tr><tr><td>Requires hierarchy + calendar type</td><td>Yes</td><td>No</td></tr><tr><td>Requires calendar table</td><td>Expression-based for standard/fiscal/ISO/Thai; physical table for Hijri/retail 4-4-5</td><td>No</td></tr><tr><td>Partial periods</td><td>Well-defined — YTD on Jan 10 is Jan 1-10</td><td>Same partial-window rules apply</td></tr><tr><td>Gaps</td><td>Each period window is computed independently; gaps are gaps</td><td><code>NULL</code> while a gap is inside the requested frame; initial partial frames are allowed</td></tr><tr><td>Materialised in aggregates</td><td>Sometimes — a period-variant query can be served from an aggregate when the query shape is proven safe; otherwise it is computed from the base aggregate or the source</td><td>Yes — window-based variants materialise in CTAS</td></tr></tbody></table></div>
+<h2>When not to use window variants</h2>
+<ul><li><strong>You need a single scorecard number, not a trend line.</strong> Use a regular measure with a date filter (e.g. <code>WHERE date &gt;= CURRENT_DATE - INTERVAL &#x27;6 MONTHS&#x27;</code>). Window variants produce one value per row; they are designed for charts, not single-cell KPIs.</li><li><strong>You require zero-filled windows for missing calendar periods.</strong> Use a calendar table or a hand-rolled expression with date filters; row windows return <code>NULL</code> for an unproven sparse frame.</li><li><strong>Your source data has frequent gaps.</strong> Expect <code>NULL</code> values while a gap remains inside the requested frame; the leading partial window may still contain fewer than N rows.</li></ul>
+<h2>Related</h2>
+<ul><li><a href="configure-time-variants.html">Configure Time Variants</a></li><li><a href="define-measures.html">Define Measures</a></li><li><a href="configure-calendar-table.html">Configure Calendar Table</a></li></ul>
+<nav class="page-nav"><a href="configure-time-variants.html" class="page-nav-btn prev">&larr; Configure Time Variants</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="configure-calendar-table.html" class="page-nav-btn next">Configure Calendar Table &rarr;</a></nav>
+  </main>
+  <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
+</body>
+</html>

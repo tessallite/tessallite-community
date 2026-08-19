@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useT } from "../../../../i18n";
 import {
-  Alert,
   Box,
   Breadcrumbs,
   Button,
@@ -36,7 +35,10 @@ import type {
   HierarchyPathEntry,
 } from "../../../../api/types";
 import { renderDimValue } from "../pivot";
+import { routeBadgeLabel } from "../routeLabels";
 import type { DrillContext } from "../types";
+import PivotErrorAlert from "../PivotErrorAlert";
+import type { PivotPanelError } from "../pivotErrors";
 import { drillCurrentPageCsvFilename, drillRowsToCsv } from "./drillCsv";
 import { downloadText } from "../export/download";
 
@@ -46,7 +48,9 @@ export const DRILL_PAGE_SIZES: DrillPageSize[] = [50, 100, 200];
 type Props = {
   open: boolean;
   loading: boolean;
-  error: string | null;
+  // Bug-8182 (review B4): structured so the friendly message leads and raw
+  // backend/transport text stays behind the collapsed accordion.
+  error: PivotPanelError | null;
   result: DrillThroughResponse | null;
   context: DrillContext | null;
   rowDims: Dimension[];
@@ -243,11 +247,12 @@ export default function DrillThroughPanel({
       )}
 
       {/* Cell filters as plain text */}
-      {context && (rowDims.length > 0 || colDims.length > 0) && (
+      {context && filterCount > 0 && (
         <Typography variant="caption" color="text.secondary">
+          {/* Bug-6285: show business display names, matching the grid/breadcrumb/export. */}
           {[
-            ...rowDims.map((d, i) => `${d.name} = ${context.coord.rowKey[i] ?? ""}`),
-            ...colDims.map((d, i) => `${d.name} = ${context.coord.colKey[i] ?? ""}`),
+            ...rowDims.slice(0, context.coord.rowKey.length).map((d, i) => `${d.display_name || d.name} = ${context.coord.rowKey[i]}`),
+            ...colDims.slice(0, context.coord.colKey.length).map((d, i) => `${d.display_name || d.name} = ${context.coord.colKey[i]}`),
           ].join(", ")}
         </Typography>
       )}
@@ -382,7 +387,7 @@ export default function DrillThroughPanel({
         </Tooltip>
       </Stack>
 
-      {error && <Alert severity="error">{error}</Alert>}
+      {error && <PivotErrorAlert error={error} />}
       {loading && <CircularProgress size={20} />}
 
       {result && (
@@ -390,7 +395,9 @@ export default function DrillThroughPanel({
           <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap">
             {result.route_type !== "" && (
               <Typography variant="caption" color="text.secondary">
-                {t("drill.routeInfo", { route: result.route_type })}
+                {/* Bug-6282: translate route_type the same way the pivot route
+                    badge does, rather than printing the raw English value. */}
+                {t("drill.routeInfo", { route: routeBadgeLabel(result.route_type, t) })}
               </Typography>
             )}
             <Typography variant="caption" color="text.secondary">

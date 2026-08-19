@@ -173,7 +173,7 @@ async def test_summary_aggregates_correctly(client):
             # F-030-08: hit_stmt now returns agg_hits (aggregate-only) and
             # accel_hits (aggregate + pocket) — 60 aggregate, 75 accelerated.
             result.one.return_value = types.SimpleNamespace(
-                total=100, agg_hits=60, accel_hits=75,
+                total=100, agg_hits=60, accel_hits=75, unacceleratable=0,
             )
         elif call_count == 3:
             result.scalar_one.return_value = 42.5
@@ -199,6 +199,42 @@ async def test_summary_aggregates_correctly(client):
     assert data["top_measure"] == "revenue"
 
 
+@pytest.mark.asyncio
+async def test_summary_acceleration_rate_excludes_unacceleratable_raw_f030_05(client):
+    """F-030-05 (Bug-9134): Usage Analytics must use the SAME eligible denominator
+    as Model Health — structurally unacceleratable ``raw`` rows are excluded. With
+    100 total, 75 accelerated, 20 raw: rate = 75 / (100-20) = 93.75, NOT 75/100=75."""
+    db = AsyncMock()
+    call_count = 0
+
+    async def _multi_execute(stmt):
+        nonlocal call_count
+        call_count += 1
+        result = MagicMock()
+        if call_count == 1:
+            result.scalar_one.return_value = 100
+        elif call_count == 2:
+            result.one.return_value = types.SimpleNamespace(
+                total=100, agg_hits=60, accel_hits=75, unacceleratable=20,
+            )
+        elif call_count == 3:
+            result.scalar_one.return_value = 42.5
+        elif call_count == 4:
+            result.first.return_value = None
+        return result
+
+    db.execute = _multi_execute
+    db.get = AsyncMock(return_value=types.SimpleNamespace(id=MODEL_ID, project_id=PROJECT_ID))
+    with patch("src.api.analytics.get_tenant_db", lambda tid: _yield(db)):
+        resp = await client.get(
+            f"/api/v1/projects/{PROJECT_ID}/models/{MODEL_ID}/analytics/summary?days=7"
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["acceleration_rate"] == 93.8   # 75/80*100, rounded to 1 dp
+    assert data["aggregate_hit_rate"] == 75.0  # 60/80*100
+
+
 # ---------------------------------------------------------------------------
 # Empty model (no queries)
 # ---------------------------------------------------------------------------
@@ -215,7 +251,7 @@ async def test_summary_empty_model(client):
         if call_count == 1:
             result.scalar_one.return_value = 0
         elif call_count == 2:
-            result.one.return_value = types.SimpleNamespace(total=0, agg_hits=0, accel_hits=0)
+            result.one.return_value = types.SimpleNamespace(total=0, agg_hits=0, accel_hits=0, unacceleratable=0)
         elif call_count == 3:
             result.scalar_one.return_value = None
         elif call_count == 4:
@@ -323,3 +359,128 @@ async def test_analytics_404_for_foreign_model(client):
             f"/api/v1/projects/{PROJECT_ID}/models/{MODEL_ID}/analytics/summary"
         )
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Bug-6425: member-discovery queries excluded from usage analytics
+# ---------------------------------------------------------------------------
+
+
+def test_exclude_probes_emits_discovery_and_introspect_filters():
+    """Bug-6425 (+ F-030-09): every QueryLog aggregation must drop introspect
+    probe rows AND member-discovery rows (protocol='discover_members'). Compile
+    the statement and assert both exclusions are present, and that the discovery
+    guard uses IS DISTINCT FROM so NULL-protocol rows are still counted."""
+    from sqlalchemy import func, select
+
+    from shared.db.models import QueryLog
+    from src.api.analytics import _DISCOVERY_PROTOCOL, _exclude_probes
+
+    assert _DISCOVERY_PROTOCOL == "discover_members"
+    stmt = _exclude_probes(select(func.count()).select_from(QueryLog))
+    sql = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+    assert "IS DISTINCT FROM 'discover_members'" in sql
+    assert "introspect" in sql
+
+
+def test_metrics_defines_discovery_protocol_constant():
+    """Producer/consumer contract: the model-service consumer excludes exactly
+    the protocol string the query-router producer tags discovery rows with."""
+    from src.api import metrics
+
+    assert metrics._DISCOVERY_PROTOCOL == "discover_members"
+
+
+@pytest.mark.asyncio
+async def test_summary_acceleration_rate_excludes_cache_reserves_bug6426(client):
+    """Bug-6426: the headline acceleration-rate query must exclude cache
+    re-serves (cache_status='cache_hit') from the accelerated counters, so the
+    number a business user reads is real acceleration — not inflated by results
+    served from the in-TTL result cache. Compile the hit_stmt and assert the
+    cache guard is present."""
+    captured: list[str] = []
+    db = AsyncMock()
+    call_count = 0
+
+    async def _multi_execute(stmt):
+        nonlocal call_count
+        call_count += 1
+        try:
+            captured.append(str(stmt.compile(compile_kwargs={"literal_binds": True})))
+        except Exception:
+            captured.append(str(stmt))
+        result = MagicMock()
+        if call_count == 1:
+            result.scalar_one.return_value = 100
+        elif call_count == 2:
+            result.one.return_value = types.SimpleNamespace(
+                total=100, agg_hits=60, accel_hits=75, unacceleratable=0,
+            )
+        elif call_count == 3:
+            result.scalar_one.return_value = 42.5
+        elif call_count == 4:
+            result.first.return_value = None
+        return result
+
+    db.execute = _multi_execute
+    db.get = AsyncMock(return_value=types.SimpleNamespace(id=MODEL_ID, project_id=PROJECT_ID))
+    with patch("src.api.analytics.get_tenant_db", lambda tid: _yield(db)):
+        resp = await client.get(
+            f"/api/v1/projects/{PROJECT_ID}/models/{MODEL_ID}/analytics/summary?days=7"
+        )
+    assert resp.status_code == 200
+    # The accelerated-hits statement (2nd execute) must carry the cache guard.
+    hit_sql = captured[1]
+    assert "cache_status" in hit_sql and "cache_hit" in hit_sql, (
+        "acceleration-rate query must exclude cache_status='cache_hit' rows"
+    )
+
+
+@pytest.mark.asyncio
+async def test_estimated_savings_excludes_cache_reserves_bug6426(client):
+    """Bug-6426: estimated-savings is the direct CFO-facing time_saved number.
+    A cache re-serve carries execution_ms=0 and did not execute a route —
+    counting it drags accel_avg toward 0 and inflates accel_count, so
+    time_saved = (source_avg - accel_avg) * accel_count is inflated on BOTH
+    factors. Both the accelerated and source statements must exclude cache
+    re-serves; assert the SQL guard so a value regression is impossible."""
+    captured: list[str] = []
+    db = AsyncMock()
+    call_count = 0
+
+    async def _multi_execute(stmt):
+        nonlocal call_count
+        call_count += 1
+        try:
+            captured.append(str(stmt.compile(compile_kwargs={"literal_binds": True})))
+        except Exception:
+            captured.append(str(stmt))
+        result = MagicMock()
+        if call_count == 1:
+            result.scalar_one.return_value = 100  # total
+        elif call_count == 2:
+            result.one.return_value = types.SimpleNamespace(cnt=10, avg_ms=20.0)
+        elif call_count == 3:
+            result.scalar_one.return_value = 500.0  # source avg
+        return result
+
+    db.execute = _multi_execute
+    db.get = AsyncMock(return_value=types.SimpleNamespace(id=MODEL_ID, project_id=PROJECT_ID))
+    with patch("src.api.analytics.get_tenant_db", lambda tid: _yield(db)):
+        resp = await client.get(
+            f"/api/v1/projects/{PROJECT_ID}/models/{MODEL_ID}/analytics/estimated-savings?days=30"
+        )
+    assert resp.status_code == 200
+    # The accelerated statement (2nd) and source statement (3rd) must both
+    # exclude cache re-serves.
+    accel_sql = captured[1]
+    source_sql = captured[2]
+    assert "cache_status" in accel_sql and "cache_hit" in accel_sql, (
+        "accelerated-savings query must exclude cache_status='cache_hit' rows"
+    )
+    assert "cache_status" in source_sql and "cache_hit" in source_sql, (
+        "source-baseline query must exclude cache_status='cache_hit' rows"
+    )
+    data = resp.json()
+    # Value sanity: (500 - 20) * 10 = 4800, with real executions only.
+    assert data["time_saved_ms"] == 4800

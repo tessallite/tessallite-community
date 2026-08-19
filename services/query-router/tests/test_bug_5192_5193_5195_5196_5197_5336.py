@@ -28,6 +28,15 @@ from conftest import (
     make_dimension,
     make_measure,
 )
+from src.semantic.snapshot_resolver import DeployedShape
+
+# Bug-7979: deployed models must resolve a real DeployedShape (fail-closed).
+# Tests that exercise binding/routing behavior use this empty shape.
+_EMPTY_DEPLOYED_SHAPE = DeployedShape(
+    measures=[], dimensions=[], hidden_column_ids=set(),
+    physical_columns_all=set(), physical_columns_visible=set(),
+    hierarchy_rows=[],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +44,8 @@ from conftest import (
 # ---------------------------------------------------------------------------
 
 class TestBug5192:
-    """CTE body table references must not be rejected by the FROM validation."""
+    """Bug-5192 / Bug-6964: CTE alias names are allowed, but physical tables
+    inside CTE bodies must belong to the semantic model (containment fix)."""
 
     @pytest.fixture
     def _mock_model(self):
@@ -46,8 +56,10 @@ class TestBug5192:
             deployed_version_id="v1",
         )
 
-    async def test_cte_body_table_allowed(self, _mock_model):
-        """A table referenced only inside a CTE body must not be rejected."""
+    async def test_cte_body_non_model_table_rejected(self, _mock_model):
+        """Bug-6964: a CTE whose body scans a table NOT in the semantic model
+        must be REJECTED -- the previous behavior (allow) was a containment
+        breach that let any authenticated caller read arbitrary source tables."""
         from src.semantic.binder import bind_query_to_model
 
         query = LogicalQuery(
@@ -74,16 +86,82 @@ class TestBug5192:
         db = AsyncMock()
         with (
             patch("src.semantic.binder._load_model", return_value=_mock_model),
-            patch("src.semantic.binder.resolve_deployed_shape", return_value=None),
-            patch("src.semantic.binder.resolve_live_metadata_bundle", return_value=None),
-            patch("src.semantic.binder._load_measures", return_value=[]),
-            patch("src.semantic.binder._load_dimensions", return_value=[]),
-            patch("src.semantic.binder._load_hierarchy_level_dimensions", return_value=[]),
-            patch("src.semantic.binder._load_hidden_column_ids", return_value=set()),
-            patch("src.semantic.binder._load_physical_column_names", return_value=set()),
+        ):
+            with pytest.raises(SemanticBindingError, match="Unknown table"):
+                await bind_query_to_model(query, db)
+
+    async def test_cte_body_model_table_allowed(self, _mock_model):
+        """A CTE whose body scans the MODEL table itself is legitimate."""
+        from src.semantic.binder import bind_query_to_model
+
+        query = LogicalQuery(
+            model_id="model-1",
+            protocol="jdbc",
+            raw_query=(
+                "WITH filtered AS (SELECT * FROM modely WHERE x = 1) "
+                "SELECT * FROM filtered"
+            ),
+            requested_measures=[],
+            requested_dimensions=[],
+            filters=[],
+            grain=[],
+            order_by=[],
+            limit=None,
+            offset=None,
+            query_fingerprint="fp1b",
+            from_tables=["modely", "filtered"],
+            cte_aliases=["filtered"],
+            has_complex_sql=True,
+            select_star=True,
+        )
+
+        # F-003-02: the CTE body references physical column ``x`` over the model
+        # table, so the deployed shape must declare it (an empty vocabulary would
+        # correctly fail closed under the new column-containment gate).
+        _shape_with_x = DeployedShape(
+            measures=[], dimensions=[], hidden_column_ids=set(),
+            physical_columns_all={"x"}, physical_columns_visible={"x"},
+            hierarchy_rows=[],
+        )
+        db = AsyncMock()
+        with (
+            patch("src.semantic.binder._load_model", return_value=_mock_model),
+            patch("src.semantic.binder.resolve_deployed_shape", return_value=_shape_with_x),
         ):
             bound = await bind_query_to_model(query, db)
-            # Should not raise: external_table is inside a CTE body
+            assert bound is not None
+
+    async def test_cte_alias_name_not_rejected(self, _mock_model):
+        """CTE alias names (not physical tables) must still pass FROM validation."""
+        from src.semantic.binder import bind_query_to_model
+
+        query = LogicalQuery(
+            model_id="model-1",
+            protocol="jdbc",
+            raw_query=(
+                "WITH summary AS (SELECT * FROM modely) "
+                "SELECT * FROM summary"
+            ),
+            requested_measures=[],
+            requested_dimensions=[],
+            filters=[],
+            grain=[],
+            order_by=[],
+            limit=None,
+            offset=None,
+            query_fingerprint="fp1c",
+            from_tables=["modely", "summary"],
+            cte_aliases=["summary"],
+            has_complex_sql=True,
+            select_star=True,
+        )
+
+        db = AsyncMock()
+        with (
+            patch("src.semantic.binder._load_model", return_value=_mock_model),
+            patch("src.semantic.binder.resolve_deployed_shape", return_value=_EMPTY_DEPLOYED_SHAPE),
+        ):
+            bound = await bind_query_to_model(query, db)
             assert bound is not None
 
     async def test_unknown_table_still_rejected_without_cte(self, _mock_model):
@@ -153,7 +231,77 @@ class TestBug5193:
         )
 
         db = AsyncMock()
-        with patch("src.semantic.binder._load_model", return_value=_mock_model):
+        with (
+            patch("src.semantic.binder._load_model", return_value=_mock_model),
+            # Bug-6089: a <slug>_* suffix that is not a known variant now
+            # consults the model's real personas. With no personas defined,
+            # ``modely_fake`` must still be rejected.
+            patch("src.semantic.binder._load_persona_slugs", return_value=set()),
+        ):
+            with pytest.raises(SemanticBindingError, match="Unknown model variant"):
+                await bind_query_to_model(query, db)
+
+    async def test_persona_catalogue_name_accepted(self, _mock_model):
+        """Bug-6089: a real persona catalogue name (<slug>_<persona_slug>),
+        such as ``modely_analyst``, must bind for direct API callers instead
+        of being rejected as an unknown variant."""
+        from src.semantic.binder import bind_query_to_model
+
+        query = LogicalQuery(
+            model_id="model-1",
+            protocol="jdbc",
+            raw_query="SELECT * FROM modely_analyst",
+            requested_measures=[],
+            requested_dimensions=[],
+            filters=[],
+            grain=[],
+            order_by=[],
+            limit=None,
+            offset=None,
+            query_fingerprint="fp3b",
+            from_tables=["modely_analyst"],
+            cte_aliases=[],
+            select_star=True,
+        )
+
+        db = AsyncMock()
+        with (
+            patch("src.semantic.binder._load_model", return_value=_mock_model),
+            patch("src.semantic.binder._load_persona_slugs", return_value={"analyst"}),
+            patch("src.semantic.binder.resolve_deployed_shape", return_value=_EMPTY_DEPLOYED_SHAPE),
+            patch("src.semantic.binder._filter_by_from_tables", return_value=([], [])),
+        ):
+            bound = await bind_query_to_model(query, db)
+            assert bound is not None
+
+    async def test_fabricated_variant_rejected_even_with_personas(self, _mock_model):
+        """Bug-6089 guard: a fabricated suffix is rejected even when the model
+        has personas, as long as the suffix does not name one of them (the
+        Bug-5193 guard must not be weakened)."""
+        from src.semantic.binder import bind_query_to_model
+
+        query = LogicalQuery(
+            model_id="model-1",
+            protocol="jdbc",
+            raw_query="SELECT * FROM modely_fake",
+            requested_measures=[],
+            requested_dimensions=[],
+            filters=[],
+            grain=[],
+            order_by=[],
+            limit=None,
+            offset=None,
+            query_fingerprint="fp3c",
+            from_tables=["modely_fake"],
+            cte_aliases=[],
+            select_star=True,
+        )
+
+        db = AsyncMock()
+        with (
+            patch("src.semantic.binder._load_model", return_value=_mock_model),
+            patch("src.semantic.binder._load_persona_slugs", return_value={"analyst", "manager"}),
+        ):
             with pytest.raises(SemanticBindingError, match="Unknown model variant"):
                 await bind_query_to_model(query, db)
 
@@ -181,13 +329,7 @@ class TestBug5193:
         db = AsyncMock()
         with (
             patch("src.semantic.binder._load_model", return_value=_mock_model),
-            patch("src.semantic.binder.resolve_deployed_shape", return_value=None),
-            patch("src.semantic.binder.resolve_live_metadata_bundle", return_value=None),
-            patch("src.semantic.binder._load_measures", return_value=[]),
-            patch("src.semantic.binder._load_dimensions", return_value=[]),
-            patch("src.semantic.binder._load_hierarchy_level_dimensions", return_value=[]),
-            patch("src.semantic.binder._load_hidden_column_ids", return_value=set()),
-            patch("src.semantic.binder._load_physical_column_names", return_value=set()),
+            patch("src.semantic.binder.resolve_deployed_shape", return_value=_EMPTY_DEPLOYED_SHAPE),
             patch("src.semantic.binder._filter_by_from_tables", return_value=([], [])),
         ):
             bound = await bind_query_to_model(query, db, include_hidden=True)
@@ -217,13 +359,7 @@ class TestBug5193:
         db = AsyncMock()
         with (
             patch("src.semantic.binder._load_model", return_value=_mock_model),
-            patch("src.semantic.binder.resolve_deployed_shape", return_value=None),
-            patch("src.semantic.binder.resolve_live_metadata_bundle", return_value=None),
-            patch("src.semantic.binder._load_measures", return_value=[]),
-            patch("src.semantic.binder._load_dimensions", return_value=[]),
-            patch("src.semantic.binder._load_hierarchy_level_dimensions", return_value=[]),
-            patch("src.semantic.binder._load_hidden_column_ids", return_value=set()),
-            patch("src.semantic.binder._load_physical_column_names", return_value=set()),
+            patch("src.semantic.binder.resolve_deployed_shape", return_value=_EMPTY_DEPLOYED_SHAPE),
             patch("src.semantic.binder._filter_by_from_tables", return_value=([], [])),
         ):
             bound = await bind_query_to_model(query, db)
