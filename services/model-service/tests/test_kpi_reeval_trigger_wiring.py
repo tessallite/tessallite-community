@@ -12,8 +12,9 @@ repopulated in seconds.
 These guards lock:
   1. the helper posts to a CONFIG-DRIVEN model-service URL with an internal
      ``kpi-snapshot-sweep`` service token (the same principal the scheduler's
-     hourly sweep already uses for this identical call) carrying exactly the
-     ``model-service.kpi-evaluate`` scope and the ``kpi_evaluator`` role, plus
+     hourly sweep already uses for this identical call) carrying the
+     model-service evaluation and query-router execution scopes and the
+     ``kpi_evaluator`` role, plus
      the internal-bypass rate-limit header (so evaluate-batch's
      is_service_context publish gate recognises the call);
   2. the helper is BEST-EFFORT — a model-service 5xx or a transport exception
@@ -215,12 +216,15 @@ async def test_trigger_posts_config_driven_url_token_and_bypass_header(monkeypat
     assert claims["aud"] == "service"
     assert claims["token_type"] == "service"
     # Reuses the existing "kpi-snapshot-sweep" principal from the closed
-    # shared.auth.service_principal allow-list (same role/scope the scheduler's
+    # shared.auth.service_principal allow-list (same role/scopes the scheduler's
     # snapshot sweep already uses for the identical evaluate-batch call).
     assert claims["service_principal"] == "kpi-snapshot-sweep"
     assert claims["tenant_id"] == "acme"
     assert claims["role"] == "kpi_evaluator"
-    assert claims["service_scopes"] == ["model-service.kpi-evaluate"]
+    assert claims["service_scopes"] == [
+        "model-service.kpi-evaluate",
+        "query-router.kpi-execute",
+    ]
 
 
 @pytest.mark.asyncio

@@ -32,10 +32,13 @@ describe("Excel task-pane i18n runtime", () => {
     expect(strings.app.askTessallite).toBe("Demander à Tessallite");
   });
 
-  it("updates document language and direction for Office task pane locale changes", () => {
+  it("keeps unsupported Arabic task-pane RTL gated until its catalogue/theme ships (Bug-9211)", () => {
     setActiveLocale("ar-SA");
     expect(document.documentElement.lang).toBe("ar");
-    expect(document.documentElement.dir).toBe("rtl");
+    // Arabic currently falls back to the English task-pane catalogue. Do not
+    // mirror LTR MUI controls without the matching RTL theme and translations.
+    expect(document.documentElement.dir).toBe("ltr");
+    expect(strings.app.askTessallite).toBe("Ask Tessallite");
 
     setActiveLocale("fr-FR");
     expect(document.documentElement.lang).toBe("fr");

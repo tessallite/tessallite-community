@@ -20,6 +20,90 @@ export type DeployResponse = {
   last_deployed_at: string;
 };
 
+/**
+ * The only structured refusal produced by the model deploy route.  Keeping the
+ * finite error domain here prevents each deploy surface from making its own
+ * unsafe assumption about Axios' `detail` value.
+ */
+export type JoinPopulationBlockedOffender = {
+  join_id: string;
+  join_label?: string | null;
+  left_table_name?: string | null;
+  right_table_name?: string | null;
+  left_column_name?: string | null;
+  right_column_name?: string | null;
+  population_participation: string;
+  status: string;
+  row_effect_ratio: number | null;
+  reason: string | null;
+};
+
+export type JoinPopulationBlockedDetail = {
+  code: "JOIN_POPULATION_BLOCKED";
+  message: string;
+  threshold: number;
+  joins: JoinPopulationBlockedOffender[];
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** Parse the backend's typed 409 without ever returning a partial contract. */
+export function parseJoinPopulationBlockedError(
+  error: unknown,
+): JoinPopulationBlockedDetail | null {
+  const response = isRecord(error) ? error.response : undefined;
+  const responseData = isRecord(response) ? response.data : undefined;
+  const detail = isRecord(responseData) ? responseData.detail : undefined;
+  if (
+    !isRecord(detail) ||
+    detail.code !== "JOIN_POPULATION_BLOCKED" ||
+    typeof detail.message !== "string" ||
+    typeof detail.threshold !== "number" ||
+    !Number.isFinite(detail.threshold) ||
+    !Array.isArray(detail.joins)
+  ) {
+    return null;
+  }
+
+  const joins: JoinPopulationBlockedOffender[] = [];
+  for (const raw of detail.joins) {
+    if (!isRecord(raw) || typeof raw.join_id !== "string") return null;
+    if (
+      typeof raw.population_participation !== "string" ||
+      typeof raw.status !== "string" ||
+      (raw.row_effect_ratio !== null &&
+        typeof raw.row_effect_ratio !== "number") ||
+      (raw.reason !== null && typeof raw.reason !== "string")
+    ) {
+      return null;
+    }
+    joins.push({
+      join_id: raw.join_id,
+      join_label: typeof raw.join_label === "string" ? raw.join_label : null,
+      left_table_name:
+        typeof raw.left_table_name === "string" ? raw.left_table_name : null,
+      right_table_name:
+        typeof raw.right_table_name === "string" ? raw.right_table_name : null,
+      left_column_name:
+        typeof raw.left_column_name === "string" ? raw.left_column_name : null,
+      right_column_name:
+        typeof raw.right_column_name === "string" ? raw.right_column_name : null,
+      population_participation: raw.population_participation,
+      status: raw.status,
+      row_effect_ratio: raw.row_effect_ratio,
+      reason: raw.reason,
+    });
+  }
+  return {
+    code: "JOIN_POPULATION_BLOCKED",
+    message: detail.message,
+    threshold: detail.threshold,
+    joins,
+  };
+}
+
 export type GitCommitEntry = {
   sha: string;
   type: string;

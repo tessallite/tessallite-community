@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useQueries, useQuery } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { safeLocalGet } from "../utils/safeLocalStorage";
-import type { Hierarchy, HierarchyLevel } from "./types";
+import type { Hierarchy, HierarchyDetail, HierarchyLevel } from "./types";
 import {
   aggregatesApi,
   aiOptimizerApi,
@@ -25,6 +25,7 @@ import {
   namedSetsApi,
   modelsApi,
   optimizerApiClient,
+  parametersApi,
   preferencesApi,
   personasApi,
   pocketsApi,
@@ -176,14 +177,27 @@ export function useAllModelTables(
   sourceIds: string[],
 ) {
   const sortedSourceIds = [...sourceIds].sort();
+  const queryClient = useQueryClient();
   return useQuery({
     queryKey: ["allModelTables", projectId, modelId, sortedSourceIds],
     queryFn: async () => {
-      const results = await Promise.all(
-        sortedSourceIds.map((sid) => modelTablesApi.list(projectId, modelId, sid))
-      );
-      return results.flat();
+      // Bug-9158: the Builder canvas needs every table's attributes, so the
+      // source/table fan-out was an O(number-of-tables) model-open path.  The
+      // model-scoped batch response hydrates both the catalogue and each
+      // per-table React Query cache in one request.
+      const rows = await modelTablesApi.listWithAttributes(projectId, modelId);
+      for (const row of rows) {
+        queryClient.setQueryData(
+          ["tableAttributes", projectId, modelId, row.table.id],
+          row.attributes,
+        );
+      }
+      return rows;
     },
+    // Keep the public hook shape stable for existing panels while retaining
+    // the raw batch rows in React Query's cache for consumers that need the
+    // already-hydrated attributes (notably ModelDetails/ModelTab).
+    select: (rows) => rows.map((row) => row.table),
     enabled: !!projectId && !!modelId && sortedSourceIds.length > 0,
   });
 }
@@ -210,9 +224,9 @@ export function useHierarchies(projectId: string, modelId: string) {
 
 /**
  * Fetch every hierarchy on the model together with its levels.  The backend
- * list endpoint returns `Hierarchy[]` (metadata only, no levels); level detail
- * lives on a per-hierarchy `listLevels` call.  `useQueries` runs the level
- * fetches in parallel and joins the result without an N+1 re-render storm.
+ * list endpoint returns `Hierarchy[]` (metadata only, no levels). The
+ * model-scoped batch endpoint returns the complete details and hydrates the
+ * per-hierarchy caches used by detail panels.
  *
  * Used by the canvas segmentation (A1) and hierarchy grouping overlay (A3).
  */
@@ -221,40 +235,30 @@ export interface HierarchyWithLevels extends Hierarchy {
 }
 
 export function useHierarchiesWithLevels(projectId: string, modelId: string) {
-  const hierarchies = useHierarchies(projectId, modelId);
-  const hierarchyList = hierarchies.data;
-
-  const levelQueries = useQueries({
-    queries: (hierarchyList ?? []).map((h) => ({
-      queryKey: ["hierarchyLevels", projectId, modelId, h.id],
-      queryFn: () => hierarchiesApi.listLevels(projectId, modelId, h.id),
-      enabled: !!projectId && !!modelId && !!h.id,
-    })),
+  const queryClient = useQueryClient();
+  const query = useQuery<HierarchyDetail[]>({
+    queryKey: ["hierarchiesWithLevels", projectId, modelId],
+    queryFn: async () => {
+      const rows = await hierarchiesApi.listWithLevels(projectId, modelId);
+      for (const row of rows) {
+        queryClient.setQueryData(
+          ["hierarchyLevels", projectId, modelId, row.id],
+          row.levels,
+        );
+      }
+      return rows;
+    },
+    enabled: Boolean(projectId && modelId),
   });
-
-  // Memoise the joined result. Without this, `data` is a brand-new array with
-  // brand-new objects on every render — which invalidates any downstream
-  // useMemo keyed on `data` (notably the Canvas segmentation/hierarchy-group
-  // memos) and triggers a setNodes re-run that wipes ReactFlow's internal
-  // node dimensions, leaving every node stuck at `visibility: hidden`.
-  // Keyed on data-pointer equality via dataUpdatedAt timestamps.
-  const levelUpdatedKey = levelQueries.map((q) => q.dataUpdatedAt ?? 0).join("|");
-  const isLoading = hierarchies.isLoading || levelQueries.some((q) => q.isLoading);
-  const isError = hierarchies.isError || levelQueries.some((q) => q.isError);
-
-  const data = useMemo<HierarchyWithLevels[]>(() => {
-    const list = hierarchyList ?? [];
-    return list.map((h, idx) => ({
-      ...h,
-      levels: levelQueries[idx]?.data ?? [],
-    }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hierarchyList, levelUpdatedKey]);
-
-  return useMemo(
-    () => ({ data, isLoading, isError }),
-    [data, isLoading, isError],
+  const data = useMemo<HierarchyWithLevels[]>(
+    () => (query.data ?? []).map((hierarchy) => ({
+      ...hierarchy,
+      level_count: hierarchy.levels.length,
+      level_names: hierarchy.levels.map((level) => level.name),
+    })),
+    [query.data],
   );
+  return { ...query, data };
 }
 
 export function useHierarchyLevels(
@@ -551,6 +555,30 @@ export function usePersona(
   });
 }
 
+export function useParameters(projectId: string, modelId: string) {
+  return useQuery({
+    queryKey: ["parameters", projectId, modelId],
+    queryFn: () => parametersApi.list(projectId, modelId),
+    enabled: !!projectId && !!modelId,
+  });
+}
+
+/**
+ * Mandatory read-only preflight for the explicit ``@`` persona contract.
+ * It compares persisted persona keys with the deployed parameter snapshot;
+ * the editor surfaces any collision without rewriting the saved persona.
+ */
+export function usePersonaParameterCollisionPreflight(
+  projectId: string,
+  modelId: string,
+) {
+  return useQuery({
+    queryKey: ["personaParameterCollisionPreflight", projectId, modelId],
+    queryFn: () => personasApi.parameterCollisionPreflight(projectId, modelId),
+    enabled: !!projectId && !!modelId,
+  });
+}
+
 
 // ---------------------------------------------------------------------------
 // SSE — Agent token streaming
@@ -811,6 +839,21 @@ export function useNamedQueries(projectId: string, modelId: string) {
     () => ({ data, isLoading, isError, isFetching, refetch }),
     [data, isLoading, isError, isFetching, refetch],
   );
+}
+
+/** Bug-9172: existing QueryLog timing/byte telemetry attributed to one Named
+ * Query. The id gate keeps create-mode dialogs from querying an absent row. */
+export function useNamedQueryAnalytics(
+  projectId: string,
+  modelId: string,
+  namedQueryId: string | null | undefined,
+  days = 30,
+) {
+  return useQuery({
+    queryKey: ["namedQueryAnalytics", projectId, modelId, namedQueryId, days],
+    queryFn: () => namedQueriesApi.analytics(projectId, modelId, namedQueryId!, days),
+    enabled: Boolean(projectId && modelId && namedQueryId),
+  });
 }
 
 export interface NamedQueryCaps {

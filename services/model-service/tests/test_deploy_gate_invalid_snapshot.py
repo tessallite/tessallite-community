@@ -94,3 +94,23 @@ def test_validated_uda_passes():
         ]
     )
     _deploy(snap)  # no raise
+
+
+def test_bug_8614_multi_table_snapshot_without_fact_is_rejected_at_deploy():
+    snap = _base_snapshot(
+        tables=[
+            {"id": "dim-a", "physical_name": "customers", "table_type": "dim_detail"},
+            {"id": "dim-b", "physical_name": "regions", "table_type": "dim_detail"},
+        ]
+    )
+    with pytest.raises(HTTPException) as ei:
+        _deploy(snap)
+    assert ei.value.status_code == 409
+    assert "exactly one fact table" in ei.value.detail
+
+
+def test_bug_8614_single_table_snapshot_is_implicitly_fact():
+    snap = _base_snapshot(
+        tables=[{"id": "one", "physical_name": "events", "table_type": "dim_detail"}]
+    )
+    _deploy(snap)

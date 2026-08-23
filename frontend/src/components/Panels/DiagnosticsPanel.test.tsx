@@ -206,7 +206,9 @@ describe("DiagnosticsPanel AI run status labels (F-559-04)", () => {
           model_id: "model-1",
           triggered_by: "manual",
           status: "queued",
-          is_dry_run: false,
+          // Bug-9407-SPA: the shipped advisor's preview mode is visible in
+          // the same status surface as the durable queued state.
+          is_dry_run: true,
           started_at: "2026-08-11T10:00:00Z",
           completed_at: null,
           llm_provider: null,
@@ -234,5 +236,6 @@ describe("DiagnosticsPanel AI run status labels (F-559-04)", () => {
     const row = (await screen.findByText("claude-pending-marker")).closest("tr")!;
     expect(row.textContent).toContain("Queued");
     expect(row.textContent).not.toContain("queued");
+    expect(row.textContent).toContain("Dry run");
   });
 });

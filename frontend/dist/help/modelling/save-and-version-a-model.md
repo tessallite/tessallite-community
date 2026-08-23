@@ -2,7 +2,7 @@
 title: "Save and Version a Model"
 audience: modeller
 area: modelling
-updated: 2026-07-17
+updated: 2026-08-18
 ---
 
 ![Model Builder toolbar showing the Save, Deploy, and Versions buttons.](../assets/screencaps/model-builder-toolbar-save.png)
@@ -78,6 +78,27 @@ You can always switch between the two options before clicking Save.
 1. On the toolbar, click the **Versions** button (clock icon).
 2. The Versions dialog lists every saved version with version number, who saved it, when, and an optional summary.
 3. The version that is currently deployed shows a green badge.
+
+---
+
+## Reviewing and discarding pending changes
+
+At any moment a model can be in three states at once: the **draft** you are editing, the **last saved** version, and the **deployed** version the gateway actually serves. When they drift apart it is easy to lose track of what you have changed but not saved, or saved but not yet deployed. The **Pending changes** tab in the Versions dialog lays this out and lets you throw work away cleanly.
+
+Open the Versions dialog (clock icon) and select the **Pending changes** tab. It shows two groups:
+
+- **Unsaved edits** — everything you have changed in the editor since your last Save, compared against the last saved version. This is the work that would be lost if you closed the model without saving.
+- **Saved but not deployed** — the difference between your last saved version and the version currently serving queries. These are changes that are safely saved but that live BI users are not seeing yet, because only a Deploy makes a version live.
+
+Each group shows a count and a **Review changes** button. Reviewing opens the same field-by-field difference view you get when comparing two saved versions, so you can see exactly which measures, dimensions, calendars, named queries, and relationships changed before you decide.
+
+### Discard unsaved edits
+
+If you have been experimenting and want to throw the experiment away, click **Discard unsaved edits**. Tessallite restores the editor to your last saved version and drops everything you changed since. This affects only your draft — what the gateway serves does not change, so discarding is safe to do at any time. Because the discarded edits were never saved, they cannot be recovered, so you are asked to confirm first.
+
+### Discard back to the deployed version
+
+**Discard to deployed version** goes further: it resets the whole draft back to the version that is currently live, throwing away both your unsaved edits and any saved-but-undeployed changes. Your saved versions are **not** deleted — they stay in the history and an admin can redeploy or revert to them later. This is the "start again from what is in production" button, so it carries the same admin permission and typed confirmation as Revert, and it never changes governance (personas, row security, data tags, or certification).
 
 ---
 

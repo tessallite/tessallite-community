@@ -70,6 +70,51 @@ class ParameterError(ValueError):
     """
 
 
+def colliding_sigil_bare_names(canonical_names: list[str]) -> set[str]:
+    """Bare names that appear both with and without a leading ``@``.
+
+    Bug-9493: ``.lstrip("@")`` collapses ``@Region`` and ``Region`` into one
+    catalogue identity. Callers use this set to keep session-variable keys
+    unambiguous while preserving the modern ``@Name`` → ``app.name`` contract.
+    """
+    with_sigil: set[str] = set()
+    without: set[str] = set()
+    for name in canonical_names:
+        bare = name.lstrip("@").lower()
+        if not bare:
+            continue
+        if name.startswith("@"):
+            with_sigil.add(bare)
+        else:
+            without.add(bare)
+    return with_sigil & without
+
+
+def parameter_session_var_key(
+    canonical_name: str,
+    *,
+    colliding_bare: set[str] | None = None,
+) -> str:
+    """Exact JDBC session-variable key for a deployed parameter.
+
+    Modern create-time names always carry ``@`` and publish ``app.<bare>``.
+    When a legacy bare name collides with a sigil form of the same bare token,
+    the catalogue still publishes a distinct key for the legacy row
+    (``app.legacy.<bare>``) so identities remain auditable — but both colliding
+    rows must be marked ``sql_usable=false`` (R2-PCR-002). Supported SQL can
+    only address ``@Name`` placeholders; a usable legacy override would be a
+    silent no-op.
+    """
+    bare = canonical_name.lstrip("@")
+    if (
+        colliding_bare
+        and bare.lower() in colliding_bare
+        and not canonical_name.startswith("@")
+    ):
+        return f"app.legacy.{bare}".lower()
+    return f"app.{bare}".lower()
+
+
 async def resolve_parameters(
     model_id: str,
     session_vars: dict[str, str],
@@ -137,6 +182,8 @@ async def resolve_parameters(
     # persona definition. Build a case-insensitive lookup.
     persona_lower = {k.lower(): v for k, v in persona_filters.items()}
 
+    colliding_bare = colliding_sigil_bare_names([str(p.name or "") for p in params])
+
     resolved: dict[str, Any] = {}
     for p in params:
         name = p.name
@@ -145,8 +192,9 @@ async def resolve_parameters(
         # Bug-7663: comparison is now case-insensitive.
         if referenced_lower is not None and name.lower() not in referenced_lower:
             continue
-        bare_name = name.lstrip("@")
-        session_key = f"app.{bare_name}".lower()
+        session_key = parameter_session_var_key(
+            str(name or ""), colliding_bare=colliding_bare,
+        )
 
         if name.lower() in persona_lower:
             value = _coerce(p.param_type, persona_lower[name.lower()], name)

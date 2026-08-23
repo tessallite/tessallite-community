@@ -49,6 +49,7 @@ from src.jdbc.liveness_watchdog import (
 _PROBE_TIMEOUT = 0.5
 _INTERVAL = 0.01
 _TEST_DEADLINE = 30.0
+_STATE_OBSERVATION_TIMEOUT = 1.0
 
 
 class _ControllableListener:
@@ -69,13 +70,41 @@ class _ControllableListener:
         self._sock.settimeout(0.02)
         self.port: int = self._sock.getsockname()[1]
         self.accepting = True
+        self._state_condition = threading.Condition()
+        self._observed_accepting: bool | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
+    def set_accepting(self, accepting: bool) -> None:
+        self.accepting = accepting
+
+    def wait_until_observed(self, accepting: bool) -> None:
+        """Wait until the real accept loop has observed the requested state.
+
+        Bug-8533's startup-grace test must not race a thread still blocked in
+        ``accept()``.  A fixed sleep can let the first probe dequeue a queued
+        connection before the thread notices ``accepting=False``.
+        """
+        deadline = time.monotonic() + _STATE_OBSERVATION_TIMEOUT
+        with self._state_condition:
+            while self._observed_accepting is not accepting:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        "the listener accept loop did not acknowledge "
+                        f"accepting={accepting} within "
+                        f"{_STATE_OBSERVATION_TIMEOUT}s"
+                    )
+                self._state_condition.wait(timeout=remaining)
+
     def _serve(self) -> None:
         while not self._stop.is_set():
-            if not self.accepting:
+            accepting = self.accepting
+            with self._state_condition:
+                self._observed_accepting = accepting
+                self._state_condition.notify_all()
+            if not accepting:
                 time.sleep(0.005)
                 continue
             try:
@@ -128,8 +157,9 @@ async def _drive(
 
     async def scripted_probe(host: str, port: int, *, timeout: float):
         idx = len(results)
-        node.accepting = script[idx] if idx < len(script) else script[-1]
-        await asyncio.sleep(0.03)  # let the accepter thread observe the flag
+        accepting = script[idx] if idx < len(script) else script[-1]
+        node.set_accepting(accepting)
+        node.wait_until_observed(accepting)
         outcome = await probe_jdbc_accept_loop_async(host, port, timeout)
         results.append(outcome)
         return outcome

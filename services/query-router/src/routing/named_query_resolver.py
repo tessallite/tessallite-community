@@ -206,21 +206,122 @@ def _meaningful_tokens(sql: str, dialect: str = "postgres"):
     ]
 
 
-def named_query_reference_name(sql: str, dialect: str = "postgres") -> Optional[str]:
-    """Return the referenced name when ``sql`` is a named-query-shaped
-    reference, else None.
+# A name token immediately after the ``@``. ``VAR`` is the bare spelling
+# (``@nq``); ``IDENTIFIER`` is the quoted one (``@"nq"``), which BI IDEs emit
+# because they quote every identifier by default (Bug-9398).
+_NAME_TOKEN_TYPES = (TokenType.VAR, TokenType.IDENTIFIER)
 
-    The EXACT v1 shape (invariant 5): the whole statement is
+
+@dataclass(frozen=True)
+class NamedQueryReference:
+    """A recognised ``SELECT * FROM @name`` reference and its row window.
+
+    ``limit`` / ``offset`` carry a trailing ``LIMIT n`` / ``OFFSET n`` when the
+    reference had one. They are the CALLER's explicit intent and are applied to
+    the served rows; they are deliberately NOT pushed into the Named Query's
+    re-dispatched definition, because the canonical population is a function of
+    the deployed definition alone (Bug-9173 / NQ2R1-F6).
+    """
+
+    name: str
+    limit: Optional[int] = None
+    offset: Optional[int] = None
+
+
+def _from_position_name(tokens, i: int) -> tuple[Optional[str], int]:
+    """Read an ``@name`` sitting immediately after the FROM at ``tokens[i]``.
+
+    Returns ``(name, index_of_last_consumed_token)``, or ``(None, i)``. Handles
+    both the bare ``@nq`` (``PARAMETER`` + ``VAR``) and the quoted ``@"nq"``
+    (``PARAMETER`` + ``IDENTIFIER``) spellings, plus the fully-quoted ``"@nq"``
+    which the lexer collapses into ONE ``IDENTIFIER`` whose text carries the
+    ``@`` (so there is no ``PARAMETER`` token to key on at all).
+    """
+    nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+    if nxt is None:
+        return None, i
+    if nxt.token_type is TokenType.PARAMETER:
+        var = tokens[i + 2] if i + 2 < len(tokens) else None
+        if var is not None and var.token_type in _NAME_TOKEN_TYPES:
+            name = var.text.strip()
+            return (name, i + 2) if name else (None, i)
+        return None, i
+    if nxt.token_type is TokenType.IDENTIFIER:
+        text = nxt.text.strip()
+        if text.startswith("@") and len(text) > 1:
+            return text[1:], i + 1
+    return None, i
+
+
+def _trailing_row_window(tokens) -> tuple[Optional[int], Optional[int], bool]:
+    """Parse a trailing ``LIMIT n`` / ``OFFSET n`` tail (either order).
+
+    Returns ``(limit, offset, ok)``. ``ok`` is False for any tail this v1 does
+    not accept — an expression limit, ``LIMIT ALL``, a negative or non-integer
+    count, MySQL's ``LIMIT a, b``, a repeated clause, or any other token.
+    Rejecting is the safe outcome: an accepted-but-unapplied window would
+    silently return the wrong number of rows.
+    """
+    limit: Optional[int] = None
+    offset: Optional[int] = None
+    i = 0
+    while i < len(tokens):
+        tt = tokens[i].token_type
+        if tt is TokenType.LIMIT and limit is None:
+            target = "limit"
+        elif tt is TokenType.OFFSET and offset is None:
+            target = "offset"
+        else:
+            return None, None, False
+        num = tokens[i + 1] if i + 1 < len(tokens) else None
+        if num is None or num.token_type is not TokenType.NUMBER:
+            return None, None, False
+        try:
+            value = int(num.text)
+        except (TypeError, ValueError):
+            # A float / scientific-notation count (``LIMIT 1e2``) is not an
+            # integer row count in this v1; refuse rather than round.
+            return None, None, False
+        if value < 0:
+            return None, None, False
+        if target == "limit":
+            limit = value
+        else:
+            offset = value
+        i += 2
+    return limit, offset, True
+
+
+def named_query_reference(
+    sql: str, dialect: str = "postgres",
+) -> Optional[NamedQueryReference]:
+    """Recognise a Named Query reference and its row window, else None.
+
+    The v1 shape (invariant 5) is the whole statement
     ``SELECT * FROM @name`` — no projection subset, no join, no WHERE, no
-    decoration of any kind (a trailing semicolon and surrounding whitespace
-    are tolerated). Recognition is token-level on the sqlglot lexer: an
-    ``@name`` inside a string literal or comment is not a placeholder and
-    never matches. This is the shape check the parameter-binding step uses to
-    whitelist the placeholder AND the step-1.6 interceptor uses to dispatch.
+    ORDER BY, no nesting. A trailing semicolon and surrounding whitespace are
+    tolerated.
+
+    Bug-9398 widens the shape in exactly two ways, both driven by what BI
+    clients actually send rather than by what a user would type:
+
+    * an OPTIONAL trailing ``LIMIT n`` and/or ``OFFSET n``, in either order —
+      JDBC IDEs (DBeaver, Excel "view data") append one to every browse, so a
+      perfectly good Named Query looked broken on first click; and
+    * a quoted name — ``@"nq"`` or ``"@nq"`` — because those same clients quote
+      identifiers by default.
+
+    Everything else stays rejected. ORDER BY in particular is NOT accepted: the
+    materialised and live legs would have to sort identically for it to mean
+    anything, and silently ignoring it would reorder the user's result.
+
+    Recognition is token-level on the sqlglot lexer, so an ``@name`` inside a
+    string literal or comment never matches.
     """
     meaningful = _meaningful_tokens(sql, dialect)
-    # Expected token stream: SELECT, STAR, FROM, PARAMETER(@), VAR(name).
-    if len(meaningful) != 5:
+    # Head: SELECT, STAR, FROM, then the @name (2 tokens bare, 2 quoted, or 1
+    # when the whole reference is a single quoted identifier).
+    if len(meaningful) < 4:
         return None
     if meaningful[0].token_type is not TokenType.SELECT:
         return None
@@ -228,11 +329,13 @@ def named_query_reference_name(sql: str, dialect: str = "postgres") -> Optional[
         return None
     if meaningful[2].token_type is not TokenType.FROM:
         return None
-    if meaningful[3].token_type is not TokenType.PARAMETER:
+    name, last = _from_position_name(meaningful, 2)
+    if name is None:
         return None
-    if meaningful[4].token_type is not TokenType.VAR:
+    limit, offset, ok = _trailing_row_window(meaningful[last + 1:])
+    if not ok:
         return None
-    return meaningful[4].text.strip()
+    return NamedQueryReference(name=name, limit=limit, offset=offset)
 
 
 def sql_references_named_query_position(sql: str) -> Optional[str]:
@@ -240,22 +343,24 @@ def sql_references_named_query_position(sql: str) -> Optional[str]:
 
     Used to give the specific ``NQ_UNSUPPORTED_SHAPE`` error instead of the
     generic unknown-placeholder error: a query that places ``@name`` as the
-    FROM target but is NOT the exact reference shape. Returns None when no
+    FROM target but is NOT an accepted reference shape. Returns None when no
     ``@name`` sits in FROM position.
+
+    Recognises the same three spellings as ``named_query_reference`` (Bug-9398)
+    so a decorated query using a QUOTED name still reaches the Named Query
+    error surface instead of failing later with a generic bind error naming a
+    table nobody created.
     """
     tokens = _meaningful_tokens(sql)
     for i, tok in enumerate(tokens):
         if tok.token_type is not TokenType.FROM:
             continue
-        # The table reference is the token right after FROM (skipping
-        # nothing — a parenthesised derived table or a real table name ends
-        # the check; only an immediate PARAMETER+VAR pair is an @-reference).
-        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
-        if nxt is None or nxt.token_type is not TokenType.PARAMETER:
-            continue
-        var = tokens[i + 2] if i + 2 < len(tokens) else None
-        if var is not None and var.token_type is TokenType.VAR:
-            return var.text.strip()
+        # The table reference is the token right after FROM: only an immediate
+        # @-reference counts (a parenthesised derived table or a real table
+        # name ends the check).
+        name, _ = _from_position_name(tokens, i)
+        if name is not None:
+            return name
     return None
 
 

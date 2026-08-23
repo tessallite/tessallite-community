@@ -41,8 +41,11 @@ If you have forgotten the System Admin password, it is stored in the `.env` file
 1. In the System Administration screen, click the **Workspaces** tab.
 2. Click **New Workspace**.
 3. Fill in the required fields (see the field reference below).
-4. Enter the email address for the first **Tenant Admin** -- the person who will manage users, roles, and settings inside this workspace.
-5. Click **Create**.
+4. Click **Create**.
+
+Creating a workspace provisions the workspace itself -- its record and its two
+database schemas. It does **not** create any user accounts. You add the first
+user in a separate step; see [Add the first user](#add-the-first-user) below.
 
 ---
 
@@ -52,7 +55,9 @@ If you have forgotten the System Admin password, it is stored in the `.env` file
 |---|---|---|
 | **Display name** | The human-readable label shown throughout the UI. Can be changed at any time after creation. | Free text; maximum 80 characters. |
 | **Slug** | A short, machine-friendly identifier. This becomes the JDBC database name and the XMLA catalog name that analysts use when connecting BI tools. | Lowercase letters, numbers, and hyphens only. No spaces. Must be unique across the entire installation. |
-| **Tenant Admin email** | The email address of the first administrator for this workspace. Tessallite creates this user automatically and sends an invitation. | Must be a valid email address. |
+
+There is no "administrator email" field. A new workspace starts with no users;
+you create the first account yourself once the workspace exists.
 
 ---
 
@@ -79,9 +84,39 @@ When you click Create, Tessallite provisions several things in the background:
 
    These schemas are the isolation boundary. No other tenant can read or write to them. The Fernet-encrypted database connection URL stored in the SystemTenant record ensures that even at the platform level, credentials are not exposed in plaintext.
 
-3. **A Tenant Admin user** with the email address you provided. This user receives an invitation and, once they sign in, can create projects, invite other users, assign roles, and configure workspace-level settings.
+This provisioning sequence completes in seconds. Once it finishes, the new
+workspace appears in the System Admin's workspace list. The workspace has no
+users yet -- add the first one next.
 
-This entire provisioning sequence completes in seconds. Once it finishes, the new workspace appears in the System Admin's workspace list and the Tenant Admin can sign in immediately.
+---
+
+## Add the first user
+
+A new workspace has no accounts, so nobody can sign in to it until you create
+one. Tessallite does not send invitation emails; an administrator sets each
+user's password directly and passes the credentials to the person out of band
+(or the user signs in through single sign-on -- see below).
+
+To create the first Tenant Admin:
+
+1. In the System Administration screen, open the workspace you just created.
+2. Click **Add User**.
+3. Enter a username, the person's email address, and an initial password. The
+   password must meet the complexity rule shown under the field (at least 12
+   characters, with an upper-case letter, a lower-case letter, and a number).
+4. Choose the **Tenant Admin** role so this first user can manage the workspace.
+5. Click **Save**, then give the email and password to the new administrator.
+
+That user can then sign in and, from the workspace **Admin > Users** tab, add
+the rest of the team the same way. See [Manage Users](../admin/manage-users.md).
+
+### Single sign-on (optional)
+
+If the workspace is configured for single sign-on, you do not have to create
+accounts by hand. The first time someone signs in through the identity
+provider, Tessallite provisions their account automatically (just-in-time
+provisioning) and assigns the role your SSO mapping specifies. A password is
+never set for these users -- the identity provider owns authentication.
 
 ---
 
@@ -95,9 +130,9 @@ If you need more tenants, upgrade your licence. See the System Administration li
 
 ## Verify the new tenant
 
-After creating a tenant, confirm that provisioning succeeded:
+After creating a tenant and adding its first user, confirm that provisioning succeeded:
 
-1. Ask the Tenant Admin to sign in at the Tessallite URL using the email address you entered and the password from their invitation.
+1. Ask the Tenant Admin to sign in at the Tessallite URL using the email address and password you set when you created their account (or through single sign-on).
 2. After sign-in, the Workspace Explorer should appear with the new workspace name displayed. The workspace will be empty (no projects or models yet) -- this is expected.
 3. Back in the System Admin screen, the new tenant should appear in the **Workspaces** tab with an active status indicator.
 

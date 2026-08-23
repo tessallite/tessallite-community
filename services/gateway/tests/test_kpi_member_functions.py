@@ -73,6 +73,25 @@ def test_find_multiple_in_order():
     assert [f[1] for f in found] == ["KPIValue", "KPIGoal"]
 
 
+def test_bug8383_range_union_is_refused_before_batch():
+    """Bug-8383/L1-R1-005: range-plus-member cannot become an AND filter."""
+    where_expr = (
+        "[Calendar].[Calendar].[Month].&[4]:"
+        "[Calendar].[Calendar].[Month].&[6], "
+        "[Calendar].[Calendar].[Month].&[8]"
+    )
+    where_filters = xmla_server._mdx_extract_where_filters(
+        where_expr, {"Calendar"},
+    )
+    with pytest.raises(ValueError, match="range union"):
+        xmla_server._translate_kpi_slicer_filters(
+            where_expr,
+            where_filters,
+            [{"id": "dim-calendar", "name": "Calendar"}],
+            {"Calendar"},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Property resolution
 # ---------------------------------------------------------------------------
@@ -257,10 +276,9 @@ async def test_live_goal_prefers_target_then_goal_alias():
 
 
 @pytest.mark.asyncio
-async def test_live_slicer_alongside_kpi_fails_loud():
-    """A dimension slicer accompanying the KPI cell cannot be forwarded to the
-    single-KPI /evaluate route, so the live path fails loud rather than serving an
-    unfiltered governed number that contradicts the requested slice."""
+async def test_live_slicer_uses_governed_batch_filters():
+    """Bug-8383: a supported dimension slicer reaches evaluate-batch with its
+    dimension ID and is never sent to the single unsliced route."""
     kpi = _kpi_with_id()
     statement = (
         'SELECT FROM [modely] '
@@ -270,8 +288,133 @@ async def test_live_slicer_alongside_kpi_fails_loud():
         xmla_server, "get_model_kpis", new=AsyncMock(return_value=[kpi]),
     ), patch.object(
         xmla_server, "evaluate_kpi_governed", new=AsyncMock(),
+    ), patch.object(
+        xmla_server,
+        "evaluate_kpi_batch",
+        new=AsyncMock(return_value={_KPI_AA_ID: {"status": 1, "value": 42}}),
+    ) as mock_batch:
+        result = await xmla_server._maybe_resolve_kpi_members(
+            statement=statement,
+            model_id="model-1",
+            project_id="proj-1",
+            tenant_slug="acme",
+            jwt_token="jwt",
+            measures_meta=_MEASURES,
+            dimensions_meta=[
+                {"id": "dim-region", "name": "Region", "type": "text"},
+            ],
+            hierarchy_level_dim_map={},
+            hierarchy_default_dim_map={"[Region].[Region]": "Region"},
+            dim_names={"Region"},
+            model_slug="modely",
+            persona_id=None,
+            is_technical_view=True,
+        )
+    assert result[1][0][result[0][0]] == 1
+    mock_batch.assert_awaited_once()
+    assert mock_batch.await_args.kwargs["filters"] == [{
+        "dimension_id": "dim-region",
+        "operator": "eq",
+        "value": "EMEA",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_bug8383_bare_dimension_where_is_not_discarded():
+    """Bug-8383/L1-R1-004: bare single-member WHERE still reaches the batch.
+
+    Some clients omit tuple parentheses for one slicer. The gateway must not
+    turn that supported member into an empty WHERE and fall through to the
+    unsliced single-evaluate route.
+    """
+    bare_statement = "SELECT FROM [modely] WHERE [Region].[Region].[EMEA]"
+    assert xmla_server._mdx_where_expr(bare_statement) == (
+        "[Region].[Region].[EMEA]"
+    )
+    kpi = _kpi_with_id()
+    statement = (
+        'SELECT FROM [modely] '
+        'WHERE (KPIStatus("aa"), [Region].[Region].[EMEA])'
+    )
+    with patch.object(
+        xmla_server, "get_model_kpis", new=AsyncMock(return_value=[kpi]),
+    ), patch.object(
+        xmla_server, "evaluate_kpi_governed", new=AsyncMock(),
+    ), patch.object(
+        xmla_server,
+        "evaluate_kpi_batch",
+        new=AsyncMock(return_value={_KPI_AA_ID: {"status": 1, "value": 42}}),
+    ) as mock_batch:
+        result = await xmla_server._maybe_resolve_kpi_members(
+            statement=statement,
+            model_id="model-1",
+            project_id="proj-1",
+            tenant_slug="acme",
+            jwt_token="jwt",
+            measures_meta=_MEASURES,
+            dimensions_meta=[
+                {"id": "dim-region", "name": "Region", "type": "text"},
+            ],
+            hierarchy_level_dim_map={},
+            hierarchy_default_dim_map={"[Region].[Region]": "Region"},
+            dim_names={"Region"},
+            model_slug="modely",
+            persona_id=None,
+            is_technical_view=True,
+        )
+    assert result[1][0][result[0][0]] == 1
+    mock_batch.assert_awaited_once()
+    assert mock_batch.await_args.kwargs["filters"] == [{
+        "dimension_id": "dim-region",
+        "operator": "eq",
+        "value": "EMEA",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_live_slicer_without_filter_equivalent_fails_loud():
+    """Bug-8383: metadata without a dimension ID cannot be translated safely."""
+    kpi = _kpi_with_id()
+    statement = (
+        'SELECT FROM [modely] '
+        'WHERE (KPIStatus("aa"), [Region].[Region].[EMEA])'
+    )
+    with patch.object(
+        xmla_server, "get_model_kpis", new=AsyncMock(return_value=[kpi]),
     ):
-        with pytest.raises(ValueError, match="dimension slicer"):
+        with pytest.raises(ValueError, match="no model filter equivalent"):
+            await xmla_server._maybe_resolve_kpi_members(
+                statement=statement,
+                model_id="model-1",
+                project_id="proj-1",
+                tenant_slug="acme",
+                jwt_token="jwt",
+                measures_meta=_MEASURES,
+                dimensions_meta=[{"name": "Region", "type": "text"}],
+                hierarchy_level_dim_map={},
+                hierarchy_default_dim_map={"[Region].[Region]": "Region"},
+                dim_names={"Region"},
+                model_slug="modely",
+                persona_id=None,
+                is_technical_view=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_live_unsupported_set_slicer_fails_before_batch_translation():
+    """Bug-8383: Except() must not be reduced to an incorrect IN filter."""
+    kpi = _kpi_with_id()
+    statement = (
+        'SELECT FROM [modely] WHERE '
+        '(KPIStatus("aa"), Except({[Region].[Region].[EMEA]}, '
+        '{[Region].[Region].[AMER]}))'
+    )
+    with patch.object(
+        xmla_server, "get_model_kpis", new=AsyncMock(return_value=[kpi]),
+    ), patch.object(
+        xmla_server, "evaluate_kpi_batch", new=AsyncMock(),
+    ) as mock_batch:
+        with pytest.raises(ValueError, match=r"Unsupported MDX function 'Except\(\)'"):
             await xmla_server._maybe_resolve_kpi_members(
                 statement=statement,
                 model_id="model-1",
@@ -280,7 +423,7 @@ async def test_live_slicer_alongside_kpi_fails_loud():
                 jwt_token="jwt",
                 measures_meta=_MEASURES,
                 dimensions_meta=[
-                    {"name": "Region", "type": "text"},
+                    {"id": "dim-region", "name": "Region", "type": "text"},
                 ],
                 hierarchy_level_dim_map={},
                 hierarchy_default_dim_map={"[Region].[Region]": "Region"},
@@ -289,6 +432,41 @@ async def test_live_slicer_alongside_kpi_fails_loud():
                 persona_id=None,
                 is_technical_view=True,
             )
+    mock_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_dynamic_slicer_fails_without_batch_filter_equivalent():
+    """Bug-8383: parameter/dynamic sets cannot silently become unsliced KPIs."""
+    kpi = _kpi_with_id()
+    statement = (
+        'SELECT FROM [modely] WHERE '
+        '(KPIStatus("aa"), STRTOSET(@Region, CONSTRAINED))'
+    )
+    with patch.object(
+        xmla_server, "get_model_kpis", new=AsyncMock(return_value=[kpi]),
+    ), patch.object(
+        xmla_server, "evaluate_kpi_batch", new=AsyncMock(),
+    ) as mock_batch:
+        with pytest.raises(ValueError, match="no request-level filter equivalent"):
+            await xmla_server._maybe_resolve_kpi_members(
+                statement=statement,
+                model_id="model-1",
+                project_id="proj-1",
+                tenant_slug="acme",
+                jwt_token="jwt",
+                measures_meta=_MEASURES,
+                dimensions_meta=[
+                    {"id": "dim-region", "name": "Region", "type": "text"},
+                ],
+                hierarchy_level_dim_map={},
+                hierarchy_default_dim_map={"[Region].[Region]": "Region"},
+                dim_names={"Region"},
+                model_slug="modely",
+                persona_id=None,
+                is_technical_view=True,
+            )
+    mock_batch.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

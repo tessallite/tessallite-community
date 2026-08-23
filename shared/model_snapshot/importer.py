@@ -161,6 +161,27 @@ def _collect_pks(
             if _is_uuid_string(old) and old not in mapping:
                 mapping[old] = _fresh()
 
+    # Named Queries carry nested artifact and refresh-policy rows. Keep these
+    # ids in the same map as every other snapshot family so project/model
+    # imports rewrite every real source identity before rehydration. The
+    # rehydrator still mints definition/artifact ids defensively (it is not
+    # called only through this importer), but policy ids must be remapped here
+    # because they are nested model content (Bug-9222).
+    for nq in snapshot.get("named_queries", []) or []:
+        old = nq.get("id")
+        if _is_uuid_string(old) and old not in mapping:
+            mapping[old] = _fresh()
+        artifact = nq.get("artifact")
+        if isinstance(artifact, dict):
+            old = artifact.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+        policy = nq.get("refresh_policy")
+        if isinstance(policy, dict):
+            old = policy.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+
     # v2 — Glossary entries carry nested synonyms + attachments.
     for g in snapshot.get("glossary_entries", []) or []:
         old = g.get("id")

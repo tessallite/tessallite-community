@@ -17,13 +17,21 @@ from __future__ import annotations
 
 import types
 import uuid
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from .result_fakes import FakeScalarResult
 
 from shared.middleware.internal_bypass import internal_request_headers
+from shared.auth.service_principal import (
+    KPI_EVALUATOR_ROLE,
+    SCOPE_KPI_EVALUATE,
+    SCOPE_KPI_QUERY_EXECUTE,
+)
 from shared.schemas.pydantic_models import KPIEvaluateResponse
+from src.auth.middleware import CurrentServiceUser, get_current_user
+from src.main import app
 
 from .conftest import (
     NOW,
@@ -133,22 +141,79 @@ def _kpi_snapshot_dict(kpi: types.SimpleNamespace) -> dict:
     return {k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in vars(kpi).items()}
 
 
-def _version_with_kpis(kpi_list: list) -> types.SimpleNamespace:
+def _version_with_kpis(
+    kpi_list: list,
+    *,
+    dimensions: list[types.SimpleNamespace] | None = None,
+) -> types.SimpleNamespace:
     """Build a mock ModelVersion namespace with a snapshot containing ``kpi_list``."""
+    snapshot = {
+        "schema_version": "1.0",
+        "measures": [{"id": str(uuid.uuid4()), "name": "Revenue"}],
+        "kpis": [_kpi_snapshot_dict(k) for k in kpi_list],
+    }
+    if dimensions is not None:
+        snapshot["dimensions"] = [
+            {
+                "id": str(d.id),
+                "name": d.name,
+                "source_column_id": getattr(d, "source_column_id", None),
+            }
+            for d in dimensions
+        ]
+        snapshot["columns"] = []
     return types.SimpleNamespace(
         id=_VERSION_ID,
         model_id=TEST_MODEL_ID,
-        snapshot_json={
-            "schema_version": "1.0",
-            "measures": [{"id": str(uuid.uuid4()), "name": "Revenue"}],
-            "kpis": [_kpi_snapshot_dict(k) for k in kpi_list],
-        },
+        snapshot_json=snapshot,
     )
+
+
+@contextmanager
+def _service_publish_user(*, scopes: list[str] | None = None):
+    """Run one real route request as a typed KPI service principal.
+
+    The normal client fixture deliberately uses an ordinary human user.  The
+    Bug-9524 positive/negative cases override only that dependency for the
+    request under test, then restore the fixture's override so one test cannot
+    leak identity into the next one.
+    """
+    service_user = CurrentServiceUser(
+        principal="kpi-snapshot-sweep",
+        tenant_id="test-tenant",
+        role=KPI_EVALUATOR_ROLE,
+        scopes=list(scopes or [SCOPE_KPI_EVALUATE, SCOPE_KPI_QUERY_EXECUTE]),
+    )
+    previous = app.dependency_overrides.get(get_current_user)
+    app.dependency_overrides[get_current_user] = lambda: service_user
+    try:
+        yield service_user
+    finally:
+        if previous is None:
+            app.dependency_overrides.pop(get_current_user, None)
+        else:
+            app.dependency_overrides[get_current_user] = previous
+
+
+def _recording_publish_mock(writer_state: dict) -> AsyncMock:
+    """Make a mutation-sensitive global writer for publication tests."""
+    async def _publish(*_args, **_kwargs):
+        writer_state["writes"] += 1
+        writer_state["value"] = "published"
+        return types.SimpleNamespace(
+            succeeded=True,
+            failed=0,
+            persisted=1,
+            suppressed=0,
+        )
+
+    return AsyncMock(side_effect=_publish)
 
 
 def _model(deployed: bool = False) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         id=TEST_MODEL_ID,
+        project_id=TEST_PROJECT_ID,
         slug="acme_sales",
         fiscal_year_start_month=None,
         deployed_version_id=_VERSION_ID if deployed else None,
@@ -324,11 +389,12 @@ async def test_composite_indicators_agree_single_vs_batch(client):
         # the publish path fires and the indicator-agreement assertion below
         # still exercises the upsert payload (a per-user render correctly
         # skips the publish — covered by test_evaluate_batch_user_render_does_not_publish).
-        batch_resp = await client.post(
-            f"{PREFIX}/evaluate-batch",
-            json={"kpi_ids": [str(parent.id)]},
-            headers=internal_request_headers(),
-        )
+        with _service_publish_user():
+            batch_resp = await client.post(
+                f"{PREFIX}/evaluate-batch",
+                json={"kpi_ids": [str(parent.id)]},
+                headers=internal_request_headers(),
+            )
     assert batch_resp.status_code == 200
     batch_results = batch_resp.json()["results"]
     assert len(batch_results) == 1
@@ -495,9 +561,11 @@ async def test_batch_composite_depth_limit_fails_loud(client):
 
 @pytest.mark.asyncio
 async def test_evaluate_batch_service_context_publishes_kpi_latest(client):
-    """A governed service-context evaluate-batch (verified internal marker, no
-    persona) DOES publish to kpi_latest — the row that feeds the JDBC $KPIs
-    virtual table. This is the scheduler snapshot sweep's path.
+    """Bug-9524: only the real dual-scope service context publishes.
+
+    A governed service-context evaluate-batch (verified internal marker, no
+    persona or request filters) DOES publish to kpi_latest — the row that feeds
+    the JDBC $KPIs virtual table. This is the scheduler snapshot sweep's path.
 
     F-017-01: the publish gate now requires a DEPLOYED model, so this test
     provides one with a snapshot that pins the KPI definition."""
@@ -509,7 +577,8 @@ async def test_evaluate_batch_service_context_publishes_kpi_latest(client):
     # The resolver's all_live select is the first KPI pop; the requested load
     # is the second.
     db = _entity_db(model, [[kpi], [kpi]], version=version)
-    upsert_mock = AsyncMock()
+    writer_state = {"writes": 0, "value": "baseline"}
+    upsert_mock = _recording_publish_mock(writer_state)
     with (
         patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
         patch("src.api.kpis.resolve_effective_persona",
@@ -520,13 +589,118 @@ async def test_evaluate_batch_service_context_publishes_kpi_latest(client):
               side_effect=_fake_single_for(values)),
         patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
     ):
+        with _service_publish_user():
+            resp = await client.post(
+                f"{PREFIX}/evaluate-batch",
+                json={"kpi_ids": [str(kpi.id)]},
+                headers=internal_request_headers(),
+            )
+    assert resp.status_code == 200
+    assert resp.json()["results"][0]["value"] == pytest.approx(90.0)
+    upsert_mock.assert_awaited_once()
+    assert writer_state == {"writes": 1, "value": "published"}
+
+
+@pytest.mark.asyncio
+async def test_bug_9524_human_with_internal_marker_cannot_publish_kpi_latest(client):
+    """Bug-9524: an HMAC marker cannot turn a human render into a global write."""
+    kpi = _kpi(name="revenue_kpi", expression='measure("Revenue")', target_value=100.0)
+    model = _model(deployed=True)
+    version = _version_with_kpis([kpi])
+    values = {kpi.id: (90.0, 100.0)}
+    db = _entity_db(model, [[kpi], [kpi]], version=version)
+    writer_state = {"writes": 0, "value": "baseline"}
+    upsert_mock = _recording_publish_mock(writer_state)
+
+    with (
+        patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
+        patch("src.api.kpis.resolve_effective_persona",
+              new_callable=AsyncMock, return_value=None),
+        patch("src.api.kpis._batch_get_measure_values",
+              new_callable=AsyncMock, return_value={}),
+        patch("src.api.kpis._evaluate_single_kpi",
+              side_effect=_fake_single_for(values)),
+        patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
+    ):
+        # The client fixture supplies an ordinary CurrentUser.  The valid
+        # internal marker is intentionally present to prove it is not enough.
         resp = await client.post(
             f"{PREFIX}/evaluate-batch",
             json={"kpi_ids": [str(kpi.id)]},
             headers=internal_request_headers(),
         )
-    assert resp.status_code == 200
-    upsert_mock.assert_awaited_once()
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["results"][0]["value"] == pytest.approx(90.0)
+    upsert_mock.assert_not_awaited()
+    assert writer_state == {"writes": 0, "value": "baseline"}
+
+
+@pytest.mark.asyncio
+async def test_bug_9524_filtered_service_evaluation_cannot_publish_kpi_latest(client):
+    """Bug-9524: slices, partial scopes, and marker-less services stay scoped.
+
+    Each case drives the real handler against a deployed snapshot.  The
+    recording writer makes an accidental global write observable even if a
+    future implementation replaces the ``AsyncMock`` assertion with another
+    awaitable.
+    """
+    kpi = _kpi(name="revenue_kpi", expression='measure("Revenue")', target_value=100.0)
+    dimension = types.SimpleNamespace(
+        id=uuid.uuid4(), name="region", source_column_id=None,
+    )
+    version = _version_with_kpis([kpi], dimensions=[dimension])
+    values = {kpi.id: (90.0, 100.0)}
+    filtered_body = {
+        "kpi_ids": [str(kpi.id)],
+        "filters": [
+            {
+                "dimension_id": str(dimension.id),
+                "operator": "eq",
+                "value": "EU",
+            }
+        ],
+    }
+    cases = (
+        # Full KPI scopes are still not enough for a model-wide value when the
+        # handler evaluated a request slice.
+        ("filtered", [SCOPE_KPI_EVALUATE, SCOPE_KPI_QUERY_EXECUTE], filtered_body, True),
+        # A marker-bearing service missing the second hop scope cannot publish,
+        # even when it asks for the unfiltered model-wide evaluation.
+        ("partial-scope", [SCOPE_KPI_EVALUATE], {"kpi_ids": [str(kpi.id)]}, True),
+        # A complete service principal without the rotating marker is also not
+        # publication-authorized.
+        ("marker-less", [SCOPE_KPI_EVALUATE, SCOPE_KPI_QUERY_EXECUTE], {"kpi_ids": [str(kpi.id)]}, False),
+    )
+
+    for _case, scopes, body, has_marker in cases:
+        db = _entity_db(
+            _model(deployed=True), [[kpi], [kpi]], version=version,
+        )
+        writer_state = {"writes": 0, "value": "baseline"}
+        upsert_mock = _recording_publish_mock(writer_state)
+        headers = internal_request_headers() if has_marker else {}
+        with _service_publish_user(scopes=scopes):
+            with (
+                patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
+                patch("src.api.kpis.resolve_effective_persona",
+                      new_callable=AsyncMock, return_value=None),
+                patch("src.api.kpis._batch_get_measure_values",
+                      new_callable=AsyncMock, return_value={}),
+                patch("src.api.kpis._evaluate_single_kpi",
+                      side_effect=_fake_single_for(values)),
+                patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
+            ):
+                resp = await client.post(
+                    f"{PREFIX}/evaluate-batch",
+                    json=body,
+                    headers=headers,
+                )
+
+        assert resp.status_code == 200, f"{_case}: {resp.text}"
+        assert resp.json()["results"][0]["value"] == pytest.approx(90.0)
+        upsert_mock.assert_not_awaited()
+        assert writer_state == {"writes": 0, "value": "baseline"}
 
 
 @pytest.mark.asyncio
@@ -547,21 +721,22 @@ async def test_evaluate_batch_clamps_future_marker_and_preserves_earlier_marker(
     async def _run(marker_iso):
         db = _entity_db(_model(deployed=True), [[kpi], [kpi]], version=version)
         upsert_mock = AsyncMock()
-        with (
-            patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
-            patch("src.api.kpis.resolve_effective_persona",
-                  new_callable=AsyncMock, return_value=None),
-            patch("src.api.kpis._batch_get_measure_values",
-                  new_callable=AsyncMock, return_value={}),
-            patch("src.api.kpis._evaluate_single_kpi",
-                  side_effect=_fake_single_for(values)),
-            patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
-        ):
-            resp = await client.post(
-                f"{PREFIX}/evaluate-batch",
-                json={"kpi_ids": [str(kpi.id)], "eval_started_at": marker_iso},
-                headers=internal_request_headers(),
-            )
+        with _service_publish_user():
+            with (
+                patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
+                patch("src.api.kpis.resolve_effective_persona",
+                      new_callable=AsyncMock, return_value=None),
+                patch("src.api.kpis._batch_get_measure_values",
+                      new_callable=AsyncMock, return_value={}),
+                patch("src.api.kpis._evaluate_single_kpi",
+                      side_effect=_fake_single_for(values)),
+                patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
+            ):
+                resp = await client.post(
+                    f"{PREFIX}/evaluate-batch",
+                    json={"kpi_ids": [str(kpi.id)], "eval_started_at": marker_iso},
+                    headers=internal_request_headers(),
+                )
         assert resp.status_code == 200
         upsert_mock.assert_awaited_once()
         return upsert_mock.call_args.kwargs["eval_started_at"]
@@ -673,22 +848,23 @@ async def test_evaluate_batch_captures_epoch_before_evaluation_not_after(client)
         return result
 
     upsert_mock = AsyncMock()
-    with (
-        patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
-        patch("src.api.kpis.resolve_effective_persona",
-              new_callable=AsyncMock, return_value=None),
-        patch("src.api.kpis.resolve_served_kpis", side_effect=_resolve_and_mutate),
-        patch("src.api.kpis._batch_get_measure_values",
-              new_callable=AsyncMock, return_value={}),
-        patch("src.api.kpis._evaluate_single_kpi",
-              side_effect=_fake_single_for(values)),
-        patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
-    ):
-        resp = await client.post(
-            f"{PREFIX}/evaluate-batch",
-            json={"kpi_ids": [str(kpi.id)]},
-            headers=internal_request_headers(),
-        )
+    with _service_publish_user():
+        with (
+            patch("src.api.kpis.get_tenant_db", async_gen_from(db)),
+            patch("src.api.kpis.resolve_effective_persona",
+                  new_callable=AsyncMock, return_value=None),
+            patch("src.api.kpis.resolve_served_kpis", side_effect=_resolve_and_mutate),
+            patch("src.api.kpis._batch_get_measure_values",
+                  new_callable=AsyncMock, return_value={}),
+            patch("src.api.kpis._evaluate_single_kpi",
+                  side_effect=_fake_single_for(values)),
+            patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
+        ):
+            resp = await client.post(
+                f"{PREFIX}/evaluate-batch",
+                json={"kpi_ids": [str(kpi.id)]},
+                headers=internal_request_headers(),
+            )
     assert resp.status_code == 200, resp.text
 
     # opus5 round-2 finding 4.3: prove the mid-flight mutation actually FIRED

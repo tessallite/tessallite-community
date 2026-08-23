@@ -105,6 +105,15 @@ class MeasureValueProvider:
     # time-intelligence subtree via decomposed query-router queries. When
     # absent, TI subtrees evaluate to None (no silently-wrong values).
     evaluate_time_intelligence: object = None
+    # Bug-8682: the KPI's business-definition slice (filters + time window) that
+    # an on-miss measure lookup must answer under. LATE-BOUND on purpose: the
+    # provider is constructed by the caller, but the slice is per-KPI and is only
+    # known inside ``_evaluate_single_kpi``. Without it, a fallback measure
+    # lookup issues an UNFILTERED ``SELECT SUM("X") FROM "<model>"`` and answers
+    # a different question from the one the KPI asked (the EMEA KPI gets the
+    # all-regions number). ``_build_measure_provider``'s closure reads this
+    # attribute at CALL time, so setting it after construction takes effect.
+    measure_where_clause: str | None = None
 
 
 @dataclass

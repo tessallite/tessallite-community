@@ -37,7 +37,8 @@ No Tessallite login page is shown. The end user's identity comes from the `user_
 |-------|------|----------|---------|-------------|
 | `tenant_id` | string | yes | - | Target tenant slug |
 | `user_identity` | string | yes | - | Display name for audit trail |
-| `persona_id` | string | no | null | Lock to this persona's permissions |
+| `persona_id` | string | no | null | Lock Query Router to this model Persona's permissions |
+| `project_persona_id` | string | no | null | Independently lock the agent to this ProjectPersona's field scope |
 | `project_ids` | string[] | no | null | Restrict access to these project IDs only |
 | `model_ids` | string[] | no | null | Restrict visible models |
 | `capabilities` | string[] | no | `[]` (deny-all) | Allowed features: `query`, `chat`, `explore`. Omit or pass `[]` for no capabilities. |
@@ -53,6 +54,7 @@ No Tessallite login page is shown. The end user's identity comes from the `user_
     "tenant_id": "acme-demo",
     "user_identity": "viewer@customer.com",
     "persona_id": null,
+    "project_persona_id": null,
     "project_ids": null,
     "model_ids": null,
     "capabilities": ["query", "chat", "explore"],
@@ -65,7 +67,7 @@ No Tessallite login page is shown. The end user's identity comes from the `user_
 
 ## Scope fields
 
-**`persona_id`** locks the session to a specific persona. All row-level security filters and measure/dimension access rules for that persona apply. If omitted, the embedded user sees the default (unfiltered) view.
+**`persona_id`** locks Query Router to a specific model Persona. All row-level security filters and measure/dimension access rules for that persona apply. **`project_persona_id`** independently locks the conversational agent to a ProjectPersona's field scope. These are separate UUID namespaces; a legacy token with only `persona_id` has no ProjectPersona lock. If `persona_id` is omitted, query-router uses the normal authenticated-persona resolution.
 
 **`project_ids`** restricts which projects the embedded session can access. API calls targeting a project not in the list return 403. The embedded chat only loads and displays projects that appear in this list. If omitted, all projects in the tenant are accessible (subject to normal RBAC).
 

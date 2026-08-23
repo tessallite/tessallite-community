@@ -6,8 +6,9 @@ Pins the DRIVER contract with a fake session + stubbed source, the same way
 * it stages one evidence row per join, bound to the deploy epoch;
 * it CLEARS the model's previous verdicts first, so "no row" can only ever mean
   "not evaluated at the last deploy";
-* it is fail-open in every failure mode — a deploy can never fail because of it
-  (invariant 4 / plan phase G1 is warn-only);
+* it is fail-open in every measurement failure mode — a deploy can never fail
+  because a source could not be measured (G5 policy consumes only returned
+  measured rows);
 * ``measure=False`` records conservative verdicts without touching the source;
 * it issues the cheap two-query probe on a clean edge and only pays for the
   third (join-cardinality) query when a key is not unique in the data.
@@ -109,6 +110,38 @@ def _star(*, participation="preserve_base_rows", dim_pk=True, join_type="left"):
             _column(pk_col, "id", is_primary_key=dim_pk, table_id=dim_id),
         ],
     ), join
+
+
+def test_g5_legacy_snapshot_defaults_only_when_participation_key_is_absent():
+    """JPG-G5-SOL-R2-20260822: preserve omission, reject bad tokens."""
+    fact_id, dim_id = uuid.uuid4(), uuid.uuid4()
+    fact_col, dim_col = uuid.uuid4(), uuid.uuid4()
+    join_id = uuid.uuid4()
+
+    def _snapshot(join_fields):
+        return {
+            "tables": [
+                {"id": str(fact_id), "table_type": "fact"},
+                {"id": str(dim_id), "table_type": "dim_detail"},
+            ],
+            "columns": [
+                {"id": str(fact_col), "model_table_id": str(fact_id)},
+                {"id": str(dim_col), "model_table_id": str(dim_id),
+                 "is_primary_key": True},
+            ],
+            "joins": [{
+                "id": str(join_id), "left_table_id": str(fact_id),
+                "right_table_id": str(dim_id), "left_column_id": str(fact_col),
+                "right_column_id": str(dim_col), **join_fields,
+            }],
+        }
+
+    legacy_join = jpv._snapshot_graph(_snapshot({}))[0][0]
+    invalid_join = jpv._snapshot_graph(
+        _snapshot({"population_participation": "not-a-token"})
+    )[0][0]
+    assert legacy_join.population_participation == jpv.DEFAULT_POPULATION_PARTICIPATION
+    assert invalid_join.population_participation == jpv.POPULATION_PARTICIPATION_UNDECLARED
 
 
 def _patch_source(monkeypatch, side_rows, join_rows=None):

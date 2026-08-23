@@ -33,6 +33,21 @@ export interface ModelParameterUpdate {
   description?: string;
 }
 
+export interface PersonaParameterCollision {
+  persona_id: string;
+  persona_name: string;
+  persona_slug: string;
+  default_filter_key: string;
+  parameter_name: string;
+  suggested_key: string;
+}
+
+export interface PersonaParameterCollisionPreflightResponse {
+  model_id: string;
+  deployed_version_id: string | null;
+  collisions: PersonaParameterCollision[];
+}
+
 // ---------------------------------------------------------------------------
 // Schema drift
 // ---------------------------------------------------------------------------
@@ -52,6 +67,22 @@ export interface SchemaChangeEvent {
 export interface SchemaChangeEventListResponse {
   items: SchemaChangeEvent[];
   total: number;
+}
+
+export interface MeasureRenameImpactItem {
+  consumer_type: string;
+  consumer_id: string;
+  consumer_name: string | null;
+  field: string;
+}
+
+export interface MeasureRenameImpactResponse {
+  measure_id: string;
+  current_name: string;
+  new_name: string;
+  safe: boolean;
+  rewrites: MeasureRenameImpactItem[];
+  blockers: MeasureRenameImpactItem[];
 }
 
 // ---------------------------------------------------------------------------
@@ -135,9 +166,8 @@ export interface JoinPopulationHealthResponse {
   evaluated_count: number;
   warning_count: number;
   blocked_count: number;
-  // Always true in the current (warn-only) phase: BLOCKED is reported here,
-  // never enforced. Restated in the payload so a consumer never has to infer
-  // the enforcement posture from the absence of an error.
+  // Compatibility posture field. G5 returns false: measured policy blockers
+  // are enforced by deploy before publish state can commit.
   warn_only: boolean;
   items: JoinPopulationHealthItem[];
 }
@@ -401,6 +431,27 @@ export interface NamedQueryRefreshPolicy {
 export interface NamedQueryRefreshPolicyUpsert {
   cron_expression?: string | null;
   is_enabled?: boolean;
+}
+
+/** Existing QueryLog cost telemetry attributed to one Named Query. */
+export interface NamedQueryFallbackReasonCount {
+  reason: string;
+  count: number;
+}
+
+export interface NamedQueryAnalytics {
+  named_query_id: string;
+  window_days: number;
+  total_queries: number;
+  materialized_queries: number;
+  fallback_queries: number;
+  fallback_failures: number;
+  fallback_rate: number;
+  avg_fallback_execution_ms: number | null;
+  avg_fallback_bytes_processed: number | null;
+  fallback_reasons: NamedQueryFallbackReasonCount[];
+  recommendation: "none" | "repair_named_query_materialisation" | string;
+  recommendation_reason: string | null;
 }
 
 export interface NamedQueryRefreshRun {

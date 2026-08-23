@@ -102,6 +102,8 @@ COVERED: dict[str, str] = {
     "quantile_coverage": "nested under aggregates",
 }
 
+# NOTE: calendar_history_provenance is classified under EXCLUDED below.
+
 # Tables intentionally NOT in the snapshot, with the reason. Runtime telemetry,
 # history, version rows themselves, per-tenant identity, project-scoped config,
 # and secret tokens.
@@ -118,6 +120,9 @@ EXCLUDED: dict[str, str] = {
     # in a snapshot would make an import/revert re-fire a re-eval for an epoch
     # that no longer exists.
     "pending_kpi_reeval": "durable re-eval outbox; transient operational state",
+    # Server-issued undo/redo capability for auto-created calendar history.
+    # Runtime provenance token — not portable semantic model config.
+    "calendar_history_provenance": "runtime calendar undo/redo provenance token; not portable model config",
     "aggregate_refresh_runs": "runtime telemetry",
     "pocket_refresh_runs": "runtime telemetry",
     "named_query_refresh_runs": "runtime telemetry",

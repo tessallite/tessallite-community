@@ -39,6 +39,7 @@ import httpx
 from shared.auth.service_principal import (
     KPI_EVALUATOR_ROLE,
     SCOPE_KPI_EVALUATE,
+    SCOPE_KPI_QUERY_EXECUTE,
     create_service_access_token,
 )
 from shared.config.settings import get_settings
@@ -95,7 +96,7 @@ async def trigger_post_deploy_kpi_reeval(
             tenant_id=tenant_id,
             role=KPI_EVALUATOR_ROLE,
             ttl_minutes=2,
-            scopes=[SCOPE_KPI_EVALUATE],
+            scopes=[SCOPE_KPI_EVALUATE, SCOPE_KPI_QUERY_EXECUTE],
         )
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(

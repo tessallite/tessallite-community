@@ -44,11 +44,9 @@ from shared.db.models import (
 
 logger = logging.getLogger(__name__)
 
-# PocketDefinition statuses that represent a currently-servable / in-pool pocket.
-# Only these are flipped to ``stale`` — a pocket already ``stale``/``failed``/
-# ``invalidating`` is already queued or being handled, and a ``retired`` pocket
-# must not be resurrected into the refresh queue.
-_SERVABLE_POCKET_STATUSES = ("fresh",)
+# Eligibility and physical freshness are separate axes. A breaking schema
+# event clears proof and build trust on every preserved pocket, including one
+# already parked as ineligible; retired rows remain out of the lifecycle.
 
 
 async def invalidate_dependent_materialisations(
@@ -164,10 +162,20 @@ async def _invalidate_model_pockets(
         update(PocketDefinition)
         .where(
             PocketDefinition.model_id == model_id,
-            PocketDefinition.status.in_(_SERVABLE_POCKET_STATUSES),
             PocketDefinition.retired_at.is_(None),
         )
-        .values(status="stale", failure_reason=reason, updated_at=datetime.now(timezone.utc))
+        .values(
+            status="stale",
+            failure_reason=reason,
+            updated_at=datetime.now(timezone.utc),
+            row_manifest=None,
+            active_refresh_run_id=None,
+            built_for_version_id=None,
+            built_for_epoch=None,
+            population_eligibility="unknown",
+            population_eligibility_reason=None,
+            population_proof_fingerprint=None,
+        )
     )
     count = int(result.rowcount or 0)
     if count:

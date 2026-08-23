@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { safeLocalGet } from "../utils/safeLocalStorage";
 import {
   Alert,
@@ -67,6 +68,12 @@ import {
 import api from "../api/client";
 import { meetsPasswordPolicy, showsPasswordPolicyError } from "../auth/passwordPolicy";
 import { agentApi } from "../api/agentApi";
+import {
+  parseJoinPopulationBlockedError,
+  type JoinPopulationBlockedDetail,
+} from "../api/versionsApi";
+import JoinPopulationBlockedNotice from "../components/Deploy/JoinPopulationBlockedNotice";
+import { extractApiError } from "../utils/extractApiError";
 import type {
   AccessRole,
   LocalUserRole,
@@ -514,6 +521,12 @@ function ModelsSection({
 }) {
   const t = useT();
   const confirm = useConfirm();
+  const navigate = useNavigate();
+  const [deployRefusal, setDeployRefusal] = useState<{
+    modelId: string;
+    detail: JoinPopulationBlockedDetail;
+  } | null>(null);
+  const [deployError, setDeployError] = useState<string | null>(null);
 
   const deployMut = useMutation({
     mutationFn: async (model: Model) => {
@@ -521,7 +534,21 @@ function ModelsSection({
         `/api/v1/projects/${project.id}/models/${model.id}/deploy`,
       );
     },
-    onSuccess: onRefresh,
+    onSuccess: () => {
+      setDeployRefusal(null);
+      setDeployError(null);
+      onRefresh();
+    },
+    onError: (error: unknown, model: Model) => {
+      const detail = parseJoinPopulationBlockedError(error);
+      if (detail) {
+        setDeployError(null);
+        setDeployRefusal({ modelId: model.id, detail });
+      } else {
+        setDeployRefusal(null);
+        setDeployError(extractApiError(error, t("errors.requestFailed")));
+      }
+    },
   });
 
   const undeployMut = useMutation({
@@ -592,6 +619,26 @@ function ModelsSection({
         </Box>
       </Box>
       <Divider />
+      {deployRefusal && (
+        <Box sx={{ p: 1.5 }}>
+          <JoinPopulationBlockedNotice
+            detail={deployRefusal.detail}
+            onClose={() => setDeployRefusal(null)}
+            onOpenJoins={() => {
+              const modelId = deployRefusal.modelId;
+              setDeployRefusal(null);
+              navigate(
+                `/tenants/${tenantId}/projects/${project.id}/models/${modelId}?panel=joins`,
+              );
+            }}
+          />
+        </Box>
+      )}
+      {deployError && (
+        <Alert severity="error" sx={{ m: 1.5 }} onClose={() => setDeployError(null)}>
+          {deployError}
+        </Alert>
+      )}
       {loading ? (
         <Box sx={{ p: 2 }}><CircularProgress size={18} /></Box>
       ) : models.length === 0 ? (
@@ -648,6 +695,7 @@ function ModelsSection({
                           size="small"
                           onClick={() => undeployMut.mutate(m)}
                           disabled={undeployMut.isPending}
+                          aria-label={t("tenantAdmin.undeployTooltip")}
                         >
                           <UnpublishedIcon sx={{ fontSize: 18 }} />
                         </IconButton>
@@ -658,6 +706,7 @@ function ModelsSection({
                           size="small"
                           onClick={() => deployMut.mutate(m)}
                           disabled={deployMut.isPending}
+                          aria-label={t("tenantAdmin.deployTooltip")}
                         >
                           <PublishIcon sx={{ fontSize: 18 }} />
                         </IconButton>

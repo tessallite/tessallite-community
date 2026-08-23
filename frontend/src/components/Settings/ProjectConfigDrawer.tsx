@@ -31,6 +31,7 @@ import type { Project } from "../../api/types";
 import ConnectionsPanel from "../Panels/ConnectionsPanel";
 import ProjectLLMScreen from "./ProjectLLMScreen";
 import BrandingPanel from "./BrandingPanel";
+import CalendarSettingsPanel from "./CalendarSettingsPanel";
 import DemoTenantPanel from "./DemoTenantPanel";
 import ProjectAgentTabs, { type AgentTabKey } from "./ProjectAgentTabs";
 import UsersAccessPanel from "../Admin/UsersAccessPanel";
@@ -52,7 +53,7 @@ type AdminKey =
   | "embed-tokens"
   | "security-audit"
   | "demo-tenant";
-type SectionKey = "connections" | "llm-providers" | "branding" | AgentTabKey | AdminKey;
+type SectionKey = "connections" | "llm-providers" | "branding" | "calendar-settings" | AgentTabKey | AdminKey;
 
 const ADMIN_KEYS = new Set<string>([
   "users-access",
@@ -76,6 +77,7 @@ const ADMIN_SECTIONS = new Set<string>([
   "connections",
   "llm-providers",
   "branding",
+  "calendar-settings",
 ]);
 
 type NavItem = { key: SectionKey; label: string; icon: React.ReactNode };
@@ -106,6 +108,7 @@ export default function ProjectConfigDrawer({
       { key: "connections", label: t("projectNav.connections"), icon: <CableIcon fontSize="small" /> },
       { key: "llm-providers", label: t("projectNav.llm"), icon: <PsychologyIcon fontSize="small" /> },
       { key: "branding", label: t("projectNav.branding"), icon: <PaletteIcon fontSize="small" /> },
+      { key: "calendar-settings", label: t("projectNav.calendarSettings"), icon: <HistoryIcon fontSize="small" /> },
     ],
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }), [t]);
@@ -252,6 +255,8 @@ export default function ProjectConfigDrawer({
               <ProjectLLMScreen projectId={projectId} />
             ) : section === "branding" ? (
               <BrandingPanel />
+            ) : section === "calendar-settings" ? (
+              <CalendarSettingsPanel />
             ) : section === "users-access" ? (
               <UsersAccessPanel
                 projectId={projectId}

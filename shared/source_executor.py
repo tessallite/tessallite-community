@@ -24,12 +24,115 @@ import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from shared.config.source_db import resolve_source_db_endpoint
+from shared.dry_run_write_fence import (
+    DryRunWriteRefused,
+    in_dry_run_write_fence,
+    refuse_under_dry_run,
+)
 from shared.schemas.connection_type import normalize_connection_type
 
 logger = logging.getLogger(__name__)
+
+
+# SQLGlot owns dialect parsing for the source connectors.  This mapping is
+# deliberately data, rather than a connector branch in the guard: the same
+# structural read-only rule must run for every connector while parsing the
+# statement in the connector's grammar.  ``jdbc`` is normalised to
+# ``hadoop_spark`` by ``normalize_connection_type`` before this lookup.
+_DRY_RUN_SQLGLOT_DIALECTS = {
+    "postgresql": "postgres",
+    "redshift": "redshift",
+    "bigquery": "bigquery",
+    "hadoop_spark": "spark",
+    "snowflake": "snowflake",
+    "sqlserver": "tsql",
+}
+
+
+def _dry_run_source_connector(connector_or_connection: Any) -> str | None:
+    """Return a canonical connector name from a connection or connector token."""
+    if isinstance(connector_or_connection, str):
+        raw = connector_or_connection
+    else:
+        raw = getattr(connector_or_connection, "connection_type", None)
+    return normalize_connection_type((raw or "").lower())
+
+
+def _refuse_dry_run_source_sql(reason: str) -> None:
+    """Raise the same fail-closed error as every other dry-run write boundary."""
+    raise DryRunWriteRefused(
+        "Refused to execute source SQL during a dry run: "
+        f"{reason}. A dry run may issue exactly one structurally read-only "
+        "query; it must not mutate source state."
+    )
+
+
+def _assert_dry_run_read_query(
+    connector_or_connection: Any,
+    sql: str,
+) -> None:
+    """Allow only one parsed, structurally read-only query under the fence.
+
+    Ordinary source reads retain their existing behaviour.  This check is
+    active only while ``dry_run_write_fence`` is set, where a caller must be
+    able to inspect source state but must not smuggle a write through one of
+    the read-shaped execution facades.  It fails closed on an unknown
+    connector, parser error, empty/multi-statement input, non-query root, or a
+    write/procedural expression nested inside a query.
+    """
+    if not in_dry_run_write_fence():
+        return
+
+    connector = _dry_run_source_connector(connector_or_connection)
+    dialect = _DRY_RUN_SQLGLOT_DIALECTS.get(connector)
+    if dialect is None:
+        _refuse_dry_run_source_sql(
+            f"unsupported or unknown connector dialect {connector!r}"
+        )
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        statements = sqlglot.parse(sql, read=dialect)
+    except Exception as exc:
+        _refuse_dry_run_source_sql(
+            f"SQL parsing failed ({type(exc).__name__})"
+        )
+
+    if len(statements) != 1:
+        _refuse_dry_run_source_sql(
+            f"expected exactly one statement, got {len(statements)}"
+        )
+
+    statement = statements[0]
+    if statement is None or not isinstance(statement, exp.Query):
+        _refuse_dry_run_source_sql(
+            "statement is not a recognised read-only query"
+        )
+
+    # A SELECT can still carry SELECT ... INTO or a DML/DDL CTE.  Reject those
+    # expression nodes as well as non-query roots; accepting only the root
+    # class would otherwise make the structural fence trivially bypassable.
+    forbidden_nodes = (
+        exp.DML,
+        exp.DDL,
+        exp.Command,
+        exp.Transaction,
+        exp.Into,
+        exp.Grant,
+        exp.Revoke,
+        exp.Lock,
+        exp.LockingStatement,
+    )
+    if any(isinstance(node, forbidden_nodes) for node in statement.walk()):
+        _refuse_dry_run_source_sql(
+            "query contains a DML, DDL, procedural, or other write expression"
+        )
 
 
 class UnconfiguredConnectionError(ValueError):
@@ -1065,6 +1168,7 @@ async def execute_source_sql(
     ValueError
         If the connector type is not supported.
     """
+    _assert_dry_run_read_query(conn_obj, sql)
     _guard_unconfigured(conn_obj)
     # F-014-04: structured start + completion (outcome) audit records so the
     # touch is attributable to a tenant/project/connection/purpose and the
@@ -1268,6 +1372,7 @@ async def execute_routed_query(
     Driver construction lives ONLY in this shared module; the query-router
     dispatcher no longer imports any private helper or connector driver.
     """
+    _assert_dry_run_read_query(conn_obj, sql)
     _guard_unconfigured(conn_obj)
     # Bug-8039/8041: attribute the primary user-query audit record to the tenant
     # even when the caller (query-router dispatcher) passes only a session.
@@ -1602,7 +1707,15 @@ async def execute_source_ddl(
     ``execute`` auto-commits outside a transaction block).
 
     *purpose* is threaded into the ``[SOURCE_AUDIT]`` record (F-014-04).
+
+    Bug-9036: this is the single chokepoint every physical source write goes
+    through, which makes it the backstop for the preview (dry-run) fence. A
+    preview that reaches DDL has already escaped whatever gate should have
+    stopped it upstream; refusing here bounds the damage to an exception instead
+    of a CREATE/DROP against the customer's database. The fence is OFF for every
+    ordinary caller, so this costs one ``ContextVar`` read.
     """
+    refuse_under_dry_run("execute DDL against the source database")
     _guard_unconfigured(conn_obj)
     ddl_fingerprint = ddl if isinstance(ddl, str) else "; ".join(ddl[:2])
     tenant_slug = _effective_tenant_slug(tenant_slug, tenant_session)
@@ -1782,11 +1895,41 @@ async def table_storage_bytes(
 _PG_TEXT_TYPES = frozenset({"TEXT", "VARCHAR", "CHAR", "CHARACTER VARYING"})
 
 
+def _is_pg_timestamp_without_timezone(pg_type: str | None) -> bool:
+    """Return whether *pg_type* is a PostgreSQL naive timestamp type.
+
+    Cross-database materialisation binds source rows through ``asyncpg`` after
+    creating the target table from the rendered column definitions.  A source
+    driver may return an aware ``datetime`` for an expression whose target
+    definition is ``TIMESTAMP WITHOUT TIME ZONE``; asyncpg rejects that pair
+    instead of silently dropping the offset.  Keep this classification narrow
+    so DATE, TIME, and TIMESTAMPTZ values retain their existing binding rules.
+    """
+    if not pg_type:
+        return False
+    token = " ".join(pg_type.upper().replace("(", " (").split())
+    if "WITH TIME ZONE" in token:
+        return False
+    return (
+        token == "TIMESTAMP"
+        or token.startswith("TIMESTAMP (")
+        or token.startswith("TIMESTAMP WITHOUT TIME ZONE")
+    )
+
+
 def _coerce_for_pg(value: Any, pg_type: str | None) -> Any:
     if value is None:
         return None
     if pg_type and pg_type.upper() in _PG_TEXT_TYPES:
         return str(value)
+    if isinstance(value, datetime) and _is_pg_timestamp_without_timezone(pg_type):
+        # TIMESTAMP WITHOUT TIME ZONE represents a wall-clock value.  Source
+        # rows carrying an offset must first be interpreted in UTC, then have
+        # the tzinfo removed for asyncpg's naive-timestamp encoder.  This is
+        # deliberately not ``replace(tzinfo=None)``: doing that would preserve
+        # the source wall clock and shift the stored instant.
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
     return value
 
 
@@ -2068,6 +2211,11 @@ async def ensure_target_schema(
     to the target dialect via sqlglot. SQL Server requires dynamic SQL
     due to lack of IF NOT EXISTS support.
     """
+    # Bug-9036: a preview must not create a schema on the customer's target.
+    # Guarded here, not only at ``execute_source_ddl``, because this writer does
+    # not route through it — a DDL-only backstop would be structurally blind to
+    # exactly this shape.
+    refuse_under_dry_run("create the target schema")
     if not schema:
         return
 
@@ -2120,7 +2268,12 @@ async def bulk_insert_batched(
 
     Used by the cross-database aggregate materialization path.
     Returns total rows inserted.
+
+    Bug-9036: a preview must not insert rows. This is the writer the
+    cross-database build uses INSTEAD of a CTAS, so a DDL-only fence would let a
+    cross-database materialisation through untouched.
     """
+    refuse_under_dry_run("insert rows into a target table")
     if not rows:
         return 0
 
@@ -2290,7 +2443,10 @@ async def refresh_table_atomic_swap(
     intact. On any failure the live table is preserved (never dropped before the
     replacement is in place). The staging table must already exist; this function
     does not create it and does not read the source.
+
+    Bug-9036: a preview must not swap a live table.
     """
+    refuse_under_dry_run("swap a materialised table into place")
     _guard_unconfigured(conn_obj)
     from shared.connector_qualify import quote_identifier
 
@@ -2353,7 +2509,10 @@ async def stream_to_staging_table(
     different from the connection default.
 
     Returns total rows inserted.
+
+    Bug-9036: a preview must not stream rows into a target.
     """
+    refuse_under_dry_run("stream rows into a staging table")
     _guard_unconfigured(conn_obj)
 
     from shared.connector_qualify import quote_identifier
@@ -2565,17 +2724,24 @@ class SourceConnection:
         # open_source_connection so per-operation logs carry tenant/project.
         self._audit_ctx = audit_ctx
 
-    def transaction(self):
+    def transaction(self, *, isolation: str | None = None):
         """Return an atomic transaction context for PostgreSQL/Redshift.
 
         Bug-8040 hardening: a pooled connection can be FORCE-terminated mid-batch
         when its pool ages out (revoked-credential bound). Multi-statement DDL that
         must be all-or-nothing (e.g. the staging live/backup RENAME swap) runs
         inside this transaction so PostgreSQL/Redshift roll it back on an aborted
-        connection instead of leaving the aggregate with no live table. Only the
-        pooled asyncpg connectors support transactional DDL here."""
+        connection instead of leaving the aggregate with no live table.
+
+        Bug-8741: callers that need one stable read snapshot may request
+        ``isolation="repeatable_read"``. The option is passed to asyncpg's
+        transaction primitive rather than emulated with connector-specific SQL.
+        Only the pooled asyncpg connectors support transactions here.
+        """
         if self._connector in ("postgresql", "redshift"):
-            return self._impl.transaction()
+            if isolation is None:
+                return self._impl.transaction()
+            return self._impl.transaction(isolation=isolation)
         raise ValueError(
             f"transaction() is only supported for pooled PostgreSQL/Redshift "
             f"connections, not {self._connector!r}"
@@ -2594,6 +2760,7 @@ class SourceConnection:
         return _ddl_client_timeout()
 
     async def fetch(self, sql: str, *args: Any) -> list[dict]:
+        _assert_dry_run_read_query(self._connector, sql)
         # Bug-7175: audit each operation individually, not just the open.
         _audit_log(f"SourceConnection.fetch[{self._connector}]", sql, context=self._audit_ctx)
         timeout_s = self._batch_timeout()
@@ -2609,8 +2776,45 @@ class SourceConnection:
             job = await asyncio.to_thread(
                 lambda: self._impl.query(sql, job_config=self._bq_job_config)
             )
-            await _bq_wait_or_cancel(job, timeout_s, label="BigQuery fetch")
-            return await asyncio.to_thread(lambda: [dict(r) for r in job.result()])
+            started = time.monotonic()
+            try:
+                await _bq_wait_or_cancel(job, timeout_s, label="BigQuery fetch")
+                rows = await asyncio.to_thread(lambda: [dict(r) for r in job.result()])
+            except BaseException as exc:
+                # Keep the cancellation/error path observable without exposing
+                # raw SQL literals. The job ID is useful for operator-side
+                # BigQuery inspection even when the job did not reach DONE.
+                _audit_log(
+                    "SourceConnection.fetch[bigquery].end",
+                    sql,
+                    context={
+                        **(self._audit_ctx or {}),
+                        "outcome": "error",
+                        "job_id": getattr(job, "job_id", None),
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                        "error": type(exc).__name__,
+                    },
+                )
+                raise
+
+            # Bug-9416 evidence: source-statistics probes need the job identity
+            # and BigQuery byte counters in the same redacted audit stream as
+            # their SQL. ``total_bytes_billed`` can be absent for free metadata
+            # reads, so retain both fields and omit missing values in the logger.
+            _audit_log(
+                "SourceConnection.fetch[bigquery].end",
+                sql,
+                context={
+                    **(self._audit_ctx or {}),
+                    "outcome": "ok",
+                    "job_id": getattr(job, "job_id", None),
+                    "bytes_processed": getattr(job, "total_bytes_processed", None),
+                    "bytes_billed": getattr(job, "total_bytes_billed", None),
+                    "rows": len(rows),
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                },
+            )
+            return rows
         if self._connector in ("hadoop_spark", "snowflake"):
             try:
                 return await asyncio.wait_for(asyncio.to_thread(self._cursor_fetch, sql), timeout=timeout_s)
@@ -2634,6 +2838,14 @@ class SourceConnection:
         return next(iter(row.values()))
 
     async def execute(self, sql: str) -> None:
+        # Bug-9036: ``SourceConnection.execute`` is the lowest public
+        # connector-neutral write boundary.  The named helpers above guard
+        # their own entry points, but callers can (and do) issue DDL/ALTER or
+        # metadata writes through this facade directly.  Keep the fence at
+        # this boundary as well so a new helper cannot silently bypass the
+        # dry-run guarantee by opening a source connection and calling
+        # ``execute`` itself.
+        refuse_under_dry_run("execute a source write")
         # Bug-7175: audit each operation individually.
         _audit_log(f"SourceConnection.execute[{self._connector}]", sql, context=self._audit_ctx)
         # Bug-8041: execute carries DDL / staging writes (CREATE TABLE AS, ALTER,
@@ -2684,6 +2896,7 @@ class SourceConnection:
         process or insert each batch before fetching the next, keeping memory
         bounded regardless of total result size.
         """
+        _assert_dry_run_read_query(self._connector, sql)
         # Bug-7175: audit the batched read start.
         _audit_log(f"SourceConnection.fetch_batched[{self._connector}]", sql, context=self._audit_ctx)
         if self._connector in ("postgresql", "redshift"):
@@ -2916,6 +3129,11 @@ class _PooledSourceConnection:
             yield SourceConnection(raw, self._connector, audit_ctx=self._audit_ctx)
 
     async def fetch(self, sql: str, *args: Any) -> list[dict]:
+        # Refuse before checking out a pooled connector.  The underlying
+        # ``SourceConnection`` also asserts this boundary, but this façade
+        # performs ``SET statement_timeout`` during checkout; checking here
+        # prevents a rejected dry-run read from touching the connector at all.
+        _assert_dry_run_read_query(self._connector, sql)
         async with self._operation() as operation:
             return await operation.fetch(sql, *args)
 
@@ -2928,17 +3146,21 @@ class _PooledSourceConnection:
         return next(iter(row.values())) if row else None
 
     async def execute(self, sql: str) -> None:
+        # Keep the pooled façade fail-closed before checkout just like the
+        # connector-bound ``SourceConnection.execute`` boundary.
+        refuse_under_dry_run("execute a source write")
         async with self._operation() as operation:
             await operation.execute(sql)
 
     async def fetch_batched(
         self, sql: str, batch_size: int = 20_000,
     ) -> AsyncIterator[list[dict]]:
+        _assert_dry_run_read_query(self._connector, sql)
         async with self._operation() as operation:
             async for batch in operation.fetch_batched(sql, batch_size=batch_size):
                 yield batch
 
-    def transaction(self):
+    def transaction(self, *, isolation: str | None = None):
         raise RuntimeError(
             "transaction() requires open_source_connection(..., "
             "transactional=True); operation-scoped connections cannot retain "

@@ -23,14 +23,17 @@ Tessallite recognises three kinds. From the BI tool's point of view they all loo
 | **User-defined attribute (UDA) measure** | A modeler-authored expression plus an aggregation, e.g. `SUM(price * quantity * (1 + tax_rate))`. The expression is stored on the model and inlined into queries. | Use when the value is a calculation across columns that doesn't change between queries. |
 | **Variant measure** | A time-intelligence transformation of another measure — for example, the year-to-date of `revenue`, or the prior-year of `orders`. The SQL is generated per query because the partitioning depends on the dimensions in the grain. | Use when you want the same measure shifted across time without re-defining it. See [Configure Time Variants](configure-time-variants.md). |
 
-This page covers plain measures. UDA measures are configured under **User-Defined Attributes** in the Toolbelt. Variant measures are configured under **Time Variants** on a base measure.
+This page covers plain measures. User-defined attributes (UDAs) are **not** in the Toolbelt: you author them on the table itself — open a table on the canvas, click the **Edit** pencil, and use the **Attributes** tab. See [User-Defined Attributes](define-user-defined-attributes.md) for the full walkthrough. Variant measures are configured under **Time Variants** on a base measure.
 
 ---
 
 ## Before you start
 
-- You must have a model open in Model Builder with at least one fact table added to the canvas.
-- The source column you want to aggregate must exist in that fact table.
+- You must have a model open in Model Builder with a source table added to the
+  canvas. A single-table model is implicitly fact; a multi-table model must
+  declare its fact table before deploy.
+- The source column you want to aggregate must exist in the model's declared
+  fact table (or its implicit single-table fact).
 - Dimensions should be defined before you configure aggregates, because the aggregation type determines which grains Tessallite can serve from pre-aggregated summaries.
 
 ---

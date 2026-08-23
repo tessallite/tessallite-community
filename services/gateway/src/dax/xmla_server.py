@@ -105,6 +105,7 @@ from src.router_client import (
     GatewayQueryRateLimitExceeded,
     QueryByteCeilingExceeded,
     QueryRouterError,
+    evaluate_kpi_batch,
     evaluate_kpi_governed,
     execute_query,
     get_model_dimensions,
@@ -2926,8 +2927,10 @@ async def _handle_execute(
             _seen_status_supports.add(_support)
             _status_members.append((_support, _kpi))
         if _status_members:
-            # Governed KPI status is model-wide; refuse a dimension breakdown or
-            # slicer rather than serving one verdict across many slices.
+            # Governed KPI status cannot produce one cell per axis member, so a
+            # dimension breakdown remains unsupported. A WHERE slicer, however,
+            # is a supported governed batch context (Bug-8383) when every MDX
+            # member maps to a model dimension filter.
             _status_axis_dims = _mdx_extract_dimensions(
                 col_expr + " " + row_expr,
                 dim_names=dim_names,
@@ -2940,16 +2943,53 @@ async def _handle_execute(
                 hierarchy_level_dim_map=hierarchy_level_dim_map,
                 hierarchy_default_dim_map=hierarchy_default_dim_map,
             ) if _status_where else {}
-            if _status_axis_dims or _status_where_filters:
+            if _status_axis_dims:
                 _rep = _status_members[0][0]
                 return _soap_fault(
                     f"KPI status member '{_rep}' was requested with a dimension "
-                    "breakdown or slicer. The governed KPI status is evaluated "
-                    "model-wide and cannot be sliced by a dimension; query the KPI "
-                    "status without a dimension breakdown, or use the underlying "
-                    "measure.",
+                    "breakdown. Governed KPI status returns one value per KPI, so "
+                    "query the status without a dimension breakdown, or use the "
+                    "underlying measure.",
                     "Client",
                 )
+            try:
+                _status_batch_filters = _translate_kpi_slicer_filters(
+                    _status_where,
+                    _status_where_filters,
+                    dimensions_meta,
+                    dim_names,
+                    hierarchy_level_dim_map=hierarchy_level_dim_map,
+                    hierarchy_default_dim_map=hierarchy_default_dim_map,
+                )
+            except ValueError as exc:
+                return _soap_fault(str(exc), "Client")
+            _status_batch: dict[str, dict[str, Any]] = {}
+            if _status_batch_filters:
+                _status_ids = [
+                    str(_kpi.get("id") or "") for _support, _kpi in _status_members
+                ]
+                if not all(_status_ids):
+                    return _soap_fault(
+                        "A governed KPI status member has no id for batch "
+                        "evaluation.",
+                        "Client",
+                    )
+                try:
+                    _status_batch = await evaluate_kpi_batch(
+                        _status_ids,
+                        model_id=model_id,
+                        project_id=_project_id,
+                        tenant_slug=tenant_slug,
+                        jwt_token=jwt_token,
+                        filters=_status_batch_filters,
+                        persona_id=persona_id,
+                    )
+                except ValueError as exc:
+                    logger.warning("KPI status batch resolution failed: %s", exc)
+                    return _soap_fault(str(exc), "Client")
+                except Exception as exc:
+                    logger.error("KPI status batch resolution error: %s", exc)
+                    return _soap_fault(str(exc), "Server")
             for _support, _kpi in _status_members:
                 _kpi_id = str(_kpi.get("id") or "")
                 if not _kpi_id:
@@ -2959,14 +2999,24 @@ async def _handle_execute(
                         "Client",
                     )
                 try:
-                    _ev = await evaluate_kpi_governed(
-                        kpi_id=_kpi_id,
-                        model_id=model_id,
-                        project_id=_project_id,
-                        tenant_slug=tenant_slug,
-                        jwt_token=jwt_token,
-                        persona_id=persona_id,
-                    )
+                    if _status_batch_filters:
+                        _ev = _status_batch.get(_kpi_id)
+                        if _ev is None:
+                            return _soap_fault(
+                                f"KPI status member '{_support}' was not returned "
+                                "by governed batch evaluation; refusing to serve "
+                                "an unfiltered value.",
+                                "Server",
+                            )
+                    else:
+                        _ev = await evaluate_kpi_governed(
+                            kpi_id=_kpi_id,
+                            model_id=model_id,
+                            project_id=_project_id,
+                            tenant_slug=tenant_slug,
+                            jwt_token=jwt_token,
+                            persona_id=persona_id,
+                        )
                 except ValueError as exc:
                     logger.warning("KPI status member resolution failed: %s", exc)
                     return _soap_fault(str(exc), "Client")
@@ -4491,6 +4541,215 @@ async def _maybe_resolve_info_measures(
     return col_names, [row_dict]
 
 
+def _reject_unrepresentable_kpi_range_unions(
+    where_expr: str,
+    where_filters: dict[str, list[str]],
+    dim_names: set[str],
+    *,
+    hierarchy_level_dim_map: dict[str, dict[str, str]] | None = None,
+    hierarchy_default_dim_map: dict[str, str] | None = None,
+) -> None:
+    """Reject KPI range unions that cannot be represented by one filter.
+
+    ``_mdx_extract_where_filters`` intentionally gives a range precedence over
+    ordinary members on the same dimension for the general SQL path.  That is
+    not safe for governed KPI translation: a range plus another member is an
+    OR-shaped slicer, while the batch API receives separate predicates and
+    evaluates them as AND.  Two ranges have the same ambiguity.  Keep the
+    general extractor unchanged and inspect the raw KPI slicer here, refusing
+    only the shapes that would otherwise change the requested set.
+    """
+    hierarchy_level_dim_map = hierarchy_level_dim_map or {}
+    hierarchy_default_dim_map = hierarchy_default_dim_map or {}
+    range_dimensions = {
+        str(dimension).casefold()
+        for dimension, values in where_filters.items()
+        if any(str(value).startswith(_RANGE_PREFIX) for value in values)
+    }
+    if not range_dimensions:
+        return
+
+    range_pattern = (
+        r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\]\.'
+        + KEYS_OR_CAPTION
+        + r'\s*:\s*'
+        r'\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\]\.'
+        + KEYS_OR_CAPTION
+    )
+    range_spans: list[tuple[int, int]] = []
+    matched_ranges: dict[str, int] = {}
+    for match in re.finditer(range_pattern, where_expr):
+        target = _resolve_hierarchy_dimension_name(
+            dim_name=match.group(1).strip(),
+            hierarchy_name=match.group(2).strip(),
+            level_name=match.group(3).strip(),
+            dim_names=dim_names,
+            hierarchy_level_dim_map=hierarchy_level_dim_map,
+            hierarchy_default_dim_map=hierarchy_default_dim_map,
+        )
+        if target is None:
+            continue
+        target_key = str(target).casefold()
+        if target_key not in range_dimensions:
+            continue
+        range_spans.append(match.span())
+        matched_ranges[target_key] = matched_ranges.get(target_key, 0) + 1
+
+    for dimension, values in where_filters.items():
+        range_count = sum(
+            1 for value in values if str(value).startswith(_RANGE_PREFIX)
+        )
+        if range_count > 1 or matched_ranges.get(str(dimension).casefold(), 0) > 1:
+            raise ValueError(
+                f"KPI slicer range union for dimension '{dimension}' has no "
+                "single request-level filter equivalent; refusing to evaluate "
+                "an unsliced KPI."
+            )
+
+    if not range_spans:
+        return
+    residual = where_expr
+    for start, end in reversed(range_spans):
+        residual = residual[:start] + residual[end:]
+    ordinary_filters = _mdx_extract_where_filters(
+        residual,
+        dim_names,
+        hierarchy_level_dim_map=hierarchy_level_dim_map,
+        hierarchy_default_dim_map=hierarchy_default_dim_map,
+    )
+    for dimension in ordinary_filters:
+        if str(dimension).casefold() in range_dimensions:
+            raise ValueError(
+                f"KPI slicer range union for dimension '{dimension}' has no "
+                "single request-level filter equivalent; refusing to evaluate "
+                "an unsliced KPI."
+            )
+
+
+def _translate_kpi_slicer_filters(
+    where_expr: str,
+    where_filters: dict[str, list[str]],
+    dimensions_meta: list[dict[str, Any]],
+    dim_names: set[str],
+    *,
+    hierarchy_level_dim_map: dict[str, dict[str, str]] | None = None,
+    hierarchy_default_dim_map: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Translate an MDX KPI slicer into the batch-evaluation filter schema.
+
+    The model-service batch API consumes dimension IDs, while the MDX parser
+    deliberately returns the semantic dimension names used by the XMLA
+    catalogue. Resolve every captured name against the same metadata snapshot
+    and fail closed if a member reference cannot be represented. An empty or
+    unknown filter must never become an unfiltered governed KPI evaluation.
+    """
+    # KPI member interception runs before the normal MDX -> SQL translator,
+    # whose validator would otherwise reject set operations and unsupported
+    # slicer functions. Keep the same fail-loud boundary here: extracting the
+    # literal members from ``Except(...)`` or ``Filter(...)`` and sending them
+    # as a plain IN filter changes the requested set instead of preserving its
+    # semantics (Bug-8383).
+    _check_unsupported_mdx_constructs(
+        where_expr, "KPI slicer", allow_range=True,
+    )
+    if re.search(r"\bStrTo(?:Set|Member)\s*\(", where_expr, re.IGNORECASE):
+        raise ValueError(
+            "Dynamic STRTOSET/STRTOMEMBER KPI slicers have no request-level "
+            "filter equivalent; refusing to evaluate an unsliced KPI."
+        )
+    if re.search(r"(?<![\w\[\"'])@\s*[A-Za-z_][A-Za-z0-9_]*", where_expr):
+        raise ValueError(
+            "Parameterized KPI slicers have no request-level filter "
+            "equivalent; refusing to evaluate an unsliced KPI."
+        )
+    _assert_where_members_applied(
+        where_expr,
+        where_filters,
+        dim_names,
+        hierarchy_level_dim_map=hierarchy_level_dim_map,
+        hierarchy_default_dim_map=hierarchy_default_dim_map,
+    )
+    extracted_dimensions = set(_mdx_extract_dimensions(
+        where_expr,
+        dim_names=dim_names,
+        hierarchy_level_dim_map=hierarchy_level_dim_map,
+        hierarchy_default_dim_map=hierarchy_default_dim_map,
+    ))
+    untranslated_dimensions = sorted(
+        dimension for dimension in extracted_dimensions
+        if dimension not in where_filters
+    )
+    if untranslated_dimensions:
+        raise ValueError(
+            "KPI slicer dimensions "
+            f"{', '.join(untranslated_dimensions)!r} have no supported "
+            "filter equivalent; refusing to evaluate an unsliced KPI."
+        )
+    _reject_unrepresentable_kpi_range_unions(
+        where_expr,
+        where_filters,
+        dim_names,
+        hierarchy_level_dim_map=hierarchy_level_dim_map,
+        hierarchy_default_dim_map=hierarchy_default_dim_map,
+    )
+    if not where_filters:
+        return []
+
+    dimension_ids: dict[str, str] = {}
+    for dimension in dimensions_meta:
+        if not isinstance(dimension, dict):
+            continue
+        dimension_id = dimension.get("id") or dimension.get("dimension_id")
+        dimension_name = dimension.get("name") or dimension.get("display_name")
+        if dimension_id is not None and dimension_name:
+            dimension_ids[str(dimension_name).casefold()] = str(dimension_id)
+
+    translated: list[dict[str, Any]] = []
+    for dimension_name, values in where_filters.items():
+        dimension_id = dimension_ids.get(str(dimension_name).casefold())
+        if not dimension_id:
+            raise ValueError(
+                f"KPI slicer dimension '{dimension_name}' has no model filter "
+                "equivalent; refusing to evaluate an unsliced KPI."
+            )
+        normal_values: list[str] = []
+        for value in values:
+            if str(value).startswith(_RANGE_PREFIX):
+                payload = str(value)[len(_RANGE_PREFIX):]
+                try:
+                    start, end = payload.split(_RANGE_SEP, 1)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"KPI slicer for '{dimension_name}' has an invalid "
+                        "range and cannot be translated."
+                    ) from exc
+                translated.append({
+                    "dimension_id": dimension_id,
+                    "operator": "between",
+                    "values": [start, end],
+                })
+            else:
+                normal_values.append(str(value))
+        if len(normal_values) == 1:
+            translated.append({
+                "dimension_id": dimension_id,
+                "operator": "eq",
+                "value": normal_values[0],
+            })
+        elif normal_values:
+            translated.append({
+                "dimension_id": dimension_id,
+                "operator": "in",
+                "values": normal_values,
+            })
+    if not translated:
+        raise ValueError(
+            "The KPI slicer has no supported filter equivalent; refusing to "
+            "evaluate an unfiltered KPI."
+        )
+    return translated
+
+
 async def _maybe_resolve_kpi_members(
     *,
     statement: str,
@@ -4563,24 +4822,24 @@ async def _maybe_resolve_kpi_members(
             kpi_by_caption.setdefault(nm, k)
 
     # Dimension slicer filters that accompany the KPI (KPI function stripped).
-    # Bug-6608 (un-gated): a slicer cannot be forwarded to the single-KPI governed
-    # ``/evaluate`` route — fail loud BEFORE the loop rather than silently returning
-    # an unfiltered governed number that contradicts the requested slice (Opus R1
-    # finding 3: hoist for clarity; statement-invariant check).
+    # Bug-8383: a governed KPI slicer uses the batch route, whose request-level
+    # filters are compiled into the KPI's SQL evaluation. Translate names to
+    # dimension IDs against this same metadata snapshot and fail loud before any
+    # evaluation when the MDX shape has no equivalent filter.
     where_expr = _mdx_where_expr(statement)
     where_filters = _mdx_extract_where_filters(
         where_expr, dim_names,
         hierarchy_level_dim_map=hierarchy_level_dim_map,
         hierarchy_default_dim_map=hierarchy_default_dim_map,
     ) if where_expr else {}
-    if where_filters:
-        # Extract a representative KPI caption for the error (the first matched).
-        _rep_caption = found[0][2] if found else "unknown"
-        raise ValueError(
-            f"KPI '{_rep_caption}' was requested with a dimension slicer, which the "
-            "governed KPI evaluation path does not apply. Query the KPI without "
-            "an accompanying dimension member, or use the underlying measure."
-        )
+    kpi_slicer_filters = _translate_kpi_slicer_filters(
+        where_expr,
+        where_filters,
+        dimensions_meta,
+        dim_names,
+        hierarchy_level_dim_map=hierarchy_level_dim_map,
+        hierarchy_default_dim_map=hierarchy_default_dim_map,
+    )
 
     columns: list[str] = []
     row: dict[str, Any] = {}
@@ -4597,9 +4856,11 @@ async def _maybe_resolve_kpi_members(
     #   * G-002-01 — composite / ratio value expressions and expression / prior-period
     #     goals resolve (the pipeline compiles the DSL), where the gateway's own
     #     single-measure ``_measure_cell`` resolution could not.
-    # A per-KPI evaluation is cached within this call so KPIValue+KPIGoal+KPIStatus
-    # for one KPI hit ``/evaluate`` once.
+    # A per-KPI evaluation is cached within this call. Sliced members share one
+    # batch request so KPIValue+KPIGoal+KPIStatus for one KPI receive the exact
+    # same translated filter context.
     eval_cache: dict[str, dict[str, Any]] = {}
+    batch_eval_cache: dict[str, dict[str, Any]] = {}
 
     # Bug-6702 visibility gate (preserved): `measures_meta` is already trimmed of
     # is_hidden measures on a non-technical view (above). A KPI whose transitive
@@ -4655,6 +4916,44 @@ async def _maybe_resolve_kpi_members(
         cached = eval_cache.get(kpi_id)
         if cached is not None:
             return cached
+        if kpi_slicer_filters:
+            if not batch_eval_cache:
+                requested_ids: list[str] = []
+                for _matched, _fn, _caption in found:
+                    _candidate = kpi_by_caption.get(
+                        (_caption or "").strip().lower()
+                    )
+                    if _candidate is None:
+                        raise ValueError(
+                            f"KPI '{_caption}' is not a deployed KPI in this model."
+                        )
+                    if not _kpi_is_surface_visible(_candidate):
+                        raise ValueError(
+                            f"KPI '{_caption}' has no resolvable value measure on "
+                            "this surface (a measure in its lineage is hidden / "
+                            "not available); the catalogue advertises no value "
+                            "member for it."
+                        )
+                    _candidate_id = str(_candidate.get("id") or "")
+                    if _candidate_id and _candidate_id not in requested_ids:
+                        requested_ids.append(_candidate_id)
+                batch_eval_cache.update(await evaluate_kpi_batch(
+                    requested_ids,
+                    model_id=model_id,
+                    project_id=project_id,
+                    tenant_slug=tenant_slug,
+                    jwt_token=jwt_token,
+                    filters=kpi_slicer_filters,
+                    persona_id=persona_id,
+                ))
+            result = batch_eval_cache.get(kpi_id)
+            if result is None:
+                raise ValueError(
+                    f"KPI '{caption}' was not returned by the governed batch "
+                    "evaluation; refusing to substitute an unfiltered value."
+                )
+            eval_cache[kpi_id] = result
+            return result
         result = await evaluate_kpi_governed(
             kpi_id=kpi_id,
             model_id=model_id,
@@ -7140,10 +7439,53 @@ def _inline_named_sets(
 
     Sets whose expression is empty or whitespace-only are skipped.
     Sets with ``list_type == "sql_fixed"`` are unconditionally skipped (Invariant 8).
+
+    Bug-8713: substitution is iterated to a FIXED POINT. One ordered pass
+    resolved a set that references another set only when the parent happened to
+    be substituted before the child — i.e. correctness depended on the order the
+    model-service returned the rows in. In the other order the parent's
+    expression introduced a bare ``[Child]`` token after the child's turn had
+    already passed; the axis extractors do not recognise a bare set name, so the
+    axis rendered EMPTY rather than failing. Iterating removes the order
+    dependence, and the depth cap makes a cyclic definition fail LOUD instead of
+    spinning or silently emitting an unresolved token.
     """
     if not named_sets or not mdx:
         return mdx
 
+    result = mdx
+    for _pass in range(_NAMED_SET_MAX_EXPANSION_DEPTH):
+        expanded = _inline_named_sets_once(result, named_sets)
+        if expanded == result:
+            break
+        result = expanded
+    else:
+        # The last bounded pass may have produced the final acyclic expansion.
+        # Probe one equality pass before classifying the chain as cyclic; this
+        # keeps the documented depth cap while allowing exactly ten nested
+        # definitions to settle (Bug-8713 / L1-R1-007).
+        final = _inline_named_sets_once(result, named_sets)
+        if final == result:
+            return result
+        raise ValueError(
+            "Named set expansion did not settle after "
+            f"{_NAMED_SET_MAX_EXPANSION_DEPTH} passes; a named set most likely "
+            "references itself (directly or through another set). Break the "
+            "cycle in the set definitions."
+        )
+    return result
+
+
+# Nesting deeper than this is a definition cycle in practice, not a real model.
+# The cap is what turns a cycle into a loud error instead of an unbounded loop.
+_NAMED_SET_MAX_EXPANSION_DEPTH = 10
+
+
+def _inline_named_sets_once(
+    mdx: str,
+    named_sets: list[dict[str, Any]],
+) -> str:
+    """One ordered substitution pass — see ``_inline_named_sets``."""
     result = mdx
     for ns in named_sets:
         # Skip SQL-type named lists — they must never be inlined as MDX.
@@ -7729,6 +8071,18 @@ def _mdx_where_expr(mdx: str) -> str:
     bare = re.match(r'(\[Measures\]\.\[(?:[^\]]|\]\])+\])', after_where)
     if bare:
         return bare.group(1).strip()
+    # Bug-8383 / L1-R1-004: SSAS clients may omit the tuple parentheses for a
+    # single dimension member (``WHERE [Region].[Region].[EMEA]``).  Returning
+    # an empty expression here discarded the slicer before the governed KPI
+    # batch translator saw it, allowing the unsliced single-evaluate path to
+    # run.  Admit only a complete member unique-name shape; arbitrary bare
+    # expressions still fail closed through the normal WHERE audit.
+    if re.fullmatch(
+        r'(?:\[(?:[^\]]|\]\])+\]\.){2,3}'
+        r'(?:&?\[(?:[^\]]|\]\])+\](?:&\[(?:[^\]]|\]\])+\])*)',
+        after_where,
+    ):
+        return after_where
     return ""
 
 

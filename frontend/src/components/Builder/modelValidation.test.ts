@@ -132,6 +132,16 @@ describe("computeStructuralIssues", () => {
     expect(issues).toEqual([]);
   });
 
+  it("Bug-8614 accepts a single table without an explicit fact designation", () => {
+    const issues = computeStructuralIssues(
+      t,
+      [table({ id: "only-dimension", table_type: "dimension" })],
+      [],
+      true,
+    );
+    expect(issues).toEqual([]);
+  });
+
   it("notes a missing query target as info", () => {
     const tables = [
       table({ id: "fact", table_type: "fact" }),

@@ -409,6 +409,7 @@ async def route_query(
     force_route: str | None = None,
     persona: Persona | None = None,
     row_security: CompiledPredicate | None = None,
+    persist_population_observation: bool = True,
 ) -> RouteDecision:
     """
     1. Find the best aggregate candidate.
@@ -491,6 +492,7 @@ async def route_query(
             target_dialect=_target_dialect_early,
             force_route=force_route,
             persona=persona,
+            persist_population_observation=persist_population_observation,
         )
     if rls_bypass and has_active_rules(row_security):
         active_rule_ids = row_security.active_rule_ids if row_security else []
@@ -680,6 +682,7 @@ async def route_query(
             bound_query,
             db,
             persona_id=str(persona.id) if persona is not None else None,
+            persist_population_observation=persist_population_observation,
         )
         pocket = pocket_result.pocket
         pocket_skipped_reason = pocket_result.skipped_reason
@@ -695,6 +698,7 @@ async def route_query(
             bound_query,
             db,
             persona_id=str(persona.id) if persona is not None else None,
+            persist_population_observation=persist_population_observation,
         )
         pocket = pocket_result.pocket
         pocket_skipped_reason = pocket_result.skipped_reason
@@ -1632,6 +1636,7 @@ async def _route_with_row_security(
     target_dialect: str | None = None,
     force_route: str | None = None,
     persona: Persona | None = None,
+    persist_population_observation: bool = True,
 ) -> RouteDecision:
     """Route with active row-security, attempting RLS-safe fast paths first.
 
@@ -1706,6 +1711,7 @@ async def _route_with_row_security(
         _pkt_result = await find_best_pocket(
             bound_query, db,
             persona_id=str(persona.id) if persona is not None else None,
+            persist_population_observation=persist_population_observation,
         )
         _pkt = _pkt_result.pocket
         _pkt_skip_reason = _pkt_result.skipped_reason

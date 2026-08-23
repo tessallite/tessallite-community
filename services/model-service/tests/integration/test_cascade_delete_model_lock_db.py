@@ -36,7 +36,7 @@ import asyncio
 import uuid
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 
 from shared.db.model_lock import acquire_model_definition_lock
@@ -162,6 +162,95 @@ async def _seed_model_with_children(
     session.add(Measure(id=uuid.uuid4(), model_id=model_id, name="m1"))
     await session.flush()
     return model_id, join_id
+
+
+async def _seed_model_with_named_query(
+    session, project_id: uuid.UUID, connection_id: uuid.UUID, suffix: str,
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+    """Seed the real NQ -> artifact/run/policy -> target FK chain.
+
+    The resolver is intentionally exercised against real tenant metadata; the
+    target-side PostgreSQL table does not need to exist because the cascade
+    only persists the detached cleanup outbox.
+    """
+    from shared.db.models import (
+        DataTarget,
+        Model,
+        NamedQuery,
+        NamedQueryArtifact,
+        NamedQueryRefreshPolicy,
+        NamedQueryRefreshRun,
+    )
+
+    model_id = uuid.uuid4()
+    target_id, named_query_id = uuid.uuid4(), uuid.uuid4()
+    run_id, artifact_id, policy_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    session.add(
+        Model(
+            id=model_id,
+            project_id=project_id,
+            slug=f"nq-model-{suffix}-{model_id.hex[:8]}",
+            display_name=f"NQ Model {suffix}",
+            seed=uuid.uuid4().hex,
+        )
+    )
+    await session.flush()
+    session.add(
+        DataTarget(
+            id=target_id,
+            model_id=model_id,
+            project_connection_id=connection_id,
+            target_type="postgresql",
+            display_name=f"NQ Target {suffix}",
+            config={"schema": "analytics"},
+        )
+    )
+    await session.flush()
+    session.add(
+        NamedQuery(
+            id=named_query_id,
+            model_id=model_id,
+            name=f"orders_{suffix}",
+            display_name=f"Orders {suffix}",
+            definition_sql="SELECT * FROM orders",
+            output_columns=[{"name": "id", "type": "number"}],
+            shape="projection",
+            certification_status="draft",
+        )
+    )
+    await session.flush()
+    session.add(
+        NamedQueryRefreshRun(
+            id=run_id,
+            named_query_id=named_query_id,
+            refresh_mode="full",
+            status="completed",
+            triggered_by="integration",
+        )
+    )
+    session.add(
+        NamedQueryRefreshPolicy(
+            id=policy_id,
+            named_query_id=named_query_id,
+            cron_expression="0 * * * *",
+            is_enabled=True,
+        )
+    )
+    await session.flush()
+    session.add(
+        NamedQueryArtifact(
+            id=artifact_id,
+            named_query_id=named_query_id,
+            target_id=target_id,
+            physical_table_name=f"nq_{suffix}_result",
+            target_schema="analytics",
+            status="fresh",
+            active_refresh_run_id=run_id,
+            row_count=1,
+        )
+    )
+    await session.flush()
+    return model_id, target_id, artifact_id, named_query_id, run_id
 
 
 async def _count(session, table: str, model_id: uuid.UUID) -> int:
@@ -462,6 +551,161 @@ async def test_project_cascade_waits_for_a_lock_held_on_any_of_its_models():
             ).scalar_one()
             assert remaining == 0
             assert await _count(check, "joins", m1) == 0
+
+
+# ---------------------------------------------------------------------------
+# Bug-9162 — real PostgreSQL FK proof for the Named Query family
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _DB_URL, reason="no versioning DB URL configured")
+async def test_bug9162_model_delete_removes_nq_family_and_persists_cleanup_identity():
+    """A real model delete must clear every NQ FK before its target row."""
+    from shared.db.models import PhysicalCleanupTask
+
+    async with _isolated_schema() as (factory, _schema):
+        async with factory() as seed:
+            project_id, connection_id = await _seed_project(seed)
+            (
+                model_id,
+                _target_id,
+                artifact_id,
+                named_query_id,
+                run_id,
+            ) = await _seed_model_with_named_query(
+                seed, project_id, connection_id, "model"
+            )
+            await seed.commit()
+
+        async with factory() as deleter:
+            errors = await delete_model_cascade(
+                deleter, model_id, cleanup_reason="bug9162_model_delete"
+            )
+            assert errors == [], errors
+            await deleter.commit()
+
+        async with factory() as check:
+            assert await _count(check, "models", model_id) == 0
+            assert await _count(check, "data_targets", model_id) == 0
+            metadata_counts = {
+                "named_queries": (
+                    "SELECT count(*) FROM named_queries WHERE id = :nqid",
+                    {"nqid": named_query_id},
+                ),
+                "named_query_refresh_policies": (
+                    "SELECT count(*) FROM named_query_refresh_policies "
+                    "WHERE named_query_id = :nqid",
+                    {"nqid": named_query_id},
+                ),
+                "named_query_refresh_runs": (
+                    "SELECT count(*) FROM named_query_refresh_runs "
+                    "WHERE named_query_id = :nqid OR id = :rid",
+                    {"nqid": named_query_id, "rid": run_id},
+                ),
+            }
+            for table, (statement, params) in metadata_counts.items():
+                result = await check.execute(text(statement), params)
+                assert result.scalar_one() == 0, table
+            artifact_count = await check.execute(
+                text(
+                    "SELECT count(*) FROM named_query_artifacts "
+                    "WHERE id = :aid"
+                ),
+                {"aid": artifact_id},
+            )
+            assert artifact_count.scalar_one() == 0
+            task = (
+                await check.execute(
+                    select(PhysicalCleanupTask).where(
+                        PhysicalCleanupTask.artifact_id == artifact_id
+                    )
+                )
+            ).scalar_one()
+            assert task.artifact_kind == "named_query"
+            assert task.model_id == model_id
+            assert task.project_id == project_id
+            assert task.connection_id == connection_id
+            assert task.target_schema == "analytics"
+            assert task.qualified_table_name == "analytics.nq_model_result"
+            assert task.status == "pending"
+            assert task.artifact_id == artifact_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not _DB_URL, reason="no versioning DB URL configured")
+async def test_bug9162_project_delete_removes_nq_families_and_keeps_outbox_rows():
+    """The project-shaped cascade must apply the same real FK ordering."""
+    from shared.db.models import PhysicalCleanupTask
+
+    async with _isolated_schema() as (factory, _schema):
+        async with factory() as seed:
+            project_id, connection_id = await _seed_project(seed)
+            model_ids = []
+            artifact_ids = []
+            named_query_ids = []
+            run_ids = []
+            for suffix in ("one", "two"):
+                model_id, _target_id, artifact_id, named_query_id, run_id = await _seed_model_with_named_query(
+                    seed, project_id, connection_id, suffix
+                )
+                model_ids.append(model_id)
+                artifact_ids.append(artifact_id)
+                named_query_ids.append(named_query_id)
+                run_ids.append(run_id)
+            await seed.commit()
+
+        async with factory() as deleter:
+            errors = await delete_project_cascade(deleter, project_id)
+            assert errors == [], errors
+            await deleter.commit()
+
+        async with factory() as check:
+            model_count = await check.execute(
+                text("SELECT count(*) FROM models WHERE project_id = :pid"),
+                {"pid": project_id},
+            )
+            assert model_count.scalar_one() == 0
+            for artifact_id in artifact_ids:
+                artifact_count = await check.execute(
+                    text(
+                        "SELECT count(*) FROM named_query_artifacts "
+                        "WHERE id = :aid"
+                    ),
+                    {"aid": artifact_id},
+                )
+                assert artifact_count.scalar_one() == 0
+            for named_query_id, run_id in zip(named_query_ids, run_ids):
+                nq_count = await check.execute(
+                    text("SELECT count(*) FROM named_queries WHERE id = :nqid"),
+                    {"nqid": named_query_id},
+                )
+                assert nq_count.scalar_one() == 0
+                child_counts = await check.execute(
+                    text(
+                        "SELECT "
+                        "(SELECT count(*) FROM named_query_refresh_policies "
+                        "WHERE named_query_id = :nqid) + "
+                        "(SELECT count(*) FROM named_query_refresh_runs "
+                        "WHERE named_query_id = :nqid OR id = :rid)"
+                    ),
+                    {"nqid": named_query_id, "rid": run_id},
+                )
+                assert child_counts.scalar_one() == 0
+            tasks = list(
+                (
+                    await check.execute(
+                        select(PhysicalCleanupTask).where(
+                            PhysicalCleanupTask.project_id == project_id
+                        )
+                    )
+                ).scalars().all()
+            )
+            assert {task.artifact_id for task in tasks} == set(artifact_ids)
+            assert {task.artifact_kind for task in tasks} == {"named_query"}
+            assert {task.requested_by for task in tasks} == {"project_delete"}
+            assert all(task.qualified_table_name.startswith("analytics.nq_") for task in tasks)
+            assert set(task.model_id for task in tasks) == set(model_ids)
 
 
 # ---------------------------------------------------------------------------

@@ -385,11 +385,12 @@ def _bound_query(*, include_dim_table_column: bool = False):
     return bq
 
 
-def _pocket():
+def _pocket(*, status="fresh"):
     return types.SimpleNamespace(
         id="pocket-8580",
         model_id="model-1",
-        status="fresh",
+        status=status,
+        failure_reason=None,
         built_for_version_id="v1",
         built_for_epoch=0,
         query_fingerprint="fp-pocket-star",
@@ -401,10 +402,13 @@ def _pocket():
     )
 
 
-async def _match(bq, shape):
+async def _match(bq, shape, *, pocket=None):
     db = AsyncMock()
     db.execute = AsyncMock(return_value=types.SimpleNamespace(
-        scalars=lambda: types.SimpleNamespace(all=lambda: [_pocket()]),
+        scalars=lambda: types.SimpleNamespace(
+            all=lambda: [pocket or _pocket()]
+            if (pocket is None or pocket.status == "fresh") else []
+        ),
     ))
     with patch(
         "src.semantic.snapshot_resolver.resolve_deployed_shape",
@@ -448,6 +452,93 @@ async def test_left_join_on_a_non_unique_key_does_not_serve():
     )
     assert result.pocket is None
     assert result.skipped_reason == PocketSkipReason.JOIN_POPULATION_MISMATCH
+
+
+async def test_population_mismatch_parks_the_candidate_with_an_exact_reason():
+    """G4: a mismatch parks eligibility without rewriting freshness."""
+    pocket = _pocket()
+    result = await _match(_bound_query(), _snapshot_shape("inner"), pocket=pocket)
+
+    assert result.pocket is None
+    assert result.skipped_reason == PocketSkipReason.JOIN_POPULATION_MISMATCH
+    assert pocket.status == "fresh"
+    assert pocket.population_eligibility == "ineligible"
+    assert pocket.population_eligibility_reason == "Ineligible: population mismatch"
+    assert pocket.failure_reason == "Ineligible: population mismatch"
+
+
+async def test_population_proof_reactivates_only_a_matching_ineligible_pocket():
+    """G4: eligibility returns only after the same plan proves lossless."""
+    pocket = _pocket(status="fresh")
+    pocket.population_eligibility = "ineligible"
+    pocket.failure_reason = "Ineligible: population mismatch"
+
+    result = await _match(_bound_query(), _snapshot_shape("left"), pocket=pocket)
+
+    assert result.pocket is pocket
+    assert pocket.status == "fresh"
+    assert pocket.population_eligibility == "eligible"
+    assert pocket.failure_reason is None
+
+
+async def test_g4_sol_r1_b02_definition_edit_cannot_reactivate_old_generation():
+    """A definition edit leaves the old physical generation unservable."""
+    pocket = _pocket(status="stale")
+    pocket.population_eligibility = "ineligible"
+    result = await _match(_bound_query(), _snapshot_shape("left"), pocket=pocket)
+    assert result.pocket is None
+    assert result.skipped_reason == PocketSkipReason.NO_CANDIDATES
+    assert pocket.status == "stale"
+    assert pocket.population_eligibility == "ineligible"
+
+
+async def test_g4_sol_r1_b02_ineligible_revert_and_target_invalidation_clear_build_trust():
+    """Control-plane invalidation clears both proof and physical trust."""
+    from shared.artifact_target_binding import _invalidate_artifacts
+
+    db = AsyncMock()
+    db.execute = AsyncMock(
+        side_effect=[types.SimpleNamespace(rowcount=0), types.SimpleNamespace(rowcount=1)]
+    )
+    await _invalidate_artifacts(
+        db,
+        pocket_scope=True,
+        aggregate_scope=True,
+        reason="target repointed",
+    )
+    pocket_stmt = db.execute.await_args_list[1].args[0]
+    rendered = str(pocket_stmt)
+    assert "population_eligibility" in rendered
+    assert "built_for_version_id" in rendered
+    assert "active_refresh_run_id" in rendered
+
+
+async def test_g4_sol_r1_b03_explain_lifecycle_policy_is_explicit_and_persisted():
+    """Explain evaluates the matcher without a lifecycle write."""
+    db = AsyncMock()
+    pocket = _pocket()
+    db.execute = AsyncMock(return_value=types.SimpleNamespace(
+        scalars=lambda: types.SimpleNamespace(all=lambda: [pocket]),
+    ))
+    shape = _snapshot_shape("inner")
+    with patch(
+        "src.semantic.snapshot_resolver.resolve_deployed_shape",
+        new=AsyncMock(return_value=shape),
+    ), patch("src.routing.pocket_matcher.system_snapshot_get") as snap, patch(
+        "src.routing.pocket_matcher.get_setting", new_callable=AsyncMock
+    ) as get_setting:
+        snap.side_effect = lambda key: {
+            "pocket.enabled": True,
+            "pocket.require_tenant_filter": False,
+            "pocket.tenant_scope_from_context": True,
+        }.get(key)
+        get_setting.return_value = True
+        result = await find_best_pocket(
+            _bound_query(), db, persist_population_observation=False,
+        )
+    assert result.skipped_reason == PocketSkipReason.JOIN_POPULATION_MISMATCH
+    assert db.execute.await_count == 1
+    assert not hasattr(pocket, "population_eligibility")
 
 
 async def test_query_spanning_the_whole_star_serves_from_an_inner_join_pocket():

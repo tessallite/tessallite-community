@@ -21,6 +21,7 @@ from shared.importers.import_warnings import (
     make_import_warning,
 )
 from shared.model_snapshot.slug_utils import slugify
+from shared.model_defaults import DEFAULT_INCLUDE_ALL_MEASURES
 
 
 _MEASURE_TYPE_MAP: dict[str, str] = {
@@ -430,7 +431,7 @@ def _map_cube(
             "refresh_strategy": "manual",
             "max_aggregates": 20,
             "aggregations_enabled": True,
-            "include_all_measures": True,
+            "include_all_measures": DEFAULT_INCLUDE_ALL_MEASURES,
         },
         "tables": tables,
         "columns": columns,

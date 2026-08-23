@@ -115,6 +115,7 @@ When Tessallite generates subtotals for a PivotTable, the subtotal engine reads 
 - [Define Measures](define-measures.md)
 - [Calculated Measures](calculated-measures.md)
 - [Configure Aggregates](configure-aggregates.md)
+- [KPIs](kpis.md) — a KPI can apply the same closing/average reduction per period. See "Choosing the reduction grain" there for the periods it accepts and why a column name is not one of them.
 
 ---
 

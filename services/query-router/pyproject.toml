@@ -40,4 +40,5 @@ markers = [
     "integration: Integration tests — mocked DB, or one service + a real Postgres (skip via TESSALLITE_VERSIONING_DB_URL)",
     "e2e: End-to-end tests requiring running services",
     "real_population_resolvers: disable conftest's synthetic one-relation population world (Bug-8580/Bug-8664); the test asserts what the REAL resolvers do, including their fail-closed behaviour",
+    "real_snapshot_resolver: disable conftest's always-succeeds empty DeployedShape; the test asserts what the REAL snapshot resolver does with a genuine or unusable snapshot_json, including its fail-closed behaviour (Bug-9200/9397)",
 ]

@@ -36,7 +36,6 @@ from shared.semantic.time_variants_sql import (
     VariantBinding,
     emit_variant_expression,
     VariantSqlError,
-    rewrite_ignore_nulls_for_postgresql,
 )
 
 # Sentinel indicating the expression cannot be compiled to SQL and must
@@ -140,7 +139,17 @@ def _inject_where(sql: str, where_clause: str) -> str:
 # Grain keywords that must be rendered as DATE_TRUNC('<grain>', <col>) rather
 # than treated as a literal column name (F-017-21). Anything else is taken as a
 # real column name.
-_GRAIN_KEYWORDS = frozenset({"day", "week", "month", "quarter", "year"})
+#
+# ONE owner, imported — not a second copy (L7-R5, the Bug-6574 pattern). The API
+# boundary gates ``at_grain`` against this exact set in
+# ``_validate_kpi_at_grain``; a private duplicate here would let the validator and
+# the compiler drift into disagreeing about which values are grain keywords and
+# which are column names, and the compiler's answer decides what the SQL GROUPS
+# BY. The import direction is service -> shared: ``shared/`` must never import
+# from a service.
+from shared.schemas.domains.governance_advanced import (  # noqa: E402
+    _KPI_AT_GRAIN_KEYWORDS as _GRAIN_KEYWORDS,
+)
 
 
 def _wrap_agg(agg: str, expr: str) -> str:
@@ -176,13 +185,20 @@ _SQLGLOT_DIALECT = {
 def _transpile_to_dialect(sql: str, dialect: str) -> str:
     """Transpile ANSI canonical SQL to the target dialect.
 
-    The compiler always emits ANSI-standard SQL. Translation pipeline:
-    1. Pre-sqlglot compatibility pass: for PostgreSQL < 16, rewrite
-       ``IGNORE NULLS`` window functions to ``ARRAY_AGG ... FILTER`` form
-       before sqlglot processes the SQL (sqlglot would otherwise strip
-       ``IGNORE NULLS`` without providing a functional equivalent).
-    2. sqlglot transpilation for all dialects (identifier quoting, function
-       name mapping, syntax normalization).
+    The compiler emits ANSI-standard SQL and sqlglot performs the single
+    translation step (identifier quoting, function name mapping, syntax
+    normalization). There is no per-dialect pre-pass and no per-connector
+    branch — SQL-generation rule (1).
+
+    Bug-9482: there used to be one exception, a PostgreSQL ``IGNORE NULLS`` ->
+    ``ARRAY_AGG ... FILTER`` rewrite for the carry-forward emission. That rewrite
+    produces SQL PostgreSQL rejects in EVERY version (an aggregate inside
+    ``FILTER``, and an aggregate ``ORDER BY`` on a window function), so the
+    carry-forward emission was rebuilt on a construct that needs no rewrite at
+    all — see ``_carry_forward_scope``. Nothing this compiler emits contains
+    ``IGNORE NULLS`` any more, so the pre-pass is gone rather than left as
+    unreachable wiring that would silently produce unexecutable SQL for the next
+    caller that trips it.
 
     Raises ValueError if transpilation produces empty output (parse failure).
     """
@@ -190,14 +206,7 @@ def _transpile_to_dialect(sql: str, dialect: str) -> str:
     if target is None:
         return sql
 
-    # Pre-sqlglot compatibility: PG < 16 IGNORE NULLS -> ARRAY_AGG FILTER.
-    # Must run before sqlglot because sqlglot strips IGNORE NULLS for PG
-    # without providing the ARRAY_AGG workaround.
-    prepared = sql
-    if dialect == "postgresql":
-        prepared = rewrite_ignore_nulls_for_postgresql(prepared)
-
-    results = sqlglot.transpile(prepared, read="postgres", write=target)
+    results = sqlglot.transpile(sql, read="postgres", write=target)
     if not results:
         raise ValueError(f"sqlglot produced empty output for dialect '{dialect}'")
     return results[0]
@@ -222,6 +231,56 @@ class KPIUnsupportedAggregationError(ValueError):
     fail the KPI closed, the same disposition the sibling
     ``has_ungrouped_window`` check already uses for the same reason.
     """
+
+
+class KPITimeContextError(KPIUnsupportedAggregationError):
+    """A KPI needs a time column this compiler was never given.
+
+    Bug-8573 / Bug-9233 [silent wrong numbers]. Three builders here used to fall
+    back to a HARD-CODED column literally named ``date`` when
+    ``CompilerContext.time_column`` was unresolved, and ``_build_semi_additive_sql``
+    additionally treated any non-keyword ``at_grain`` as a raw column name. Both
+    defaults answer a DIFFERENT question from the one the modeller asked:
+
+      * ``"date"`` is not the KPI's time dimension. On a model whose fact date is
+        ``business_date`` the emitted SQL references a column that does not exist
+        (a cryptic source error); on a model that happens to also carry a
+        ``date`` column it silently reduces over the WRONG column and returns a
+        plausible, wrong number.
+      * a raw-column ``at_grain`` makes the inner query group by
+        ``(that column, time column)``, so the ``first``/``last`` outer
+        ``ORDER BY <time> LIMIT 1`` picks ONE ARBITRARY row from the whole table
+        instead of reducing per period.
+
+    Bug-7228 already established the rule for the sibling decomposed-TI path
+    ("never fall back to a hardcoded ``date`` column"); this is the same rule
+    inside the compiler, so it holds for EVERY writer of ``at_grain`` /
+    ``non_additive_agg`` — the REST schemas, project import, the seed importer
+    and rows persisted before the Bug-8573 validator landed — not just the two
+    Pydantic models that gate the API.
+
+    Subclasses ``KPIUnsupportedAggregationError`` deliberately: every existing
+    caller already routes that type to a fail-closed disposition
+    (``_GUARD_REFUSED``) rather than to the Python evaluator, so no call site can
+    be missed.
+    """
+
+
+def _require_time_column(ctx: CompilerContext, what: str) -> str:
+    """Return the quoted time column, or fail closed (Bug-8573 / Bug-9233).
+
+    ``what`` names the construct that needs it, so the log/refusal says which
+    part of the KPI definition is unsatisfiable.
+    """
+    if not ctx.time_column:
+        raise KPITimeContextError(
+            f"KPI {what} requires a time dimension, but none is bound to this "
+            "KPI. Bind the KPI's time dimension (or remove the time-based "
+            "reduction). Compiling it against a default column would reduce "
+            "over a column that is not this KPI's time dimension and report a "
+            "plausible, wrong number."
+        )
+    return _safe_ident(ctx.time_column)
 
 
 def _canonical_non_additive_agg(non_additive_agg: str | None) -> str:
@@ -299,13 +358,33 @@ def _build_semi_additive_sql(
 
     For first/last, uses ORDER BY + LIMIT 1 which is portable across
     all dialects (sqlglot transpiles LIMIT to TOP/FETCH as needed).
+
+    When ``ctx.carry_forward`` is set the per-period rows pass through
+    ``_carry_forward_scope`` BEFORE the reduction, so the fill operates on
+    per-period values rather than on the aggregate expression (Bug-9482).
     """
-    raw_grain = ctx.at_grain or "date"
-    time_col = _safe_ident(ctx.time_column or "date")
-    if raw_grain.lower() in _GRAIN_KEYWORDS:
-        grain_expr = f"DATE_TRUNC('{raw_grain.lower()}', {time_col})"
+    # Bug-8573 / Bug-9233: the time column is REQUIRED here — there is no
+    # correct default. See ``KPITimeContextError``.
+    time_col = _require_time_column(ctx, "semi-additive reduction")
+    raw_grain = ctx.at_grain
+    if raw_grain is None:
+        # Documented default for a half-configured KPI (non_additive_agg set,
+        # at_grain absent): reduce "by date" — i.e. per distinct value of the
+        # KPI's OWN time column, not a column named "date".
+        grain_expr = time_col
+    elif raw_grain.strip().lower() in _GRAIN_KEYWORDS:
+        grain_expr = f"DATE_TRUNC('{raw_grain.strip().lower()}', {time_col})"
     else:
-        grain_expr = _safe_ident(raw_grain)
+        # Bug-8573: a non-keyword at_grain used to be emitted as a raw column
+        # name. The inner query then grouped by (that column, time column) and
+        # the first/last outer ORDER BY ... LIMIT 1 picked ONE ARBITRARY row
+        # from the whole table instead of reducing per period. Refuse.
+        raise KPITimeContextError(
+            f"Invalid KPI at_grain {raw_grain!r}. Must be one of "
+            f"{sorted(_GRAIN_KEYWORDS)}. A non-keyword value would group the "
+            "reduction by that column instead of by period, so first/last "
+            "would return one arbitrary row rather than the per-period value."
+        )
     # Bug-6252: canonicalise (and reject an unsupported token) BEFORE choosing
     # the SQL shape, so a legacy/free-form value cannot select the generic
     # else-branch below and then be SUMmed by the old fallback.
@@ -317,6 +396,14 @@ def _build_semi_additive_sql(
             f"FROM {_safe_ident(ctx.model_slug)} "
             f"GROUP BY {grain_expr}, {time_col}"
         )
+        if ctx.carry_forward:
+            # Fill across the ordered candidate points, then reduce. The time
+            # column is a total order here (grain_key is a function of it), so
+            # the island numbering is deterministic.
+            inner_sql = _carry_forward_scope(
+                inner_sql, order_expr=time_col,
+                passthrough=("grain_key", time_col),
+            )
         order_dir = "DESC" if agg == "last" else "ASC"
         return (
             f"SELECT inner_val AS value "
@@ -332,11 +419,18 @@ def _build_semi_additive_sql(
             f"FROM {_safe_ident(ctx.model_slug)} "
             f"GROUP BY {grain_expr}"
         )
+        fill_order, fill_passthrough = "grain_key", ("grain_key",)
     else:
         inner_sql = (
             f"SELECT {grain_expr} AS grain_key, {select_expr} AS inner_val, {time_col} "
             f"FROM {_safe_ident(ctx.model_slug)} "
             f"GROUP BY {grain_expr}, {time_col}"
+        )
+        fill_order, fill_passthrough = time_col, ("grain_key", time_col)
+
+    if ctx.carry_forward:
+        inner_sql = _carry_forward_scope(
+            inner_sql, order_expr=fill_order, passthrough=fill_passthrough,
         )
 
     # min/max/avg/sum use standard aggregate functions
@@ -347,25 +441,68 @@ def _build_semi_additive_sql(
     )
 
 
-def _build_carry_forward_expr(select_expr: str, ctx: CompilerContext) -> str:
-    """Wrap a compiled expression with carry-forward NULL fill.
+# Column names the carry-forward scopes introduce. Local to the generated
+# subqueries; never user-visible.
+_CARRY_FORWARD_VALUE_COL = "inner_val"
+_CARRY_FORWARD_ISLAND_COL = "carry_grp"
 
-    Always emits the ANSI-standard ``LAST_VALUE(expr IGNORE NULLS)`` form.
-    Dialect-specific translation (e.g. PostgreSQL ``ARRAY_AGG`` pattern) is
-    handled by ``_transpile_to_dialect`` after compilation, keeping the
-    compiler itself dialect-agnostic.
+
+def _carry_forward_scope(
+    inner_sql: str,
+    *,
+    order_expr: str,
+    value_col: str = _CARRY_FORWARD_VALUE_COL,
+    passthrough: tuple[str, ...] = (),
+) -> str:
+    """Wrap a PER-PERIOD subquery in a carry-forward NULL-fill scope.
+
+    ``inner_sql`` must already be GROUPED — one row per period, exposing
+    ``value_col`` plus every column in ``passthrough``. The result is a SELECT
+    over it with ``value_col`` gap-filled and every passthrough column intact,
+    so the caller's outer reduction is unchanged.
+
+    Bug-9482 [the value never evaluated at all]. The previous design wrapped the
+    carry-forward around the AGGREGATE EXPRESSION itself
+    (``COALESCE(SUM(x), LAST_VALUE(SUM(x) IGNORE NULLS) OVER (...))``) and left
+    the PostgreSQL translation to ``rewrite_ignore_nulls_for_postgresql``. That
+    is unexecutable on every PostgreSQL version, for two independent reasons:
+    the rewrite copies the aggregate into ``FILTER (WHERE <agg> IS NOT NULL)``
+    ("aggregate functions are not allowed in FILTER") and it emits
+    ``ARRAY_AGG(x ORDER BY t) ... OVER (...)`` ("aggregate ORDER BY is not
+    implemented for window functions"). Both were reproduced on 15.19 and 16.15.
+    A carry-forward is a fill ACROSS PERIODS, so it belongs one scope OUT from
+    the aggregation, which is also the shape the spec documents
+    (architecture_kpi-requirements-specification.md section 12.2).
+
+    The fill itself is the portable gaps-and-islands form:
+
+      * ``COUNT(v) OVER (ORDER BY k ROWS UNBOUNDED PRECEDING .. CURRENT ROW)``
+        numbers each island — rows sharing a count are the run that begins at
+        the last non-NULL value.
+      * ``COALESCE(v, MAX(v) OVER (PARTITION BY island))`` takes that value,
+        because an island holds exactly one non-NULL row.
+
+    Chosen over a plain ``LAST_VALUE(v) OVER (... 1 PRECEDING)`` (which only
+    fills a SINGLE-row gap: two consecutive empty periods leave the second NULL)
+    and over ``LAST_VALUE(v IGNORE NULLS)`` (which needs the broken PostgreSQL
+    pre-pass above). It is ordinary ANSI SQL, so sqlglot transpiles it to
+    postgres / bigquery / snowflake / tsql / spark / redshift with no
+    per-connector branch. Leading NULL periods stay NULL — there is nothing
+    before them to carry.
     """
-    time_col = _safe_ident(ctx.time_column or "date")
-
-    # Canonical ANSI form — sqlglot handles dialect conversion downstream.
-    # PostgreSQL-specific rewriting is handled in _transpile_to_dialect.
-    lag_fill = (
-        f"LAST_VALUE({select_expr} IGNORE NULLS)"
-        f" OVER (ORDER BY {time_col}"
-        f" ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)"
+    carried = "".join(f", {col}" for col in passthrough)
+    island_sql = (
+        f"SELECT {value_col}{carried}, "
+        f"COUNT({value_col}) OVER (ORDER BY {order_expr} "
+        f"ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) "
+        f"AS {_CARRY_FORWARD_ISLAND_COL} "
+        f"FROM ({inner_sql}) cf_src"
     )
-
-    return f"COALESCE({select_expr}, {lag_fill})"
+    return (
+        f"SELECT COALESCE({value_col}, MAX({value_col}) OVER "
+        f"(PARTITION BY {_CARRY_FORWARD_ISLAND_COL})) AS {value_col}{carried} "
+        f"FROM ({island_sql}) cf_island"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +530,15 @@ def _build_ti_subquery(select_expr: str, ctx: CompilerContext) -> str:
         f"FROM {model}{inner_where} "
         f"GROUP BY {time_col}"
     )
+
+    if ctx.carry_forward:
+        # Bug-9482: this path's inner query is already one row per time point,
+        # so the fill is the same scope-level wrap the semi-additive and
+        # aggregate-of-aggregate builders use.
+        inner_sql = _carry_forward_scope(
+            inner_sql, order_expr=time_col, value_col="value",
+            passthrough=(time_col,),
+        )
 
     outer_where = ""
     if ctx.time_where_clause:
@@ -469,8 +615,11 @@ def compile_scalar_kpi_sql(
 
     if not time_window_start_sql:
         time_window_start_sql = f"DATE_TRUNC('{grain}', CURRENT_DATE)"
+    # Bug-9478: exclusive end must include the anchor day (same contract as
+    # period_to_date / business-builder "today"). Bare CURRENT_DATE made
+    # prior_period one day shorter than period_to_date.
     if not time_window_end_sql:
-        time_window_end_sql = "CURRENT_DATE"
+        time_window_end_sql = "CURRENT_DATE + INTERVAL '1 day'"
 
     if ti_type == "prior_period":
         return (
@@ -510,7 +659,7 @@ def compile_scalar_kpi_sql(
             f"SELECT {base_select_expr} AS value "
             f"FROM {model} "
             f"WHERE {time_col} >= DATE_TRUNC('{ptd_grain}', CURRENT_DATE) "
-            f"AND {time_col} < CURRENT_DATE + INTERVAL '1 day'{filter_where}"
+            f"AND {time_col} < {time_window_end_sql}{filter_where}"
         )
 
     n = ti_n_periods or 3
@@ -742,22 +891,36 @@ def _build_agg_of_agg_sql(
     # F-017-21: inner_grain may be a grain keyword ("month") OR a real column.
     # A grain keyword must be DATE_TRUNC'd against the model's time column
     # (spec 5.4.3) — treating it as a raw column name produces invalid SQL.
-    raw_grain = (ctx.inner_grain or ctx.time_column or "date")
-    if raw_grain.lower() in _GRAIN_KEYWORDS:
-        time_col = _safe_ident(ctx.time_column or "date")
-        inner_grain_expr = f"DATE_TRUNC('{raw_grain.lower()}', {time_col})"
+    # Bug-8573 / Bug-9233: a grain keyword (and the no-inner_grain default) both
+    # need the KPI's OWN time column; the old ``or "date"`` fallback bucketed the
+    # inner aggregate by a column that is not the KPI's time dimension and
+    # returned a plausible, wrong number. A non-keyword inner_grain stays a real
+    # column name (F-017-21) and needs no time column.
+    raw_grain = ctx.inner_grain
+    if raw_grain is None or raw_grain.strip().lower() in _GRAIN_KEYWORDS:
+        time_col = _require_time_column(ctx, "aggregate-of-aggregate inner grain")
+        if raw_grain is None:
+            inner_grain_expr = time_col
+        else:
+            inner_grain_expr = (
+                f"DATE_TRUNC('{raw_grain.strip().lower()}', {time_col})"
+            )
     else:
         inner_grain_expr = _safe_ident(raw_grain)
     inner_select = _wrap_agg(ctx.inner_agg, select_expr)
     outer_select = _wrap_agg(ctx.outer_agg, "inner_val")
-    return (
-        f"SELECT {outer_select} AS value "
-        f"FROM ("
+    inner_sql = (
         f"SELECT {inner_grain_expr} AS grain_key, {inner_select} AS inner_val "
         f"FROM {_safe_ident(ctx.model_slug)} "
         f"GROUP BY {inner_grain_expr}"
-        f") sub"
     )
+    if ctx.carry_forward:
+        # Bug-9482: the fill belongs OUTSIDE the inner aggregation, over the
+        # per-bucket values, never inside ``inner_select``.
+        inner_sql = _carry_forward_scope(
+            inner_sql, order_expr="grain_key", passthrough=("grain_key",),
+        )
+    return f"SELECT {outer_select} AS value FROM ({inner_sql}) sub"
 
 
 # ---------------------------------------------------------------------------
@@ -887,8 +1050,14 @@ class _Compiler:
             agg = self.ctx.measure_aggs[name]
 
         mode = self.ctx.calc_agg_mode
-        if mode in ("row_first", "pre_aggregated"):
-            # Row-first: use bare column, outer agg applied later
+        # Bug-9480: aggregate-of-aggregate builds its own inner wrap in
+        # ``_build_agg_of_agg_sql``. Emitting ``SUM(col)`` here produced
+        # nested ``SUM(SUM(col))`` for every mode except row_first /
+        # pre_aggregated (including the mode named for the feature).
+        if mode in ("row_first", "pre_aggregated") or (
+            self.ctx.inner_agg and self.ctx.outer_agg
+        ):
+            # Row-first / agg-of-agg inner grain: bare column; outer wrap later
             return _safe_ident(name)
         # aggregate_first or automatic: wrap in aggregation
         return _wrap_agg(agg, _safe_ident(name))
@@ -1128,8 +1297,15 @@ class _Compiler:
         if variant_name is None:
             return "NULL"
 
-        # Build the VariantBinding
-        time_col = self.ctx.time_column or "date"
+        # Build the VariantBinding.
+        # Bug-8573 / Bug-9233: a time-intelligence variant is computed RELATIVE
+        # to the KPI's time column. The old ``or "date"`` fallback anchored the
+        # period boundary on a column that is not the KPI's time dimension —
+        # a YTD/prior-period figure that looks legitimate and is wrong. The
+        # callers in api/kpis.py already fail closed with
+        # ``_TI_NO_TIME_DIMENSION`` before reaching here; this is the backstop
+        # for any writer that does not (Bug-7228's rule, applied in-compiler).
+        quoted_time_col = _require_time_column(self.ctx, f"time-intelligence '{fn}'")
         # calendar_type defaults to "standard" so period-boundary variants
         # (prior_month, ytd, etc.) can use EXTRACT-based computation even
         # when no calendar table is present.
@@ -1137,7 +1313,7 @@ class _Compiler:
         try:
             binding = VariantBinding(
                 base_expression=inner_expr,
-                fact_date_column=_safe_ident(time_col),
+                fact_date_column=quoted_time_col,
                 calendar_type=cal_type,
                 fiscal_year_start_month=self.ctx.fiscal_year_start_month,
                 n=n_val,
@@ -1439,10 +1615,28 @@ def compile_expression(
     ):
         select_expr = _wrap_agg(outer, select_expr)
 
-    # Carry-forward: wrap expression with COALESCE NULL fill before
-    # any subquery wrapping so the fill operates at the row level.
+    # Carry-forward is applied one scope OUT from the aggregation, by each
+    # builder that produces per-period rows (``_build_semi_additive_sql``,
+    # ``_build_agg_of_agg_sql``, ``_build_ti_subquery``) — never around
+    # ``select_expr``, which is already an aggregate (Bug-9482). The time column
+    # is still required here so the refusal names carry-forward rather than
+    # whichever builder happens to consume it.
     if ctx.carry_forward:
-        select_expr = _build_carry_forward_expr(select_expr, ctx)
+        _require_time_column(ctx, "carry-forward NULL fill")
+
+    # Bug-9481: share/rank and CTE-scalar TI recompile ``base_expression`` and
+    # never thread carry_forward. Fail closed rather than silently drop the fill.
+    if ctx.carry_forward and ctx.share_type:
+        raise ValueError(
+            "carry_forward cannot be combined with share/rank; refuse rather "
+            "than emit a share query that silently drops the fill"
+        )
+    if ctx.carry_forward and ctx.ti_type and ctx.base_expression:
+        raise ValueError(
+            "carry_forward on CTE-scalar time-intelligence must use the "
+            "decomposed evaluator path; refuse compile rather than emit a "
+            "CTE that silently drops the fill"
+        )
 
     # Resolve effective WHERE clause for non-subquery paths.
     effective_where = ctx.where_clause
@@ -1512,6 +1706,19 @@ def compile_expression(
     # Legacy window-function subquery for non-business-builder TI paths.
     elif compiler.has_time_intelligence and ctx.time_column and ctx.enable_ti_subquery:
         sql = _build_ti_subquery(select_expr, ctx)
+    # Carry-forward with NEITHER semi-additive half set. A gap-fill needs a
+    # period series to fill across, and the plain single-aggregate path has one
+    # row, so the flag would be inert there. Bug-9482: route it through the same
+    # bucketed builder using the half-configuration defaults that builder already
+    # documents (bucket by the KPI's OWN time column, reduce with ``last``) —
+    # the identical treatment ``at_grain`` alone and ``non_additive_agg`` alone
+    # already get since Bug-6252. carry_forward is only ever authored for a
+    # balance/level measure, so serving the model-wide SUM instead is the exact
+    # wrong number the semi-additive machinery exists to prevent.
+    elif ctx.carry_forward:
+        sql = _build_semi_additive_sql(select_expr, ctx)
+        if where_suffix and " FROM " in sql:
+            sql = _inject_where(sql, effective_where)
     else:
         sql = f"SELECT {select_expr} AS value FROM {_safe_ident(ctx.model_slug)}{where_suffix}"
 

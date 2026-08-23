@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 from src.ir.logical_query import (
     BoundQuery,
@@ -22,6 +22,7 @@ from src.ir.logical_query import (
     SemanticBindingError,
 )
 from src.rewrite.join_graph_cache import _get_join_graph, _put_join_graph
+from shared.semantic.join_population_serving import augment_required_table_ids
 
 if TYPE_CHECKING:
     # F-006-10: the local helpers below are annotated ``-> ModelTable | None``.
@@ -324,6 +325,7 @@ def _resolve_required_and_base_tables(
     calc_ref_measures_by_name: dict,
     _sa_finest_time_col_id: Any,
     _sa_has_time_in_grain: bool,
+    joins: Iterable[Any] = (),
 ) -> tuple:
     """Resolve the required physical tables and the base table.
 
@@ -403,6 +405,23 @@ def _resolve_required_and_base_tables(
         _sa_col = columns_by_id.get(_sa_finest_time_col_id)
         if _sa_col:
             required_table_ids.add(_sa_col.model_table_id)
+
+    # Bug-8615 / G3: deployed population-defining joins belong to the source
+    # row population even when projection, filters, and ordering do not name
+    # their far table.  Keep this closure shared with aggregate and pocket
+    # consumers.  Unknown participation stays elidable; malformed mandatory
+    # endpoints refuse the source route rather than silently widening it.
+    _required_with_population = augment_required_table_ids(
+        required_table_ids,
+        joins,
+        table_ids=tables_by_id,
+    )
+    if _required_with_population is None:
+        raise SemanticBindingError(
+            "Cannot resolve source SQL: deployed population-defining join "
+            "has an unknown or malformed graph endpoint."
+        )
+    required_table_ids = _required_with_population
 
     if not required_table_ids:
         # Phase 2 fail-loud (Finding 3): the query references columns,

@@ -8,8 +8,7 @@ What this file protects, in the order the contract states it:
   invariant of this phase);
 * a metadata gap never reads as ``neutral`` (invariant 1);
 * absence of measurement is reported, never promoted to ``BLOCKED``;
-* ``BLOCKED`` is computed but the deploy path cannot refuse a deploy
-  (invariant 4 / plan G1's warn-only rule);
+* only measured, policy-relevant ``BLOCKED`` rows can refuse a deploy (G5);
 * the probe SQL is dialect-neutral and goes through ``connector_qualify``.
 """
 from __future__ import annotations
@@ -47,6 +46,7 @@ from shared.semantic.join_population_validator import (
     build_inner_join_count_sql,
     build_side_probe_sql,
     build_verdict,
+    blocking_join_population_rows,
     classify_edge,
     join_status,
     preserved_sides,
@@ -1046,6 +1046,53 @@ def test_the_rollup_reads_persisted_orm_rows_too():
     assert (rollup.status, rollup.blocked_count, rollup.evaluated) == (
         STATUS_BLOCKED, 1, True,
     )
+
+
+@pytest.mark.parametrize(
+    "participation,status,measured,expected",
+    [
+        (POPULATION_PARTICIPATION_UNDECLARED, STATUS_BLOCKED, True, True),
+        (POPULATION_PARTICIPATION_ENRICHMENT_ONLY, STATUS_BLOCKED, True, True),
+        (POPULATION_PARTICIPATION_PRESERVE_BASE_ROWS, STATUS_BLOCKED, True, False),
+        (POPULATION_PARTICIPATION_UNDECLARED, STATUS_BLOCKED, False, False),
+        (POPULATION_PARTICIPATION_UNDECLARED, STATUS_WARNING, True, False),
+    ],
+)
+def test_g5_block_candidates_are_measured_and_policy_relevant(
+    participation, status, measured, expected,
+):
+    row = type("Row", (), {
+        "population_participation": participation,
+        "status": status,
+        "measured": measured,
+    })()
+    assert bool(blocking_join_population_rows([row])) is expected
+
+
+def test_g5_mixed_model_keeps_measured_blocker_visible():
+    measured_blocker = type("Row", (), {
+        "population_participation": POPULATION_PARTICIPATION_UNDECLARED,
+        "status": STATUS_BLOCKED,
+        "measured": True,
+    })()
+    unmeasured = type("Row", (), {
+        "population_participation": POPULATION_PARTICIPATION_UNDECLARED,
+        "status": STATUS_WARNING,
+        "measured": False,
+    })()
+    assert blocking_join_population_rows([measured_blocker, unmeasured]) == [
+        measured_blocker
+    ]
+
+
+def test_g5_status_alone_cannot_block_below_authoritative_threshold():
+    row = type("Row", (), {
+        "population_participation": POPULATION_PARTICIPATION_UNDECLARED,
+        "status": STATUS_BLOCKED,
+        "measured": True,
+        "row_effect_ratio": 0.05,
+    })()
+    assert blocking_join_population_rows([row], threshold=0.10) == []
 
 
 # ---------------------------------------------------------------------------

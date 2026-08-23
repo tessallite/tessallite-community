@@ -138,6 +138,7 @@ def create_embed_token(
     user_identity: str,
     tenant_id: str,
     persona_id: str | None = None,
+    project_persona_id: str | None = None,
     project_ids: list[str] | None = None,
     model_ids: list[str] | None = None,
     capabilities: list[str] | None = None,
@@ -170,6 +171,8 @@ def create_embed_token(
     }
     if persona_id:
         payload["persona_id"] = persona_id
+    if project_persona_id:
+        payload["project_persona_id"] = project_persona_id
     if project_ids is not None:
         payload["project_ids"] = project_ids
     if model_ids is not None:

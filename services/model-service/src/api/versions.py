@@ -49,7 +49,7 @@ from shared.db.models import (
     ProjectAgentModel,
     UserAccessBinding,
 )
-from shared.db.session import get_tenant_db
+from shared.db.session import get_system_db, get_tenant_db
 from shared.model_snapshot import (
     OneFactViolationError,
     RehydrationMode,
@@ -59,6 +59,7 @@ from shared.model_snapshot import (
     rehydrate_into_live,
 )
 from shared.model_snapshot.differ import diff_snapshots
+from shared.semantic.graph_order import fact_anchor_violation
 from src.auth.middleware import (
     CurrentUser,
     forbid_embed_user,
@@ -208,22 +209,20 @@ async def _validate_join_population_on_deploy(
     model_id: UUID,
     deployed_version_id: UUID,
     deploy_epoch: int,
-) -> None:
+    system_session: AsyncSession | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> list[Any]:
     """Classify this model's joins against the source at deploy time (Bug-8615).
 
     Governance contract:
     ``docs/architecture/architecture_join-population-governance.md``
-    (invariants 1, 4, 5, 6). Fully fail-open, exactly like the attribute-
-    relationship verifier above: it resolves the source connection, runs the
-    shared classifier, and stages evidence rows into ``tenant_db`` (committed
-    with the deploy). Any failure — no joins, no source connection, validation
-    disabled, connector error — is swallowed.
-
-    WARN-ONLY (governance plan phase G1). A ``BLOCKED`` rollup is computed and
-    surfaced in the deploy response and the join-population-health endpoint, and
-    the deploy still succeeds. Turning that into an actual refusal is phase G5,
-    a separately-triggered rollout stage, and is deliberately NOT implemented
-    here — there is no code path in this function that can reject a deploy.
+    (invariants 1, 4, 5, 6). This hook remains fail-open for measurement and
+    stages evidence rows into ``tenant_db``; the deploy handler applies the G5
+    policy to the returned rows. The system session is required for the
+    authoritative system threshold and probe budget, while validation mode
+    remains a model-level tenant setting. ``snapshot`` is the immutable
+    definition graph selected for this deploy; source credentials remain
+    resolved from live operational state only.
 
     When validation is switched off for the model, or the source cannot be
     resolved, the classifier still runs with ``measure=False``: that CLEARS the
@@ -268,7 +267,9 @@ async def _validate_join_population_on_deploy(
             try:
                 threshold = float(
                     await get_setting(
-                        SETTING_ROW_EFFECT_THRESHOLD, tenant_session=tenant_db,
+                        SETTING_ROW_EFFECT_THRESHOLD,
+                        system_session=system_session,
+                        tenant_session=tenant_db,
                     )
                 )
             except Exception:
@@ -276,7 +277,9 @@ async def _validate_join_population_on_deploy(
             try:
                 budget = float(
                     await get_setting(
-                        SETTING_PROBE_BUDGET_SECONDS, tenant_session=tenant_db,
+                        SETTING_PROBE_BUDGET_SECONDS,
+                        system_session=system_session,
+                        tenant_session=tenant_db,
                     )
                 )
             except Exception:
@@ -306,7 +309,7 @@ async def _validate_join_population_on_deploy(
     try:
         import shared.semantic.join_population_validator as _jpv
 
-        await _jpv.validate_model_joins_on_deploy(
+        return await _jpv.validate_model_joins_on_deploy(
             db=tenant_db,
             model_id=model_id,
             deployed_version_id=deployed_version_id,
@@ -317,6 +320,7 @@ async def _validate_join_population_on_deploy(
             budget_seconds=budget,
             measure=measure,
             tenant_session=tenant_db,
+            snapshot=snapshot,
         )
     except Exception:
         # The validator already swallows its own failures; this is the last
@@ -325,6 +329,7 @@ async def _validate_join_population_on_deploy(
             "join population validation skipped for model %s",
             model_id, exc_info=True,
         )
+        return []
 
 
 def _validate_snapshot_for_deploy(
@@ -372,6 +377,20 @@ def _validate_snapshot_for_deploy(
                 "snapshot with no measures, dimensions, or columns. An empty "
                 "model cannot be deployed. Add model content and Save before "
                 "deploying."
+            ),
+        )
+
+    # Bug-8614: a multi-table deployed model must have one declared population
+    # anchor. A single-table model is implicitly fact, and query projections
+    # are deliberately not involved in this deploy-time invariant.
+    anchor_error = fact_anchor_violation(snapshot.get("tables") or [])
+    if anchor_error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Version v{version_number} ({version_id}) violates the "
+                f"fact-anchor contract: {anchor_error} Save a version with "
+                "exactly one declared fact table before deploying."
             ),
         )
 
@@ -650,7 +669,17 @@ async def _stale_incompatible_artifacts(
                 new_epoch,
             ),
         )
-        .values(status="stale")
+        .values(
+            status="stale",
+            failure_reason="Model definition changed; pocket rebuild required.",
+            row_manifest=None,
+            active_refresh_run_id=None,
+            built_for_version_id=None,
+            built_for_epoch=None,
+            population_eligibility="unknown",
+            population_eligibility_reason=None,
+            population_proof_fingerprint=None,
+        )
     )
     # F-013-03: Named Query artifacts are the third materialised family and were
     # NOT staled on deploy/revert, so after a Deploy that moved the definition a
@@ -1732,6 +1761,7 @@ async def deploy_model(
     model_id: UUID,
     body: DeployBody = Body(default_factory=DeployBody),
     current_user: CurrentUser = Depends(forbid_embed_user),
+    system_db: AsyncSession = Depends(get_system_db),
 ) -> dict:
     async for tenant_db in get_tenant_db(current_user.tenant_id):
         model = await _ensure_model_access(project_id, model_id, current_user, tenant_db)
@@ -1751,6 +1781,7 @@ async def deploy_model(
         # committed current epoch, not a value read before a racing deploy won.
         await tenant_db.refresh(model, ["deploy_epoch", "deployed_version_id"])
         version_id = body.version_id
+        selected_version: ModelVersion
         if version_id is None:
             # Deploy latest saved version. Bug-6295: imported history rows are
             # non-servable placeholders (snapshot_unavailable) with a {} snapshot
@@ -1778,6 +1809,7 @@ async def deploy_model(
                     ),
                 )
             version_id = latest.id
+            selected_version = latest
             # Bug-7151: validate snapshot integrity before committing deploy.
             _validate_snapshot_for_deploy(
                 latest.snapshot_json, latest.id, latest.version_number,
@@ -1789,15 +1821,88 @@ async def deploy_model(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Version not found for this model",
                 )
+            selected_version = v
             # Bug-7151: validate snapshot integrity before committing deploy.
             _validate_snapshot_for_deploy(
                 v.snapshot_json, v.id, v.version_number,
             )
+        next_deploy_epoch = (getattr(model, "deploy_epoch", 0) or 0) + 1
+
+        # Bug-8615 / G5: classify before mutating the deploy pointer or
+        # staging any other publish state.  The validator remains fail-open
+        # for source failures, but a successfully measured threshold breach is
+        # an explicit modeller action gate.
+        join_population_checks = await _validate_join_population_on_deploy(
+            tenant_db,
+            model_id=model_id,
+            deployed_version_id=version_id,
+            deploy_epoch=next_deploy_epoch,
+            system_session=system_db,
+            snapshot=selected_version.snapshot_json,
+        )
+        from shared.semantic.join_population_validator import (
+            DEFAULT_ROW_EFFECT_WARNING_THRESHOLD,
+            SETTING_ROW_EFFECT_THRESHOLD,
+            blocking_join_population_rows,
+            snapshot_join_labels,
+        )
+        try:
+            from shared.config.resolver import get_setting
+
+            authoritative_threshold = float(
+                await get_setting(
+                    SETTING_ROW_EFFECT_THRESHOLD,
+                    system_session=system_db,
+                    tenant_session=tenant_db,
+                )
+            )
+        except Exception:
+            # The validator uses the same fail-open default when policy
+            # resolution fails. Keep the route predicate and its response
+            # diagnostic aligned with that fallback.
+            authoritative_threshold = DEFAULT_ROW_EFFECT_WARNING_THRESHOLD
+
+        blocking_checks = blocking_join_population_rows(
+            join_population_checks, threshold=authoritative_threshold,
+        )
+        if blocking_checks:
+            selected_labels = snapshot_join_labels(selected_version.snapshot_json)
+            offending = [
+                {
+                    **selected_labels.get(
+                        str(getattr(row, "join_id", "")),
+                        {"join_id": str(getattr(row, "join_id", ""))},
+                    ),
+                    "population_participation": str(
+                        getattr(row, "population_participation", "undeclared")
+                    ),
+                    "status": str(getattr(row, "status", "BLOCKED")),
+                    "row_effect_ratio": getattr(row, "row_effect_ratio", None),
+                    "reason": getattr(row, "reason", None),
+                }
+                for row in blocking_checks
+            ]
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "JOIN_POPULATION_BLOCKED",
+                    "message": (
+                        "Deployment refused because measured join-population "
+                        "effects exceed the system threshold. Declare each "
+                        "offending join's population role accurately "
+                        "(population_defining when it defines base rows) or "
+                        "fix the join/source data, then deploy again."
+                    ),
+                    "threshold": authoritative_threshold,
+                    "joins": offending,
+                },
+            )
+
         model.deployed_version_id = version_id
         model.last_deployed_at = datetime.now(timezone.utc)
         # Bug-7140: bump deploy_epoch so multi-replica caches keyed on
         # (model_id, deployed_version_id, deploy_epoch) see a new key.
-        model.deploy_epoch = (getattr(model, "deploy_epoch", 0) or 0) + 1
+        model.deploy_epoch = next_deploy_epoch
 
         # Derived-grain routing (Bug-7359, spec §7.6.2): tenant-global
         # complete-data verification of declared attribute relationships against
@@ -1808,16 +1913,6 @@ async def deploy_model(
         # runs the semantic-binding fan-out below; verification simply records
         # evidence before the same commit.
         await _verify_attribute_relationships_on_deploy(
-            tenant_db, model_id=model_id,
-            deployed_version_id=version_id, deploy_epoch=model.deploy_epoch,
-        )
-
-        # Bug-8615 phase G1: classify this model's joins as neutral /
-        # filtering / multiplying against the real source data, and record the
-        # per-join verdict bound to the NEW deploy epoch in THIS transaction.
-        # WARN-ONLY — the rollup is reported in the response below and by
-        # /join-population-health; a BLOCKED model still deploys. Never raises.
-        await _validate_join_population_on_deploy(
             tenant_db, model_id=model_id,
             deployed_version_id=version_id, deploy_epoch=model.deploy_epoch,
         )
@@ -1947,9 +2042,9 @@ async def deploy_model(
         #
         # Bug-8615 invariant 6: surface the join-population rollup at the point
         # the modeller acted, read from the rows the deploy transaction just
-        # committed. WARN-ONLY — a ``BLOCKED`` value here accompanies a
-        # SUCCESSFUL deploy; it is a finding to act on, not a refusal. Empty
-        # dict when the summary could not be read (it never raises).
+        # committed. The compatibility ``warn_only`` field is false; measured
+        # policy blockers were refused before this success path. Empty dict
+        # when the summary could not be read (it never raises).
         from src.api.join_population_health import summarise_join_population
 
         return {
@@ -1957,7 +2052,7 @@ async def deploy_model(
             "deployed_version_id": str(version_id),
             "last_deployed_at": model.last_deployed_at.isoformat(),
             "join_population": await summarise_join_population(
-                tenant_db, model_id,
+                tenant_db, model_id, snapshot=selected_version.snapshot_json,
             ),
         }
     # F-013-15: get_tenant_db always yields exactly one session, so the loop

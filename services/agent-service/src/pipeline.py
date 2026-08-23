@@ -66,6 +66,8 @@ from shared.config.settings import get_settings
 from shared.llm.adapter import build_adapter, RetryingAdapter
 from shared.middleware.internal_bypass import internal_request_headers
 from shared.llm.config_resolution import resolve_agent_llm_failover_configs
+from shared.deploy_resolver_core import index_snapshot_rows, load_deployed_snapshot
+from src.prompt.deployed_catalogue import CatalogueSnapshotInvalidError
 from src.narrate.narrate import (
     narrate_answer,
     narrate_answer_stream,
@@ -1304,13 +1306,35 @@ async def _named_set_outside_persona_scope(
     if ns is None or ns.model_id != model_uuid:
         return True
 
+    # Bug-9029 — preview_named_set is served from the deployed definition, so
+    # this prompt-side defence-in-depth check must inspect that same authority.
+    # Reading the live expression here made the precheck disagree with the
+    # model-service endpoint after an undeployed draft edit. Any missing or
+    # malformed deployed authority fails closed; never fall back to the draft.
+    model = await db.get(Model, model_uuid)
+    if model is None:
+        return True
+    try:
+        snapshot = await load_deployed_snapshot(
+            db, model, family="named_sets", error_cls=CatalogueSnapshotInvalidError,
+        )
+    except CatalogueSnapshotInvalidError:
+        return True
+    if snapshot is None:
+        return True
+    snapshot_ns = index_snapshot_rows(snapshot, "named_sets").get(str(nid))
+    if snapshot_ns is None:
+        return True
+    if "expression" not in snapshot_ns or "dimensions" not in snapshot_ns:
+        return True
+
     # Two lineage signals: (1) the authoritative persisted ``dimensions``
     # field (comma/semicolon-separated dimension names, when the builder
     # populated it) and (2) confident dimension-name references extracted
     # from the MDX expression. Refuse when EITHER names a real model
     # dimension the persona cannot see.
-    referenced = _named_set_referenced_dimension_names(getattr(ns, "expression", None))
-    raw_dims = getattr(ns, "dimensions", None)
+    referenced = _named_set_referenced_dimension_names(snapshot_ns.get("expression"))
+    raw_dims = snapshot_ns.get("dimensions")
     if raw_dims:
         for part in re.split(r"[;,]", str(raw_dims)):
             token = part.strip()
@@ -1340,6 +1364,7 @@ async def run_turn(
     persona_id: UUID | None = None,
     embed_model_ids: list[str] | None = None,
     budget_reservation_id: UUID | None = None,
+    turn_id: UUID | None = None,
 ) -> TurnOutcome:
     # F-023-03 (round 2) — in sync judge mode every emission from the
     # pipeline (including the compound/recipe branches and execute_recipe)
@@ -1352,11 +1377,25 @@ async def run_turn(
     if publisher is not None and getattr(cfg, "judge_mode", "sync") == "sync":
         publisher = _SyncVerdictGate(publisher)
 
+    # Resolve once for the project-persona prompt scope. This UUID belongs to
+    # ``ProjectPersona``; it is never serialized as query-router's model
+    # ``Persona.id``. Query-router derives its model-persona/RLS scope from the
+    # authenticated JWT independently, so both restrictions intersect.
+    resolved_project_persona_id = (
+        persona_id
+        if persona_id is not None
+        else getattr(conversation, "persona_id", None)
+    )
+    started_payload = {
+        "conversation_id": str(conversation.id),
+        "user_message": user_message,
+    }
+    if turn_id is not None:
+        started_payload["turn_id"] = str(turn_id)
     await _emit(
         publisher,
         "turn.started",
-        conversation_id=str(conversation.id),
-        user_message=user_message,
+        **started_payload,
     )
 
     # D2.1 — input guardrails (cheap, pre-LLM).
@@ -1383,7 +1422,7 @@ async def run_turn(
 
     bundle = await assemble_prompt(
         db, cfg, conversation.id, user_message,
-        persona_id=persona_id or getattr(conversation, "persona_id", None),
+        persona_id=resolved_project_persona_id,
         pinned_model_id=getattr(conversation, "pinned_model_id", None),
         embed_model_ids=embed_model_ids,
     )

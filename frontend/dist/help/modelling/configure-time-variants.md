@@ -183,6 +183,50 @@ A window-based variant additionally requires the aggregate's grain to contain a 
 
 ---
 
+## Time-aware measures and aggregate grain
+
+### Why your acceleration table needs a date dimension
+
+When you build an acceleration table (an aggregate), you choose the set of dimensions to group by — called the **grain**. For example: by Region, by Product Category, or by Month. Most measures like revenue and counts can be summarized at any grain. But time-aware measures work differently.
+
+Time-aware measures — moving averages, running totals, year-to-date, month-to-date, prior-period comparisons, and other date-dependent calculations — need to know which values belong to which time periods. This date context is essential for them to compute correctly.
+
+### The problem
+
+When an acceleration table is built at a grain with no date or calendar dimension, the summary has thrown away that time context. Pre-computing a moving average or a year-to-date figure in such a table would produce **wrong numbers**, because there would be no way to know the order of time periods or which data to include in the window or accumulation.
+
+### How Tessallite protects your numbers
+
+Tessallite prevents this by refusing to pre-build time-aware measures into aggregates that have no time dimension. Instead:
+
+- **Period-aware time variants** (year-to-date, quarter-to-date, month-to-date, prior-year, year-over-year comparisons) — these always compute live from the source, not from the acceleration table. Your numbers stay correct; these measures simply take the longer path.
+- **Window-based variants** (moving averages, trailing-N periods, lag/lead) — these can be pre-built into the acceleration table only if the grain includes a time dimension for ordering. Otherwise they also compute from the source.
+
+The regular measures in your acceleration table (like total revenue, order count, averages) continue to get the speed benefit. Only the time-aware measures skip the fast path to stay correct.
+
+### How to get time-aware measures accelerated
+
+Include a date or calendar dimension in your aggregate's grain.
+
+**Worked example:**
+
+Imagine you have a sales model and want to accelerate queries. You build an aggregate at the grain: Region, Product Category, Month.
+
+- Revenue and counts at that grain run fast from the acceleration table.
+- Year-to-date revenue can now also run fast, because the Month dimension provides the time context needed.
+- Moving averages and prior-year comparisons can also run fast from the same table.
+
+By contrast, if you built the aggregate at just Region and Product Category (no Month), then:
+
+- Revenue and counts at that grain still run fast.
+- All time-aware measures — year-to-date, moving averages, prior-year — would compute live from source every time, with no speed benefit.
+
+### Practical tip
+
+When designing your aggregates, ask: "Which dimensions do my BI reports actually need?" If your reports use time-aware measures and group by region, product, and month, then include all three in the grain. If they group only by region and product and ignore month, then a time dimension is not needed for that grain (though you can create additional aggregates at finer grains for other query patterns).
+
+---
+
 ## Partial and sparse windows (limitation)
 
 `trailing_n`, `moving_avg_n`, and `lag` use **row frames** with a semantic period guard: the source and aggregate routes share the selected time grain and period order. They do not insert zero rows for empty periods. This matters in two situations.
@@ -331,4 +375,4 @@ Use the rolling variant when you want to **plot** the trend; use a filtered quer
 
 ---
 
-← [Calculated Measures](calculated-measures.md) | [Home](../index.md) | [Understanding Window Functions →](window-functions.md)
+← [User-Defined Attributes](define-user-defined-attributes.md) | [Home](../index.md) | [Understanding Window Functions →](window-functions.md)

@@ -6,7 +6,8 @@ Several builders turn a model's ``ModelTable`` / ``Join`` / ``ModelColumn`` rows
 into physical SQL, and every one of them makes at least one **positional**
 decision:
 
-* the FROM/JOIN **anchor** — ``facts[0] if facts else <first table>``;
+* the FROM/JOIN **anchor** — ``facts[0] if facts else <first table>`` for
+  incomplete drafts and legacy rows;
 * the **BFS expansion order**, which decides both the ``t1/t2/...`` alias
   numbering and, when a join graph has two equally short paths between the
   anchor and a needed table, *which intermediate tables end up in the FROM
@@ -37,11 +38,12 @@ The rule
 ``(model_table_id, id)`` so a table's columns stay grouped.
 
 **The anchor is the fact table if the model has one, otherwise the first table
-in canonical order.** At most one fact table per model is enforced at the
-storage layer (``uq_model_tables_one_fact_per_model``, migration 0136), so the
-fact branch is unique by construction; the canonical order settles the
-zero-fact case, which is legal (``_assert_at_most_one_fact`` imposes no
-minimum) and is the case that was flipping.
+in canonical order for incomplete drafts and legacy rows.** At most one fact
+table per model is enforced at the storage layer
+(``uq_model_tables_one_fact_per_model``, migration 0136), so the fact branch is
+unique by construction. Deploy/import validation rejects multi-table zero-fact
+models under Bug-8614 Option 1; the canonical fallback is not a deployable-
+model contract.
 
 Why ``id`` and not ``(created_at, id)``
 ---------------------------------------
@@ -70,16 +72,17 @@ in the snapshot, preserved verbatim by rehydration, and immutable for the life
 of a row. The live graph, the deployed snapshot and a rehydrated live graph
 therefore enumerate identically **by construction**, with no dependence on a
 field that gets dropped or regenerated. The ordering is arbitrary from a
-business point of view — so was creation order — and the real gap, that a
-zero-fact model cannot DECLARE its base table, is tracked as its own issue
-rather than papered over with a prettier sort key.
+business point of view — so was creation order — and the fallback remains only
+for incomplete drafts and legacy rows; deployable models must declare exactly
+one fact table under Bug-8614 Option 1.
 
 A consequence worth stating: because ``id`` is a random UUID, a table added to
-a draft CAN sort ahead of the existing ones and take the anchor of a zero-fact
-model. That is not a hole — ``definition_closure._fact_anchor_additions``
-already reports every live-only table as anchor-moving drift precisely when the
-deployed table set has no fact table, so the refresh is refused before it can
-build on the new anchor.
+an incomplete zero-fact draft CAN sort ahead of the existing ones and take the
+legacy fallback anchor. That is not a deploy hole — ``fact_anchor_violation``
+rejects a multi-table zero-fact model before deployment, and
+``definition_closure._fact_anchor_additions`` reports every live-only table as
+anchor-moving drift when an older deployed set has no fact table, so refresh is
+refused before it can build on the new anchor.
 
 Two layers, on purpose
 ----------------------
@@ -116,6 +119,7 @@ __all__ = [
     "canonical_column_order",
     "canonical_join_order",
     "canonical_table_order",
+    "fact_anchor_violation",
     "is_fact_table",
     "order_model_columns",
     "order_model_joins",
@@ -170,6 +174,52 @@ def is_fact_table(row: Any) -> bool:
     else:
         value = getattr(row, "table_type", None)
     return value == FACT_TABLE_TYPE
+
+
+def fact_anchor_violation(tables: Iterable[Any]) -> str | None:
+    """Return a deploy-time error for an invalid model population anchor.
+
+    A single-table model is implicitly its own fact table.  Multi-table models
+    must instead carry exactly one explicitly declared ``table_type='fact'``
+    row; canonical ordering remains the fallback only for callers handling
+    incomplete drafts, never for a deployable model.  This helper accepts ORM
+    and snapshot rows so deploy, import, and rehydrate cannot drift.
+    """
+    rows = list(tables)
+    if len(rows) <= 1:
+        return None
+    facts = [row for row in rows if is_fact_table(row)]
+    if len(facts) == 1:
+        return None
+    names = [
+        str(
+            row.get("physical_name") or row.get("alias") or "?"
+            if isinstance(row, Mapping)
+            else getattr(row, "physical_name", None)
+            or getattr(row, "alias", None)
+            or "?"
+        )
+        for row in rows
+    ]
+    if not facts:
+        return (
+            "a multi-table model must declare exactly one fact table; "
+            f"none is declared ({', '.join(names)})."
+        )
+    fact_names = [
+        str(
+            row.get("physical_name") or row.get("alias") or "?"
+            if isinstance(row, Mapping)
+            else getattr(row, "physical_name", None)
+            or getattr(row, "alias", None)
+            or "?"
+        )
+        for row in facts
+    ]
+    return (
+        "a multi-table model must declare exactly one fact table; "
+        f"{len(facts)} are declared ({', '.join(fact_names)})."
+    )
 
 
 def order_model_tables(stmt: Select) -> Select:
@@ -254,8 +304,10 @@ def pick_anchor_table(tables: Iterable[Any]) -> Any | None:
     """The model's FROM/JOIN anchor, as a pure function of the rows.
 
     The fact table when the model has one (the storage layer allows at most
-    one), otherwise the first table in canonical ``id`` order. Returns ``None``
-    for an empty input so callers can raise their own, context-specific error.
+    one), otherwise the first table in canonical ``id`` order for incomplete
+    drafts and legacy rows. Deploy/import validation rejects multi-table
+    zero-fact models. Returns ``None`` for an empty input so callers can raise
+    their own, context-specific error.
     """
     ordered = canonical_table_order(tables)
     if not ordered:
@@ -269,11 +321,12 @@ def pick_anchor_table(tables: Iterable[Any]) -> Any | None:
 def anchor_is_by_convention(tables: Iterable[Any]) -> bool:
     """True when the anchor is a platform convention rather than a modelling act.
 
-    A model with no fact table and more than one table has no metadata that
-    says which table the FROM clause should be built around, so the anchor is
-    decided by ``pick_anchor_table``'s ordering rule. That is deterministic and
-    therefore safe, but it is still a choice the modeller never made — callers
-    log it so a surprising aggregate total is explainable.
+    An incomplete draft or legacy row set with no fact table and more than one
+    table has no metadata that says which table the FROM clause should be built
+    around, so the anchor is decided by ``pick_anchor_table``'s ordering rule.
+    Deploy/import validation rejects that shape for a deployable model; callers
+    handling the fallback log it so a surprising draft/legacy total is
+    explainable.
     """
     rows = list(tables)
     if len(rows) < 2:

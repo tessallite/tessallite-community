@@ -20,6 +20,11 @@ from datetime import date
 import sqlglot
 
 from shared.connector_qualify import quote_table_ref
+from shared.semantic.fiscal_year_labels import (
+    DEFAULT_FISCAL_YEAR_LABEL_FORMAT,
+    extract_fiscal_year_label_format,
+    render_fiscal_year_label,
+)
 
 # NOTE: CALENDAR_TYPES is deliberately re-declared below (not imported from
 # shared.semantic.calendar_types) and kept in sync by a parity test. Importing
@@ -304,30 +309,55 @@ class _SqlServerDateSource(_DateSource):
 # This is the same sanctioned per-dialect carve-out the date-source clauses
 # use. A row is ``(date_iso, [int, ...])`` aligned to ``int_columns``.
 
-RowTableRow = tuple[str, list[int]]
+RowTableRow = tuple[str, list[int | str]]
 
 
 class _RowTableEmitter:
-    """Emit ``DROP``+``CREATE``+populate DDL for a date_key + N integer columns
-    table from pre-computed Python rows. One subclass per dialect family."""
+    """Emit DDL for a date_key plus integer/text columns from Python rows.
+
+    Row-materialised calendars use this same interface for their numeric period
+    keys and the caption-only ``year_label``. Keeping the text-column extension
+    here avoids per-connector label branches in the calendar business logic.
+    """
 
     @staticmethod
-    def emit(table_name: str, int_columns: list[str], rows: list[RowTableRow]) -> str:
+    def emit(
+        table_name: str,
+        int_columns: list[str],
+        rows: list[RowTableRow],
+        text_columns: list[str] | None = None,
+    ) -> str:
         raise NotImplementedError
 
 
+def _sql_literal(value: int | str) -> str:
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    return str(value)
+
+
 def _row_values_literal(row: RowTableRow) -> str:
-    date_iso, ints = row
-    return "(" + ", ".join([f"'{date_iso}'", *[str(i) for i in ints]]) + ")"
+    date_iso, values = row
+    return "(" + ", ".join([f"'{date_iso}'", *[_sql_literal(v) for v in values]]) + ")"
 
 
 class _PgRowTableEmitter(_RowTableEmitter):
     @staticmethod
-    def emit(table_name: str, int_columns: list[str], rows: list[RowTableRow]) -> str:
+    def emit(
+        table_name: str,
+        int_columns: list[str],
+        rows: list[RowTableRow],
+        text_columns: list[str] | None = None,
+    ) -> str:
+        text_columns = text_columns or []
         col_defs = ",\n    ".join(
-            ["date_key DATE PRIMARY KEY", *[f"{c} INT NOT NULL" for c in int_columns]]
+            [
+                "date_key DATE PRIMARY KEY",
+                *[f"{c} INT NOT NULL" for c in int_columns],
+                *[f"{c} TEXT NOT NULL" for c in text_columns],
+            ]
         )
-        col_list = ", ".join(["date_key", *int_columns])
+        col_list = ", ".join(["date_key", *int_columns, *text_columns])
         values = ",\n    ".join(_row_values_literal(r) for r in rows)
         return (
             f"DROP TABLE IF EXISTS {table_name};\n"
@@ -354,16 +384,26 @@ _BQ_MAX_VALUES_ROWS = 1_000
 
 class _BqRowTableEmitter(_RowTableEmitter):
     @staticmethod
-    def emit(table_name: str, int_columns: list[str], rows: list[RowTableRow]) -> str:
+    def emit(
+        table_name: str,
+        int_columns: list[str],
+        rows: list[RowTableRow],
+        text_columns: list[str] | None = None,
+    ) -> str:
+        text_columns = text_columns or []
         col_defs = ",\n    ".join(
-            ["date_key DATE", *[f"{c} INT64 NOT NULL" for c in int_columns]]
+            [
+                "date_key DATE",
+                *[f"{c} INT64 NOT NULL" for c in int_columns],
+                *[f"{c} STRING NOT NULL" for c in text_columns],
+            ]
         )
-        col_list = ", ".join(["date_key", *int_columns])
+        col_list = ", ".join(["date_key", *int_columns, *text_columns])
 
         def _row_values(row: RowTableRow) -> str:
-            date_iso, ints = row
+            date_iso, values = row
             return (
-                "(" + ", ".join([f"DATE '{date_iso}'", *[str(i) for i in ints]]) + ")"
+                "(" + ", ".join([f"DATE '{date_iso}'", *[_sql_literal(v) for v in values]]) + ")"
             )
 
         parts: list[str] = [
@@ -396,12 +436,18 @@ _SPARK_MAX_VALUES_ROWS = 1_000
 
 class _SparkRowTableEmitter(_RowTableEmitter):
     @staticmethod
-    def emit(table_name: str, int_columns: list[str], rows: list[RowTableRow]) -> str:
+    def emit(
+        table_name: str,
+        int_columns: list[str],
+        rows: list[RowTableRow],
+        text_columns: list[str] | None = None,
+    ) -> str:
+        text_columns = text_columns or []
         # Bug-7207: Spark infers bare string literals as STRING type.
         # Use TO_DATE() in the outer SELECT to ensure DATE typing.
-        col_list = ", ".join(["date_key", *int_columns])
+        col_list = ", ".join(["date_key", *int_columns, *text_columns])
         select_cols = ", ".join(
-            ["TO_DATE(date_key) AS date_key", *int_columns]
+            ["TO_DATE(date_key) AS date_key", *int_columns, *text_columns]
         )
 
         parts: list[str] = [f"DROP TABLE IF EXISTS {table_name};\n"]
@@ -446,11 +492,21 @@ class _SqlServerRowTableEmitter(_RowTableEmitter):
     """
 
     @staticmethod
-    def emit(table_name: str, int_columns: list[str], rows: list[RowTableRow]) -> str:
+    def emit(
+        table_name: str,
+        int_columns: list[str],
+        rows: list[RowTableRow],
+        text_columns: list[str] | None = None,
+    ) -> str:
+        text_columns = text_columns or []
         col_defs = ",\n    ".join(
-            ["date_key DATE PRIMARY KEY", *[f"{c} INT NOT NULL" for c in int_columns]]
+            [
+                "date_key DATE PRIMARY KEY",
+                *[f"{c} INT NOT NULL" for c in int_columns],
+                *[f"{c} VARCHAR(255) NOT NULL" for c in text_columns],
+            ]
         )
-        col_list = ", ".join(["date_key", *int_columns])
+        col_list = ", ".join(["date_key", *int_columns, *text_columns])
 
         parts: list[str] = [
             f"DROP TABLE IF EXISTS {table_name};\n"
@@ -484,11 +540,21 @@ class _SnowflakeRowTableEmitter(_RowTableEmitter):
     """
 
     @staticmethod
-    def emit(table_name: str, int_columns: list[str], rows: list[RowTableRow]) -> str:
+    def emit(
+        table_name: str,
+        int_columns: list[str],
+        rows: list[RowTableRow],
+        text_columns: list[str] | None = None,
+    ) -> str:
+        text_columns = text_columns or []
         col_defs = ",\n    ".join(
-            ["date_key DATE PRIMARY KEY", *[f"{c} INT NOT NULL" for c in int_columns]]
+            [
+                "date_key DATE PRIMARY KEY",
+                *[f"{c} INT NOT NULL" for c in int_columns],
+                *[f"{c} VARCHAR(255) NOT NULL" for c in text_columns],
+            ]
         )
-        col_list = ", ".join(["date_key", *int_columns])
+        col_list = ", ".join(["date_key", *int_columns, *text_columns])
 
         parts: list[str] = [
             f"DROP TABLE IF EXISTS {table_name};\n"
@@ -619,11 +685,15 @@ def emit_calendar_ddl(
     end_date: date,
     fiscal_year_start_month: int = 1,
     calendar_type: str = "standard",
+    year_label_format: str = DEFAULT_FISCAL_YEAR_LABEL_FORMAT,
 ) -> str:
     if end_date <= start_date:
         raise ValueError("end_date must be after start_date")
     if calendar_type not in CALENDAR_TYPES:
         raise ValueError(f"Unsupported calendar_type: {calendar_type}")
+    # Validate even for ISO/Thai/Hijri calls. A caller cannot accidentally
+    # persist a setting value that this emitter would silently ignore.
+    year_label_format = extract_fiscal_year_label_format(year_label_format)
 
     # F-016-04: bound row-materialised calendar generation up front so a valid
     # but enormous range fails loud with an actionable message instead of
@@ -654,19 +724,53 @@ def emit_calendar_ddl(
     # SQL metacharacters (e.g. "cal; DELETE FROM sales.orders; --").
     table_name = quote_table_ref(config.connector_name, table_name)
 
+    if calendar_type in ("standard", "fiscal"):
+        return _emit_standard(
+            dialect, table_name, start_date, end_date, fys,
+            year_label_format=year_label_format,
+        )
+    if calendar_type == "retail_445":
+        return _emit_retail_445(
+            dialect, table_name, start_date, end_date, fys,
+            year_label_format=year_label_format,
+        )
     emitters = {
-        "standard": _emit_standard,
-        "fiscal": _emit_standard,
         "iso_week": _emit_iso_week,
-        "retail_445": _emit_retail_445,
         "thai_buddhist": _emit_thai_buddhist,
         "hijri": _emit_hijri,
     }
     return emitters[calendar_type](dialect, table_name, start_date, end_date, fys)
 
 
+def _year_label_pg(year_pg: str, format_token: str, *, spans_years: bool) -> str:
+    """Return one canonical PostgreSQL caption expression for ``year_pg``."""
+    token = extract_fiscal_year_label_format(format_token)
+    year_text = f"CAST(({year_pg}) AS TEXT)"
+    if not spans_years or token == "start_year":
+        return year_text
+    next_year_text = f"CAST((({year_pg}) + 1) AS TEXT)"
+    if token == "span_short":
+        return f"CONCAT({year_text}, '-', RIGHT({next_year_text}, 2))"
+    if token == "span_long":
+        return f"CONCAT({year_text}, '-', {next_year_text})"
+    if token == "span_fy":
+        return (
+            f"CONCAT('FY', RIGHT({year_text}, 2), '-', "
+            f"RIGHT({next_year_text}, 2))"
+        )
+    if token == "end_year":
+        return f"CONCAT('FY', {next_year_text})"
+    raise ValueError(f"Unsupported fiscal year label format: {token!r}")
+
+
 def _emit_standard(
-    dialect: str, table_name: str, start: date, end: date, fys: int
+    dialect: str,
+    table_name: str,
+    start: date,
+    end: date,
+    fys: int,
+    *,
+    year_label_format: str = DEFAULT_FISCAL_YEAR_LABEL_FORMAT,
 ) -> str:
     date_alias, from_clause, cte_prefix = _date_source(dialect, start, end)
 
@@ -675,6 +779,19 @@ def _emit_standard(
         half_pg = f"CASE WHEN EXTRACT(MONTH FROM {date_alias}) <= 6 THEN 1 ELSE 2 END"
         quarter_pg = f"EXTRACT(QUARTER FROM {date_alias})::int"
     else:
+        # Bug-9207 / parity: the fiscal year_no is a month-conditional CASE, NOT a
+        # naive Gregorian EXTRACT(YEAR) (plus a fixed offset). It uses the
+        # START-year label convention (the fiscal year is named by the calendar
+        # year in which it BEGINS). This expression MUST use the SAME start-year
+        # boundary math (month >= fys ? year : year - 1) as the query-time
+        # fiscal-year expression in shared/semantic/time_variants_sql.py
+        # (_extract_period, "year"/"month_year" keys) — the rendered strings differ
+        # (this path adds ::int casts and is sqlglot-transpiled per dialect; the
+        # query-time path is not), but the boundary must match so DDL-materialised
+        # calendar/aggregate rows and query-time period boundaries bucket the same
+        # rows into the same year. Flipping to an END-year label here without
+        # changing the query path would silently produce mismatched (wrong) numbers
+        # on the join. Which label convention to expose is a product decision.
         year_pg = (
             f"CASE WHEN EXTRACT(MONTH FROM {date_alias})::int >= {fys} "
             f"THEN EXTRACT(YEAR FROM {date_alias})::int "
@@ -698,6 +815,17 @@ def _emit_standard(
     columns = [
         (f"{date_alias}", "date_key"),
         (_transpile_expr(year_pg, dialect), "year_no"),
+        (
+            _transpile_expr(
+                _year_label_pg(
+                    year_pg,
+                    year_label_format,
+                    spans_years=fys != 1,
+                ),
+                dialect,
+            ),
+            "year_label",
+        ),
         (_transpile_expr(half_pg, dialect), "half_no"),
         (_transpile_expr(quarter_pg, dialect), "quarter_no"),
         (_transpile_expr(month_pg, dialect), "month_no"),
@@ -751,6 +879,7 @@ def _emit_iso_week(
 
 # NRF 4-5-4 retail calendar columns (in emit order, after date_key).
 _RETAIL_445_INT_COLUMNS = ["retail_year", "retail_quarter", "retail_period", "retail_week"]
+_RETAIL_445_TEXT_COLUMNS = ["year_label"]
 
 
 def _nrf_year_start(cal_year: int) -> date:
@@ -807,7 +936,13 @@ def nrf_retail_445_fields(d: date) -> tuple[int, int, int, int]:
 
 
 def _emit_retail_445(
-    dialect: str, table_name: str, start: date, end: date, _fys: int
+    dialect: str,
+    table_name: str,
+    start: date,
+    end: date,
+    _fys: int,
+    *,
+    year_label_format: str = DEFAULT_FISCAL_YEAR_LABEL_FORMAT,
 ) -> str:
     """NRF 4-5-4 retail calendar.
 
@@ -823,11 +958,25 @@ def _emit_retail_445(
     current = start
     while current <= end:
         ry, rq, rp, rw = nrf_retail_445_fields(current)
-        rows.append((current.isoformat(), [ry, rq, rp, rw]))
+        rows.append(
+            (
+                current.isoformat(),
+                [
+                    ry,
+                    rq,
+                    rp,
+                    rw,
+                    render_fiscal_year_label(ry, year_label_format, spans_years=True),
+                ],
+            )
+        )
         current += timedelta(days=1)
 
     return _get_dialect_config(dialect).row_table_emitter.emit(
-        table_name, _RETAIL_445_INT_COLUMNS, rows
+        table_name,
+        _RETAIL_445_INT_COLUMNS,
+        rows,
+        text_columns=_RETAIL_445_TEXT_COLUMNS,
     )
 
 
@@ -836,6 +985,12 @@ def _emit_thai_buddhist(
 ) -> str:
     date_alias, from_clause, cte_prefix = _date_source(dialect, start, end)
 
+    # Bug-9207: thai_year is the Buddhist-Era year = Gregorian year + 543, applied
+    # to the calendar YEAR (not month/day). The Thai civil calendar's new year is
+    # Jan 1 (since B.E. 2484 / 1941 CE), so the +543 offset holds for the whole
+    # Gregorian year for every modern date. Pre-1941 dates (April-1 year start,
+    # +542 for Jan-Mar) are outside the supported analytics range and are
+    # deliberately not special-cased.
     thai_year_pg = f"(EXTRACT(YEAR FROM {date_alias})::int + 543)"
     half_pg = f"CASE WHEN EXTRACT(MONTH FROM {date_alias}) <= 6 THEN 1 ELSE 2 END"
     quarter_pg = f"EXTRACT(QUARTER FROM {date_alias})::int"

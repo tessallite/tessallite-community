@@ -63,6 +63,7 @@ from shared.semantic.aggregate_plan_bound import (
     aggregate_plan_upper_bound,
     component_is_acyclic,
 )
+from shared.semantic.join_population_serving import population_defining_table_ids
 from src.routing.pocket_population import ModelJoinGraph, population_proven
 
 logger = logging.getLogger(__name__)
@@ -570,11 +571,15 @@ def aggregate_population_proven(
     if needed is None:
         return (False, POPULATION_PLAN_MISMATCH if split_codes else LEGACY_POPULATION_MISMATCH)
     edges = [(e.left_table_id, e.right_table_id) for e in graph.edges]
+    population_tables = population_defining_table_ids(graph.edges)
+    if population_tables is None:
+        return (False, POPULATION_PLAN_MISMATCH if split_codes else LEGACY_POPULATION_MISMATCH)
     plan = aggregate_plan_upper_bound(
         table_ids=graph.table_ids,
         edges=edges,
         anchor_table_id=graph.anchor_table_id,
         needed_table_ids=needed,
+        population_defining_table_ids=population_tables,
     )
     if plan is None:
         # plan is None splits into two families:

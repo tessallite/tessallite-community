@@ -39,10 +39,10 @@ Five properties this module holds to
 1. **Deploy time only, never the query path** (invariant 5). Every source
    touch happens in :func:`validate_model_joins_on_deploy`, called once from
    the model-service deploy endpoint. Nothing here is reachable from a query.
-2. **Warn-only in this phase** (invariant 4 / plan phase G1). ``BLOCKED`` is
-   computed and surfaced but MUST NOT prevent a deploy. This module therefore
-   never raises out of :func:`validate_model_joins_on_deploy`; block mode is
-   plan phase G5, a separately-triggered rollout stage.
+2. **Deploy-time policy input** (invariant 4 / plan phase G5). ``BLOCKED`` is
+   computed and surfaced here; the model-service deploy handler refuses only
+   the measured, policy-relevant rows returned by this module. Measurement
+   failures remain unmeasured and therefore never become a deploy block.
 3. **Classifies, does not gate.** Nothing here reads or changes the elision
    decision. Wiring the flag into serving is plan phase G3.
 4. **Conservative on a metadata gap** (invariant 1: "a join cannot be honestly
@@ -57,8 +57,9 @@ Five properties this module holds to
    An unreachable source, a timeout, or an unresolvable column yields
    ``measured=False`` with NULL ratios and a ``WARNING``. It is NOT promoted to
    ``BLOCKED``: a temporarily unreachable source must not become a deploy block
-   when phase G5 turns blocking on. The rollup exposes ``evaluated`` so G5 can
-   require full evaluation before it blocks anything.
+   under the active G5 policy. The rollup exposes ``evaluated`` for honest
+   health reporting; deploy enforcement remains per-row so an unrelated
+   unmeasured row never hides or creates a measured block.
 
 Orientation of the measurement (near side / far side)
 -----------------------------------------------------
@@ -83,6 +84,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Iterable, Optional, Sequence
 from uuid import UUID
 
@@ -98,6 +100,7 @@ from shared.schemas.domains.aggregates_security import (
     POPULATION_PARTICIPATION_ENRICHMENT_ONLY,
     POPULATION_PARTICIPATION_POPULATION_DEFINING,
     POPULATION_PARTICIPATION_PRESERVE_BASE_ROWS,
+    POPULATION_PARTICIPATION_UNDECLARED,
     coerce_population_participation,
 )
 from shared.semantic.graph_order import is_fact_table
@@ -273,8 +276,9 @@ class ModelPopulationRollup:
     """The per-model status (invariant 6).
 
     ``evaluated`` is False when at least one of the model's joins has no
-    measured verdict. Phase G5's block mode MUST require ``evaluated`` before
-    it refuses a deploy, so an unreachable source can never become an outage.
+    measured verdict. Block mode is decided per row, not by this aggregate:
+    a measured blocker still refuses a mixed model containing another
+    unmeasured join, while the unmeasured row itself never blocks.
     """
 
     status: str
@@ -283,6 +287,152 @@ class ModelPopulationRollup:
     evaluated_count: int
     blocked_count: int
     warning_count: int
+
+
+def _snapshot_id(value: Any) -> Any:
+    """Return snapshot identifiers in the same type used by the ORM graph.
+
+    Snapshots are JSON, so UUID primary/foreign keys arrive as strings.  The
+    deployed graph must not be rebuilt from live rows merely to coerce those
+    values; normalising them here keeps the existing graph/fingerprint code
+    usable for both ORM and immutable-snapshot inputs.
+    """
+    if value is None:
+        return None
+    if isinstance(value, UUID):
+        return value
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return value
+
+
+def _snapshot_graph(snapshot: dict[str, Any]) -> tuple[list[Any], dict[Any, Any], dict[Any, Any]]:
+    """Adapt one immutable version snapshot into the classifier's graph shape.
+
+    The snapshot is the sole definition authority when supplied by deploy.  A
+    missing ``joins`` key means this version has no join graph (including
+    pre-G1 snapshots); it does *not* authorize a fallback to today's mutable
+    draft.  Missing participation keeps the rehydration/serving compatibility
+    default, while missing endpoint metadata remains an honest unmeasured
+    result in ``_verdict_for_join``.
+    """
+    table_rows = snapshot.get("tables") or []
+    column_rows = snapshot.get("columns") or []
+    join_rows = snapshot.get("joins") or []
+    tables: dict[Any, Any] = {}
+    columns: dict[Any, Any] = {}
+
+    for raw in table_rows:
+        if not isinstance(raw, dict):
+            continue
+        table_id = _snapshot_id(raw.get("id"))
+        if table_id is None:
+            continue
+        tables[table_id] = SimpleNamespace(
+            id=table_id,
+            physical_name=raw.get("physical_name"),
+            table_type=raw.get("table_type"),
+            alias=raw.get("alias"),
+            display_name=raw.get("display_name"),
+        )
+
+    for raw in column_rows:
+        if not isinstance(raw, dict):
+            continue
+        column_id = _snapshot_id(raw.get("id"))
+        if column_id is None:
+            continue
+        columns[column_id] = SimpleNamespace(
+            id=column_id,
+            model_table_id=_snapshot_id(raw.get("model_table_id")),
+            column_name=raw.get("column_name"),
+            display_name=raw.get("display_name"),
+            is_primary_key=bool(raw.get("is_primary_key", False)),
+        )
+
+    joins: list[Any] = []
+    for raw in join_rows:
+        if not isinstance(raw, dict):
+            continue
+        join_id = _snapshot_id(raw.get("id"))
+        if join_id is None:
+            continue
+        # Snapshot schema evolution is deliberately different from token
+        # validation.  Versions written before G1 do not contain this key and
+        # must preserve the pre-G1 behaviour; a key that is present but invalid
+        # is untrusted and must remain ``undeclared``.
+        participation = (
+            DEFAULT_POPULATION_PARTICIPATION
+            if "population_participation" not in raw
+            else coerce_population_participation(raw.get("population_participation"))
+        )
+        joins.append(SimpleNamespace(
+            id=join_id,
+            left_table_id=_snapshot_id(raw.get("left_table_id")),
+            right_table_id=_snapshot_id(raw.get("right_table_id")),
+            left_column_id=_snapshot_id(raw.get("left_column_id")),
+            right_column_id=_snapshot_id(raw.get("right_column_id")),
+            join_type=raw.get("join_type"),
+            population_participation=participation,
+        ))
+    return joins, tables, columns
+
+
+def _join_labels(
+    joins: Iterable[Any], tables: dict[Any, Any], columns: dict[Any, Any],
+    *, prefer_alias: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Return stable endpoint labels for one selected graph.
+
+    Labels are definition data.  Keeping this helper independent of the ORM
+    lets deploy evidence and health use the exact same selected snapshot graph
+    even after the mutable draft deletes or renames its join.
+    """
+    def table_label(table: Any) -> str | None:
+        if table is None:
+            return None
+        names = (
+            ("alias", "display_name", "physical_name")
+            if prefer_alias
+            else ("display_name", "alias", "physical_name")
+        )
+        return next((getattr(table, name, None) for name in names if getattr(table, name, None)), None)
+
+    def column_label(column: Any) -> str | None:
+        if column is None:
+            return None
+        return getattr(column, "display_name", None) or getattr(
+            column, "column_name", None
+        )
+
+    labels: dict[str, dict[str, Any]] = {}
+    for join in joins:
+        left_table_name = table_label(tables.get(join.left_table_id))
+        right_table_name = table_label(tables.get(join.right_table_id))
+        left_column_name = column_label(columns.get(join.left_column_id))
+        right_column_name = column_label(columns.get(join.right_column_id))
+        left_endpoint = ".".join(
+            part for part in (left_table_name, left_column_name) if part
+        )
+        right_endpoint = ".".join(
+            part for part in (right_table_name, right_column_name) if part
+        )
+        labels[str(join.id)] = {
+            "join_id": str(join.id),
+            "join_label": f"{left_endpoint} ↔ {right_endpoint}".strip(" ↔"),
+            "left_table_name": left_table_name,
+            "right_table_name": right_table_name,
+            "left_column_name": left_column_name,
+            "right_column_name": right_column_name,
+        }
+    return labels
+
+
+def snapshot_join_labels(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return stable endpoint labels from a selected snapshot's join graph."""
+    joins, tables, columns = _snapshot_graph(snapshot)
+    return _join_labels(joins, tables, columns)
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +699,7 @@ def join_status(
 
     ``preserve_base_rows`` is the DEFAULT every pre-existing join carries, so
     it is not an affirmative modeller decision and must not read as OK — but
-    escalating it to BLOCKED would, once phase G5 turns blocking on, block
+    escalating it to BLOCKED would, under the active G5 policy, block
     every model that predates this field without a modeller ever having been
     asked. WARNING at any magnitude is the only reading that satisfies both
     invariant 4 ("no existing model changes unless a modeller acts") and
@@ -670,6 +820,44 @@ def roll_up_model_status(
         blocked_count=blocked,
         warning_count=warning,
     )
+
+
+def blocking_join_population_rows(
+    verdict_rows: Iterable[Any],
+    *,
+    threshold: Optional[float] = None,
+) -> list[Any]:
+    """Return the exact rows authorised to refuse a deployment.
+
+    G5 deliberately uses per-join evidence rather than the model rollup's
+    ``evaluated`` flag.  A mixed model may contain one measured blocker and a
+    second row that timed out (or was disabled); the measured blocker still
+    needs to be acted on, while the unmeasured row can never block.  The two
+    affirmative declarations below are the only policies whose unresolved
+    effects may block.  ``preserve_base_rows`` is warning-only at every
+    magnitude, and the classifier already accounts for enrichment-only's
+    multiplying-only exemption before producing ``BLOCKED``.
+    """
+    blockable_participation = {
+        POPULATION_PARTICIPATION_ENRICHMENT_ONLY,
+        POPULATION_PARTICIPATION_UNDECLARED,
+    }
+    blocking: list[Any] = []
+    for row in verdict_rows:
+        if not (
+            bool(getattr(row, "measured", False))
+            and str(getattr(row, "status", "") or "") == STATUS_BLOCKED
+            and coerce_population_participation(
+                getattr(row, "population_participation", None)
+            ) in blockable_participation
+        ):
+            continue
+        if threshold is not None:
+            effect = getattr(row, "row_effect_ratio", None)
+            if effect is None or float(effect) <= threshold:
+                continue
+        blocking.append(row)
+    return blocking
 
 
 # ---------------------------------------------------------------------------
@@ -973,6 +1161,7 @@ async def validate_model_joins_on_deploy(
     measure: bool = True,
     budget_seconds: float = DEFAULT_PROBE_BUDGET_SECONDS,
     tenant_session: Any = None,
+    snapshot: Optional[dict[str, Any]] = None,
 ) -> list[Any]:
     """Classify every join of a model and stage its evidence rows.
 
@@ -985,7 +1174,8 @@ async def validate_model_joins_on_deploy(
     transaction, so the evidence carries the committed deploy epoch — the same
     contract ``verify_model_relationships_on_deploy`` uses.
 
-    NEVER raises and NEVER blocks a deploy (invariant 4 / phase G1 is warn-only).
+    NEVER raises and NEVER decides the deploy gate itself; the model-service
+    caller consumes the returned rows for G5 enforcement.
     ``measure=False`` records conservative unmeasured verdicts without touching
     the source at all; that is what a caller passes when validation is switched
     off for the model or no source connection resolved.
@@ -1012,13 +1202,6 @@ async def validate_model_joins_on_deploy(
 
     staged: list[Any] = []
     try:
-        joins = list(
-            (
-                await db.execute(
-                    select(Join).where(Join.model_id == model_id).order_by(Join.id)
-                )
-            ).scalars().all()
-        )
         # Always clear first, even when there is nothing to record: an empty set
         # must read as "not evaluated", not as last deploy's verdicts.
         await db.execute(
@@ -1026,31 +1209,50 @@ async def validate_model_joins_on_deploy(
                 JoinPopulationCheck.model_id == model_id
             )
         )
+        if snapshot is None:
+            joins = list(
+                (
+                    await db.execute(
+                        select(Join).where(Join.model_id == model_id).order_by(Join.id)
+                    )
+                ).scalars().all()
+            )
+            tables = {
+                t.id: t
+                for t in (
+                    await db.execute(
+                        select(ModelTable).where(ModelTable.model_id == model_id)
+                    )
+                ).scalars().all()
+            }
+            column_ids = {
+                cid
+                for j in joins
+                for cid in (j.left_column_id, j.right_column_id)
+                if cid is not None
+            }
+            columns = {
+                c.id: c
+                for c in (
+                    await db.execute(
+                        select(ModelColumn).where(ModelColumn.id.in_(column_ids))
+                    )
+                ).scalars().all()
+            } if column_ids else {}
+        else:
+            # Deploy policy is about the selected immutable version, never the
+            # mutable draft graph.  Operational rows (evidence/FKs) continue
+            # through this tenant transaction, but they never supply classifier
+            # definitions when a snapshot was explicitly selected.
+            joins, tables, columns = _snapshot_graph(snapshot)
+
+        # The evidence row carries the selected graph's labels as well as its
+        # machine identity. This keeps health/deploy diagnostics useful after
+        # the mutable draft deletes or renames the selected join.
+        selected_labels = _join_labels(joins, tables, columns)
+
         if not joins:
             return staged
-
-        tables = {
-            t.id: t
-            for t in (
-                await db.execute(
-                    select(ModelTable).where(ModelTable.model_id == model_id)
-                )
-            ).scalars().all()
-        }
-        column_ids = {
-            cid
-            for j in joins
-            for cid in (j.left_column_id, j.right_column_id)
-            if cid is not None
-        }
-        columns = {
-            c.id: c
-            for c in (
-                await db.execute(
-                    select(ModelColumn).where(ModelColumn.id.in_(column_ids))
-                )
-            ).scalars().all()
-        } if column_ids else {}
 
         # Bug-8668: the FULL declared-key column set per table, not just the two
         # endpoint columns. ``source_introspection`` stamps ``is_primary_key``
@@ -1062,16 +1264,23 @@ async def validate_model_joins_on_deploy(
         # (``_declared_key_columns``) already applies to the same flag for the
         # same question; the two consumers must not disagree.
         pk_columns_by_table: dict[Any, set[Any]] = {}
-        if tables:
-            for col in (
-                await db.execute(
-                    select(ModelColumn).where(
-                        ModelColumn.model_table_id.in_(list(tables.keys())),
-                        ModelColumn.is_primary_key.is_(True),
+        if snapshot is None:
+            if tables:
+                for col in (
+                    await db.execute(
+                        select(ModelColumn).where(
+                            ModelColumn.model_table_id.in_(list(tables.keys())),
+                            ModelColumn.is_primary_key.is_(True),
+                        )
                     )
-                )
-            ).scalars().all():
-                pk_columns_by_table.setdefault(col.model_table_id, set()).add(col.id)
+                ).scalars().all():
+                    pk_columns_by_table.setdefault(col.model_table_id, set()).add(col.id)
+        else:
+            for col in columns.values():
+                if getattr(col, "is_primary_key", False):
+                    pk_columns_by_table.setdefault(
+                        col.model_table_id, set()
+                    ).add(col.id)
 
         # Deterministic anchor. ``uq_model_tables_one_fact_per_model`` makes a
         # second fact table impossible at the storage layer, but picking with a
@@ -1149,11 +1358,19 @@ async def validate_model_joins_on_deploy(
                 row_effect_ratio=verdict.row_effect_ratio,
                 reason=verdict.reason,
                 inputs_fingerprint=join_definition_fingerprint(j),
+                **{
+                    name: selected_labels.get(str(j.id), {}).get(name)
+                    for name in (
+                        "join_label", "left_table_name", "right_table_name",
+                        "left_column_name", "right_column_name",
+                    )
+                },
             )
             db.add(row)
             staged.append(row)
     except Exception:
-        # Warn-only: a validator failure must never fail a deploy.
+        # Measurement failure must never fail a deploy; the caller only blocks
+        # rows successfully returned and classified by this driver.
         logger.warning(
             "join population validation skipped for model %s", model_id,
             exc_info=True,

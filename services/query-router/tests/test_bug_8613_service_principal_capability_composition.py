@@ -26,6 +26,8 @@ from shared.auth.middleware import CurrentEmbedUser, CurrentServiceUser, Current
 from shared.auth.project_access import ensure_project_model_access, load_authorized_model
 from shared.auth.service_principal import (
     SCOPE_DATA_QUALITY,
+    SCOPE_KPI_EVALUATE,
+    SCOPE_KPI_QUERY_EXECUTE,
     SCOPE_POCKET_REFRESH,
     create_service_access_token,
 )
@@ -191,12 +193,13 @@ def _mint_service_token(
     principal: str = "pocket-refresh",
     scopes: str | list[str] = SCOPE_POCKET_REFRESH,
     tenant_id: str = "tenant-1",
+    role: str = "system_admin",
 ) -> str:
     """Mint a production-valid JWT that decodes to CurrentServiceUser."""
     return create_service_access_token(
         principal=principal,
         tenant_id=tenant_id,
-        role="system_admin",
+        role=role,
         scopes=[scopes] if isinstance(scopes, str) else scopes,
     )
 
@@ -206,8 +209,22 @@ def _mint_scoped_service_token(scope: str) -> str:
     principals = {
         SCOPE_POCKET_REFRESH: "pocket-refresh",
         SCOPE_DATA_QUALITY: "data-quality-validator",
+        SCOPE_KPI_QUERY_EXECUTE: "kpi-snapshot-sweep",
     }
-    return _mint_service_token(principal=principals[scope], scopes=scope)
+    role = "kpi_evaluator" if scope == SCOPE_KPI_QUERY_EXECUTE else "system_admin"
+    return _mint_service_token(
+        principal=principals[scope], scopes=scope, role=role,
+    )
+
+
+def _mint_kpi_service_token(tenant_id: str = "tenant-1") -> str:
+    """Mint the exact two-hop token used by the scheduler/model-service path."""
+    return _mint_service_token(
+        principal="kpi-snapshot-sweep",
+        tenant_id=tenant_id,
+        role="kpi_evaluator",
+        scopes=[SCOPE_KPI_EVALUATE, SCOPE_KPI_QUERY_EXECUTE],
+    )
 
 
 def test_service_token_fixture_reaches_the_typed_principal_branch():
@@ -220,6 +237,36 @@ def test_service_token_fixture_reaches_the_typed_principal_branch():
     )
     assert isinstance(user, CurrentServiceUser)
     assert user.service_scopes == [SCOPE_POCKET_REFRESH]
+
+
+def test_kpi_service_token_carries_only_the_two_hop_scopes():
+    """Bug-9257: KPI evaluation gets its two typed scopes, not pocket refresh."""
+    from shared.auth.jwt import decode_access_token
+    from shared.auth.middleware import _build_user_from_payload
+
+    user = _build_user_from_payload(
+        decode_access_token(_mint_kpi_service_token())
+    )
+    assert isinstance(user, CurrentServiceUser)
+    assert set(user.service_scopes) == {
+        SCOPE_KPI_EVALUATE,
+        SCOPE_KPI_QUERY_EXECUTE,
+    }
+    assert SCOPE_POCKET_REFRESH not in user.service_scopes
+
+
+@pytest.mark.asyncio
+async def test_kpi_execute_dependency_refuses_unlisted_service_scope():
+    """The plural dependency is an allowlist, not a generic service bypass."""
+    from shared.auth.middleware import require_capability_or_service_scopes
+
+    check = require_capability_or_service_scopes(
+        "query", (SCOPE_KPI_QUERY_EXECUTE, SCOPE_POCKET_REFRESH),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await check(_service_user(scopes=[SCOPE_DATA_QUALITY]))
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Service token scope required"
 
 
 def _route_db_gen(db):
@@ -314,9 +361,13 @@ class TestVerifiedNotAffectedRoutesStillWork:
     scope. These tests confirm the opt-in wiring is correct."""
 
     @pytest.mark.asyncio
-    async def test_execute_admits_scoped_service_token(self, client, monkeypatch):
-        """POST /execute uses require_capability_or_service_scope('query',
-        SCOPE_POCKET_REFRESH) and passes service_scope_verified=True."""
+    @pytest.mark.parametrize(
+        "scope", [SCOPE_POCKET_REFRESH, SCOPE_KPI_QUERY_EXECUTE],
+    )
+    async def test_execute_admits_scoped_service_token(
+        self, client, monkeypatch, scope,
+    ):
+        """POST /execute admits only its explicit typed scopes (Bug-9257)."""
         from unittest.mock import AsyncMock, MagicMock
         model_id = uuid.uuid4()
         project_id = uuid.uuid4()
@@ -353,19 +404,56 @@ class TestVerifiedNotAffectedRoutesStillWork:
             AsyncMock(return_value=None),
         )
 
-        token = _mint_scoped_service_token(SCOPE_POCKET_REFRESH)
+        token = _mint_scoped_service_token(scope)
+        request_body = {
+            "model_id": str(model_id),
+            "raw_query": "SELECT 1",
+            "protocol": "jdbc",
+        }
+        if scope == SCOPE_KPI_QUERY_EXECUTE:
+            request_body["client_kind"] = "kpi"
+            monkeypatch.setattr(
+                "src.api.routes.is_internal_request_header",
+                lambda _presented: True,
+            )
+        resp = await client.post(
+            "/api/v1/execute",
+            json=request_body,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code not in {401, 403}
+        handle_execute.assert_awaited_once()
+        assert load_model.await_args.kwargs["service_scope_verified"] is True
+
+    @pytest.mark.asyncio
+    async def test_execute_rejects_kpi_scope_without_internal_marker(
+        self, client, monkeypatch,
+    ):
+        """Bug-9257: the dedicated KPI scope is not a generic query bypass."""
+        model_id = uuid.uuid4()
+        model = types.SimpleNamespace(id=model_id, project_id=uuid.uuid4())
+        db = _RouteDB(model=model)
+        monkeypatch.setattr("src.api.routes.get_tenant_db", _route_db_gen(db))
+        monkeypatch.setattr(
+            "src.api.routes.is_internal_request_header",
+            lambda _presented: False,
+        )
+
         resp = await client.post(
             "/api/v1/execute",
             json={
                 "model_id": str(model_id),
                 "raw_query": "SELECT 1",
                 "protocol": "jdbc",
+                "client_kind": "kpi",
             },
-            headers={"Authorization": f"Bearer {token}"},
+            headers={
+                "Authorization": "Bearer "
+                + _mint_scoped_service_token(SCOPE_KPI_QUERY_EXECUTE),
+            },
         )
-        assert resp.status_code not in {401, 403}
-        handle_execute.assert_awaited_once()
-        assert load_model.await_args.kwargs["service_scope_verified"] is True
+        assert resp.status_code == 403
+        assert "internal service context" in resp.json()["detail"]
 
     @pytest.mark.asyncio
     async def test_introspect_admits_scoped_service_token(self, client, monkeypatch):

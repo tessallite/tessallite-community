@@ -98,7 +98,7 @@ def _patched(mock_model, shape):
     return stack
 
 
-def _complex_query(raw: str, *, from_tables, cte_aliases=()):
+def _complex_query(raw: str, *, from_tables, cte_aliases=(), select_star=False):
     return LogicalQuery(
         model_id="model-1",
         protocol="jdbc",
@@ -114,15 +114,28 @@ def _complex_query(raw: str, *, from_tables, cte_aliases=()):
         from_tables=list(from_tables),
         cte_aliases=list(cte_aliases),
         has_complex_sql=True,
-        select_star=False,
+        select_star=select_star,
     )
 
 
-async def _bind(raw: str, *, from_tables=("modely",), cte_aliases=(), model, cols=None):
+async def _bind(
+    raw: str,
+    *,
+    from_tables=("modely",),
+    cte_aliases=(),
+    model,
+    cols=None,
+    select_star=False,
+):
     from src.semantic.binder import bind_query_to_model
 
     shape = _shape_with_columns(MODEL_COLUMNS if cols is None else cols)
-    query = _complex_query(raw, from_tables=from_tables, cte_aliases=cte_aliases)
+    query = _complex_query(
+        raw,
+        from_tables=from_tables,
+        cte_aliases=cte_aliases,
+        select_star=select_star,
+    )
     db = AsyncMock()
     with _patched(model, shape):
         return await bind_query_to_model(query, db)
@@ -348,4 +361,92 @@ class TestContainmentStillFailsClosed:
         with pytest.raises(SecurityAuditError, match="secret_bonus"):
             audit_result_columns(
                 bound, ["source_system", "total_amount", "secret_bonus"], None,
+            )
+
+
+class TestBug9458DerivedScopeContainment:
+    """The supported derived-relation shapes must bind through production code.
+
+    Bug-9458 exposed three JDBC queries where the old containment pass treated a
+    query-defined name as a physical model column.  The identity-star cases are
+    also marked ``select_star`` so the normal post-bind result-audit path is
+    exercised with the same outer projection shape as the live query.
+    """
+
+    async def test_q34_nested_star_wrappers_publish_count_alias(self, _mock_model):
+        bound = await _bind(
+            "SELECT * FROM ("
+            "SELECT * FROM ("
+            "SELECT * FROM ("
+            "SELECT payment_status, COUNT(*) AS cnt FROM modely "
+            "GROUP BY payment_status"
+            ") AS l1"
+            ") AS l2"
+            ") AS l3 ORDER BY cnt DESC",
+            model=_mock_model,
+            select_star=True,
+        )
+        assert bound is not None
+        audit_result_columns(bound, ["payment_status", "cnt"], None)
+
+    async def test_q44_nested_star_wrappers_publish_rate_alias(self, _mock_model):
+        bound = await _bind(
+            "SELECT * FROM ("
+            "SELECT * FROM ("
+            "SELECT payment_status, SUM(fee_amount) / "
+            "NULLIF(SUM(transaction_amount), 0) AS rate FROM modely "
+            "GROUP BY payment_status"
+            ") AS inner_rates WHERE rate > 0"
+            ") AS outer_rates ORDER BY rate DESC",
+            model=_mock_model,
+            cols=MODEL_COLUMNS | {"fee_amount"},
+            select_star=True,
+        )
+        assert bound is not None
+        audit_result_columns(bound, ["payment_status", "rate"], None)
+
+    async def test_q39_values_alias_list_publishes_multiplier(self, _mock_model):
+        bound = await _bind(
+            # This is the JDBC gateway's normalized form: it removes relation
+            # qualifiers from expressions but retains the VALUES alias list.
+            "SELECT payment_reference, transaction_amount, multiplier, "
+            "transaction_amount * multiplier AS scaled "
+            "FROM modely CROSS JOIN (VALUES (1.0), (1.1), (1.25)) "
+            "AS v(multiplier) ORDER BY payment_reference, multiplier LIMIT 30",
+            model=_mock_model,
+            cols=MODEL_COLUMNS | {"fee_amount"},
+        )
+        assert bound is not None
+        assert {"multiplier", "scaled"} <= bound.complex_projection_names
+        audit_result_columns(
+            bound,
+            ["payment_reference", "transaction_amount", "multiplier", "scaled"],
+            None,
+        )
+
+    async def test_q34_mutation_to_unknown_outer_name_is_rejected(self, _mock_model):
+        with pytest.raises(SemanticBindingError, match="secret_bonus"):
+            await _bind(
+                "SELECT * FROM ("
+                "SELECT * FROM ("
+                "SELECT * FROM ("
+                "SELECT payment_status, COUNT(*) AS cnt FROM modely "
+                "GROUP BY payment_status"
+                ") AS l1"
+                ") AS l2"
+                ") AS l3 ORDER BY secret_bonus DESC",
+                model=_mock_model,
+                select_star=True,
+            )
+
+    async def test_q39_mutation_to_unpublished_values_name_is_rejected(
+        self, _mock_model,
+    ):
+        with pytest.raises(SemanticBindingError, match="secret_bonus"):
+            await _bind(
+                "SELECT payment_reference, transaction_amount, secret_bonus, "
+                "transaction_amount * secret_bonus AS scaled "
+                "FROM modely CROSS JOIN (VALUES (1.0), (1.1), (1.25)) "
+                "AS v(multiplier) ORDER BY payment_reference, secret_bonus LIMIT 30",
+                model=_mock_model,
             )

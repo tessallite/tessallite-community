@@ -5,12 +5,16 @@ import {
   Box,
   CircularProgress,
   Divider,
+  FormControl,
   IconButton,
   InputAdornment,
   List,
   ListItemButton,
   ListItemText,
   Paper,
+  InputLabel,
+  MenuItem,
+  Select,
   Stack,
   TextField,
   Tooltip,
@@ -27,7 +31,7 @@ import {
   agentApi,
   type AgentConversation,
 } from "../api/agentApi";
-import { mainAppAdapter } from "../api/agentChatAdapter";
+import { mainAppAdapter, setProjectPersonaWriteBarrier } from "../api/agentChatAdapter";
 import { useProject } from "../api/hooks";
 import { useConfirm } from "../components/Confirm/useConfirm";
 import HelpIconButton from "../components/HelpIconButton";
@@ -61,6 +65,12 @@ export default function AgentChat() {
   const setActiveConversation = useConversationStore(
     (s: { setActiveConversation: (id: string | null) => void }) => s.setActiveConversation,
   );
+  const pendingProjectPersonaId = useConversationStore(
+    (s: { pendingPersonaId: string | null }) => s.pendingPersonaId,
+  );
+  const setPendingProjectPersonaId = useConversationStore(
+    (s: { setPendingPersonaId: (id: string | null) => void }) => s.setPendingPersonaId,
+  );
   const conversationIdFromUrl = searchParams.get("conversation");
 
   useEffect(() => {
@@ -88,13 +98,113 @@ export default function AgentChat() {
     enabled: Boolean(projectId) && configQuery.data?.enabled === true,
   });
 
+  // Agent personas are ProjectPersona records.  They are intentionally kept
+  // on the conversation API and never passed through the model Persona
+  // picker used by SQL/query surfaces.
+  const projectPersonasQuery = useQuery({
+    queryKey: ["agent-project-personas", projectId],
+    queryFn: () => agentApi.listPersonas(projectId!),
+    enabled: Boolean(projectId) && configQuery.data?.enabled === true,
+  });
+
+  const activeConversation = useMemo(
+    () =>
+      (conversationsQuery.data ?? []).find(
+        (conversation) => conversation.id === activeConversationId,
+      ) ?? null,
+    [conversationsQuery.data, activeConversationId],
+  );
+  const [projectPersonaSelection, setProjectPersonaSelection] =
+    useState<string | null>(null);
+  const [projectPersonaError, setProjectPersonaError] = useState<string | null>(null);
+  const selectedProjectPersonaId = projectPersonaSelection;
+
+  // Keep a new-conversation selection in the shared store, but do not let a
+  // stale conversation-list query overwrite an in-flight persona update on an
+  // already active conversation. The list query is the eventual authority for
+  // that active conversation and will resync the picker when its persona_id
+  // changes.
+  useEffect(() => {
+    if (!activeConversation && !activeConversationId) {
+      setProjectPersonaSelection(pendingProjectPersonaId);
+    }
+  }, [activeConversation, activeConversationId, pendingProjectPersonaId]);
+
+  useEffect(() => {
+    if (activeConversation) {
+      setProjectPersonaSelection(activeConversation.persona_id);
+      setPendingProjectPersonaId(activeConversation.persona_id);
+    }
+  }, [
+    activeConversation?.id,
+    activeConversation?.persona_id,
+    setPendingProjectPersonaId,
+  ]);
+
   const createConv = useMutation({
-    mutationFn: () => agentApi.createConversation(projectId!),
+    mutationFn: () =>
+      mainAppAdapter.createConversation(projectId!, {
+        // The agent service calls this ProjectPersona.  Do not substitute a
+        // model Persona ID here; the two contracts have different scopes.
+        personaId: projectPersonaSelection,
+      }),
     onSuccess: (c) => {
       setActiveConversation(c.id);
       qc.invalidateQueries({ queryKey: ["agent-conversations", projectId] });
     },
   });
+
+  const updateProjectPersona = useMutation({
+    mutationFn: (personaId: string | null) =>
+      agentApi.patchConversation(projectId!, activeConversationId!, {
+        persona_id: personaId,
+      }),
+    onMutate: async (_personaId) => {
+      await qc.cancelQueries({ queryKey: ["agent-conversations", projectId] });
+      const previous = qc.getQueryData<AgentConversation[]>([
+        "agent-conversations", projectId,
+      ]);
+      // Keep the picker and conversation list on the persisted value while
+      // PATCH is in flight. Optimistically changing either one lets Agent
+      // Chat display an authority that the backend has not accepted yet.
+      return {
+        previous,
+        prior: activeConversation?.persona_id ?? projectPersonaSelection,
+      };
+    },
+    onSuccess: (updated, personaId) => {
+      const persisted = updated?.persona_id ?? personaId;
+      setProjectPersonaSelection(persisted);
+      setPendingProjectPersonaId(persisted);
+      setProjectPersonaError(null);
+      qc.invalidateQueries({ queryKey: ["agent-conversations", projectId] });
+    },
+    onError: (err: any, _personaId, context) => {
+      if (context?.previous) {
+        qc.setQueryData(["agent-conversations", projectId], context.previous);
+      }
+      const prior = context?.prior ?? null;
+      setProjectPersonaSelection(prior);
+      setPendingProjectPersonaId(prior);
+      setProjectPersonaError(
+        err?.response?.data?.detail ?? t("agentChat.projectPersonaSaveFailed"),
+      );
+    },
+  });
+
+  function handleProjectPersonaChange(personaId: string) {
+    const selected = personaId || null;
+    setProjectPersonaError(null);
+    if (activeConversationId) {
+      // An active conversation's displayed persona is its persisted execution
+      // authority. Hold it steady until the PATCH resolves; ChatCanvas is
+      // gated below for the same transition.
+      setProjectPersonaWriteBarrier(updateProjectPersona.mutateAsync(selected));
+      return;
+    }
+    setProjectPersonaSelection(selected);
+    setPendingProjectPersonaId(selected);
+  }
 
   const togglePin = useMutation({
     mutationFn: (args: { id: string; pinned: boolean }) =>
@@ -174,6 +284,32 @@ export default function AgentChat() {
         </Typography>
         {t("agentChat.conversationalAgent")}
       </Typography>
+      <FormControl size="small" sx={{ minWidth: 210, ml: "auto" }}>
+        <InputLabel id="project-persona-label">
+          {t("agentChat.projectPersona")}
+        </InputLabel>
+        <Select
+          labelId="project-persona-label"
+          value={selectedProjectPersonaId ?? ""}
+          label={t("agentChat.projectPersona")}
+          onChange={(event) => handleProjectPersonaChange(event.target.value)}
+          disabled={projectPersonasQuery.isLoading || updateProjectPersona.isPending}
+        >
+          <MenuItem value="">
+            {t("agentChat.projectPersonaNone")}
+          </MenuItem>
+          {(projectPersonasQuery.data ?? []).map((persona) => (
+            <MenuItem key={persona.id} value={persona.id}>
+              {persona.name}
+            </MenuItem>
+          ))}
+        </Select>
+      </FormControl>
+      {projectPersonaError && (
+        <Alert severity="error" sx={{ py: 0, ml: 1 }} role="alert">
+          {projectPersonaError}
+        </Alert>
+      )}
       <HelpIconButton href="/help/agent/agent-chat.html" />
     </Box>
   );
@@ -216,6 +352,7 @@ export default function AgentChat() {
           conversations={conversationsQuery.data ?? []}
           activeId={activeConversationId}
           loading={conversationsQuery.isLoading}
+          disabled={updateProjectPersona.isPending}
           onSelect={setActiveConversation}
           onCreate={() => createConv.mutate()}
           onDelete={async (id) => {
@@ -257,6 +394,7 @@ export default function AgentChat() {
                   configQuery.data?.feedback_enabled,
                 )}
                 onOpenTrace={setTraceTurn}
+                disabled={updateProjectPersona.isPending}
                 showModelPicker
                 echartsTheme={TESSALLITE_ECHARTS_THEME}
                 chartsCss={chartsCss}
@@ -280,6 +418,7 @@ const ConversationList = memo(function ConversationList({
   conversations,
   activeId,
   loading,
+  disabled,
   onSelect,
   onCreate,
   onDelete,
@@ -288,6 +427,7 @@ const ConversationList = memo(function ConversationList({
   conversations: AgentConversation[];
   activeId: string | null;
   loading: boolean;
+  disabled?: boolean;
   onSelect: (id: string | null) => void;
   onCreate: () => void;
   onDelete: (id: string) => void;
@@ -351,7 +491,7 @@ const ConversationList = memo(function ConversationList({
           {t("agentChat.conversationsHeader")}
         </Typography>
         <Tooltip title={t("agentChat.newConversationTooltip")}>
-          <IconButton size="small" onClick={onCreate}>
+          <IconButton size="small" onClick={onCreate} disabled={disabled}>
             <AddIcon fontSize="small" />
           </IconButton>
         </Tooltip>
@@ -395,6 +535,7 @@ const ConversationList = memo(function ConversationList({
               key={c.id}
               selected={c.id === activeId}
               onClick={() => onSelect(c.id)}
+              disabled={disabled}
             >
               <ListItemText
                 primary={
@@ -429,6 +570,7 @@ const ConversationList = memo(function ConversationList({
               >
                 <IconButton
                   size="small"
+                  disabled={disabled}
                   onClick={(e) => {
                     e.stopPropagation();
                     onTogglePin(c.id, !c.pinned_at);
@@ -443,6 +585,7 @@ const ConversationList = memo(function ConversationList({
               </Tooltip>
               <IconButton
                 size="small"
+                disabled={disabled}
                 onClick={(e) => {
                   e.stopPropagation();
                   onDelete(c.id);

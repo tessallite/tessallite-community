@@ -31,6 +31,7 @@ import type {
 } from "../../api/types";
 import { useBuilderStore } from "../../store/builderStore";
 import { useConfirm } from "../Confirm";
+import { recordCreate, recordDelete, recordUpdate } from "../Builder/emitDrawerHistory";
 
 type DialogMode = "create" | "edit";
 
@@ -73,17 +74,41 @@ const BOOLEAN_FALSE = new Set(["false", "0", "no"]);
 /** @internal exported for unit testing (Bug-7661 round-trip guard). */
 export function parseDefaultValue(v: string, type: ParamType): unknown {
   if (!v.trim()) return undefined;
-  if (type === "number") return Number(v);
+  if (type === "number") return Number(v.trim());
   if (type === "boolean") {
     const n = v.trim().toLowerCase();
     if (BOOLEAN_TRUE.has(n)) return true;
     if (BOOLEAN_FALSE.has(n)) return false;
     return undefined; // invalid — gated by defaultValueError before Save
   }
-  if (type === "multi_value") return v.split(",").map((s) => s.trim());
+  if (type === "multi_value") {
+    // JSON is the lossless editor representation.  Keep accepting the
+    // historical comma-separated spelling so existing authored parameters do
+    // not become uneditable, but never rewrite a value containing commas or
+    // quotes into a different array on the next save.
+    try {
+      const parsed: unknown = JSON.parse(v);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      // Legacy comma-separated input; handled below.
+    }
+    return v.split(",").map((s) => s.trim());
+  }
   if (type === "date_range") {
     try {
-      return JSON.parse(v);
+      const parsed: unknown = JSON.parse(v);
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        typeof (parsed as Record<string, unknown>).from === "string" &&
+        typeof (parsed as Record<string, unknown>).to === "string"
+      ) {
+        return {
+          from: (parsed as Record<string, string>).from,
+          to: (parsed as Record<string, string>).to,
+        };
+      }
+      return undefined;
     } catch {
       return undefined;
     }
@@ -120,20 +145,40 @@ export function defaultValueError(v: string, type: ParamType): string | null {
     ) {
       return "parameters.defaultValueDateRangeError";
     }
+    const keys = Object.keys(parsed as Record<string, unknown>);
+    if (keys.some((key) => key !== "from" && key !== "to")) {
+      return "parameters.defaultValueDateRangeError";
+    }
+  }
+  if (type === "multi_value") {
+    const parsed = parseDefaultValue(v, type);
+    if (!Array.isArray(parsed)) return "parameters.defaultValueMultiValueError";
   }
   return null;
 }
 
 /** @internal exported for unit testing (Bug-7661 round-trip guard). */
-export function formatDefaultValue(v: unknown): string {
+export function formatDefaultValue(v: unknown, type?: ParamType): string {
   if (v === null || v === undefined) return "";
-  // Bug-7661: multi_value defaults are stored as arrays (e.g. ["EMEA","NA"]).
-  // Format them as comma-separated text so parseDefaultValue (which comma-
-  // splits) round-trips without corruption.  JSON.stringify would produce
-  // '["EMEA","NA"]' which comma-splits into '["EMEA"' and '"NA"]'.
+  // Type-aware JSON is the canonical representation for structured defaults.
+  // The optional type keeps the old display helper source-compatible for
+  // callers that only need a human-readable catalogue value.
+  if (type === "multi_value" && Array.isArray(v)) return JSON.stringify(v);
+  if (type === "date_range" && typeof v === "object") return JSON.stringify(v);
   if (Array.isArray(v)) return v.join(", ");
   if (typeof v === "object") return JSON.stringify(v);
   return String(v);
+}
+
+function parameterToPayload(p: ModelParameter): Record<string, unknown> {
+  return {
+    name: p.name,
+    display_name: p.display_name ?? undefined,
+    param_type: p.param_type,
+    default_value: p.default_value ?? undefined,
+    allowed_values: p.allowed_values ?? undefined,
+    description: p.description ?? undefined,
+  };
 }
 
 export default function ParametersPanel() {
@@ -161,7 +206,10 @@ export default function ParametersPanel() {
   const createMut = useMutation({
     mutationFn: (data: ModelParameterCreate) =>
       parametersApi.create(projectId, modelId, data),
-    onSuccess: () => {
+    onSuccess: (created, data) => {
+      // Bug-9395/F-026-10: parameter drawer writes participate in the same
+      // model-scoped undo history as measures and dimensions.
+      recordCreate("parameter", created.id, data as unknown as Record<string, unknown>);
       qc.invalidateQueries({ queryKey });
       closeDialog();
     },
@@ -170,9 +218,10 @@ export default function ParametersPanel() {
   });
 
   const updateMut = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: Record<string, unknown> }) =>
+    mutationFn: ({ id, data }: { id: string; data: Record<string, unknown>; prior: Record<string, unknown> }) =>
       parametersApi.update(projectId, modelId, id, data),
-    onSuccess: () => {
+    onSuccess: (_updated, variables) => {
+      recordUpdate("parameter", variables.id, variables.prior, variables.data);
       qc.invalidateQueries({ queryKey });
       closeDialog();
     },
@@ -181,8 +230,12 @@ export default function ParametersPanel() {
   });
 
   const deleteMut = useMutation({
-    mutationFn: (id: string) => parametersApi.delete(projectId, modelId, id),
-    onSuccess: () => qc.invalidateQueries({ queryKey }),
+    mutationFn: ({ id }: { id: string; prior: Record<string, unknown> }) =>
+      parametersApi.delete(projectId, modelId, id),
+    onSuccess: (_deleted, variables) => {
+      recordDelete("parameter", variables.id, variables.prior);
+      qc.invalidateQueries({ queryKey });
+    },
   });
 
   function openCreate() {
@@ -198,7 +251,7 @@ export default function ParametersPanel() {
       name: p.name,
       display_name: p.display_name ?? "",
       param_type: p.param_type,
-      default_value: formatDefaultValue(p.default_value),
+      default_value: formatDefaultValue(p.default_value, p.param_type),
       allowed_values: Array.isArray(p.allowed_values)
         ? p.allowed_values.join(", ")
         : "",
@@ -231,8 +284,10 @@ export default function ParametersPanel() {
         description: form.description || undefined,
       });
     } else if (editId) {
+      const prior = params.find((p) => p.id === editId);
       updateMut.mutate({
         id: editId,
+        prior: prior ? parameterToPayload(prior) : {},
         data: {
           // Send explicit null (not undefined) so cleared fields actually
           // reset. undefined is dropped from the JSON body and the backend's
@@ -254,7 +309,7 @@ export default function ParametersPanel() {
       message: t("parameters.deleteConfirmMessage", { name: p.name }),
       confirmLabel: t("common.delete"),
     });
-    if (ok) deleteMut.mutate(p.id);
+    if (ok) deleteMut.mutate({ id: p.id, prior: parameterToPayload(p) });
   }
 
   const isPending = createMut.isPending || updateMut.isPending;
@@ -333,7 +388,7 @@ export default function ParametersPanel() {
               )}
               <Box display="flex" gap={2} mt={1}>
                 <Typography variant="caption" color="text.secondary">
-                  {t("parameters.defaultLabel")}: {p.default_value !== null ? formatDefaultValue(p.default_value) : t("parameters.noneValue")}
+                  {t("parameters.defaultLabel")}: {p.default_value !== null ? formatDefaultValue(p.default_value, p.param_type) : t("parameters.noneValue")}
                 </Typography>
                 {p.allowed_values && (
                   <Typography variant="caption" color="text.secondary">

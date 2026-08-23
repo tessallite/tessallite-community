@@ -39,6 +39,7 @@ from sqlalchemy.exc import OperationalError
 from shared.named_query.population_contract import (
     named_query_population_fingerprint,
 )
+from shared.source_executor import QueryTimeoutError
 from src.api import routes as _routes
 from src.api.routes import ExecuteRequest, ExecuteResponse
 from src.routing.named_query_resolver import NamedQueryDefinition
@@ -348,16 +349,17 @@ def _make_db(script: _ExecuteScript) -> MagicMock:
     return db
 
 
-def _live_response() -> ExecuteResponse:
+def _live_response(rows: list[dict] | None = None) -> ExecuteResponse:
+    rows = [{"branch_id": "A"}] if rows is None else rows
     return ExecuteResponse(
-        rows=[{"branch_id": "A"}],
+        rows=rows,
         columns=["branch_id"],
         route_type="source",
         reason="",
         aggregate_id=None,
         execution_ms=5,
         bytes_processed=100,
-        rows_returned=1,
+        rows_returned=len(rows),
     )
 
 
@@ -376,6 +378,12 @@ async def _run(
     overdue: bool = False,
     proof_holds: bool | None = None,
     real_execute: bool = False,
+    raw_query: str = "SELECT * FROM @leads",
+    rows: list[dict] | None = None,
+    row_limit: int | None = None,
+    via_execute: bool = False,
+    exec_error: Exception | None = None,
+    failure_mock: AsyncMock | None = None,
 ) -> tuple[ExecuteResponse, _ExecuteScript, dict[str, AsyncMock]]:
     """Drive the REAL ``_handle_named_query_reference`` once per cell.
 
@@ -385,10 +393,31 @@ async def _run(
     stubbed. The mock of ``_handle_execute`` is what made the F1 regression
     invisible (the persona/CLS 403 on the expanded projection never fired), so
     these cells fail if the live body ever carries an unpermitted field again.
+
+    ``via_execute=True`` (L2-F1 cells) enters through the REAL ``_handle_execute``
+    instead of calling the reference handler directly, so the caller's
+    ``row_limit`` passes through the REAL step-1.2 clamp that derives
+    ``server_row_cap`` — the clamp is half of the leg-disagreement this guards,
+    so a test that hand-computed the cap would not have caught it. Requires
+    ``real_execute=True`` (the inner live re-dispatch must run its own clamp too).
     """
+    if via_execute and not real_execute:
+        raise AssertionError(
+            "via_execute requires real_execute. With ``_handle_execute`` mocked "
+            "the inner live re-dispatch never runs its own row-limit clamp, so "
+            "the leg-agreement cells would pass vacuously."
+        )
     db = _make_db(script)
-    live_response = _live_response()
-    exec_mock = AsyncMock(return_value=([{"branch_id": "A"}], 123, ["branch_id"]))
+    live_response = _live_response(rows)
+    exec_mock = AsyncMock(
+        return_value=(
+            rows if rows is not None else [{"branch_id": "A"}],
+            123,
+            ["branch_id"],
+        )
+    )
+    if exec_error is not None:
+        exec_mock.side_effect = exec_error
     live_mock = AsyncMock(return_value=live_response)
     record_mock = AsyncMock()
     mocks = {"exec": exec_mock, "live": live_mock, "record": record_mock}
@@ -433,8 +462,12 @@ async def _run(
             new=AsyncMock(return_value=types.SimpleNamespace()),
         ),
     ]
+    if failure_mock is not None:
+        patches.append(
+            patch.object(_routes, "_log_query_failure", new=failure_mock)
+        )
     if real_execute:
-        patches.extend(_real_execute_patches(mocks))
+        patches.extend(_real_execute_patches(mocks, rows=rows))
     else:
         patches.append(patch.object(_routes, "_handle_execute", new=live_mock))
     if overdue:
@@ -456,27 +489,40 @@ async def _run(
             )
         )
     body = ExecuteRequest(
-        model_id=str(_MODEL_ID), raw_query="SELECT * FROM @leads",
+        model_id=str(_MODEL_ID), raw_query=raw_query, row_limit=row_limit,
     )
     logical_query = types.SimpleNamespace(limit=None)
+    _identity = principal.user_identity if principal else "anon@acme-demo.com"
+    # Captured BEFORE the patches go up: the live re-dispatch resolves
+    # ``_handle_execute`` through the module global, so entering through the
+    # saved reference keeps the outer call real while the inner one obeys
+    # whatever ``real_execute`` installed.
+    _real_handle_execute = _routes._handle_execute
     with contextlib.ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
-        response = await _routes._handle_named_query_reference(
-            db, body, logical_query,
-            ref_name="leads",
-            persona=persona,
-            principal=principal,
-            user_identity=(
-                principal.user_identity if principal else "anon@acme-demo.com"
-            ),
-            tenant_id="acme-demo",
-        )
+        if via_execute:
+            response = await _real_handle_execute(
+                body, db, _identity,
+                principal=principal,
+                persona=persona,
+                tenant_id="acme-demo",
+            )
+        else:
+            response = await _routes._handle_named_query_reference(
+                db, body, logical_query,
+                ref_name="leads",
+                persona=persona,
+                principal=principal,
+                user_identity=_identity,
+                tenant_id="acme-demo",
+            )
     return response, script, mocks
 
 
 def _real_execute_patches(
     mocks: dict[str, AsyncMock],
+    rows: list[dict] | None = None,
 ) -> list[object]:
     """Seams for driving the REAL ``_handle_execute`` on the live re-dispatch.
 
@@ -487,6 +533,11 @@ def _real_execute_patches(
     ``_check_column_restrictions``) run, and only execution/observation/logging
     are stubbed. ``mocks["live_body"]`` captures the body that reached the
     helper, and ``mocks["decision"]`` the routed decision.
+
+    The observation stub HONOURS ``bound.logical_query.limit`` — the row cap the
+    clamp pushed into the compiled SQL — because a source that ignored the
+    pushed-down LIMIT would hide exactly the row-window defect the L2-F1 cells
+    exist to catch.
     """
     from src.semantic.snapshot_resolver import DeployedShape
 
@@ -530,8 +581,10 @@ def _real_execute_patches(
     async def _capture_body(body, db, persona_id):
         captured["raw_query"] = body.raw_query
 
+    _population: list[dict] = list(rows) if rows else [{"v": 1}]
+
     async def _fake_observation(*, bound, decision, db, user_identity,
-                                tenant_id, persona, client_kind):
+                                tenant_id, persona, client_kind, **_kwargs):
         routed_decision = types.SimpleNamespace(
             route_type="source",
             reason="force_route=source set on request; aggregate + pocket matchers bypassed",
@@ -541,7 +594,13 @@ def _real_execute_patches(
             target_dialect="postgres",
             security_rules_applied=[],
         )
-        return ([{"v": 1}], 0, ["v"], None, 5, routed_decision)
+        _limit = getattr(bound.logical_query, "limit", None)
+        _served = (
+            _population[:_limit] if _limit is not None else list(_population)
+        )
+        return (
+            _served, 0, list(_population[0].keys()), None, 5, routed_decision,
+        )
 
     from src.api.routes import PipelineTrace
 
@@ -654,13 +713,23 @@ async def test_cell_1a_no_artifact_serves_live() -> None:
 
 
 async def test_cell_1b_artifact_not_fresh_serves_live() -> None:
+    """Bug-9166: a present-but-unfresh artifact reports ``artifact_not_fresh``.
+
+    This cell used to assert ``no_artifact`` — the same label cell 1a gets when
+    there is no artifact ROW AT ALL — because ``_skip_reason`` was initialised
+    to ``no_artifact`` and only the ``status == "fresh"`` branch ever
+    re-laboured it. The two states are operationally different: one means the
+    Named Query has never been materialised, the other means a build is in
+    flight or has failed, and an operator watching a first refresh was told the
+    first when the second was true. Routing is unchanged (live either way).
+    """
     response, _, mocks = await _run(
         _ExecuteScript(
             [_ScalarOne(_artifact_row(status="building")),
              _ScalarOne(_policy_row())],
         ),
     )
-    _assert_live(response, mocks, "no_artifact")
+    _assert_live(response, mocks, "artifact_not_fresh")
 
 
 async def test_cell_2_version_gate_failure_serves_live() -> None:
@@ -791,6 +860,37 @@ async def test_cell_7_persona_no_restriction_serves_materialised() -> None:
     assert len(executed.calls) == 4
     assert "persona_tag_restrictions" in str(executed.calls[2])
     _assert_materialised(response, mocks, sql_fragment=_TABLE_REF)
+
+
+@pytest.mark.asyncio
+async def test_bug9172_sol_r1_f1_materialised_timeout_is_one_attributed_failure() -> None:
+    """B9172-SOL-R1-F1-B: a physical NQ timeout is logged once with its id.
+
+    Materialised execution has no ordinary ``execute_with_observation``
+    wrapper, so the handler must own this failure boundary and preserve the
+    timeout status rather than letting the outer request wrapper create an
+    un-attributed duplicate.
+    """
+    failure_mock = AsyncMock()
+    script = _ExecuteScript(
+        [
+            _ScalarOne(_artifact_row()),
+            _ScalarOne(_policy_row()),
+        ],
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await _run(
+            script,
+            exec_error=QueryTimeoutError("timed out"),
+            failure_mock=failure_mock,
+        )
+    assert exc_info.value.status_code == 408
+    assert getattr(exc_info.value, "_tessallite_failure_logged", False) is True
+    failure_mock.assert_awaited_once()
+    kwargs = failure_mock.await_args.kwargs
+    assert kwargs["named_query_id"] == _NQ_ID
+    assert kwargs["named_query_fallback_reason"] is None
+    assert failure_mock.await_args.args[6] == "timeout"
 
 
 async def test_cell_8a_rls_projection_proof_holds_serves_materialised_with_predicate() -> None:
@@ -1065,3 +1165,342 @@ async def test_live_body_is_the_expanded_deployed_definition() -> None:
     _live_body = mocks["live"].await_args.args[0]
     assert _live_body.raw_query == _expanded_definition_sql(_PROJECTION_DEF)
     assert "*" not in _live_body.raw_query.replace("acme", "")
+
+
+# ---------------------------------------------------------------------------
+# Bug-9398 — a trailing LIMIT/OFFSET is HONOURED on both legs
+# ---------------------------------------------------------------------------
+#
+# The shape recogniser now accepts ``SELECT * FROM @nq LIMIT n [OFFSET m]``
+# because that is what every JDBC IDE sends. Accepting it is only half the
+# work: a window that is recognised but not APPLIED returns the wrong number of
+# rows — and an OFFSET recognised but not applied returns the wrong ROWS, which
+# is strictly worse than the refusal it replaced. Both legs are asserted,
+# because they truncate in different places.
+
+_WINDOW_ROWS = [
+    {"branch_id": "A"}, {"branch_id": "B"}, {"branch_id": "C"},
+    {"branch_id": "D"}, {"branch_id": "E"},
+]
+
+
+async def test_bug_9398_materialised_leg_honours_a_trailing_limit() -> None:
+    """The physical table returns 5 rows; the reference asked for 2."""
+    script = _ExecuteScript(
+        [_ScalarOne(_artifact_row()), _ScalarOne(_policy_row()),
+         _ScalarOne(_model_row())],
+    )
+    response, _, mocks = await _run(
+        script,
+        raw_query="SELECT * FROM @leads LIMIT 2",
+        rows=list(_WINDOW_ROWS),
+    )
+    mocks["exec"].assert_awaited_once()
+    assert response.route_type == "named_query"
+    assert response.rows == [{"branch_id": "A"}, {"branch_id": "B"}]
+    assert response.rows_returned == 2
+    # The reference's own LIMIT is the caller's explicit intent, not a server
+    # cap, so it must NOT raise the truncation marker a BI client renders as
+    # "your result was cut short by the server".
+    assert response.truncated is False
+
+
+async def test_bug_9398_materialised_leg_honours_offset_before_limit() -> None:
+    """OFFSET is applied FIRST. Applying it after the limit would return rows
+    1-2 where the caller asked for 3-4 — the wrong rows, silently."""
+    script = _ExecuteScript(
+        [_ScalarOne(_artifact_row()), _ScalarOne(_policy_row()),
+         _ScalarOne(_model_row())],
+    )
+    response, _, mocks = await _run(
+        script,
+        raw_query="SELECT * FROM @leads LIMIT 2 OFFSET 2",
+        rows=list(_WINDOW_ROWS),
+    )
+    mocks["exec"].assert_awaited_once()
+    assert response.rows == [{"branch_id": "C"}, {"branch_id": "D"}]
+
+
+async def test_bug_9398_live_leg_honours_the_window_without_moving_population() -> None:
+    """The live leg truncates the RETURNED ROWS and leaves the dispatched
+    definition alone.
+
+    This is the load-bearing half. The canonical population is a function of
+    the DEPLOYED DEFINITION alone (Bug-9173/NQ2R1-F6) — folding the reference's
+    window into ``_live_body`` would make a windowed reference and an unwindowed
+    one compile DIFFERENT populations, so the live and materialised legs would
+    stop agreeing about which rows exist.
+    """
+    script = _ExecuteScript(
+        [_ScalarOne(_artifact_row(stamp_fingerprint=False)),
+         _ScalarOne(_policy_row())],
+    )
+    response, _, mocks = await _run(
+        script,
+        raw_query="SELECT * FROM @leads LIMIT 2 OFFSET 1",
+        rows=list(_WINDOW_ROWS),
+    )
+    assert response.route_type == "source"
+    assert response.rows == [{"branch_id": "B"}, {"branch_id": "C"}]
+    assert response.rows_returned == 2
+    _live_body = mocks["live"].await_args.args[0]
+    assert _live_body.raw_query == _expanded_definition_sql(_PROJECTION_DEF)
+    assert "LIMIT" not in _live_body.raw_query.upper()
+    assert "OFFSET" not in _live_body.raw_query.upper()
+
+
+async def test_bug_9398_a_quoted_reference_still_serves() -> None:
+    """``SELECT * FROM @"leads"`` — what a BI IDE emits when it quotes
+    identifiers — must reach the same served result as the bare spelling."""
+    script = _ExecuteScript(
+        [_ScalarOne(_artifact_row()), _ScalarOne(_policy_row()),
+         _ScalarOne(_model_row())],
+    )
+    response, _, mocks = await _run(
+        script,
+        raw_query='SELECT * FROM @"leads"',
+        rows=list(_WINDOW_ROWS),
+    )
+    mocks["exec"].assert_awaited_once()
+    assert response.route_type == "named_query"
+    assert response.rows == _WINDOW_ROWS
+
+
+async def test_bug_9398_an_unwindowed_reference_returns_every_row() -> None:
+    """Control: no window means no truncation. Without this the window tests
+    would pass on an implementation that always truncated."""
+    script = _ExecuteScript(
+        [_ScalarOne(_artifact_row()), _ScalarOne(_policy_row()),
+         _ScalarOne(_model_row())],
+    )
+    response, _, _ = await _run(script, rows=list(_WINDOW_ROWS))
+    assert response.rows == _WINDOW_ROWS
+
+
+async def test_bug_9398_an_unsupported_shape_is_still_refused() -> None:
+    """Widening the recogniser must not widen it past LIMIT/OFFSET. An
+    ORDER BY reference stays a 400 unsupported-shape refusal — silently
+    dropping the sort would reorder the caller's result."""
+    script = _ExecuteScript(
+        [_ScalarOne(_artifact_row()), _ScalarOne(_policy_row())],
+    )
+    with pytest.raises(HTTPException) as exc:
+        await _run(script, raw_query="SELECT * FROM @leads ORDER BY 1")
+    assert exc.value.status_code == 400
+    assert "v1 accepts only" in str(exc.value.detail)
+
+
+# ---------------------------------------------------------------------------
+# L2-F1 — the two legs must compose the row window and the server cap in the
+# SAME order.
+#
+# The materialised leg windows THEN caps. The LIVE leg used to hand the
+# caller's ``row_limit`` straight to the inner ``_handle_execute``, which caps
+# FIRST — so the window was applied to already-capped rows and an OFFSET past
+# the cap silently returned fewer rows, or none. The MCP server sets
+# ``row_limit`` on EVERY request, so a client paging a Named Query with
+# offset+limit got a different answer depending only on whether a refresh had
+# landed: correct while materialised, short or empty while live.
+#
+# These cells enter through the REAL ``_handle_execute`` so the caller's
+# ``row_limit`` passes the REAL clamp, and the live leg's inner dispatch runs
+# its own REAL clamp against a source stub that honours the pushed-down LIMIT.
+# They assert KNOWN ROWS, not counts: a count assertion passes on an
+# implementation that returns the wrong rows.
+
+
+def _materialised_script() -> _ExecuteScript:
+    return _ExecuteScript(
+        [_ScalarOne(_artifact_row()), _ScalarOne(_policy_row()),
+         _ScalarOne(_model_row())],
+    )
+
+
+def _live_script() -> _ExecuteScript:
+    """Artifact present but pre-contract -> ``population_contract_mismatch``
+    -> live, then the inner real dispatch's CLS + dialect probes."""
+    return _ExecuteScript(
+        [
+            _ScalarOne(_artifact_row(stamp_fingerprint=False)),
+            _ScalarOne(_policy_row()),
+            _ScalarsAll([]),   # real route_query CLS probe: no restrictions
+            _ScalarsAll([]),   # dialect: no touched-table rows
+            _ScalarOne(None),  # dialect: no DataSource -> postgres fallback
+        ],
+    )
+
+
+async def test_l2_f1_both_legs_agree_on_the_window_under_a_caller_row_cap() -> None:
+    """THE leg-agreement cell. Same Named Query, same 5-row population, same
+    caller ``row_limit=3``, same ``LIMIT 2 OFFSET 3`` — the two legs must return
+    the SAME rows and the SAME truncation marker.
+
+    Pre-fix: materialised -> [D, E] truncated=False; live -> [] truncated=True.
+    """
+    materialised, _, m_mocks = await _run(
+        _materialised_script(),
+        raw_query="SELECT * FROM @leads LIMIT 2 OFFSET 3",
+        rows=list(_WINDOW_ROWS),
+        row_limit=3,
+        real_execute=True,
+        via_execute=True,
+    )
+    live, _, l_mocks = await _run(
+        _live_script(),
+        raw_query="SELECT * FROM @leads LIMIT 2 OFFSET 3",
+        rows=list(_WINDOW_ROWS),
+        row_limit=3,
+        real_execute=True,
+        via_execute=True,
+    )
+    # Both legs really were the legs they claim to be.
+    m_mocks["exec"].assert_awaited_once()
+    l_mocks["exec"].assert_not_awaited()
+    assert materialised.route_type == "named_query"
+    assert live.route_type == "source"
+
+    assert materialised.rows == [{"branch_id": "D"}, {"branch_id": "E"}]
+    assert live.rows == [{"branch_id": "D"}, {"branch_id": "E"}]
+    assert live.rows == materialised.rows
+    # The reference's own window bounded the answer, so neither leg may claim
+    # the SERVER cut the result short — a BI client renders that differently.
+    assert materialised.truncated is False
+    assert live.truncated is False
+    assert live.rows_returned == materialised.rows_returned == 2
+
+
+async def test_l2_f1_a_window_wider_than_the_cap_truncates_the_same_on_both_legs() -> None:
+    """``LIMIT 4`` under a caller cap of 3 — the shape every JDBC IDE produces
+    against an MCP client that caps every request.
+
+    Here the cap DOES bind (the caller's own LIMIT is the larger of the two), so
+    both legs must serve the first three rows AND raise the truncation marker.
+    A fix that simply stopped reporting ``truncated`` would pass the cell above
+    and fail this one.
+    """
+    materialised, _, _ = await _run(
+        _materialised_script(),
+        raw_query="SELECT * FROM @leads LIMIT 4",
+        rows=list(_WINDOW_ROWS),
+        row_limit=3,
+        real_execute=True,
+        via_execute=True,
+    )
+    live, _, _ = await _run(
+        _live_script(),
+        raw_query="SELECT * FROM @leads LIMIT 4",
+        rows=list(_WINDOW_ROWS),
+        row_limit=3,
+        real_execute=True,
+        via_execute=True,
+    )
+    expected = [{"branch_id": "A"}, {"branch_id": "B"}, {"branch_id": "C"}]
+    assert materialised.rows == expected
+    assert live.rows == expected
+    assert materialised.truncated is True
+    assert live.truncated is True
+
+
+async def test_l2_f1_an_offset_only_window_agrees_on_both_legs() -> None:
+    """``OFFSET 3`` with no LIMIT: the window is unbounded, so the live leg has
+    to fetch ``offset + cap + 1`` rows to reproduce the materialised answer AND
+    its truncation marker. 5-row population, offset 3, cap 3 -> two rows, not
+    truncated."""
+    materialised, _, _ = await _run(
+        _materialised_script(),
+        raw_query="SELECT * FROM @leads OFFSET 3",
+        rows=list(_WINDOW_ROWS),
+        row_limit=3,
+        real_execute=True,
+        via_execute=True,
+    )
+    live, _, _ = await _run(
+        _live_script(),
+        raw_query="SELECT * FROM @leads OFFSET 3",
+        rows=list(_WINDOW_ROWS),
+        row_limit=3,
+        real_execute=True,
+        via_execute=True,
+    )
+    assert materialised.rows == [{"branch_id": "D"}, {"branch_id": "E"}]
+    assert live.rows == materialised.rows
+    assert materialised.truncated is False
+    assert live.truncated is False
+
+
+async def test_l2_f1_an_offset_only_window_that_overruns_the_cap_agrees() -> None:
+    """The N+1 probe cell. ``OFFSET 1`` leaves four rows but the cap is three,
+    so BOTH legs must serve three rows AND report truncation. The live leg can
+    only know that by fetching one row past the cap — a fetch bound of
+    ``offset + cap`` would return the right rows with the WRONG marker."""
+    materialised, _, _ = await _run(
+        _materialised_script(),
+        raw_query="SELECT * FROM @leads OFFSET 1",
+        rows=list(_WINDOW_ROWS),
+        row_limit=3,
+        real_execute=True,
+        via_execute=True,
+    )
+    live, _, _ = await _run(
+        _live_script(),
+        raw_query="SELECT * FROM @leads OFFSET 1",
+        rows=list(_WINDOW_ROWS),
+        row_limit=3,
+        real_execute=True,
+        via_execute=True,
+    )
+    expected = [{"branch_id": "B"}, {"branch_id": "C"}, {"branch_id": "D"}]
+    assert materialised.rows == expected
+    assert live.rows == expected
+    assert materialised.truncated is True
+    assert live.truncated is True
+
+
+async def test_l2_f1_an_unwindowed_reference_still_reports_server_truncation() -> None:
+    """Control — the window suppression must not swallow a REAL server cap.
+
+    No window, caller cap of 3 over a 5-row population: the caller IS being cut
+    short by the server and both legs must say so. Without this cell the fix
+    could have been "never report truncated", which loses the one fact a BI
+    client needs to stop treating an extract as complete.
+    """
+    materialised, _, _ = await _run(
+        _materialised_script(),
+        raw_query="SELECT * FROM @leads",
+        rows=list(_WINDOW_ROWS),
+        row_limit=3,
+        real_execute=True,
+        via_execute=True,
+    )
+    live, _, _ = await _run(
+        _live_script(),
+        raw_query="SELECT * FROM @leads",
+        rows=list(_WINDOW_ROWS),
+        row_limit=3,
+        real_execute=True,
+        via_execute=True,
+    )
+    expected = [{"branch_id": "A"}, {"branch_id": "B"}, {"branch_id": "C"}]
+    assert materialised.rows == expected
+    assert live.rows == expected
+    assert materialised.truncated is True
+    assert live.truncated is True
+
+
+async def test_l2_f1_the_live_body_still_carries_the_expanded_definition() -> None:
+    """The window fix adjusts ``row_limit`` ONLY. ``raw_query`` must stay the
+    byte-identical expanded deployed definition — folding the window into the
+    dispatched SQL would make a windowed reference compile a DIFFERENT
+    population from an unwindowed one, and the two legs would stop agreeing
+    about which rows exist."""
+    _, _, mocks = await _run(
+        _live_script(),
+        raw_query="SELECT * FROM @leads LIMIT 2 OFFSET 3",
+        rows=list(_WINDOW_ROWS),
+        row_limit=3,
+        real_execute=True,
+        via_execute=True,
+    )
+    assert mocks["live_body"]["raw_query"] == _expanded_definition_sql(
+        _PROJECTION_DEF
+    )

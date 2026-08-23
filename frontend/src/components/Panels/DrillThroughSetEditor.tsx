@@ -24,6 +24,7 @@ import type {
   ModelTable,
 } from "../../api/types";
 import { useConfirm } from "../Confirm";
+import { recordDelete, recordUpdate } from "../Builder/emitDrawerHistory";
 import { useT } from "../../i18n";
 import { ui } from "../../theme/tokens";
 
@@ -39,6 +40,20 @@ type ApiErrorBody = {
   message?: string;
   invalid_ids?: string[];
 };
+
+function drillThroughSetPayload(
+  set: DrillThroughSet,
+  measureId: string,
+): Record<string, unknown> {
+  return {
+    source_table_id: set.source_table_id,
+    detail_columns: set.detail_columns ?? null,
+    joined_dimension_ids: set.joined_dimension_ids ?? null,
+    row_limit_override: set.row_limit_override ?? null,
+    source_join_path: set.source_join_path ?? null,
+    __measure_id: measureId,
+  };
+}
 
 // Bug-5935 (F-019-04): mirrors DRILL_MAX_ROW_LIMIT in
 // tessallite/shared/drill_limits.py, the single source of truth the shared
@@ -239,9 +254,15 @@ export function DrillThroughSetEditor({
   ]);
 
   const updateMut = useMutation({
-    mutationFn: (data: DrillThroughSetUpdate) =>
-      measuresApi.updateDrillThroughSet(projectId, modelId, measure.id, data),
-    onSuccess: (data) => {
+    mutationFn: (vars: { data: DrillThroughSetUpdate; prior: Record<string, unknown> }) =>
+      measuresApi.updateDrillThroughSet(projectId, modelId, measure.id, vars.data),
+    onSuccess: (data, variables) => {
+      recordUpdate(
+        "drillThroughSet",
+        measure.id,
+        variables.prior,
+        { ...variables.data, __measure_id: measure.id },
+      );
       qc.setQueryData(
         ["drillThroughSet", projectId, modelId, measure.id],
         data,
@@ -252,9 +273,10 @@ export function DrillThroughSetEditor({
   });
 
   const resetMut = useMutation({
-    mutationFn: () =>
+    mutationFn: (prior: Record<string, unknown>) =>
       measuresApi.resetDrillThroughSet(projectId, modelId, measure.id),
-    onSuccess: (data: DrillThroughSet) => {
+    onSuccess: (data: DrillThroughSet, prior) => {
+      recordDelete("drillThroughSet", measure.id, prior);
       qc.setQueryData(
         ["drillThroughSet", projectId, modelId, measure.id],
         data,
@@ -313,7 +335,7 @@ export function DrillThroughSetEditor({
       setError(t("drillThrough.multipleJoinPaths"));
       return;
     }
-    updateMut.mutate({
+    const data: DrillThroughSetUpdate = {
       source_table_id: sourceTableId,
       detail_columns: detailColumns.length > 0 ? detailColumns : null,
       joined_dimension_ids:
@@ -321,6 +343,12 @@ export function DrillThroughSetEditor({
       row_limit_override: limit,
       source_join_path:
         overrideRequiresPath && sourceJoinPath ? sourceJoinPath : null,
+    };
+    updateMut.mutate({
+      data,
+      prior: drillQuery.data
+        ? drillThroughSetPayload(drillQuery.data, measure.id)
+        : { __measure_id: measure.id },
     });
   };
 
@@ -331,7 +359,13 @@ export function DrillThroughSetEditor({
       confirmLabel: t("drillThrough.reset"),
       destructive: false,
     });
-    if (ok) resetMut.mutate();
+    if (ok) {
+      resetMut.mutate(
+        drillQuery.data
+          ? drillThroughSetPayload(drillQuery.data, measure.id)
+          : { __measure_id: measure.id },
+      );
+    }
   };
 
   return (

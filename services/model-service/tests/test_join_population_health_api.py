@@ -1,4 +1,4 @@
-"""Route-level contract for the join population surface (Bug-8615 phase G1).
+"""Route-level contract for the join population surface (Bug-8615 G5).
 
 The classifier's own rules are unit-tested in
 ``shared/semantic/tests/test_join_population_validator.py``. This file covers
@@ -19,7 +19,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from shared.db.models import Join, JoinPopulationCheck, Model, ModelColumn, ModelTable
+from shared.db.models import (
+    Join,
+    JoinPopulationCheck,
+    Model,
+    ModelColumn,
+    ModelTable,
+    ModelVersion,
+)
 
 from .conftest import (
     TEST_MODEL_ID,
@@ -54,7 +61,7 @@ class _Result:
         return self._rows[0] if self._rows else None
 
 
-def _fixture(*, checks, deploy_epoch=3):
+def _fixture(*, checks, deploy_epoch=3, deployed_snapshot=None, check_rows=None):
     """A one-join model plus whatever verdict rows the test wants."""
     fact_id, dim_id = uuid.uuid4(), uuid.uuid4()
     fk_col, pk_col = uuid.uuid4(), uuid.uuid4()
@@ -68,7 +75,10 @@ def _fixture(*, checks, deploy_epoch=3):
     # The rows are built AFTER the join so a check can fingerprint it.
     rows_by_entity = {
         "joins": [join],
-        "join_population_checks": [c(join.id, join) for c in checks],
+        "join_population_checks": (
+            check_rows if check_rows is not None
+            else [c(join.id, join) for c in checks]
+        ),
         "model_tables": [
             types.SimpleNamespace(
                 id=fact_id, alias="sales", display_name="Sales",
@@ -89,8 +99,17 @@ def _fixture(*, checks, deploy_epoch=3):
     model = types.SimpleNamespace(
         id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, deploy_epoch=deploy_epoch,
     )
+    version = None
+    if deployed_snapshot is not None:
+        version = types.SimpleNamespace(
+            id=uuid.uuid4(), snapshot_json=deployed_snapshot,
+        )
+        model.deployed_version_id = version.id
     db.get = AsyncMock(
-        side_effect=lambda entity, pk: model if entity is Model else None
+        side_effect=lambda entity, pk: (
+            model if entity is Model
+            else version if entity is ModelVersion else None
+        )
     )
 
     async def _execute(stmt):
@@ -141,7 +160,7 @@ async def test_health_reports_a_blocked_rollup(client) -> None:
     payload = response.json()
     assert payload["status"] == "BLOCKED"
     assert payload["evaluated"] is True
-    assert payload["warn_only"] is True
+    assert payload["warn_only"] is False
     assert (payload["join_count"], payload["blocked_count"]) == (1, 1)
     item = payload["items"][0]
     assert item["join_id"] == str(join.id)
@@ -150,6 +169,65 @@ async def test_health_reports_a_blocked_rollup(client) -> None:
     assert item["left_table_name"] == "sales"
     assert item["left_column_name"] == "customer_id"
     assert item["stale"] is False
+
+
+@pytest.mark.asyncio
+async def test_deployed_health_and_summary_use_selected_snapshot_after_live_delete(client) -> None:
+    """A deployed historical join remains visible after its draft row is gone."""
+    ids = types.SimpleNamespace(
+        fact=uuid.uuid4(), dim=uuid.uuid4(), fact_col=uuid.uuid4(), dim_col=uuid.uuid4(),
+        join=uuid.uuid4(),
+    )
+    snapshot = {
+        "tables": [
+            {"id": str(ids.fact), "table_type": "fact", "display_name": "Fact"},
+            {"id": str(ids.dim), "table_type": "dim_detail", "display_name": "Customer"},
+        ],
+        "columns": [
+            {"id": str(ids.fact_col), "model_table_id": str(ids.fact), "column_name": "customer_id"},
+            {"id": str(ids.dim_col), "model_table_id": str(ids.dim), "column_name": "id", "is_primary_key": True},
+        ],
+        "joins": [{
+            "id": str(ids.join), "left_table_id": str(ids.fact),
+            "right_table_id": str(ids.dim), "left_column_id": str(ids.fact_col),
+            "right_column_id": str(ids.dim_col), "join_type": "inner",
+            "population_participation": "preserve_base_rows",
+        }],
+    }
+    from shared.semantic.join_population_validator import _snapshot_graph, join_definition_fingerprint
+
+    selected_join = _snapshot_graph(snapshot)[0][0]
+    check = JoinPopulationCheck(
+        join_id=ids.join, model_id=TEST_MODEL_ID, deployed_version_id=uuid.uuid4(),
+        deploy_epoch=3, classification="neutral", population_participation="preserve_base_rows",
+        status="OK", measured=True, row_loss_ratio=0.0, row_mult_ratio=0.0,
+        row_effect_ratio=0.0, reason="measured",
+        inputs_fingerprint=join_definition_fingerprint(selected_join),
+        join_label="Fact.customer_id ↔ Customer.id",
+        left_table_name="Fact", right_table_name="Customer",
+        left_column_name="customer_id", right_column_name="id",
+        checked_at=datetime.now(UTC),
+    )
+    db, live_join = _fixture(
+        checks=[], deployed_snapshot=snapshot, check_rows=[check],
+    )
+    assert live_join.id != ids.join, "the live draft deliberately has a different join"
+    with patch("src.api.join_population_health.get_tenant_db", async_gen_from(db)):
+        response = await client.get(_URL)
+
+    payload = response.json()
+    assert [item["join_id"] for item in payload["items"]] == [str(ids.join)]
+    item = payload["items"][0]
+    assert item["left_table_name"] == "Fact"
+    assert item["right_table_name"] == "Customer"
+    assert item["population_participation"] == "preserve_base_rows"
+    assert item["stale"] is False
+
+    from src.api.join_population_health import summarise_join_population
+
+    summary = await summarise_join_population(db, TEST_MODEL_ID, snapshot=snapshot)
+    assert [item["join_id"] for item in summary["items"]] == [str(ids.join)]
+    assert summary["items"][0]["left_table_name"] == "Fact"
 
 
 @pytest.mark.asyncio

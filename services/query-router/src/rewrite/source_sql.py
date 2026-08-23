@@ -22,7 +22,7 @@ import sqlglot
 from sqlglot import exp
 
 from shared.aggregate_quantiles import quantile_suffix_to_fraction
-from shared.connector_qualify import safe_ident
+from shared.connector_qualify import quote_table_ref, safe_ident
 from shared.schemas.measure_formats import (
     SEMI_ADDITIVE_INELIGIBLE_FAMILIES,
     TIME_VARIANT_FAMILY,
@@ -39,6 +39,7 @@ from shared.semantic.time_variants_sql import (
     resolve_effective_variant_anchor,
     select_finest_time_dimension,
 )
+from shared.semantic.join_population_serving import augment_required_table_ids
 
 from src.ir.logical_query import (
     BoundQuery,
@@ -392,7 +393,9 @@ async def rewrite_for_source(bound_query: BoundQuery, db: Any = None, *, target_
     if bound_query.logical_query.select_star:
         if getattr(bound_query, "persona_narrowed_star", False) and db is not None:
             return await _build_persona_star_sql(bound_query, db, _connector, _target_dialect)
-        rewritten = await _substitute_table_names(bound_query, db, _connector)
+        rewritten = await _substitute_table_names(
+            bound_query, db, _connector, include_population=True,
+        )
         if rewritten:
             return rewritten
         # Bug-904: apply dialect translation so SELECT * fallback SQL is not
@@ -645,6 +648,18 @@ async def _build_persona_star_sql(bound_query: BoundQuery, db: Any, connector: s
                 except Exception:
                     _reject_restricted_reference(obj.name)
 
+    # Bug-8615 / L3-CH-001: a persona/CLS star may project only fact columns,
+    # but its deployed population is still defined by mandatory joins. Apply
+    # the same closure used by ordinary source and aggregate builders before
+    # deciding whether the FROM clause can remain base-only.
+    required_table_ids = augment_required_table_ids(
+        required_table_ids, joins, table_ids=tables_by_id,
+    )
+    if required_table_ids is None:
+        _reject_restricted_reference("(population-defining join)")
+    for _table_id in required_table_ids:
+        _alias_for(_table_id)
+
     if not select_parts:
         # No projectable allowed column remains — reject cleanly (403) instead
         # of falling back to a raw SELECT * (Bug-4467/809).
@@ -825,10 +840,81 @@ def _extract_raw_order_node(logical_query: Any) -> Any:
     return order
 
 
+async def _population_star_from_clause(
+    bound_query: BoundQuery,
+    db: Any,
+    connector: str,
+    *,
+    source_alias: str | None = None,
+) -> tuple[str, str | None] | None:
+    """Build a deployed SELECT-* FROM clause and return its base alias.
+
+    The alias is returned by the same builder that emits the FROM/JOIN graph so
+    callers can qualify an unrestricted star without re-deriving which physical
+    relation is the base.  A single-table clause has no population join to
+    qualify against and therefore returns ``None`` for the alias.
+    """
+    tables_by_id, joins, columns_by_id, _uda_by_id = await _load_model_graph(
+        bound_query, db, set(),
+    )
+    if not tables_by_id:
+        return None
+
+    from shared.semantic.graph_order import pick_anchor_table
+
+    base_table = pick_anchor_table(tables_by_id.values())
+    if base_table is None:
+        return None
+    required_table_ids = augment_required_table_ids(
+        {base_table.id}, joins, table_ids=tables_by_id,
+    )
+    if required_table_ids is None:
+        raise SemanticBindingError(
+            "Cannot rewrite SELECT *: malformed population-defining join graph."
+        )
+    if required_table_ids == {base_table.id}:
+        base_ref = quote_table_ref(connector, base_table.physical_name)
+        from_clause = (
+            f"{base_ref} AS {safe_ident(source_alias)}"
+            if source_alias
+            else base_ref
+        )
+        return from_clause, None
+
+    aliases: dict[Any, str] = {}
+    for index, (table_id, table) in enumerate(
+        sorted(tables_by_id.items(), key=lambda item: str(item[0]))
+    ):
+        if str(table_id) == str(base_table.id):
+            aliases[table_id] = (
+                source_alias
+                or getattr(table, "alias", None)
+                or getattr(bound_query.model, "slug", None)
+                or "base"
+            )
+        else:
+            aliases[table_id] = getattr(table, "alias", None) or f"t_{index}"
+
+    from_clause = _build_joined_from_clause(
+        base_table_id=base_table.id,
+        required_table_ids=required_table_ids,
+        joins=joins,
+        tables_by_id=tables_by_id,
+        columns_by_id=columns_by_id,
+        alias_by_table_id=aliases,
+        connector=connector,
+    )
+    if from_clause is None:
+        return None
+    return from_clause, aliases[base_table.id]
+
+
 async def _substitute_table_names(
     bound_query: BoundQuery,
     db: Any,
     connector: str = "postgresql",
+    *,
+    include_population: bool = False,
 ) -> str | None:
     """Replace semantic table names with physical table names in raw SQL.
     Used for SELECT * queries where we keep the star but fix the FROM clause.
@@ -958,6 +1044,71 @@ async def _substitute_table_names(
 
     try:
         tree = sqlglot.parse_one(raw, read=_input_dialect)
+
+        if include_population:
+            from_node = tree.args.get("from_")
+            source_node = from_node.this if from_node is not None else None
+            if isinstance(source_node, exp.Table) and source_node.name.lower() in _match_lower:
+                source_qualifiers = {source_node.name.lower()}
+                source_alias = source_node.args.get("alias")
+                source_alias = source_alias.name if source_alias is not None else None
+                if source_alias:
+                    source_qualifiers.add(source_alias.lower())
+                population_result = await _population_star_from_clause(
+                    bound_query,
+                    db,
+                    connector,
+                    source_alias=source_alias,
+                )
+                if population_result is None:
+                    raise SemanticBindingError(
+                        "Cannot rewrite SELECT *: deployed population graph is unavailable."
+                    )
+                population_from_clause, population_base_alias = population_result
+                fragment = sqlglot.parse_one(
+                    f"SELECT * FROM {population_from_clause}",
+                    read=_sub_dialect,
+                )
+                from_node.set("this", fragment.args["from_"].this)
+                tree.set(
+                    "joins",
+                    list(fragment.args.get("joins") or [])
+                    + list(tree.args.get("joins") or []),
+                )
+                if population_base_alias and isinstance(tree, exp.Select):
+                    def _retarget_population_star(expression):
+                        if isinstance(expression, exp.Star):
+                            return exp.Column(
+                                this=expression,
+                                table=exp.to_identifier(
+                                    population_base_alias,
+                                    quoted=True,
+                                ),
+                            )
+                        if (
+                            isinstance(expression, exp.Column)
+                            and isinstance(expression.this, exp.Star)
+                            and not expression.args.get("db")
+                            and not expression.args.get("catalog")
+                            and expression.table
+                            and expression.table.lower() in source_qualifiers
+                        ):
+                            retargeted = expression.copy()
+                            retargeted.set(
+                                "table",
+                                exp.to_identifier(
+                                    population_base_alias,
+                                    quoted=True,
+                                ),
+                            )
+                            return retargeted
+                        return expression
+
+                    tree.set(
+                        "expressions",
+                        [_retarget_population_star(expression) for expression in tree.expressions],
+                    )
+                _sub_fired = True
         tree = tree.transform(_replace_table)
         if not _sub_fired:
             return None  # No table matched: byte-identical-when-off.
@@ -1035,6 +1186,72 @@ async def _build_no_columns_sql(
         if base_table is not None and not isinstance(getattr(base_table, "physical_name", None), str):
             base_table = None
         if base_table:
+            async def _population_from_clause() -> str:
+                """Resolve the COUNT/constant source FROM through G3 closure."""
+                tables_by_id, joins, columns_by_id, _uda_by_id = await _load_model_graph(
+                    bound_query, db, set()
+                )
+                graph_base = next(
+                    (
+                        table
+                        for table_id, table in tables_by_id.items()
+                        if str(table_id) == str(getattr(base_table, "id", ""))
+                    ),
+                    None,
+                )
+                if graph_base is None:
+                    graph_base = next(
+                        (
+                            table
+                            for table in tables_by_id.values()
+                            if str(getattr(table, "physical_name", ""))
+                            == str(getattr(base_table, "physical_name", ""))
+                        ),
+                        None,
+                    )
+                if graph_base is None:
+                    raise SemanticBindingError(
+                        "Cannot rewrite no-column source SQL: base table is "
+                        "absent from the deployed graph."
+                    )
+                required = augment_required_table_ids(
+                    {graph_base.id}, joins, table_ids=tables_by_id,
+                )
+                if required is None:
+                    raise SemanticBindingError(
+                        "Cannot rewrite no-column source SQL: malformed "
+                        "population-defining join graph."
+                    )
+                # Keep the established single-table rendering byte-for-byte
+                # stable when no deployed population-defining edge is needed.
+                # The joined form below is required only when the G3 closure
+                # actually expands beyond the base table; it supplies aliases
+                # so ON predicates remain qualified and deterministic.
+                if required == {graph_base.id}:
+                    return _qtbl(base_table.physical_name)
+                aliases = {
+                    table_id: getattr(table, "alias", None) or f"t_{index}"
+                    for index, (table_id, table) in enumerate(
+                        sorted(tables_by_id.items(), key=lambda item: str(item[0]))
+                    )
+                }
+                aliases.setdefault(graph_base.id, getattr(graph_base, "alias", None) or "base")
+                from_clause = _build_joined_from_clause(
+                    base_table_id=graph_base.id,
+                    required_table_ids=required,
+                    joins=joins,
+                    tables_by_id=tables_by_id,
+                    columns_by_id=columns_by_id,
+                    alias_by_table_id=aliases,
+                    connector="postgresql",
+                )
+                if not from_clause:
+                    raise SemanticBindingError(
+                        "Cannot rewrite no-column source SQL: population "
+                        "defining joins are not reachable from the base table."
+                    )
+                return from_clause
+
             has_row_count = any(m.name == "__row_count" for m in bound_query.resolved_measures)
             if has_row_count:
                 # Preserve the user's original alias (e.g. COUNT(*) AS cnt);
@@ -1047,13 +1264,42 @@ async def _build_no_columns_sql(
                     if _e.classification == "literal" and _e.agg_function == "count" and _e.alias:
                         _rc_alias = _e.alias
                         break
-                table_ref = _qtbl(base_table.physical_name)
-                count_sql = f"SELECT COUNT(*) AS {_qid(_rc_alias)} FROM {table_ref}"
+                from_clause = await _population_from_clause()
+                count_sql = f"SELECT COUNT(*) AS {_qid(_rc_alias)} FROM {from_clause}"
                 if bound_query.logical_query.limit is not None:
                     count_sql += f" LIMIT {bound_query.logical_query.limit}"
                 if bound_query.logical_query.offset is not None:
                     count_sql += f" OFFSET {bound_query.logical_query.offset}"
                 return _final_transpile(count_sql)
+
+            # Constant/no-column queries still have a model row population.
+            # Use the same mandatory-edge closure as COUNT(*) instead of
+            # substituting only the fact table.
+            if not from_tables:
+                return _final_transpile(bound_query.logical_query.raw_query)
+            if not getattr(bound_query.logical_query, "raw_query", None):
+                return _final_transpile(bound_query.logical_query.raw_query)
+            try:
+                _constant_from = await _population_from_clause()
+                _constant_tree = sqlglot.parse_one(
+                    bound_query.logical_query.raw_query,
+                    read=getattr(bound_query.logical_query, "input_dialect", "postgres"),
+                )
+                # Parse the generated FROM once so sqlglot owns the JOIN AST;
+                # attaching a fabricated Identifier would quote the whole
+                # clause as one table name.  Complex original forms retain
+                # their existing substitution path below.
+                if isinstance(_constant_tree, exp.Select) and not _constant_tree.args.get("joins"):
+                    _replacement = sqlglot.parse_one(
+                        f"SELECT TRUE FROM {_constant_from}", read="postgres",
+                    )
+                    _constant_tree.set("from_", _replacement.args.get("from_"))
+                    _constant_tree.set("joins", _replacement.args.get("joins"))
+                    return _final_transpile(_constant_tree.sql(dialect="postgres"))
+            except (SemanticBindingError, DeployedSnapshotUnavailableError):
+                raise
+            except Exception:
+                pass
 
             # General case: replace the FROM table name in the raw SQL
             # with the physical table reference.
@@ -2908,6 +3154,7 @@ async def _build_source_sql(
         calc_ref_measures_by_name,
         _sa_finest_time_col_id,
         _sa_has_time_in_grain,
+        joins=joins,
     )
 
     alias_by_table_id = {

@@ -16,6 +16,7 @@ backwards compatibility with existing model-service imports.
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import func, select
@@ -118,6 +119,7 @@ class CurrentEmbedUser(CurrentUser):
         tenant_id: str,
         email: str,
         persona_id: str | None = None,
+        project_persona_id: str | None = None,
         project_ids: list[str] | None = None,
         model_ids: list[str] | None = None,
         capabilities: list[str] | None = None,
@@ -137,6 +139,10 @@ class CurrentEmbedUser(CurrentUser):
             roles=[rls_role] if rls_role else [],
         )
         self.persona_id = persona_id
+        # ``persona_id`` is the model-service/query-router Persona claim.
+        # Agent-service ProjectPersona rows live in a separate namespace and
+        # must never be inferred from or aliased to that claim.
+        self.project_persona_id = project_persona_id
         self.project_ids = project_ids
         self.model_ids = model_ids
         # F-021-08: omit/None means deny-all, not the historical all-capabilities
@@ -182,6 +188,9 @@ def _build_user_from_payload(payload: dict) -> CurrentUser:
         project_ids = [str(p).lower() for p in raw_projects] if isinstance(raw_projects, list) else None
         raw_models = payload.get("model_ids")
         model_ids = [str(m).lower() for m in raw_models] if isinstance(raw_models, list) else None
+        raw_project_persona = payload.get("project_persona_id")
+        if raw_project_persona is not None and not isinstance(raw_project_persona, str):
+            raise ValueError("project_persona_id must be a string")
         # Bug-7995 / F-024-01: read the admin-authored row-security subject from
         # the signed embed token. Same claim names as an interactive token so the
         # principal adapter builds an embed principal identically. A missing/blank
@@ -198,6 +207,7 @@ def _build_user_from_payload(payload: dict) -> CurrentUser:
             tenant_id=tenant_id,
             email=sub,
             persona_id=payload.get("persona_id"),
+            project_persona_id=raw_project_persona,
             project_ids=project_ids,
             model_ids=model_ids,
             capabilities=caps,
@@ -353,16 +363,31 @@ SYSTEM_ADMIN_TOKEN_VERSION_KEY = "system_admin.token_version"
 
 
 async def get_system_admin_token_version() -> int:
-    """Durable system-admin JWT version stored in tess_system.system_settings."""
+    """Durable system-admin JWT version stored in tess_system.system_settings.
+
+    Bug-9552: ``system_settings`` is migration 0016, so a fresh system (or
+    one whose schema is behind it) cannot read it during bootstrap login.
+    Missing-table errors fall back to the default version 0; any other
+    error still raises.
+    """
+    from sqlalchemy.exc import ProgrammingError
+
     from shared.db.models import SystemSetting
+    from shared.db.pre_migration import is_missing_table_error
     from shared.db.session import get_system_db
 
     async for db in get_system_db():
-        result = await db.execute(
-            select(SystemSetting.value_json).where(
-                SystemSetting.key == SYSTEM_ADMIN_TOKEN_VERSION_KEY
+        try:
+            result = await db.execute(
+                select(SystemSetting.value_json).where(
+                    SystemSetting.key == SYSTEM_ADMIN_TOKEN_VERSION_KEY
+                )
             )
-        )
+        except ProgrammingError as exc:
+            if is_missing_table_error(exc):
+                await db.rollback()
+                return 0  # pre-migration: no persisted version exists yet
+            raise
         raw = result.scalar_one_or_none()
         if raw is None:
             return 0
@@ -576,6 +601,45 @@ def require_capability_or_service_scope(capability: str, scope: str):
         return current_user
 
     _check.__wrapped_capability__ = capability
+    return _check
+
+
+def require_capability_or_service_scopes(
+    capability: str, scopes: Collection[str],
+):
+    """Allow a capability check or a typed service token with any *scopes*.
+
+    This is intentionally separate from
+    :func:`require_capability_or_service_scope`: existing routes retain their
+    one-scope contract, while a boundary that deliberately admits more than
+    one typed internal caller can state that allowlist explicitly. The service
+    principal must still carry one of the listed scopes; human and embed
+    behaviour is identical to the singular dependency.
+    """
+    allowed_scopes = frozenset(scopes)
+    if not allowed_scopes:
+        raise ValueError("at least one service scope is required")
+
+    async def _check(
+        current_user: CurrentUser = Depends(get_current_user),
+    ) -> CurrentUser:
+        if isinstance(current_user, CurrentServiceUser):
+            if allowed_scopes.intersection(current_user.service_scopes):
+                return current_user
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Service token scope required",
+            )
+        if isinstance(current_user, CurrentEmbedUser):
+            if capability not in current_user.capabilities:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Embed token does not grant '{capability}' capability",
+                )
+        return current_user
+
+    _check.__wrapped_capability__ = capability
+    _check.__wrapped_service_scopes__ = allowed_scopes
     return _check
 
 

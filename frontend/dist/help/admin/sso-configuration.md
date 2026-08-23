@@ -37,6 +37,8 @@ Download this XML and upload it to your IdP (Auth0, Google Workspace, Okta, AD F
 
 In the tenant settings, provide:
 
+You can also set these from **Workspace Settings → project configuration drawer → Identity provider** without restarting the service. Process environment variables remain the deployment default; the workspace overlay is used for that tenant's login flow.
+
 | Setting | Purpose |
 |---|---|
 | `SAML_IDP_METADATA_URL` | URL to the IdP's SAML metadata. Tessallite fetches and parses it automatically at login time. Use this OR the XML field below — not both. The URL must be a public `https://` address the Tessallite host can reach; internal, loopback, and cloud-metadata addresses are refused for security. If the metadata cannot be fetched or parsed, SAML login fails cleanly (it never falls back to a half-configured state) and the reason is written to the service logs. |

@@ -1173,11 +1173,131 @@ async def test_delete_aggregate(client):
     mock_db = make_mock_db()
     mock_db.get = AsyncMock(side_effect=lambda cls, id_: model if id_ == TEST_MODEL_ID else agg)
 
-    with patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)):
+    with (
+        patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "shared.physical_cleanup.schedule_model_physical_cleanup",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "shared.physical_cleanup.attempt_scheduled_physical_cleanup",
+            new=AsyncMock(return_value=0),
+        ),
+    ):
         resp = await client.delete(f"{PREFIX}/{TEST_AGG_ID}")
 
     assert resp.status_code == 204
     mock_db.delete.assert_called_once_with(agg)
+
+
+@pytest.mark.asyncio
+async def test_bug_9051_delete_schedules_the_physical_table_drop(client):
+    """Bug-9051: deleting an aggregate definition must not orphan its table.
+
+    The definition row is the ONLY record of the materialised table's name,
+    target and schema, and the retirement sweep enumerates RETIRED definitions
+    only — so a plain delete leaked the storage permanently with nothing left to
+    find it.
+
+    Asserts the whole ordering, not just that a drop happens: the cleanup
+    identity is persisted INSIDE the delete transaction (before the commit that
+    removes the owning row), and the physical DROP is attempted only AFTER that
+    commit — the Bug-8126/Bug-9148 stop-routing-before-removal order that every
+    other drop site on this codebase already follows.
+    """
+    model = make_model()
+    agg = make_aggregate()
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(
+        side_effect=lambda cls, id_: model if id_ == TEST_MODEL_ID else agg
+    )
+
+    order: list[str] = []
+    scheduled: dict = {}
+
+    async def _schedule(db, *, model_id, aggregate_definitions, pocket_definitions,
+                        requested_by, **_kw):
+        order.append("schedule")
+        scheduled["aggregates"] = list(aggregate_definitions)
+        scheduled["model_id"] = model_id
+        scheduled["requested_by"] = requested_by
+        return [uuid.uuid4()]
+
+    async def _delete(obj):
+        order.append("delete")
+
+    async def _commit():
+        order.append("commit")
+
+    async def _drain(_db):
+        order.append("drain")
+        return 1
+
+    mock_db.delete = AsyncMock(side_effect=_delete)
+    mock_db.commit = AsyncMock(side_effect=_commit)
+
+    with (
+        patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "shared.physical_cleanup.schedule_model_physical_cleanup",
+            new=AsyncMock(side_effect=_schedule),
+        ),
+        patch(
+            "shared.physical_cleanup.attempt_scheduled_physical_cleanup",
+            new=AsyncMock(side_effect=_drain),
+        ),
+    ):
+        resp = await client.delete(f"{PREFIX}/{TEST_AGG_ID}")
+
+    assert resp.status_code == 204
+    assert scheduled["aggregates"] == [agg], (
+        "the deleted aggregate itself must be the cleanup subject"
+    )
+    assert scheduled["model_id"] == TEST_MODEL_ID
+    assert scheduled["requested_by"] == "aggregate_delete"
+    assert order == ["schedule", "delete", "commit", "drain"], (
+        "Bug-9051: the drop identity must be durable before the row is removed, "
+        f"and the DROP must follow the metadata commit; got {order}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bug_9051_delete_refuses_when_the_table_cannot_be_resolved(client):
+    """Fail closed rather than leak.
+
+    If the physical table's target identity cannot be resolved (missing target,
+    cross-project connection), committing the delete would discard the only
+    retry ownership record — the exact Bug-8140 failure mode. The delete is
+    refused with a 409 that says what to repair, and the definition survives.
+    """
+    from shared.physical_cleanup import PhysicalCleanupIdentityError
+
+    model = make_model()
+    agg = make_aggregate()
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(
+        side_effect=lambda cls, id_: model if id_ == TEST_MODEL_ID else agg
+    )
+
+    with (
+        patch("src.api.aggregates.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "shared.physical_cleanup.schedule_model_physical_cleanup",
+            new=AsyncMock(
+                side_effect=PhysicalCleanupIdentityError("no safe target identity")
+            ),
+        ),
+        patch(
+            "shared.physical_cleanup.attempt_scheduled_physical_cleanup",
+            new=AsyncMock(return_value=0),
+        ),
+    ):
+        resp = await client.delete(f"{PREFIX}/{TEST_AGG_ID}")
+
+    assert resp.status_code == 409
+    mock_db.delete.assert_not_called()
+    mock_db.commit.assert_not_awaited()
+    mock_db.rollback.assert_awaited()
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,8 @@ implementation details.
 """
 from __future__ import annotations
 
+import struct
+
 import pytest
 
 from src.jdbc import protocol as proto
@@ -41,13 +43,24 @@ class TestBug6647TypeOids:
         assert _map_type_oid("timetz") == proto.OID_TIMETZ
         assert _map_type_oid("time with time zone") == proto.OID_TIMETZ
 
-    def test_time_oids_are_text_encoded_on_wire(self):
-        # The gateway text-encodes these; row_description must advertise text
-        # format even when the client requests binary (Bug-3655 lockstep).
-        assert proto.OID_TIME in proto._TEXT_ONLY_BINARY_OIDS
-        assert proto.OID_TIMETZ in proto._TEXT_ONLY_BINARY_OIDS
-        assert proto._effective_result_format(1, proto.OID_TIME) == 0
-        assert proto._effective_result_format(1, proto.OID_TIMETZ) == 0
+    def test_time_oids_are_binary_encodable_on_wire(self):
+        # Bug-9433 lane: the gateway now implements PG binary encoders for the
+        # temporal types, so a requested binary format is HONOURED. Previously
+        # these OIDs sat on a deny-list and were downgraded to text — which a
+        # prepared-statement client (which fixes its formats from the STATEMENT
+        # description and never re-reads the RowDescription) then decoded as
+        # binary, corrupting the value.
+        assert proto.OID_TIME in proto._BINARY_ENCODABLE_OIDS
+        assert proto.OID_TIMETZ in proto._BINARY_ENCODABLE_OIDS
+        assert proto._effective_result_format(1, proto.OID_TIME) == 1
+        assert proto._effective_result_format(1, proto.OID_TIMETZ) == 1
+        # And the payload really is the PG binary form, not the text bytes.
+        assert proto._encode_binary_value("13:45:06.123456", proto.OID_TIME) == (
+            struct.pack("!q", ((13 * 3600 + 45 * 60 + 6) * 1_000_000) + 123456)
+        )
+        assert proto._encode_binary_value("13:45:06+02:00", proto.OID_TIMETZ) == (
+            struct.pack("!qi", (13 * 3600 + 45 * 60 + 6) * 1_000_000, -7200)
+        )
 
     def test_catalogue_information_schema_type_names_align(self):
         # information_schema.columns pg_type name must resolve for the new types.

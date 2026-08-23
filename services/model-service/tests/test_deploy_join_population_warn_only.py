@@ -1,11 +1,8 @@
-"""Deploy-route contract for join population governance (Bug-8615 phase G1).
+"""Deploy-route contract for join population governance (Bug-8615 G5).
 
-The single property this phase must not get wrong is that classification is
-WARN-ONLY: ``BLOCKED`` is computed and surfaced, and the deploy still succeeds.
-Proving that in the classifier module is not enough — it has to hold at the
-real ``POST .../deploy`` route, because that is where a future phase G5 will
-turn it into a refusal and where a reviewer would look for an accidental
-raise.
+The route must refuse only measured, policy-relevant ``BLOCKED`` rows, before
+the deploy pointer or any publish side effect changes.  The allow matrix keeps
+the explicit non-blocking cases executable at the real route boundary.
 
 Also pins the wiring itself (the classifier is actually invoked with the NEW
 deploy epoch) and the fail-open backstop (a validator that raises does not fail
@@ -70,35 +67,76 @@ def _deploy_fixture():
 
 
 @pytest.mark.asyncio
-async def test_a_blocked_model_still_deploys_and_reports_the_finding(client):
-    """WARN-ONLY. A BLOCKED rollup rides along on a 200 response; it is a
-    finding for the modeller to act on, never a refusal. Turning this into an
-    actual block is governance plan phase G5."""
-    db, _model, version_id = _deploy_fixture()
-
-    async def _blocked(_db, _model_id):
-        return {
-            "status": "BLOCKED", "evaluated": True, "join_count": 3,
-            "evaluated_count": 3, "warning_count": 1, "blocked_count": 2,
-            "warn_only": True,
-        }
+async def test_a_measured_blocker_refuses_before_pointer_or_commit(client):
+    """G5: a measured undeclared blocker returns actionable 409 before commit."""
+    db, model, version_id = _deploy_fixture()
+    join_id = uuid.uuid4()
+    blocked = types.SimpleNamespace(
+        join_id=join_id,
+        population_participation="undeclared",
+        status="BLOCKED",
+        measured=True,
+        row_effect_ratio=0.2,
+        reason="measured",
+    )
 
     with patch("src.api.versions.get_tenant_db", async_gen_from(db)), \
             patch(
-                "src.api.join_population_health.summarise_join_population",
-                _blocked,
+                "src.api.versions._validate_join_population_on_deploy",
+                AsyncMock(return_value=[blocked]),
+            ):
+        response = await client.post(
+            f"{PREFIX}/deploy", json={"version_id": str(version_id)},
+        )
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "JOIN_POPULATION_BLOCKED"
+    assert detail["joins"] == [{
+        "join_id": str(join_id),
+        "population_participation": "undeclared",
+        "status": "BLOCKED",
+        "row_effect_ratio": 0.2,
+        "reason": "measured",
+    }]
+    assert "Declare" in detail["message"]
+    assert model.deployed_version_id is None
+    assert model.deploy_epoch == 5
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "participation,status,measured,effect",
+    [
+        ("preserve_base_rows", "BLOCKED", True, 0.9),
+        ("undeclared", "WARNING", True, 0.01),
+        ("undeclared", "BLOCKED", False, 0.9),
+        ("undeclared", "WARNING", False, None),
+    ],
+)
+async def test_non_blocking_join_population_cases_proceed(
+    client, participation, status, measured, effect,
+):
+    """G5 allow matrix: preserved, below-threshold and unmeasured never block."""
+    db, _model, version_id = _deploy_fixture()
+    row = types.SimpleNamespace(
+        join_id=uuid.uuid4(), population_participation=participation,
+        status=status, measured=measured, row_effect_ratio=effect,
+        reason="measured" if measured else "not_measured",
+    )
+    with patch("src.api.versions.get_tenant_db", async_gen_from(db)), \
+            patch(
+                "src.api.versions._validate_join_population_on_deploy",
+                AsyncMock(return_value=[row]),
             ):
         response = await client.post(
             f"{PREFIX}/deploy", json={"version_id": str(version_id)},
         )
 
     assert response.status_code == 200, response.text
-    payload = response.json()
-    assert payload["status"] == "ok"
-    assert payload["deployed_version_id"] == str(version_id)
-    assert payload["join_population"]["status"] == "BLOCKED"
-    assert payload["join_population"]["blocked_count"] == 2
-    assert payload["join_population"]["warn_only"] is True
+    assert response.json()["status"] == "ok"
+    db.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio

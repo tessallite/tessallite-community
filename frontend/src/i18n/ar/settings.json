@@ -113,7 +113,7 @@
   "connections.deleteConfirmLabel": "حذف الاتصال",
   "connections.deleteConnection": "حذف",
   "connections.deleteFailed": "تعذر حذف الاتصال.",
-  "connections.deleteMessage": "حذف الاتصال <strong>{{name}}</strong>؟ ستصبح المصادر والأهداف المرتبطة به غير قابلة للاستخدام حتى يُعاد ربطها.",
+  "connections.deleteMessage": "حذف الاتصال {{name}}؟ ستصبح المصادر والأهداف المرتبطة به غير قابلة للاستخدام حتى يُعاد ربطها.",
   "connections.deleteTitle": "حذف الاتصال؟",
   "connections.deleteTooltip": "حذف الاتصال",
   "connections.displayName": "الاسم المعروض *",

@@ -33,6 +33,7 @@ from shared.model_snapshot.slug_utils import (
     slugify as _shared_slugify,
 )
 from src.licensing_guard import enforce_demo_source_locked, enforce_import_model_cap
+from shared.model_defaults import DEFAULT_INCLUDE_ALL_MEASURES
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -411,7 +412,7 @@ def _catalog_to_bundle(
             "refresh_strategy": "manual",
             "max_aggregates": 20,
             "aggregations_enabled": True,
-            "include_all_measures": True,
+            "include_all_measures": DEFAULT_INCLUDE_ALL_MEASURES,
         },
         "tables": bundle_tables,
         "columns": bundle_columns,

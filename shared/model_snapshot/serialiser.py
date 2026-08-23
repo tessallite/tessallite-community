@@ -67,7 +67,12 @@ from shared.db.models import (
     UserDefinedAttributeColumnRef,
     data_tag_columns,
 )
+from shared.named_query.star_expansion import (
+    exposed_star_fields_by_kind,
+    is_expandable_star_definition,
+)
 from shared.semantic.graph_order import MODEL_JOIN_ORDER, MODEL_TABLE_ORDER
+from shared.type_family import BOOLEAN, DATETIME, NUMERIC, type_family
 
 
 # v3 (F-013-06): adds the six previously-missing model-scoped configuration
@@ -91,7 +96,10 @@ from shared.semantic.graph_order import MODEL_JOIN_ORDER, MODEL_TABLE_ORDER
 # historical behaviour. The deploy-time CLASSIFICATION evidence
 # (``join_population_checks``) is live operational state and deliberately does
 # NOT travel; it is re-established by the next deploy.
-SNAPSHOT_SCHEMA_VERSION = 5
+# v6 (G4): adds ``joins[].population_participation_source`` so an explicit
+# modeller override cannot be mistaken for the compatibility default during a
+# later source introspection pass. Missing v5 values are default-owned.
+SNAPSHOT_SCHEMA_VERSION = 6
 
 
 def _j(value: Any) -> Any:
@@ -140,6 +148,56 @@ def _row_to_dict(row: Any, *, exclude: tuple[str, ...] = ()) -> dict[str, Any]:
 row_to_snapshot_dict = _row_to_dict
 
 
+def _deployed_named_query_output_columns(
+    named_query: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Return the catalogue schema pinned into a deployed Named Query row.
+
+    Authoring cannot derive the width of ``SELECT *`` and stores a single
+    ``*`` placeholder. Deployment has the complete snapshot, so Bug-9180
+    expands that placeholder from the exact field enumeration used by the
+    refresh/live population compiler. Explicit projections retain their
+    authoring-time metadata.
+    """
+    current = named_query.get("output_columns")
+    if not is_expandable_star_definition(
+        str(named_query.get("definition_sql") or "")
+    ):
+        return current if isinstance(current, list) else []
+
+    snapshot_columns = {
+        str(row["id"]): row
+        for row in snapshot.get("columns") or []
+        if isinstance(row, dict) and row.get("id") is not None
+    }
+    dimensions, measures = exposed_star_fields_by_kind(snapshot)
+    output: list[dict[str, str]] = []
+
+    for dimension in dimensions:
+        source = snapshot_columns.get(str(dimension.get("source_column_id")))
+        data_type = dimension.get("data_type")
+        if not data_type and source is not None:
+            data_type = source.get("data_type")
+        family = type_family(data_type)
+        if family == NUMERIC:
+            output_type = "number"
+        elif family == BOOLEAN:
+            output_type = "boolean"
+        elif family == DATETIME:
+            normalized = str(data_type or "").strip().lower()
+            output_type = "date" if normalized == "date" else "timestamp"
+        else:
+            output_type = "string"
+        output.append({"name": str(dimension["name"]), "type": output_type})
+
+    output.extend(
+        {"name": str(measure["name"]), "type": "number"}
+        for measure in measures
+    )
+    return output
+
+
 def _merge_effective_descriptions(snap: dict[str, Any]) -> None:
     """Merge approved/show glossary definitions into dimension and measure
     snapshot rows as an additive ``effective_description`` field.
@@ -149,14 +207,29 @@ def _merge_effective_descriptions(snap: dict[str, Any]) -> None:
     model-service routes (glossary could change before deploy) and JDBC
     used raw snapshot rows (glossary text never appeared at all).
 
-    The merge mirrors the live ``glossary_text_for_target`` logic in
-    ``model-service/src/api/_scope.py``:
+    This merge and the live ``glossary_text_for_target`` /
+    ``glossary_texts_for_targets`` in ``model-service/src/api/_scope.py`` are
+    TWO implementations of ONE contract, and they must agree rule for rule: the
+    live routes feed the Explorer and the Excel task pane, this merge feeds the
+    deployed JDBC/XMLA catalogue, and a user comparing the two sees the same
+    object described twice. A change to either side is a change to both (the
+    parity guard is
+    ``model-service/tests/test_effective_description_glossary_live_route_parity.py``).
+    The shared rules are:
       - Only entries with ``status == "approved"`` and ``superseded_by``
         absent (None / null) qualify.
       - Only entries with ``visibility == "show"`` (or legacy NULL) qualify
         (Bug-5926).
       - For each qualifying entry, its attachments link it to dimensions or
         measures via ``target_type`` / ``target_id``.
+      - Bug-9392: an attachment may also target a physical ``column``
+        (``target_type == "column"``, ``target_id`` a ``model_columns.id``).
+        A dimension/measure that has no direct attachment falls back to a
+        term attached to its underlying ``source_column_id``, so column-level
+        glossary entries (a large share of bootstrap-proposed terms) still
+        reach the JDBC/XMLA catalogue comment instead of being dropped. A
+        direct dimension/measure attachment always wins over the column
+        fallback.
       - When multiple qualifying entries attach to the same target, the
         one with the highest ``version`` wins.
       - The glossary ``definition`` text becomes ``effective_description``
@@ -189,17 +262,27 @@ def _merge_effective_descriptions(snap: dict[str, Any]) -> None:
             if prev is None or version > prev[0]:
                 best[key] = (version, definition)
 
-    # Merge into dimensions.
+    # Merge into dimensions. A term attached directly to the dimension wins;
+    # Bug-9392: when none exists, fall back to a term attached to the
+    # dimension's underlying source column (``target_type == "column"``).
     for dim in snap.get("dimensions") or []:
         dim_id = str(dim.get("id") or "")
         entry = best.get(("dimension", dim_id))
+        if entry is None:
+            col_id = str(dim.get("source_column_id") or "")
+            if col_id:
+                entry = best.get(("column", col_id))
         glossary_text = entry[1] if entry else None
         dim["effective_description"] = glossary_text or dim.get("description") or ""
 
-    # Merge into measures.
+    # Merge into measures (same direct-then-source-column precedence, Bug-9392).
     for meas in snap.get("measures") or []:
         meas_id = str(meas.get("id") or "")
         entry = best.get(("measure", meas_id))
+        if entry is None:
+            col_id = str(meas.get("source_column_id") or "")
+            if col_id:
+                entry = best.get(("column", col_id))
         glossary_text = entry[1] if entry else None
         meas["effective_description"] = glossary_text or meas.get("description") or ""
 
@@ -409,6 +492,9 @@ async def snapshot_model(
     nq_dicts: list[dict[str, Any]] = []
     for nq in nq_q.scalars().all():
         nq_dict = _row_to_dict(nq, exclude=("created_at", "updated_at"))
+        nq_dict["output_columns"] = _deployed_named_query_output_columns(
+            nq_dict, snap,
+        )
         art = await tenant_db.execute(
             select(NamedQueryArtifact).where(
                 NamedQueryArtifact.named_query_id == nq.id

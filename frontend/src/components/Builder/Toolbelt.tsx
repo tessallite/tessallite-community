@@ -72,6 +72,43 @@ const BOTTOM_TOOLS: ToolItem[] = [
 
 const STORAGE_KEY = "builder.toolbelt.expanded";
 
+// Bug-9537: the vertical scrollbar must not overlap the icons in the
+// collapsed 48px belt. Hidden by default (zero-width -> no overlay at all),
+// revealed while the mouse hovers over the toolbelt. Only the scrollbar's
+// VISIBILITY is hover-gated; the scroll path itself stays enabled
+// unconditionally (Bug-7407), so wheel/touch scrolling always works and a
+// short viewport can never make tools unreachable.
+export const TOOLBELT_SCROLL_SX = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 0.25,
+  overflowY: "auto",
+  flexGrow: 1,
+  minHeight: 0,
+  pb: 0.5,
+  // Firefox: no scrollbar until hover.
+  scrollbarWidth: "none",
+  scrollbarColor: "transparent transparent",
+  // Chromium/WebKit: zero-width track until hover.
+  "&::-webkit-scrollbar": {
+    width: 0,
+  },
+  "&::-webkit-scrollbar-thumb": {
+    backgroundColor: "rgba(0,0,0,0.18)",
+    borderRadius: 3,
+  },
+  "&:hover": {
+    scrollbarWidth: "thin",
+    scrollbarColor: "rgba(0,0,0,0.3) transparent",
+  },
+  "&:hover::-webkit-scrollbar": {
+    width: 5,
+  },
+  "&:hover::-webkit-scrollbar-thumb": {
+    backgroundColor: "rgba(0,0,0,0.3)",
+  },
+};
+
 export default function Toolbelt() {
   const activePanel       = useBuilderStore((s) => s.activePanel);
   const openPanel         = useBuilderStore((s) => s.openPanel);
@@ -218,36 +255,7 @@ export default function Toolbelt() {
     >
       <Box
         data-testid="toolbelt-scroll"
-        sx={{
-          display: "flex",
-          flexDirection: "column",
-          gap: 0.25,
-          // Bug-7407: the tool list can exceed the viewport height in either
-          // collapsed or expanded state, so the scroll path must stay enabled
-          // unconditionally (never gated on `expanded`). A persistently thin
-          // scrollbar keeps the "more tools below" affordance discoverable
-          // instead of hiding it until hover, which made lower tools look
-          // clipped and unreachable on short viewports.
-          overflowY: "auto",
-          flexGrow: 1,
-          minHeight: 0,
-          pb: 0.5,
-          scrollbarWidth: "thin",
-          scrollbarColor: "rgba(0,0,0,0.18) transparent",
-          "&::-webkit-scrollbar": {
-            width: 5,
-          },
-          "&::-webkit-scrollbar-thumb": {
-            backgroundColor: "rgba(0,0,0,0.18)",
-            borderRadius: 3,
-          },
-          "&:hover": {
-            scrollbarColor: "rgba(0,0,0,0.3) transparent",
-          },
-          "&:hover::-webkit-scrollbar-thumb": {
-            backgroundColor: "rgba(0,0,0,0.3)",
-          },
-        }}
+        sx={TOOLBELT_SCROLL_SX}
       >
         {TOOLS.map(renderTool)}
         <Box sx={{ flexGrow: 1 }} />

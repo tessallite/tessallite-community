@@ -15,13 +15,28 @@ import yaml
 from shared.schemas.domains.aggregates_security import (
     DEFAULT_POPULATION_PARTICIPATION,
     coerce_population_participation,
+    coerce_population_participation_source,
+    POPULATION_PARTICIPATION_SOURCE_DEFAULT,
     persona_filter_value_is_valid,
 )
+from shared.schemas.domains.dimensions_measures import CALCULATED_AGG_MODES
 from shared.security.persona_resolver import (
     PersonaAudienceNarrowingError,
     reject_empty_audience_narrowing,
 )
 from shared.semantic.join_keyword import normalise_cardinality, split_join_token
+from shared.model_defaults import DEFAULT_INCLUDE_ALL_MEASURES
+
+# Bug-9390: the historical default aggregation mode for a calculated measure whose
+# YAML omits ``calc_mode``. It MUST match what the compiler assumes when the
+# ``measures.calc_agg_mode`` column is NULL
+# (``shared/semantic/calculated_columns.py`` — ``... or "expression_as_written"``)
+# and what the format specification documents
+# (``docs/architecture/architecture_yaml-model-format.md``). The two modes compute
+# DIFFERENT numbers, so this default is applied only with a surfaced warning
+# (never silently), and a present-but-unrecognised value is rejected rather than
+# guessed. See the calculated-measure block in ``parse_model_yaml``.
+_DEFAULT_CALC_AGG_MODE = "expression_as_written"
 
 _JOIN_TYPE_MAP = {
     "many-to-one": "many_to_one",
@@ -314,6 +329,13 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
                 if j.get("population_participation") is not None
                 else DEFAULT_POPULATION_PARTICIPATION
             ),
+            "population_participation_source": (
+                coerce_population_participation_source(
+                    j["population_participation_source"]
+                )
+                if j.get("population_participation_source") is not None
+                else POPULATION_PARTICIPATION_SOURCE_DEFAULT
+            ),
         })
 
     dims_out = []
@@ -392,11 +414,58 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
         if row["is_additive"] is None:
             del row["is_additive"]
         if measure_type == "calculated":
-            # Bug-6294: REQUIRED by the create API and it changes the number.
-            # Default to the historical implicit behaviour for files that
-            # predate the field, matching what the compiler assumes when the
-            # column is null.
-            row["calc_agg_mode"] = m.get("calc_mode") or "expression_as_written"
+            # Bug-6294 + Bug-9390: ``calc_agg_mode`` is REQUIRED by the create API
+            # and it CHANGES THE NUMBER — ``expression_as_written`` combines
+            # pre-aggregated measures (a ratio of sums), ``per_row_then_aggregate``
+            # evaluates at fact grain and then aggregates (a sum of ratios). The
+            # historical default for a file that omits the field is
+            # ``expression_as_written`` (``_DEFAULT_CALC_AGG_MODE``), matching the
+            # compiler's NULL-column behaviour and the documented format contract,
+            # so an older or hand-written file still imports.
+            #
+            # Bug-9390: what was wrong was doing this SILENTLY. A measure a
+            # modeller authored as ``per_row_then_aggregate`` whose YAML dropped
+            # the field would flip to ``expression_as_written`` with no signal —
+            # different numbers, invisibly. Absence now emits a loud, surfaced
+            # warning so the result-affecting assumption is visible and
+            # correctable. A present-but-unrecognised value has no safe coercion
+            # (guessing either mode changes the number), so it is REJECTED
+            # fail-closed — matching ``MeasureCreate``'s validator — rather than
+            # passed through to a raw ``measures_calc_agg_mode_values`` constraint
+            # violation at insert time.
+            # Bug-9525 / PCR-DR-002: key ABSENCE (legacy inference) is distinct
+            # from a PRESENT empty/null/whitespace/unknown value (reject).
+            # Testing truthiness collapsed ``calc_mode: ""`` into the missing
+            # branch and silently inferred a wrong-numbers default.
+            if "calc_mode" not in m:
+                row["calc_agg_mode"] = _DEFAULT_CALC_AGG_MODE
+                warnings.append(
+                    f"Calculated measure '{m.get('name', '')}' has no calc_mode; "
+                    f"assumed '{_DEFAULT_CALC_AGG_MODE}' (the historical default). "
+                    "The two modes compute DIFFERENT numbers: "
+                    "'expression_as_written' combines already-aggregated measures "
+                    "(a ratio of sums), 'per_row_then_aggregate' evaluates the "
+                    "expression at fact-row grain and then aggregates (a sum of "
+                    "ratios). Set calc_mode explicitly if this measure should "
+                    "aggregate per row."
+                )
+            else:
+                raw_calc_mode = m.get("calc_mode")
+                if (
+                    isinstance(raw_calc_mode, str)
+                    and raw_calc_mode in CALCULATED_AGG_MODES
+                ):
+                    row["calc_agg_mode"] = raw_calc_mode
+                else:
+                    # Present but empty, whitespace-only, null, unknown string, or
+                    # non-string YAML scalar/collection. Reject cleanly rather than
+                    # inferring a wrong-numbers default or raising a raw TypeError.
+                    errors.append(
+                        f"Calculated measure '{m.get('name', '')}' has an unrecognised "
+                        f"calc_mode '{raw_calc_mode}'; it must be one of "
+                        f"{sorted(CALCULATED_AGG_MODES)}. These compute different "
+                        "numbers, so the importer will not guess which was intended."
+                    )
 
         if m.get("variant"):
             base_name = m.get("variant_of", "")
@@ -643,7 +712,7 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
             "refresh_strategy": model_sec.get("refresh", "manual"),
             "max_aggregates": model_sec.get("max_aggregates", 20),
             "aggregations_enabled": True,
-            "include_all_measures": True,
+            "include_all_measures": DEFAULT_INCLUDE_ALL_MEASURES,
         },
         "tables": tables_out,
         "columns": columns_out,

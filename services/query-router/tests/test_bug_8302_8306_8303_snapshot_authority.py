@@ -610,6 +610,7 @@ async def test_execute_route_resolves_persona_against_simulated_identity():
     import src.api.routes as routes
 
     body = routes.ExecuteRequest(model_id="model-1", raw_query="SELECT 1", protocol="jdbc")
+    request = types.SimpleNamespace(headers={})
     db = AsyncMock()
     captured = {}
 
@@ -628,6 +629,7 @@ async def test_execute_route_resolves_persona_against_simulated_identity():
     ):
         out = await routes.execute_query(
             body,
+            request=request,
             current_user=_admin_user(),
             x_simulate_principal="viewer@x.com",
             x_simulate_roles="viewer",
@@ -649,6 +651,7 @@ async def test_execute_route_resolves_persona_as_admin_without_simulation():
     import src.api.routes as routes
 
     body = routes.ExecuteRequest(model_id="model-1", raw_query="SELECT 1", protocol="jdbc")
+    request = types.SimpleNamespace(headers={})
     db = AsyncMock()
     captured = {}
 
@@ -666,6 +669,7 @@ async def test_execute_route_resolves_persona_as_admin_without_simulation():
     ):
         await routes.execute_query(
             body,
+            request=request,
             current_user=_admin_user(),
             x_simulate_principal=None,
             x_simulate_roles=None,

@@ -266,6 +266,99 @@ async def test_update_model_display_name(client):
 
 
 # ---------------------------------------------------------------------------
+# Bug-9409 — include_all_measures is a recorded aggregate-shape decision
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_include_all_measures_change_is_recorded_with_its_transition(client):
+    """A flag change alters what every future aggregate materialises, so the
+    audit entry must name the transition — not just list the field.
+
+    The lifecycle it triggers is the EXISTING one, on the optimizer's next
+    sweep: ``backfill_include_all_measures`` widens active aggregates on
+    OFF->ON, and new builds narrow to the requested measures on ON->OFF. The
+    PATCH itself is deliberately non-destructive.
+    """
+    model = make_model()
+    model.include_all_measures = False
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(return_value=model)
+    mock_db.refresh = AsyncMock()
+
+    recorded: dict = {}
+
+    async def _audit(_db, **kwargs):
+        recorded.update(kwargs)
+
+    with (
+        patch("src.api.models.get_tenant_db", async_gen_from(mock_db)),
+        patch("src.api.models.audit", new=AsyncMock(side_effect=_audit)),
+    ):
+        resp = await client.patch(
+            f"{PREFIX}/{TEST_MODEL_ID}",
+            json={"include_all_measures": True},
+        )
+
+    assert resp.status_code == 200
+    assert model.include_all_measures is True
+    detail = recorded.get("detail") or {}
+    assert detail.get("include_all_measures") == {
+        "from": False,
+        "to": True,
+        "aggregate_lifecycle": "backfill_widens_active_aggregates_on_next_sweep",
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_include_all_measures_value_records_no_transition(client):
+    """Re-sending the same value is not a change and must not claim one."""
+    model = make_model()
+    model.include_all_measures = True
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(return_value=model)
+    mock_db.refresh = AsyncMock()
+
+    recorded: dict = {}
+
+    async def _audit(_db, **kwargs):
+        recorded.update(kwargs)
+
+    with (
+        patch("src.api.models.get_tenant_db", async_gen_from(mock_db)),
+        patch("src.api.models.audit", new=AsyncMock(side_effect=_audit)),
+    ):
+        resp = await client.patch(
+            f"{PREFIX}/{TEST_MODEL_ID}",
+            json={"include_all_measures": True},
+        )
+
+    assert resp.status_code == 200
+    assert "include_all_measures" not in (recorded.get("detail") or {})
+
+
+@pytest.mark.asyncio
+async def test_a_patch_that_omits_the_flag_never_rewrites_it(client):
+    """The PRESERVATION half of the decision, at the API boundary: an unrelated
+    edit must not carry the new default onto an existing model."""
+    model = make_model()
+    model.include_all_measures = True
+    mock_db = make_mock_db()
+    mock_db.get = AsyncMock(return_value=model)
+    mock_db.refresh = AsyncMock()
+
+    with patch("src.api.models.get_tenant_db", async_gen_from(mock_db)):
+        resp = await client.patch(
+            f"{PREFIX}/{TEST_MODEL_ID}",
+            json={"display_name": "Renamed"},
+        )
+
+    assert resp.status_code == 200
+    assert model.include_all_measures is True, (
+        "an existing model's persisted opt-in must survive an unrelated edit"
+    )
+
+
+# ---------------------------------------------------------------------------
 # DELETE — model
 # ---------------------------------------------------------------------------
 

@@ -21,6 +21,7 @@ const createConversationMock = vi.fn();
 const patchConversationMock = vi.fn();
 const deleteConversationMock = vi.fn();
 const setActiveConversationMock = vi.fn();
+const setPendingPersonaIdMock = vi.fn();
 
 vi.mock("../api/agentApi", () => ({
   agentApi: {
@@ -46,12 +47,21 @@ vi.mock("@tessallite/shared-ui", () => ({
   ChatProvider: ({ children }: { children: React.ReactNode }) => (
     <div data-testid="chat-provider">{children}</div>
   ),
-  ChatCanvas: () => <div data-testid="chat-canvas">ChatCanvas</div>,
+  ChatCanvas: ({ disabled }: { disabled?: boolean }) => (
+    <>
+      <div data-testid="chat-canvas" data-disabled={String(Boolean(disabled))}>
+        ChatCanvas
+      </div>
+      <button type="button" disabled={disabled}>Send message</button>
+    </>
+  ),
   TraceDrawer: () => null,
   useConversationStore: vi.fn((selector: (s: Record<string, unknown>) => unknown) =>
     selector({
       activeConversationId: null,
       setActiveConversation: setActiveConversationMock,
+      pendingPersonaId: null,
+      setPendingPersonaId: setPendingPersonaIdMock,
     }),
   ),
 }));
@@ -233,6 +243,8 @@ describe("AgentChat page", () => {
         selector({
           activeConversationId: null,
           setActiveConversation: setActiveConversationMock,
+          pendingPersonaId: null,
+          setPendingPersonaId: setPendingPersonaIdMock,
         }) as never,
     );
     listTurnsMock.mockResolvedValue([]);
@@ -289,9 +301,11 @@ describe("AgentChat page", () => {
   it("renders ChatCanvas inside ChatProvider when a conversation is active", async () => {
     vi.mocked(useConversationStore).mockImplementation(
       (selector: (s: Record<string, unknown>) => unknown) =>
-        selector({
+      selector({
           activeConversationId: "conv-1",
           setActiveConversation: setActiveConversationMock,
+          pendingPersonaId: null,
+          setPendingPersonaId: setPendingPersonaIdMock,
         }) as never,
     );
 
@@ -338,7 +352,209 @@ describe("AgentChat page", () => {
     await userEvent.click(addButton);
 
     await waitFor(() => {
-      expect(createConversationMock).toHaveBeenCalledWith("proj-1");
+      expect(createConversationMock).toHaveBeenCalledWith("proj-1", {
+        persona_id: null,
+      });
+    });
+  });
+
+  it("L13-9196-SPA: sends the selected ProjectPersona on conversation create", async () => {
+    getConfigMock.mockResolvedValue({ enabled: true });
+    listConversationsMock.mockResolvedValue([]);
+    listPersonasMock.mockResolvedValue([
+      {
+        id: "project-persona-1",
+        project_id: "proj-1",
+        name: "Finance analyst",
+        slug: "finance-analyst",
+        description: null,
+        model_scopes: [],
+      },
+    ]);
+    createConversationMock.mockResolvedValue({
+      id: "conv-project-persona",
+      project_id: "proj-1",
+      title: null,
+      pinned_at: null,
+      started_at: "2026-06-20T00:00:00Z",
+      last_active_at: "2026-06-20T00:00:00Z",
+      deleted_at: null,
+      persona_id: "project-persona-1",
+    });
+
+    renderChat();
+    const picker = await screen.findByRole("combobox", {
+      name: "Project persona",
+    });
+    await userEvent.click(picker);
+    await userEvent.click(await screen.findByRole("option", { name: "Finance analyst" }));
+
+    expect(setPendingPersonaIdMock).toHaveBeenCalledWith("project-persona-1");
+    await userEvent.click(screen.getByRole("button", { name: /new/i }));
+
+    await waitFor(() => {
+      expect(createConversationMock).toHaveBeenCalledWith("proj-1", {
+        persona_id: "project-persona-1",
+      });
+    });
+  });
+
+  it("L13-R1-F5 keeps persisted ProjectPersona authority visible and blocks send while saving", async () => {
+    const storeState = {
+      activeConversationId: "conv-1",
+      setActiveConversation: setActiveConversationMock,
+      pendingPersonaId: null,
+      setPendingPersonaId: setPendingPersonaIdMock,
+    };
+    vi.mocked(useConversationStore).mockImplementation(
+      (selector: (s: Record<string, unknown>) => unknown) =>
+        selector(storeState) as never,
+    );
+    getConfigMock.mockResolvedValue({ enabled: true });
+    const conversation = {
+      id: "conv-1",
+      project_id: "proj-1",
+      title: "Active chat",
+      pinned_at: null,
+      started_at: "2026-05-10T00:00:00Z",
+      last_active_at: "2026-05-10T00:00:00Z",
+      persona_id: null,
+    };
+    listConversationsMock.mockResolvedValue([conversation]);
+    listPersonasMock.mockResolvedValue([
+      {
+        id: "project-persona-1",
+        project_id: "proj-1",
+        name: "Finance analyst",
+        slug: "finance-analyst",
+        description: null,
+        model_scopes: [],
+      },
+    ]);
+    let resolvePatch!: (value: typeof conversation) => void;
+    patchConversationMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolvePatch = resolve;
+      }),
+    );
+
+    renderChat();
+    const picker = await screen.findByRole("combobox", {
+      name: "Project persona",
+    });
+    await userEvent.click(picker);
+    await userEvent.click(await screen.findByRole("option", { name: "Finance analyst" }));
+
+    await waitFor(() => {
+      expect(patchConversationMock).toHaveBeenCalledWith(
+        "proj-1",
+        "conv-1",
+        { persona_id: "project-persona-1" },
+      );
+      expect(screen.getByRole("combobox", { name: "Project persona" })).not.toHaveTextContent(
+        "Finance analyst",
+      );
+      expect(screen.getByTestId("chat-canvas")).toHaveAttribute(
+        "data-disabled",
+        "true",
+      );
+    });
+
+    await act(async () => {
+      resolvePatch({ ...conversation, persona_id: "project-persona-1" });
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: "Project persona" })).toHaveTextContent(
+        "Finance analyst",
+      );
+      expect(screen.getByTestId("chat-canvas")).toHaveAttribute(
+        "data-disabled",
+        "false",
+      );
+    });
+  });
+
+  it("L13 F5 restores the persisted ProjectPersona and reports a failed PATCH", async () => {
+    vi.mocked(useConversationStore).mockImplementation(
+      (selector: (s: Record<string, unknown>) => unknown) =>
+        selector({
+          activeConversationId: "conv-1",
+          setActiveConversation: setActiveConversationMock,
+          pendingPersonaId: null,
+          setPendingPersonaId: setPendingPersonaIdMock,
+        }) as never,
+    );
+    getConfigMock.mockResolvedValue({ enabled: true });
+    listConversationsMock.mockResolvedValue([{
+      id: "conv-1", project_id: "proj-1", title: "Active", pinned_at: null,
+      started_at: "2026-05-10T00:00:00Z", last_active_at: "2026-05-10T00:00:00Z",
+      deleted_at: null, persona_id: null,
+    }]);
+    listPersonasMock.mockResolvedValue([{
+      id: "project-persona-1", project_id: "proj-1", name: "Finance analyst",
+      slug: "finance-analyst", description: null, model_scopes: [],
+    }]);
+    patchConversationMock.mockRejectedValueOnce(new Error("persist failed"));
+    renderChat();
+    const picker = await screen.findByRole("combobox", { name: "Project persona" });
+    await userEvent.click(picker);
+    await userEvent.click(await screen.findByRole("option", { name: "Finance analyst" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/previous selection was restored/i));
+    expect(setPendingPersonaIdMock).toHaveBeenLastCalledWith(null);
+  });
+
+  it("L13-R1-F5 blocks direct New/create/send across a ProjectPersona transition", async () => {
+    const storeState = {
+      activeConversationId: "conv-1",
+      setActiveConversation: setActiveConversationMock,
+      pendingPersonaId: null,
+      setPendingPersonaId: setPendingPersonaIdMock,
+    };
+    vi.mocked(useConversationStore).mockImplementation(
+      (selector: (s: Record<string, unknown>) => unknown) =>
+        selector(storeState) as never,
+    );
+    getConfigMock.mockResolvedValue({ enabled: true });
+    listConversationsMock.mockResolvedValue([{
+      id: "conv-1", project_id: "proj-1", title: "Active", pinned_at: null,
+      started_at: "2026-05-10T00:00:00Z", last_active_at: "2026-05-10T00:00:00Z",
+      deleted_at: null, persona_id: null,
+    }]);
+    listPersonasMock.mockResolvedValue([{
+      id: "project-persona-1", project_id: "proj-1", name: "Finance analyst",
+      slug: "finance-analyst", description: null, model_scopes: [],
+    }]);
+    let resolvePatch!: (value: unknown) => void;
+    patchConversationMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolvePatch = resolve;
+    }));
+
+    renderChat();
+    const picker = await screen.findByRole("combobox", { name: "Project persona" });
+    await userEvent.click(picker);
+    await userEvent.click(await screen.findByRole("option", { name: "Finance analyst" }));
+    await waitFor(() => {
+      expect(patchConversationMock).toHaveBeenCalledWith(
+        "proj-1", "conv-1", { persona_id: "project-persona-1" },
+      );
+      expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+      expect(screen.getByTestId("chat-canvas")).toHaveAttribute("data-disabled", "true");
+    });
+
+    const newButton = screen.getByRole("button", { name: /new/i });
+    expect(newButton).toBeDisabled();
+    expect(createConversationMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolvePatch({
+        id: "conv-1", project_id: "proj-1", title: "Active", pinned_at: null,
+        started_at: "2026-05-10T00:00:00Z", last_active_at: "2026-05-10T00:00:00Z",
+        deleted_at: null, persona_id: "project-persona-1",
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Send message" })).not.toBeDisabled();
+      expect(screen.getByRole("button", { name: /new/i })).not.toBeDisabled();
     });
   });
 

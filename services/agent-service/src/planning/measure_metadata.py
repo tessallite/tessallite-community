@@ -96,6 +96,11 @@ class MeasureRoleMetadata:
     @property
     def additivity_notes(self) -> list[str]:
         notes: list[str] = []
+        if self.semi_additive_behavior:
+            # A semi-additive measure (for example, a closing balance) is not
+            # safe to stack or re-aggregate across the semi-additive axis even
+            # when a legacy persisted row still says ``is_additive=True``.
+            notes.append("semi_additive_treated_non_additive")
         if self.is_time_variant and self.is_additive is not True:
             notes.append("time_variant_treated_non_additive")
         if self.measure_type == "calculated" and self.is_additive is not True:

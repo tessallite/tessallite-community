@@ -7,7 +7,7 @@ updated: 2026-06-21
 
 ## What this covers
 
-Predictive aggregates are aggregates Tessallite builds *before* any query is observed, using **source statistics** collected from the connected database — row counts, distinct counts, null ratios, top-N values, and join selectivity. This article explains the idea behind the predictor, the four moving parts the modeller controls (storage budget, eviction policy, approval gate, feedback loop), what each control actually does, and how predictive aggregates coexist with manual and demand-defined ones.
+Predictive aggregates are aggregates Tessallite builds *before* any query is observed, using **source statistics** collected from the connected database. Tessallite collects row counts, distinct counts, null ratios, top-N values, and join selectivity, and shows them in the Statistics panel; the predictive *ranking today* is driven by grain **cardinality** — how far a candidate grain's distinct-value product reduces the fact's row count — while the other statistics are collected and displayed but not yet weighted into the score. This article explains the idea behind the predictor, the four moving parts the modeller controls (storage budget, eviction policy, approval gate, feedback loop), what each control actually does, and how predictive aggregates coexist with manual and demand-defined ones.
 
 ---
 
@@ -15,7 +15,7 @@ Predictive aggregates are aggregates Tessallite builds *before* any query is obs
 
 A freshly deployed model has no observed workload — no query log, no miss patterns, nothing for the demand-driven optimiser to learn from. The very first BI user therefore pays the full cold-path cost: a scan against the source, with no aggregate to short-circuit it. The demand optimiser only helps *after* a pattern of repeated queries has been seen, which is exactly what a brand-new model does not have yet.
 
-Predictive aggregates close that gap. Instead of waiting for queries, Tessallite samples the source, scores plausible aggregates by expected speed-up per unit of storage, and builds the most promising ones within the model's budget — so the first user already lands on a fast path.
+Predictive aggregates close that gap. Instead of waiting for queries, Tessallite samples the source, ranks plausible grains by how much they reduce the fact's cardinality per unit of storage, and builds the highest-ranked ones within the model's budget — so the first user already lands on a fast path.
 
 **Source coverage.** Statistics collection ships for **PostgreSQL, BigQuery, and Spark/Hive** sources. Each uses its own catalogue probes (PostgreSQL `pg_stats`, BigQuery `INFORMATION_SCHEMA` + `APPROX_*`, Spark `ANALYZE TABLE`). Snowflake and SQL Server are not yet fully supported for statistics — their probes return sparse results, so the predictor has little to work with on those sources today.
 

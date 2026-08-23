@@ -823,7 +823,11 @@ def test_physical_repro_build_and_live_send_the_same_expanded_definition() -> No
                 AsyncMock(), body, nq, expanded,
                 persona=None, principal=None,
                 user_identity="u", tenant_id="t",
-                skip_reason="no_artifact",
+                skip_reason="no_artifact", reference=None,
+                # L2-F1: REQUIRED, like ``reference``. No reference means no
+                # row window, so the caller's cap is the only bound and the
+                # inner dispatch applies it itself.
+                server_row_cap=None,
             )
         )
     assert response.route_type == "source"
@@ -865,7 +869,8 @@ def test_live_helper_asserts_the_source_route() -> None:
                     AsyncMock(), body, nq, "SELECT 1",
                     persona=None, principal=None,
                     user_identity="u", tenant_id="t",
-                    skip_reason="no_artifact",
+                    skip_reason="no_artifact", reference=None,
+                    server_row_cap=None,
                 )
             )
     assert exc_info.value.status_code == 422

@@ -49,12 +49,21 @@ from shared.pocket.refresh import (
     drop_pocket_storage,
     refresh_pocket_definition,
 )
+from shared.pocket.refresh_guard import (
+    POCKET_INELIGIBLE_POPULATION_REASON,
+    POCKET_POPULATION_ELIGIBILITY_INELIGIBLE,
+)
+from shared.pocket_refresh_lock import (
+    PocketRefreshInFlightError,
+    pocket_refresh_lock,
+)
 from shared.source_executor import resolve_connector_type
 from shared.pocket.structure import collect_pocket_structure_violations
 from shared.schemas.pydantic_models import (
     PocketDefinitionCreate,
     PocketDefinitionResponse,
     PocketDefinitionUpdate,
+    PocketCompoundEdit,
     PocketDryRunRequest,
     PocketDryRunResponse,
     PocketRefreshPolicyResponse,
@@ -65,6 +74,7 @@ from shared.schemas.pydantic_models import (
     PocketViolationItem,
 )
 from src.api._validator_unavailable import validator_unavailable
+from src.api._model_lock import acquire_model_definition_lock
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 
@@ -120,6 +130,10 @@ async def _run_pocket_refresh_in_background(
                         if pocket is not None:
                             pocket.status = "failed"
                             pocket.failure_reason = str(exc)[:1000]
+                            pocket.row_manifest = None
+                            pocket.active_refresh_run_id = None
+                            pocket.built_for_version_id = None
+                            pocket.built_for_epoch = None
                         await db.commit()
                 except Exception:
                     logger.exception("Failed to mark pocket run %s failed", run_id)
@@ -307,6 +321,7 @@ class PocketMetricsResponse(BaseModel):
     stale_pockets: int
     invalidating_pockets: int
     failed_pockets: int
+    ineligible_pockets: int
     retired_pockets: int
     pocket_hit_rate: float
     pocket_time_saved_ms: int
@@ -367,10 +382,29 @@ async def pocket_metrics(
         pockets = list(result.scalars().all())
         active = [p for p in pockets if p.retired_at is None]
         total = len(active)
-        fresh = sum(1 for p in active if p.status == "fresh")
+        ineligible_ids = {
+            id(p)
+            for p in active
+            if p.status == "ineligible"
+            or getattr(p, "population_eligibility", None) == "ineligible"
+        }
+        ineligible = len(ineligible_ids)
+        fresh = sum(
+            1 for p in active
+            if p.status == "fresh" and id(p) not in ineligible_ids
+        )
         stale = sum(1 for p in active if p.status == "stale")
         invalidating = sum(1 for p in active if p.status == "invalidating")
         failed = sum(1 for p in active if p.status == "failed")
+        state_total = fresh + stale + invalidating + failed + ineligible
+        if state_total != total:
+            # A new/unknown lifecycle token must not be silently omitted from
+            # the product metrics. Fail loudly until its producer/consumer
+            # contract is updated.
+            raise RuntimeError(
+                "Pocket metrics status counters do not reconcile with total "
+                f"({state_total} != {total})"
+            )
         retired = sum(1 for p in pockets if p.retired_at is not None)
         # F-005-08 (Bug-2251): `time_saved_ms_total` is now the per-pocket sum of
         # (source baseline − pocket execution) recorded at route time, so this
@@ -413,7 +447,9 @@ async def pocket_metrics(
         zero_match_fresh = sum(
             1
             for p in active
-            if p.status == "fresh" and not _matched_since_refresh(p)
+            if p.status == "fresh"
+            and id(p) not in ineligible_ids
+            and not _matched_since_refresh(p)
         )
 
         # F-005-22: surface the single most common reason the router skipped a
@@ -447,6 +483,7 @@ async def pocket_metrics(
                 "pocket_id": str(p.id),
                 "physical_table_name": p.physical_table_name,
                 "status": p.status,
+                "population_eligibility": getattr(p, "population_eligibility", "unknown"),
                 "hit_count": int(p.hit_count or 0),
                 "ttl_days": int(p.ttl_days or 0),
                 "matched_since_refresh": _matched_since_refresh(p),
@@ -459,6 +496,7 @@ async def pocket_metrics(
             stale_pockets=stale,
             invalidating_pockets=invalidating,
             failed_pockets=failed,
+            ineligible_pockets=ineligible,
             retired_pockets=retired,
             pocket_hit_rate=round(hit_rate, 4),
             pocket_time_saved_ms=time_saved,
@@ -764,6 +802,188 @@ def _validate_pocket_cron(value: str) -> str:
     return cron
 
 
+async def _prepare_pocket_definition_update(
+    db,
+    *,
+    model: Model,
+    pocket_id: UUID,
+    pocket_status: str | None,
+    body: PocketDefinitionUpdate,
+    current_user: CurrentUser,
+) -> tuple[dict, list[dict] | None]:
+    """Validate a definition edit using the canonical PATCH contract.
+
+    Compound history edits and ordinary PATCHes must have identical semantic
+    gates before either one mutates a pocket.  Keeping this preparation phase
+    side-effect free also lets the compound route validate its child policy in
+    the same transaction without a weaker parallel SQL validator.
+    """
+    updates = body.model_dump(exclude_unset=True)
+    rebuilt_predicates: list[dict] | None = None
+
+    if "refresh_policy" in updates and updates["refresh_policy"] is not None:
+        allowed = await get_setting(
+            "pocket.allowed_refresh_policies", tenant_session=db
+        )
+        if updates["refresh_policy"] not in set(allowed or []):
+            raise HTTPException(
+                status_code=400,
+                detail=f"refresh_policy must be one of {allowed}",
+            )
+    if "refresh_cron" in updates and updates["refresh_cron"]:
+        updates["refresh_cron"] = _validate_pocket_cron(updates["refresh_cron"])
+
+    if "defining_sql" in updates and updates["defining_sql"]:
+        try:
+            validation = await _validate_via_router(
+                model.id, updates["defining_sql"], current_user.raw_token
+            )
+        except RouterUnavailableError as exc:
+            raise _router_unavailable_http(exc) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        if not validation.get("ok"):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Pocket SQL failed validation.",
+                    "errors": validation.get("errors", []),
+                },
+            )
+        slug = (getattr(model, "slug", "") or "").lower()
+        violations = _check_pocket_structure(validation, slug)
+        if violations:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Pocket SQL is not a valid model subset.",
+                    "violations": [v.model_dump() for v in violations],
+                },
+            )
+        updates["query_fingerprint"] = validation.get("query_fingerprint") or ""
+        rebuilt_predicates = _predicates_from_validation(validation)
+        updates["predicate_set_hash"] = predicate_set_hash(rebuilt_predicates)
+        # A definition edit changes the physical generation and clears both
+        # axes.  The next matcher proof may establish eligibility, but it may
+        # never make this old physical table fresh; only a successful rebuild
+        # may do that.
+        updates.update(
+            status="stale",
+            failure_reason=None,
+            population_eligibility="unknown",
+            population_eligibility_reason=None,
+            population_proof_fingerprint=None,
+            row_manifest=None,
+            active_refresh_run_id=None,
+            built_for_version_id=None,
+            built_for_epoch=None,
+        )
+
+    return updates, rebuilt_predicates
+
+
+async def _apply_pocket_definition_update(
+    db,
+    *,
+    pocket: PocketDefinition,
+    pocket_id: UUID,
+    updates: dict,
+    rebuilt_predicates: list[dict] | None,
+) -> None:
+    """Apply an already validated definition edit and its authoritative rows."""
+    for key, value in updates.items():
+        if hasattr(pocket, key):
+            setattr(pocket, key, value)
+    if rebuilt_predicates is None:
+        return
+    await db.execute(
+        delete(PocketPredicate).where(
+            PocketPredicate.pocket_definition_id == pocket_id
+        )
+    )
+    for predicate in rebuilt_predicates:
+        db.add(PocketPredicate(
+            pocket_definition_id=pocket_id,
+            column_name=predicate["column_name"],
+            operator=predicate["operator"],
+            value_json={"value": predicate["value"]},
+        ))
+
+
+async def _commit_pocket_definition_write(db) -> None:
+    """Commit a pocket definition edit with the canonical identity conflict."""
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A pocket with the same query shape and predicate set already "
+                "exists for this model."
+            ),
+        )
+
+
+@router.post(
+    "/{pocket_id}/compound-edit",
+    response_model=PocketDefinitionResponse,
+    dependencies=[require_role("modeler")],
+)
+async def compound_edit_pocket(
+    project_id: UUID,
+    model_id: UUID,
+    pocket_id: UUID,
+    body: PocketCompoundEdit,
+    current_user: CurrentUser = Depends(forbid_embed_user),
+) -> PocketDefinitionResponse:
+    """Apply definition and refresh policy in one tenant transaction.
+
+    Drawer history replays this endpoint so one compound edit has one commit,
+    one cache invalidation boundary, and one revision delta.
+    """
+    async for db in get_tenant_db(current_user.tenant_id):
+        model = await _get_scoped_model(db, project_id, model_id)
+        await acquire_model_definition_lock(db, model_id)
+        pocket = await db.get(PocketDefinition, pocket_id)
+        if pocket is None or pocket.model_id != model_id:
+            raise HTTPException(status_code=404, detail="Pocket not found")
+        updates, rebuilt_predicates = await _prepare_pocket_definition_update(
+            db,
+            model=model,
+            pocket_id=pocket_id,
+            pocket_status=getattr(pocket, "status", None),
+            body=body.definition,
+            current_user=current_user,
+        )
+        await _apply_pocket_definition_update(
+            db,
+            pocket=pocket,
+            pocket_id=pocket_id,
+            updates=updates,
+            rebuilt_predicates=rebuilt_predicates,
+        )
+        policy_data = body.policy.model_dump()
+        policy = (await db.execute(select(PocketRefreshPolicy).where(
+            PocketRefreshPolicy.pocket_definition_id == pocket_id,
+        ))).scalar_one_or_none()
+        if policy is None:
+            policy = PocketRefreshPolicy(pocket_definition_id=pocket_id, **policy_data)
+            db.add(policy)
+        else:
+            for key, value in policy_data.items():
+                setattr(policy, key, value)
+        await _commit_pocket_definition_write(db)
+        result = await db.execute(select(PocketDefinition).where(
+            PocketDefinition.id == pocket_id,
+        ).options(
+            selectinload(PocketDefinition.predicates),
+            selectinload(PocketDefinition.refresh_policy_row),
+        ))
+        return PocketDefinitionResponse.model_validate(result.scalar_one())
+
+
 @router.patch(
     "/{pocket_id}",
     response_model=PocketDefinitionResponse,
@@ -782,95 +1002,21 @@ async def update_pocket(
         if pocket is None or pocket.model_id != model_id:
             raise HTTPException(status_code=404, detail="Pocket not found")
 
-        updates = body.model_dump(exclude_unset=True)
-        rebuild_predicate_rows = False
-        rebuilt_predicates: list[dict] = []
-
-        # Bug-6108: PATCH previously accepted any refresh_policy string with no
-        # allowed-list check and wrote refresh_cron to the deprecated, unread
-        # column only — silently inert. Validate both like create, and (below)
-        # sync the authoritative PocketRefreshPolicy child row.
-        #
-        # Bug-6593 (two-layer contract): a token OUTSIDE the policy universe
-        # ({schedule, manual, event}) is already rejected by the
-        # PocketDefinitionUpdate schema validator with a Pydantic 422 before this
-        # handler runs — the same status create returns for the same input. The
-        # check below is the DISTINCT per-tenant rule: a universe-valid token
-        # that this tenant has narrowed out of ``pocket.allowed_refresh_policies``
-        # is a business-rule rejection (400), not a malformed-body rejection.
-        if "refresh_policy" in updates and updates["refresh_policy"] is not None:
-            allowed = await get_setting(
-                "pocket.allowed_refresh_policies", tenant_session=db
-            )
-            if updates["refresh_policy"] not in set(allowed or []):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"refresh_policy must be one of {allowed}",
-                )
-        if "refresh_cron" in updates and updates["refresh_cron"]:
-            updates["refresh_cron"] = _validate_pocket_cron(updates["refresh_cron"])
-
-        if "defining_sql" in updates and updates["defining_sql"]:
-            try:
-                validation = await _validate_via_router(
-                    model_id, updates["defining_sql"], current_user.raw_token
-                )
-            except RouterUnavailableError as exc:
-                # Bug-8162: see create_pocket — an outage is 503, not 422.
-                raise _router_unavailable_http(exc) from exc
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc))
-
-            if not validation.get("ok"):
-                raise HTTPException(
-                    status_code=422,
-                    detail={
-                        "message": "Pocket SQL failed validation.",
-                        "errors": validation.get("errors", []),
-                    },
-                )
-
-            slug = (getattr(model, "slug", "") or "").lower()
-            violations = _check_pocket_structure(validation, slug)
-            if violations:
-                raise HTTPException(
-                    status_code=422,
-                    detail={
-                        "message": "Pocket SQL is not a valid model subset.",
-                        "violations": [v.model_dump() for v in violations],
-                    },
-                )
-
-            updates["query_fingerprint"] = validation.get("query_fingerprint") or ""
-            # Bug-1093 (F-005): the predicate child rows describe the cached
-            # slice the matcher routes to. A defining_sql edit changes which
-            # rows the next refresh caches, so the predicate rows MUST be
-            # rebuilt from the new validated SQL — otherwise they keep
-            # describing the OLD rows and the matcher over-claims coverage.
-            rebuilt_predicates = _predicates_from_validation(validation)
-            rebuild_predicate_rows = True
-            updates["predicate_set_hash"] = predicate_set_hash(rebuilt_predicates)
-            updates["status"] = "stale"
-            updates["failure_reason"] = None
-
-        for k, v in updates.items():
-            setattr(pocket, k, v)
-
-        if rebuild_predicate_rows:
-            # Delete + reinsert: the new predicate set authoritatively replaces
-            # the stale rows so the two never disagree with the cached slice.
-            await db.execute(
-                delete(PocketPredicate).where(
-                    PocketPredicate.pocket_definition_id == pocket_id
-                )
-            )
-            for pred in rebuilt_predicates:
-                db.add(PocketPredicate(
-                    pocket_definition_id=pocket_id,
-                    column_name=pred["column_name"],
-                    operator=pred["operator"],
-                    value_json={"value": pred["value"]},
-                ))
+        updates, rebuilt_predicates = await _prepare_pocket_definition_update(
+            db,
+            model=model,
+            pocket_id=pocket_id,
+            pocket_status=getattr(pocket, "status", None),
+            body=body,
+            current_user=current_user,
+        )
+        await _apply_pocket_definition_update(
+            db,
+            pocket=pocket,
+            pocket_id=pocket_id,
+            updates=updates,
+            rebuilt_predicates=rebuilt_predicates,
+        )
 
         # Bug-6108: the scheduler's refresh_due_pockets query reads the
         # PocketRefreshPolicy child row (enabled + cron), NOT pocket.refresh_cron
@@ -917,19 +1063,10 @@ async def update_pocket(
                 # firing on the stale cron instead of leaving it enabled.
                 policy_row.is_enabled = False
 
-        # F-005-02 (residual): a defining_sql edit can recompute an identity
-        # (query_fingerprint + predicate_set_hash) that collides with another
-        # pocket on this model's partial unique index. Create catches this and
-        # returns 409; PATCH historically did not, surfacing a raw 500. Catch
-        # it symmetrically.
-        try:
-            await db.commit()
-        except IntegrityError:
-            await db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A pocket with the same query shape and predicate set already exists for this model.",
-            )
+        # Keep the identity conflict contract shared with compound history
+        # edits: the same partial unique index must produce the same 409 and
+        # rollback rather than leaking a raw IntegrityError.
+        await _commit_pocket_definition_write(db)
         result = await db.execute(
             select(PocketDefinition)
             .where(PocketDefinition.id == pocket_id)
@@ -969,6 +1106,11 @@ async def refresh_pocket(
         pocket = await db.get(PocketDefinition, pocket_id)
         if pocket is None or pocket.model_id != model_id:
             raise HTTPException(status_code=404, detail="Pocket not found")
+        if getattr(pocket, "population_eligibility", None) == POCKET_POPULATION_ELIGIBILITY_INELIGIBLE:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=POCKET_INELIGIBLE_POPULATION_REASON,
+            )
 
         run = PocketRefreshRun(
             pocket_definition_id=pocket_id,
@@ -1034,15 +1176,44 @@ async def delete_pocket(
         pocket = await db.get(PocketDefinition, pocket_id)
         if pocket is None or pocket.model_id != model_id:
             raise HTTPException(status_code=404, detail="Pocket not found")
+        # Capture the scalar before any rollback can expire the ORM identity
+        # map. The failure path below must remain safe even when a real
+        # AsyncSession would raise while lazily reading ``pocket.id`` after
+        # rollback (Bug-8579).
+        pocket_id_scalar = pocket.id
 
-        # Best-effort physical cleanup.
         try:
-            await drop_pocket_storage(pocket, db)
-        except Exception:
-            pass
+            # Bug-9430: serialize destructive delete with the same dedicated
+            # per-pocket lock held across refresh CTAS/streaming. An in-flight
+            # refresh is a retryable conflict, never a partially deleted
+            # pocket.
+            async with pocket_refresh_lock(db, pocket_id_scalar):
+                try:
+                    await drop_pocket_storage(pocket, db)
+                except Exception as exc:
+                    # Bug-8579: a storage-drop failure is not success. Keep the
+                    # metadata and physical identity intact so the operator or
+                    # reclamation sweep can retry; return the established
+                    # retryable service error instead of swallowing evidence.
+                    await db.rollback()
+                    logger.exception(
+                        "Pocket %s delete could not reclaim physical storage; "
+                        "metadata was retained for retry",
+                        pocket_id_scalar,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=(
+                            "Pocket storage could not be reclaimed. The pocket "
+                            "was not deleted; retry after the target is available."
+                        ),
+                    ) from exc
 
-        await db.delete(pocket)
-        await db.commit()
+                await db.delete(pocket)
+                await db.commit()
+        except PocketRefreshInFlightError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         # Bug-8581: mechanism 2 of the result-cache invalidation contract
         # (shared/cache/result_cache.py) — clear the receiving replica NOW so the
         # operator who just deleted a pocket does not keep seeing route_type=pocket

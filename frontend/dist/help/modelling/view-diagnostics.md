@@ -45,7 +45,7 @@ Click any row in the diagnostic list. The Canvas scrolls to and highlights the a
 |-------|----------|-------|------------|
 | Join column missing | Error | A column used in a join definition no longer exists in the source schema, typically because the source table was altered. | Open the join in the Drawer. Update the join to use a column that still exists, or remove the join if it is no longer needed. |
 | Measure on non-numeric column | Error | A measure (sum, average, etc.) targets a column with a text or boolean data type. | Open the measure in the Drawer. Change the source column to a numeric column, or change the measure type to Count if counting rows is the intent. |
-| Fact table missing | Error | No table in the model is designated as the fact table. | Open the relevant table's Drawer and change its Type to **Fact**. |
+| Fact table missing | Error | A multi-table model has no table designated as the fact anchor. A single-table model is implicitly fact. | Open the relevant table's Drawer and change its Type to **Fact**. |
 | Schema drift detected | Warning | The source table's column list has changed since the model was last synced. | Run a schema sync from the table Drawer or trigger a workspace-wide sync from workspace settings. |
 | Aggregate refresh overdue | Warning | An aggregate has not been refreshed within its expected window. | Open the Aggregates page, switch to the Refresh tab, check the aggregate's last-refresh status, and re-run the refresh manually if needed. |
 | Unused dimension | Info | A dimension is defined in the model but has never appeared in a query. | No immediate action required. Consider removing it to keep the model clean if it is not expected to be used. |

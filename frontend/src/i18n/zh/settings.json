@@ -113,7 +113,7 @@
   "connections.deleteConfirmLabel": "删除连接",
   "connections.deleteConnection": "删除",
   "connections.deleteFailed": "删除连接失败。",
-  "connections.deleteMessage": "删除连接 <strong>{{name}}</strong>？与其绑定的源和目标在重新绑定前将无法使用。",
+  "connections.deleteMessage": "删除连接 {{name}}？与其绑定的源和目标在重新绑定前将无法使用。",
   "connections.deleteTitle": "删除连接？",
   "connections.deleteTooltip": "删除连接",
   "connections.displayName": "显示名称 *",

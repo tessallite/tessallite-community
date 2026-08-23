@@ -98,6 +98,7 @@ End-to-end walkthroughs for the people who consume the models: building dashboar
 - [Configure Time Variants](modelling/configure-time-variants.md)
 - [Understanding Window Functions](modelling/window-functions.md)
 - [Configure Calendar Table](modelling/configure-calendar-table.md)
+- [Fiscal and Retail Year Captions](modelling/configure-calendar-table.md#fiscal-and-retail-year-captions)
 - [Associate Calendar with Dimensions](modelling/associate-calendar-with-dimensions.md)
 - [Multi-Calendar Best Practices](modelling/multi-calendar-best-practices.md)
 - [Measure Query Panel](modelling/measure-query-panel.md)

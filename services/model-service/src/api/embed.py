@@ -10,7 +10,14 @@ from sqlalchemy import select
 
 from shared.audit.logger import audit_required
 from shared.auth.embed_revocation import revoke_embed_token
-from shared.db.models import EmbedTokenMint, Model, Persona, Project, SystemTenant
+from shared.db.models import (
+    EmbedTokenMint,
+    Model,
+    Persona,
+    Project,
+    ProjectPersona,
+    SystemTenant,
+)
 from shared.db.session import get_system_db, get_tenant_db
 from shared.schemas.pydantic_models import EmbedTokenRequest, EmbedTokenResponse, EmbedTokenScope
 from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
@@ -158,6 +165,39 @@ async def mint_embed_token(
                         ),
                     )
 
+        if body.project_persona_id:
+            try:
+                project_persona_uuid = UUID(body.project_persona_id)
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        "Invalid project persona ID format: "
+                        f"'{body.project_persona_id}'"
+                    ),
+                )
+            project_persona = await tenant_db.get(
+                ProjectPersona, project_persona_uuid
+            )
+            if project_persona is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        f"Project persona '{body.project_persona_id}' does not "
+                        f"exist in tenant '{body.tenant_id}'"
+                    ),
+                )
+            if body.project_ids:
+                allowed_projects = {str(p).lower() for p in body.project_ids}
+                if str(project_persona.project_id).lower() not in allowed_projects:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=(
+                            f"Project persona '{body.project_persona_id}' belongs "
+                            f"to project '{project_persona.project_id}' which is "
+                            "not in the allowed project_ids list"
+                        ),
+                    )
     # Bug-7995 / F-024-01: carry the admin-authored row-security subject
     # (role/groups/claims) into the signed token so attribute/role RLS rules
     # fire for the embedded session. The subject only narrows returned rows;
@@ -168,6 +208,7 @@ async def mint_embed_token(
         user_identity=body.user_identity,
         tenant_id=body.tenant_id,
         persona_id=body.persona_id,
+        project_persona_id=body.project_persona_id,
         project_ids=body.project_ids,
         model_ids=body.model_ids,
         capabilities=body.capabilities,
@@ -184,6 +225,7 @@ async def mint_embed_token(
         tenant_id=body.tenant_id,
         user_identity=body.user_identity,
         persona_id=body.persona_id,
+        project_persona_id=body.project_persona_id,
         project_ids=body.project_ids,
         model_ids=body.model_ids,
         capabilities=caps,
@@ -200,6 +242,7 @@ async def mint_embed_token(
                     actor_email=admin.email,
                     user_identity=body.user_identity,
                     persona_id=body.persona_id,
+                    project_persona_id=body.project_persona_id,
                     project_ids=body.project_ids,
                     model_ids=body.model_ids,
                     capabilities=caps,
@@ -357,6 +400,8 @@ async def list_embed_tokens(
                 "jti": str(r.jti),
                 "actor_email": r.actor_email,
                 "user_identity": r.user_identity,
+                "persona_id": r.persona_id,
+                "project_persona_id": r.project_persona_id,
                 "capabilities": r.capabilities or [],
                 "expires_at": r.expires_at.isoformat() if r.expires_at else None,
                 "revoked_at": r.revoked_at.isoformat() if r.revoked_at else None,

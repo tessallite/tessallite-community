@@ -331,10 +331,12 @@ async def test_patch_persona_replaces_include_lists(client):
     # F-008-16 / F-008-21: the patch now validates the EFFECTIVE scope. Script
     # the measure-existence query (both new ids present) and the dimension-name
     # query (``year`` is a real dimension, so the default filter is valid);
-    # the third query is the restricted-columns lookup in the response build.
+    # the parameter-name query is also read for explicit @ targets; the final
+    # query is the restricted-columns lookup in the response build.
     db.execute = _execute_script(
         _ScalarResult([uuid.UUID(i) for i in new_ids]),  # include-id existence
         _ScalarResult(["year"]),                          # dimension names
+        _ScalarResult([]),                                # declared parameters
         _ScalarResult([]),                                # restricted columns
     )
 

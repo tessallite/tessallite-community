@@ -228,6 +228,7 @@ class TestExecuteQueryChokepoint:
             await execute_query(
                 db, _call(FORBIDDEN_MODEL), "jwt",
                 allowed_model_ids={ALLOWED_MODEL},
+                persona_scopes=None,
             )
         db.get.assert_not_awaited()
         db.execute.assert_not_awaited()
@@ -294,6 +295,7 @@ class TestRecipeExecutionEnforcement:
                 RunRecipeToolCall(recipe_id=str(recipe.id), parameters={}),
                 "jwt",
                 allowed_model_ids={ALLOWED_MODEL},
+                persona_scopes=None,
             )
         assert isinstance(exc.value.__cause__, ModelNotAllowListedError)
 
@@ -370,6 +372,7 @@ class TestRecipeExecutionEnforcement:
             ),
         ]
 
+        persona_scopes = _scope()
         with patch(
             "src.exec.recipe.execute_query",
             new=AsyncMock(side_effect=executions),
@@ -380,12 +383,18 @@ class TestRecipeExecutionEnforcement:
                 RunRecipeToolCall(recipe_id=str(recipe.id), parameters={}),
                 "jwt",
                 allowed_model_ids={ALLOWED_MODEL},
+                persona_scopes=persona_scopes,
             )
 
         assert [call.args[1].measures for call in query.await_args_list] == [
             ["Net Revenue"],
             ["Units"],
         ]
+        assert [call.kwargs["persona_scopes"] for call in query.await_args_list] == [
+            persona_scopes,
+            persona_scopes,
+        ]
+        assert all("persona_id" not in call.kwargs for call in query.await_args_list)
         assert result.combine_value == 25
 
 
@@ -695,6 +704,7 @@ class TestRecipeCrudRoleGate:
 # ── Bug-5279 / Bug-6329: persona field-scope on KPI/named-set/aggregate ──
 
 MODEL_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
+_UNSET = object()
 
 
 class _Scalars:
@@ -737,11 +747,51 @@ def _kpi_lineage_db(*, get_return, measure_rows=None, dim_rows=None, kpi_rows=No
     return db
 
 
-def _ns_lineage_db(*, get_return, dim_rows=None):
-    """Mock DB for the named-set lineage gate: ``db.get`` -> the NamedSet;
-    a single ``db.execute`` -> ``.all()`` yields *dim_rows*."""
+def _ns_lineage_db(
+    *, get_return, dim_rows=None,
+    deployed_expression=_UNSET, deployed_dimensions=_UNSET,
+):
+    """Mock DB for the named-set lineage gate.
+
+    The live NamedSet and its deployed snapshot intentionally share the
+    definition in legacy tests; Bug-9029-specific tests vary the two to prove
+    the precheck follows the deployed authority.
+    """
     db = AsyncMock()
-    db.get = AsyncMock(return_value=get_return)
+    version_id = uuid.uuid4()
+    model = types.SimpleNamespace(
+        id=getattr(get_return, "model_id", MODEL_ID),
+        deployed_version_id=version_id,
+    )
+    version = types.SimpleNamespace(
+        id=version_id,
+        model_id=model.id,
+        snapshot_json={
+            "measures": [{"id": str(uuid.uuid4()), "name": "m1"}],
+            "named_sets": [{
+                "id": str(get_return.id),
+                "expression": (
+                    getattr(get_return, "expression", None)
+                    if deployed_expression is _UNSET else deployed_expression
+                ),
+                "dimensions": (
+                    getattr(get_return, "dimensions", None)
+                    if deployed_dimensions is _UNSET else deployed_dimensions
+                ),
+            }],
+        },
+    )
+
+    async def _get(cls, _id):
+        if cls.__name__ == "NamedSet":
+            return get_return
+        if cls.__name__ == "Model":
+            return model
+        if cls.__name__ == "ModelVersion":
+            return version
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
     db.execute = AsyncMock(return_value=_Result(dim_rows or []))
     return db
 
@@ -1131,3 +1181,44 @@ class TestPersonaScopeOnNonQueryTools:
         db = _ns_lineage_db(get_return=ns, dim_rows=[("hidden_dim",), ("visible_dim",)])
         result = await _allow_list_refusal_outcome(call, bundle, None, None, db=db)
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_preview_named_set_uses_deployed_expression_not_live_draft(self):
+        """Bug-9029: a hidden live draft must not block a published visible set."""
+        ns = _ns_row(expression="[hidden_dim].members")
+        call = PreviewNamedSetToolCall(model_id=str(MODEL_ID), named_set_id=str(ns.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["m1"]),
+            dimensions=frozenset(["visible_dim"]),
+        )
+        db = _ns_lineage_db(
+            get_return=ns,
+            dim_rows=[("hidden_dim",), ("visible_dim",)],
+            deployed_expression="[visible_dim].members",
+            deployed_dimensions="visible_dim",
+        )
+        result = await _allow_list_refusal_outcome(call, bundle=self._bundle(
+            persona_scopes={MODEL_ID: scope}
+        ), prompt_messages=None, llm_raw_response=None, db=db)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_preview_named_set_follows_deployed_hidden_dimension(self):
+        """Bug-9029: a live-visible draft cannot authorise a hidden published set."""
+        ns = _ns_row(expression="[visible_dim].members")
+        call = PreviewNamedSetToolCall(model_id=str(MODEL_ID), named_set_id=str(ns.id))
+        scope = PersonaFieldScope(
+            measures=frozenset(["m1"]),
+            dimensions=frozenset(["visible_dim"]),
+        )
+        db = _ns_lineage_db(
+            get_return=ns,
+            dim_rows=[("hidden_dim",), ("visible_dim",)],
+            deployed_expression="[hidden_dim].members",
+            deployed_dimensions="hidden_dim",
+        )
+        result = await _allow_list_refusal_outcome(
+            call, self._bundle(persona_scopes={MODEL_ID: scope}), None, None, db=db
+        )
+        assert result is not None
+        assert result.status == "refused"

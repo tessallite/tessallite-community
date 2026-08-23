@@ -19,11 +19,22 @@ const {
   kpisApiMock,
   namedSetsApiMock,
   namedQueriesApiMock,
+  pocketsApiMock,
+  rowSecurityApiMock,
+  parametersApiMock,
+  glossaryApiMock,
+  attributeRelationshipsApiMock,
+  calendarApiMock,
+  userDefinedAttributesApiMock,
 } = vi.hoisted(() => {
   const makeEntityMock = () => ({
     create: vi.fn(async () => ({ id: "new-id" })),
     update: vi.fn(async () => ({ id: "existing-id" })),
     delete: vi.fn(async () => ({})),
+    updateDrillThroughSet: vi.fn(async () => ({ id: "drill-id" })),
+    resetDrillThroughSet: vi.fn(async () => ({})),
+    setPolicy: vi.fn(async () => ({ id: "policy-id" })),
+    updateCompound: vi.fn(async () => ({ id: "pocket-id" })),
   });
   return {
     measuresApiMock: makeEntityMock(),
@@ -33,6 +44,20 @@ const {
     kpisApiMock: makeEntityMock(),
     namedSetsApiMock: makeEntityMock(),
     namedQueriesApiMock: makeEntityMock(),
+    pocketsApiMock: makeEntityMock(),
+    rowSecurityApiMock: makeEntityMock(),
+    parametersApiMock: makeEntityMock(),
+    glossaryApiMock: makeEntityMock(),
+    attributeRelationshipsApiMock: makeEntityMock(),
+    calendarApiMock: {
+      create: vi.fn(async () => ({ id: "calendar-id" })),
+      bind: vi.fn(async () => ({ id: "calendar-id" })),
+      autoCreate: vi.fn(async () => ({ id: "calendar-id" })),
+      undoAutoCreate: vi.fn(async () => undefined),
+      update: vi.fn(async () => ({ id: "calendar-id" })),
+      delete: vi.fn(async () => ({})),
+    },
+    userDefinedAttributesApiMock: makeEntityMock(),
   };
 });
 
@@ -51,6 +76,13 @@ vi.mock("../../api/client", () => ({
   kpisApi: kpisApiMock,
   namedSetsApi: namedSetsApiMock,
   namedQueriesApi: namedQueriesApiMock,
+  pocketsApi: pocketsApiMock,
+  rowSecurityApi: rowSecurityApiMock,
+  parametersApi: parametersApiMock,
+  glossaryApi: glossaryApiMock,
+  attributeRelationshipsApi: attributeRelationshipsApiMock,
+  calendarApi: calendarApiMock,
+  userDefinedAttributesApi: userDefinedAttributesApiMock,
 }));
 
 import { useCanvasHistory, ENTITY_QUERY_KEYS, type NodePositions } from "./useCanvasHistory";
@@ -614,11 +646,18 @@ describe("useCanvasHistory — drawer-edit commands (Bug-8227)", () => {
     joinsCreateMock.mockReset();
     joinsCreateMock.mockResolvedValue({ id: "j-recreated" });
     joinsDeleteMock.mockReset();
-    for (const m of [measuresApiMock, dimensionsApiMock, hierarchiesApiMock, personasApiMock, kpisApiMock, namedSetsApiMock]) {
+    for (const m of [measuresApiMock, dimensionsApiMock, hierarchiesApiMock, personasApiMock, kpisApiMock, namedSetsApiMock, namedQueriesApiMock, pocketsApiMock, rowSecurityApiMock, parametersApiMock, glossaryApiMock, attributeRelationshipsApiMock, calendarApiMock, userDefinedAttributesApiMock]) {
       m.create.mockClear();
       m.update.mockClear();
       m.delete.mockClear();
     }
+    pocketsApiMock.setPolicy.mockClear();
+    pocketsApiMock.updateCompound.mockClear();
+    calendarApiMock.bind.mockClear();
+    calendarApiMock.autoCreate.mockClear();
+    calendarApiMock.undoAutoCreate.mockClear();
+    calendarApiMock.update.mockClear();
+    calendarApiMock.delete.mockClear();
     // Reset the editor store to a clean baseline for the open model.
     useModelEditorStore.setState({
       modelId: "m1",
@@ -653,6 +692,155 @@ describe("useCanvasHistory — drawer-edit commands (Bug-8227)", () => {
       await view.result.current.history.redo();
     });
     expect(measuresApiMock.update).toHaveBeenLastCalledWith("p1", "m1", "meas-1", { expression: "SUM(b)" });
+  });
+
+  it("Bug-9395 F-026-10 registers model-scoped omitted drawer entities", async () => {
+    const { view } = setup();
+    act(() => useModelEditorStore.getState().markDirty());
+    emitCommand({
+      type: "command",
+      entity: "parameter",
+      redo: { kind: "update", id: "param-1", data: { display_name: "Region" } },
+      undo: { kind: "update", id: "param-1", data: { display_name: "Area" } },
+    });
+
+    expect(ENTITY_QUERY_KEYS.parameter).toEqual(["parameters"]);
+    expect(ENTITY_QUERY_KEYS.pocket).toEqual(["pockets", "pocket-policy", "metrics"]);
+    expect(ENTITY_QUERY_KEYS.rowSecurity).toEqual(["row-security"]);
+    expect(ENTITY_QUERY_KEYS.glossary).toEqual(["glossary"]);
+    expect(ENTITY_QUERY_KEYS.dimension).toEqual([
+      "dimensions", "modelTables", "allModelTables", "sources",
+    ]);
+    expect(ENTITY_QUERY_KEYS.hierarchy).toEqual([
+      "hierarchies", "hierarchy", "dimensions", "sources", "modelTables",
+      "allModelTables", "joins", "hierarchy-health",
+    ]);
+    expect(ENTITY_QUERY_KEYS.attributeRelationship).toEqual([
+      "attributeRelationships", "dimensions",
+    ]);
+    expect(ENTITY_QUERY_KEYS.calendar).toEqual([
+      "calendars", "sources", "modelTables", "allModelTables", "joins",
+    ]);
+    expect(ENTITY_QUERY_KEYS.userDefinedAttribute).toEqual([
+      "userDefinedAttributes", "dimensions", "measures",
+    ]);
+    expect(ENTITY_QUERY_KEYS.drillThroughSet).toEqual(["drillThroughSet", "measures"]);
+
+    await act(async () => {
+      await view.result.current.history.undo();
+    });
+    expect(parametersApiMock.update).toHaveBeenCalledWith(
+      "p1",
+      "m1",
+      "param-1",
+      { display_name: "Area" },
+    );
+  });
+
+  it("Bug-9395 F-026-10 routes parent-scoped undo commands without leaking metadata", async () => {
+    const { view } = setup();
+    act(() => useModelEditorStore.getState().markDirty());
+    emitCommand({
+      type: "command",
+      entity: "userDefinedAttribute",
+      redo: {
+        kind: "create",
+        data: {
+          name: "net",
+          expression: "amount",
+          output_data_type: "numeric",
+          __table_id: "table-1",
+        },
+      },
+      undo: {
+        kind: "delete",
+        id: "uda-1",
+        data: { __table_id: "table-1" },
+      },
+    });
+    await act(async () => { await view.result.current.history.undo(); });
+    expect(userDefinedAttributesApiMock.delete).toHaveBeenCalledWith("p1", "m1", "table-1", "uda-1");
+
+    emitCommand({
+      type: "command",
+      entity: "attributeRelationship",
+      redo: {
+        kind: "update",
+        id: "rel-1",
+        data: { enabled: false, __dimension_id: "dim-1" },
+      },
+      undo: {
+        kind: "update",
+        id: "rel-1",
+        data: { enabled: true, __dimension_id: "dim-1" },
+      },
+    });
+    await act(async () => { await view.result.current.history.undo(); });
+    expect(attributeRelationshipsApiMock.update).toHaveBeenCalledWith(
+      "p1",
+      "m1",
+      "dim-1",
+      "rel-1",
+      { enabled: true },
+    );
+  });
+
+  it("L13-R1-F6 replays a conditional pocket edit through one atomic revision", async () => {
+    const { view } = setup();
+    act(() => useModelEditorStore.getState().markDirty());
+    emitCommand({
+      type: "command",
+      entity: "pocket",
+      redo: {
+        kind: "update",
+        id: "pocket-1",
+        data: {
+          defining_sql: "SELECT 2",
+          __policy: { cron_expression: "0 3 * * *", is_enabled: true },
+        },
+      },
+      undo: {
+        kind: "update",
+        id: "pocket-1",
+        data: {
+          defining_sql: "SELECT 1",
+          __policy: { cron_expression: "0 2 * * *", is_enabled: false },
+        },
+      },
+    });
+    await act(async () => { await view.result.current.history.undo(); });
+    expect(pocketsApiMock.updateCompound).toHaveBeenCalledWith("p1", "m1", "pocket-1", {
+      definition: { defining_sql: "SELECT 1" },
+      policy: { cron_expression: "0 2 * * *", is_enabled: false },
+    });
+    expect(pocketsApiMock.setPolicy).not.toHaveBeenCalledWith(
+      "p1",
+      "m1",
+      "pocket-1",
+      { cron_expression: "0 2 * * *", is_enabled: false },
+    );
+    expect(useModelEditorStore.getState()).toMatchObject({
+      currentRevision: 0,
+      savedRevision: 0,
+      isDirty: false,
+    });
+    expect(pocketsApiMock.updateCompound).toHaveBeenCalledTimes(1);
+  });
+
+  it("L13-R1-F4 undoes and redoes an auto-created calendar with generated aliases", async () => {
+    const { view } = setup();
+    act(() => useModelEditorStore.getState().markDirty());
+    emitCommand({
+      type: "command",
+      entity: "calendar",
+      redo: { kind: "create", data: { __source_id: "source-1", __calendar_flow: "auto-create", __history_provenance: "token-1", table_name: "calendar", dialect: "postgresql", date_column: "date_key", year_column: "year_no", calendar_type: "standard" } },
+      undo: { kind: "delete", id: "calendar-1", data: { __source_id: "source-1", __calendar_flow: "auto-create", __history_provenance: "token-1" } },
+    });
+    await act(async () => { await view.result.current.history.undo(); });
+    expect(calendarApiMock.undoAutoCreate).toHaveBeenCalledWith("p1", "m1", "source-1", "calendar-1", "token-1");
+    await act(async () => { await view.result.current.history.redo(); });
+    expect(calendarApiMock.bind).toHaveBeenCalledWith("p1", "m1", "source-1", { table_name: "calendar", dialect: "postgresql", date_column: "date_key", year_column: "year_no", calendar_type: "standard", history_provenance: "token-1" });
+    expect(calendarApiMock.autoCreate).not.toHaveBeenCalled();
   });
 
   it("in a mixed canvas+drawer sequence, undo restores the most consequential drawer edit (S5)", async () => {

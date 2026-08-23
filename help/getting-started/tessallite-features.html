@@ -79,7 +79,7 @@
 <tr><td>Predictive aggregates</td><td>Auto-probe sources, score by ROI, top-K build</td><td>Aggregates panel &gt; Predictive tab</td></tr>
 <tr><td>AI optimiser</td><td>LLM analysis of miss patterns for suggestions</td><td>Aggregates panel &gt; AI Optimiser</td></tr>
 <tr><td>Aggregate lifecycle</td><td>Auto events: created, validated, retired, evicted</td><td>Model Health &gt; Lifecycle</td></tr>
-<tr><td>Pocket tables</td><td>Materialised filtered slices with incremental refresh</td><td>Pocket Tables panel</td></tr>
+<tr><td>Pocket tables</td><td>Materialised filtered slices; incremental refresh requires the existing row key and safety checks plus complete watermark coverage for every table in the captured deployed snapshot. Under the current single-column contract, multi-table pockets always use a full CTAS rebuild (Bug-8745).</td><td>Pocket Tables panel</td></tr>
 <tr><td>Pocket auto-suggestion</td><td>Analyse repeated WHERE predicates within size budget</td><td>Pocket Tables &gt; Suggestions</td></tr>
 </tbody>
 </table>

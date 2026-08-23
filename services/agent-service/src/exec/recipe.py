@@ -144,7 +144,7 @@ async def execute_recipe(
     publisher: Any = None,
     *,
     allowed_model_ids: Collection[UUID],
-    persona_scopes: Mapping[UUID, PersonaFieldScope] | None = None,
+    persona_scopes: Mapping[UUID, PersonaFieldScope] | None,
 ) -> RecipeExecution:
     try:
         recipe_uuid = UUID(call.recipe_id)

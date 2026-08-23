@@ -26,8 +26,13 @@ import { useBuilderStore, PANEL_IDS, type PanelId } from "../store/builderStore"
 import { useModelEditorStore } from "../store/useModelEditorStore";
 import UnsavedChangesGuard from "../components/Builder/UnsavedChangesGuard";
 import VersionsDialog from "../components/Builder/VersionsDialog";
+import JoinPopulationBlockedNotice from "../components/Deploy/JoinPopulationBlockedNotice";
 import SaveVersionDialog from "../components/Builder/SaveVersionDialog";
-import { versionsApi } from "../api/versionsApi";
+import {
+  parseJoinPopulationBlockedError,
+  versionsApi,
+  type JoinPopulationBlockedDetail,
+} from "../api/versionsApi";
 import ModelImportExportDialog from "../components/importExport/ModelImportExportDialog";
 import { useConfirm } from "../components/Confirm";
 import { useState } from "react";
@@ -762,8 +767,11 @@ export function ModelToolbarActions({
   const deployedVersion = useModelEditorStore((s) => s.deployedVersion);
   const markClean = useModelEditorStore((s) => s.markClean);
   const setGlobalMessage = useBuilderStore((s) => s.setGlobalMessage);
+  const openPanel = useBuilderStore((s) => s.openPanel);
   const [versionsOpen, setVersionsOpen] = useState(false);
   const [importExportOpen, setImportExportOpen] = useState(false);
+  const [deployRefusal, setDeployRefusal] =
+    useState<JoinPopulationBlockedDetail | null>(null);
 
   // F-026-07: Save / Deploy / Undeploy are the most important builder actions.
   // A failure (viewer-role 403, expired session, 409 conflict, network) must
@@ -787,6 +795,7 @@ export function ModelToolbarActions({
   const deployMut = useMutation({
     mutationFn: () => versionsApi.deploy(projectId, modelId),
     onSuccess: (data) => {
+      setDeployRefusal(null);
       // F-026-13: deploy publishes the last-saved version, but DeployResponse
       // carries no version number, so advance the deployed pointer to the
       // last-saved version optimistically. Without this the chip compares a
@@ -802,8 +811,17 @@ export function ModelToolbarActions({
       qc.invalidateQueries({ queryKey: ["models", projectId, modelId] });
       qc.invalidateQueries({ queryKey: ["versions", projectId, modelId] });
     },
-    onError: (err) =>
-      setGlobalMessage(extractApiError(err, t("modelBuilder.deployFailed")), "error"),
+    onError: (err) => {
+      const refusal = parseJoinPopulationBlockedError(err);
+      if (refusal) {
+        setDeployRefusal(refusal);
+        return;
+      }
+      setGlobalMessage(
+        extractApiError(err, t("modelBuilder.deployFailed")),
+        "error",
+      );
+    },
   });
 
   const undeployMut = useMutation({
@@ -877,6 +895,16 @@ export function ModelToolbarActions({
 
   return (
     <>
+      {deployRefusal && (
+        <JoinPopulationBlockedNotice
+          detail={deployRefusal}
+          onClose={() => setDeployRefusal(null)}
+          onOpenJoins={() => {
+            setDeployRefusal(null);
+            openPanel("joins");
+          }}
+        />
+      )}
       <Tooltip
         title={
           isStaleDeployment
@@ -976,6 +1004,10 @@ export function ModelToolbarActions({
         onClose={() => setVersionsOpen(false)}
         projectId={projectId}
         modelId={modelId}
+        onOpenJoins={() => {
+          setVersionsOpen(false);
+          openPanel("joins");
+        }}
       />
       <SaveVersionDialog
         open={saveDialogOpen}

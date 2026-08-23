@@ -2,7 +2,7 @@
 title: "Manage Aggregate Schedules"
 audience: modeller
 area: Modelling
-updated: 2026-08-14
+updated: 2026-08-22
 ---
 
 ![Aggregates page, Refresh tab listing aggregate refresh jobs.](../assets/screencaps/scheduler-panel.png)
@@ -121,6 +121,12 @@ In the Aggregates page, Refresh tab, click **Run now** in the Actions column. Th
 2. A history drawer opens showing the last 10 refresh runs.
 3. Each entry shows start time, duration, and outcome (Success or Failed).
 4. For failed runs, click **View log** to see the full Scheduler log for that run.
+
+---
+
+## Viewing scheduler job history
+
+Open the **Scheduler** panel in Model Builder and scroll to **Scheduler Job History**. This read-only table lists every registered scheduler job with its durable last status, completion time, last error, next run, and whether the last run was scheduled or manual. It refreshes every 30 seconds. **Not run yet** means that job has no execution-ledger record yet; it does not mean the job failed.
 
 ---
 

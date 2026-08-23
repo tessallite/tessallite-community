@@ -842,8 +842,54 @@ async def delete_aggregate(
         a = await db.get(AggregateDefinition, agg_id)
         if a is None or a.model_id != model_id:
             raise HTTPException(status_code=404, detail="Aggregate not found")
+
+        # Bug-9051: deleting the DEFINITION used to leave the materialised table
+        # on the target with nothing left to find it — the definition row was the
+        # only record of its name, target and schema, and the retirement sweep
+        # only enumerates RETIRED definitions, so the storage leaked forever.
+        #
+        # Uses the SAME durable outbox the model/project cascade delete uses
+        # (Bug-8140): the drop identity is captured and persisted INSIDE this
+        # transaction, so it is durable before the owning row disappears, and the
+        # physical DROP happens only after the metadata delete has committed —
+        # the Bug-8126/Bug-9148 stop-routing-before-removal order. A failed drop
+        # leaves a retryable task row, never a routable definition over a missing
+        # table.
+        from shared.physical_cleanup import (
+            PhysicalCleanupIdentityError,
+            attempt_scheduled_physical_cleanup,
+            schedule_model_physical_cleanup,
+        )
+
+        try:
+            await schedule_model_physical_cleanup(
+                db,
+                model_id=model_id,
+                aggregate_definitions=[a],
+                pocket_definitions=[],
+                requested_by="aggregate_delete",
+            )
+        except PhysicalCleanupIdentityError as exc:
+            await db.rollback()
+            logger.error(
+                "Bug-9051: refusing to delete aggregate %s — its physical table "
+                "cannot be safely resolved for cleanup: %s",
+                agg_id, exc,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This aggregate's materialised table cannot be resolved for "
+                    "removal (its target connection is missing or belongs to "
+                    "another project). Deleting the definition now would leave "
+                    "the table behind with nothing left to find it. Repair the "
+                    "target connection and retry."
+                ),
+            ) from exc
+
         await db.delete(a)
         await db.commit()
+        await attempt_scheduled_physical_cleanup(db)
 
 
 async def _get_ai_rationale(db, agg: AggregateDefinition) -> str | None:

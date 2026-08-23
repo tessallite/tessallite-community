@@ -11,16 +11,24 @@ import VersionsDialog from "./VersionsDialog";
 // phrase 400s on every non-English locale, making rollback unusable there.
 
 const revertMock = vi.fn().mockResolvedValue({ status: "ok" });
+const deployMock = vi.fn();
 const listMock = vi.fn();
 
-vi.mock("../../api/versionsApi", () => ({
-  versionsApi: {
-    list: (...args: unknown[]) => listMock(...args),
-    revert: (...args: unknown[]) => revertMock(...args),
-    deploy: vi.fn(),
-  },
-  isSingletonDiff: () => false,
-}));
+vi.mock("../../api/versionsApi", async () => {
+  const actual = await vi.importActual<typeof import("../../api/versionsApi")>(
+    "../../api/versionsApi",
+  );
+  return {
+    ...actual,
+    versionsApi: {
+      ...actual.versionsApi,
+      list: (...args: unknown[]) => listMock(...args),
+      revert: (...args: unknown[]) => revertMock(...args),
+      deploy: (...args: unknown[]) => deployMock(...args),
+    },
+    isSingletonDiff: () => false,
+  };
+});
 
 // Bug-7616: Revert is gated on isTenantAdmin() (backend require_role("admin")),
 // which reads user_role from localStorage. Default the tests to a tenant admin
@@ -89,6 +97,7 @@ describe("VersionsDialog revert (Bug-6201)", () => {
     setRole("tenant_admin");
     confirmMock.mockResolvedValue(true);
     revertMock.mockResolvedValue({ status: "ok" });
+    deployMock.mockReset();
     listMock.mockResolvedValue([
       {
         id: VERSION_ID,
@@ -189,6 +198,59 @@ describe("VersionsDialog revert (Bug-6201)", () => {
       expect(screen.getByText(/revert failed/i)).toBeInTheDocument(),
     );
     expect(screen.getByText(/boom/i)).toBeInTheDocument();
+  });
+
+  it("renders every structured offender and leaves the deployed state unchanged", async () => {
+    deployMock.mockRejectedValue({
+      response: {
+        data: {
+          detail: {
+            code: "JOIN_POPULATION_BLOCKED",
+            message: "deployment refused",
+            threshold: 0.15,
+            joins: [
+              {
+                join_id: "join-1",
+                join_label: "Fact.customer_id ↔ Customer.id",
+                population_participation: "undeclared",
+                status: "BLOCKED",
+                row_effect_ratio: 0.2,
+                reason: "measured row effect exceeds threshold",
+              },
+              {
+                join_id: "join-2",
+                join_label: "Fact.region_id ↔ Region.id",
+                population_participation: "enrichment_only",
+                status: "BLOCKED",
+                row_effect_ratio: 0.18,
+                reason: "filtering enrichment effect exceeds threshold",
+              },
+            ],
+          },
+        },
+      },
+    });
+    listMock.mockResolvedValue([
+      {
+        id: VERSION_ID,
+        version_number: 3,
+        summary: "third",
+        created_at: "2026-07-01T00:00:00Z",
+        created_by: "someone@example.com",
+        is_deployed: false,
+      },
+    ]);
+    renderDialog();
+
+    const deployButton = await screen.findByRole("button", { name: /deploy/i });
+    await userEvent.click(deployButton);
+    await waitFor(() => expect(deployMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.getByTestId("join-population-blocked-notice")).toBeInTheDocument(),
+    );
+    expect(screen.getByText("Fact.customer_id ↔ Customer.id")).toBeInTheDocument();
+    expect(screen.getByText("Fact.region_id ↔ Region.id")).toBeInTheDocument();
+    expect(screen.queryByText(/deployment refused/)).not.toBeInTheDocument();
   });
 
   // Bug-7152: revert must also invalidate the schema-v3 caches that live under

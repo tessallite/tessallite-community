@@ -385,8 +385,8 @@ describe('TESSALLITE.LISTBYID (legacy ID-based)', () => {
     }, { interval: 1, timeout: 100 });
   });
 
-  it('returns (empty set) for empty result', async () => {
-    setAuth('jwt-token', 'https://test.tessallite.com', 'proj-1', 'model-1');
+  it('returns an empty matrix for an empty result instead of a fake member caption (Bug-9229)', async () => {
+    setAuth('jwt-token', 'https://test.tessallite.com', 'proj-1', 'model-1', 'persona-ar');
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
       ok: true,
       json: () => Promise.resolve({ items: [], total_count: 0, truncated: false }),
@@ -401,8 +401,12 @@ describe('TESSALLITE.LISTBYID (legacy ID-based)', () => {
     registered['LISTBYID']('ns-empty', invocation);
 
     await vi.waitFor(() => {
-      expect(resultValue).toEqual([['(empty set)']]);
+      expect(resultValue).toEqual([]);
     }, { interval: 1, timeout: 100 });
+    expect(fetch).toHaveBeenCalledWith(
+      'https://test.tessallite.com/api/v1/projects/proj-1/models/model-1/named-sets/ns-empty/preview?deployed_only=true&persona_id=persona-ar',
+      expect.objectContaining({ method: 'POST' }),
+    );
   });
 
   it('returns error on API failure', async () => {

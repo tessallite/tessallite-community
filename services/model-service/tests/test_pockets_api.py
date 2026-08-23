@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import types
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.exc import IntegrityError, InvalidRequestError
 
-from shared.db.models import Model, PocketDefinition, PocketRefreshPolicy
+from shared.db.models import Model, PocketDefinition, PocketPredicate, PocketRefreshPolicy
 
 from .conftest import (
     TEST_MODEL_ID,
@@ -193,6 +195,60 @@ async def test_pocket_metrics_zero_match_signal(client):
     assert data["top_skip_count"] == 4
     # the single top pocket is flagged as not matched since refresh
     assert data["top_pockets"][0]["matched_since_refresh"] is False
+
+
+@pytest.mark.asyncio
+async def test_g4_sol_r1_b04_metrics_account_for_ineligible_pockets(client):
+    """Eligibility is a first-class metric and all active states reconcile."""
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+    now = datetime.now(timezone.utc)
+    pockets = [
+        types.SimpleNamespace(
+            id="fresh", physical_table_name="p_fresh", status="fresh",
+            population_eligibility="eligible", hit_count=0, ttl_days=14,
+            time_saved_ms_total=0, storage_bytes=0, retired_at=None,
+            last_access_at=now, last_refresh_at=now, last_match_at=now,
+        ),
+        types.SimpleNamespace(
+            id="parked", physical_table_name="p_parked", status="fresh",
+            population_eligibility="ineligible", hit_count=0, ttl_days=14,
+            time_saved_ms_total=0, storage_bytes=0, retired_at=None,
+            last_access_at=now, last_refresh_at=now, last_match_at=None,
+        ),
+        types.SimpleNamespace(
+            id="stale", physical_table_name="p_stale", status="stale",
+            population_eligibility="unknown", hit_count=0, ttl_days=14,
+            time_saved_ms_total=0, storage_bytes=0, retired_at=None,
+            last_access_at=now, last_refresh_at=now, last_match_at=None,
+        ),
+    ]
+
+    async def _get(cls, obj_id):
+        if cls is Model and str(obj_id) == str(TEST_MODEL_ID):
+            return scoped_model
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+    calls = {"n": 0}
+
+    async def _execute(_stmt):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _result_with(pockets)
+        return types.SimpleNamespace(all=lambda: [("source", 1)])
+
+    db.execute = _execute
+    with patch("src.api.pockets.get_tenant_db", async_gen_from(db)):
+        resp = await client.get(f"{PREFIX}/metrics")
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total_pockets"] == 3
+    assert data["fresh_pockets"] == 1
+    assert data["stale_pockets"] == 1
+    assert data["ineligible_pockets"] == 1
+    assert data["fresh_pockets"] + data["stale_pockets"] + data["invalidating_pockets"] + data["failed_pockets"] + data["ineligible_pockets"] == data["total_pockets"]
 
 
 @pytest.mark.asyncio
@@ -1269,6 +1325,159 @@ def _pocket_response_stub(predicate_rows):
 
 
 @pytest.mark.asyncio
+async def test_compound_edit_is_one_locked_atomic_route_write(client):
+    """L13-F6: production compound route owns one lock and one commit.
+
+    The response query is kept at the route boundary, so this proves the
+    definition and policy are accepted through the shipped endpoint together,
+    rather than only asserting a mocked hook call.
+    """
+    db = make_mock_db()
+    scoped_model = types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+    pocket = PocketDefinition(
+        model_id=TEST_MODEL_ID,
+        target_id=uuid.uuid4(),
+        physical_table_name="pocket_x",
+        defining_sql="SELECT 1",
+        query_fingerprint="old",
+        predicate_set_hash="old-hash",
+        refresh_policy="schedule",
+        ttl_days=14,
+        status="stale",
+    )
+    pocket.id = uuid.uuid4()
+    policy = PocketRefreshPolicy(
+        pocket_definition_id=pocket.id,
+        cron_expression="0 2 * * *",
+        is_enabled=False,
+    )
+
+    async def _get(cls, obj_id):
+        if cls is Model:
+            return scoped_model
+        if cls is PocketDefinition:
+            return pocket
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+    response_result = MagicMock()
+    response_result.scalar_one.return_value = _pocket_response_stub([])
+    policy_result = MagicMock()
+    policy_result.scalar_one_or_none.return_value = policy
+    db.execute = AsyncMock(side_effect=[MagicMock(), policy_result, response_result])
+    lock = AsyncMock()
+    router_response = _router_response(query_fingerprint="new-fingerprint")
+
+    with (
+        patch("src.api.pockets.get_tenant_db", async_gen_from(db)),
+        patch("src.api.pockets.acquire_model_definition_lock", lock),
+        patch("src.api.pockets._validate_via_router", AsyncMock(return_value=router_response)),
+    ):
+        resp = await client.post(
+            f"{PREFIX}/{pocket.id}/compound-edit",
+            json={
+                "definition": {"defining_sql": "SELECT 2"},
+                "policy": {"cron_expression": "0 3 * * *", "is_enabled": True},
+            },
+            headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 200, resp.text
+    lock.assert_awaited_once_with(db, TEST_MODEL_ID)
+    db.commit.assert_awaited_once()
+    assert pocket.defining_sql == "SELECT 2"
+    assert policy.cron_expression == "0 3 * * *"
+    assert policy.is_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_l13_r2_f7_compound_edit_enforces_canonical_invariants(client):
+    """Compound history writes must share PATCH structure/policy/conflict gates."""
+
+    async def run_case(*, router_response=None, policy_values=None, commit_error=None, body):
+        db = make_mock_db()
+        scoped_model = types.SimpleNamespace(
+            id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID, slug="modely",
+        )
+        pocket = PocketDefinition(
+            model_id=TEST_MODEL_ID, target_id=uuid.uuid4(),
+            physical_table_name="pocket_x", defining_sql="SELECT * FROM modely",
+            query_fingerprint="old", predicate_set_hash="old-hash",
+            refresh_policy="manual", ttl_days=14, status="stale",
+        )
+        pocket.id = uuid.uuid4()
+        policy = PocketRefreshPolicy(
+            pocket_definition_id=pocket.id,
+            cron_expression="0 2 * * *", is_enabled=False,
+        )
+
+        async def _get(cls, obj_id):
+            if cls is Model:
+                return scoped_model
+            if cls is PocketDefinition:
+                return pocket
+            return None
+
+        db.get = AsyncMock(side_effect=_get)
+        policy_result = MagicMock()
+        policy_result.scalar_one_or_none.return_value = policy
+        db.execute = AsyncMock(side_effect=[MagicMock(), policy_result])
+        db.commit = AsyncMock(side_effect=commit_error)
+        db.rollback = AsyncMock()
+        with (
+            patch("src.api.pockets.get_tenant_db", async_gen_from(db)),
+            patch("src.api.pockets.acquire_model_definition_lock", new=AsyncMock()),
+            patch("src.api.pockets._validate_via_router", AsyncMock(return_value=router_response)),
+            patch("src.api.pockets.get_setting", AsyncMock(return_value=policy_values or ["manual", "schedule", "event"])),
+        ):
+            response = await client.post(
+                f"{PREFIX}/{pocket.id}/compound-edit",
+                json=body,
+                headers=AUTH_HEADERS,
+            )
+        return response, db
+
+    invalid_structure, invalid_db = await run_case(
+        router_response=_router_response(from_tables=["demo_data.sales_data"]),
+        body={
+            "definition": {"defining_sql": "SELECT * FROM demo_data.sales_data"},
+            "policy": {"cron_expression": None, "is_enabled": False},
+        },
+    )
+    assert invalid_structure.status_code == 422
+    assert "FROM_NOT_MODEL" in invalid_structure.text
+    invalid_db.commit.assert_not_awaited()
+    assert not any(
+        call.args and isinstance(call.args[0], PocketPredicate)
+        for call in invalid_db.add.call_args_list
+    )
+
+    tenant_policy, tenant_db = await run_case(
+        policy_values=["manual", "schedule"],
+        body={
+            "definition": {"refresh_policy": "event"},
+            "policy": {"cron_expression": None, "is_enabled": False},
+        },
+    )
+    assert tenant_policy.status_code == 400
+    assert "refresh_policy must be one of" in tenant_policy.text
+    tenant_db.commit.assert_not_awaited()
+
+    duplicate, duplicate_db = await run_case(
+        router_response=_router_response(query_fingerprint="duplicate-shape"),
+        commit_error=IntegrityError("duplicate", {}, Exception("duplicate")),
+        body={
+            "definition": {"defining_sql": "SELECT * FROM modely"},
+            "policy": {"cron_expression": None, "is_enabled": False},
+        },
+    )
+    assert duplicate.status_code == 409
+    assert "same query shape" in duplicate.text
+    duplicate_db.commit.assert_awaited_once()
+    duplicate_db.rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_create_pocket_rejects_cross_connector_target(client):
     """Bug-5475: a pocket whose source connector differs from its target
     connector (e.g. BigQuery source -> PostgreSQL target) is rejected at
@@ -1764,6 +1973,34 @@ def _pocket_row():
     )
 
 
+class _RollbackExpiredPocket:
+    """Raise like an expired async ORM attribute after rollback."""
+
+    def __init__(self):
+        self._id = uuid.uuid4()
+        self.model_id = TEST_MODEL_ID
+        self.physical_table_name = "pocket_abc"
+        self.target_schema = "public"
+        self.target_id = uuid.uuid4()
+        self.status = "fresh"
+        self.retired_at = None
+        self.expired = False
+
+    @property
+    def id(self):
+        if self.expired:
+            raise InvalidRequestError(
+                "greenlet_spawn has not been called; expired pocket.id"
+            )
+        return self._id
+
+
+@asynccontextmanager
+async def _noop_pocket_delete_lock(*_args, **_kwargs):
+    """Keep API unit tests independent of PostgreSQL advisory-lock plumbing."""
+    yield
+
+
 @pytest.mark.asyncio
 async def test_bug_8581_delete_pocket_evicts_the_query_router_cache(client):
     """Observed live (LIVE-POCKET-RLS-001): after a pocket DELETE returned 204
@@ -1787,6 +2024,7 @@ async def test_bug_8581_delete_pocket_evicts_the_query_router_cache(client):
         patch("src.api.pockets.get_tenant_db", async_gen_from(db)),
         patch.object(_pockets, "_get_scoped_model", new=AsyncMock(return_value=model)),
         patch.object(_pockets, "drop_pocket_storage", new=AsyncMock()),
+        patch.object(_pockets, "pocket_refresh_lock", new=_noop_pocket_delete_lock),
         patch.object(_pockets, "_evict_query_router_cache", evict),
     ):
         resp = await client.delete(f"{PREFIX}/{pocket.id}", headers=AUTH_HEADERS)
@@ -1829,9 +2067,107 @@ async def test_bug_8581_delete_still_succeeds_when_the_router_is_unreachable(cli
         patch("src.api.pockets.get_tenant_db", async_gen_from(db)),
         patch.object(_pockets, "_get_scoped_model", new=AsyncMock(return_value=model)),
         patch.object(_pockets, "drop_pocket_storage", new=AsyncMock()),
+        patch.object(_pockets, "pocket_refresh_lock", new=_noop_pocket_delete_lock),
         patch("httpx.AsyncClient", _BrokenClient),
     ):
         resp = await client.delete(f"{PREFIX}/{pocket.id}", headers=AUTH_HEADERS)
 
     assert resp.status_code == 204, resp.text
     assert db.delete.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_bug9430_delete_returns_retryable_conflict_when_refresh_is_in_flight(client):
+    """Delete must not race a live pocket CTAS/streaming refresh."""
+    from shared.pocket_refresh_lock import PocketRefreshInFlightError
+    from src.api import pockets as _pockets
+
+    pocket = _pocket_row()
+    model = types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+    db = make_mock_db()
+    db.get = AsyncMock(return_value=pocket)
+
+    @asynccontextmanager
+    async def _conflict(*_args, **_kwargs):
+        raise PocketRefreshInFlightError(pocket.id)
+        yield  # pragma: no cover
+
+    with (
+        patch("src.api.pockets.get_tenant_db", async_gen_from(db)),
+        patch.object(_pockets, "_get_scoped_model", new=AsyncMock(return_value=model)),
+        patch.object(_pockets, "pocket_refresh_lock", new=_conflict),
+        patch.object(_pockets, "drop_pocket_storage", new=AsyncMock()),
+    ):
+        resp = await client.delete(f"{PREFIX}/{pocket.id}", headers=AUTH_HEADERS)
+
+    assert resp.status_code == 409, resp.text
+    assert "in flight" in resp.json()["detail"]
+    db.delete.assert_not_awaited()
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bug8579_delete_surfaces_storage_failure_and_retains_metadata(client):
+    """A failed physical drop is evidence of incomplete cleanup, not 204."""
+    from src.api import pockets as _pockets
+
+    pocket = _pocket_row()
+    model = types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+    db = make_mock_db()
+    db.get = AsyncMock(return_value=pocket)
+
+    with (
+        patch("src.api.pockets.get_tenant_db", async_gen_from(db)),
+        patch.object(_pockets, "_get_scoped_model", new=AsyncMock(return_value=model)),
+        patch.object(_pockets, "pocket_refresh_lock", new=_noop_pocket_delete_lock),
+        patch.object(
+            _pockets,
+            "drop_pocket_storage",
+            new=AsyncMock(side_effect=RuntimeError("target unavailable")),
+        ),
+    ):
+        resp = await client.delete(f"{PREFIX}/{pocket.id}", headers=AUTH_HEADERS)
+
+    assert resp.status_code == 503, resp.text
+    assert "not deleted" in resp.json()["detail"]
+    db.delete.assert_not_awaited()
+    db.commit.assert_not_awaited()
+    db.rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bug8579_delete_does_not_read_expired_pocket_after_rollback(client):
+    """Rollback expiration cannot turn the retained-metadata 503 into a 500."""
+    from src.api import pockets as _pockets
+
+    pocket = _RollbackExpiredPocket()
+    model = types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+    db = make_mock_db()
+    db.get = AsyncMock(return_value=pocket)
+    original_rollback = db.rollback
+
+    async def _rollback_and_expire():
+        pocket.expired = True
+        await original_rollback()
+
+    db.rollback = AsyncMock(side_effect=_rollback_and_expire)
+
+    with (
+        patch("src.api.pockets.get_tenant_db", async_gen_from(db)),
+        patch.object(_pockets, "_get_scoped_model", new=AsyncMock(return_value=model)),
+        patch.object(_pockets, "pocket_refresh_lock", new=_noop_pocket_delete_lock),
+        patch.object(
+            _pockets,
+            "drop_pocket_storage",
+            new=AsyncMock(side_effect=RuntimeError("target unavailable")),
+        ),
+    ):
+        resp = await client.delete(
+            f"{PREFIX}/{pocket._id}", headers=AUTH_HEADERS,
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert "not deleted" in resp.json()["detail"]
+    db.delete.assert_not_awaited()
+    db.commit.assert_not_awaited()
+    db.rollback.assert_awaited_once()

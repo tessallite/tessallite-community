@@ -40,6 +40,7 @@ import type {
   PocketViolationItem,
 } from "../../api/types";
 import { useConfirm } from "../Confirm";
+import { recordCreate, recordUpdate } from "../Builder/emitDrawerHistory";
 import { FrequencyPicker, RefreshRunHistory, cronToPreset, presetToCron } from "../Refresh";
 import SqlQueryEditor from "../Sql/SqlQueryEditor";
 
@@ -208,29 +209,78 @@ export default function PocketDrawer({
           incremental_column: incrementalColumn || null,
           incremental_lookback_hours: incrementalColumn ? lookbackHours : null,
         };
-        return pocketsApi.create(projectId, modelId, payload);
+        const created = await pocketsApi.create(projectId, modelId, payload);
+        return {
+          result: created,
+          history: { kind: "create" as const, id: created.id, data: payload as unknown as Record<string, unknown> },
+        };
       }
       if (!pocket) throw new Error(t("pocket.noPocketError"));
       const sqlChanged = definingSql !== initialSql;
       const incChanged = incrementalColumn !== initialIncrementalColumn || lookbackHours !== initialLookbackHours;
-      const policyChanged = refreshPolicy !== initialRefreshPolicy;
+      const policyChanged =
+        refreshPolicy !== initialRefreshPolicy ||
+        cron !== initialCron ||
+        enabled !== initialEnabled;
+      const patchBody: PocketUpdate = {};
       if (sqlChanged || incChanged || policyChanged) {
-        const patchBody: PocketUpdate = {};
         if (sqlChanged) patchBody.defining_sql = definingSql;
         if (policyChanged) patchBody.refresh_policy = refreshPolicy;
         if (incChanged) {
           patchBody.incremental_column = incrementalColumn || null;
           patchBody.incremental_lookback_hours = incrementalColumn ? lookbackHours : null;
         }
-        await pocketsApi.update(projectId, modelId, pocket.id, patchBody);
       }
-      await pocketsApi.setPolicy(projectId, modelId, pocket.id, {
+      const nextPolicy = {
         cron_expression: (isEvent || isManual) ? null : (cron || null),
         is_enabled: (isEvent || isManual) ? false : enabled,
-      });
-      return pocket;
+      };
+      if (Object.keys(patchBody).length > 0 || policyChanged) {
+        await pocketsApi.updateCompound(projectId, modelId, pocket.id, {
+          definition: patchBody,
+          policy: nextPolicy,
+        });
+      }
+      const priorBody: PocketUpdate = {};
+      if (patchBody.defining_sql !== undefined) priorBody.defining_sql = initialSql;
+      if (patchBody.refresh_policy !== undefined) priorBody.refresh_policy = initialRefreshPolicy;
+      if (patchBody.incremental_column !== undefined) {
+        priorBody.incremental_column = initialIncrementalColumn || null;
+        priorBody.incremental_lookback_hours = initialIncrementalColumn ? initialLookbackHours : null;
+      }
+      const priorPolicy = {
+        cron_expression: initialCron || null,
+        is_enabled: initialEnabled,
+      };
+      const historyData = {
+        ...patchBody,
+        ...(policyChanged ? { __policy: nextPolicy } : {}),
+      };
+      const historyPrior = {
+        ...priorBody,
+        ...(policyChanged ? { __policy: priorPolicy } : {}),
+      };
+      return {
+        result: pocket,
+        history: Object.keys(historyData).length > 0
+          ? {
+              kind: "update" as const,
+              id: pocket.id,
+              prior: historyPrior as unknown as Record<string, unknown>,
+              data: historyData as unknown as Record<string, unknown>,
+            }
+          : null,
+      };
     },
-    onSuccess: () => {
+    onSuccess: ({ history }) => {
+      // Bug-9395/F-026-10: pocket definition and refresh-policy writes are
+      // reversible through the pocket adapter. The adapter strips history
+      // metadata before sending the normal definition/policy requests.
+      if (history?.kind === "create") {
+        recordCreate("pocket", history.id, history.data);
+      } else if (history?.kind === "update") {
+        recordUpdate("pocket", history.id, history.prior, history.data);
+      }
       qc.invalidateQueries({ queryKey: ["pockets", projectId, modelId] });
       qc.invalidateQueries({ queryKey: ["pocket-policy", projectId, modelId] });
       onClose();

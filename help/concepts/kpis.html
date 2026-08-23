@@ -209,6 +209,7 @@
 
 <h3>How evaluation works</h3>
 <p>The scorecard evaluates KPIs using the <code>evaluate-batch</code> endpoint. Each KPI's expression is compiled to SQL and executed via the query-router. Results include the computed value, formatted value, status code, status colour, trend direction, and sparkline data points. Results are cached with a configurable TTL. The cache is invalidated when a KPI is created, updated, deleted, reverted, or the model is deployed. Composite-child changes also invalidate the parent and KPIs that depend on it.</p>
+<p>In XMLA pivots, an ordinary dimension slicer is translated into governed KPI filters, so value, goal and status are calculated for the same slice. Filtered requests are not served from the model-wide KPI cache or measure prefetch. If a calculated set, range union, unknown dimension or other slicer shape has no exact filter equivalent, Tessallite refuses the request instead of showing an unsliced certified result.</p>
 
 <h2>Snapshots</h2>
 <p>KPIs can capture periodic snapshots of their evaluated values for historical tracking. Snapshot frequency and retention are configured per KPI in the wizard (only available for non-draft KPIs).</p>

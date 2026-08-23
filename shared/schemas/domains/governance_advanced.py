@@ -162,6 +162,10 @@ class QueryLogResponse(OrmBase):
     route_type: str
     aggregate_id: Optional[uuid.UUID]
     pocket_id: Optional[uuid.UUID]
+    # Bug-9172: optional attribution for the existing Named Query observation
+    # row. Ordinary query-log rows remain valid with both values null.
+    named_query_id: Optional[uuid.UUID] = None
+    named_query_fallback_reason: Optional[str] = None
     # F-030-20: the row-security rules applied to this query were recorded on the
     # QueryLog row (models.py: security_rules_applied JSONB) but never surfaced,
     # so auditors could not see which rules fired without raw DB access. Exposed
@@ -1265,6 +1269,35 @@ class NamedQueryRefreshRunResponse(OrmBase):
     triggered_by: str = "scheduler"
 
 
+class NamedQueryFallbackReasonCount(BaseModel):
+    """Count of one source-fallback reason in a Named Query's window."""
+
+    reason: str
+    count: int
+
+
+class NamedQueryAnalyticsResponse(BaseModel):
+    """Existing QueryLog cost telemetry attributed to one Named Query.
+
+    ``recommendation`` is deliberately a closed, Named-Query-owned action: a
+    sustained expensive fallback can ask the modeller to repair/refresh/adjust
+    this object's materialisation, but can never suggest an aggregate copy.
+    """
+
+    named_query_id: uuid.UUID
+    window_days: int
+    total_queries: int
+    materialized_queries: int
+    fallback_queries: int
+    fallback_failures: int
+    fallback_rate: float
+    avg_fallback_execution_ms: Optional[float] = None
+    avg_fallback_bytes_processed: Optional[float] = None
+    fallback_reasons: list[NamedQueryFallbackReasonCount] = Field(default_factory=list)
+    recommendation: str = "none"
+    recommendation_reason: Optional[str] = None
+
+
 class NamedQueryResponse(OrmBase):
     id: uuid.UUID
     model_id: uuid.UUID
@@ -1816,6 +1849,26 @@ class KPIAdhocRequest(BaseModel):
     filters: Optional[list[dict]] = None
     time_dimension: Optional[str] = None
     business_definition: Optional[dict] = None
+    # Bug-8570: the builder preview must evaluate under the SAME semi-additive
+    # rules the KPI will serve once saved. Without these the preview showed the
+    # un-reduced per-period SUM (the sum of every day's balance) for a KPI that
+    # serves the closing balance — the modeller then saves on a number the
+    # product will never show them again.
+    at_grain: Optional[str] = None
+    non_additive_agg: Optional[str] = None
+    carry_forward: bool = False
+
+    # Bug-8573: same closed vocabularies as KPICreate/KPIUpdate. A preview that
+    # accepted a value the save endpoint rejects is a contract split.
+    @field_validator("at_grain")
+    @classmethod
+    def _check_at_grain(cls, v: str | None) -> str | None:
+        return _validate_kpi_at_grain(v)
+
+    @field_validator("non_additive_agg")
+    @classmethod
+    def _check_non_additive_agg(cls, v: str | None) -> str | None:
+        return _validate_kpi_non_additive_agg(v)
 
 
 class KPIBatchRequest(BaseModel):
@@ -2036,6 +2089,7 @@ class SavedQueryCreate(BaseModel):
     # arbitrary query_type stored here would render as garbage in the panel
     # badge and could never be routed. Constrain to the supported set (F-029-16).
     query_type: Literal["sql", "dax"] = "sql"
+    is_shared: bool = False
 
 
 class SavedQueryUpdate(BaseModel):
@@ -2043,6 +2097,7 @@ class SavedQueryUpdate(BaseModel):
     description: Optional[str] = None
     query_text: Optional[str] = None
     query_type: Optional[Literal["sql", "dax"]] = None
+    is_shared: Optional[bool] = None
 
 
 class SavedQueryResponse(OrmBase):
@@ -2053,6 +2108,7 @@ class SavedQueryResponse(OrmBase):
     query_text: str
     query_type: str
     created_by: str
+    is_shared: bool
     created_at: datetime
     updated_at: datetime
     is_owner: Optional[bool] = None

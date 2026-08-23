@@ -42,6 +42,7 @@ The FakeDB scaffold mirrors the proven pattern in ``test_calculated_rewrite.py``
 from __future__ import annotations
 
 import os
+import sqlite3
 import types
 from pathlib import Path
 
@@ -243,6 +244,13 @@ def _fact_db(*, dimensions=(), measures=(), udas=()):
     ]
     return FakeDB(tables=[fact], columns=cols, measures=list(measures),
                   dimensions=list(dimensions), udas=list(udas))
+
+
+def _single_implicit_fact_db(*, dimensions=()):
+    """One table with no explicit fact designation (Bug-8614 contract)."""
+    table = _tbl("t-single", "demo.modely", "m", table_type="dim_detail")
+    cols = [_col("c-risk", "t-single", "risk_score_name")]
+    return FakeDB(tables=[table], columns=cols, dimensions=list(dimensions))
 
 
 def _join_db(*, dimensions=(), measures=(),
@@ -908,6 +916,34 @@ async def test_render_golden_source(shape, dialect):
     _common_assertions(sql, shape, dialect)
 
 
+@pytest.mark.asyncio
+async def test_bug_8614_dimension_only_group_by_and_distinct_are_supported():
+    """A single-table implicit-fact model keeps dimension-only query shapes.
+
+    Bug-8614's deploy anchor rule must not become a projection rule: these are
+    valid source-route queries even though ``risk_score_name`` is the only
+    projected column.
+    """
+    dimension = _dim("risk_score_name", source_column_id="c-risk")
+    db = _single_implicit_fact_db(dimensions=[dimension])
+    for query, expected in (
+        ("SELECT risk_score_name FROM modely GROUP BY risk_score_name", "GROUP BY"),
+        ("SELECT DISTINCT risk_score_name FROM modely", "DISTINCT"),
+    ):
+        bq = _bound(
+            measures=[], dimensions=[dimension], grain=["risk_score_name"],
+            raw_query=query,
+            select_expressions=[
+                _se("risk_score_name", classification="passthrough", inner_column="risk_score_name")
+            ],
+            has_distinct="DISTINCT" in query,
+        )
+        _attach_deployed_shape(bq, db)
+        sql = await rewrite_for_source(bq, db, target_dialect="postgres")
+        assert expected in sql.upper()
+        assert "risk_score_name" in sql
+
+
 @pytest.mark.parametrize("shape,dialect", _flatten(AGGREGATE_SCENARIOS))
 def test_render_golden_aggregate(shape, dialect):
     """Aggregate-routed shapes via ``rewrite_for_aggregate``."""
@@ -1546,7 +1582,7 @@ async def test_persona_star_expr_order_excluded_col_suppresses_offset():
 # ---------------------------------------------------------------------------
 
 
-def _persona_star_join_db():
+def _persona_star_join_db(*, population_defining=False):
     """Fact ``demo.sales`` (alias 'f') joined to dim ``demo.country`` (alias
     'd') on ``country_id = id``. The fact carries a HIDDEN ``secret_code``
     column that the persona narrowing removed — it must NEVER appear in the
@@ -1566,6 +1602,9 @@ def _persona_star_join_db():
         left_table_id="t-fact", left_column_id="c-fkey",
         right_table_id="t-dim", right_column_id="c-dkey",
         join_type="inner",
+        population_participation=(
+            "population_defining" if population_defining else "enrichment_only"
+        ),
     )
     return FakeDB(tables=[fact, dimt], columns=cols, joins=[join])
 
@@ -1755,4 +1794,84 @@ async def test_non_narrowed_star_unchanged():
     sql = await rewrite_for_source(bq, db, target_dialect="postgres")
     # The non-narrowed path keeps SELECT * (table-name substituted).
     assert "*" in sql, f"non-narrowed star unexpectedly rewritten: {sql}"
+    _assert_self_parses(sql, "postgres")
+
+
+@pytest.mark.asyncio
+async def test_bug_l3_ch_001_unrestricted_star_keeps_population_join():
+    """SELECT * must exclude dangling fact rows under a mandatory INNER edge."""
+    bq = _bound(
+        measures=[], dimensions=[], grain=[], from_tables=[MODEL_SLUG],
+        select_star=True, raw_query="SELECT * FROM golden",
+    )
+    bq.model.deployed_version_id = "v-population-star"
+    db = _persona_star_join_db(population_defining=True)
+    _attach_deployed_shape(bq, db)
+    sql = await rewrite_for_source(bq, db, target_dialect="postgres")
+    assert "INNER JOIN" in sql.upper()
+    assert '"demo"."country"' in sql
+    _assert_self_parses(sql, "postgres")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw_query",
+    [
+        "SELECT * FROM golden",
+        "SELECT golden.* FROM golden",
+        "SELECT g.* FROM golden AS g",
+    ],
+)
+async def test_bug_l3_fg_b01_unrestricted_population_star_preserves_base_schema(
+    raw_query,
+):
+    """A population join must not widen an unrestricted star projection."""
+    bq = _bound(
+        measures=[], dimensions=[], grain=[], from_tables=[MODEL_SLUG],
+        select_star=True, raw_query=raw_query,
+    )
+    bq.model.deployed_version_id = "v-population-star-schema"
+    db = _persona_star_join_db(population_defining=True)
+    _attach_deployed_shape(bq, db)
+
+    sql = await rewrite_for_source(bq, db, target_dialect="postgres")
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("ATTACH DATABASE ':memory:' AS demo")
+        connection.execute(
+            "CREATE TABLE demo.sales "
+            "(region TEXT, amount NUMERIC, secret_code TEXT, country_id INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE demo.country (id INTEGER, country_name TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO demo.sales VALUES (?, ?, ?, ?)",
+            [("EU", 10, "S1", 1), ("NA", 20, "S2", 99)],
+        )
+        connection.execute("INSERT INTO demo.country VALUES (1, 'Spain')")
+        cursor = connection.execute(sql)
+        assert [column[0] for column in cursor.description] == [
+            "region", "amount", "secret_code", "country_id",
+        ]
+        assert cursor.fetchall() == [("EU", 10, "S1", 1)]
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_bug_l3_ch_001_persona_fact_only_star_keeps_population_join():
+    """CLS narrowing must not turn a mandatory population join into base-only."""
+    region = _dim("region", source_column_id="c-region")
+    bq = _persona_star_bound(
+        dimensions=[region], measures=[], raw_query="SELECT * FROM golden",
+    )
+    bq.model.deployed_version_id = "v-population-persona-star"
+    db = _persona_star_join_db(population_defining=True)
+    _attach_deployed_shape(bq, db)
+    sql = await _build_persona_star_sql(bq, db, "postgresql", "postgres")
+    assert "SELECT *" not in sql.upper()
+    assert "INNER JOIN" in sql.upper()
+    assert '"demo"."country"' in sql
     _assert_self_parses(sql, "postgres")

@@ -541,6 +541,13 @@ def _create_persona(token: str, project_id: str, model_id: str,
                     "included_measure_ids": measure_ids,
                     "included_dimension_ids": dimension_ids,
                     "includes_hidden_columns": includes_hidden,
+                    # Bug-9462 / F-008-03: a visibility-narrowing persona must name
+                    # at least one audience role, else it is assigned to nobody and
+                    # the restriction never applies. This suite's caller is the
+                    # tenant admin (BATCH_TENANT_EMAIL); name that role so the
+                    # restricted persona actually gates the caller's queries — the
+                    # pre-F-008-03 empty-audience behaviour this test relied on.
+                    "audience_roles": ["tenant_admin"],
                 })
     return str(resp.get("id") or resp.get("persona_id", ""))
 
@@ -935,6 +942,15 @@ def _validate_query(q: SecurityQuery, result: QueryResult,
                 "PERSONA_COMPLEX_SQL_NOT_ALLOWED",
                 "row_security_unsupported_shape",
                 "row_security_misconfigured",
+                # Bug-9462: over the JDBC / PostgreSQL-wire transport (protocol
+                # "jdbc"), a PG error is a MESSAGE string, not an app-level JSON
+                # error_code — so the persona/CLS denial surfaces as the
+                # non-disclosing OBJECT_NOT_AVAILABLE MESSAGE
+                # (persona_gate._PERSONA_DENY_MESSAGE), not the code token. This
+                # phrase is that exact denial message; recognising it is the JDBC
+                # form of the same non-disclosing OBJECT_NOT_AVAILABLE signal (no
+                # less specific — the code is equally used for missing-or-blocked).
+                "not available for this query",
             )
             if any(tok.lower() in text.lower() for tok in tokens):
                 return "PASS", f"Correctly blocked: {result.error[:80]}"

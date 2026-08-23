@@ -106,6 +106,36 @@ beforeAll(async () => {
 });
 
 describe("i18n en.json coverage", () => {
+  it("keeps delete-dialog translations as escaped text, not HTML fragments (Bug-9211)", () => {
+    const keys = [
+      "connections.deleteMessage",
+      "measures.deleteConfirm",
+      "measures.deleteVariantsPlural",
+      "measures.deleteVariantsSingular",
+    ];
+    for (const locale of ["en", ...PARKED_LOCALES]) {
+      const messages = getMessages(locale);
+      for (const key of keys) {
+        expect(messages[key], `${locale}.${key}`).not.toMatch(/<\/?[A-Za-z][^>]*>/);
+      }
+    }
+  });
+
+  it("keeps the SQL editor placeholder stable across locales (Bug-9211)", () => {
+    // SQL is an executable example, not prose to translate. Changing its
+    // selected columns or clauses in one locale gives users a different
+    // query shape and can turn a harmless placeholder into an invalid query.
+    const english = readDomainMessages("en", "explorer.json")["query.placeholder"];
+    expect(english).toBe('SELECT * FROM "{{slug}}" LIMIT 10');
+    for (const locale of ["en", ...PARKED_LOCALES]) {
+      const value = readDomainMessages(locale, "explorer.json")["query.placeholder"];
+      expect(value, `${locale}.query.placeholder`).toBe(english);
+      expect(value.replaceAll("{{slug}}", "model_slug")).toBe(
+        'SELECT * FROM "model_slug" LIMIT 10',
+      );
+    }
+  });
+
   it("resolves every static t(\"...\") key used in source code", () => {
     const used = collectStaticKeys();
     const missing: string[] = [];

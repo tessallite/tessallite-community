@@ -114,6 +114,69 @@ async def test_adhoc_trend_series_none_for_time_intelligence_expression(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reduction",
+    [
+        {"at_grain": "day"},
+        {"non_additive_agg": "last"},
+        {"carry_forward": True},
+    ],
+    ids=["at_grain", "non_additive_agg", "carry_forward"],
+)
+async def test_adhoc_trend_series_refuses_every_field_of_the_reduction(
+    monkeypatch, reduction,
+):
+    """L7B-01 — the sparkline gate must know all THREE reduction fields.
+
+    A semi-additive reduction cannot be applied per period in one grouped
+    SELECT, so this builder returns no series rather than un-reduced per-period
+    sums (Bug-8570). ``carry_forward`` was missing from that gate: since
+    Bug-9482 routes a carry-forward-only KPI through the bucketed builder, the
+    preview SCALAR is a per-bucket reduction while the sparkline beside it drew
+    raw per-period sums — a balance of 90 under a series whose last point is
+    310.
+
+    Parameterised over the whole reduction vocabulary so adding a fourth field
+    to it and forgetting this gate fails here.
+    """
+    # A router that SUCCEEDS with a drawable two-point series. Raising here
+    # would be swallowed by the builder's best-effort ``except Exception ->
+    # None`` and the test would pass against a missing gate.
+    issued: list[str] = []
+
+    async def fake_router(model_id, sql, bearer, **kw):
+        issued.append(sql)
+        return {
+            "rows": [
+                {"period": "2026-02-01", "value": 310},
+                {"period": "2026-01-01", "value": 20},
+            ]
+        }
+
+    monkeypatch.setattr(kpis_mod, "_execute_via_router", fake_router)
+
+    series = await kpis_mod._build_adhoc_trend_series(
+        'measure("Balance")',
+        model_id="m1",
+        model_slug="SalesModel",
+        bearer="t",
+        measure_map={"Balance": _measure("Balance")},
+        ctx=_Ctx(),
+        time_column="order_date",
+        trend_period="month",
+        filter_where_clause=None,
+        n_periods=12,
+        **reduction,
+    )
+    assert issued == [], (
+        f"a reduced KPI ({reduction}) reached the gateway: {issued}. The "
+        "grouped SELECT cannot apply the reduction, so the series it draws "
+        "contradicts the scalar the same preview serves"
+    )
+    assert series is None
+
+
+@pytest.mark.asyncio
 async def test_adhoc_trend_series_none_on_single_point(monkeypatch):
     """F-017-26: a single returned period is not a sparkline → None."""
     async def fake_router(*a, **k):

@@ -1192,21 +1192,31 @@ def _compile_filters(
     dimension_names: dict[str, str],
     parameter_defaults: dict[str, Any] | None,
     dimension_data_types: dict[str, str] | None = None,
+    *,
+    strict: bool = False,
 ) -> list[str]:
     predicates: list[str] = []
 
     for f in filters:
         did = f.get("dimension_id")
         if not did:
+            if strict:
+                raise ValueError("filter is missing dimension_id")
             continue
         dim_name = dimension_names.get(str(did))
         if not dim_name:
+            if strict:
+                raise ValueError(f"unknown dimension_id {did}")
             continue
 
         col = safe_ident(dim_name)
         col_type = (dimension_data_types or {}).get(str(did))
         op = f.get("operator", "eq")
         mode = f.get("mode", "fixed")
+        if mode not in {"fixed", "parameter", "relative"}:
+            if strict:
+                raise ValueError(f"unsupported filter mode {mode!r}")
+            mode = "fixed"
 
         if mode == "parameter":
             param_name = f.get("parameter_name", "")
@@ -1215,6 +1225,10 @@ def _compile_filters(
             if parameter_defaults and param_name in parameter_defaults:
                 val = parameter_defaults[param_name]
             if val is None:
+                if strict:
+                    raise ValueError(
+                        f"parameter filter {param_name or '<unnamed>'} has no value"
+                    )
                 continue
             values = [val] if not isinstance(val, list) else val
         elif mode == "relative":
@@ -1223,7 +1237,11 @@ def _compile_filters(
             preset = preset_values[0] if preset_values else None
             if preset:
                 rel_preds = _preset_to_predicates(preset, dim_name)
+                if strict and not rel_preds:
+                    raise ValueError(f"unknown relative preset {preset}")
                 predicates.extend(rel_preds)
+            elif strict:
+                raise ValueError("relative filter is missing a preset")
             continue
         else:
             raw_val = f.get("value")
@@ -1232,7 +1250,11 @@ def _compile_filters(
         pred = _op_to_sql(col, op, values, f, col_type)
         if pred:
             predicates.append(pred)
+        elif strict:
+            raise ValueError(f"operator {op!r} cannot be compiled")
 
+    if strict and filters and not predicates:
+        raise ValueError("request filters produced no predicates")
     return predicates
 
 
@@ -1296,6 +1318,29 @@ def _op_to_sql(
 # ---------------------------------------------------------------------------
 # Summary builder
 # ---------------------------------------------------------------------------
+
+# Every ``summary_tokens`` key whose STRING value is a bare measure NAME.
+#
+# THE producer/consumer contract for measure renames (Bug-9483). ``measure_rename``
+# imports this set to decide which summary strings to rewrite; a private copy
+# there drifted the moment ``compare_measures`` was added, leaving a shipped,
+# wizard-reachable formula family whose summary still named a measure that no
+# longer exists. One owner, exported — the Bug-6574 pattern.
+#
+# Deliberately EXCLUDED:
+#   * ``dimension_name`` — a DIMENSION name; a measure rename must not touch it.
+#   * ``filter_dimensions`` — rendered filter LABELS ("region in EMEA, APAC"),
+#     not bare names; rewriting inside them would corrupt member values.
+# Both exclusions are asserted by the contract test, so widening this set to
+# "every *_name key" cannot happen by accident.
+MEASURE_NAME_SUMMARY_TOKEN_KEYS = frozenset({
+    "measure_name",
+    "numerator_name",
+    "denominator_name",
+    "measure_a_name",
+    "measure_b_name",
+})
+
 
 def _build_summary(
     defn: dict,

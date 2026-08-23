@@ -43,7 +43,10 @@ export function recordCreate(
   emit(
     entity,
     { kind: "create", data: createData },
-    { kind: "delete", id: createdId },
+    // Keep the parent-scope metadata on the delete op. The generic model-
+    // scoped APIs ignore it; adapters for UDA/calendar/relationship entities
+    // need it to route the inverse call to the correct parent resource.
+    { kind: "delete", id: createdId, data: createData },
   );
 }
 
@@ -69,7 +72,8 @@ export function recordDelete(
 ): void {
   emit(
     entity,
-    { kind: "delete", id },
+    // The redo delete also needs parent-scope metadata for non-uniform APIs.
+    { kind: "delete", id, data: priorData },
     { kind: "create", data: priorData },
   );
 }

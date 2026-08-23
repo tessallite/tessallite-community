@@ -53,6 +53,8 @@ from shared.schemas.pydantic_models import (
     DrillThroughSetResponse,
     DrillThroughSetUpdate,
     MeasureCreate,
+    MeasureRenameImpactItem,
+    MeasureRenameImpactResponse,
     MeasureResponse,
     MeasureUpdate,
     RedundantPartnerInfo,
@@ -87,7 +89,11 @@ from src.api._scope import (
     glossary_texts_for_targets as _glossary_texts_for_targets,
     purge_entity_soft_references,
 )
-from src.measure_rename import UnsafeMeasureRename, propagate_measure_renames
+from src.measure_rename import (
+    UnsafeMeasureRename,
+    plan_measure_renames,
+    propagate_measure_renames,
+)
 
 router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}/measures", tags=["measures"]
@@ -303,7 +309,12 @@ async def _build_response(
     if glossary_texts is not None:
         glossary_text = glossary_texts.get(measure.id)
     else:
-        glossary_text = await _glossary_text_for_target(db, measure.model_id, "measure", measure.id)
+        # Bug-9392: no direct attachment falls back to the physical column's
+        # term, matching the deployed snapshot (serialiser) exactly.
+        glossary_text = await _glossary_text_for_target(
+            db, measure.model_id, "measure", measure.id,
+            fallback_column_id=measure.source_column_id,
+        )
     effective_description = glossary_text or measure.description
 
     # F-015-12: eligibility is an N+1 cost (2 extra queries per measure) and
@@ -1187,7 +1198,8 @@ async def list_measures(
                         if m.name not in hidden_names
                     ]
         glossary_texts = await _glossary_texts_for_targets(
-            db, model_id, "measure", [m.id for m in measures]
+            db, model_id, "measure", [m.id for m in measures],
+            fallback_column_ids={m.id: m.source_column_id for m in measures},
         )
         out: list[MeasureResponse] = []
         for m in measures:
@@ -1510,7 +1522,12 @@ async def update_measure(
                 )
             except UnsafeMeasureRename as exc:
                 await db.rollback()
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+                raise HTTPException(
+                    status_code=409,
+                    detail=exc.detail_for(
+                        current_user.email or current_user.user_id
+                    ),
+                ) from exc
         for k, v in updates.items():
             setattr(m, k, v)
         # Bug-8257: re-derive effective additivity AFTER the merge. A PATCH is
@@ -1954,6 +1971,78 @@ def _variant_reason(
             "Hijri calendars also require a bound calendar table."
         )
     return None
+
+
+@router.get(
+    "/{measure_id}/rename-impact",
+    response_model=MeasureRenameImpactResponse,
+    dependencies=[require_role("modeler")],
+)
+async def measure_rename_impact(
+    project_id: UUID,
+    model_id: UUID,
+    measure_id: UUID,
+    new_name: str = Query(
+        min_length=1,
+        description="The candidate new measure name.",
+    ),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> MeasureRenameImpactResponse:
+    """Preview what renaming this measure would change (Bug-9394).
+
+    The KPI DSL binds measures by NAME, so a rename silently orphans every KPI
+    expression that referenced the old one unless the cascade rewrites it. The
+    cascade exists (``propagate_measure_renames``); what was missing is the
+    modeller's ability to SEE the affected KPIs before committing. This endpoint
+    answers exactly that, from the SAME enumeration the rename itself runs, so
+    the preview can never disagree with what the PATCH does.
+
+    Read-only: nothing is written and no row lock is taken.
+    """
+    enforce_model_scope(current_user, str(model_id), project_id=str(project_id))
+    async for db in get_tenant_db(current_user.tenant_id):
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        measure = await db.get(Measure, measure_id)
+        if measure is None or measure.model_id != model_id:
+            raise HTTPException(status_code=404, detail="Measure not found")
+
+        candidate = new_name.strip()
+        if not candidate:
+            raise HTTPException(
+                status_code=400, detail="new_name must not be blank",
+            )
+
+        _updates, _coverage, _unsafe, plan = await plan_measure_renames(
+            db, model_id, {measure.id: (measure.name, candidate)},
+            for_update=False,
+        )
+        plan = plan.for_viewer(current_user.email or current_user.user_id)
+        return MeasureRenameImpactResponse(
+            measure_id=measure.id,
+            current_name=measure.name,
+            new_name=candidate,
+            safe=plan.safe,
+            rewrites=[
+                MeasureRenameImpactItem(
+                    consumer_type=item.consumer_type,
+                    consumer_id=item.consumer_id,
+                    consumer_name=item.consumer_name,
+                    field=item.field,
+                )
+                for item in plan.rewrites
+            ],
+            blockers=[
+                MeasureRenameImpactItem(
+                    consumer_type=item.consumer_type,
+                    consumer_id=item.consumer_id,
+                    consumer_name=item.consumer_name,
+                    field=item.field,
+                )
+                for item in plan.blockers
+            ],
+        )
+
+    raise HTTPException(status_code=500, detail="DB session exhausted")
 
 
 @router.get("/{measure_id}/available-variants")

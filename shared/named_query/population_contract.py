@@ -23,7 +23,7 @@ from typing import Any, Optional
 # Bump whenever the NQ population compile logic changes in a way that changes
 # what a build materialises: every artifact carrying an older (or no)
 # fingerprint is refused at serve and falls back to live until rebuilt.
-NQ_POPULATION_CONTRACT_VERSION = 1
+NQ_POPULATION_CONTRACT_VERSION = 2  # G3 mandatory population-defining joins
 
 # The ONE canonical compile body both refresh build and live serving use.
 # A Named Query's population is a function of its deployed definition ALONE:

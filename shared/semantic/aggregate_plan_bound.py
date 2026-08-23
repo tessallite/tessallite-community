@@ -236,6 +236,7 @@ def aggregate_plan_upper_bound(
     edges: Iterable[tuple[str, str]],
     anchor_table_id: str | None,
     needed_table_ids: Iterable[str],
+    population_defining_table_ids: Iterable[str] = (),
 ) -> frozenset[str] | None:
     """Upper bound on the relations an aggregate CTAS over this graph joins.
 
@@ -252,6 +253,10 @@ def aggregate_plan_upper_bound(
         return None
 
     needed = frozenset(str(t) for t in needed_table_ids if str(t))
+    # Bug-8615 / G3: aggregate creation and refresh include the same
+    # population-defining endpoints as source serving, even when the
+    # aggregate's selected grain/measures do not name the far table.
+    needed |= frozenset(str(t) for t in population_defining_table_ids if str(t))
     if not needed.issubset(universe):
         # The aggregate needs a relation this graph does not describe, so the
         # graph cannot bound its plan.

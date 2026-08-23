@@ -4,7 +4,9 @@ Status: active. Updated 2026-06-13.
 
 ## What it is
 
-The Solidatus integration lets you push your Tessallite semantic model metadata into Solidatus, the enterprise lineage and governance graph platform. When connected, Solidatus becomes a visual map of your data landscape — showing where every metric, dimension, KPI, and downstream report comes from.
+The Solidatus integration builds a Solidatus-shaped lineage graph of your Tessallite semantic model — showing where every metric, dimension, KPI, and downstream report comes from — so you can preview exactly what would land in Solidatus, the enterprise lineage and governance graph platform.
+
+In this build the integration is a **preview / dry-run** tool. It reads your model and computes the graph locally; it does not send anything to Solidatus. Live push (writing the nodes and edges into your Solidatus instance) is not yet available — see [Not available yet: live connector](#not-available-yet-live-connector).
 
 ## Who it is for
 
@@ -14,7 +16,7 @@ The Solidatus integration lets you push your Tessallite semantic model metadata 
 
 ## What gets exported
 
-When you sync a model to Solidatus, Tessallite exports these objects as graph nodes and edges:
+When you preview or dry-run a model export, Tessallite maps these objects into Solidatus graph nodes and edges (computed locally — nothing is written to Solidatus yet):
 
 | Tessallite object | Solidatus representation |
 |---|---|
@@ -100,12 +102,18 @@ Each time you preview or dry-run, Tessallite:
 
 1. **Builds a governance graph** — reads every table, column, dimension, measure, KPI, glossary term, downstream asset, aggregate, and data tag from your model.
 2. **Maps to Solidatus format** — converts each Tessallite object into a Solidatus node or edge.
-3. **Hashes every object** — creates a SHA256 fingerprint of each node and edge.
-4. **Compares with the previous run's mapping** — checks which objects are new, changed, or unchanged, so the dry run can show what a future push *would* create or update.
-5. **Records the run** — saves the run in history with the exact model snapshot it was built from, the node/edge counts, and any governance warnings (for example, a KPI whose expression references a measure that is missing).
+3. **Hashes every object** — creates a SHA256 fingerprint of each node and edge, ready to drive an incremental diff once live push exists.
+4. **Records the run** — saves the run in history with the exact model snapshot it was built from, the node/edge counts, and any governance warnings (for example, a KPI whose expression references a measure that is missing).
 
-The dry run computes what a push would do; it does not contact Solidatus and
+The dry run computes what a push *would* do; it does not contact Solidatus and
 does not create, update, or deprecate anything remotely.
+
+**Incremental diff is not available yet.** Live push is not implemented in this
+build, so no remote mapping is ever saved. With no saved baseline to compare
+against, every dry run reports all objects as *new* — it cannot yet show which
+nodes or edges changed or stayed the same since a previous sync. When live push
+lands, the fingerprints above will drive an incremental create/update/deprecate
+diff.
 
 ## Not available yet: live connector
 

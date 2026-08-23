@@ -27,7 +27,7 @@ Every table added to a model is assigned one of three types. The type tells Tess
 
 | Type | Role | Participates in aggregate grain | Typical example |
 |---|---|---|---|
-| `fact` | The primary transaction table. Drives the aggregate grain. Each model must have exactly one fact table. | Yes | `orders`, `sales_events`, `page_views` |
+| `fact` | The primary transaction table. Drives the aggregate grain. Each multi-table model must declare exactly one fact table at deploy. | Yes | `orders`, `sales_events`, `page_views` |
 | `dim_aggregate` | A dimension table whose columns may extend the aggregate grain. | Yes | `dim_product`, `dim_date`, `dim_store` |
 | `dim_detail` | A dimension table used for filtering and labelling only. Cannot define an aggregate grain. | No | `dim_customer_contact`, `dim_employee_notes` |
 
@@ -37,7 +37,12 @@ Use `dim_detail` sparingly. Any dimension drawn from a `dim_detail` table bypass
 
 ## The fact table as primary table
 
-Every model must have exactly one `fact` table. This is the central table from which all aggregates are built. Every join in the model connects either directly or transitively back to the fact table. If a model contains no fact table, the Health tab will surface a "Fact table missing" error and no aggregates can be built.
+Every multi-table model must declare exactly one `fact` table at deploy. A
+single-table model is implicitly its fact table. This is the central table from
+which governed aggregates are built, and every join in a multi-table model
+connects either directly or transitively back to it. A multi-table model with
+no declared fact table is rejected at deploy; dimension-only queries remain
+valid when their projection omits the fact table.
 
 ---
 

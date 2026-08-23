@@ -34,8 +34,9 @@ import {
   useJoins,
 } from "../../api/hooks";
 import { useConfirm } from "../Confirm";
+import { recordCreate, recordDelete, recordUpdate } from "../Builder/emitDrawerHistory";
 import { ui, statusColor, type StatusSeverity } from "../../theme/tokens";
-import type { AttributeRelationshipStatus } from "../../api/types";
+import type { AttributeRelationshipStatus, DimensionAttributeRelationship } from "../../api/types";
 
 /** Advisory validation result for one column, from the validate endpoint. */
 interface AdvisoryResult {
@@ -103,6 +104,19 @@ function advisorySeverity(reason: string): StatusSeverity {
     default:
       return "default";
   }
+}
+
+function relationshipToPayload(
+  relationship: DimensionAttributeRelationship,
+  dimensionId: string,
+): Record<string, unknown> {
+  return {
+    detail_column_name: relationship.detail_column_name,
+    cardinality: relationship.cardinality,
+    key_column_name: relationship.key_column_name,
+    enabled: relationship.enabled,
+    __dimension_id: dimensionId,
+  };
 }
 
 interface Props {
@@ -272,19 +286,29 @@ export default function AttributeRelationshipsSection({
   // Bulk create: loop single creates for each selected column.
   const bulkCreate = useMutation({
     mutationFn: async () => {
+      const created: Array<{ id: string; payload: Record<string, unknown> }> = [];
       const entries = Array.from(selectedColumns).map((key) => {
         const [, ...rest] = key.split(":");
         return rest.join(":");
       });
       for (const colName of entries) {
-        await attributeRelationshipsApi.create(projectId, modelId, dimensionId, {
+        const payload = {
           detail_column_name: colName,
           cardinality: "BIJECTION",
           enabled: true,
+        } as const;
+        const result = await attributeRelationshipsApi.create(projectId, modelId, dimensionId, payload);
+        created.push({
+          id: result.id,
+          payload: { ...payload, __dimension_id: dimensionId },
         });
       }
+      return created;
     },
-    onSuccess: () => {
+    onSuccess: (created) => {
+      for (const item of created) {
+        recordCreate("attributeRelationship", item.id, item.payload);
+      }
       invalidate();
       resetForm();
     },
@@ -322,7 +346,7 @@ export default function AttributeRelationshipsSection({
   }
 
   const toggleRel = useMutation({
-    mutationFn: (vars: { relId: string; enabled: boolean }) =>
+    mutationFn: (vars: { relId: string; enabled: boolean; prior: Record<string, unknown> }) =>
       attributeRelationshipsApi.update(
         projectId,
         modelId,
@@ -330,11 +354,19 @@ export default function AttributeRelationshipsSection({
         vars.relId,
         { enabled: vars.enabled },
       ),
-    onSuccess: invalidate,
+    onSuccess: (_updated, variables) => {
+      recordUpdate(
+        "attributeRelationship",
+        variables.relId,
+        variables.prior,
+        { enabled: variables.enabled, __dimension_id: dimensionId },
+      );
+      invalidate();
+    },
   });
 
   const deleteRel = useMutation({
-    mutationFn: (vars: { relId: string; retireAggregates: boolean }) =>
+    mutationFn: (vars: { relId: string; retireAggregates: boolean; prior: Record<string, unknown> }) =>
       attributeRelationshipsApi.delete(
         projectId,
         modelId,
@@ -342,7 +374,14 @@ export default function AttributeRelationshipsSection({
         vars.relId,
         vars.retireAggregates,
       ),
-    onSuccess: invalidate,
+    onSuccess: (_deleted, variables) => {
+      recordDelete("attributeRelationship", variables.relId, {
+        ...variables.prior,
+        __dimension_id: dimensionId,
+        __retire_aggregates: variables.retireAggregates,
+      });
+      invalidate();
+    },
   });
 
   function toggleCreateForm() {
@@ -404,6 +443,10 @@ export default function AttributeRelationshipsSection({
     });
     if (!deleteOk) return;
 
+    const prior = (rels.data ?? []).find((relationship) => relationship.id === relId);
+    if (!prior) return;
+    const priorPayload = relationshipToPayload(prior, dimensionId);
+
     if (hasAggregates) {
       // Second: ask about aggregate retirement (after confirming delete).
       const retireOk = await confirm({
@@ -414,9 +457,9 @@ export default function AttributeRelationshipsSection({
         confirmLabel: t("attributeRelationships.retireAndDelete"),
         cancelLabel: t("attributeRelationships.deleteOnly"),
       });
-      deleteRel.mutate({ relId, retireAggregates: !!retireOk });
+      deleteRel.mutate({ relId, retireAggregates: !!retireOk, prior: priorPayload });
     } else {
-      deleteRel.mutate({ relId, retireAggregates: false });
+      deleteRel.mutate({ relId, retireAggregates: false, prior: priorPayload });
     }
   }
 
@@ -568,6 +611,7 @@ export default function AttributeRelationshipsSection({
                           toggleRel.mutate({
                             relId: r.id,
                             enabled: e.target.checked,
+                            prior: relationshipToPayload(r, dimensionId),
                           })
                         }
                       />

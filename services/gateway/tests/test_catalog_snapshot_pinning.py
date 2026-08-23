@@ -144,6 +144,98 @@ async def test_deployed_catalog_ignores_draft_rename_and_add(monkeypatch):
     assert "Channel" not in names, "draft-added dimension leaked into deployed catalog"
 
 
+@pytest.mark.asyncio
+async def test_bug9433_catalog_honors_hidden_source_columns_for_select_star(monkeypatch):
+    """The gateway descriptor must match the deployed SELECT * projection.
+
+    Bug-9433: deployed physical columns are independently curated from the
+    semantic dimension/measure rows.  A source-backed object whose semantic
+    ``is_hidden`` flag is false is still removed by query-router when its
+    deployed snapshot column is hidden.  Business catalogues must omit it,
+    while an authorised hidden-column persona keeps the field available.
+    """
+    deployed_snapshot = {
+        "measures": [
+            {"id": "m-visible", "name": "Revenue", "default_agg": "sum",
+             "source_column_id": "c-visible-measure", "is_hidden": False},
+            {"id": "m-hidden", "name": "Internal Revenue", "default_agg": "sum",
+             "source_column_id": "c-hidden-measure", "is_hidden": False},
+        ],
+        "dimensions": [
+            {"id": "d-visible", "name": "Region", "data_type": "text",
+             "source_column_id": "c-visible-dimension", "is_hidden": False},
+            {"id": "d-hidden", "name": "Payment Token", "data_type": "text",
+             "source_column_id": "c-hidden-dimension", "is_hidden": False},
+        ],
+        "columns": [
+            {"id": "c-visible-measure", "model_table_id": "table-1",
+             "is_hidden": False},
+            {"id": "c-hidden-measure", "model_table_id": "table-1",
+             "is_hidden": True},
+            {"id": "c-visible-dimension", "model_table_id": "table-1",
+             "is_hidden": False},
+            {"id": "c-hidden-dimension", "model_table_id": "table-1",
+             "is_hidden": True},
+        ],
+        "tables": [{
+            "id": "table-1",
+            "alias": "sales_detail",
+            "table_type": "fact",
+            "row_count_estimate": 100,
+        }],
+    }
+    _patch_clients(
+        monkeypatch,
+        deployed_version_id=DEPLOYED_VERSION_ID,
+        live_measures=[],
+        live_dimensions=[],
+        deployed_snapshot=deployed_snapshot,
+    )
+
+    async def _authorized_persona(mid, tenant_slug, jwt_token, project_id=""):
+        return [{
+            "id": "persona-technical",
+            "slug": "analyst",
+            "includes_hidden_columns": True,
+            "included_measure_ids": [],
+            "included_dimension_ids": [],
+            "restricted_column_ids": [],
+        }]
+
+    monkeypatch.setattr(router_client, "get_model_personas", _authorized_persona)
+    monkeypatch.setattr(router_client.settings, "LOOKER_GATEWAY_ENABLED", True)
+    result = await router_client.fetch_model_metadata(MODEL_ID, "acme", "jwt")
+    table_columns = result[1]
+
+    base_names = {column["name"] for column in table_columns["sales"]}
+    assert base_names == {"Region", "Revenue"}
+    assert "Payment Token" not in base_names
+    assert "Internal Revenue" not in base_names
+
+    persona_columns = {
+        column["name"]: column for column in table_columns["sales_analyst"]
+    }
+    assert {"Region", "Revenue", "Payment Token", "Internal Revenue"} == set(persona_columns)
+    assert persona_columns["Payment Token"]["is_hidden"] is True
+    assert persona_columns["Internal Revenue"]["is_hidden"] is True
+
+    # The table-scoped Looker relation is intentionally technical: hidden
+    # fields remain available, but its metadata must carry the same effective
+    # physical-column curation as the business/persona surfaces. Assert both
+    # changed branches so a semantic-only mutant in either assignment fails.
+    looker_columns = {
+        column["name"]: column
+        for column in table_columns["sales__sales_detail"]
+    }
+    assert set(looker_columns) == {
+        "Region", "Revenue", "Payment Token", "Internal Revenue",
+    }
+    assert looker_columns["Region"]["is_hidden"] is False
+    assert looker_columns["Revenue"]["is_hidden"] is False
+    assert looker_columns["Payment Token"]["is_hidden"] is True
+    assert looker_columns["Internal Revenue"]["is_hidden"] is True
+
+
 async def test_catalog_updates_after_save_and_deploy(monkeypatch):
     """After Save+Deploy, the new version's snapshot IS the catalog.
 

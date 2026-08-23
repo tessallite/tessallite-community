@@ -86,6 +86,10 @@ export interface QueryLog {
   route_type: string;
   aggregate_id: string | null;
   pocket_id?: string | null;
+  // Bug-9172: existing QueryLog timing/byte telemetry can be attributed to a
+  // Named Query. Ordinary rows and historical rows keep these fields null.
+  named_query_id?: string | null;
+  named_query_fallback_reason?: string | null;
   // F-030-20: row-security rules applied to this query (shape varies by rule).
   security_rules_applied?: unknown | null;
   persona_id?: string | null;

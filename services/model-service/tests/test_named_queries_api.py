@@ -360,6 +360,56 @@ async def test_refresh_queues_background_run(client, monkeypatch) -> None:
     assert resp.json()["status"] == "queued"
 
 
+async def test_bug9193_background_refresh_failure_locks_fallback_writes(monkeypatch) -> None:
+    """The crash fallback cannot dirty a run/artifact outside the model lock."""
+    from shared.db.models import NamedQuery, NamedQueryArtifact, NamedQueryRefreshRun
+    from src.api import named_queries as _named_queries
+
+    model_id = TEST_MODEL_ID
+    named_query_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    nq = _make_nq_response_obj(named_query_id)
+    nq.model_id = model_id
+    run = types.SimpleNamespace(
+        id=run_id,
+        named_query_id=named_query_id,
+        status="queued",
+        error_message=None,
+        completed_at=None,
+    )
+    artifact = _make_artifact_obj(status="invalidating")
+    db = _make_db(nq_obj=nq)
+
+    async def _get(cls, object_id):
+        if cls is NamedQueryRefreshRun:
+            return run
+        if cls is NamedQuery:
+            return nq
+        if cls is NamedQueryArtifact:
+            return artifact
+        return None
+
+    db.get = AsyncMock(side_effect=_get)
+    db.execute = _make_execute_script(_ScalarResult([artifact]))
+    lock = AsyncMock()
+    _patch_tenant_db(monkeypatch, db)
+    monkeypatch.setattr(_named_queries, "acquire_model_definition_lock", lock)
+
+    with patch(
+        "shared.named_query.refresh.refresh_named_query_artifact",
+        new=AsyncMock(side_effect=RuntimeError("build failed")),
+    ):
+        await _named_queries._run_named_query_refresh_in_background(
+            "tenant-1", named_query_id, run_id, None,
+        )
+
+    lock.assert_awaited_once_with(db, model_id)
+    assert run.status == "failed"
+    assert artifact.status == "failed"
+    db.rollback.assert_awaited_once()
+    assert db.commit.await_count == 1
+
+
 async def test_upsert_refresh_policy(client, monkeypatch) -> None:
     db = _make_db()
     # model-lock, then the policy SELECT (empty -> create).

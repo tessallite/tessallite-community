@@ -35,6 +35,7 @@ import { useBuilderStore } from "../../store/builderStore";
 import { aiSchedulerApi, aiOptimizerApi, optimizerApiClient, schedulerApiClient } from "../../api/client";
 import type { ModelAISchedulerConfigUpdate } from "../../api/types";
 import { SLAConfigPanel } from "../Settings/SLAConfigPanel";
+import { SchedulerJobLedger } from "./SchedulerJobLedger";
 import { ui } from "../../theme/tokens";
 import { useT } from "../../i18n";
 
@@ -560,6 +561,11 @@ export default function SchedulerPanel({ projectId, modelId, tenantId }: Props) 
           {runningPocketEviction ? t("scheduler.pocketEvictionRunning") : t("scheduler.pocketEvictionButton")}
         </Button>
       </SchedulerSection>
+
+      <Divider />
+
+      {/* ── Durable Job Ledger ── */}
+      <SchedulerJobLedger />
 
       <Divider />
 

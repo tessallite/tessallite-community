@@ -42,6 +42,7 @@ import type {
 } from "../../api/types";
 import { useBuilderStore } from "../../store/builderStore";
 import { useConfirm } from "../Confirm";
+import { recordCreate, recordDelete, recordUpdate } from "../Builder/emitDrawerHistory";
 import { extractApiError } from "../../utils/extractApiError";
 
 type DialogMode = "create" | "edit";
@@ -152,6 +153,14 @@ function toUpdate(form: RuleFormState, original: RowSecurityRule): RowSecurityRu
   return base;
 }
 
+function ruleToCreatePayload(rule: RowSecurityRule): Record<string, unknown> {
+  return toCreate(fromRule(rule)) as unknown as Record<string, unknown>;
+}
+
+function ruleToUpdatePayload(rule: RowSecurityRule): Record<string, unknown> {
+  return toUpdate(fromRule(rule), rule) as unknown as Record<string, unknown>;
+}
+
 export default function RowSecurityPanel() {
   const t = useT();
   const { projectId, modelId } = useParams<{ projectId: string; modelId: string }>();
@@ -199,7 +208,10 @@ export default function RowSecurityPanel() {
   const createMutation = useMutation({
     mutationFn: (body: RowSecurityRuleCreate) =>
       rowSecurityApi.create(projectId!, modelId!, body),
-    onSuccess: () => {
+    onSuccess: (created, body) => {
+      // Bug-9395/F-026-10: row-security drawer CRUD is reversible through the
+      // shared Builder history boundary.
+      recordCreate("rowSecurity", created.id, body as unknown as Record<string, unknown>);
       invalidate();
       setDialogOpen(false);
       setFormError(null);
@@ -210,9 +222,10 @@ export default function RowSecurityPanel() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, body }: { id: string; body: RowSecurityRuleUpdate }) =>
+    mutationFn: ({ id, body }: { id: string; body: RowSecurityRuleUpdate; prior: Record<string, unknown> }) =>
       rowSecurityApi.update(projectId!, modelId!, id, body),
-    onSuccess: () => {
+    onSuccess: (_updated, variables) => {
+      recordUpdate("rowSecurity", variables.id, variables.prior, variables.body as unknown as Record<string, unknown>);
       invalidate();
       setDialogOpen(false);
       setFormError(null);
@@ -221,8 +234,12 @@ export default function RowSecurityPanel() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (id: string) => rowSecurityApi.delete(projectId!, modelId!, id),
-    onSuccess: () => invalidate(),
+    mutationFn: ({ id }: { id: string; prior: Record<string, unknown> }) =>
+      rowSecurityApi.delete(projectId!, modelId!, id),
+    onSuccess: (_deleted, variables) => {
+      recordDelete("rowSecurity", variables.id, variables.prior);
+      invalidate();
+    },
   });
 
   const simulateMutation = useMutation({
@@ -271,7 +288,11 @@ export default function RowSecurityPanel() {
     if (dialogMode === "create") {
       createMutation.mutate(toCreate(form));
     } else if (editing) {
-      updateMutation.mutate({ id: editing.id, body: toUpdate(form, editing) });
+      updateMutation.mutate({
+        id: editing.id,
+        body: toUpdate(form, editing),
+        prior: ruleToUpdatePayload(editing),
+      });
     }
   }
 
@@ -285,7 +306,7 @@ export default function RowSecurityPanel() {
       ),
       confirmLabel: t("rowSecurity.deleteRuleLabel"),
     });
-    if (ok) deleteMutation.mutate(rule.id);
+    if (ok) deleteMutation.mutate({ id: rule.id, prior: ruleToCreatePayload(rule) });
   }
 
   const busy = createMutation.isPending || updateMutation.isPending;

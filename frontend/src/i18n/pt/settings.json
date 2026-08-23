@@ -113,7 +113,7 @@
   "connections.deleteConfirmLabel": "Eliminar ligação",
   "connections.deleteConnection": "Eliminar",
   "connections.deleteFailed": "Falha ao eliminar a ligação.",
-  "connections.deleteMessage": "Eliminar a ligação <strong>{{name}}</strong>? As origens e destinos associados à mesma ficarão inutilizáveis até serem reassociados.",
+  "connections.deleteMessage": "Eliminar a ligação {{name}}? As origens e destinos associados à mesma ficarão inutilizáveis até serem reassociados.",
   "connections.deleteTitle": "Eliminar ligação?",
   "connections.deleteTooltip": "Eliminar ligação",
   "connections.displayName": "Nome a apresentar *",

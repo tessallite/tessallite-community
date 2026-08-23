@@ -16,6 +16,7 @@ const useAggregatesMock = vi.fn();
 const updateMock = vi.fn();
 const triggerRunMock = vi.fn();
 const getDependenciesMock = vi.fn();
+const jobsMock = vi.fn();
 
 vi.mock("../../api/hooks", () => ({
   useAISchedulerConfig: (...a: unknown[]) => useAISchedulerConfigMock(...a),
@@ -27,6 +28,7 @@ vi.mock("../../api/client", () => ({
   aiOptimizerApi: { triggerRun: (...a: unknown[]) => triggerRunMock(...a) },
   optimizerApiClient: { runModelSweep: vi.fn() },
   schedulerApiClient: {
+    jobs: (...a: unknown[]) => jobsMock(...a),
     getDependencies: (...a: unknown[]) => getDependenciesMock(...a),
     createDependency: vi.fn(),
     deleteDependency: vi.fn(),
@@ -82,6 +84,7 @@ function runAiButton() {
 beforeEach(() => {
   vi.clearAllMocks();
   useAggregatesMock.mockReturnValue({ data: [] });
+  jobsMock.mockResolvedValue({ jobs: [] });
   getDependenciesMock.mockResolvedValue({ dependencies: [], execution_order: [] });
   updateMock.mockImplementation((_p, _m, body) =>
     Promise.resolve(makeConfig(body as Record<string, unknown>)),
@@ -119,6 +122,28 @@ describe("SchedulerPanel — save-before-run guard (Bug-7117)", () => {
     expect(
       screen.queryByText("scheduler.saveBeforeRun"),
     ).not.toBeInTheDocument();
+  });
+
+  it("passes the saved dry-run mode to the shipped advisor trigger (Bug-9407-SPA)", async () => {
+    triggerRunMock.mockResolvedValue({});
+    useAISchedulerConfigMock.mockReturnValue({
+      data: makeConfig({ ai_enabled: true, dry_run: false }),
+      isLoading: false,
+    });
+    renderPanel();
+    const user = userEvent.setup();
+
+    // The Run AI surface must send the persisted preview choice, not a
+    // hard-coded mode or a stale value from the initial config.
+    await user.click(screen.getByLabelText("scheduler.previewOnly"));
+    await user.click(screen.getByText("scheduler.saveSettings").closest("button")!);
+    await waitFor(() => expect(updateMock).toHaveBeenCalled());
+
+    await user.click(runAiButton());
+    await waitFor(() => expect(triggerRunMock).toHaveBeenCalledWith({
+      model_id: "m-1",
+      dry_run: true,
+    }));
   });
 
   it("clears the guard once the dirty change is saved", async () => {

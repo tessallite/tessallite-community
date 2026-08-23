@@ -318,6 +318,10 @@ class TestRequireTls:
         monkeypatch.setattr(
             "src.jdbc.server.settings.GATEWAY_SSL_REQUIRED", True, raising=False
         )
+        monkeypatch.setattr(
+            "src.jdbc.server.settings.GATEWAY_ALLOW_INSECURE_TRANSPORT", False,
+            raising=False,
+        )
         server = PGWireServer()
         server._peer_ip = "203.0.113.7"
         server._tls_active = False  # plaintext channel

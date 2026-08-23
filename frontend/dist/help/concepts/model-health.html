@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Concepts</span> / <span>Model Health</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-04-17</span></div>
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-08-02</span></div>
     <h1>Model Health</h1>
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/model-health-tab.png" alt="Model Builder — Health tab."></figure>
 <h2>What this covers</h2>
@@ -33,7 +33,7 @@
 <p>To resolve: open the measure definition in the Drawer and either select a numeric source column or change the aggregation type to COUNT or COUNT DISTINCT.</p>
 <h3>Fact table missing</h3>
 <p><strong>Severity: Error</strong></p>
-<p>The model contains no table designated as <code>fact</code>. Every model requires exactly one fact table. Without it, the Scheduler has no anchor point and cannot generate aggregate build SQL.</p>
+<p>The model has multiple tables but none is designated as <code>fact</code>. A single-table model is implicitly fact; only a multi-table model needs an explicit fact anchor before deploy. Without that anchor, the Scheduler cannot generate governed aggregate build SQL.</p>
 <p>To resolve: open the table in the Canvas, select it, and use the Drawer to change its type to <code>fact</code>. If the model has multiple candidates, designate the primary transaction table and reclassify the others.</p>
 <h3>Schema drift detected</h3>
 <p><strong>Severity: Error</strong></p>
@@ -50,6 +50,9 @@
 <h3>Dimension with no queries</h3>
 <p><strong>Severity: Info</strong></p>
 <p>A dimension exists in the model but has not appeared in any query within the usage window. The dimension is valid but may be unused. Consider whether it is needed, or whether users are accessing the data through a different name.</p>
+<h3>Join population health</h3>
+<p>The <strong>Join population health</strong> section shows deploy-time evidence for each declared join and the model rollup: <strong>OK</strong>, <strong>WARNING</strong>, or <strong>BLOCKED</strong>. A warning means a join can filter or multiply rows and needs modeller attention; blocked means the measured effect is above the configured system threshold or the join is not declared safely. A measured policy blocker prevents deployment until the modeller declares the population role accurately or fixes the join/source data. <code>preserve_base_rows</code> remains warning-only; unavailable, failed, timed-out, budget-exhausted, and validation-off checks never block. The per-model rollup may be unevaluated while a measured blocker still blocks, because enforcement is per join rather than hidden by another unmeasured row.</p>
+<p>The table uses translated join type and participation labels, shows the measured classification (<strong>Filtering</strong>, <strong>Multiplying</strong>, or <strong>Neutral</strong>), and shows <strong>Unavailable</strong> when no classification was recorded. A row marked <strong>Stale — redeploy to recheck</strong> has no current deploy evidence; an error or empty state tells you whether the health request failed or no joins have been measured yet. The check is not guessed from a column name and it is not run for every query. It uses the last deploy's source measurement and key metadata. If a join's type, columns, or population participation changes, the row is marked stale; deploy the model again to refresh the evidence. Change the declaration in the Joins panel only after confirming whether the join is population-defining, preserves base rows, or is enrichment-only.</p>
 <h2>Query routing metrics</h2>
 <p>The Model Health panel has a separate <strong>Query routing</strong> section. Unlike the structural health checks above — which inspect the model <em>definition</em> — this section reports on <strong>live query traffic</strong>, so it answers a different question: are the model's speed-up tables actually earning their keep? Pick a window (<strong>Last 24 hours</strong>, <strong>Last 7 days</strong>, or <strong>Last 30 days</strong>) and it shows:</p>
 <ul><li><strong>Acceleration rate</strong> — the share of queries served from an aggregate or pocket table instead of going all the way to the source. Higher is better: it means more queries took the fast path.</li><li><strong>Total queries</strong>, broken down into <strong>Aggregate hits</strong>, <strong>Pocket hits</strong>, and <strong>Source queries</strong> — where each query was actually served.</li><li><strong>Data scanned avoided</strong> — how much source data the fast paths saved you from scanning.</li><li><strong>Hourly query volume</strong> — a simple chart of traffic across the window.</li><li>When pockets are in use, a <strong>Pocket savings</strong> block adds <strong>Pocket storage</strong>, <strong>Time saved</strong>, and <strong>Evictions (24h)</strong>.</li></ul>

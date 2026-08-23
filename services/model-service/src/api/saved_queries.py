@@ -4,7 +4,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from shared.db.models import SavedQuery
 from shared.db.session import get_tenant_db
@@ -21,6 +21,34 @@ router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}/saved-queries",
     tags=["saved-queries"],
 )
+
+
+def _caller_identity(current_user: CurrentUser) -> str:
+    return current_user.email or current_user.user_id
+
+
+async def _load_visible_query(
+    db,
+    *,
+    model_id: UUID,
+    query_id: UUID,
+    owner: str,
+) -> SavedQuery:
+    """Load through the ownership predicate so private rows never leak."""
+    result = await db.execute(
+        select(SavedQuery).where(
+            SavedQuery.id == query_id,
+            SavedQuery.model_id == model_id,
+            or_(
+                SavedQuery.created_by == owner,
+                SavedQuery.is_shared.is_(True),
+            ),
+        )
+    )
+    query = result.scalar_one_or_none()
+    if query is None:
+        raise HTTPException(status_code=404, detail="Saved query not found")
+    return query
 
 
 async def _can_edit(
@@ -52,15 +80,17 @@ async def _require_owner_or_modeler(
 ) -> None:
     """Authorise a mutation (edit/delete) on a shared saved query.
 
-    Saved queries are a model-shared library, but only the query's owner or a
-    modeler+ may change or destroy one — a viewer cannot rewrite or delete a
-    colleague's query (F-029-03). ``created_by`` records the owner's email at
-    create time; we compare it to the caller's email, and otherwise require the
-    modeler role via the same binding precedence as ``require_role``.
+    Saved queries are personal by default. For a shared query, only its owner or
+    a modeler+ may change or destroy it — a viewer cannot rewrite or delete a
+    colleague's query. ``created_by`` records the owner's email at create time;
+    we compare it to the caller's email, and otherwise require the modeler role
+    via the same binding precedence as ``require_role``.
     """
-    caller_identity = current_user.email or current_user.user_id
+    caller_identity = _caller_identity(current_user)
     if query.created_by == caller_identity:
         return
+    if not query.is_shared:
+        raise HTTPException(status_code=404, detail="Saved query not found")
     if await caller_has_role(
         db, current_user, project_id, "modeler", model_id=model_id
     ):
@@ -82,14 +112,20 @@ async def list_saved_queries(
 ) -> list[SavedQueryResponse]:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        caller_identity = _caller_identity(current_user)
         result = await db.execute(
             select(SavedQuery)
-            .where(SavedQuery.model_id == model_id)
+            .where(
+                SavedQuery.model_id == model_id,
+                or_(
+                    SavedQuery.created_by == caller_identity,
+                    SavedQuery.is_shared.is_(True),
+                ),
+            )
             .order_by(SavedQuery.updated_at.desc())
             .limit(limit)
             .offset(offset)
         )
-        caller_identity = current_user.email or current_user.user_id
         rows = result.scalars().all()
         # Bug-5983: the modeler-role mutation grant is model-wide (not
         # per-row), so resolve it once per request rather than once per
@@ -101,7 +137,7 @@ async def list_saved_queries(
         for q in rows:
             resp = SavedQueryResponse.model_validate(q)
             resp.is_owner = q.created_by == caller_identity
-            resp.can_edit = resp.is_owner or is_modeler_plus
+            resp.can_edit = resp.is_owner or (q.is_shared and is_modeler_plus)
             responses.append(resp)
         return responses
 
@@ -116,11 +152,11 @@ async def get_saved_query(
 ) -> SavedQueryResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
-        q = await db.get(SavedQuery, query_id)
-        if q is None or q.model_id != model_id:
-            raise HTTPException(status_code=404, detail="Saved query not found")
+        caller_identity = _caller_identity(current_user)
+        q = await _load_visible_query(
+            db, model_id=model_id, query_id=query_id, owner=caller_identity
+        )
         resp = SavedQueryResponse.model_validate(q)
-        caller_identity = current_user.email or current_user.user_id
         resp.is_owner = q.created_by == caller_identity
         resp.can_edit = await _can_edit(
             db, current_user, project_id, model_id, is_owner=resp.is_owner
@@ -148,7 +184,8 @@ async def create_saved_query(
             description=body.description,
             query_text=body.query_text,
             query_type=body.query_type,
-            created_by=current_user.email,
+            created_by=_caller_identity(current_user),
+            is_shared=body.is_shared,
         )
         db.add(q)
         await db.commit()
@@ -173,17 +210,29 @@ async def update_saved_query(
 ) -> SavedQueryResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
-        q = await db.get(SavedQuery, query_id)
-        if q is None or q.model_id != model_id:
-            raise HTTPException(status_code=404, detail="Saved query not found")
+        caller_identity = _caller_identity(current_user)
+        q = await _load_visible_query(
+            db, model_id=model_id, query_id=query_id, owner=caller_identity
+        )
         await _require_owner_or_modeler(db, current_user, project_id, model_id, q)
         updates = body.model_dump(exclude_unset=True)
+        if (
+            "is_shared" in updates
+            and updates["is_shared"] is not None
+            and updates["is_shared"] != q.is_shared
+            and q.created_by != caller_identity
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Only the query owner can change sharing",
+            )
         for key, val in updates.items():
+            if key == "is_shared" and val is None:
+                continue
             setattr(q, key, val)
         await db.commit()
         await db.refresh(q)
         resp = SavedQueryResponse.model_validate(q)
-        caller_identity = current_user.email or current_user.user_id
         resp.is_owner = q.created_by == caller_identity
         # The mutation above already passed the owner-or-modeler gate, so the
         # caller can always edit the query they just successfully updated.
@@ -204,9 +253,12 @@ async def delete_saved_query(
 ) -> None:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
-        q = await db.get(SavedQuery, query_id)
-        if q is None or q.model_id != model_id:
-            raise HTTPException(status_code=404, detail="Saved query not found")
+        q = await _load_visible_query(
+            db,
+            model_id=model_id,
+            query_id=query_id,
+            owner=_caller_identity(current_user),
+        )
         await _require_owner_or_modeler(db, current_user, project_id, model_id, q)
         await db.delete(q)
         await db.commit()

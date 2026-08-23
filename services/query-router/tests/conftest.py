@@ -8,11 +8,13 @@ sys.path is configured via [tool.pytest.ini_options] pythonpath in pyproject.tom
 from __future__ import annotations
 import contextlib
 import types
+from contextlib import ExitStack as _ExitStack
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from shared.config.fastapi_drift import check_fastapi_version_drift
+from src.semantic.snapshot_resolver import DeployedShape as _DeployedShape
 
 check_fastapi_version_drift()
 
@@ -464,7 +466,7 @@ def make_bound_query(
 
 
 @pytest.fixture(autouse=True)
-def _patch_inactive_aggregates():
+def _patch_inactive_aggregates(request):
     # Bug-874: clear module-level join graph cache between tests to prevent
     # stale column references from polluting subsequent test runs.
     from src.rewrite.query_rewriter import invalidate_join_graph_cache
@@ -508,35 +510,59 @@ def _patch_inactive_aggregates():
     # canonical dims get empty dims (matching the prior build_canonical_dim...
     # mock). Tests that need specific canonical dims must override this patch
     # with their own snapshot shape.
-    import types as _types
-    # A2: the conftest empty shape must carry every attribute that any consumer
-    # of DeployedShape reads (binder, aggregate_matcher, pocket_matcher,
-    # snapshot_graph_resolvers). Missing attributes cause AttributeError when a
-    # test's deployed model reaches that consumer.
-    _empty_shape = _types.SimpleNamespace(
-        dimensions=[], hierarchy_rows=[], measures=[],
-        # Bug-7000: pocket matcher derives table identifiers and required
-        # tables from the snapshot for deployed models
-        tables_by_id={}, columns_by_id={},
-        # A1/A2 binder reads these for hidden-column gating + physical-name
-        # resolution + column-id mapping
+    # The empty shape must carry every attribute any consumer of DeployedShape
+    # reads (binder, aggregate_matcher, pocket_matcher, snapshot_graph_resolvers,
+    # calendar_support, the parameter binder). It used to be a hand-written
+    # ``SimpleNamespace`` listing them one by one, which is a duplicate of the
+    # dataclass that silently goes stale: every field added to DeployedShape had
+    # to be remembered here too, and the annotations above it (A1, A2, Bug-7000,
+    # F-013-01, F-016-02) are the archaeology of forgetting. Constructing the
+    # REAL dataclass makes the drift unrepresentable — a new field arrives with
+    # its own default and the fixture is correct by construction.
+    _empty_shape = _DeployedShape(
+        measures=[],
+        dimensions=[],
         hidden_column_ids=set(),
         physical_columns_all=set(),
         physical_columns_visible=set(),
-        physical_column_ids={},
-        # Stage-4 relabel surfaces read by the binder (attribute relationships,
-        # qualified column ids, table name ids)
-        attribute_relationships=[],
-        qualified_column_ids={},
-        table_name_ids={},
-        # F-013-01 / F-016-02: calendar serving surface read by
-        # calendar_support when a deployed period-aware query resolves its
-        # calendar / hierarchy calendar rules from the pinned snapshot.
-        calendar_tables=[],
-        calendar_tables_by_id={},
+    )
+
+    # A test that asserts what the REAL snapshot resolver does — that a genuine
+    # ``snapshot_json`` produces the right pinned shape, or that an unusable one
+    # fails closed — marks itself ``real_snapshot_resolver`` and keeps the real
+    # function. Without the opt-out the always-succeeds empty shape would make
+    # the fail-closed leg untestable, which is the one thing a fixture that
+    # exists for convenience must never do. Same precedent and same reasoning as
+    # ``real_population_resolvers`` above.
+    _real_snapshot = (
+        request.node.get_closest_marker("real_snapshot_resolver") is not None
+    )
+    _shape_patches = (
+        []
+        if _real_snapshot
+        else [
+            patch(
+                "src.semantic.snapshot_resolver.resolve_deployed_shape",
+                new_callable=AsyncMock,
+                return_value=_empty_shape,
+            ),
+            # A2: the binder imports resolve_deployed_shape at module level,
+            # binding the name into its own namespace. Patching the
+            # snapshot_resolver copy alone does not replace the binder's bound
+            # reference, so a deployed test model hits the fail-closed 503
+            # instead of getting the empty shape. Patch the binder's copy too.
+            # Similarly, the A2 snapshot_graph_resolvers module imports it
+            # lazily, so patching at the module level covers it.
+            patch(
+                "src.semantic.binder.resolve_deployed_shape",
+                new_callable=AsyncMock,
+                return_value=_empty_shape,
+            ),
+        ]
     )
 
     with (
+        _ExitStack() as _shape_stack,
         patch(
             "src.routing.aggregate_matcher.load_inactive_aggregates",
             new_callable=AsyncMock,
@@ -546,22 +572,6 @@ def _patch_inactive_aggregates():
             "shared.semantic.canonical_dimensions.build_canonical_dimension_list",
             new_callable=AsyncMock,
             return_value=[],
-        ),
-        patch(
-            "src.semantic.snapshot_resolver.resolve_deployed_shape",
-            new_callable=AsyncMock,
-            return_value=_empty_shape,
-        ),
-        # A2: the binder imports resolve_deployed_shape at module level, binding
-        # the name into its own namespace. Patching the snapshot_resolver copy
-        # alone does not replace the binder's bound reference, so a deployed test
-        # model hits the fail-closed 503 instead of getting the empty shape. Patch
-        # the binder's copy too. Similarly, the A2 snapshot_graph_resolvers module
-        # imports it lazily, so patching at the module level covers it.
-        patch(
-            "src.semantic.binder.resolve_deployed_shape",
-            new_callable=AsyncMock,
-            return_value=_empty_shape,
         ),
         # F-004-14: ``router.resolve_target_dialect`` was an unused import,
         # removed from router.py; only ``resolve_target_dialect_for_bound`` is
@@ -582,6 +592,8 @@ def _patch_inactive_aggregates():
             return_value=False,
         ),
     ):
+        for _p in _shape_patches:
+            _shape_stack.enter_context(_p)
         yield
 
 

@@ -46,7 +46,7 @@ def test_schema_version_is_current():
     # population governance G1) added joins[].population_participation. The v2
     # families this module exercises still travel; the constant just moved
     # forward.
-    assert SNAPSHOT_SCHEMA_VERSION == 5
+    assert SNAPSHOT_SCHEMA_VERSION == 6
 
 
 def test_collect_pks_remaps_attribute_relationships():

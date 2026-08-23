@@ -323,18 +323,44 @@ class TestBug5582KpiSecurityBoundary:
         server._session_vars = session_vars or {}
         return server
 
-    def test_kpi_read_rejected_for_persona_context(self):
-        # Defence-in-depth: if a non-null relation persona is ever supplied for a
-        # $KPIs read, the guard still fails closed. NOTE: in production the $KPIs
-        # relation always registers persona_id=None (see
-        # test_kpi_read_relation_persona_is_none_in_production), so this branch is
-        # not the real persona-enforcement path — persona/CLS gating happens in the
-        # query-router. This only proves the guard does not open a hole if a
-        # persona id leaks through.
+    def test_kpi_read_permitted_for_persona_context_bug_9259(self):
+        """Bug-9259: an ADVERTISED persona ``$KPIs`` relation must be servable.
+
+        This branch used to fail closed on any non-null ``persona_id``, on the
+        stated assumption that "in production the $KPIs relation always
+        registers persona_id=None". F-008-05 made that false: the catalogue now
+        registers a ``<slug>_<persona>$KPIs`` relation PER persona, carrying
+        that persona's id (proved by
+        ``test_kpi_persona_scoped_relation_f00805.py::
+        test_kpis_relation_registered_per_persona_with_persona_id``). So the
+        gateway advertised a persona scorecard and then refused every read of it
+        with 42501 — a catalogue promising what the serving path denies.
+
+        Persona measure-lineage, CLS (Bug-6139) and RLS (Bug-6930) are enforced
+        by the query-router's ``_handle_kpi_table_query``, and ``persona_id`` is
+        forwarded to ``/execute`` on both JDBC seams, so nothing is unguarded by
+        permitting the read here.
+        """
         server = self._make_server(persona_id="persona-1")
-        err = server._kpi_security_error('SELECT * FROM "modelx$KPIs"', "persona-1")
+        assert server._kpi_security_error(
+            'SELECT * FROM "modelx_sales_eu$KPIs"', "persona-1"
+        ) is None
+
+    def test_kpi_read_still_rejected_for_persona_plus_session_variable(self):
+        """The session-variable refusal is unconditional — persona or not.
+
+        Narrowing the persona branch must not open the branch the gateway
+        genuinely owns: a ``SET app.*`` filter cannot be applied to
+        pre-aggregated ``kpi_latest`` rows, so it fails closed either way.
+        """
+        server = self._make_server(
+            persona_id="persona-1", session_vars={"app.region": "EMEA"},
+        )
+        err = server._kpi_security_error(
+            'SELECT * FROM "modelx_sales_eu$KPIs"', "persona-1"
+        )
         assert err is not None
-        assert "row-level security" in err
+        assert "session-variable" in err
 
     def test_kpi_read_rejected_for_session_variable_context(self):
         # Real, gateway-detectable fail-closed case: a JDBC SET app.* filter cannot

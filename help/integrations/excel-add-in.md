@@ -174,7 +174,7 @@ The persona switcher sets the active persona for everything the add-in does. Sel
 
 ## Custom Excel Functions
 
-The add-in registers connectionless worksheet functions under the `TESSALLITE` namespace, plus older compatibility functions under the `TESS` namespace. These functions use the add-in sign-in session, so the task pane must be signed in and a model selected before custom functions will work.
+The add-in registers connectionless worksheet functions under the single `TESSALLITE` namespace. These functions use the add-in sign-in session, so the task pane must be signed in and a model selected before custom functions will work. Existing workbooks that use the retired short namespace must be updated to `TESSALLITE.*`; the add-in does not publish a second namespace.
 
 ### TESSALLITE.VALUE
 
@@ -203,10 +203,13 @@ Returns one KPI property. Status returns `1`, `0`, or `-1`, so Excel icon-set fo
 
 Returns one measure for one dimension member. Use it for small hand-built schedules where a full PivotTable would be too much.
 
-### Older TESS Namespace
+### TESSALLITE.LISTBYID and KPI ID functions
 
-- `=TESS.LISTBYID("named_set_id")` returns the members of a named set as a spilled array where the Excel version supports dynamic arrays.
-- `=TESS.KPIVALUE("kpi_id")`, `=TESS.KPIGOAL("kpi_id")`, and `=TESS.KPISTATUS("kpi_id")` are retained for older workbooks.
+The published ID-based functions use the same namespace: `TESSALLITE.LISTBYID`, `TESSALLITE.KPIVALUE`, `TESSALLITE.KPIGOAL`, and `TESSALLITE.KPISTATUS`. `LISTBYID` returns a named set's members as a spilled array where the Excel version supports dynamic arrays.
+
+### Retired namespace
+
+The historical short namespace is not a shipped namespace. Replace those formulas with the equivalent `TESSALLITE.*` function before opening the workbook in a supported Excel host.
 
 ### Caching And Refresh
 

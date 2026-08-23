@@ -130,6 +130,44 @@ class ModelMetrics(BaseModel):
     top_pockets: list[PocketSummaryItem]
 
 
+async def _calculate_pocket_time_saved(
+    db, model_id: UUID, since: datetime, now: datetime
+) -> int:
+    """Estimate pocket savings from live executions in the requested window.
+
+    Bug-7460: ``PocketDefinition.time_saved_ms_total`` is lifetime telemetry and
+    cannot back a windowed Model Health response. Match Usage Analytics'
+    estimate: (average source latency - average pocket latency) * pocket count.
+    """
+    common_filters = (
+        QueryLog.model_id == model_id,
+        QueryLog.created_at >= since,
+        QueryLog.created_at <= now,
+        QueryLog.status == "success",
+        QueryLog.route_type.notin_(_ANALYTICS_EXCLUDED_ROUTE_TYPES),
+        QueryLog.protocol.is_distinct_from(_DISCOVERY_PROTOCOL),
+        QueryLog.cache_status.is_distinct_from(_CACHE_HIT_STATUS),
+    )
+    pocket_stmt = select(
+        # Count only rows that contribute to the average. Historical successful
+        # rows may have NULL timing; multiplying by them would inflate savings.
+        func.count(QueryLog.execution_ms).label("cnt"),
+        func.avg(QueryLog.execution_ms).label("avg_ms"),
+    ).where(*common_filters, QueryLog.route_type == "pocket")
+    pocket = (await db.execute(pocket_stmt)).one()
+
+    source_stmt = select(func.avg(QueryLog.execution_ms)).where(
+        *common_filters, QueryLog.route_type == "source"
+    )
+    source_avg = (await db.execute(source_stmt)).scalar_one()
+
+    pocket_count = int(getattr(pocket, "cnt", 0) or 0)
+    pocket_avg = getattr(pocket, "avg_ms", None)
+    if source_avg is None or pocket_avg is None or pocket_count == 0:
+        return 0
+    return max(int((float(source_avg) - float(pocket_avg)) * pocket_count), 0)
+
+
 @router.get("/metrics", response_model=ModelMetrics)
 async def get_model_metrics(
     project_id: UUID,
@@ -307,8 +345,9 @@ async def get_model_metrics(
         )
         pockets = list(pockets_result.scalars().all())
 
-        pocket_hit_total = sum(int(p.hit_count or 0) for p in pockets)
-        pocket_time_saved_ms = sum(int(p.time_saved_ms_total or 0) for p in pockets)
+        pocket_time_saved_ms = await _calculate_pocket_time_saved(
+            db, model_id, since, now
+        )
         pocket_storage_bytes = sum(int(p.storage_bytes or 0) for p in pockets)
         day_ago = now - timedelta(hours=24)
         pocket_evictions_24h = sum(

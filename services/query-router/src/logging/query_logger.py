@@ -498,6 +498,8 @@ async def log_query(
     client_kind: Optional[str] = None,
     security_rules_applied: Optional[list[dict]] = None,
     cache_status: Optional[str] = None,
+    named_query_id: Optional[uuid.UUID] = None,
+    named_query_fallback_reason: Optional[str] = None,
 ) -> QueryLog:
     """Write a QueryLog row and pipeline trace RouteLog rows. Return the QueryLog.
 
@@ -518,6 +520,8 @@ async def log_query(
         route_type=decision.route_type,
         aggregate_id=decision.aggregate_id,
         pocket_id=decision.pocket_id,
+        named_query_id=named_query_id,
+        named_query_fallback_reason=named_query_fallback_reason,
         persona_id=persona_id,
         client_kind=client_kind,
         rewritten_query=decision.rewritten_query,
@@ -681,6 +685,8 @@ async def log_query_failure(
     error_detail: str = "",
     raw_query_override: Optional[str] = None,
     protocol_override: Optional[str] = None,
+    named_query_id: Optional[uuid.UUID] = None,
+    named_query_fallback_reason: Optional[str] = None,
 ) -> QueryLog:
     """Persist a failed query as a QueryLog row with status='error'.
 
@@ -705,6 +711,8 @@ async def log_query_failure(
         route_type=decision.route_type if decision else "unknown",
         aggregate_id=getattr(decision, "aggregate_id", None) if decision else None,
         pocket_id=getattr(decision, "pocket_id", None) if decision else None,
+        named_query_id=named_query_id,
+        named_query_fallback_reason=named_query_fallback_reason,
         persona_id=persona_id,
         client_kind=client_kind,
         rewritten_query=getattr(decision, "rewritten_query", None) if decision else None,

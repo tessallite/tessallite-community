@@ -134,7 +134,20 @@ Non-median percentiles (p90, p95, p99, and the rest) are **temporarily served fr
 
 **Functions that always hit the source.** Order-dependent or distribution-shaped functions — `MODE`, `STRING_AGG`/`ARRAY_AGG`/`LISTAGG`, and `APPROX_COUNT_DISTINCT` — cannot be served from pre-computed columns and always route to the source table.
 
-**Include all measures.** When the model setting "Include all measures" is enabled (the default), every aggregate includes all model measures. The Optimizer's advisors recommend only the dimension grain in this mode; measures are added automatically at build time. If a new measure is added to the model after an aggregate was built, the lifecycle sweep detects the gap, retires the stale aggregate, and rebuilds it with the full measure set.
+**Include all measures.** This model setting is **off by default**, and new models start with it off. With it off, each summary table holds only the measures the queries that triggered it actually asked for. That is usually what you want: a narrow summary table is faster to build, cheaper to store, and — importantly — much more likely to be usable.
+
+Turn it on when you want every summary table on a model to carry every measure, so that a brand-new question about an existing grouping is answered instantly instead of waiting for the Optimizer to notice it. The trade is size and build time, and one subtler cost worth understanding.
+
+**Why "all measures" is not always better.** A summary table is only allowed to answer a question when it was built over exactly the same set of rows the question would have scanned. Adding a measure that lives on a different table pulls that table into the summary's build, and if joining it drops or duplicates rows, the summary now covers a *different* population — so Tessallite refuses to answer from it and quietly goes back to the source table. Switch the setting on for a model with measures spread across several tables and you can end up with many summary tables that are never used. Tessallite guards against this automatically: when the setting is on, it only adds the measures that fit the same population as the query that triggered the build. But the narrower default avoids the problem entirely.
+
+**Existing summary tables when you change the setting.** Nothing is destroyed the moment you flip the switch.
+
+- **Turning it on** — the next Optimizer sweep rebuilds each live summary table with the wider set of measures.
+- **Turning it off** — new summary tables are built narrow from then on. Summary tables you already have keep every column they were built with, so no report that relies on them stops working. Where an old wide table cannot answer a question, the Optimizer builds a narrow one **next to it** rather than replacing it — the wide table may still be the right answer for a report that asks for all of those measures at once. Tessallite does not delete the old table for you: it stays until the model's summary-table limit pushes it out, or until you retire it yourself from the Aggregates panel.
+
+  **Tip.** If you turned the setting off because a model had many summary tables that were never being used, check the Aggregates panel a few days later. The new narrow tables will show hits; the old wide ones that show none are safe to retire by hand.
+
+If a new measure is added to the model while the setting is on, the lifecycle sweep detects the gap, retires the stale summary table, and rebuilds it — keeping the columns it already had and adding the missing ones.
 
 ---
 
@@ -149,6 +162,16 @@ Whether the optimiser builds these enriched aggregates is controlled by a per-mo
 ## Manual versus auto-created aggregates
 
 Manual aggregates are displayed in the Canvas with a solid border on their dashed outline. Auto-created aggregates show an Optimizer badge. Both respond to the same status indicators (Ready, Stale, Refreshing, Error). Manual aggregates are permanent — the Optimizer will not retire them. Auto-created aggregates may be removed by the Optimizer if the query patterns they serve drop off; you receive a notification in the Health tab when this occurs.
+
+---
+
+## Deleting an aggregate
+
+Deleting an aggregate removes both halves: the definition you see in Tessallite **and** the summary table it built on your target database. Tessallite records what needs removing before it deletes the definition, deletes the definition, and only then drops the table — in that order, so there is never a moment where Tessallite still thinks it can answer from a table that has already gone.
+
+If the drop itself does not succeed (the target database is briefly unreachable, for example), the delete still goes through and the table is dropped on a later retry — the record of what to remove is kept.
+
+One case is refused rather than half-done: if Tessallite cannot work out where the summary table actually lives — its target connection has been deleted, or now belongs to a different project — you get an error asking you to repair the connection first, and the aggregate is left alone. Deleting it at that point would leave a table on your database with nothing left in Tessallite pointing at it.
 
 ---
 

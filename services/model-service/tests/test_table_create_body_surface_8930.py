@@ -32,7 +32,7 @@ import pytest
 
 from shared.db.models import DataSource, Model, ModelTable
 from shared.schemas.pydantic_models import ModelTableCreate, ModelTableUpdate
-from src.api.tables import create_table
+from src.api.tables import ApplyClassificationRequest, create_table
 
 pytestmark = pytest.mark.unit
 
@@ -97,6 +97,21 @@ def test_table_type_enum_is_validated_on_update():
     ModelTableUpdate.model_validate({"table_type": "dim_aggregate"})
     with pytest.raises(ValidationError):
         ModelTableUpdate.model_validate({"table_type": "Fact"})
+
+
+def test_bug_8626_apply_classification_reuses_table_type_domain():
+    """The second public table-type writer cannot reintroduce a free string."""
+    from pydantic import ValidationError
+
+    for good in ("fact", "dim_aggregate", "dim_detail", None):
+        ApplyClassificationRequest.model_validate(
+            {"table_type": good, "overrides": []}
+        )
+    for bad in ("Fact", "FACT", "dimension", "calendar", "unclassified", ""):
+        with pytest.raises(ValidationError):
+            ApplyClassificationRequest.model_validate(
+                {"table_type": bad, "overrides": []}
+            )
 
 
 def test_removed_fields_are_not_silently_accepted_as_attributes():

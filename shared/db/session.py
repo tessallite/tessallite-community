@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import OrderedDict
 from typing import AsyncGenerator
 
 from sqlalchemy.engine import make_url
@@ -31,6 +32,10 @@ settings = get_settings()
 # ---------------------------------------------------------------------------
 _system_engine = create_async_engine(
     settings.SYSTEM_DATABASE_URL,
+    # Bug-9192: every retained engine has a deliberately small pool so cached
+    # tenant engines do not each reserve SQLAlchemy's much larger defaults.
+    pool_size=2,
+    max_overflow=0,
     pool_pre_ping=True,
     pool_recycle=1800,
     echo=False,
@@ -51,17 +56,58 @@ async def get_system_db() -> AsyncGenerator[AsyncSession, None]:
 # engine, closing its connection pool instead of stranding connections until
 # GC.  The public API continues to return only the factory; the engine is
 # kept internally for lifecycle management.
-_tenant_engines: dict[str, tuple[object, async_sessionmaker]] = {}
+#
+# Bug-9192 / RFGPT-002: OrderedDict + TENANT_ENGINE_CACHE_MAX so the number of
+# retained engines (and therefore idle connections) is bounded per process.
+# Access refreshes LRU order; overflow disposes the least-recently-used engine.
+_tenant_engines: OrderedDict[str, tuple[object, async_sessionmaker]] = OrderedDict()
 # Bug-7980 follow-up: a SEPARATE NullPool-backed engine per tenant used ONLY for
 # the short-lived REPEATABLE READ Save snapshot session, so that second
 # connection never draws from / blocks on the bounded request pool while many
 # Saves are paused on the per-model advisory lock (which would starve/deadlock
 # the request pool). NullPool opens and closes a dedicated connection each use.
-# INVARIANT: this cache is disposed only via ``evict_tenant_engine``; that is safe
-# ONLY because ``poolclass=NullPool`` holds no idle connections. If the pool class
-# ever changes, add an explicit shutdown-disposal hook for both caches.
-_tenant_snapshot_engines: dict[str, tuple[object, async_sessionmaker]] = {}
+# INVARIANT: this cache is disposed only via ``evict_tenant_engine`` / LRU
+# eviction; that is safe ONLY because ``poolclass=NullPool`` holds no idle
+# connections. If the pool class ever changes, add an explicit shutdown-disposal
+# hook for both caches.
+_tenant_snapshot_engines: OrderedDict[str, tuple[object, async_sessionmaker]] = OrderedDict()
 _tenant_engines_lock = asyncio.Lock()  # M-04 fix: protect concurrent access
+
+
+def _tenant_engine_cache_max() -> int:
+    return int(settings.TENANT_ENGINE_CACHE_MAX)
+
+
+async def _dispose_engine_entry(entry: tuple[object, async_sessionmaker] | None) -> None:
+    if entry is None:
+        return
+    engine, _factory = entry
+    await engine.dispose()
+
+
+async def _lru_insert_request_engine(
+    tenant_id: str,
+    entry: tuple[object, async_sessionmaker],
+) -> None:
+    """Insert/refresh a request engine under the lock; dispose LRU overflow.
+
+    Caller MUST hold ``_tenant_engines_lock``.
+    """
+    _tenant_engines[tenant_id] = entry
+    _tenant_engines.move_to_end(tenant_id)
+    limit = _tenant_engine_cache_max()
+    while len(_tenant_engines) > limit:
+        old_id, old_entry = _tenant_engines.popitem(last=False)
+        logger.info(
+            "Bug-9192: disposing LRU tenant engine for %s (cache_max=%d)",
+            old_id,
+            limit,
+        )
+        await _dispose_engine_entry(old_entry)
+        # Keep the parallel NullPool snapshot engine in sync so a URL-stale
+        # snapshot cannot outlive its request-engine sibling.
+        snap_entry = _tenant_snapshot_engines.pop(old_id, None)
+        await _dispose_engine_entry(snap_entry)
 
 
 def _decrypt_db_url(encrypted: bytes) -> str:
@@ -131,11 +177,16 @@ async def get_tenant_session_factory(tenant_id: str) -> async_sessionmaker:
     async with _tenant_engines_lock:
         if tenant_id in _tenant_engines:
             _engine, factory = _tenant_engines[tenant_id]
+            _tenant_engines.move_to_end(tenant_id)
             return factory
 
         db_url, quoted_schema = await _resolve_tenant_dsn(tenant_id)
         engine = create_async_engine(
             db_url,
+            # Bug-9192: bound each cached tenant pool; aggregate retained
+            # connections are further capped by TENANT_ENGINE_CACHE_MAX LRU.
+            pool_size=2,
+            max_overflow=0,
             pool_pre_ping=True,
             pool_recycle=1800,
             echo=False,
@@ -147,7 +198,7 @@ async def get_tenant_session_factory(tenant_id: str) -> async_sessionmaker:
             engine, expire_on_commit=False,
             info={"tenant_id": tenant_id},
         )
-        _tenant_engines[tenant_id] = (engine, factory)
+        await _lru_insert_request_engine(tenant_id, (engine, factory))
         return factory
 
 
@@ -165,9 +216,13 @@ async def get_tenant_snapshot_session_factory(tenant_id: str) -> async_sessionma
     async with _tenant_engines_lock:
         if tenant_id in _tenant_snapshot_engines:
             _engine, factory = _tenant_snapshot_engines[tenant_id]
+            _tenant_snapshot_engines.move_to_end(tenant_id)
             return factory
 
         db_url, quoted_schema = await _resolve_tenant_dsn(tenant_id)
+        # Bug-9192: NullPool retains no connections and accepts no
+        # pool_size/max_overflow knobs, so this short-lived snapshot path is
+        # already bounded to one connection per active snapshot operation.
         engine = create_async_engine(
             db_url,
             poolclass=NullPool,
@@ -181,6 +236,13 @@ async def get_tenant_snapshot_session_factory(tenant_id: str) -> async_sessionma
             info={"tenant_id": tenant_id},
         )
         _tenant_snapshot_engines[tenant_id] = (engine, factory)
+        _tenant_snapshot_engines.move_to_end(tenant_id)
+        # Snapshot engines hold no idle connections; still bound the dict so a
+        # long-lived process cannot accumulate unbounded engine objects.
+        limit = _tenant_engine_cache_max()
+        while len(_tenant_snapshot_engines) > limit:
+            old_id, old_entry = _tenant_snapshot_engines.popitem(last=False)
+            await _dispose_engine_entry(old_entry)
         return factory
 
 

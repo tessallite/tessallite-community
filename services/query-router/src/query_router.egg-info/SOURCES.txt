@@ -92,6 +92,8 @@ tests/test_binder_query_defined_alias_scope.py
 tests/test_binder_visibility_cascade.py
 tests/test_bug8285_caption_augmentation.py
 tests/test_bug8285_caption_source_render.py
+tests/test_bug8615_g3_join_population_serving.py
+tests/test_bug9172_named_query_attribution.py
 tests/test_bug_5173_dialect_fragment_boundary.py
 tests/test_bug_5192_5193_5195_5196_5197_5336.py
 tests/test_bug_5547_count_distinct_aggregate_quoting.py
@@ -128,6 +130,7 @@ tests/test_bug_8664_aggregate_join_population.py
 tests/test_bug_8664_derived_exact_population.py
 tests/test_bug_8789_split_population_codes.py
 tests/test_bug_8809_row_security_error_disclosure.py
+tests/test_bug_9020_execute_compile_error_is_422.py
 tests/test_cache_hit_observability.py
 tests/test_cache_hit_pocket_no_double_count.py
 tests/test_calc_aggregate_routing.py
@@ -136,6 +139,7 @@ tests/test_calculated_aggregate_match.py
 tests/test_calculated_measure_execute.py
 tests/test_calculated_rewrite.py
 tests/test_calendar_binding.py
+tests/test_calendar_deploy_pin.py
 tests/test_canonical_grain_match.py
 tests/test_column_restriction.py
 tests/test_column_usage_stable_refs_8074.py
@@ -175,6 +179,7 @@ tests/test_force_aggregate.py
 tests/test_force_route_source.py
 tests/test_from_builder_cross_builder_equivalence.py
 tests/test_headless_api.py
+tests/test_health_serving_readiness.py
 tests/test_hit_credit_wiring.py
 tests/test_hit_rate_update.py
 tests/test_input_dialect_contract.py
@@ -192,9 +197,13 @@ tests/test_ml4_rewriter_dialect_fixes.py
 tests/test_ml5_routing_fixes.py
 tests/test_named_list_resolver.py
 tests/test_named_query_binding_seam.py
+tests/test_named_query_decision_matrix.py
 tests/test_named_query_generation_guard.py
 tests/test_named_query_resolver.py
+tests/test_named_query_rls_compile_error.py
 tests/test_normalize_value.py
+tests/test_nq2_bug9161_build_live_population_divergence.py
+tests/test_nq2_bug9161_star_expansion.py
 tests/test_param_resolver.py
 tests/test_passthrough_dialect_transpile.py
 tests/test_percentile_exactness_gate_inventory.py
@@ -229,6 +238,7 @@ tests/test_row_security_compiler.py
 tests/test_row_security_routing.py
 tests/test_security_lane_qr2.py
 tests/test_security_lane_qr2b.py
+tests/test_seed_demolist_expansion.py
 tests/test_select_group_by_validation.py
 tests/test_select_star_compat.py
 tests/test_semi_additive.py
@@ -236,12 +246,15 @@ tests/test_semi_additive_grand_total.py
 tests/test_serve_time_overdue_gate.py
 tests/test_shape_coverage.py
 tests/test_simulate_principal.py
+tests/test_snapshot_authority_serving.py
 tests/test_snapshot_pinning.py
+tests/test_snapshot_serving_surface_enumeration.py
 tests/test_source_audit_guardrail.py
 tests/test_source_bigquery_exact_quantile.py
 tests/test_specific_query.py
 tests/test_sql_parser.py
 tests/test_undeployed_model_http_409.py
+tests/test_validate_security_verdict_f007_07.py
 tests/test_variant_calendar_decision.py
 tests/test_variant_date_anchor.py
 tests/test_where_numeric_literal.py

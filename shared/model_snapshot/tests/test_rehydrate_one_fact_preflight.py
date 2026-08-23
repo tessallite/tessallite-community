@@ -36,7 +36,7 @@ async def test_two_fact_tables_raise_before_db():
     # tenant_db=None proves the preflight raises before any DB access.
     with pytest.raises(OneFactViolationError) as ei:
         await rehydrate_into_live(uuid.uuid4(), snap, None)
-    assert "2 fact tables" in str(ei.value)
+    assert "exactly one fact table" in str(ei.value)
     assert "sales" in str(ei.value) and "orders" in str(ei.value)
 
 
@@ -57,3 +57,13 @@ async def test_single_fact_snapshot_passes_preflight():
     with pytest.raises(Exception) as ei:
         await rehydrate_into_live(uuid.uuid4(), snap, None)
     assert not isinstance(ei.value, OneFactViolationError)
+
+
+@pytest.mark.asyncio
+async def test_bug_8614_multi_table_zero_fact_snapshot_fails_before_db():
+    snap = _snapshot([
+        _table("dim_detail", "customers"),
+        _table("dim_detail", "regions"),
+    ])
+    with pytest.raises(OneFactViolationError, match="exactly one fact table"):
+        await rehydrate_into_live(uuid.uuid4(), snap, None)

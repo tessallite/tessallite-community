@@ -119,6 +119,17 @@ class DeployedShape:
     # calendar identity from here, not from ``db.get(CalendarTable, ...)``.
     calendar_tables: list[dict[str, Any]] = field(default_factory=list)
     calendar_tables_by_id: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # --- Parameter serving surface (F-029-01 / Bug-9397) ----------------------
+    # The deployed ``model_parameters`` rows and the set of declared ``@name``s
+    # they define. BOTH the parameter VALUES that get bound into the SQL and the
+    # query-time ``@``-namespace collision check must read this ONE pinned copy.
+    # They used to disagree: the values came from the snapshot while the
+    # collision check ran ``select(ModelParameter)`` against the LIVE ORM, so a
+    # draft parameter that collided with a deployed named list 400'd production
+    # queries that should have expanded the deployed list. Pinning both here
+    # makes the disagreement unrepresentable inside one request.
+    model_parameters: list[dict[str, Any]] = field(default_factory=list)
+    model_parameter_names: set[str] = field(default_factory=set)
 
 
 # key -> (expires_at, DeployedShape)
@@ -369,6 +380,16 @@ def _build_shape(model_id: uuid.UUID, snapshot: dict[str, Any]) -> DeployedShape
         if raw_id:
             calendar_tables_by_id[str(raw_id)] = cal
 
+    # Parameter family (F-029-01 / Bug-9397). Non-dict rows are dropped rather
+    # than allowed to reach the resolver as an untyped value.
+    model_parameters = [
+        p for p in (snapshot.get("model_parameters", []) or [])
+        if isinstance(p, dict)
+    ]
+    model_parameter_names = {
+        str(p["name"]) for p in model_parameters if p.get("name")
+    }
+
     return DeployedShape(
         measures=measures,
         dimensions=dimensions,
@@ -389,6 +410,8 @@ def _build_shape(model_id: uuid.UUID, snapshot: dict[str, Any]) -> DeployedShape
         table_name_ids=table_name_ids,
         calendar_tables=calendar_tables,
         calendar_tables_by_id=calendar_tables_by_id,
+        model_parameters=model_parameters,
+        model_parameter_names=model_parameter_names,
     )
 
 
@@ -515,6 +538,34 @@ async def resolve_snapshot_authority(
     return SnapshotAuthority.DEPLOYED_SNAPSHOT_INVALID, None
 
 
+async def resolve_serving_authority(
+    model_id: Any, db: AsyncSession
+) -> tuple[SnapshotAuthority, Optional[DeployedShape]]:
+    """Classify a model's serving semantic authority *by id*, fail-closed.
+
+    The by-id sibling of ``resolve_snapshot_authority`` for the serving
+    consumers that hold a ``model_id`` rather than a loaded ``Model`` (the
+    calendar rewrite consumers, the pre-parse parameter binder, the deployed
+    named-object catalogue). It loads the ``Model`` and delegates, so every
+    caller shares the SAME request-pinned ``DeployedShape`` the binder resolved
+    — one authority per request, no second snapshot rebuild, no divergence.
+
+    A missing ``model_id``, or a model row that does not exist, is
+    ``UNDEPLOYED``: there is no deploy pointer to pin against. A DB failure
+    PROPAGATES rather than being coerced to ``UNDEPLOYED`` — "we could not
+    read the model" is not "the model is undeployed", and conflating the two
+    is precisely the fail-open this classification exists to prevent.
+    """
+    if model_id is None:
+        return SnapshotAuthority.UNDEPLOYED, None
+    from shared.db.models import Model
+
+    model = await db.get(Model, model_id)
+    if model is None:
+        return SnapshotAuthority.UNDEPLOYED, None
+    return await resolve_snapshot_authority(model, db)
+
+
 async def resolve_calendar_serving_shape(
     model_id: Any, db: AsyncSession
 ) -> tuple[SnapshotAuthority, Optional[DeployedShape]]:
@@ -537,17 +588,13 @@ async def resolve_calendar_serving_shape(
       ``hierarchy_rows``; the caller fails closed if the pinned id is absent.
     * ``DEPLOYED_SNAPSHOT_INVALID`` -> fail closed; the caller must NOT read live.
 
-    A missing ``model_id`` or a model that cannot be loaded is treated as
-    ``UNDEPLOYED`` (no deploy pointer to pin against).
+    A missing ``model_id`` or a model row that does not exist is treated as
+    ``UNDEPLOYED`` (no deploy pointer to pin against). Thin alias of
+    ``resolve_serving_authority`` — kept as the calendar consumers' named entry
+    point (and as the marker the calendar serving-surface enumeration guard
+    looks for in ``calendar_support.py``).
     """
-    if model_id is None:
-        return SnapshotAuthority.UNDEPLOYED, None
-    from shared.db.models import Model
-
-    model = await db.get(Model, model_id)
-    if model is None:
-        return SnapshotAuthority.UNDEPLOYED, None
-    return await resolve_snapshot_authority(model, db)
+    return await resolve_serving_authority(model_id, db)
 
 
 async def resolve_calc_dependency_measures(
@@ -801,5 +848,6 @@ __all__ = [
     "invalidate_live_metadata",
     "SnapshotAuthority",
     "resolve_snapshot_authority",
+    "resolve_serving_authority",
     "resolve_calendar_serving_shape",
 ]

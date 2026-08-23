@@ -224,6 +224,12 @@ class Principal:
     roles: frozenset[str] = frozenset()
     groups: frozenset[str] = frozenset()
     claims: dict[str, Any] = field(default_factory=dict)
+    # An explicitly authenticated internal full-model operation may opt out
+    # of the unmatched-audience *coverage* denial. This is not an RLS bypass:
+    # wildcard rules and rules that explicitly match the principal still
+    # compile and apply. The query-router sets this only for the signed KPI
+    # snapshot hop after validating its service scope and client marker.
+    unmatched_role_coverage_exempt: bool = False
 
     @classmethod
     def from_current_user(cls, current_user: Any) -> "Principal":
@@ -657,7 +663,7 @@ async def compile_row_security(
     )
     privileged_coverage_exempt = bool(
         principal.roles & PRIVILEGED_COVERAGE_EXEMPT_ROLES
-    )
+    ) or principal.unmatched_role_coverage_exempt
     if (
         has_role_predicate_rule
         and not matched_role_predicate

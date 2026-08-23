@@ -583,8 +583,20 @@ class TestMdxSetInSqlQuery:
             _make_list("MdxSet", "string", ["a"], list_type="advanced_mdx")
         )
         sql = "SELECT * FROM t WHERE ch IN (@MdxSet)"
-        with pytest.raises(ParameterError, match="MDX named set.*XMLA"):
+        with pytest.raises(ParameterError, match="MDX named set.*XMLA") as exc:
             expand_named_lists(sql, lists)
+        # Bug-9219: the refusal is correct — an MDX-expression set stores no
+        # member list, so there is nothing for SQL to expand. What was wrong is
+        # that the message named ONLY the XMLA escape hatch, leaving an analyst
+        # in the SPA Query Panel with no next step. Both routes forward must
+        # stay in the message: use it over XMLA, or republish it as a SQL list.
+        message = str(exc.value)
+        assert "model builder" in message
+        assert "redeploy" in message
+        # It must also say WHY, not just "no": the set has an expression, not
+        # members. Without this the user cannot tell a broken set from an
+        # inapplicable one.
+        assert "not a list of members" in message
 
     def test_topn_type_also_rejected(self):
         lists = _lists_dict(

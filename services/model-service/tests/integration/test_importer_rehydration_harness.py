@@ -24,9 +24,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from shared.db.models import (
     AggregateRefreshPolicy,
+    CalendarTable,
+    DataQualityRule,
     DataSource,
     Dimension,
     Join,
+    KPI,
     Measure,
     Model,
     ModelColumn,
@@ -438,6 +441,202 @@ async def test_restore_mode_preserves_append_only():
             session, mode=RehydrationMode.RESTORE, force_pending=False
         )
     assert persisted is True
+
+
+async def _seed_neighbour_model(
+    session: AsyncSession, project_id: uuid.UUID, connection_id: uuid.UUID
+) -> dict[str, uuid.UUID]:
+    """Seed a SECOND model in the same tenant schema and return its row ids.
+
+    This is what makes the cross-model test faithful rather than a constraint
+    test. The ids a hand-edited bundle carries are REAL rows that exist in the
+    tenant schema and belong to somebody else — every database FK is satisfied,
+    so the FK constraint catches nothing and only the rehydrator's membership
+    guard stands between the import and a cross-model binding. Pointing at a
+    fabricated id would merely prove Postgres enforces its own constraints.
+    """
+    model = Model(
+        id=uuid.uuid4(), project_id=project_id, slug="neighbour-model",
+        display_name="Neighbour", seed=str(uuid.uuid4()),
+    )
+    session.add(model)
+    await session.flush()
+    source = DataSource(
+        id=uuid.uuid4(), model_id=model.id,
+        project_connection_id=connection_id, source_type="jdbc",
+        display_name="Neighbour Source", config={},
+    )
+    session.add(source)
+    await session.flush()
+    calendar = CalendarTable(
+        id=uuid.uuid4(), data_source_id=source.id,
+        table_name="neighbour_calendar", dialect="postgresql",
+    )
+    table = ModelTable(
+        id=uuid.uuid4(), model_id=model.id, source_id=source.id,
+        table_type="fact", physical_name="neighbour_fact",
+        alias="neighbour_fact", display_name="Neighbour Fact",
+    )
+    session.add_all([calendar, table])
+    await session.flush()
+    column = ModelColumn(
+        id=uuid.uuid4(), model_table_id=table.id, column_name="secret_amount",
+        data_type="numeric",
+    )
+    measure = Measure(
+        id=uuid.uuid4(), model_id=model.id, name="neighbour_revenue",
+    )
+    dimension = Dimension(
+        id=uuid.uuid4(), model_id=model.id, name="neighbour_date",
+        is_time_dim=True,
+    )
+    session.add_all([column, measure, dimension])
+    await session.flush()
+    return {
+        "model_id": model.id, "calendar_id": calendar.id,
+        "column_id": column.id, "measure_id": measure.id,
+        "dimension_id": dimension.id,
+    }
+
+
+async def test_bug8950_import_drops_every_cross_model_fk_against_postgres():
+    """Bug-8932 / Bug-8950 / L9-F2 through the REAL persistence path.
+
+    The unit guards assert compiled INSERT parameters; they cannot show what
+    actually LANDS. This drives ``prepare_snapshot_for_import`` +
+    ``rehydrate_into_live`` against real PostgreSQL with a hand-edited bundle
+    whose tenant-schema-wide foreign keys all name rows of a DIFFERENT model in
+    the same schema, then reads the persisted rows back:
+
+      * ``model_tables.calendar_table_id`` -> NULL (Bug-8932): otherwise the
+        imported model dates itself off another model's calendar spine;
+      * the ``data_quality_rules`` row is absent (Bug-8950): its ``target_id``
+        is NOT NULL and ``data_quality/validator.py`` dereferences it with a
+        bare ``db.get`` on a service token, so an imported foreign target reads
+        another project's physical table;
+      * all four ``kpis`` FKs -> NULL (Bug-8950 + L9-F2): a KPI left pointing
+        at another model's measure drags it into target evaluation, dependency
+        resolution, lineage and governance export.
+
+    Fails against the pre-guard rehydrator, which persisted every one of them
+    verbatim (the database FK constraints are all satisfied by the neighbour
+    rows, so nothing else refuses them).
+    """
+    db_url = os.environ.get(DB_URL_ENV)
+    if not db_url:
+        pytest.skip(f"Set {DB_URL_ENV} to run DB-backed importer rehydration tests")
+
+    async with _isolated_schema_session(db_url) as session:
+        project_id, connection_id = await _seed_project(session)
+        foreign = await _seed_neighbour_model(session, project_id, connection_id)
+
+        case = next(
+            item for item in importer_rehydration_cases()
+            if item.name == "yaml-roundtrip"
+        )
+        snapshot = case.build_snapshot()
+        source_connection_id = str(uuid.uuid4())
+        snapshot["data_sources"][0]["project_connection_id"] = source_connection_id
+
+        # The bundle declares no calendar of its own, yet binds a table to one.
+        snapshot["calendar_tables"] = []
+        snapshot["tables"][0]["calendar_table_id"] = str(foreign["calendar_id"])
+        snapshot["data_quality_rules"] = [
+            {
+                "id": str(uuid.uuid4()),
+                "name": "foreign_target_rule",
+                "target_type": "column",
+                "target_id": str(foreign["column_id"]),
+                "rule_type": "not_null",
+                "severity": "error",
+                "is_enabled": True,
+            }
+        ]
+        snapshot["kpis"] = [
+            {
+                "id": str(uuid.uuid4()),
+                "name": "foreign_fk_kpi",
+                "time_dimension_id": str(foreign["dimension_id"]),
+                "value_measure_id": str(foreign["measure_id"]),
+                "goal_measure_id": str(foreign["measure_id"]),
+                "target_measure_id": str(foreign["measure_id"]),
+            }
+        ]
+
+        new_model_id = uuid.uuid4()
+        rewritten, missing = prepare_snapshot_for_import(
+            snapshot,
+            new_model_id=new_model_id,
+            connection_mapping={source_connection_id: str(connection_id)},
+        )
+        assert missing == []
+        # The re-key must not have quietly rewritten the foreign ids into
+        # in-model ones; that would make the assertions below vacuous.
+        assert rewritten["tables"][0]["calendar_table_id"] == str(
+            foreign["calendar_id"]
+        )
+        assert rewritten["data_quality_rules"][0]["target_id"] == str(
+            foreign["column_id"]
+        )
+        assert rewritten["kpis"][0]["value_measure_id"] == str(
+            foreign["measure_id"]
+        )
+
+        session.add(
+            Model(
+                id=new_model_id,
+                project_id=project_id,
+                slug=rewritten["model"]["slug"],
+                display_name=rewritten["model"]["display_name"],
+                seed=str(uuid.uuid4()),
+            )
+        )
+        await session.flush()
+
+        await rehydrate_into_live(
+            new_model_id,
+            rewritten,
+            session,
+            drop_orphan_aggregates=False,
+            actor="bug-8950-cross-model-fk-test",
+            preserve_destination_seed=True,
+        )
+        await session.commit()
+
+        bound = await _count(
+            session,
+            ModelTable,
+            ModelTable.model_id == new_model_id,
+            ModelTable.calendar_table_id.isnot(None),
+        )
+        assert bound == 0, "an imported table kept another model's calendar"
+
+        assert await _count(
+            session, DataQualityRule, DataQualityRule.model_id == new_model_id
+        ) == 0, "a rule targeting another model's column was imported"
+
+        kpi_row = (
+            await session.execute(
+                select(
+                    KPI.time_dimension_id,
+                    KPI.value_measure_id,
+                    KPI.goal_measure_id,
+                    KPI.target_measure_id,
+                ).where(KPI.model_id == new_model_id)
+            )
+        ).one()
+        assert kpi_row == (None, None, None, None), (
+            f"imported KPI kept cross-model foreign keys: {kpi_row}"
+        )
+
+        # The neighbour model is untouched — the guard drops the reference, it
+        # never deletes the referenced row.
+        assert await _count(
+            session, Measure, Measure.id == foreign["measure_id"]
+        ) == 1
+        assert await _count(
+            session, CalendarTable, CalendarTable.id == foreign["calendar_id"]
+        ) == 1
 
 
 @pytest.mark.parametrize(

@@ -107,8 +107,11 @@ class TestRedactTraceWithholdsJudgePending:
         resp = _redact_trace(_turn("judge_pending"), cfg)
 
         assert resp.status == "judge_pending"
-        # The unvetted answer itself is withheld (no block message written yet).
-        assert resp.answer_text is None
+        # The unvetted answer itself is withheld; users receive only the
+        # generic held-for-review/retry message (Bug-9024).
+        assert resp.answer_text == (
+            "This answer is being held for review. Please try again shortly."
+        )
         # Answer-derived artefacts are all withheld, same as judge_blocked.
         assert resp.rendered_output is None
         assert resp.chart_type is None
@@ -171,7 +174,9 @@ class TestRedactTraceWithholdsJudgePending:
 
         assert len(rows) == 1
         assert rows[0].status == "judge_pending"
-        assert rows[0].answer_text is None
+        assert rows[0].answer_text == (
+            "This answer is being held for review. Please try again shortly."
+        )
         assert SECRET_ANSWER not in json.dumps(
             [r.model_dump() for r in rows], default=str
         )
@@ -233,7 +238,9 @@ class TestIdempotencyReplayWithholdsJudgePending:
         assert len(completed) == 1
         data = completed[0]["data"]
         assert data["status"] == "judge_pending"
-        assert data["answer_text"] is None
+        assert data["answer_text"] == (
+            "This answer is being held for review. Please try again shortly."
+        )
         assert data["judge_pending"] is True
         assert data["citations"] is None
         assert data["result_sample"] is None
@@ -367,7 +374,9 @@ class TestDurableFailClosedLeavesPending:
         # durable fail-closed property: no release to ok happened.
         durable_read = _redact_trace(_turn("judge_pending"), cfg)
         assert durable_read.status == "judge_pending"
-        assert durable_read.answer_text is None
+        assert durable_read.answer_text == (
+            "This answer is being held for review. Please try again shortly."
+        )
         assert SECRET_ANSWER not in durable_read.model_dump_json()
 
 

@@ -28,7 +28,11 @@ import VerifiedIcon from "@mui/icons-material/Verified";
 import BlockIcon from "@mui/icons-material/Block";
 
 import { namedQueriesApi } from "../../api/client";
-import { useNamedQueries, useNamedQueryCaps } from "../../api/hooks";
+import {
+  useNamedQueries,
+  useNamedQueryAnalytics,
+  useNamedQueryCaps,
+} from "../../api/hooks";
 import { useT } from "../../i18n";
 import type {
   NamedQuery,
@@ -120,6 +124,19 @@ function parseCapField(raw: string): number | null {
   return Number.isFinite(num) && num >= 1 ? Math.trunc(num) : null;
 }
 
+function formatAnalyticsMilliseconds(value: number): string {
+  return new Intl.NumberFormat(undefined, {
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1,
+  }).format(value);
+}
+
+function formatAnalyticsBytes(value: number): string {
+  return new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: 1,
+  }).format(value);
+}
+
 interface NamedQueryEditorProps {
   open: boolean;
   mode: "create" | "edit";
@@ -189,6 +206,11 @@ export default function NamedQueryEditor({
   const health = useMemo(
     () => (serverNq ? namedQueryHealth(serverNq) : null),
     [serverNq],
+  );
+  const analytics = useNamedQueryAnalytics(
+    projectId,
+    modelId,
+    isEdit ? serverNq?.id : null,
   );
 
   const effectiveRowCap = serverNq?.row_cap ?? caps.maxRows;
@@ -680,6 +702,57 @@ export default function NamedQueryEditor({
               >
                 {refreshError}
               </Alert>
+            )}
+            {analytics.isError && (
+              <Alert severity="warning" sx={{ mt: 1 }} data-testid="nq-analytics-error">
+                {t("namedQueries.analyticsUnavailable")}
+              </Alert>
+            )}
+            {analytics.data && (
+              <Box mt={1} data-testid="nq-analytics">
+                <Typography variant="subtitle2">
+                  {t("namedQueries.analyticsTitle")}
+                </Typography>
+                <Typography variant="caption" color="text.secondary" display="block">
+                  {t("namedQueries.analyticsSummary", {
+                    fallback: String(analytics.data.fallback_queries),
+                    total: String(analytics.data.total_queries),
+                    rate: analytics.data.fallback_rate.toFixed(1),
+                  })}
+                </Typography>
+                {analytics.data.avg_fallback_execution_ms != null && (
+                  <Typography variant="caption" color="text.secondary" display="block">
+                    {t("namedQueries.analyticsAvgExecution", {
+                      value: formatAnalyticsMilliseconds(
+                        analytics.data.avg_fallback_execution_ms,
+                      ),
+                    })}
+                  </Typography>
+                )}
+                {analytics.data.avg_fallback_bytes_processed != null && (
+                  <Typography variant="caption" color="text.secondary" display="block">
+                    {t("namedQueries.analyticsAvgBytes", {
+                      value: formatAnalyticsBytes(
+                        analytics.data.avg_fallback_bytes_processed,
+                      ),
+                    })}
+                  </Typography>
+                )}
+                {analytics.data.fallback_reasons.length > 0 && (
+                  <Typography variant="caption" color="text.secondary" display="block">
+                    {t("namedQueries.analyticsReasons", {
+                      reasons: analytics.data.fallback_reasons
+                        .map((entry) => `${entry.reason} (${entry.count})`)
+                        .join(", "),
+                    })}
+                  </Typography>
+                )}
+                {analytics.data.recommendation === "repair_named_query_materialisation" && (
+                  <Alert severity="warning" sx={{ mt: 1, py: 0 }} data-testid="nq-analytics-recommendation">
+                    {t("namedQueries.analyticsRecommendation")}
+                  </Alert>
+                )}
+              </Box>
             )}
           </Box>
         )}

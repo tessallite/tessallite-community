@@ -18,6 +18,7 @@ Inside one transaction:
 from __future__ import annotations
 
 import logging
+import secrets
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
@@ -33,6 +34,7 @@ from shared.deploy_resolver_core import (
     malformed_snapshot_families,
 )
 from shared.model_snapshot.slug_utils import validate_bi_safe_slug
+from shared.schemas.domains.governance_advanced import _DQ_TARGET_TYPES
 from shared.security.predicate_compiler import (
     RowSecurityCompileError,
     _compile_dsl_expression,
@@ -93,7 +95,7 @@ from shared.db.models import (
     data_tag_columns,
 )
 from shared.model_snapshot.serialiser import SNAPSHOT_SCHEMA_VERSION
-from shared.semantic.graph_order import is_fact_table
+from shared.semantic.graph_order import fact_anchor_violation
 from shared.schemas.domains.aggregates_security import persona_filter_value_is_valid
 from shared.schemas.domains.governance_advanced import CertificationStatus
 from shared.security.persona_resolver import (
@@ -154,6 +156,20 @@ _NAMED_SET_GOVERNANCE_FIELDS: tuple[str, ...] = (
     "owner_user_id",
 )
 
+# Bug-8950 / L9-F3: which snapshot collection holds the rows a data-quality
+# rule's polymorphic ``target_id`` may name, per ``target_type``. The VOCABULARY
+# itself is owned by ``_DQ_TARGET_TYPES`` in
+# ``shared/schemas/domains/governance_advanced.py`` — this map only says where to
+# look for each declared type, and is pinned equal to that domain by
+# ``model-service/tests/test_body_fk_scope_p3c.py``. A declared type missing here
+# validates against an EMPTY set, i.e. its rules are skipped (fail closed), never
+# inserted unvalidated.
+_DQ_TARGET_SNAP_TYPE_KEYS: dict[str, str] = {
+    "column": "columns",
+    "dimension": "dimensions",
+    "measure": "measures",
+}
+
 
 def _clamp_certification_status(
     row: dict[str, Any], *, object_kind: str, object_id: Any
@@ -197,7 +213,7 @@ class SnapshotVersionError(ValueError):
 
 
 class OneFactViolationError(SnapshotSchemaError):
-    """Raised when a snapshot carries more than one fact table (F-013-09).
+    """Raised when a snapshot violates the model fact-anchor contract.
 
     A subclass of ``SnapshotSchemaError`` so every existing
     ``except SnapshotSchemaError`` caller already maps it to a clean 4xx; callers
@@ -481,26 +497,19 @@ async def rehydrate_into_live(
             f"version {SNAPSHOT_SCHEMA_VERSION} — upgrade Tessallite first"
         )
 
-    # F-013-09 / F-020-12 (Bug-9120): one fact table per model, checked HERE so
-    # every caller inherits it (revert, catalogue/dbt/cube/atscale/YAML import),
-    # not only the two consumers — project import and model JSON import — that
-    # already preflight it. Without this, a two-fact snapshot reaches the per-row
-    # INSERT below and trips the partial unique index
+    # Bug-8614 / F-013-09 / F-020-12 (Bug-9120): the fact-anchor contract is
+    # checked HERE so every caller inherits it (revert,
+    # catalogue/dbt/cube/atscale/YAML import), not only the two consumers —
+    # project import and model JSON import — that also preflight it. Without
+    # this, an invalid snapshot reaches the per-row INSERT below and trips the
+    # partial unique index
     # ``uq_model_tables_one_fact_per_model`` as a raw IntegrityError / 500
-    # instead of a clean, typed one-fact error. The already-guarded callers
-    # preflight and raise before reaching here, so a valid one-fact bundle is
-    # unaffected and the check never double-fires.
-    _fact_tables = [t for t in (snapshot.get("tables") or []) if is_fact_table(t)]
-    if len(_fact_tables) > 1:
-        _fact_names = [
-            str(t.get("physical_name") or t.get("alias") or "?")
-            for t in _fact_tables
-        ]
-        raise OneFactViolationError(
-            f"snapshot has {len(_fact_tables)} fact tables "
-            f"({', '.join(_fact_names)}); a model may contain at most one "
-            "fact table."
-        )
+    # instead of a clean, typed fact-anchor error. The already-guarded callers
+    # preflight and raise before reaching here, so a valid bundle is unaffected
+    # and the check never double-fires.
+    anchor_error = fact_anchor_violation(snapshot.get("tables") or [])
+    if anchor_error:
+        raise OneFactViolationError(f"snapshot violates fact-anchor contract: {anchor_error}")
 
     model_row = await tenant_db.get(Model, model_id)
     if model_row is None:
@@ -988,6 +997,17 @@ async def rehydrate_into_live(
     snap_model = snapshot.get("model") or {}
     update_kwargs: dict[str, Any] = {}
     uuid_fields = _model_uuid_fields()
+    # Bug-8950: ``models.target_id`` is a tenant-schema-wide FK to a DataTarget
+    # and is restored by the generic model-scalar copy below. A hand-edited or
+    # cross-project bundle can re-point the model's DEFAULT materialisation
+    # destination — and thus the project_connection_id credentials future
+    # aggregates/pockets inherit — at another project's DataTarget (the API
+    # guard refuses this on the write path). Only THIS snapshot's targets are
+    # (re)inserted, so any target_id outside snap["data_targets"] is dangling
+    # and is dropped to NULL (a nullable FK).
+    valid_target_ids = {
+        str(t["id"]) for t in (snapshot.get("data_targets") or []) if t.get("id")
+    }
     for field in _model_scalar_fields():
         # F-013-05: on import the destination model carries a fresh seed and
         # its aggregate/pocket physical names were rebound to it. Overwriting
@@ -1000,6 +1020,18 @@ async def rehydrate_into_live(
             val = snap_model[field]
             if field in uuid_fields:
                 val = _coerce_uuid(val)
+            if (
+                field == "target_id"
+                and val is not None
+                and str(val) not in valid_target_ids
+            ):
+                logger.warning(
+                    "Bug-8950: dropping models.target_id %s on rehydrate of "
+                    "model %s: absent from the snapshot's data targets "
+                    "(cross-project or hand-edited bundle).",
+                    val, model_id,
+                )
+                val = None
             update_kwargs[field] = val
     update_kwargs.update({
         "predictive_built_for_version_id": None,
@@ -1210,25 +1242,25 @@ async def _validate_preserved_pockets(model_id: UUID, db: AsyncSession) -> None:
         # retired pocket is left alone, matching the invalidators elsewhere.
         if pocket.retired_at is not None:
             continue
-        if missing or pocket.status != "stale":
-            await db.execute(
-                update(PocketDefinition)
-                .where(PocketDefinition.id == pocket.id)
-                .values(
-                    status="stale",
-                    # Round-4 review: match the control-plane policy in
-                    # ``shared/artifact_target_binding._invalidate_artifacts``
-                    # exactly, rather than staling alone. The manifest
-                    # describes the COLUMNS of a table on whichever database
-                    # the pocket was built from; if the revert moved the
-                    # model's source, leaving it would let the row-security
-                    # coverage gate prove coverage against the wrong table.
-                    # The liveness pointer goes for the same reason. One
-                    # hazard, one policy.
-                    row_manifest=None,
-                    active_refresh_run_id=None,
-                )
+        # Rehydration changes the model definition/source regardless of the
+        # prior population verdict. Always withdraw the physical generation
+        # and clear proof/trust; preserving an old ineligible label would let a
+        # later matcher proof reactivate rows built for the reverted definition.
+        await db.execute(
+            update(PocketDefinition)
+            .where(PocketDefinition.id == pocket.id)
+            .values(
+                status="stale",
+                failure_reason=None,
+                population_eligibility="unknown",
+                population_eligibility_reason=None,
+                population_proof_fingerprint=None,
+                row_manifest=None,
+                active_refresh_run_id=None,
+                built_for_version_id=None,
+                built_for_epoch=None,
             )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1482,32 +1514,36 @@ async def _truncate_model_children(
         await db.execute(
             delete(PocketDefinition).where(PocketDefinition.model_id == model_id)
         )
-        # Named Query children + definitions. Delete order matters: the
-        # artifact references the refresh runs (SET NULL), so artifacts go
-        # first.
-        nq_ids_q = await db.execute(
-            select(NamedQuery.id).where(NamedQuery.model_id == model_id)
-        )
-        nq_ids = [r[0] for r in nq_ids_q.all()]
-        if nq_ids:
-            await db.execute(
-                delete(NamedQueryArtifact).where(
-                    NamedQueryArtifact.named_query_id.in_(nq_ids)
-                )
-            )
-            await db.execute(
-                delete(NamedQueryRefreshPolicy).where(
-                    NamedQueryRefreshPolicy.named_query_id.in_(nq_ids)
-                )
-            )
-            await db.execute(
-                delete(NamedQueryRefreshRun).where(
-                    NamedQueryRefreshRun.named_query_id.in_(nq_ids)
-                )
-            )
+    # Named Query children + definitions are always rebuilt from the snapshot.
+    # Unlike pockets, ``preserve_pockets=True`` is not a Named Query preserve
+    # flag: RESTORE must reinsert the surviving definition/artifact with the
+    # same ids and physical name while clearing live run/manifest state. Delete
+    # order matters because the artifact points at refresh runs (SET NULL), so
+    # artifacts go first. This also keeps IMPORT and RESTORE on one funnel.
+    nq_ids_q = await db.execute(
+        select(NamedQuery.id).where(NamedQuery.model_id == model_id)
+    )
+    nq_ids = [r[0] for r in nq_ids_q.all()]
+    if nq_ids:
         await db.execute(
-            delete(NamedQuery).where(NamedQuery.model_id == model_id)
+            delete(NamedQueryArtifact).where(
+                NamedQueryArtifact.named_query_id.in_(nq_ids)
+            )
         )
+        await db.execute(
+            delete(NamedQueryRefreshPolicy).where(
+                NamedQueryRefreshPolicy.named_query_id.in_(nq_ids)
+            )
+        )
+        await db.execute(
+            delete(NamedQueryRefreshRun).where(
+                NamedQueryRefreshRun.named_query_id.in_(nq_ids)
+            )
+        )
+    await db.execute(
+        delete(NamedQuery).where(NamedQuery.model_id == model_id)
+    )
+    if not preserve_pockets:
         # Bug-6205: personas are governance — keep them on revert.
         if restore_governance:
             await db.execute(delete(Persona).where(Persona.model_id == model_id))
@@ -1850,9 +1886,29 @@ async def _reconcile_sources_and_targets(
 async def _insert_tables_and_columns(
     model_id: UUID, snap: dict[str, Any], db: AsyncSession
 ) -> None:
+    # Bug-8932: ``model_tables.calendar_table_id`` is a tenant-schema-wide FK,
+    # so a hand-edited or cross-project bundle can point it at another model's
+    # calendar table and the DB FK constraint does not stop it — reinstating
+    # exactly the binding the API guard (Bug-8878) refuses on the write path.
+    # Only THIS snapshot's calendar tables are (re)inserted (_insert_calendar_
+    # tables), so the valid post-rehydrate set is exactly snap["calendar_tables"];
+    # any id outside it is dangling and is dropped to NULL (a nullable FK),
+    # mirroring the dangling-drop the revert path already does elsewhere.
+    valid_calendar_ids = {
+        str(c["id"]) for c in (snap.get("calendar_tables") or []) if c.get("id")
+    }
     for t in snap.get("tables", []):
         row = _strip_pk_and_uuids(t)
         row["model_id"] = model_id
+        cal_id = row.get("calendar_table_id")
+        if cal_id is not None and str(cal_id) not in valid_calendar_ids:
+            logger.warning(
+                "Bug-8932: dropping model_tables.calendar_table_id %s on "
+                "rehydrate of model %s (table '%s'): absent from the snapshot's "
+                "calendar tables (cross-model or hand-edited bundle).",
+                cal_id, model_id, t.get("display_name", t.get("id", "?")),
+            )
+            row.pop("calendar_table_id", None)
         await db.execute(insert(ModelTable).values(**row))
     for c in snap.get("columns", []):
         row = _strip_pk_and_uuids(c)
@@ -1877,6 +1933,8 @@ async def _insert_joins(
     from shared.schemas.domains.aggregates_security import (
         POPULATION_PARTICIPATION_VALUES,
         coerce_population_participation,
+        coerce_population_participation_source,
+        POPULATION_PARTICIPATION_SOURCE_VALUES,
     )
 
     for j in snap.get("joins", []):
@@ -1905,6 +1963,15 @@ async def _insert_joins(
                 j.get("id"), raw_participation, coerced,
             )
             row["population_participation"] = coerced
+        raw_source = row.get("population_participation_source")
+        if raw_source is not None and raw_source not in POPULATION_PARTICIPATION_SOURCE_VALUES:
+            coerced_source = coerce_population_participation_source(raw_source)
+            logger.warning(
+                "G4: join %s carried out-of-vocabulary population participation "
+                "provenance %r on rehydrate; coercing to %r",
+                j.get("id"), raw_source, coerced_source,
+            )
+            row["population_participation_source"] = coerced_source
         await db.execute(insert(Join).values(**row))
 
 
@@ -2493,8 +2560,59 @@ async def _insert_kpis(
     # composition; replacement_id = GOVERNANCE). In-place upsert keeps KPI
     # identity so KPIVersion/Usage/Snapshot/Latest children are never cascaded;
     # the two-pass wiring preserves valid cyclic/self graphs.
+    #
+    # Bug-8950: a KPI carries FOUR non-self FKs into tenant-schema-wide tables —
+    # ``time_dimension_id`` -> dimensions.id and ``value_measure_id`` /
+    # ``goal_measure_id`` / ``target_measure_id`` -> measures.id. All four are
+    # nullable, all four are guarded on the CRUD write path (api/kpis.py refuses
+    # "does not belong to this model"), and all four travel verbatim through a
+    # hand-edited or cross-project bundle, where the DB FK constraint is
+    # satisfied by ANY tenant row and so catches nothing. Only THIS snapshot's
+    # dimensions/measures are (re)inserted, so a reference outside those sets is
+    # dangling: drop it to NULL before the upsert, mirroring how
+    # ``revert_kpi_version`` and the self-FK ``_resolve`` in
+    # ``_upsert_definition_rows`` already detach dangling references.
+    # _upsert_definition_rows clears a nullable column absent from the
+    # (None-stripped) row, so a None here is applied on both INSERT and the
+    # in-place UPDATE path.
+    #
+    # Enumerate every FK, never just the one a bug was reported against: the
+    # three measure FKs are the SAME defect on the SAME rows as the dimension
+    # FK, and none of them is inert. ``target_measure_id`` drives KPI target
+    # evaluation (model-service ``kpi_evaluator.py``), and the "legacy"
+    # value/goal pair are still walked as real references by dependency
+    # resolution (``dependencies/loader.py``), the lineage graph
+    # (``api/lineage_derive.py``) and governance export — so a foreign one
+    # pulls another model's measure into this model's dependency and lineage
+    # answers.
+    valid_dim_ids = {
+        str(d["id"]) for d in (snap.get("dimensions") or []) if d.get("id")
+    }
+    valid_measure_ids = {
+        str(m["id"]) for m in (snap.get("measures") or []) if m.get("id")
+    }
+    foreign_fk_specs: tuple[tuple[str, str, set[str]], ...] = (
+        ("time_dimension_id", "dimensions", valid_dim_ids),
+        ("value_measure_id", "measures", valid_measure_ids),
+        ("goal_measure_id", "measures", valid_measure_ids),
+        ("target_measure_id", "measures", valid_measure_ids),
+    )
+    kpi_rows: list[dict[str, Any]] = []
+    for k in (snap.get("kpis", []) or []):
+        for field, collection, valid_ids in foreign_fk_specs:
+            fk_value = k.get(field)
+            if fk_value is not None and str(fk_value) not in valid_ids:
+                logger.warning(
+                    "Bug-8950: dropping kpis.%s %s on rehydrate of model %s "
+                    "(KPI '%s'): absent from the snapshot's %s (cross-model or "
+                    "hand-edited bundle).",
+                    field, fk_value, model_id,
+                    k.get("name", k.get("id", "?")), collection,
+                )
+                k = {**k, field: None}
+        kpi_rows.append(k)
     await _upsert_definition_rows(
-        KPI, list(snap.get("kpis", []) or []), model_id, db,
+        KPI, kpi_rows, model_id, db,
         self_fk_definition_cols=("parent_kpi_id",),
         self_fk_governance_cols=("replacement_id",),
         governance_cols=_KPI_GOVERNANCE_FIELDS,
@@ -3052,9 +3170,10 @@ async def _insert_named_queries(
     query-router requires ``manifest.build_refresh_run_id ==
     active_refresh_run_id``) is what stops an imported manifest from ever
     admitting a rehydrated artifact under row security. The version binding
-    is cleared too (NULL built_for fails the version gate closed). The
-    physical table name is preserved so the first refresh rebuilds the same
-    identity on the NEW target dialect.
+    is cleared too (NULL built_for fails the version gate closed). On IMPORT
+    the physical table name is always rebound to a destination-scoped identity
+    before the first refresh; RESTORE preserves the historical identity
+    because it belongs to this model.
 
     F-013-02: identity handling depends on ``mode``.
 
@@ -3064,9 +3183,11 @@ async def _insert_named_queries(
       saved views / health chips / any stored reference. ``_strip_pk_and_uuids``
       already keeps the snapshot ``id``, so simply not overriding it preserves
       identity, exactly as measures/dimensions/named-sets already do on revert.
-    * ``IMPORT`` (clone / cross-model import): MINT fresh ids, because the
-      importer's PK rewrite does not cover Named Queries and the source model's
-      NQ rows may still hold those ids in the same tenant (a collision).
+    * ``IMPORT`` (clone / cross-model import): MINT fresh ids. The importer
+      rewrites nested Named Query ids for normal bundles, while this boundary
+      remains defensive for catalog/YAML/direct rehydration callers that hand
+      us a raw snapshot; source rows may still hold those ids in the same
+      tenant (a collision).
     """
     preserve_identity = mode == RehydrationMode.RESTORE
     _NQ_NESTED = {"artifact", "refresh_policy"}
@@ -3086,7 +3207,7 @@ async def _insert_named_queries(
             art_row = _strip_pk_and_uuids(artifact)
             if not (preserve_identity and art_row.get("id") is not None):
                 art_row["id"] = uuid.uuid4()
-            # F-020-01 (CRITICAL): on IMPORT (clone / cross-model), the artifact
+            # F-020-01 / Bug-9222 (CRITICAL): on IMPORT (clone / cross-model), the artifact
             # still carries the SOURCE model's physical table name
             # (nq_<srcseed>_<sfx>). A same-tenant clone shares the tenant
             # aggregates schema, so the first refresh of the clone's NQ would
@@ -3094,9 +3215,15 @@ async def _insert_named_queries(
             # production path. Rebind the seed to the destination model, exactly
             # as aggregates/pockets already do. On RESTORE (revert of the same
             # model) the name is preserved — it IS this model's own table.
-            if not preserve_identity and reseed:
+            if mode == RehydrationMode.IMPORT:
+                # A direct rehydrator caller may omit ``reseed``. Passing the
+                # source name through in that case is still a data-loss path:
+                # the first refresh would DROP/CTAS the source table. Use a
+                # destination-only fallback so every IMPORT funnel is isolated
+                # even when it bypasses ``prepare_snapshot_for_import``.
+                import_seed = reseed or secrets.token_hex(6)
                 art_row["physical_table_name"] = _reseed_physical_table_name(
-                    art_row.get("physical_table_name"), "nq", reseed,
+                    art_row.get("physical_table_name"), "nq", import_seed,
                 )
             art_row["named_query_id"] = nq_id
             art_row["status"] = "stale"
@@ -3110,9 +3237,13 @@ async def _insert_named_queries(
             art_row["failure_reason"] = None
             await db.execute(insert(NamedQueryArtifact).values(**art_row))
         if isinstance(policy, dict):
-            # Policy id is kept from the snapshot (unchanged behaviour): the
-            # policy is 1:1 with its NQ, and its id travels with the NQ id.
             pol_row = _strip_pk_and_uuids(policy)
+            # Policy rows are model-owned identity too. ``_collect_pks`` now
+            # rewrites them for normal import bundles, but mint here as a
+            # second boundary guarantee for catalog/YAML/direct rehydration
+            # callers that hand us a raw snapshot (Bug-9222).
+            if mode == RehydrationMode.IMPORT or pol_row.get("id") is None:
+                pol_row["id"] = uuid.uuid4()
             pol_row["named_query_id"] = nq_id
             await db.execute(insert(NamedQueryRefreshPolicy).values(**pol_row))
 
@@ -3349,7 +3480,49 @@ async def _insert_refresh_sla_config(
 async def _insert_data_quality_rules(
     model_id: UUID, snap: dict[str, Any], db: AsyncSession
 ) -> None:
+    # Bug-8950: ``(target_type, target_id)`` is a polymorphic tenant-schema-wide
+    # FK. ``shared/data_quality/validator.py::_resolve_column_ref`` dereferences
+    # target_id with a bare ``db.get(ModelColumn, ...)`` and introspects that
+    # column's physical table on a system_admin service token, so a cross-model
+    # target_id turns a rehydrated rule into a read of ANOTHER project's source
+    # data (the exact exposure the API guard ``ensure_target_in_model`` closes on
+    # the write path). target_id is NOT nullable, so a rule whose target is
+    # absent from the snapshot has nothing valid to point at and is SKIPPED
+    # (mirroring the dangling-hierarchy skip, Bug-6725) rather than inserted with
+    # a dangling/foreign pointer. An unrecognised target_type fails closed (skip).
+    #
+    # The vocabulary is READ from the canonical domain
+    # (``shared/schemas/domains/governance_advanced.py::_DQ_TARGET_TYPES``, the
+    # same set the CRUD route's ``_DQ_RULE_TARGETS`` is pinned to) rather than
+    # restated here: a re-typed copy is exactly how a fourth target type would
+    # be accepted by the API and then silently DROPPED by import, with the
+    # membership guard reporting a clean skip.
+    # A target type the domain declares but this map has no collection for
+    # yields an EMPTY valid set, so every rule of that type is skipped with the
+    # warning below (fail closed) instead of being inserted unvalidated. The
+    # wiring gap itself is pinned by
+    # ``model-service/tests/test_body_fk_scope_p3c.py::
+    # test_dq_rule_target_map_covers_exactly_the_schemas_vocabulary``.
+    valid_by_type: dict[str, set[str]] = {
+        ttype: {
+            str(row["id"])
+            for row in (snap.get(_DQ_TARGET_SNAP_TYPE_KEYS.get(ttype, "")) or [])
+            if row.get("id")
+        }
+        for ttype in _DQ_TARGET_TYPES
+    }
     for r in snap.get("data_quality_rules", []) or []:
+        ttype = r.get("target_type")
+        tid = r.get("target_id")
+        valid_ids = valid_by_type.get(ttype or "")
+        if valid_ids is None or tid is None or str(tid) not in valid_ids:
+            logger.warning(
+                "Bug-8950: skipping data_quality_rule '%s' on rehydrate of model "
+                "%s: target (%s, %s) is absent from the snapshot (cross-model, "
+                "hand-edited bundle, or unknown target_type).",
+                r.get("name", r.get("id", "?")), model_id, ttype, tid,
+            )
+            continue
         row = _strip_pk_and_uuids(r)
         row["model_id"] = model_id
         await db.execute(insert(DataQualityRule).values(**row))

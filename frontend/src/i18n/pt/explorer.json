@@ -384,6 +384,7 @@
   "modelHealth.aggHealthRetired": "Descontinuado",
   "modelHealth.aggHealthUnhealthy": "Total não saudável",
   "modelHealth.aggHealthNone": "Este modelo ainda não tem agregados.",
+  "modelHealth.aggHealthWaitingForStats": "A aguardar estatísticas de origem antes de recomendar agregados preditivos.",
   "modelHealth.aggHealthPendingNote": "Os agregados pendentes foram colocados de parte após uma importação ou reseed e aguardam reconstrução. O ciclo de atualização agendado reconstrói-os automaticamente, ou pode acionar uma atualização a partir do painel Agregados.",
   "modelHealth.sectionAggRefresh": "Execuções recentes de atualização de agregados",
   "modelHealth.sectionAlerts": "Alertas",

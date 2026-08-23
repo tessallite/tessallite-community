@@ -113,7 +113,7 @@
   "connections.deleteConfirmLabel": "Supprimer la connexion",
   "connections.deleteConnection": "Supprimer",
   "connections.deleteFailed": "Échec de la suppression de la connexion.",
-  "connections.deleteMessage": "Supprimer la connexion <strong>{{name}}</strong> ? Les sources et cibles qui y sont liées deviendront inutilisables jusqu'à ce qu'elles soient liées à nouveau.",
+  "connections.deleteMessage": "Supprimer la connexion {{name}} ? Les sources et cibles qui y sont liées deviendront inutilisables jusqu'à ce qu'elles soient liées à nouveau.",
   "connections.deleteTitle": "Supprimer la connexion ?",
   "connections.deleteTooltip": "Supprimer la connexion",
   "connections.displayName": "Nom d'affichage *",

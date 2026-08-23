@@ -28,6 +28,7 @@ from shared.config.bootstrap import (
 )
 from shared.config.settings import get_settings
 from shared.middleware.internal_bypass import internal_request_headers
+from shared.semantic.graph_order import is_fact_table
 from src.catalogue_cls import (
     build_closure_context as build_cls_closure_context,
     object_hidden_by_cls,
@@ -189,6 +190,29 @@ async def check_gateway_query_rate(tenant_slug: str) -> None:
         bucket.tokens -= 1
 
 
+# The structural marker that makes a relation a scorecard table. Consumers test
+# for it with ``endswith`` (``jdbc/server._is_kpi_table_query``, the router's
+# ``$KPIs`` interception), so any name we generate must preserve it as the LAST
+# segment — see ``_suffix_preserving_counter`` (Bug-6773).
+KPI_TABLE_SUFFIX = "$KPIs"
+
+
+def _suffix_preserving_counter(name: str, counter: int) -> str:
+    """Append a disambiguating counter WITHOUT breaking a structural suffix.
+
+    Bug-6773: ``alpha__sales$KPIs`` must disambiguate to
+    ``alpha__sales_2$KPIs``, never ``alpha__sales$KPIs_2`` — the latter no
+    longer ends with ``$KPIs``, so every consumer that recognises a scorecard
+    relation by that suffix stops recognising it, and the advertised relation
+    becomes permanently unqueryable.
+    """
+    if name.lower().endswith(KPI_TABLE_SUFFIX.lower()):
+        base = name[: -len(KPI_TABLE_SUFFIX)]
+        marker = name[-len(KPI_TABLE_SUFFIX):]
+        return f"{base}_{counter}{marker}"
+    return f"{name}_{counter}"
+
+
 # Schema of the ``<model>$KPIs`` scorecard virtual table. These columns MUST
 # match the rows returned by the query-router's ``_handle_kpi_table_query``
 # (one row per KPI read from ``kpi_latest``) so metadata discovery and data
@@ -241,11 +265,11 @@ def build_named_query_relation_columns(nq: dict) -> list[dict]:
     """Build the column dicts for a ``@name`` Named Query relation.
 
     The advertised columns come from the deployed snapshot's derived
-    ``output_columns`` (spec §4.1) — the authoring-time schema. The
-    authoritative physical column types live in the artifact row manifest and
-    are what the query-router serves; these are catalogue metadata only, and a
-    ``*`` placeholder (star projection) is advertised as a single star column
-    exactly like the definition itself projects.
+    ``output_columns`` (spec §4.1). Current deployments expand a star definition
+    to its semantic field list while producing that snapshot (Bug-9180), so the
+    catalogue matches the served result. The authoritative physical column types
+    still live in the artifact row manifest. A ``*`` entry is tolerated only for
+    compatibility with a snapshot deployed before Bug-9180.
     """
     cols: list[dict] = []
     for ordinal_pos, col in enumerate(nq.get("output_columns") or [], start=1):
@@ -530,8 +554,15 @@ async def list_models_for_project(
 # stale scope; the TTL mirrors the metadata burst caches (30 s) — a
 # request-burst de-duplicator, not a catalog store.
 _TENANT_MODELS_CACHE_TTL_SECONDS = 30
-_tenant_models_cache: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
+# (stored_at, models, degraded_project_count) — the degraded count travels WITH
+# the entry so a strict reader can refuse a partial answer (Bug-9218).
+_tenant_models_cache: dict[
+    tuple[str, str], tuple[float, list[dict[str, Any]], int]
+] = {}
 _tenant_models_cache_lock = asyncio.Lock()
+# Completeness of the most recent listing per (tenant, jwt) — see
+# ``tenant_listing_degraded``.
+_tenant_listing_degraded: dict[tuple[str, str], int] = {}
 
 
 def _tenant_models_cache_ttl() -> float:
@@ -541,9 +572,135 @@ def _tenant_models_cache_ttl() -> float:
     raw = _os.getenv("XMLA_METADATA_CACHE_TTL", "")
     try:
         val = float(raw)
-        return val if val > 0 else float(_TENANT_MODELS_CACHE_TTL_SECONDS)
+        # Bug-9061 / L1-R1-008: documented ``0`` is the explicit cache-disable
+        # value used by CLS revalidation.  Keep invalid and negative values on
+        # the safe default, but do not turn a deliberate zero back into 30s.
+        return val if val >= 0 else float(_TENANT_MODELS_CACHE_TTL_SECONDS)
     except (TypeError, ValueError):
         return float(_TENANT_MODELS_CACHE_TTL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# Bug-9061 — burst cache for the per-model metadata FAN-OUT
+# ---------------------------------------------------------------------------
+# ``fetch_model_metadata`` issues six model-service GETs PER MODEL (dimensions,
+# measures, personas, snapshot, KPIs, deployed-version snapshot). Only the cheap
+# model LIST above was ever cached, so every JDBC connection re-ran the whole
+# O(models x 6) fan-out before it could answer its first query — ~8 s on the
+# five-model demo tenant, which is what made validate_security.py time out on
+# its own test model. It is the same uncached primitive Bug-9112 hit from the
+# per-query seam (fixed there by classifying the SQL first, SOL-LAT-001); this
+# caches the primitive itself.
+#
+# Bug-9061's filed diagnosis — "each JDBC connection is served by its own
+# process, so in-process caches are cold on every connection" — is incorrect and
+# is why the obvious cache was never written. ``PGWireServer._pid`` (jdbc/
+# server.py) is a SYNTHETIC per-connection counter used as the PostgreSQL
+# backend pid, not an OS process id; every connection is a task in ONE asyncio
+# process, so a module-level cache is shared across connections.
+#
+# FAIL-CLOSED rules, per the discipline a sibling lane's result cache violated:
+#   * a failure or a DEGRADED fetch is never stored (see the call site);
+#   * the key carries the JWT, so a re-login, tenant switch or persona change
+#     can never read another scope's entry;
+#   * the TTL is short, non-extendable (a read never refreshes ``stored_at``)
+#     and comes from the SAME documented lever as the shipped XMLA metadata
+#     cache — no new knob, and the same bounded staleness posture;
+#   * it is OPT-IN, so the Bug-7043 CLS revalidation path (whose whole purpose
+#     is an immediate re-read at ttl=0) never reads it.
+_METADATA_CACHE_MAX_ENTRIES = 256
+_metadata_cache: dict[
+    tuple[str, str, str, str], tuple[float, tuple]
+] = {}
+
+
+def _metadata_cache_key(
+    model_id: str | None,
+    tenant_slug: str,
+    jwt_token: str,
+    project_slug: str | None,
+) -> tuple[str, str, str, str]:
+    return (tenant_slug, jwt_token, str(model_id or ""), str(project_slug or ""))
+
+
+def _metadata_cache_get(
+    model_id: str | None,
+    tenant_slug: str,
+    jwt_token: str,
+    project_slug: str | None,
+) -> tuple | None:
+    import time as _time
+
+    ttl = _tenant_models_cache_ttl()
+    if ttl <= 0:
+        return None
+    entry = _metadata_cache.get(
+        _metadata_cache_key(model_id, tenant_slug, jwt_token, project_slug)
+    )
+    if entry is None:
+        return None
+    stored_at, value = entry
+    if (_time.monotonic() - stored_at) >= ttl:
+        return None
+    return value
+
+
+def _metadata_cache_put(
+    model_id: str | None,
+    tenant_slug: str,
+    jwt_token: str,
+    project_slug: str | None,
+    value: tuple,
+) -> None:
+    import time as _time
+
+    ttl = _tenant_models_cache_ttl()
+    if ttl <= 0:
+        return
+    now = _time.monotonic()
+    for key in [k for k, (ts, _v) in _metadata_cache.items() if (now - ts) >= ttl]:
+        _metadata_cache.pop(key, None)
+    if len(_metadata_cache) >= _METADATA_CACHE_MAX_ENTRIES:
+        oldest = min(_metadata_cache, key=lambda k: _metadata_cache[k][0])
+        _metadata_cache.pop(oldest, None)
+    _metadata_cache[
+        _metadata_cache_key(model_id, tenant_slug, jwt_token, project_slug)
+    ] = (now, value)
+
+
+def _reset_metadata_caches_for_tests() -> None:
+    """Clear every module-level metadata cache (test isolation only)."""
+    _metadata_cache.clear()
+    _tenant_models_cache.clear()
+    _tenant_listing_degraded.clear()
+
+
+class ModelMetadataUnavailable(Exception):
+    """Model metadata could not be determined — NOT "there are no models".
+
+    Bug-9213 / Bug-9218: the catalogue builders used to answer an upstream
+    FAILURE with an ABSENCE — an empty model list, an empty column set, a
+    dropped project. Every consumer then reported the absence as fact: a JDBC
+    client browsing a tenant saw a catalogue with no tables, and a client that
+    named a model got ``FATAL Unknown model`` for a model that exists and is
+    deployed (the query-router, which never goes through these calls, served the
+    very same model). An empty catalogue returned on an error is a silent lie;
+    this exception is the fail-closed alternative.
+    """
+
+
+def tenant_listing_degraded(tenant_slug: str, jwt_token: str) -> int:
+    """How many projects the last tenant listing FAILED to read (Bug-9218).
+
+    ``list_all_models_for_tenant`` degrades gracefully by design (F-013-12): one
+    flaky project must not blank every BI catalog. That is right for browsing
+    and wrong for resolving ONE named model, where a dropped project is
+    indistinguishable from "no such model". Recording the count lets the caller
+    that cannot tolerate a partial answer refuse, while discovery keeps
+    degrading. Zero when the listing was complete, or when it came from a
+    caller-supplied stub (a stub returns a complete list by construction).
+    """
+    return _tenant_listing_degraded.get((tenant_slug, jwt_token), 0)
 
 
 async def list_all_models_for_tenant(
@@ -554,6 +711,9 @@ async def list_all_models_for_tenant(
     List all models across all projects for the tenant.
     Returns a flat list of model dicts, each augmented with 'project_id'.
     Results are burst-cached for a short TTL (see _tenant_models_cache).
+
+    Completeness is reported separately via ``tenant_listing_degraded`` rather
+    than by raising, so broad BI discovery keeps its graceful degradation.
     """
     import time as _time
 
@@ -563,29 +723,46 @@ async def list_all_models_for_tenant(
     async with _tenant_models_cache_lock:
         entry = _tenant_models_cache.get(cache_key)
         if entry is not None and (now - entry[0]) < ttl:
-            return [dict(m) for m in entry[1]]
+            _ts, cached, degraded = entry
+            # The degraded count travels WITH the cached entry, so a strict
+            # reader is not fooled by a cache hit on a partial listing.
+            _tenant_listing_degraded[cache_key] = degraded
+            return [dict(m) for m in cached]
 
-    result = await _list_all_models_for_tenant_uncached(tenant_slug, jwt_token)
+    result, degraded = await _list_all_models_for_tenant_uncached(
+        tenant_slug, jwt_token,
+    )
 
     async with _tenant_models_cache_lock:
         # Opportunistic sweep so dead JWTs do not accumulate.
         expired = [
-            k for k, (ts, _v) in _tenant_models_cache.items()
-            if (now - ts) >= ttl
+            k for k, ent in _tenant_models_cache.items()
+            if (now - ent[0]) >= ttl
         ]
         for k in expired:
             _tenant_models_cache.pop(k, None)
-        _tenant_models_cache[cache_key] = (now, [dict(m) for m in result])
+            _tenant_listing_degraded.pop(k, None)
+        _tenant_models_cache[cache_key] = (
+            now, [dict(m) for m in result], degraded,
+        )
+        _tenant_listing_degraded[cache_key] = degraded
     return result
 
 
 async def _list_all_models_for_tenant_uncached(
     tenant_slug: str,
     jwt_token: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
+    """Return ``(models, degraded_project_count)``.
+
+    The degraded count is carried alongside the list (and into the burst cache)
+    so a caller that cannot tolerate a partial answer can tell "this tenant has
+    these models" apart from "this is what we managed to fetch".
+    """
     projects = await list_projects(tenant_slug, jwt_token)
 
     project_slug_map = {str(p["id"]): str(p.get("slug") or p.get("id")) for p in projects}
+    _degraded: list[str] = []
 
     async def _fetch_project_models(pid: str) -> list[dict[str, Any]]:
         try:
@@ -603,23 +780,31 @@ async def _list_all_models_for_tenant_uncached(
         except Exception as exc:
             # F-013-12: a per-project failure here drops that project's entire
             # catalog from BI-tool discovery. Degrading gracefully (returning
-            # the projects that DID resolve) is the right call — one flaky
-            # project must not blank every catalog — but the drop must be loud,
-            # not a stray warning, because the user-visible symptom is "my
-            # models vanished" with no other signal. Log at error level and say
-            # exactly what the consequence is.
+            # the projects that DID resolve) is the right call for BROAD
+            # discovery — one flaky project must not blank every catalog — but
+            # the drop must be loud, not a stray warning, because the
+            # user-visible symptom is "my models vanished" with no other signal.
+            #
+            # Bug-9218: it is NOT the right call when the caller is resolving
+            # ONE named model. A dropped project makes a model that exists look
+            # like a model that does not, and the connection reports
+            # "Unknown model" — while the query-router, which does not go
+            # through this call, serves that model perfectly well. That is the
+            # asymmetry Bug-9218 reports. The drop is COUNTED here and refused
+            # by ``fetch_model_metadata`` when a specific model was requested.
             logger.error(
                 "Catalog discovery: project %s failed to list models (%s); "
                 "its models are HIDDEN from BI tools for this discovery call. "
                 "Other projects are unaffected.",
                 pid, exc,
             )
+            _degraded.append(pid)
             return []
 
     results = await asyncio.gather(
         *[_fetch_project_models(p["id"]) for p in projects]
     )
-    return [m for batch in results for m in batch]
+    return [m for batch in results for m in batch], len(_degraded)
 
 
 # Backward-compatible alias
@@ -830,6 +1015,61 @@ async def evaluate_kpi_governed(
         return resp.json()
 
 
+async def evaluate_kpi_batch(
+    kpi_ids: list[str],
+    model_id: str,
+    project_id: str,
+    tenant_slug: str,
+    jwt_token: str,
+    *,
+    filters: list[dict[str, Any]] | None = None,
+    persona_id: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Evaluate governed KPIs through the batch route.
+
+    This is intentionally a user-context request. ``_headers`` adds the
+    internal-service marker used by the model-service scheduler and that marker
+    authorises publication to the model-wide ``kpi_latest`` cache. A BI user's
+    dimension-sliced result must never become the value served to another user,
+    so this call forwards only the bearer JWT and is therefore ineligible for
+    publication. The route still applies the caller's persona and row security.
+    """
+    if not kpi_ids:
+        return {}
+    if not project_id:
+        project_id = await _resolve_project_id(model_id, tenant_slug, jwt_token)
+    url = (
+        f"{settings.MODEL_SERVICE_URL}/api/v1/projects/{project_id}"
+        f"/models/{model_id}/kpis/evaluate-batch"
+    )
+    body: dict[str, Any] = {"kpi_ids": [str(kpi_id) for kpi_id in kpi_ids]}
+    if filters:
+        body["filters"] = filters
+    if persona_id:
+        params: dict[str, str] | None = {"persona_id": str(persona_id)}
+    else:
+        params = None
+    # Do not call _headers here: this is a user render, not a scheduler write.
+    headers = {"Authorization": f"Bearer {jwt_token}"}
+    async with httpx.AsyncClient(timeout=_t_long()) as client:
+        resp = await client.post(url, json=body, headers=headers, params=params)
+        if resp.status_code >= 400:
+            detail = _extract_error_detail(resp)
+            raise ValueError(
+                f"KPI batch evaluation failed ({resp.status_code}): {detail}"
+            )
+        payload = resp.json()
+    rows = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("KPI batch evaluation returned no results")
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("kpi_id") is None:
+            continue
+        result[str(row["kpi_id"])] = row
+    return result
+
+
 async def get_model_dimensions(
     model_id: str,
     tenant_slug: str,
@@ -1016,8 +1256,13 @@ async def get_model_personas(
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:
+            # A missing persona endpoint (404 above) is a complete "no
+            # personas" answer. Any other failure is an incomplete metadata
+            # fan-out; let the caller retain the base catalogue if appropriate
+            # but mark the result non-cacheable rather than pinning a silently
+            # persona-blind catalogue for the burst TTL (Bug-9061).
             logger.warning("Failed to list personas for model %s: %s", model_id, exc)
-            return []
+            raise
 
 
 async def get_model_snapshot(
@@ -1234,6 +1479,8 @@ async def fetch_model_metadata(
     tenant_slug: str,
     jwt_token: str,
     project_slug: str | None = None,
+    *,
+    use_cache: bool = False,
 ) -> tuple[
     list[str],
     dict[str, list[dict]],
@@ -1270,12 +1517,54 @@ async def fetch_model_metadata(
 
     If model_id is given, only that model is fetched (single table).
     If model_id is None, ALL enabled models for the tenant are fetched.
+
+    Raises :class:`ModelMetadataUnavailable` when the metadata cannot be
+    determined (Bug-9213/9218). It must NOT be reported as "this tenant has no
+    tables" or "unknown model" — see that exception's docstring.
+
+    ``use_cache`` serves a short-TTL burst cache of the whole fan-out
+    (Bug-9061). It is OPT-IN because the CLS revalidation path
+    (``_refresh_catalogue_if_stale``) exists precisely to defeat caching: its
+    default TTL is 0 so a tightened persona restriction hides columns
+    immediately, and serving that path from a 30 s cache would silently undo a
+    security contract.
     """
+    # The per-model loop below REBINDS ``project_slug`` (``project_slug =
+    # m.get("project_slug", "public")``), so by the time the cache is written
+    # the parameter no longer holds the caller's scope. Capture it now and key
+    # both the read and the write on this — otherwise every entry is stored
+    # under a scope nobody looks it up by, and the cache never hits.
+    _scope_project_slug = project_slug
+    if use_cache:
+        cached = _metadata_cache_get(
+            model_id, tenant_slug, jwt_token, _scope_project_slug
+        )
+        if cached is not None:
+            return cached
+    # A caller resolving ONE model cannot tolerate a partial listing: a dropped
+    # project makes a real model look absent (Bug-9218).
+    strict = model_id is not None
     try:
         all_models = await list_all_models_for_tenant(tenant_slug, jwt_token)
+    except ModelMetadataUnavailable:
+        raise
     except Exception as exc:
-        logger.warning("Failed to list models for tenant %s: %s", tenant_slug, exc)
-        return [], {}, {}, {}, {}, {}, {}, {}, {}, {}, set(), {}
+        logger.error(
+            "Failed to list models for tenant %s: %s — refusing to serve an "
+            "empty catalogue (Bug-9213: an absence is not a failure)",
+            tenant_slug, exc,
+        )
+        raise ModelMetadataUnavailable(
+            f"Model metadata for tenant {tenant_slug!r} is unavailable: {exc}"
+        ) from exc
+    if strict:
+        _missing_projects = tenant_listing_degraded(tenant_slug, jwt_token)
+        if _missing_projects:
+            raise ModelMetadataUnavailable(
+                f"Model listing for tenant {tenant_slug!r} is incomplete "
+                f"({_missing_projects} project(s) could not be listed), so "
+                f"model {model_id!r} cannot be resolved."
+            )
 
     # Bug-5878: an optional project scope (3-part JDBC dbname
     # <tenant>/<project>/<model>) narrows every match below.
@@ -1303,6 +1592,9 @@ async def fetch_model_metadata(
     else:
         target_models = [m for m in all_models if _in_project(m)]
 
+    # Bug-9061: a model dropped by the degradation path below makes the result
+    # incomplete, so it must not be cached (see the return statement).
+    _degraded_models = 0
     model_names: list[str] = []
     table_columns: dict[str, list[dict]] = {}
     table_model_id: dict[str, str] = {}
@@ -1328,7 +1620,17 @@ async def fetch_model_metadata(
         name: str, owner_key: str, project_slug: str,
     ) -> str:
         """Return a collision-free relation name, prefixing on a true
-        cross-owner collision (fail closed: never silently overwrite)."""
+        cross-owner collision (fail closed: never silently overwrite).
+
+        Bug-6773: the disambiguating counter goes BEFORE the ``$KPIs`` marker,
+        never after it. ``$KPIs`` is a structural suffix, not decoration —
+        ``_is_kpi_table_query`` (jdbc/server.py) and the router's scorecard
+        interception both test ``endswith("$kpis")``. Appending the counter at
+        the end produced ``alpha__sales$KPIs_2``, which stops being recognised
+        as a scorecard relation: the interception misses, the binder cannot
+        resolve it, and every query against that advertised relation 422s.
+        Fail-closed, but permanently broken for that model.
+        """
         prior = _relation_owner.get(name)
         if prior is None or prior == owner_key:
             _relation_owner[name] = owner_key
@@ -1341,7 +1643,7 @@ async def fetch_model_metadata(
             _relation_owner.get(candidate) is not None
             and _relation_owner.get(candidate) != owner_key
         ):
-            candidate = f"{prefixed}_{suffix}"
+            candidate = _suffix_preserving_counter(prefixed, suffix)
             suffix += 1
         logger.warning(
             "Relation name collision: %r already owned by %s; "
@@ -1396,8 +1698,29 @@ async def fetch_model_metadata(
             deployed_snapshot_result = gathered[5] if deployed_version_id else None
             if isinstance(dim_result, BaseException) or isinstance(meas_result, BaseException):
                 exc = dim_result if isinstance(dim_result, BaseException) else meas_result
-                logger.warning("Failed to fetch metadata for model %s: %s", mid, exc)
+                # Bug-9218: dropping the model here is what turns a metadata
+                # FAILURE into "FATAL Unknown model" at the connection seam. When
+                # the caller asked for THIS model, say the metadata is
+                # unavailable; only a broad tenant browse degrades past it.
+                if strict:
+                    raise ModelMetadataUnavailable(
+                        f"Metadata for model {mid} could not be fetched: {exc}"
+                    ) from exc
+                logger.error(
+                    "Failed to fetch metadata for model %s (%s); it is HIDDEN "
+                    "from BI tools for this discovery call.", mid, exc,
+                )
+                _degraded_models += 1
                 continue
+            _metadata_complete = not any(
+                isinstance(_optional_result, BaseException)
+                for _optional_result in (
+                    persona_result,
+                    snapshot_result,
+                    kpi_result,
+                    deployed_snapshot_result,
+                )
+            )
             dimensions = dim_result
             measures = meas_result
             personas: list = persona_result if not isinstance(persona_result, BaseException) else []
@@ -1442,15 +1765,36 @@ async def fetch_model_metadata(
                     # joins, UDAs) so column metadata, technical persona, and
                     # FK relations also reflect the deployed contract.
                     snapshot = deployed_snapshot
+            if not _metadata_complete:
+                # Preserve broad discovery's useful base columns, but never
+                # cache a catalogue assembled from an optional endpoint
+                # failure. The next connection must retry the fan-out and can
+                # then restore personas, KPIs, snapshots, or the deployed
+                # contract (Bug-9061).
+                _degraded_models += 1
+        except ModelMetadataUnavailable:
+            # A named-model lookup must preserve the typed fail-closed signal
+            # raised above. Catching it here would turn an upstream metadata
+            # failure back into an empty result and the JDBC layer would lie
+            # with ``Unknown model`` (Bug-9218).
+            raise
         except Exception as exc:
             logger.warning("Failed to fetch metadata for model %s: %s", mid, exc)
             continue
 
         semantic_tables = snapshot.get("tables") or []
+        # Bug-9110: ONE fact test for the whole codebase. This site used to ask
+        # ``.lower() in {"fact", "center"}`` — case-INsensitive, and carrying a
+        # phantom "center" alias no producer in this repo has ever emitted. The
+        # canonical predicate is deliberately case-SENSITIVE and "fact"-only,
+        # matching the partial unique index that caps a model at one fact table,
+        # so the looser test could count a ``"Fact"`` row as the fact table for
+        # the gateway's row-count estimate while the router, the anchor rule and
+        # the storage index all say it is not.
         fact_estimates = [
             table.get("row_count_estimate")
             for table in semantic_tables
-            if str(table.get("table_type") or "").lower() in {"fact", "center"}
+            if is_fact_table(table)
             and table.get("row_count_estimate") is not None
         ]
         base_row_estimate = max(fact_estimates) if fact_estimates else None
@@ -1458,6 +1802,28 @@ async def fetch_model_metadata(
             str(column.get("id")): column
             for column in snapshot.get("columns") or []
         }
+        # The query-router binds the deployed physical shape before serving a
+        # SELECT *. A semantic dimension/measure can still carry
+        # ``is_hidden=False`` while its source column is hidden in that shape
+        # (the semantic object and snapshot column are separate producer
+        # domains). Treat deployed source-column curation as the authority
+        # here too, or the JDBC/XMLA descriptor advertises fields that the
+        # execution path deliberately removes (Bug-9433).
+        hidden_column_ids = {
+            column_id
+            for column_id, column in column_rows.items()
+            if column.get("is_hidden")
+        }
+
+        def _source_column_is_hidden(item: dict) -> bool:
+            source_column_id = item.get("source_column_id")
+            return (
+                source_column_id is not None
+                and str(source_column_id) in hidden_column_ids
+            )
+
+        def _effective_is_hidden(item: dict) -> bool:
+            return bool(item.get("is_hidden")) or _source_column_is_hidden(item)
 
         variants: list[tuple[str, bool, dict]] = [("", False, {})]
         for persona in personas:
@@ -1499,7 +1865,8 @@ async def fetch_model_metadata(
             cols: list[dict] = []
             ordinal = 1
             for dim in dimensions:
-                if dim.get("is_hidden") and not include_hidden:
+                is_hidden = _effective_is_hidden(dim)
+                if is_hidden and not include_hidden:
                     continue
                 if allow_dimension_ids and str(dim.get("id", "")) not in allow_dimension_ids:
                     continue
@@ -1520,7 +1887,7 @@ async def fetch_model_metadata(
                     "data_type": dim.get("data_type", "text"),
                     "ordinal_position": ordinal,
                     "kind": "dimension",
-                    "is_hidden": bool(dim.get("is_hidden")),
+                    "is_hidden": is_hidden,
                     "is_nullable": bool(
                         column_rows.get(str(dim.get("source_column_id")), {}).get("is_nullable", True)
                     ),
@@ -1530,7 +1897,8 @@ async def fetch_model_metadata(
                 })
                 ordinal += 1
             for measure in measures:
-                if measure.get("is_hidden") and not include_hidden:
+                is_hidden = _effective_is_hidden(measure)
+                if is_hidden and not include_hidden:
                     continue
                 if allow_measure_ids and str(measure.get("id", "")) not in allow_measure_ids:
                     continue
@@ -1551,7 +1919,7 @@ async def fetch_model_metadata(
                     "data_type": _measure_sql_type(measure.get("default_agg", "sum")),
                     "ordinal_position": ordinal,
                     "kind": "measure",
-                    "is_hidden": bool(measure.get("is_hidden")),
+                    "is_hidden": is_hidden,
                     "is_nullable": bool(
                         column_rows.get(str(measure.get("source_column_id")), {}).get("is_nullable", True)
                     ),
@@ -1813,7 +2181,7 @@ async def fetch_model_metadata(
                     "data_type": dim.get("data_type", "text"),
                     "ordinal_position": ordinal,
                     "kind": "dimension",
-                    "is_hidden": bool(dim.get("is_hidden")),
+                    "is_hidden": _effective_is_hidden(dim),
                     "is_nullable": bool(
                         column_rows.get(str(dim.get("source_column_id")), {}).get("is_nullable", True)
                     ),
@@ -1830,7 +2198,7 @@ async def fetch_model_metadata(
                     "data_type": _measure_sql_type(measure.get("default_agg", "sum")),
                     "ordinal_position": len(cols) + 1,
                     "kind": "measure",
-                    "is_hidden": bool(measure.get("is_hidden")),
+                    "is_hidden": _effective_is_hidden(measure),
                     "is_nullable": bool(
                         column_rows.get(str(measure.get("source_column_id")), {}).get("is_nullable", True)
                     ),
@@ -1907,8 +2275,11 @@ async def fetch_model_metadata(
             # a SELECT * against the technical relation actually returns.
             exec_table = None
             for st in semantic_tables:
-                tt = str(st.get("table_type") or "").lower()
-                if tt == "fact":
+                # Bug-9110: same canonical, case-SENSITIVE predicate as above —
+                # this choice must agree with the execution path's anchor rule,
+                # or the advertised technical columns describe a different table
+                # from the one ``SELECT *`` actually reads.
+                if is_fact_table(st):
                     exec_table = st
                     break
             if exec_table is None and semantic_tables:
@@ -1973,7 +2344,7 @@ async def fetch_model_metadata(
                 }
                 table_foreign_keys[tech_table] = []
 
-    return (
+    result = (
         model_names,
         table_columns,
         table_model_id,
@@ -1987,6 +2358,15 @@ async def fetch_model_metadata(
         looker_relations,
         table_project_slug,
     )
+    if use_cache and _degraded_models == 0:
+        # Bug-9061: only a COMPLETE fetch is cached. A degraded result (a model
+        # whose metadata could not be fetched) must be retried on the next
+        # connection, never pinned for the TTL — that is how a transient
+        # model-service blip would turn into 30 s of "my model vanished".
+        _metadata_cache_put(
+            model_id, tenant_slug, jwt_token, _scope_project_slug, result
+        )
+    return result
 
 
 def _extract_token_from_response(resp: httpx.Response) -> str:

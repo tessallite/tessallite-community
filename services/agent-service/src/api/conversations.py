@@ -176,6 +176,15 @@ class TurnResponse(BaseModel):
     persona_name: Optional[str] = None
 
 
+# Bug-9024 — a durable ``judge_pending`` row is safe to replay (its answer is
+# withheld), but a content-free response left users with no indication that
+# retrying is the right action. This is a generic status message, never the
+# persisted unvetted answer.
+_JUDGE_PENDING_STATUS_MESSAGE = (
+    "This answer is being held for review. Please try again shortly."
+)
+
+
 class FeedbackBody(BaseModel):
     vote: str = Field(pattern="^(up|down)$")
     comment: Optional[str] = None
@@ -265,9 +274,10 @@ def _redact_trace(
         resp.judge_reasoning = None
     if turn.status == "judge_pending":
         # No block message has been written yet (the verdict has not run), so
-        # answer_text still holds the unvetted original — withhold it. The
-        # caller sees a pending, content-free row until the judge resolves it.
-        resp.answer_text = None
+        # answer_text still holds the unvetted original — replace it with a
+        # generic retry message. The caller never receives answer content, but
+        # now knows why the row is empty and what action can resolve it.
+        resp.answer_text = _JUDGE_PENDING_STATUS_MESSAGE
     return resp
 
 
@@ -617,8 +627,11 @@ async def create_conversation(
 ) -> ConversationResponse:
     _enforce_project_scope(project_id, current_user)
     persona_override = None
-    if isinstance(current_user, CurrentEmbedUser) and current_user.persona_id:
-        persona_override = current_user.persona_id
+    if (
+        isinstance(current_user, CurrentEmbedUser)
+        and current_user.project_persona_id
+    ):
+        persona_override = current_user.project_persona_id
     resolved_persona_id = persona_override or body.persona_id
     async for db in get_tenant_db(current_user.tenant_id):
         await _require_project_access_and_agent(db, project_id, current_user)
@@ -774,11 +787,11 @@ async def patch_conversation(
         if (
             "persona_id" in body.model_fields_set
             and isinstance(current_user, CurrentEmbedUser)
-            and current_user.persona_id
+            and current_user.project_persona_id
         ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Embed token persona cannot be overridden",
+                detail="Embed token project persona cannot be overridden",
             )
 
         # EVERY body-supplied foreign key is proven BEFORE the first
@@ -1347,6 +1360,10 @@ async def send_message(
                 conversation=conv,
                 user_message=body.text,
                 jwt_token=jwt_token,
+                # The reservation created the durable AgentTurn row before
+                # the pipeline starts. Reuse that id in turn.started; never
+                # mint a second lifecycle identity in the pipeline.
+                turn_id=reservation.existing_turn_id,
                 embed_model_ids=(
                     current_user.model_ids
                     if isinstance(current_user, CurrentEmbedUser)
@@ -1706,10 +1723,11 @@ async def _replay_turn_into_publisher(
             # Bug-8290 — a retried stream POST whose keyed turn is still
             # ``judge_pending`` (the in-flight original's sync-judge verdict has
             # not resolved) must NOT replay the unvetted answer. Emit the redacted
-            # answer_text (withheld to None for judge_pending) and surface the
-            # true pending state so the client keeps waiting for the verdict
-            # rather than rendering the original. The verdict is delivered by the
-            # in-flight original's own post-judge events / a later fetch.
+            # answer_text (replaced with a generic held-for-review message for
+            # judge_pending) and surface the true pending state so the client
+            # keeps waiting for the verdict rather than rendering the original.
+            # The verdict is delivered by the in-flight original's own
+            # post-judge events / a later fetch.
             await publisher.emit(
                 "turn.completed",
                 turn_id=str(turn.id),
@@ -1759,6 +1777,7 @@ async def _run_turn_into_publisher(
     started: float,
     publisher: EventPublisher,
     *,
+    turn_id: UUID | None = None,
     embed_caller_ref: str | None = None,
     embed_model_ids: list[str] | None = None,
 ) -> None:
@@ -1815,6 +1834,7 @@ async def _run_turn_into_publisher(
                     user_message=user_message,
                     jwt_token=jwt_token,
                     publisher=publisher,
+                    turn_id=turn_id,
                     embed_model_ids=embed_model_ids,
                     budget_reservation_id=_stream_budget_res_id,
                 )
@@ -2176,6 +2196,7 @@ async def send_message_stream(
     # stream instead of re-running the pipeline.
     next_idx: int = 0
     replay_turn_id: Optional[UUID] = None
+    reserved_turn_id: Optional[UUID] = None
     async for db in get_tenant_db(current_user.tenant_id):
         await _require_project_access_and_agent(db, project_id, current_user)
         conv = await db.get(AgentConversation, conversation_id)
@@ -2189,6 +2210,7 @@ async def send_message_stream(
             idempotency_key=idempotency_key,
         )
         next_idx = reservation.turn_index
+        reserved_turn_id = reservation.existing_turn_id
         if reservation.is_duplicate:
             replay_turn_id = reservation.existing_turn_id
         break
@@ -2238,6 +2260,7 @@ async def send_message_stream(
             project_id=project_id,
             conversation_id=conversation_id,
             turn_index=next_idx,
+            turn_id=reserved_turn_id,
             user_message=body.text,
             jwt_token=jwt_token,
             started=started,

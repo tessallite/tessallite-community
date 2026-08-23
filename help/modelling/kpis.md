@@ -334,6 +334,74 @@ Hover over the **Restricted** badge for the full explanation.
 
 **Worth knowing if you build models:** the moment a model gets its first row-security rule, everybody whose role is not named in a rule sees nothing — including you, and including administrators. That is deliberate: it is safer to show nothing than to accidentally show data a rule was meant to hide. If you add a rule and the whole model suddenly goes blank for you, that is why. Add a rule that covers your own role, or set up a persona that is allowed to see everything, and the numbers come back. See [Configure row security](configure-row-security.md).
 
+### When a KPI needs a time dimension
+
+Some KPI settings only make sense against a date. If you use any of these, the
+KPI must have a **time dimension** chosen:
+
+- a **time calculation** (year to date, versus last month, 3-month average, and
+  so on);
+- a **balance-style reduction** — telling the KPI to take the closing, opening,
+  average, highest or lowest value per day, week, month, quarter or year
+  instead of adding every row up;
+- **carry forward**, which fills a gap with the last known value;
+- an **aggregate of aggregate** whose inner grain is a period (for example
+  "average of the monthly totals").
+
+If a KPI asks for one of these but no time dimension is set, the card shows an
+error instead of a number. That is deliberate. There is no safe guess: picking
+some other date column would quietly answer a different question, and the
+number would look perfectly ordinary while being wrong. Choose the date that
+represents when the business event happened, and the KPI calculates.
+
+### Choosing the reduction grain
+
+When you tell a KPI to take a closing or average value rather than a total, you
+also choose the period it resets on. The grain must be one of:
+
+`day`, `week`, `month`, `quarter`, `year`
+
+These are the only accepted values. A typo such as "monthly", or the name of a
+column, is rejected when you save. Older KPIs that somehow carry a different
+value show an error rather than a number.
+
+The reason is worth understanding. "Closing balance per month" means: group the
+rows into months, and take the last value in each. If the grouping is by
+something that is not a period — a column such as `account_code`, say — the KPI
+no longer has a "last value per month" to return, so it hands back one row it
+happened to pick. That number looks like a balance and is not one.
+
+### Balances combined with time calculations
+
+You can combine the two: "the trailing three months of the closing balance",
+"year to date on the closing balance", "last month's closing balance".
+
+Tessallite reduces each period FIRST and then does the time arithmetic. With
+daily balances of 100, 120 and 90 in March, March contributes 90 — the closing
+balance — not 310, the sum of the three days. A trailing three-month sum adds
+the three monthly closing balances together.
+
+**Carry forward on a time calculation.** If you also switch carry forward on,
+it is applied inside each period as that period is worked out. Say March has a
+balance on the 1st and the 3rd but nothing on the 2nd: the 2nd takes the 1st's
+value, and March's average is worked out over all three days instead of two.
+
+Two things are worth knowing about where the filling stops:
+
+- It fills **inside** a period, never across one. February's last balance does
+  not carry into March, because each period is worked out on its own. So if a
+  period starts with a gap — no balance yet on its first day — that first day
+  stays empty; there is nothing earlier in that period to copy.
+- It fills days that exist but have **no value**. It does not invent days, or
+  months, that have no rows at all. A period with nothing in it stays empty.
+
+One preview limitation: while you are still building the KPI, the little trend
+line (the sparkline) is left empty for a balance-style KPI — including one that
+only uses carry forward. Drawing it would mean adding the days up again, which
+would contradict the single number shown right next to it. The number is
+correct; only the preview sparkline is withheld. Once the KPI is saved, its
+trend chart is built from real saved readings and shows normally.
+
 ### Time calculation (optional)
 
 Most formula types offer a "+ Add time calculation" link below the formula controls. Clicking it adds a secondary time-variant calculation that transforms the base formula's result over time. This is different from the time window -- the time window says "look at data from last month", while the time calculation says "compare this month to last month" or "average across the last 3 months".
@@ -815,3 +883,7 @@ Snapshots are captured by the scheduler service and stored in the `kpi_snapshots
 - [Define Measures](define-measures.md) -- create the measures that KPIs reference.
 - [Named Queries](named-queries.md) -- MDX Named Sets, Tessallite Named Lists, and Named Queries (reusable dimension member selections and governed queries).
 - [Usage & Downstream Assets](usage-downstream-assets.md) -- record downstream consumers and review observed table usage.
+
+---
+
+← [Named Queries](named-queries.md) | [Home](../index.md) | [Data Preview →](data-preview.md)

@@ -153,6 +153,18 @@ describe('custom-functions runtime reads the deployed snapshot', () => {
     await vi.waitFor(() => expect(invocation.setResult).toHaveBeenCalled());
     expect(requestedUrl(fetchMock)).toContain('deployed_only=true');
   });
+
+  it('TESSALLITE.LISTBYID uses the selected persona contract (Bug-9063)', async () => {
+    mockGetActivePersonaId.mockResolvedValue('persona-9');
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ items: [{ ordinal: 1, caption: 'North', key: 'North' }], total_count: 1 }),
+    );
+    const invocation = { setResult: vi.fn(), onCanceled: null as unknown };
+    registered['LISTBYID'](SET, invocation);
+    await vi.waitFor(() => expect(invocation.setResult).toHaveBeenCalled());
+    expect(requestedUrl(fetchMock)).toContain('deployed_only=true');
+    expect(requestedUrl(fetchMock)).toContain('persona_id=persona-9');
+  });
 });
 
 // ---------------------------------------------------------------------------

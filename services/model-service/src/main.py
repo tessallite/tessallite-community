@@ -277,6 +277,7 @@ def create_app() -> FastAPI:
     app.include_router(sources.router, prefix=PREFIX)
     app.include_router(calendar.router, prefix=PREFIX)
     app.include_router(tables.router, prefix=PREFIX)
+    app.include_router(tables.batch_router, prefix=PREFIX)
     app.include_router(table_preview.router, prefix=PREFIX)
     app.include_router(table_attributes.router, prefix=PREFIX)
     app.include_router(user_defined_attributes.router, prefix=PREFIX)

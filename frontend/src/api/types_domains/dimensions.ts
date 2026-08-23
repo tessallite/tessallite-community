@@ -333,6 +333,8 @@ export type PopulationParticipation =
   | "enrichment_only"
   | "undeclared";
 
+export type PopulationParticipationSource = "default" | "manual" | "auto" | string;
+
 export interface JoinCreate {
   left_table_id: string;
   right_table_id: string;
@@ -354,6 +356,8 @@ export interface Join {
   // string, not the write-side Literal — a historical/imported row may carry
   // a value read-side coercion has not yet folded onto the vocabulary.
   population_participation: string;
+  /** Server-owned provenance; introspection may only revise default-owned rows. */
+  population_participation_source: PopulationParticipationSource;
   left_column_id: string;
   right_column_id: string;
   left_column_name: string | null;
@@ -468,6 +472,11 @@ export interface PocketUpdate {
   incremental_lookback_hours?: number | null;
   ttl_days?: number;
   status?: string;
+}
+
+export interface PocketCompoundEdit {
+  definition: PocketUpdate;
+  policy: { cron_expression?: string | null; is_enabled: boolean };
 }
 
 export interface PocketPredicate {

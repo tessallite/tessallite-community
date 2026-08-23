@@ -314,6 +314,31 @@ POPULATION_PARTICIPATION_VALUES: tuple[str, ...] = (
     POPULATION_PARTICIPATION_UNDECLARED,
 )
 
+# Provenance is deliberately separate from participation.  A concrete
+# ``preserve_base_rows`` value can either be the compatibility default or an
+# explicit modeller decision; introspection may only revise the former.
+POPULATION_PARTICIPATION_SOURCE_DEFAULT = "default"
+POPULATION_PARTICIPATION_SOURCE_MANUAL = "manual"
+POPULATION_PARTICIPATION_SOURCE_AUTO = "auto"
+POPULATION_PARTICIPATION_SOURCE_VALUES: tuple[str, ...] = (
+    POPULATION_PARTICIPATION_SOURCE_DEFAULT,
+    POPULATION_PARTICIPATION_SOURCE_MANUAL,
+    POPULATION_PARTICIPATION_SOURCE_AUTO,
+)
+PopulationParticipationSource = Literal["default", "manual", "auto"]
+
+
+def coerce_population_participation_source(value: object) -> str:
+    """Coerce imported/read provenance without granting auto ownership.
+
+    Unknown provenance is treated as manual.  A malformed bundle must never
+    make a row eligible for an automatic semantic decision.
+    """
+    token = str(value or "").strip().lower()
+    if token in POPULATION_PARTICIPATION_SOURCE_VALUES:
+        return token
+    return POPULATION_PARTICIPATION_SOURCE_MANUAL
+
 PopulationParticipation = Literal[
     "preserve_base_rows", "population_defining", "enrichment_only", "undeclared",
 ]
@@ -373,6 +398,7 @@ class JoinResponse(OrmBase):
     cardinality: Optional[str] = None
     # Same rule: free-form on read, Literal-constrained on write.
     population_participation: str = DEFAULT_POPULATION_PARTICIPATION
+    population_participation_source: str = POPULATION_PARTICIPATION_SOURCE_DEFAULT
     left_column_id: uuid.UUID
     right_column_id: uuid.UUID
     left_column_name: Optional[str] = None
@@ -694,6 +720,13 @@ class PocketRefreshPolicyUpsert(BaseModel):
         return self
 
 
+class PocketCompoundEdit(BaseModel):
+    """Definition and refresh policy written as one history transaction."""
+
+    definition: PocketDefinitionUpdate = Field(default_factory=PocketDefinitionUpdate)
+    policy: PocketRefreshPolicyUpsert
+
+
 class PocketRefreshPolicyResponse(OrmBase):
     id: uuid.UUID
     pocket_definition_id: uuid.UUID
@@ -764,6 +797,9 @@ class PocketDefinitionResponse(OrmBase):
     include_fact_key: bool = False
     ttl_days: int
     status: str
+    population_eligibility: str = "unknown"
+    population_eligibility_reason: Optional[str] = None
+    population_proof_fingerprint: Optional[str] = None
     failure_reason: Optional[str]
     last_refresh_at: Optional[datetime]
     last_access_at: Optional[datetime]
@@ -1291,4 +1327,3 @@ class SecurityAuditEntry(BaseModel):
 class SecurityAuditListResponse(BaseModel):
     items: list[SecurityAuditEntry]
     total: int
-

@@ -1072,8 +1072,54 @@ async def ensure_calendar_table_in_model(
     )
 
 
+def _glossary_eligibility_criteria(model_id, target_type: str) -> tuple:
+    """The ONE eligibility predicate every glossary-text surface reads through.
+
+    Bug-5926 (approved / not superseded / visibility show-or-null) and the
+    target-type filter, as WHERE criteria so the single-row and batch helpers
+    can each keep their own SELECT shape without restating the rules. The
+    deployment-pinned serialiser
+    (``shared/model_snapshot/serialiser.py::_merge_effective_descriptions``)
+    applies the identical rules over snapshot dicts; the two must not drift.
+    """
+    from sqlalchemy import or_
+    return (
+        GlossaryEntry.model_id == model_id,
+        GlossaryEntry.status == "approved",
+        GlossaryEntry.superseded_by.is_(None),
+        or_(
+            GlossaryEntry.visibility == "show",
+            GlossaryEntry.visibility.is_(None),
+        ),
+        GlossaryAttachment.target_type == target_type,
+    )
+
+
+def _one_glossary_definition_select(model_id, target_type: str, target_id):
+    """Latest qualifying definition for ONE target, as a scalar select."""
+    return (
+        select(GlossaryEntry.definition)
+        .join(GlossaryAttachment, GlossaryAttachment.entry_id == GlossaryEntry.id)
+        .where(*_glossary_eligibility_criteria(model_id, target_type))
+        .where(GlossaryAttachment.target_id == target_id)
+        .order_by(GlossaryEntry.version.desc())
+        .limit(1)
+    )
+
+
+def _many_glossary_definitions_select(model_id, target_type: str, target_ids):
+    """Latest qualifying definition per target, ordered version-desc per target."""
+    return (
+        select(GlossaryAttachment.target_id, GlossaryEntry.definition)
+        .join(GlossaryEntry, GlossaryAttachment.entry_id == GlossaryEntry.id)
+        .where(*_glossary_eligibility_criteria(model_id, target_type))
+        .where(GlossaryAttachment.target_id.in_(target_ids))
+        .order_by(GlossaryAttachment.target_id, GlossaryEntry.version.desc())
+    )
+
+
 async def glossary_text_for_target(
-    db, model_id, target_type: str, target_id
+    db, model_id, target_type: str, target_id, fallback_column_id=None
 ) -> str | None:
     """Return the latest approved glossary definition attached to the given
     semantic object, or None when no entry exists.
@@ -1083,25 +1129,27 @@ async def glossary_text_for_target(
 
     Bug-5926: only entries with visibility == "show" (or legacy NULL) are
     eligible for gateway metadata and public-facing surfaces.
+
+    Bug-9392: an attachment may instead target the PHYSICAL column a dimension
+    or measure is built on (``target_type == "column"``), which is where a large
+    share of bootstrap-proposed terms land. When ``fallback_column_id`` is
+    supplied and the object has no direct attachment of its own, the term
+    attached to that column is returned. A direct dimension/measure attachment
+    always wins. This mirrors ``_merge_effective_descriptions`` in
+    ``shared/model_snapshot/serialiser.py`` exactly: without it the Excel task
+    pane (live route) and the JDBC/XMLA catalogue (deployed snapshot) show
+    DIFFERENT description text for the same object.
     """
-    from sqlalchemy import or_
-    stmt = (
-        select(GlossaryEntry.definition)
-        .join(GlossaryAttachment, GlossaryAttachment.entry_id == GlossaryEntry.id)
-        .where(GlossaryEntry.model_id == model_id)
-        .where(GlossaryEntry.status == "approved")
-        .where(GlossaryEntry.superseded_by.is_(None))
-        .where(or_(
-            GlossaryEntry.visibility == "show",
-            GlossaryEntry.visibility.is_(None),
-        ))
-        .where(GlossaryAttachment.target_type == target_type)
-        .where(GlossaryAttachment.target_id == target_id)
-        .order_by(GlossaryEntry.version.desc())
-        .limit(1)
+    result = await db.execute(
+        _one_glossary_definition_select(model_id, target_type, target_id)
     )
-    result = await db.execute(stmt)
-    return result.scalar_one_or_none()
+    direct = result.scalar_one_or_none()
+    if direct is not None or fallback_column_id is None:
+        return direct
+    fallback_result = await db.execute(
+        _one_glossary_definition_select(model_id, "column", fallback_column_id)
+    )
+    return fallback_result.scalar_one_or_none()
 
 
 async def glossary_texts_for_targets(
@@ -1109,6 +1157,7 @@ async def glossary_texts_for_targets(
     model_id,
     target_type: str,
     target_ids: list[UUID],
+    fallback_column_ids: Mapping[UUID, UUID | None] | None = None,
 ) -> dict[UUID, str]:
     """Batch sibling of ``glossary_text_for_target``.
 
@@ -1119,27 +1168,47 @@ async def glossary_texts_for_targets(
 
     Bug-5926: only entries with visibility == "show" (or legacy NULL) are
     eligible for gateway metadata and public-facing surfaces.
+
+    Bug-9392: ``fallback_column_ids`` maps a target id to the physical column it
+    is built on (``Dimension.source_column_id`` / ``Measure.source_column_id``).
+    Targets left without a direct attachment fall back to the term attached to
+    their column, in ONE extra query for the whole page — same precedence as the
+    single-row helper and as the serialiser.
     """
     if not target_ids:
         return {}
-    from sqlalchemy import or_
-    stmt = (
-        select(GlossaryAttachment.target_id, GlossaryEntry.definition)
-        .join(GlossaryEntry, GlossaryAttachment.entry_id == GlossaryEntry.id)
-        .where(GlossaryEntry.model_id == model_id)
-        .where(GlossaryEntry.status == "approved")
-        .where(GlossaryEntry.superseded_by.is_(None))
-        .where(or_(
-            GlossaryEntry.visibility == "show",
-            GlossaryEntry.visibility.is_(None),
-        ))
-        .where(GlossaryAttachment.target_type == target_type)
-        .where(GlossaryAttachment.target_id.in_(target_ids))
-        .order_by(GlossaryAttachment.target_id, GlossaryEntry.version.desc())
+    result = await db.execute(
+        _many_glossary_definitions_select(model_id, target_type, target_ids)
     )
-    result = await db.execute(stmt)
     by_target: dict[UUID, str] = {}
     # Rows are ordered version-desc per target; first seen wins (latest).
     for target_id, definition in result.all():
         by_target.setdefault(target_id, definition)
+    if not fallback_column_ids:
+        return by_target
+
+    # Only targets with no direct attachment consult their column.
+    wanted: dict[UUID, list[UUID]] = {}
+    for target_id in target_ids:
+        if target_id in by_target:
+            continue
+        column_id = fallback_column_ids.get(target_id)
+        if column_id is None:
+            continue
+        wanted.setdefault(column_id, []).append(target_id)
+    if not wanted:
+        return by_target
+
+    column_result = await db.execute(
+        _many_glossary_definitions_select(model_id, "column", list(wanted))
+    )
+    by_column: dict[UUID, str] = {}
+    for column_id, definition in column_result.all():
+        by_column.setdefault(column_id, definition)
+    for column_id, dependent_targets in wanted.items():
+        definition = by_column.get(column_id)
+        if definition is None:
+            continue
+        for target_id in dependent_targets:
+            by_target[target_id] = definition
     return by_target

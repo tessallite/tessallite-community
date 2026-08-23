@@ -1,9 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Node } from "reactflow";
 import type { QueryClient } from "@tanstack/react-query";
-import type { CanvasLayout, JoinCreate } from "../../api/types";
+import type {
+  CalendarBindRequest,
+  CanvasLayout,
+  DimensionAttributeRelationshipCreate,
+  DimensionAttributeRelationshipUpdate,
+  JoinCreate,
+  UserDefinedAttributeCreate,
+  UserDefinedAttributeUpdate,
+} from "../../api/types";
 import {
   dimensionsApi,
+  attributeRelationshipsApi,
+  calendarApi,
   hierarchiesApi,
   joinsApi,
   kpisApi,
@@ -11,7 +21,12 @@ import {
   modelTablesApi,
   namedQueriesApi,
   namedSetsApi,
+  parametersApi,
+  pocketsApi,
   personasApi,
+  rowSecurityApi,
+  glossaryApi,
+  userDefinedAttributesApi,
 } from "../../api/client";
 import { isEditableTarget } from "../../hooks/useGlobalShortcuts";
 import {
@@ -32,9 +47,10 @@ export type EdgeLayouts = NonNullable<CanvasLayout["edges"]>;
 // modeller editing a measure formula, dimension, hierarchy, persona, KPI or
 // named set in a drawer had no way to undo it. To fix this at the root without
 // per-panel bespoke logic, every drawer-authored mutation records a generic
-// `command` action carrying a forward op and its inverse op. Because all six
+// `command` action carrying a forward op and its inverse op. Model-scoped
 // entity APIs share the uniform create(p,m,data) / update(p,m,id,data) /
-// delete(p,m,id) contract, one entity->API registry replays either direction.
+// delete(p,m,id) contract; parent-scoped entities use small adapters below so
+// one entity->API registry replays either direction.
 // ---------------------------------------------------------------------------
 
 /** Drawer entities whose create/update/delete can be undone/redone. */
@@ -45,7 +61,15 @@ export type DrawerEntity =
   | "persona"
   | "kpi"
   | "namedSet"
-  | "namedQuery";
+  | "namedQuery"
+  | "pocket"
+  | "rowSecurity"
+  | "parameter"
+  | "glossary"
+  | "userDefinedAttribute"
+  | "attributeRelationship"
+  | "calendar"
+  | "drillThroughSet";
 
 /**
  * A single reversible model-content write. `kind` names the API call to make;
@@ -101,18 +125,138 @@ export interface CanvasActionEvent {
   action: Omit<HistoryAction, "before" | "after">;
 }
 
-/** Uniform CRUD surface every drawer entity API already exposes. */
+/** Uniform CRUD surface used by command replay; adapters bridge parent scopes. */
 interface EntityApi {
   create: (p: string, m: string, data: Record<string, unknown>) => Promise<unknown>;
   update: (p: string, m: string, id: string, data: Record<string, unknown>) => Promise<unknown>;
-  delete: (p: string, m: string, id: string) => Promise<unknown>;
+  delete: (p: string, m: string, id: string, data?: Record<string, unknown>) => Promise<unknown>;
 }
+
+function withoutHistoryKeys(
+  data: Record<string, unknown>,
+  ...keys: string[]
+): Record<string, unknown> {
+  const payload = { ...data };
+  for (const key of keys) delete payload[key];
+  return payload;
+}
+
+// These four builder entities are scoped by a parent resource in the API. The
+// history command still has one stable entity name, while the parent id rides
+// in non-wire metadata on the command payload and is stripped before sending.
+const userDefinedAttributeEntityApi: EntityApi = {
+  create: (p, m, data) => userDefinedAttributesApi.create(
+    p,
+    m,
+    String(data.__table_id),
+    withoutHistoryKeys(data, "__table_id") as unknown as UserDefinedAttributeCreate,
+  ),
+  update: (p, m, id, data) => userDefinedAttributesApi.update(
+    p,
+    m,
+    String(data.__table_id),
+    id,
+    withoutHistoryKeys(data, "__table_id") as unknown as UserDefinedAttributeUpdate,
+  ),
+  delete: (p, m, id, data = {}) => userDefinedAttributesApi.delete(
+    p,
+    m,
+    String(data.__table_id),
+    id,
+  ),
+};
+
+const attributeRelationshipEntityApi: EntityApi = {
+  create: (p, m, data) => attributeRelationshipsApi.create(
+    p,
+    m,
+    String(data.__dimension_id),
+    withoutHistoryKeys(data, "__dimension_id", "__retire_aggregates") as unknown as DimensionAttributeRelationshipCreate,
+  ),
+  update: (p, m, id, data) => attributeRelationshipsApi.update(
+    p,
+    m,
+    String(data.__dimension_id),
+    id,
+    withoutHistoryKeys(data, "__dimension_id", "__retire_aggregates") as unknown as DimensionAttributeRelationshipUpdate,
+  ),
+  delete: (p, m, id, data = {}) => attributeRelationshipsApi.delete(
+    p,
+    m,
+    String(data.__dimension_id),
+    id,
+    Boolean(data.__retire_aggregates),
+  ),
+};
+
+const pocketEntityApi: EntityApi = {
+  create: (p, m, data) => pocketsApi.create(
+    p,
+    m,
+    withoutHistoryKeys(data, "__policy") as unknown as Parameters<typeof pocketsApi.create>[2],
+  ),
+  update: async (p, m, id, data) => {
+    const patch = withoutHistoryKeys(data, "__policy");
+    const policy = data.__policy;
+    if (policy && typeof policy === "object") {
+      return pocketsApi.updateCompound(p, m, id, {
+        definition: patch as Parameters<typeof pocketsApi.updateCompound>[3]["definition"],
+        policy: policy as { cron_expression?: string | null; is_enabled: boolean },
+      });
+    }
+    return Object.keys(patch).length > 0
+      ? pocketsApi.update(p, m, id, patch as unknown as Parameters<typeof pocketsApi.update>[3])
+      : {};
+  },
+  delete: (p, m, id) => pocketsApi.delete(p, m, id),
+};
+
+const calendarEntityApi: EntityApi = {
+  create: (p, m, data) => {
+    const payload = withoutHistoryKeys(data, "__source_id", "__calendar_flow", "__history_provenance");
+    // Redo of an auto-create is deliberately metadata-only: the physical
+    // table survived the undo and must be rebound, never DROP/recreated.
+    if (data.__history_provenance) {
+      (payload as Record<string, unknown>).history_provenance = data.__history_provenance;
+    }
+    return calendarApi.bind(p, m, String(data.__source_id), payload as unknown as CalendarBindRequest);
+  },
+  update: (p, m, id, data) => calendarApi.update(
+    p,
+    m,
+    String(data.__source_id),
+    id,
+    withoutHistoryKeys(data, "__source_id"),
+  ),
+  delete: (p, m, id, data = {}) => data.__calendar_flow === "auto-create" && data.__history_provenance
+    ? calendarApi.undoAutoCreate(p, m, String(data.__source_id), id, String(data.__history_provenance))
+    : calendarApi.delete(p, m, String(data.__source_id), id),
+};
+
+const drillThroughSetEntityApi: EntityApi = {
+  create: (p, m, data) => measuresApi.updateDrillThroughSet(
+    p,
+    m,
+    String(data.__measure_id),
+    withoutHistoryKeys(data, "__measure_id"),
+  ),
+  update: (p, m, _id, data) => measuresApi.updateDrillThroughSet(
+    p,
+    m,
+    String(data.__measure_id),
+    withoutHistoryKeys(data, "__measure_id"),
+  ),
+  delete: (p, m, _id, data = {}) => measuresApi.resetDrillThroughSet(
+    p,
+    m,
+    String(data.__measure_id),
+  ),
+};
 
 /**
  * Entity -> API registry for command replay. Each client API is cast to the
- * uniform EntityApi shape (they all share create(p,m,data) / update(p,m,id,data)
- * / delete(p,m,id) — the create/update payloads are the entity's *Create /
- * *Update types, which a CommandOp.data carries structurally).
+ * uniform EntityApi shape. Model-scoped APIs are cast to this surface; the
+ * parent-scoped adapters above route their metadata before sending payloads.
  */
 const DRAWER_ENTITY_APIS: Record<DrawerEntity, EntityApi> = {
   measure: measuresApi as unknown as EntityApi,
@@ -122,6 +266,14 @@ const DRAWER_ENTITY_APIS: Record<DrawerEntity, EntityApi> = {
   kpi: kpisApi as unknown as EntityApi,
   namedSet: namedSetsApi as unknown as EntityApi,
   namedQuery: namedQueriesApi as unknown as EntityApi,
+  pocket: pocketEntityApi,
+  rowSecurity: rowSecurityApi as unknown as EntityApi,
+  parameter: parametersApi as unknown as EntityApi,
+  glossary: glossaryApi as unknown as EntityApi,
+  userDefinedAttribute: userDefinedAttributeEntityApi,
+  attributeRelationship: attributeRelationshipEntityApi,
+  calendar: calendarEntityApi,
+  drillThroughSet: drillThroughSetEntityApi,
 };
 
 /** Cache-key family each entity's consumers subscribe to, invalidated after a
@@ -133,12 +285,32 @@ const DRAWER_ENTITY_APIS: Record<DrawerEntity, EntityApi> = {
  *  open drawer showing pre-undo rows until a manual refresh. */
 export const ENTITY_QUERY_KEYS: Record<DrawerEntity, string[]> = {
   measure: ["measures"],
-  dimension: ["dimensions"],
-  hierarchy: ["hierarchies"],
+  dimension: ["dimensions", "modelTables", "allModelTables", "sources"],
+  hierarchy: [
+    "hierarchies",
+    "hierarchy",
+    "dimensions",
+    "sources",
+    "modelTables",
+    "allModelTables",
+    "joins",
+    "hierarchy-health",
+  ],
   persona: ["personas"],
   kpi: ["kpis"],
   namedSet: ["namedSets"],
   namedQuery: ["namedQueries"],
+  pocket: ["pockets", "pocket-policy", "metrics"],
+  rowSecurity: ["row-security"],
+  parameter: ["parameters"],
+  glossary: ["glossary"],
+  userDefinedAttribute: ["userDefinedAttributes", "dimensions", "measures"],
+  attributeRelationship: ["attributeRelationships", "dimensions"],
+  calendar: ["calendars", "sources", "modelTables", "allModelTables", "joins"],
+  // DrillThroughSetEditor reads this dedicated query family. Keep the
+  // measure catalogue invalidation too because the set is shown from the
+  // measure drawer, but do not leave the dedicated panel stale after replay.
+  drillThroughSet: ["drillThroughSet", "measures"],
 };
 
 /**
@@ -416,7 +588,11 @@ export function useCanvasHistory(
             await registry.update(projectId, modelId, op.id, op.data ?? {});
           } else {
             if (!op.id) throw new Error("delete command missing id");
-            await registry.delete(projectId, modelId, op.id);
+            if (op.data) {
+              await registry.delete(projectId, modelId, op.id, op.data);
+            } else {
+              await registry.delete(projectId, modelId, op.id);
+            }
           }
           invalidateEntity(action.entity);
           break;

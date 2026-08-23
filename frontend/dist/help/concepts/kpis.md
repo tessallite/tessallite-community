@@ -201,6 +201,13 @@ The scorecard evaluates KPIs using the `evaluate-batch` endpoint. Each KPI's exp
 
 Results are cached with a configurable TTL. The cache is invalidated when a KPI is created, updated, deleted, reverted, or the model is deployed. Composite-child changes also invalidate the parent and KPIs that depend on it.
 
+In XMLA pivots, an ordinary dimension slicer is translated into governed KPI
+filters, so value, goal and status are calculated for the same slice. Filtered
+requests are not served from the model-wide KPI cache or measure prefetch. If a
+calculated set, range union, unknown dimension or other slicer shape has no exact
+filter equivalent, Tessallite refuses the request instead of showing an
+unsliced certified result.
+
 ## Snapshots
 
 KPIs can capture periodic snapshots of their evaluated values for historical tracking. Snapshot frequency and retention are configured per KPI in the wizard (only available for non-draft KPIs).

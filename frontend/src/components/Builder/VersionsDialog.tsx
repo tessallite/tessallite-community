@@ -23,7 +23,12 @@ import {
   Typography,
 } from "@mui/material";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
-import { versionsApi } from "../../api/versionsApi";
+import {
+  parseJoinPopulationBlockedError,
+  versionsApi,
+  type JoinPopulationBlockedDetail,
+} from "../../api/versionsApi";
+import JoinPopulationBlockedNotice from "../Deploy/JoinPopulationBlockedNotice";
 import { useModel } from "../../api/hooks";
 import { isTenantAdmin } from "../../auth/currentUser";
 import { useConfirm } from "../Confirm";
@@ -51,6 +56,7 @@ type Props = {
   onClose: () => void;
   projectId: string;
   modelId: string;
+  onOpenJoins?: () => void;
 };
 
 /**
@@ -62,7 +68,13 @@ type Props = {
  * versions.py require_role("admin"). Deploy/Revert failures surface an inline
  * error instead of failing silently.
  */
-export default function VersionsDialog({ open, onClose, projectId, modelId }: Props) {
+export default function VersionsDialog({
+  open,
+  onClose,
+  projectId,
+  modelId,
+  onOpenJoins,
+}: Props) {
   const t = useT();
   const qc = useQueryClient();
   const confirm = useConfirm();
@@ -72,6 +84,8 @@ export default function VersionsDialog({ open, onClose, projectId, modelId }: Pr
   >("history");
   // Bug-7616: a Deploy/Revert failure must be shown, not swallowed.
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionRefusal, setActionRefusal] =
+    useState<JoinPopulationBlockedDetail | null>(null);
   // F-013-04: the backend returns a governance-preserved note on revert
   // (personas / RLS / data-tags are NOT rolled back). It was typed but never
   // rendered, so an admin believed security had been reverted. Surface it.
@@ -97,6 +111,7 @@ export default function VersionsDialog({ open, onClose, projectId, modelId }: Pr
       versionsApi.deploy(projectId, modelId, versionId),
     onSuccess: (data) => {
       setActionError(null);
+      setActionRefusal(null);
       markClean({
         deployedVersion:
           versions.data?.find((v) => v.id === data.deployed_version_id)
@@ -106,12 +121,20 @@ export default function VersionsDialog({ open, onClose, projectId, modelId }: Pr
       qc.invalidateQueries({ queryKey: ["versions", projectId, modelId] });
       qc.invalidateQueries({ queryKey: ["models", projectId, modelId] });
     },
-    onError: (e: unknown) =>
+    onError: (e: unknown) => {
+      const refusal = parseJoinPopulationBlockedError(e);
+      if (refusal) {
+        setActionError(null);
+        setActionRefusal(refusal);
+        return;
+      }
+      setActionRefusal(null);
       setActionError(
         t("versions.deployFailed", {
           error: extractError(e) || t("errors.requestFailed"),
         }),
-      ),
+      );
+    },
   });
 
   const revertMut = useMutation({
@@ -206,6 +229,13 @@ export default function VersionsDialog({ open, onClose, projectId, modelId }: Pr
           <Alert severity="error" sx={{ mb: 2 }} onClose={() => setActionError(null)}>
             {actionError}
           </Alert>
+        )}
+        {actionRefusal && (
+          <JoinPopulationBlockedNotice
+            detail={actionRefusal}
+            onClose={() => setActionRefusal(null)}
+            onOpenJoins={onOpenJoins}
+          />
         )}
         {revertNote && (
           <Alert severity="success" sx={{ mb: 2 }} onClose={() => setRevertNote(null)}>

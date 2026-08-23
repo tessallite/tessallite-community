@@ -61,8 +61,8 @@ describe("useGlobalShortcuts", () => {
     expect(ctx.focusMiniTabs).toHaveBeenCalledOnce();
   });
 
-  // Digits map to the ACTUAL tab strip (canvas / query / health). The old
-  // "3 -> pivot" pointed at a value with no matching <Tab> (F-026-08).
+  // Digits map to the visible tab strip (canvas / query / KPI scorecard /
+  // Model Health / analytics).
   it("digit 1 switches to canvas tab", () => {
     act(() => useBuilderStore.getState().setMiniTab("matrix"));
     renderHook(() => useGlobalShortcuts(ctx));
@@ -76,10 +76,10 @@ describe("useGlobalShortcuts", () => {
     expect(useBuilderStore.getState().miniTab).toBe("query");
   });
 
-  it("digit 3 switches to the health (matrix) tab", () => {
+  it("digit 3 switches to the KPI scorecard tab", () => {
     renderHook(() => useGlobalShortcuts(ctx));
     act(() => fireKey("3"));
-    expect(useBuilderStore.getState().miniTab).toBe("matrix");
+    expect(useBuilderStore.getState().miniTab).toBe("kpi-scorecard");
   });
 
   it("Escape closes the active panel", () => {

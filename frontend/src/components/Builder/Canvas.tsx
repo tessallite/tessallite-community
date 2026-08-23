@@ -57,7 +57,7 @@ import ERDTableNode, {
   type SegmentationRefs,
 } from "./ERDTableNode";
 import CrowsFootEdge, { type CrowsFootEdgeData } from "./CrowsFootEdge";
-import { partitionJoinsByEndpoints } from "./joinFilter";
+import { countDroppedJoins, partitionJoinsByEndpoints } from "./joinFilter";
 import { nodeHeader, nodeHeaderFallback, palette } from "../../theme/tokens";
 import { classifyJoinEndpoints, isDimTableType, sameTypeWarningText } from "../../lib/joinRules";
 import {
@@ -377,6 +377,10 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
     return () => onViewControlsReadyRef.current?.(null);
   }, []);
   const queryClient = useQueryClient();
+  const hiddenJoinCount = useMemo(
+    () => countDroppedJoins(joins, new Set(tables.map((table) => table.id))),
+    [joins, tables],
+  );
 
   const isConnectingMode = useBuilderStore((s) => s.isConnectingMode);
 
@@ -1773,21 +1777,44 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
             </ControlButton>
           )}
         </Controls>
-        {notesOpen && !readOnly && (
-          <Panel position="bottom-left">
-            <div style={{ background: "#fff", border: "1px solid #cfd8dc", borderRadius: 4, padding: 8, width: 280 }}>
-              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>{t("canvas.modelAnnotations")}</div>
-              <textarea
-                value={notesText}
-                onChange={(e) => { notesDirtyRef.current = true; setNotesText(e.target.value); }}
-                placeholder={t("canvas.annotationsPlaceholder")}
-                rows={5}
-                style={{ width: "100%", border: "1px solid #ccc", borderRadius: 3, padding: 4, fontSize: 12, resize: "vertical" }}
-              />
-              <div style={{ display: "flex", justifyContent: "flex-end", gap: 4, marginTop: 4 }}>
-                <button onClick={() => setNotesOpen(false)} style={{ fontSize: 11, cursor: "pointer" }}>{t("common.cancel")}</button>
-                <button onClick={handleSaveNotes} style={{ fontSize: 11, cursor: "pointer", fontWeight: 600 }}>{t("canvas.saveButton")}</button>
-              </div>
+        {(hiddenJoinCount > 0 || (notesOpen && !readOnly)) && (
+          <Panel position="bottom-center">
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
+              {hiddenJoinCount > 0 && (
+                <div
+                  role="alert"
+                  aria-live="polite"
+                  style={{
+                    maxWidth: 320,
+                    background: "#fff8e1",
+                    border: "1px solid #e0b84b",
+                    borderRadius: 4,
+                    padding: "6px 8px",
+                    color: "#5f4300",
+                    fontSize: 11,
+                    lineHeight: 1.35,
+                    boxShadow: "0 1px 2px rgba(0,0,0,0.08)",
+                  }}
+                >
+                  {t("canvas.hiddenJoinsWarning", { count: String(hiddenJoinCount) })}
+                </div>
+              )}
+              {notesOpen && !readOnly && (
+                <div style={{ background: "#fff", border: "1px solid #cfd8dc", borderRadius: 4, padding: 8, width: 280 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>{t("canvas.modelAnnotations")}</div>
+                  <textarea
+                    value={notesText}
+                    onChange={(e) => { notesDirtyRef.current = true; setNotesText(e.target.value); }}
+                    placeholder={t("canvas.annotationsPlaceholder")}
+                    rows={5}
+                    style={{ width: "100%", border: "1px solid #ccc", borderRadius: 3, padding: 4, fontSize: 12, resize: "vertical" }}
+                  />
+                  <div style={{ display: "flex", justifyContent: "flex-end", gap: 4, marginTop: 4 }}>
+                    <button onClick={() => setNotesOpen(false)} style={{ fontSize: 11, cursor: "pointer" }}>{t("common.cancel")}</button>
+                    <button onClick={handleSaveNotes} style={{ fontSize: 11, cursor: "pointer", fontWeight: 600 }}>{t("canvas.saveButton")}</button>
+                  </div>
+                </div>
+              )}
             </div>
           </Panel>
         )}

@@ -9,7 +9,12 @@ import pytest
 
 from fastapi.params import Query as QueryParam
 
-from src.api.metrics import _build_hourly_volume, _calculate_bytes_avoided, get_model_metrics
+from src.api.metrics import (
+    _build_hourly_volume,
+    _calculate_bytes_avoided,
+    _calculate_pocket_time_saved,
+    get_model_metrics,
+)
 from tests.conftest import (
     TEST_PROJECT_ID,
     TEST_MODEL_ID,
@@ -170,6 +175,41 @@ async def test_bytes_avoided_not_inflated_by_cache_hit_zero_bytes():
 
     # Exactly one real execution's worth of savings — not multiplied by cache hits.
     assert avoided == source_bytes - aggregate_bytes
+
+
+@pytest.mark.anyio
+async def test_bug7460_pocket_savings_are_estimated_from_windowed_query_logs():
+    """Three 50ms pocket runs against a 500ms source baseline save 1350ms.
+
+    Both statements must be bounded on both sides of the requested window and
+    exclude cache re-serves; lifetime PocketDefinition counters are irrelevant.
+    """
+    since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    now = since + timedelta(hours=24)
+    pocket_result = MagicMock()
+    pocket_result.one.return_value = types.SimpleNamespace(cnt=3, avg_ms=50)
+    source_result = MagicMock()
+    source_result.scalar_one.return_value = 500
+    captured: list[str] = []
+    results = iter([pocket_result, source_result])
+
+    async def _execute(stmt):
+        captured.append(str(stmt.compile(compile_kwargs={"literal_binds": True})))
+        return next(results)
+
+    db = AsyncMock()
+    db.execute = _execute
+
+    saved = await _calculate_pocket_time_saved(
+        db, TEST_MODEL_ID, since, now
+    )
+
+    assert saved == 1350
+    assert len(captured) == 2
+    assert all("created_at >=" in sql and "created_at <=" in sql for sql in captured)
+    assert all("cache_status" in sql and "cache_hit" in sql for sql in captured)
+    assert "'pocket'" in captured[0]
+    assert "'source'" in captured[1]
 
 
 @pytest.mark.anyio
