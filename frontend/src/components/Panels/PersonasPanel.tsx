@@ -35,14 +35,38 @@ import {
   useDimensions,
   useHierarchies,
   useMeasures,
+  useParameters,
+  usePersonaParameterCollisionPreflight,
   usePersonas,
 } from "../../api/hooks";
 import type {
+  ModelParameter,
   Persona,
   PersonaCreate,
   PersonaUpdate,
 } from "../../api/types";
 import { useConfirm } from "../Confirm";
+import { useCanAuthorModel } from "../../auth/useCanAuthorModel";
+import { recordCreate, recordUpdate, recordDelete } from "../Builder/emitDrawerHistory";
+
+/** Map a persisted persona to a create-shaped body for undo/redo restore
+ *  (Bug-8227). `priorRestrictedTagIds` is the restriction set loaded when the
+ *  editor opened (the Persona list object does not carry it). */
+function personaToBody(p: Persona, priorRestrictedTagIds: string[]): PersonaCreate {
+  return {
+    slug: p.slug,
+    name: p.name,
+    description: p.description ?? null,
+    included_measure_ids: p.included_measure_ids,
+    included_dimension_ids: p.included_dimension_ids,
+    included_hierarchy_ids: p.included_hierarchy_ids,
+    audience_roles: p.audience_roles,
+    default_filters: p.default_filters,
+    bypass_row_security: p.bypass_row_security,
+    includes_hidden_columns: p.includes_hidden_columns,
+    restricted_tag_ids: priorRestrictedTagIds,
+  };
+}
 
 interface EditorState {
   open: boolean;
@@ -59,9 +83,254 @@ interface EditorState {
   bypassRowSecurityInitial: boolean;
   includesHiddenColumns: boolean;
   restrictedTagIds: string[];
+  // Bug-8227: the restriction set loaded when the editor opened, so an undo of
+  // a persona update restores the prior restrictions faithfully.
+  restrictedTagIdsInitial: string[];
   // F-008-07: when loading the persona's current restrictions fails we
   // must not silently overwrite them with an empty set on save.
   restrictionsLoaded: boolean;
+}
+
+const FILTER_OPERATORS = [
+  "eq", "neq", "gt", "gte", "lt", "lte",
+  "in", "not_in", "between", "like", "not_like",
+  "is_null", "is_not_null",
+] as const;
+
+export type FilterRow = { dim: string; op: string; value: string };
+type ParameterDescriptor = Pick<ModelParameter, "name" | "param_type">;
+
+function coerceFilterValue(raw: string): string | number | boolean {
+  const trimmed = raw.trim();
+  if (trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  if (trimmed !== "" && !Number.isNaN(Number(trimmed))) return Number(trimmed);
+  return raw;
+}
+
+function parseFilterEntry(dim: string, raw: unknown): FilterRow {
+  if (Array.isArray(raw)) {
+    return { dim, op: "in", value: raw.map(String).join(", ") };
+  }
+  if (raw != null && typeof raw === "object") {
+    const [op, val] = Object.entries(raw as Record<string, unknown>)[0] ?? ["eq", ""];
+    // in/not_in carry a list payload — the typed object form
+    // ``{ not_in: [...] }`` is how not_in round-trips (a bare array reads
+    // back as ``in`` above, which silently loses the not_in operator).
+    if (Array.isArray(val)) {
+      return { dim, op, value: val.map(String).join(", ") };
+    }
+    return {
+      dim,
+      op,
+      value: val == null || val === true ? "" : String(val),
+    };
+  }
+  return { dim, op: "eq", value: String(raw) };
+}
+
+export function parseFilterRows(json: string): FilterRow[] {
+  if (!json.trim()) return [];
+  try {
+    const obj = JSON.parse(json) as Record<string, unknown>;
+    if (!obj || Array.isArray(obj) || typeof obj !== "object") return [];
+    return Object.entries(obj).map(([dim, raw]) => parseFilterEntry(dim, raw));
+  } catch {
+    return [];
+  }
+}
+
+function parameterText(raw: unknown, descriptor?: ParameterDescriptor): string {
+  // A string parameter is already typed by the catalogue. Keeping its exact
+  // text is what preserves values such as "001" and "true". Every structured
+  // type uses JSON so commas, arrays, and date-range objects cannot be split.
+  if (descriptor?.param_type === "string" && typeof raw === "string") return raw;
+  return raw == null ? "null" : JSON.stringify(raw);
+}
+
+function parameterDescriptor(
+  dim: string,
+  catalog: readonly ParameterDescriptor[],
+): ParameterDescriptor | undefined {
+  const descriptors = new Map(catalog.map((p) => [p.name, p]));
+  const bare = dim.startsWith("@") ? dim.slice(1) : dim;
+  return descriptors.get(dim) ?? descriptors.get(`@${bare}`) ?? descriptors.get(bare);
+}
+
+export function parseParameterFilterRows(
+  json: string,
+  catalog: readonly ParameterDescriptor[] = [],
+): FilterRow[] {
+  if (!json.trim()) return [];
+  try {
+    const obj = JSON.parse(json) as Record<string, unknown>;
+    if (!obj || Array.isArray(obj) || typeof obj !== "object") return [];
+    return Object.entries(obj)
+      .filter(([dim]) => dim.startsWith("@"))
+      .map(([dim, raw]) => {
+        const descriptor = parameterDescriptor(dim, catalog);
+        if (
+          raw !== null &&
+          typeof raw === "object" &&
+          !Array.isArray(raw) &&
+          !("from" in raw && "to" in raw && Object.keys(raw).every((key) => key === "from" || key === "to"))
+        ) {
+          // Parameter overrides are scalar/array/date-range values, not
+          // dimension operator objects. Keep every non-canonical object
+          // opaque so editing a different row cannot destroy it; save-time
+          // validation then rejects it loudly instead of changing meaning.
+          return { dim, op: "__raw", value: JSON.stringify(raw) };
+        }
+        return { dim, op: "eq", value: parameterText(raw, descriptor) };
+      });
+  } catch {
+    return [];
+  }
+}
+
+/** Parse dimensions and explicit @parameters together for an edit operation.
+ * Dimension updates must carry every parameter row through the serializer;
+ * otherwise a date range is reduced to its first object member. */
+function parseEditableFilterRows(
+  json: string,
+  catalog: readonly ParameterDescriptor[] = [],
+): FilterRow[] {
+  if (!json.trim()) return [];
+  try {
+    const obj = JSON.parse(json) as Record<string, unknown>;
+    if (!obj || Array.isArray(obj) || typeof obj !== "object") return [];
+    const parameters = new Map(
+      parseParameterFilterRows(json, catalog).map((row) => [row.dim, row]),
+    );
+    return Object.entries(obj).map(([dim, raw]) =>
+      dim.startsWith("@") ? parameters.get(dim)! : parseFilterEntry(dim, raw),
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function parseDimensionFilterRows(
+  json: string,
+  catalog: readonly ParameterDescriptor[] = [],
+): FilterRow[] {
+  return parseEditableFilterRows(json, catalog).filter((row) => !row.dim.startsWith("@"));
+}
+
+export function updateFilterRow(
+  json: string,
+  currentKey: string,
+  update: (row: FilterRow) => FilterRow,
+  parameterCatalog?: readonly ParameterDescriptor[],
+): string {
+  const rows = parseEditableFilterRows(json, parameterCatalog);
+  const index = rows.findIndex((row) => row.dim === currentKey);
+  if (index < 0) return json;
+  rows[index] = update(rows[index]);
+  return serializeFilterRows(rows, parameterCatalog);
+}
+
+function removeFilterRow(
+  json: string,
+  currentKey: string,
+  parameterCatalog?: readonly ParameterDescriptor[],
+): string {
+  return serializeFilterRows(
+    parseEditableFilterRows(json, parameterCatalog)
+      .filter((row) => row.dim !== currentKey),
+    parameterCatalog,
+  );
+}
+
+function encodeParameterValue(
+  text: string,
+  descriptor?: ParameterDescriptor,
+): unknown {
+  if (descriptor?.param_type === "string") return text;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("Parameter values must use valid JSON for their declared type.");
+  }
+  switch (descriptor?.param_type) {
+    case "number":
+      if (typeof parsed !== "number" || !Number.isFinite(parsed)) throw new Error("Parameter number is invalid.");
+      break;
+    case "boolean":
+      if (typeof parsed !== "boolean") throw new Error("Parameter boolean is invalid.");
+      break;
+    case "multi_value":
+      if (
+        !Array.isArray(parsed) ||
+        parsed.length === 0 ||
+        parsed.some((item) =>
+          item === null ||
+          typeof item === "boolean" ||
+          (typeof item !== "string" && typeof item !== "number") ||
+          (typeof item === "number" && !Number.isFinite(item))
+        )
+      ) throw new Error("Parameter multi_value must be a non-empty scalar array.");
+      break;
+    case "date_range":
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        Object.keys(parsed).some((key) => key !== "from" && key !== "to") ||
+        !Object.prototype.hasOwnProperty.call(parsed, "from") ||
+        !Object.prototype.hasOwnProperty.call(parsed, "to") ||
+        typeof (parsed as { from?: unknown }).from !== "string" ||
+        typeof (parsed as { to?: unknown }).to !== "string"
+      ) throw new Error("Parameter date_range must contain only from and to ISO strings.");
+      {
+        const from = new Date((parsed as { from: string }).from);
+        const to = new Date((parsed as { to: string }).to);
+        if (
+          Number.isNaN(from.getTime()) ||
+          Number.isNaN(to.getTime()) ||
+          from.getTime() > to.getTime()
+        ) throw new Error("Parameter date_range bounds are invalid or inverted.");
+      }
+      break;
+    default:
+      break;
+  }
+  return parsed;
+}
+
+export function serializeFilterRows(
+  rows: FilterRow[],
+  parameterCatalog: readonly ParameterDescriptor[] = [],
+): string {
+  const obj: Record<string, unknown> = {};
+  for (const r of rows) {
+    const dim = r.dim.trim();
+    if (!dim) continue;
+    if (dim.startsWith("@")) {
+      if (r.op === "__raw") {
+        obj[dim] = JSON.parse(r.value);
+      } else {
+        obj[dim] = encodeParameterValue(r.value, parameterDescriptor(dim, parameterCatalog));
+      }
+      continue;
+    }
+    if (r.op === "eq") {
+      obj[dim] = coerceFilterValue(r.value);
+    } else if (r.op === "in") {
+      // ``in`` serialises as a bare array (its canonical default_filters form).
+      obj[dim] = r.value.split(",").map((s) => coerceFilterValue(s.trim()));
+    } else if (r.op === "not_in") {
+      // ``not_in`` MUST use the typed object form so it survives a reload — a
+      // bare array is indistinguishable from ``in`` on the way back in.
+      obj[dim] = { not_in: r.value.split(",").map((s) => coerceFilterValue(s.trim())) };
+    } else if (r.op === "is_null" || r.op === "is_not_null") {
+      obj[dim] = { [r.op]: true };
+    } else {
+      obj[dim] = { [r.op]: coerceFilterValue(r.value) };
+    }
+  }
+  return Object.keys(obj).length ? JSON.stringify(obj, null, 2) : "";
 }
 
 const EMPTY_EDITOR: EditorState = {
@@ -79,6 +348,7 @@ const EMPTY_EDITOR: EditorState = {
   bypassRowSecurityInitial: false,
   includesHiddenColumns: false,
   restrictedTagIds: [],
+  restrictedTagIdsInitial: [],
   restrictionsLoaded: true,
 };
 
@@ -90,11 +360,18 @@ export default function PersonasPanel() {
   const qc = useQueryClient();
   const confirm = useConfirm();
   const t = useT();
+  // F-026-04: gate every mutation entry point on the shared author capability.
+  const canEdit = useCanAuthorModel();
 
   const personas = usePersonas(projectId!, modelId!);
   const measures = useMeasures(projectId!, modelId!);
   const dimensions = useDimensions(projectId!, modelId!);
   const hierarchies = useHierarchies(projectId!, modelId!);
+  const parameters = useParameters(projectId!, modelId!);
+  const parameterCollisionPreflight = usePersonaParameterCollisionPreflight(
+    projectId!,
+    modelId!,
+  );
   const dataTags = useDataTags(projectId!, modelId!);
 
   const [editor, setEditor] = useState<EditorState>(EMPTY_EDITOR);
@@ -103,48 +380,40 @@ export default function PersonasPanel() {
   const refresh = () =>
     qc.invalidateQueries({ queryKey: ["personas", projectId, modelId] });
 
-  // F-008-07: persona save and restriction save are one logical operation.
-  // The mutation chains both calls so a restriction failure is surfaced in
-  // the editor instead of dying in the developer console, and the create
-  // path persists the ticked restrictions against the new persona id.
+  // Bug-7051: persona + restrictions are now a single atomic request.
+  // The backend accepts restricted_tag_ids in the create/update payload,
+  // so we no longer need the separate dataTagsApi.setPersonaRestrictions
+  // two-step call that could leave a persona without its intended
+  // restrictions on partial failure.
   const saveMutation = useMutation({
     mutationFn: async ({
       personaId,
       body,
-      restrictedTagIds,
-      saveRestrictions,
+      priorBody,
     }: {
       personaId: string | null;
       body: PersonaCreate;
-      restrictedTagIds: string[];
-      saveRestrictions: boolean;
+      priorBody: PersonaCreate | null;
     }) => {
-      let targetId = personaId;
-      if (targetId) {
-        await personasApi.update(projectId!, modelId!, targetId, body as PersonaUpdate);
-      } else {
-        const created = await personasApi.create(projectId!, modelId!, body);
-        targetId = created.id;
+      if (personaId) {
+        await personasApi.update(projectId!, modelId!, personaId, body as PersonaUpdate);
+        return { kind: "update" as const, id: personaId, body, priorBody };
       }
-      if (saveRestrictions) {
-        try {
-          await dataTagsApi.setPersonaRestrictions(
-            projectId!, modelId!, targetId,
-            { tag_ids: restrictedTagIds },
-          );
-        } catch (e: any) {
-          // The persona itself saved — report the restriction failure
-          // explicitly so the modeler knows the security control did
-          // not persist.
-          throw new Error(
-            t("personas.restrictionsSaveFailed", {
-              error: extractError(e) || t("errors.requestFailed"),
-            }),
-          );
-        }
-      }
+      const created = await personasApi.create(projectId!, modelId!, body);
+      return { kind: "create" as const, id: created.id, body, priorBody };
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
+      // Bug-8227: record the create/update so it can be undone/redone.
+      if (result.kind === "create") {
+        recordCreate("persona", result.id, result.body as unknown as Record<string, unknown>);
+      } else if (result.priorBody) {
+        recordUpdate(
+          "persona",
+          result.id,
+          result.priorBody as unknown as Record<string, unknown>,
+          result.body as unknown as Record<string, unknown>,
+        );
+      }
       refresh();
       setEditor(EMPTY_EDITOR);
       setError(null);
@@ -153,9 +422,29 @@ export default function PersonasPanel() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (id: string) =>
-      personasApi.delete(projectId!, modelId!, id),
-    onSuccess: () => refresh(),
+    mutationFn: async (persona: Persona) => {
+      // Load the persona's restrictions before deleting so undo can re-create
+      // it with them (the list object does not carry restricted_tag_ids).
+      let priorTagIds: string[] = [];
+      try {
+        const restrictions = await dataTagsApi.getPersonaRestrictions(
+          projectId!, modelId!, persona.id,
+        );
+        priorTagIds = restrictions.map((r) => r.tag_id);
+      } catch {
+        priorTagIds = [];
+      }
+      await personasApi.delete(projectId!, modelId!, persona.id);
+      return { persona, priorTagIds };
+    },
+    onSuccess: ({ persona, priorTagIds }) => {
+      recordDelete(
+        "persona",
+        persona.id,
+        personaToBody(persona, priorTagIds) as unknown as Record<string, unknown>,
+      );
+      refresh();
+    },
     onError: (e: any) => setError(extractError(e) || t("errors.requestFailed")),
   });
 
@@ -198,6 +487,7 @@ export default function PersonasPanel() {
       bypassRowSecurityInitial: Boolean(p.bypass_row_security),
       includesHiddenColumns: Boolean(p.includes_hidden_columns),
       restrictedTagIds: tagIds,
+      restrictedTagIdsInitial: tagIds,
       restrictionsLoaded,
     });
   }
@@ -212,7 +502,7 @@ export default function PersonasPanel() {
         throw new Error(t("personas.errorJsonInvalid"));
       }
     }
-    return {
+    const body: PersonaCreate = {
       slug: editor.slug.trim(),
       name: editor.name.trim(),
       description: editor.description.trim() || null,
@@ -224,6 +514,17 @@ export default function PersonasPanel() {
       bypass_row_security: editor.bypassRowSecurity,
       includes_hidden_columns: editor.includesHiddenColumns,
     };
+    // Bug-7051: include restricted_tag_ids in the payload for atomic
+    // persistence. Only include when restrictions were successfully loaded
+    // (or on create) so we never silently wipe restrictions we could not
+    // read. On create with no tags ticked, omit the field entirely so the
+    // backend does not wastefully persist an empty set.
+    if (editor.restrictionsLoaded) {
+      if (editor.personaId !== null || editor.restrictedTagIds.length > 0) {
+        body.restricted_tag_ids = editor.restrictedTagIds;
+      }
+    }
+    return body;
   }
 
   async function handleSave() {
@@ -261,16 +562,26 @@ export default function PersonasPanel() {
       });
       if (!ok) return;
     }
+    // Bug-8227: capture the prior persona definition for an update so undo can
+    // restore it (core fields from the list object + the restriction set loaded
+    // when the editor opened).
+    const priorPersona = editor.personaId
+      ? (personas.data ?? []).find((x) => x.id === editor.personaId)
+      : undefined;
+    // When restrictions failed to load, the forward body omits
+    // restricted_tag_ids (F-008-07 safety). The prior body must mirror that
+    // so an undo PATCH does not silently wipe restrictions to [] (review
+    // finding 8 — security-relevant silent wipe in a degraded flow).
+    const priorBody = priorPersona
+      ? personaToBody(priorPersona, editor.restrictedTagIdsInitial)
+      : null;
+    if (priorBody && !editor.restrictionsLoaded) {
+      delete priorBody.restricted_tag_ids;
+    }
     saveMutation.mutate({
       personaId: editor.personaId,
       body,
-      restrictedTagIds: editor.restrictedTagIds,
-      // Skip the restriction write when the current restrictions could
-      // not be loaded (would wipe them) — and on create, skip the extra
-      // call when nothing was ticked.
-      saveRestrictions:
-        editor.restrictionsLoaded
-        && (editor.personaId !== null || editor.restrictedTagIds.length > 0),
+      priorBody: priorBody as PersonaCreate | null,
     });
   }
 
@@ -281,12 +592,15 @@ export default function PersonasPanel() {
       confirmLabel: t("personas.deleteConfirmButton"),
       destructive: true,
     });
-    if (ok) deleteMutation.mutate(p.id);
+    if (ok) deleteMutation.mutate(p);
   }
 
   const measureOptions = measures.data ?? [];
   const dimensionOptions = dimensions.data ?? [];
   const hierarchyOptions = hierarchies.data ?? [];
+  const parameterOptions = parameters.data ?? [];
+  const parameterRows = parseParameterFilterRows(editor.defaultFiltersJson, parameterOptions);
+  const hasOpaqueParameterFilter = parameterRows.some((row) => row.op === "__raw");
 
   const measureNameById = useMemo(() => {
     const m = new Map<string, string>();
@@ -310,6 +624,7 @@ export default function PersonasPanel() {
         <Typography variant="h6" sx={{ flexGrow: 1 }}>
           {t("personas.title")}
         </Typography>
+        {canEdit && (
         <Button
           variant="contained"
           size="small"
@@ -318,6 +633,7 @@ export default function PersonasPanel() {
         >
           {t("personas.newPersona")}
         </Button>
+        )}
       </Box>
 
       {error && (
@@ -387,6 +703,8 @@ export default function PersonasPanel() {
                     )}
                   </TableCell>
                   <TableCell align="right">
+                    {canEdit && (
+                    <>
                     <Tooltip title={t("personas.editTooltip")}>
                       <IconButton size="small" onClick={() => openEdit(p)}>
                         <EditIcon fontSize="small" />
@@ -400,6 +718,8 @@ export default function PersonasPanel() {
                         <DeleteIcon fontSize="small" />
                       </IconButton>
                     </Tooltip>
+                    </>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}
@@ -514,8 +834,242 @@ export default function PersonasPanel() {
             )}
           />
 
+          {(editor.measureIds.length > 0
+            || editor.dimensionIds.length > 0
+            || editor.hierarchyIds.length > 0
+            || editor.defaultFiltersJson.trim().length > 0
+            || editor.restrictedTagIds.length > 0)
+            && editor.audienceRoles.length === 0 && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              {t("personas.emptyAudienceNarrowingWarning")}
+            </Alert>
+          )}
+
+          {parameterCollisionPreflight.isError && (
+            <Alert severity="error" sx={{ mb: 2 }}>
+              {t("personas.parameterCollisionPreflightFailed")}
+            </Alert>
+          )}
+          {(parameterCollisionPreflight.data?.collisions.length ?? 0) > 0 && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                {t("personas.parameterCollisionPreflightTitle")}
+              </Typography>
+              <Typography variant="body2">
+                {t("personas.parameterCollisionPreflightHelp")}
+              </Typography>
+              <ul style={{ margin: "0.5rem 0 0", paddingLeft: "1.25rem" }}>
+                {parameterCollisionPreflight.data?.collisions.map((collision) => (
+                  <li key={`${collision.persona_id}-${collision.default_filter_key}`}>
+                    {collision.persona_name}: {collision.default_filter_key} → {collision.suggested_key}
+                  </li>
+                ))}
+              </ul>
+            </Alert>
+          )}
+
+          <Typography variant="caption" sx={{ display: "block", mb: 0.5, fontWeight: 600 }}>
+            {t("personas.fieldDefaultFilters")}
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
+            {t("personas.fieldDefaultFiltersHelp")}
+          </Typography>
+          {parseDimensionFilterRows(editor.defaultFiltersJson, parameterOptions).map((row) => (
+            <Stack direction="row" spacing={1} key={row.dim} sx={{ mb: 1 }} alignItems="center">
+              <TextField
+                select
+                label={t("personas.fieldDefaultFiltersDimension")}
+                size="small"
+                value={row.dim}
+                onChange={(e) =>
+                  setEditor({
+                    ...editor,
+                    defaultFiltersJson: updateFilterRow(
+                      editor.defaultFiltersJson,
+                      row.dim,
+                      (current) => ({ ...current, dim: e.target.value }),
+                      parameterOptions,
+                    ),
+                  })
+                }
+                sx={{ minWidth: 160 }}
+              >
+                {dimensionOptions.map((d) => (
+                  <MenuItem key={d.id} value={d.name}>
+                    {d.display_name || d.name}
+                  </MenuItem>
+                ))}
+                {row.dim && !dimensionOptions.some((d) => d.name === row.dim) && (
+                  <MenuItem value={row.dim}>{row.dim}</MenuItem>
+                )}
+              </TextField>
+              <TextField
+                select
+                label={t("personas.fieldDefaultFiltersOperator")}
+                size="small"
+                value={row.op}
+                onChange={(e) =>
+                  setEditor({
+                    ...editor,
+                    defaultFiltersJson: updateFilterRow(
+                      editor.defaultFiltersJson,
+                      row.dim,
+                      (current) => ({ ...current, op: e.target.value }),
+                      parameterOptions,
+                    ),
+                  })
+                }
+                sx={{ minWidth: 120 }}
+              >
+                {FILTER_OPERATORS.map((op) => (
+                  <MenuItem key={op} value={op}>{op}</MenuItem>
+                ))}
+              </TextField>
+              {row.op !== "is_null" && row.op !== "is_not_null" && (
+                <TextField
+                  label={t("personas.fieldDefaultFiltersValue")}
+                  size="small"
+                  value={row.value}
+                  onChange={(e) =>
+                    setEditor({
+                      ...editor,
+                      defaultFiltersJson: updateFilterRow(
+                      editor.defaultFiltersJson,
+                      row.dim,
+                      (current) => ({ ...current, value: e.target.value }),
+                      parameterOptions,
+                    ),
+                    })
+                  }
+                />
+              )}
+              <IconButton
+                size="small"
+                aria-label={t("personas.fieldDefaultFiltersRemove")}
+                onClick={() =>
+                  setEditor({
+                    ...editor,
+                    defaultFiltersJson: removeFilterRow(
+                      editor.defaultFiltersJson,
+                      row.dim,
+                      parameterOptions,
+                    ),
+                  })
+                }
+              >
+                <DeleteIcon fontSize="small" />
+              </IconButton>
+            </Stack>
+          ))}
+          <Button
+            size="small"
+            sx={{ mb: 1 }}
+            onClick={() => {
+              const rows = parseEditableFilterRows(editor.defaultFiltersJson, parameterOptions);
+              rows.push({
+                dim: dimensionOptions[0]?.name ?? "",
+                op: "eq",
+                value: "",
+              });
+              setEditor({ ...editor, defaultFiltersJson: serializeFilterRows(rows, parameterOptions) });
+            }}
+          >
+            {t("personas.fieldDefaultFiltersAdd")}
+          </Button>
+
+          <Typography variant="caption" sx={{ display: "block", mb: 0.5, fontWeight: 600 }}>
+            {t("personas.fieldParameterOverrides")}
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1 }}>
+            {t("personas.fieldParameterOverridesHelp")}
+          </Typography>
+          {hasOpaqueParameterFilter && (
+            <Alert severity="warning" sx={{ mb: 1 }}>
+              {t("personas.parameterCodecUnsupported")}
+            </Alert>
+          )}
+          {parameterRows.map((row) => (
+            <Stack direction="row" spacing={1} key={row.dim} sx={{ mb: 1 }} alignItems="center">
+              <TextField
+                select
+                label={t("personas.fieldParameterOverridesParameter")}
+                size="small"
+                value={row.dim}
+                onChange={(e) =>
+                  setEditor({
+                    ...editor,
+                    defaultFiltersJson: updateFilterRow(
+                      editor.defaultFiltersJson,
+                      row.dim,
+                      (current) => ({ ...current, dim: e.target.value }),
+                      parameterOptions,
+                    ),
+                  })
+                }
+                sx={{ minWidth: 180 }}
+              >
+                {parameterOptions.map((parameter) => (
+                  <MenuItem key={parameter.id} value={parameter.name}>
+                    {parameter.display_name || parameter.name}
+                  </MenuItem>
+                ))}
+                {row.dim && !parameterOptions.some((p) => p.name === row.dim) && (
+                  <MenuItem value={row.dim}>{row.dim}</MenuItem>
+                )}
+              </TextField>
+              <TextField
+                label={t("personas.fieldDefaultFiltersValue")}
+                size="small"
+                value={row.value}
+                onChange={(e) =>
+                  setEditor({
+                    ...editor,
+                    defaultFiltersJson: updateFilterRow(
+                        editor.defaultFiltersJson,
+                        row.dim,
+                        (current) => ({ ...current, value: e.target.value }),
+                        parameterOptions,
+                      ),
+                  })
+                }
+              />
+              <IconButton
+                size="small"
+                aria-label={t("personas.fieldDefaultFiltersRemove")}
+                onClick={() =>
+                  setEditor({
+                    ...editor,
+                    defaultFiltersJson: removeFilterRow(
+                      editor.defaultFiltersJson,
+                      row.dim,
+                      parameterOptions,
+                    ),
+                  })
+                }
+              >
+                <DeleteIcon fontSize="small" />
+              </IconButton>
+            </Stack>
+          ))}
+          <Button
+            size="small"
+            sx={{ mb: 1 }}
+            disabled={parameterOptions.length === 0}
+            onClick={() => {
+              const rows = parseEditableFilterRows(editor.defaultFiltersJson, parameterOptions);
+              rows.push({
+                dim: parameterOptions[0]?.name ?? "",
+                op: "eq",
+                value: parameterOptions[0]?.param_type === "string" ? "" : "null",
+              });
+              setEditor({ ...editor, defaultFiltersJson: serializeFilterRows(rows, parameterOptions) });
+            }}
+          >
+            {t("personas.fieldParameterOverridesAdd")}
+          </Button>
+
           <TextField
-            label={t("personas.fieldDefaultFilters")}
+            label={t("personas.fieldDefaultFiltersAdvanced")}
             value={editor.defaultFiltersJson}
             onChange={(e) =>
               setEditor({ ...editor, defaultFiltersJson: e.target.value })
@@ -523,7 +1077,7 @@ export default function PersonasPanel() {
             size="small"
             fullWidth
             multiline
-            minRows={3}
+            minRows={2}
             maxRows={8}
             placeholder={t("personas.fieldDefaultFiltersPlaceholder")}
             sx={{ mb: 2, fontFamily: "monospace" }}

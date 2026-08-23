@@ -32,7 +32,7 @@ A semantic model is only reliable while its source bindings are reliable. If a s
 3. For a removed column, check whether it backs a measure, dimension, row-security rule, data tag, or drill-through set.
 4. For an added column, decide whether to import it, hide it, tag it, or leave it out of the model.
 5. After syncing columns, re-run validation from Model Health.
-6. If the changed column is used by dashboards or jobs, check [Impact Analysis](impact-analysis.md) before renaming or deleting semantic objects.
+6. If the changed column is used by dashboards or jobs, check [Usage & Downstream Assets](usage-downstream-assets.md) before renaming or deleting semantic objects.
 
 ## What not to do
 
@@ -41,7 +41,7 @@ Do not blindly sync every new source column into the business catalogue. New col
 ## Related
 
 - [Data Preview](data-preview.md)
-- [Impact Analysis](impact-analysis.md)
+- [Usage & Downstream Assets](usage-downstream-assets.md)
 - [Data Tags](data-tags.md)
 - [Model Health](../concepts/model-health.md)
 

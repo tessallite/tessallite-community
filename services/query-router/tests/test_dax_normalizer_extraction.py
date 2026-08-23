@@ -93,6 +93,64 @@ def test_filter_with_spaced_column():
 
 
 # ---------------------------------------------------------------------------
+# Bug-6086 — query_fingerprint uses the shared fingerprint_shape authority
+# ---------------------------------------------------------------------------
+
+def test_dax_fingerprint_uses_shared_shape_authority():
+    # Bug-6086: the DAX normalizer previously hashed a PRIVATE payload
+    # ({measures, grain, filter_cols}) that omitted the ``dimensions`` and
+    # ``having_cols`` keys the shared ``fingerprint_shape`` authority (and the
+    # SQL parser) include. That made an equivalent DAX and SQL query hash
+    # DIFFERENTLY, so cross-protocol QueryLog dedup / miss-log grouping split.
+    # The normalizer must now delegate to the shared authority.
+    from shared.pocket.fingerprint import fingerprint_shape
+
+    q = parse_dax_to_ir(
+        'EVALUATE SUMMARIZECOLUMNS(Sales[Region], "Revenue", [Revenue])', "m1"
+    )
+    expected = fingerprint_shape(
+        measures=["Revenue"],
+        dimensions=["Region"],
+        grain=["Region"],
+        filter_cols=[],
+        having_cols=[],
+    )
+    assert q.query_fingerprint == expected
+
+
+def test_dax_fingerprint_matches_sql_parser_for_equivalent_shape():
+    # Bug-6086: a DAX query and the SQL parser's fingerprint for the SAME
+    # measures/dimensions/grain/filters must be byte-identical — both go
+    # through the single shared authority. Compare the two parser fingerprint
+    # helpers directly so the schemes can never drift again.
+    from src.parsing import sql_parser
+    from src.ir.logical_query import LogicalFilter
+
+    filt = LogicalFilter(dimension_name="Channel", operator="eq", value="WEB")
+    dax_fp = __import__(
+        "src.parsing.dax_normalizer", fromlist=["_compute_fingerprint"]
+    )._compute_fingerprint(["Revenue"], ["Region"], ["Region"], [filt])
+    sql_fp = sql_parser._compute_fingerprint(
+        ["Revenue"], ["Region"], ["Region"], [filt], having_columns=[],
+    )
+    assert dax_fp == sql_fp
+
+
+def test_dax_fingerprint_includes_filter_column():
+    # A filtered DAX query hashes differently from the same shape without the
+    # filter (filter_cols participate in the shared shape payload).
+    unfiltered = parse_dax_to_ir(
+        'EVALUATE SUMMARIZECOLUMNS(Sales[Region], "Revenue", [Revenue])', "m1"
+    )
+    filtered = parse_dax_to_ir(
+        'EVALUATE SUMMARIZECOLUMNS(Sales[Region], '
+        'FILTER(Sales, Sales[Channel] = "WEB"), "Revenue", [Revenue])',
+        "m1",
+    )
+    assert unfiltered.query_fingerprint != filtered.query_fingerprint
+
+
+# ---------------------------------------------------------------------------
 # Measure expression binding (SUMMARIZE) — bind to column, not alias
 # ---------------------------------------------------------------------------
 
@@ -114,6 +172,32 @@ def test_summarize_binds_column_inside_nested_expression():
         "m1",
     )
     assert q.requested_measures == ["Net Amount"]
+
+
+def test_summarizecolumns_calculate_measure_ref_preserves_filter_context():
+    q = parse_dax_to_ir(
+        'EVALUATE SUMMARIZECOLUMNS(Sales[Region], "Web Revenue", '
+        'CALCULATE([Revenue], FILTER(Sales, Sales[Channel] = "WEB")))',
+        "m1",
+    )
+
+    assert q.requested_dimensions == ["Region"]
+    assert q.requested_measures == ["Revenue"]
+    assert len(q.filters) == 1
+    assert (q.filters[0].dimension_name, q.filters[0].operator, q.filters[0].value) == (
+        "Channel",
+        "eq",
+        "WEB",
+    )
+
+
+def test_summarizecolumns_calculate_unrepresentable_filter_raises():
+    with pytest.raises(UnsupportedSQL):
+        parse_dax_to_ir(
+            'EVALUATE SUMMARIZECOLUMNS(Sales[Region], "Revenue", '
+            'CALCULATE([Revenue], Sales[Channel] = "WEB"))',
+            "m1",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -164,3 +248,33 @@ def test_time_variant_hints_still_applied_on_valid_dax():
     )
     assert q.time_variant_hints == {"Revenue": "ytd"}
     assert q.requested_measures == ["Revenue"]
+
+
+# ---------------------------------------------------------------------------
+# Bug-7595: same-column repeated expressions must be rejected
+# ---------------------------------------------------------------------------
+
+def test_same_column_repeated_in_expression_raises():
+    """Bug-7595: SUM(Sales[Amount]) + SUM(Sales[Amount]) references the same
+    column twice.  The expression semantics (2*SUM) would be silently lost if
+    we bind to a single measure.  Must raise UnsupportedSQL."""
+    with pytest.raises(UnsupportedSQL):
+        parse_dax_to_ir(
+            'EVALUATE SUMMARIZECOLUMNS(Sales[Region], '
+            '"Double", SUM(Sales[Amount]) + SUM(Sales[Amount]))',
+            "m1",
+        )
+
+
+def test_same_column_single_agg_passes():
+    """A single SUM(Sales[Amount]) with no repetition should still bind
+    successfully (regression guard for Bug-7595 fix).
+    Bug-7796: also carries the 'sum' override (lowercased key) so the
+    source rewriter applies the requested function."""
+    q = parse_dax_to_ir(
+        'EVALUATE SUMMARIZECOLUMNS(Sales[Region], '
+        '"Total", SUM(Sales[Amount]))',
+        "m1",
+    )
+    assert q.requested_measures == ["Amount"]
+    assert q.measure_agg_overrides == {"amount": "sum"}

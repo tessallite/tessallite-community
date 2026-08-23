@@ -2,7 +2,7 @@
 title: "Drill-through"
 audience: modeller
 area: modelling
-updated: 2026-06-21
+updated: 2026-07-02
 ---
 
 ## Why drill-through matters
@@ -26,15 +26,15 @@ Drill-through is **not a separate feature you enable**. Every standard measure g
 | Field | What it controls | Default |
 |---|---|---|
 | **Source fact table** | The fact table the measure aggregates. Modellers can override with a finer-grained sibling table; Tessallite asks them to pick a join path back to the original fact when more than one exists. | Auto-detected from the measure. |
-| **Detail columns** | Which columns of the source table are returned when drilling. | Every column of the source table. |
-| **Joined dimensions** | LEFT-JOINs human-readable dimension columns into the drilled rows (display-prefixed: `customer__name`, `product__category`). | Empty. |
+| **Detail columns** | Which dimension-backed columns of the source table are returned when drilling. Only columns that are exposed as a dimension on the model can be projected. | The cell's grouping dimensions — the dimensions that identify the clicked cell. |
+| **Joined dimensions** | LEFT-JOINs human-readable dimension columns into the drilled rows. Each joined dimension is projected under its own dimension name (`customer_name`, `product_category`); there is no automatic prefix. | Empty. |
 | **Row-limit override** | Caps the page size at a custom value; otherwise the global default applies. | Unset (default 1 000, cap 10 000). |
 
-The reason configuration exists — even though the default "every column" works out of the box — is that fact tables often carry columns you do not want every drill-through consumer to see: internal IDs, PII, audit timestamps that confuse rather than help. The full curation workflow, with all four controls and worked business examples, is documented in [Curate drill-through](curate-drill-through.md).
+The reason configuration exists is control in both directions. By default a drill returns only the cell's grouping dimensions — the dimensions that identify the number you clicked — so you see the contributing breakdown without exposing anything else. Curation lets the modeller **add** detail: extra dimension-backed columns from the source table, or human-readable columns LEFT-JOINed in from a dimension table. It also lets them keep the projection tight when a fact carries columns no drill-through consumer should see: internal IDs, PII, audit timestamps that confuse rather than help. The full curation workflow, with all four controls and worked business examples, is documented in [Curate drill-through](curate-drill-through.md).
 
 ![The Drill-through configuration sub-drawer, showing the detail-columns multi-select and row-limit override.](../assets/screencaps/drill-through-config-drawer.png)
 
-*Figure 1 — Drill-through configuration on a measure. Leave it at default for "every column". Tighten the detail-columns list when the fact has PII or noise columns. Full description: [drill-through-config-drawer.txt](../assets/screencaps/drill-through-config-drawer.txt).*
+*Figure 1 — Drill-through configuration on a measure. Leave it at default to return the cell's grouping dimensions. Add detail columns or joined dimensions when the analyst needs more than the breakdown; tighten the list when the fact has PII or noise columns. Full description: [drill-through-config-drawer.txt](../assets/screencaps/drill-through-config-drawer.txt).*
 
 ---
 
@@ -55,13 +55,13 @@ A drill-through call returns a structured response the frontend renders as a tab
 - **`bytes_processed`** — bytes scanned by the source engine (where the connector reports it; zero otherwise).
 - **`rows_returned`** — total row count in this page of the result.
 
-Rows are ordered by every projected column on each call — the detail columns first, then the measure value. This is a *best-effort widest key*: the sort takes the broadest deterministic ordering the model can reach, so each row usually gets a distinct ordering position even when the cell coordinate is the same for every row. A **strict total order is only guaranteed when the fact table has a primary key exposed as a dimension** — that key is then added to the end of the sort as a guaranteed-unique tie-breaker, and every row is distinctly ordered. Without a PK-backed dimension, two rows that share identical projected detail *and* an identical measure value tie, and the database is free to order tied rows either way between runs; in that case a tie that straddles a page boundary can, on a non-stable-scan engine, swap a row between adjacent pages (it is still returned exactly once across the full page set, so totals reconcile, but the per-page disjointness guarantee is best-effort, not absolute, for those tied rows). This is why the order matters at all: a deterministic order is what keeps pagination safe — sorting only by a value that is identical on every row (the clicked cell coordinate) would let page two repeat or skip rows from page one, because a database is free to return table rows in any order it likes between two runs of the same query.
+Rows are ordered by every projected column on each call — the detail columns first, then the measure value. A **strict total order is required before Tessallite offers a second leaf page**. Every component of the fact table's primary key must be exposed as a dimension; Tessallite appends that complete tuple in canonical schema order. A partial composite key is not unique. When any component is missing and the result exceeds one page, the endpoint returns `STABLE_CURSOR_UNAVAILABLE` instead of risking repeated or skipped rows.
 
 Filter values are never spliced into the SQL as raw text. Each value is turned into a typed SQL literal by the query compiler (numbers as numbers, strings as quoted-and-escaped strings, nulls as `IS NULL`), and the whole statement is then re-parsed, bound to the semantic model, and security-checked before it reaches the database. A fact table with a column named `"; DROP TABLE orders; --` is handled as an ordinary identifier — the crafted text never escapes its quotes.
 
-![The Drill-through drawer showing 25 rows of order-line detail behind a single cell, with pagination, scanned-row count, and a Route badge.](../assets/screencaps/drill-through-drawer.png)
+![The Measure Query panel opened from the model canvas, with controls for the measure, rows, columns, execution mode, and filters.](../assets/screencaps/drill-through-drawer.png)
 
-*Figure 2 — A drill-through result rendered inline in the pivot result panel. Rows are typed, the Route badge explains which engine served them, and pagination lets the analyst walk a result set without freezing the browser. Full description: [drill-through-drawer.txt](../assets/screencaps/drill-through-drawer.txt).*
+*Figure 2 — Where drill-through starts. Build and run a measure query in this panel; after the result grid appears, select a measure cell to show its detail rows inline below the grid. Full description: [drill-through-drawer.txt](../assets/screencaps/drill-through-drawer.txt).*
 
 For a standard measure, clicking a cell now renders the drill-through result **inline, directly below the pivot grid** in the same result panel, rather than sliding a separate side panel in from the right. Use the close (X) control in the panel header to dismiss it. (Calculated measures still open the decomposed drawer described below, because they stack one mini-panel per referenced base measure.)
 
@@ -98,9 +98,7 @@ Keeping these separate in the payload (rather than collapsing both into one filt
 
 ## Pagination
 
-Drill-through uses an opaque cursor that the caller passes back unchanged to fetch the next page. Behind that cursor today is `LIMIT`/`OFFSET` paging combined with a deterministic `ORDER BY`, so pages never overlap or skip rows. The cursor is opaque precisely so this mechanism can change later (for example to keyset paging on very deep result sets) without breaking integrations.
-
-Because the underlying mechanism is offset-based, very deep pages cost more than shallow ones — the database walks past the skipped rows. In practice this is a non-issue at the 10 000-row page ceiling, and drill-through is for investigation, not bulk export; for bulk export use the pivot CSV/JSON buttons.
+Drill-through uses a signed, opaque keyset cursor that the caller passes back unchanged to fetch the next page. The cursor records the final row's complete ordering key and is bound to the tenant, project, deployed model version and epochs, measure, coordinates, filters, page size, route override, persona, and security principal. Inserts or deletes before the current position therefore do not shift the next page. A tampered cursor returns `INVALID_CURSOR`; a cursor from changed scope returns `STALE_CURSOR` with HTTP 409 so the caller restarts from the first page. If the complete signed key would exceed 16,384 characters, the endpoint returns HTTP 409 `CURSOR_TOO_LARGE` instead of emitting a token the next request must reject.
 
 Use it like this:
 
@@ -108,7 +106,7 @@ Use it like this:
 2. Second call: pass the `next_cursor` from the previous response back as `cursor`.
 3. Keep going until the response returns `next_cursor: null` and `has_more: false`.
 
-The cursor is opaque by design. Do not try to parse it — its shape is implementation detail and will change when the underlying ordering strategy changes.
+The cursor is opaque by design. Do not parse or edit it. Reuse it only with the same request and security context.
 
 The per-page limit is clamped at 10 000 rows. The default is 1 000. If you need more than that in one shot, consider whether you really need every row in the browser — drill-through is for investigation, not bulk export. For bulk export, see the CSV/JSON export buttons on the Measure Query Panel grid.
 
@@ -144,9 +142,10 @@ This trades "one table of rows" for "one table per base measure". In exchange, a
 Drill-through is deliberately **not** offered for:
 
 - **Composite or multi-fact measures** — a v1 simplification. A measure that aggregates across two joined fact tables has no single "source fact" to drill into; the composite drill-through case will be specified in a future phase.
-- **Measures on source systems Tessallite does not yet bind** — PostgreSQL, BigQuery, and Spark / HiveServer2 are all supported as of Phase 8. Other connectors (Snowflake, Databricks SQL Warehouses, etc.) are reserved for later passes; the measure will still return aggregated values normally on those, only drill-through is off.
 
-Calculated measures are handled differently — clicking one opens the decomposed drawer (below) rather than erroring. For the other unsupported cases the inline panel opens with a structured error whose payload carries a stable `error_code` so an integration can branch on the code rather than parsing the message string. See the error-code reference below for the actual codes the endpoint returns.
+Drill-through has **no connector-specific restriction**. It runs through the same rewrite-and-execute pipeline as every other query — the SQL is transpiled to the connector's dialect and executed through the source gateway — so any source your model can query, it can drill. There is no gate that switches drill-through off for particular sources.
+
+Calculated measures are handled differently — clicking one opens the decomposed drawer (below) rather than erroring. For the composite / multi-fact case the inline panel opens with a structured error whose payload carries a stable `error_code` so an integration can branch on the code rather than parsing the message string. See the error-code reference below for the actual codes the endpoint returns.
 
 ---
 
@@ -159,7 +158,7 @@ Calculated measures are handled differently — clicking one opens the decompose
 1. Open the [Measure Query Panel](measure-query-panel.md). Pick `Revenue` as the measure, `region` on rows, `quarter` on columns. Click **Run**.
 2. Click the cell at row `EMEA`, column `2024-Q2`. The drill-through panel opens inline below the grid with the 312 order lines that contributed.
 3. Click the Route badge tooltip. It says `aggregate · rev_by_region_quarter`. So the dashboard reads the aggregate, and the drill-through reads from the source — if they disagree, one of the two is stale.
-4. Sort the panel by `order_date` descending. The most recent row is 2024-03-31. Orders from the final three days of Q2 (2024-06-28, 29, 30) are missing.
+4. Scan the drilled rows (page through them, or use **Export current page to CSV** and inspect in a spreadsheet). The latest `order_date` present is 2024-03-31 — orders from the final weeks of Q2 (2024-06-28, 29, 30) never appear. The drill panel returns rows in a fixed deterministic order and has no column-sort control, so you read them as returned rather than re-sorting in place.
 5. Run the same query with **Force Live** on (see [Live vs Aggregate](../querying/live-vs-aggregate.md)). The number reads €5.2M — the aggregate is behind. Now the conversation is "refresh the aggregate" rather than "investigate a data bug".
 
 Drill-through did not fix the problem. It made the problem visible in under a minute.
@@ -170,7 +169,6 @@ Drill-through did not fix the problem. It made the problem visible in under a mi
 
 | Limitation | Impact | Workaround |
 |---|---|---|
-| Connector coverage | PostgreSQL, BigQuery, and Spark are supported. Other warehouses are not bound to drill-through yet. | For unsupported connectors, query the source directly; aggregation still works |
 | No multi-fact joins in drill | The drilled rows come from a single source fact (possibly with the override + join-path expansion documented in [Curate drill-through](curate-drill-through.md)) | Drill each measure separately for cross-fact investigations |
 | Per-page limit ≤ 10 000 | Very large drills are paginated, not one-shot | Use the page-aware API, or export the underlying pivot via CSV |
 | Drill reflects the **deployed** model | Drill picks its dimensions and detail columns from the deployed version of the model. An edit you have not deployed yet (a renamed dimension, a re-ordered hierarchy level, a changed drill-through set) is not reflected, and a drill that references a not-yet-deployed object returns a binding error rather than a partial result | Deploy the model, then drill |
@@ -183,11 +181,17 @@ Errors carry stable codes. Integrations should branch on the code, not the human
 |---|---|
 | `MEASURE_NOT_FOUND` | The measure id does not exist (or is out of scope for the caller). |
 | `MODEL_NOT_FOUND` | The measure's model could not be resolved. |
-| `INVALID_CURSOR` | The supplied `cursor` is malformed. Restart from `cursor: null`. |
+| `INVALID_CURSOR` | The cursor is malformed, unsigned, or its signature does not verify. Restart from `cursor: null`. |
+| `STALE_CURSOR` | The cursor belongs to a different request, security scope, deploy epoch, or data epoch. The endpoint returns HTTP 409; restart from `cursor: null`. |
+| `STABLE_CURSOR_UNAVAILABLE` | The result exceeds one page but the model does not expose dimensions over every source-primary-key component. Add the missing dimensions, deploy, and retry. |
+| `CURSOR_TOO_LARGE` | The complete signed order key exceeds the cursor transport ceiling. Reduce projected key size or use smaller primary-key dimensions. |
 | `DrillThroughUnsupportedOperator` | A filter / grouping-level `op` is not one of the supported operators. |
 | `DrillThroughBadOperand` | An operator received the wrong operand shape (e.g. `in` without a list). |
+| `DRILL_MEASURE_NOT_DEPLOYED` | The measure exists but is not in the deployed model version. Deploy the model, then drill. |
+| `DRILL_JOIN_PATH_REQUIRED` | The measure's drill-through set has a source-table override with no saved join path. The modeller must pick and save a join path first (see [Curate drill-through](curate-drill-through.md)). |
+| `DRILL_DETAIL_COLUMN_NOT_PROJECTABLE` | A curated detail column has no dimension over it, so it cannot be projected through the semantic layer. Create a dimension over the column, or drop it from the drill-through set. |
 
-Curation-side validation (the modeller's PATCH endpoint) returns the `DRILL_*` codes documented in [Curate drill-through](curate-drill-through.md).
+The last three are raised at drill time because they depend on the deployed model state and the measure's curation. Curation-side validation (the modeller's PATCH endpoint) returns the additional `DRILL_*` codes documented in [Curate drill-through](curate-drill-through.md).
 
 ---
 
@@ -199,7 +203,7 @@ Curation-side validation (the modeller's PATCH endpoint) returns the `DRILL_*` c
 | Drill rows don't add up to the clicked cell | A slicer was active on the pivot but an integration posted no `filters` | Pass the active slicer predicates in `filters`; the SPA does this automatically |
 | Drill panel shows zero rows on a non-zero cell | The cell was served from an aggregate that rolls up a now-deleted source row; live re-run returns zero | Refresh the aggregate, or use Force Live to confirm source state |
 | Drilling on a calculated measure shows only one mini-panel | The calculated expression references only one base measure | Expected — decomposition produces one panel per *distinct* referenced base measure |
-| Drill returns aggregated values on an unsupported connector | The connector is not bound to drill-through yet (PostgreSQL, BigQuery, Spark are) | Query the source directly for now; tracked for a later phase |
+| Drill returns a `DRILL_MEASURE_NOT_DEPLOYED` error | The measure was added or changed after the last deploy | Deploy the model, then drill |
 
 ---
 

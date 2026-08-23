@@ -80,7 +80,7 @@ Delete resources in this order:
    gcloud secrets delete tessallite-session-secret
    ```
 
-6. Optionally drop aggregate tables from your data source. Connect to your data warehouse and drop them manually.
+6. Optionally drop aggregate tables from your data source. Connect to the target source and drop them manually.
 
 > **Warning:** Deleting the Cloud SQL instance is irreversible. Back up the database before proceeding if you may need the model definitions or workspace configuration later.
 

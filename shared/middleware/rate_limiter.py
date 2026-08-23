@@ -59,8 +59,13 @@ from shared.middleware.internal_bypass import (  # noqa: F401 — re-exported
 
 logger = logging.getLogger(__name__)
 
-# Paths exempt from rate limiting: liveness probes and metrics scrapes.
-EXEMPT_PATHS = frozenset({"/health", "/metrics"})
+# Paths exempt from rate limiting: liveness probes, metrics scrapes, and
+# the XMLA wire-protocol endpoint.  BI clients (Excel, Power BI) fire
+# dozens of rapid-fire SOAP requests for a single PivotTable operation —
+# session handshakes, metadata discovery, data queries — each doubled by
+# HTTP Basic Auth 401 challenges.  The 60/min API limit blocks them mid-
+# pivot.  XMLA is already guarded by per-request authentication.
+EXEMPT_PATHS = frozenset({"/health", "/metrics", "/api/v1/xmla/"})
 
 # Login routes get the stricter ``rate_limit.login_per_minute`` bucket.
 LOGIN_PATH_SUFFIXES = (
@@ -163,45 +168,75 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
     settings UI controls enforcement without service restarts. Internal
     service calls (verified bypass header) and health/metrics probes are
     never throttled.
+
+    Multi-replica behaviour (Bug-7410): buckets are per-process by default
+    (``memory://``). Under N replicas the effective ceiling is N x the
+    configured limit and buckets reset on restart/scale events. This is
+    bounded and documented -- Tessallite scales UP (single replica, larger
+    CPU/RAM) not OUT; a scale-out deployment that needs a shared ceiling
+    sets ``RATE_LIMIT_STORAGE_URI`` (e.g. ``redis://<host>:6379``) to route
+    all replicas through a single store, with no code or dependency change.
+
+    ``login_only=True`` (model-service placement, architecture_rate-limit-
+    placement.md) throttles ONLY the login paths — brute-force protection — and
+    passes the operational/metadata API through untouched. The default (full)
+    mode additionally throttles the per-tenant ``api`` bucket (the gateway).
     """
+
+    def __init__(self, app, *, login_only: bool = False) -> None:
+        super().__init__(app)
+        self.login_only = login_only
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
+        # RL-CG-R1-01: this try must only DECIDE whether to reject; it must NEVER
+        # dispatch the downstream app from inside it. If call_next() ran here and
+        # raised, the broad `except` below would swallow it and the final
+        # call_next() would REPLAY the request — double-executing a non-idempotent
+        # POST/PATCH/DELETE. So call_next() is invoked exactly once, OUTSIDE this
+        # try, for every pass-through path (disabled, exempt, internal, login-only,
+        # and under-limit). The limiter still fails OPEN on its own internal error.
         try:
             limiter: Limiter | None = getattr(request.app.state, "limiter", None)
-            if limiter is None or not bool(system_snapshot_get("rate_limit.enabled")):
-                return await call_next(request)
+            if limiter is not None and bool(system_snapshot_get("rate_limit.enabled")):
+                path = request.url.path
+                if path not in EXEMPT_PATHS and not _is_internal_request(request):
+                    per_minute: int | None
+                    if path.endswith(LOGIN_PATH_SUFFIXES):
+                        per_minute = int(system_snapshot_get("rate_limit.login_per_minute"))
+                        scope = "login"
+                        # Login requests carry no JWT — key by client address.
+                        key = get_remote_address(request) or "unknown"
+                    elif self.login_only:
+                        # login-only placement (model-service): the operational/
+                        # metadata API is deliberately NOT request-rate throttled
+                        # here — that load is bounded by fixing the N+1 fan-out, not
+                        # a per-tenant bucket (architecture_rate-limit-placement.md).
+                        # per_minute=None => skip the bucket; the request passes
+                        # through via the single call_next() below.
+                        per_minute = None
+                    else:
+                        per_minute = int(system_snapshot_get("rate_limit.per_minute"))
+                        scope = "api"
+                        key = _extract_tenant_key(request)
 
-            path = request.url.path
-            if path in EXEMPT_PATHS or _is_internal_request(request):
-                return await call_next(request)
-
-            if path.endswith(LOGIN_PATH_SUFFIXES):
-                per_minute = int(system_snapshot_get("rate_limit.login_per_minute"))
-                scope = "login"
-                # Login requests carry no JWT — key by client address.
-                key = get_remote_address(request) or "unknown"
-            else:
-                per_minute = int(system_snapshot_get("rate_limit.per_minute"))
-                scope = "api"
-                key = _extract_tenant_key(request)
-
-            limit_str = f"{per_minute}/minute"
-            item = _parse_limit_cached(limit_str)
-            if not limiter.limiter.hit(item, key, scope):
-                logger.warning(
-                    "rate limit %s exceeded: key=%s scope=%s path=%s",
-                    limit_str, key, scope, path,
-                )
-                return _rate_limit_response(limit_str)
+                    if per_minute is not None:
+                        limit_str = f"{per_minute}/minute"
+                        item = _parse_limit_cached(limit_str)
+                        if not limiter.limiter.hit(item, key, scope):
+                            logger.warning(
+                                "rate limit %s exceeded: key=%s scope=%s path=%s",
+                                limit_str, key, scope, path,
+                            )
+                            return _rate_limit_response(limit_str)
         except Exception:  # defensive: never let the limiter break requests
             logger.exception("Rate limiter check failed — request allowed through")
 
         return await call_next(request)
 
 
-def attach_limiter(app: FastAPI, limiter: Limiter) -> None:
+def attach_limiter(app: FastAPI, limiter: Limiter, *, login_only: bool = False) -> None:
     """
     Attach the Limiter and enforcement middleware to the app.
 
@@ -209,13 +244,20 @@ def attach_limiter(app: FastAPI, limiter: Limiter) -> None:
     The middleware is always attached; the per-request enabled check
     (``rate_limit.enabled``) governs enforcement, so toggling the switch
     in system settings takes effect without a restart.
+
+    ``login_only=True`` restricts enforcement to the login paths (brute-force
+    protection) and leaves the operational/metadata API un-throttled — the
+    model-service placement per architecture_rate-limit-placement.md. The
+    default (full) mode also throttles the per-tenant ``api`` bucket and is
+    what the gateway uses.
     """
     app.state.limiter = limiter
-    app.add_middleware(TenantRateLimitMiddleware)
+    app.add_middleware(TenantRateLimitMiddleware, login_only=login_only)
     logger.info(
-        "Rate limiting middleware attached (enabled=%s, %s requests/minute per tenant, "
+        "Rate limiting middleware attached (enabled=%s, mode=%s, %s requests/minute per tenant, "
         "%s logins/minute per client)",
         bool(system_snapshot_get("rate_limit.enabled")),
+        "login-only" if login_only else "full",
         int(system_snapshot_get("rate_limit.per_minute")),
         int(system_snapshot_get("rate_limit.login_per_minute")),
     )

@@ -33,8 +33,19 @@ async def test_cte_binds_with_model_relation_and_cte_alias() -> None:
         protocol="jdbc",
     )
     model = types.SimpleNamespace(id="model-1", slug="modelx", display_name="Model X", deployed_version_id="v1")
+    # F-003-02: the CTE body references physical column ``payment_status`` over the
+    # model relation, so the deployed shape must declare it; the new complex-SQL
+    # column-containment gate fails closed on an empty/unavailable vocabulary.
+    from src.semantic.snapshot_resolver import DeployedShape
+    _shape = DeployedShape(
+        measures=[], dimensions=[], hidden_column_ids=set(),
+        physical_columns_all={"payment_status"},
+        physical_columns_visible={"payment_status"},
+        hierarchy_rows=[],
+    )
     with (
         patch("src.semantic.binder._load_model", new=AsyncMock(return_value=model)),
+        patch("src.semantic.binder.resolve_deployed_shape", new=AsyncMock(return_value=_shape)),
         patch("src.semantic.binder._load_measures", new=AsyncMock(return_value=[])),
         patch("src.semantic.binder._load_dimensions", new=AsyncMock(return_value=[])),
         patch("src.semantic.binder._load_hierarchy_level_dimensions", new=AsyncMock(return_value=[])),

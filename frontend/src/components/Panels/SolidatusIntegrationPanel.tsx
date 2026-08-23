@@ -89,10 +89,11 @@ function requestErrorMessage(t: T, fallbackKey: string) {
 
 function syncErrorMessage(t: T, message: string | null | undefined) {
   if (!message) return t("solidatus.noErrorDetails");
+  // Bug-7516: pass through real errors instead of generic fallback.
   if (message.toLowerCase().includes("not implemented")) {
     return t("solidatus.syncFailureFallback");
   }
-  return t("solidatus.syncFailureFallback");
+  return message;
 }
 
 export function SolidatusIntegrationPanel() {
@@ -192,6 +193,18 @@ export function SolidatusIntegrationPanel() {
     }
   }
 
+  // Bug-7720: is_active toggle.
+  async function toggleActive(connection: SolidatusConnection) {
+    try {
+      await solidatusApi.updateConfig(pid, mid, connection.id, {
+        is_active: !connection.is_active,
+      } as Record<string, unknown>);
+      await refresh();
+    } catch {
+      setError(requestErrorMessage(t, "solidatus.saveFailed"));
+    }
+  }
+
   async function runValidate(connection: SolidatusConnection) {
     setLoading(true);
     setNotice(null);
@@ -200,29 +213,27 @@ export function SolidatusIntegrationPanel() {
         connection_id: connection.id,
       });
       setError(null);
-      setPreview({
-        nodes_total: 0,
-        edges_total: 0,
-        by_type: {},
-        warnings: result.warnings.map((w) => ({ message: w })),
-      });
+      // Bug-7517: do not overwrite preview with fabricated zeros.
+      const warnings = result.warnings ?? [];
+      const warningSuffix =
+        warnings.length > 0 ? ` ${warnings.join("; ")}` : "";
       // ok is tri-state: null => simulated (connector not contacted),
       // false => verified failure, true => verified pass. A simulated
       // result must never read as a green success.
       if (result.simulated || result.ok === null) {
         setNotice({
           severity: "info",
-          message: t("solidatus.validationSimulated", { connection: connection.display_name }),
+          message: t("solidatus.validationSimulated", { connection: connection.display_name }) + warningSuffix,
         });
       } else if (result.ok === false) {
         setNotice({
           severity: "warning",
-          message: t("solidatus.validationReportedIssue", { connection: connection.display_name }),
+          message: t("solidatus.validationReportedIssue", { connection: connection.display_name }) + warningSuffix,
         });
       } else {
         setNotice({
-          severity: "success",
-          message: t("solidatus.validationVerified", { connection: connection.display_name }),
+          severity: warnings.length > 0 ? "warning" : "success",
+          message: t("solidatus.validationVerified", { connection: connection.display_name }) + warningSuffix,
         });
       }
     } catch {
@@ -333,6 +344,11 @@ export function SolidatusIntegrationPanel() {
                 </Stack>
               </Box>
               <Stack direction="row" gap={0.5}>
+                <Tooltip title={c.is_active ? t("solidatus.deactivate") : t("solidatus.activate")}>
+                  <Button size="small" variant="text" onClick={() => toggleActive(c)}>
+                    {c.is_active ? t("solidatus.deactivate") : t("solidatus.activate")}
+                  </Button>
+                </Tooltip>
                 <Tooltip title={t("solidatus.edit")}>
                   <IconButton size="small" onClick={() => openEdit(c)}>
                     <EditIcon fontSize="small" />

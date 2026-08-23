@@ -24,6 +24,7 @@ import AddIcon from "@mui/icons-material/Add";
 
 import { useT } from "../../i18n";
 import { queryRouterApiClient } from "../../api/client";
+import { rowSecurityDeniedAll } from "../../utils/rowSecurity";
 import type { Dimension } from "../../api/types";
 import type { BusinessFilter, BusinessFilterOp } from "../../api/types_domains/kpis";
 import { TIME_WINDOW_PRESETS } from "./businessDefinition";
@@ -46,8 +47,6 @@ const OP_LABELS: Record<BusinessFilterOp, string> = {
   not_like: "kpiBusiness.opNotLike",
   is_null: "kpiBusiness.opIsNull",
   is_not_null: "kpiBusiness.opIsNotNull",
-  top_n: "kpiBusiness.opTopN",
-  bottom_n: "kpiBusiness.opBottomN",
 };
 
 const BUILDER_OPS: BusinessFilterOp[] = [
@@ -59,7 +58,6 @@ const BUILDER_OPS: BusinessFilterOp[] = [
 
 const SINGLE_VALUE_OPS: BusinessFilterOp[] = ["eq", "ne", "gt", "gte", "lt", "lte"];
 const NO_VALUE_OPS: BusinessFilterOp[] = ["is_null", "is_not_null"];
-const N_OPS: BusinessFilterOp[] = ["top_n", "bottom_n"];
 
 function needsValues(op: BusinessFilterOp): boolean {
   return !NO_VALUE_OPS.includes(op);
@@ -77,9 +75,6 @@ function chipSummary(
   if (filter.operator === "between") {
     const vals = filter.values ?? [];
     return `${name} ${vals[0] ?? "?"}–${vals[1] ?? "?"}`;
-  }
-  if (N_OPS.includes(filter.operator)) {
-    return `${name} ${t(OP_LABELS[filter.operator])} ${filter.n ?? "?"}`;
   }
   const vals = filter.values ?? (filter.value ? [filter.value] : []);
   if (vals.length === 0) return `${name} ${t(OP_LABELS[filter.operator])} ...`;
@@ -106,6 +101,9 @@ function FilterEditor({ modelId, dim, filter, onChange, onClose, onRemove }: Edi
   const [options, setOptions] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [truncated, setTruncated] = useState(false);
+  // Bug-8453 / R3 finding B-2: row security denied every row, so the empty
+  // member list is a permissions outcome, not an empty dimension.
+  const [rowSecurityDenied, setRowSecurityDenied] = useState(false);
 
   const dt = (dim.data_type ?? "").toUpperCase();
   const isDate =
@@ -125,7 +123,6 @@ function FilterEditor({ modelId, dim, filter, onChange, onClose, onRemove }: Edi
   const shouldFetchValues =
     needsValues(filter.operator) &&
     !["between", "like", "not_like"].includes(filter.operator) &&
-    !N_OPS.includes(filter.operator) &&
     !(SINGLE_VALUE_OPS.includes(filter.operator) && filter.operator !== "eq") &&
     !isDate;
 
@@ -152,6 +149,17 @@ function FilterEditor({ modelId, dim, filter, onChange, onClose, onRemove }: Edi
       })
       .then((r) => {
         if (cancelled) return;
+        // Bug-8453 / R3 finding B-2: a row-security deny-all returns HTTP 200
+        // with zero rows, which rendered as an empty member list -- i.e. "this
+        // dimension has no members" -- when the truth is that the caller may
+        // not see any of them. Report the restriction instead of an empty set.
+        if (rowSecurityDeniedAll(r)) {
+          setRowSecurityDenied(true);
+          setOptions([]);
+          setTruncated(false);
+          return;
+        }
+        setRowSecurityDenied(false);
         const strs = r.rows
           .map((row) => {
             const rec = row as Record<string, unknown>;
@@ -189,7 +197,7 @@ function FilterEditor({ modelId, dim, filter, onChange, onClose, onRemove }: Edi
           ? vals
           : vals.slice(0, 1)
       : [];
-    onChange({ ...filter, operator: op, values: nextValues, value: undefined, n: undefined });
+    onChange({ ...filter, operator: op, values: nextValues, value: undefined });
   }
 
   function setValues(v: string[]) {
@@ -284,7 +292,14 @@ function FilterEditor({ modelId, dim, filter, onChange, onClose, onRemove }: Edi
             <TextField
               {...params}
               label={multi ? t("kpiBusiness.values") : t("kpiBusiness.value")}
-              helperText={truncated ? t("kpiBusiness.first50") : undefined}
+              helperText={
+                rowSecurityDenied
+                  ? t("query.rowSecurityDeniedBody")
+                  : truncated
+                    ? t("kpiBusiness.first50")
+                    : undefined
+              }
+              error={rowSecurityDenied}
               InputProps={{
                 ...params.InputProps,
                 endAdornment: (
@@ -311,22 +326,6 @@ function FilterEditor({ modelId, dim, filter, onChange, onClose, onRemove }: Edi
             onChange={(e) => setValues([e.target.value])}
           />
         )}
-
-      {N_OPS.includes(filter.operator) && (
-        <TextField
-          size="small"
-          type="number"
-          label={t("kpiBusiness.nValue")}
-          value={filter.n ?? ""}
-          onChange={(e) =>
-            onChange({
-              ...filter,
-              n: e.target.value ? Number(e.target.value) : undefined,
-            })
-          }
-          inputProps={{ min: 1 }}
-        />
-      )}
 
       {/* Filter mode toggle */}
       <FormControl size="small">

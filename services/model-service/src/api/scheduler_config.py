@@ -16,13 +16,14 @@ from sqlalchemy import select
 from shared.config.bootstrap import system_snapshot_get
 from shared.config.resolver import get_setting
 from shared.config.settings import get_settings
-from shared.db.models import ModelAISchedulerConfig
+from shared.db.models import LLMProviderConfig, ModelAISchedulerConfig
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import (
     ModelAISchedulerConfigResponse,
     ModelAISchedulerConfigUpdate,
 )
-from src.api._scope import ensure_model_in_project
+from src.api._scope import ensure_model_in_project, ensure_ref_in_project
+from src.api._model_lock import acquire_model_definition_lock
 from src.auth.middleware import CurrentUser, forbid_embed_user, require_tenant_admin
 from src.auth.rbac import require_role
 
@@ -153,6 +154,49 @@ async def upsert_scheduler_config(
 ) -> ModelAISchedulerConfigResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+
+        updates = body.model_dump(exclude_unset=True)
+
+        # Body-supplied foreign keys. ``llm_config_id`` (the aggregate-creator
+        # override) and ``glossary_llm_config_id`` name rows in
+        # ``llm_provider_configs``, which is PROJECT-owned and carries a
+        # Fernet-encrypted provider API key and a base_url. The route proves
+        # the PATH model belongs to the PATH project and then applied the whole
+        # body with a blanket ``setattr`` loop, so nothing proved the submitted
+        # config id belonged to that project: a foreign id bound this model's
+        # AI scheduler to ANOTHER PROJECT'S provider credentials, and every
+        # scheduled aggregate/glossary creation run would then bill and prompt
+        # through them. ``ensure_ref_in_project`` proves project -> config in
+        # one query.
+        #
+        # The guard keys on the field being PRESENT in the payload
+        # (``exclude_unset``), not on it being truthy: an explicit ``null``
+        # means "clear the override, inherit the project default" and stays
+        # legal — the helper returns None for it.
+        #
+        # It runs BEFORE ``acquire_model_definition_lock`` and before the
+        # ``db.add``/``flush`` that materialises a config row for a model that
+        # has never had one, so a request that is about to be refused neither
+        # takes the cross-family model-definition lock (serialising unrelated
+        # writers behind a doomed request) nor inserts a row on its way out.
+        # The optimizer-reload HTTP call already happens after commit, so a
+        # refused request never reaches it.
+        for _fk_field in ("llm_config_id", "glossary_llm_config_id"):
+            if _fk_field in updates:
+                await ensure_ref_in_project(
+                    db,
+                    LLMProviderConfig,
+                    ref_id=updates[_fk_field],
+                    project_id=project_id,
+                    field_name=_fk_field,
+                    noun="an LLM provider config",
+                    error_code="LLM_CONFIG_NOT_IN_PROJECT",
+                )
+
+        # Bug-7982 finding 7 then 3: auth before lock; ModelAISchedulerConfig is
+        # snapshot-owned (truncate-reinserted on revert). The optimizer-reload
+        # HTTP call happens AFTER commit below, so it is never made under the lock.
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         result = await db.execute(
             select(ModelAISchedulerConfig).where(ModelAISchedulerConfig.model_id == model_id)
         )
@@ -161,8 +205,6 @@ async def upsert_scheduler_config(
             config = ModelAISchedulerConfig(model_id=model_id)
             db.add(config)
             await db.flush()
-
-        updates = body.model_dump(exclude_unset=True)
 
         for k, v in updates.items():
             setattr(config, k, v)

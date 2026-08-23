@@ -23,9 +23,10 @@ import { Divider } from "@mui/material";
 import { dataQualityApi, pocketsApi } from "../../api/client";
 import { usePockets } from "../../api/hooks";
 import type { PocketDefinition } from "../../api/types";
-import { canEditModelConfig } from "../../auth/currentUser";
+import { isTenantAdmin } from "../../auth/currentUser";
 import { useBuilderStore } from "../../store/builderStore";
 import { useConfirm } from "../Confirm";
+import { recordDelete } from "../Builder/emitDrawerHistory";
 import { RefreshTriggerButton } from "../Refresh";
 import PocketDrawer from "./PocketDrawer";
 import PocketSuggestionsPanel from "./PocketSuggestionsPanel";
@@ -37,6 +38,26 @@ const STATUS_COLOR: Record<string, "success" | "default" | "error" | "warning" |
   failed: "error",
 };
 
+type TFn = (key: string, params?: Record<string, string>) => string;
+
+function pocketToCreatePayload(pocket: PocketDefinition): Record<string, unknown> {
+  const refreshPolicy = pocket.refresh_policy === "event"
+    ? "event"
+    : pocket.refresh_policy === "manual"
+      ? "manual"
+      : "schedule";
+  return {
+    target_id: pocket.target_id,
+    defining_sql: pocket.defining_sql,
+    refresh_policy: refreshPolicy,
+    refresh_cron: pocket.refresh_policy_row?.cron_expression ?? pocket.refresh_cron,
+    refresh_policy_enabled: pocket.refresh_policy_row?.is_enabled ?? false,
+    incremental_column: pocket.incremental_column,
+    incremental_lookback_hours: pocket.incremental_lookback_hours,
+    ttl_days: pocket.ttl_days,
+  };
+}
+
 export default function PocketTablesPanel() {
   const { projectId, modelId } = useParams<{ projectId: string; modelId: string }>();
   const qc = useQueryClient();
@@ -45,7 +66,15 @@ export default function PocketTablesPanel() {
 
   const pockets = usePockets(projectId!, modelId!);
   const storeReadOnly = useBuilderStore((s) => s.readOnly);
-  const canManagePockets = canEditModelConfig() && !storeReadOnly;
+  const canManagePockets = !storeReadOnly;  // Bug-8784: backend caller_can_author is authoritative
+  // Bug-6999: create/edit are require_role("modeler") on the backend, but
+  // DELETE pocket is require_role("admin") (api/pockets.py). Gating delete with
+  // canManagePockets let a modeller click a Delete that always 403s, and the
+  // failure was swallowed. Gate delete separately with isTenantAdmin() — the
+  // same mapping api/connections.py admin routes use in explorerPrivileges.ts.
+  const canDeletePockets = isTenantAdmin() && !storeReadOnly;
+  // Bug-6999: a delete failure must surface, not vanish silently.
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const { data: pocketViolations = {} } = useQuery<Record<string, number>>({
     queryKey: ["pocket-violations", projectId, modelId],
@@ -75,11 +104,22 @@ export default function PocketTablesPanel() {
   );
 
   const deletePocket = useMutation({
-    mutationFn: (pocketId: string) => pocketsApi.delete(projectId!, modelId!, pocketId),
-    onSuccess: () => {
+    mutationFn: ({ pocketId }: { pocketId: string; prior: Record<string, unknown> }) =>
+      pocketsApi.delete(projectId!, modelId!, pocketId),
+    onSuccess: (_deleted, variables) => {
+      // Bug-9395/F-026-10: deleting a pocket records its create payload so
+      // Builder undo can restore the definition through the normal API.
+      recordDelete("pocket", variables.pocketId, variables.prior);
+      setDeleteError(null);
       qc.invalidateQueries({ queryKey: ["pockets", projectId, modelId] });
       qc.invalidateQueries({ queryKey: ["metrics", projectId, modelId] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(
+        t("pocketTables.deleteFailed", {
+          error: extractPocketError(e) || t("errors.requestFailed"),
+        }),
+      ),
   });
 
   function openCreate() {
@@ -115,7 +155,7 @@ export default function PocketTablesPanel() {
       ),
       confirmLabel: t("pocketTables.deleteConfirm"),
     });
-    if (ok) deletePocket.mutate(pocket.id);
+    if (ok) deletePocket.mutate({ pocketId: pocket.id, prior: pocketToCreatePayload(pocket) });
   }
 
   return (
@@ -166,7 +206,7 @@ export default function PocketTablesPanel() {
           {metrics.top_skip_reason
             ? " " +
               t("pocketTables.zeroMatchSkipReason", {
-                reason: metrics.top_skip_reason,
+                reason: pocketSkipReasonLabel(t, metrics.top_skip_reason),
                 count: String(metrics.top_skip_count ?? 0),
               })
             : ""}
@@ -175,6 +215,11 @@ export default function PocketTablesPanel() {
       {!canManagePockets && (
         <Alert severity="warning" sx={{ mb: 1 }}>
           {t("pocketTables.readOnlyAlert")}
+        </Alert>
+      )}
+      {deleteError && (
+        <Alert severity="error" sx={{ mb: 1 }} onClose={() => setDeleteError(null)}>
+          {deleteError}
         </Alert>
       )}
 
@@ -197,7 +242,7 @@ export default function PocketTablesPanel() {
                   </Box>
 
                   <Chip
-                    label={pocket.status}
+                    label={pocketStatusLabel(t, pocket.status)}
                     size="small"
                     color={STATUS_COLOR[pocket.status] ?? "default"}
                   />
@@ -242,19 +287,21 @@ export default function PocketTablesPanel() {
                     size="small"
                     variant="text"
                   />
-                  <Button
-                    size="small"
-                    startIcon={<DeleteIcon />}
-                    onClick={() => void handleDelete(pocket)}
-                    disabled={!canManagePockets || deletePocket.isPending}
-                  >
-                    {t("common.delete")}
-                  </Button>
+                  {canDeletePockets && (
+                    <Button
+                      size="small"
+                      startIcon={<DeleteIcon />}
+                      onClick={() => void handleDelete(pocket)}
+                      disabled={deletePocket.isPending}
+                    >
+                      {t("common.delete")}
+                    </Button>
+                  )}
                 </Box>
 
                 {pocket.failure_reason && (
                   <Typography variant="caption" color="error" display="block" mt={0.5}>
-                    {pocket.failure_reason}
+                    {formatPocketFailureReason(t, pocket.failure_reason)}
                   </Typography>
                 )}
 
@@ -263,8 +310,8 @@ export default function PocketTablesPanel() {
                     {pocket.predicates.map((p) => {
                       const val = (p.value_json as { value?: unknown })?.value;
                       const label = Array.isArray(val)
-                        ? `${p.column_name} ${p.operator} [${val.join(", ")}]`
-                        : `${p.column_name} ${p.operator} ${val === null || val === undefined ? t("common.nullValue") : String(val)}`;
+                        ? `${p.column_name} ${pocketOperatorLabel(t, p.operator)} [${val.join(", ")}]`
+                        : `${p.column_name} ${pocketOperatorLabel(t, p.operator)} ${val === null || val === undefined ? t("common.nullValue") : String(val)}`;
                       return <Chip key={p.id} size="small" variant="outlined" label={label} />;
                     })}
                   </Box>
@@ -324,4 +371,57 @@ function fmtMs(ms: number): string {
   if (ms >= 60_000) return `${(ms / 60_000).toFixed(1)} min`;
   if (ms >= 1000) return `${(ms / 1000).toFixed(1)} s`;
   return `${ms} ms`;
+}
+
+function pocketStatusLabel(t: TFn, status: string): string {
+  const key = `pocketTables.status.${status}`;
+  const translated = t(key);
+  return translated === key ? humanizeToken(status) : translated;
+}
+
+function pocketOperatorLabel(t: TFn, operator: string): string {
+  const key = `pocketTables.operator.${operator}`;
+  const translated = t(key);
+  return translated === key ? humanizeToken(operator) : translated;
+}
+
+function pocketSkipReasonLabel(t: TFn, reason: string): string {
+  const key = `pocketTables.skipReason.${reason}`;
+  const translated = t(key);
+  return translated === key ? humanizeToken(reason) : translated;
+}
+
+function formatPocketFailureReason(t: TFn, reason: string): string {
+  return reason
+    .split(";")
+    .map((part) => {
+      const trimmed = part.trim();
+      const code = trimmed.match(/^([A-Z_]+):?/)?.[1];
+      if (!code) return trimmed;
+      const key = `pocketTables.violation.${code}`;
+      const translated = t(key);
+      return translated === key ? trimmed : trimmed.replace(code, translated);
+    })
+    .join("; ");
+}
+
+function humanizeToken(token: string): string {
+  return token
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^\w/, (c) => c.toUpperCase());
+}
+
+// Bug-6999: pull the backend detail (403 permission, 409 dependency, etc.) so
+// the delete failure is shown to the user instead of vanishing.
+function extractPocketError(e: unknown): string {
+  const err = e as {
+    response?: { data?: { detail?: string | { message?: string } } };
+    message?: string;
+  };
+  const detail = err?.response?.data?.detail;
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object" && detail.message) return detail.message;
+  return err?.message ?? "";
 }

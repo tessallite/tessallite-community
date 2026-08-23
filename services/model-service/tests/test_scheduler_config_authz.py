@@ -84,7 +84,13 @@ async def test_tenant_admin_admitted():
 
 @pytest.mark.asyncio
 async def test_system_admin_admitted():
-    resp = await _put(_user("system_admin"))
+    # Canonical human system admin requires tenant_id="__system__" after the
+    # session-revocation middleware hardening (Bug-7322).
+    sa = CurrentUser(
+        user_id="admin@tessallite.local", tenant_id="__system__",
+        email="admin@tessallite.local", role="system_admin",
+    )
+    resp = await _put(sa)
     assert resp.status_code != 403
 
 

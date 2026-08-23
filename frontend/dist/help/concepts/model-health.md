@@ -2,7 +2,7 @@
 title: "Model Health"
 audience: modeller
 area: concepts
-updated: 2026-04-17
+updated: 2026-08-02
 ---
 
 ![Model Builder — Health tab.](../assets/screencaps/model-health-tab.png)
@@ -37,7 +37,7 @@ An issue in the Health tab means something in the model configuration is inconsi
 
 **Severity: Error**
 
-A column referenced in a join definition no longer exists in the source schema. This happens when the source data warehouse has been modified since the model was last synced.
+A column referenced in a join definition no longer exists in the source schema. This happens when the source has been modified since the model was last synced.
 
 To resolve: open the join in the Model Builder Drawer, update the left or right column to a column that currently exists in the source, and save. If the join is no longer valid, remove it entirely. Then run a schema sync to confirm the model is consistent with the current source.
 
@@ -53,7 +53,10 @@ To resolve: open the measure definition in the Drawer and either select a numeri
 
 **Severity: Error**
 
-The model contains no table designated as `fact`. Every model requires exactly one fact table. Without it, the Scheduler has no anchor point and cannot generate aggregate build SQL.
+The model has multiple tables but none is designated as `fact`. A
+single-table model is implicitly fact; only a multi-table model needs an
+explicit fact anchor before deploy. Without that anchor, the Scheduler cannot
+generate governed aggregate build SQL.
 
 To resolve: open the table in the Canvas, select it, and use the Drawer to change its type to `fact`. If the model has multiple candidates, designate the primary transaction table and reclassify the others.
 
@@ -66,6 +69,12 @@ A source table's schema has changed since the model was last synced. Tessallite 
 To resolve: open the Model Builder and run a schema sync from the table's context menu. After syncing, review dimensions and joins that reference the changed table — any that reference a removed column will appear as additional errors.
 
 Running a schema sync only refreshes the available column list. You must manually update any dimension, measure, or join definitions that reference columns that no longer exist.
+
+### What Re-check covers
+
+**Re-check model** reruns structural validation and combines it with unresolved hierarchy issues, failed pockets, and unacknowledged schema-drift events already recorded by the Scheduler. The panel displays these recorded-signal counts and the latest recorded drift time.
+
+Re-check does not connect to the live source. A source change that occurred after the latest scheduled drift scan will not appear until that scan runs; the result explicitly says that live source introspection was not performed.
 
 ### Aggregate refresh overdue
 
@@ -80,6 +89,31 @@ To resolve: open the Scheduler job log for the model and look for the failed or 
 **Severity: Info**
 
 A dimension exists in the model but has not appeared in any query within the usage window. The dimension is valid but may be unused. Consider whether it is needed, or whether users are accessing the data through a different name.
+
+### Join population health
+
+The **Join population health** section shows the deploy-time evidence for each
+declared join and the model rollup: **OK**, **WARNING**, or **BLOCKED**. A
+warning means a join can filter or multiply rows and needs modeller attention;
+blocked means the measured effect is above the configured system threshold or
+the join is not declared safely. A measured policy blocker prevents deployment
+until the modeller declares the population role accurately or fixes the
+join/source data. `preserve_base_rows` remains warning-only; unavailable,
+failed, timed-out, budget-exhausted, and validation-off checks never block.
+The per-model rollup may be unevaluated while a measured blocker still blocks,
+because enforcement is per join rather than hidden by another unmeasured row.
+
+The table uses translated join type and participation labels, shows the
+measured classification (**Filtering**, **Multiplying**, or **Neutral**), and
+shows **Unavailable** when no classification was recorded. A row marked
+**Stale — redeploy to recheck** has no current deploy evidence; an error or
+empty state tells you whether the health request failed or no joins have been
+measured yet. The check is not guessed from a column name and it is not run for
+every query. It uses the last deploy's source measurement and key metadata. If
+a join's type, columns, or population participation changes, the row is marked
+stale; deploy the model again to refresh the evidence. Change the declaration in
+the Joins panel only after confirming whether the join is population-defining,
+preserves base rows, or is enrichment-only.
 
 ---
 

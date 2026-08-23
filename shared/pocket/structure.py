@@ -100,8 +100,9 @@ def collect_pocket_structure_violations(
             ),
             suggestion=(
                 "Rewrite the WHERE clause using simple column comparisons "
-                "(=, IN, <, >, BETWEEN) on model columns; remove expressions, "
-                "functions, or quoting the engine cannot resolve."
+                "(=, IN, NOT IN, <, >, BETWEEN) on model columns; remove "
+                "expressions, functions, or subquery IN lists the engine "
+                "cannot resolve."
             ),
         ))
 

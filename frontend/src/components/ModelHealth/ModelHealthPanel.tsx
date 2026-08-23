@@ -1,6 +1,6 @@
 /**
  * Model Health — the dashboard that replaces the disabled "Matrix"
- * tab in the Model Builder. Five read-only sections:
+ * tab in the Model Builder. It contains read-only health sections:
  *
  *   A. Exposed model info (business + technical facts)
  *   B. Alerts stream (dedup-aware, paginated, dismissable)
@@ -55,9 +55,19 @@ import {
   dimensionsApi,
   measuresApi,
   schemaDriftApi,
+  relationshipHealthApi,
+  joinPopulationHealthApi,
   dataQualityApi,
+  optimizerApiClient,
 } from "../../api/client";
-import type { DataQualityRule, MeasureWarning, ModelAlert, SchemaChangeEvent } from "../../api/types";
+import type {
+  DataQualityRule,
+  MeasureWarning,
+  ModelAlert,
+  RelationshipHealthItem,
+  JoinPopulationHealthItem,
+  SchemaChangeEvent,
+} from "../../api/types";
 import {
   useMetrics,
   useModelRefreshRuns,
@@ -67,6 +77,7 @@ import {
 } from "../../api/hooks";
 import HelpIconButton from "../HelpIconButton";
 import ColdStartLatencySection from "./ColdStartLatencySection";
+import { runStatusLabel } from "../../utils/runStatus";
 
 interface Props {
   projectId: string;
@@ -117,6 +128,9 @@ export default function ModelHealthPanel({ projectId, modelId }: Props) {
       qc.invalidateQueries({ queryKey: ["dimensions", projectId, modelId] });
       qc.invalidateQueries({ queryKey: ["measures", projectId, modelId] });
       qc.invalidateQueries({ queryKey: ["aggregates", projectId, modelId] });
+      qc.invalidateQueries({ queryKey: ["hierarchies", projectId, modelId] });
+      qc.invalidateQueries({ queryKey: ["pockets", projectId, modelId] });
+      qc.invalidateQueries({ queryKey: ["schema-drift", modelId, "all"] });
     },
   });
 
@@ -205,6 +219,23 @@ export default function ModelHealthPanel({ projectId, modelId }: Props) {
               {t("modelHealth.newlyValid")} {revalidateResult.newly_valid_dimension_count} {t("modelHealth.dim")} /{" "}
               {revalidateResult.newly_valid_measure_count} {t("modelHealth.measure")} /{" "}
               {revalidateResult.newly_valid_aggregate_count} {t("modelHealth.aggregate")}.
+              <Typography variant="body2" component="div" sx={{ mt: 0.75 }}>
+                {t("modelHealth.recordedSignals", {
+                  hierarchies: String(revalidateResult.unresolved_hierarchy_issue_count),
+                  pockets: String(revalidateResult.failed_pocket_count),
+                  drift: String(revalidateResult.unacknowledged_schema_drift_count),
+                })}
+                {revalidateResult.latest_recorded_schema_drift_at
+                  ? ` ${t("modelHealth.latestRecordedDrift", {
+                      time: new Date(revalidateResult.latest_recorded_schema_drift_at).toLocaleString(),
+                    })}`
+                  : ""}
+              </Typography>
+              {!revalidateResult.live_source_checked && (
+                <Typography variant="caption" component="div" color="text.secondary">
+                  {t("modelHealth.liveSourceNotChecked")}
+                </Typography>
+              )}
             </Alert>
             {(revalidateResult.measure_warnings?.length ?? 0) > 0 && (
               <Alert severity="warning" sx={{ mt: 1 }}>
@@ -247,7 +278,9 @@ export default function ModelHealthPanel({ projectId, modelId }: Props) {
         personaFilter={personaFilter}
         personaNameById={personaNameById}
       />
-      <SchemaDriftSection modelId={modelId} />
+      <SchemaDriftSection projectId={projectId} modelId={modelId} />
+      <RelationshipHealthSection projectId={projectId} modelId={modelId} />
+      <JoinPopulationHealthSection projectId={projectId} modelId={modelId} />
       <DataQualitySection projectId={projectId} modelId={modelId} />
     </Box>
   );
@@ -380,6 +413,26 @@ export function QueryRoutingMetricsSection({
                   {(data.hit_rate * 100).toFixed(1)}%
                 </Typography>
               </Box>
+              {/* Bug-8180: hit_rate above counts every non-cache query,
+                  including route_type="raw" ungrouped flat-row detail pulls
+                  that no aggregate/pocket can ever serve — so it understates
+                  coverage on models with detail-query traffic. eligible_hit_rate
+                  excludes those from the denominator; this is the figure an
+                  operator should read for "are my acceleratable queries being
+                  accelerated", so it must be visible next to (not instead of)
+                  the raw rate. */}
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">
+                  {t("modelHealth.metricsEligibleHitRate")}
+                </Typography>
+                <Typography
+                  variant="h6"
+                  sx={{ fontWeight: 600, lineHeight: 1, color: "success.main" }}
+                  data-testid="metrics-eligible-hit-rate"
+                >
+                  {((data.eligible_hit_rate ?? 0) * 100).toFixed(1)}%
+                </Typography>
+              </Box>
               <SummaryChip
                 label={t("modelHealth.metricsTotalQueries")}
                 value={data.total_queries}
@@ -400,6 +453,26 @@ export function QueryRoutingMetricsSection({
                 value={data.source_hits}
                 tone="default"
               />
+              {/* Bug-6426: result-cache re-serves are a distinct category (not
+                  real acceleration). Showing them makes the chips sum to total
+                  instead of leaving an unexplained gap when cache traffic
+                  exists. Hidden when zero to avoid clutter. */}
+              {(data.cache_hits ?? 0) > 0 && (
+                <SummaryChip
+                  label={t("modelHealth.metricsCacheHits")}
+                  value={data.cache_hits ?? 0}
+                  tone="default"
+                />
+              )}
+              {/* Bug-8180: surfaced unconditionally (not gated on > 0 like
+                  cache_hits) — a modeler needs to see zero just as much as a
+                  nonzero count, because "why is eligible_hit_rate different
+                  from hit_rate" is only answerable if this chip is present. */}
+              <SummaryChip
+                label={t("modelHealth.metricsUnacceleratableQueries")}
+                value={data.unacceleratable_queries ?? 0}
+                tone="default"
+              />
               <Box>
                 <Typography variant="caption" color="text.secondary" display="block">
                   {t("modelHealth.metricsBytesAvoided")}
@@ -411,6 +484,9 @@ export function QueryRoutingMetricsSection({
             </Stack>
             <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
               {t("modelHealth.metricsAccelerationHint")}
+            </Typography>
+            <Typography variant="caption" color="text.secondary" display="block">
+              {t("modelHealth.metricsEligibleHitRateHint")}
             </Typography>
           </Paper>
 
@@ -510,7 +586,9 @@ function ModelInfoSection({ model }: { model: any }) {
     [t("modelHealth.description"), model.description],
     [t("modelHealth.status"), model.status],
     [t("modelHealth.aggregationsEnabled"), model.aggregations_enabled ? t("modelHealth.yes") : t("modelHealth.no")],
-    [t("modelHealth.includeAllMeasures"), (model.include_all_measures ?? true) ? t("modelHealth.yes") : t("modelHealth.no")],
+    // Bug-9409: all-measure aggregates are opt-in; an un-loaded value reads as
+    // OFF, matching the backend default in shared/model_defaults.py.
+    [t("modelHealth.includeAllMeasures"), (model.include_all_measures ?? false) ? t("modelHealth.yes") : t("modelHealth.no")],
   ];
   const technical: [string, string | null | undefined][] = [
     [t("modelHealth.modelId"), model.id],
@@ -768,14 +846,27 @@ export function AggregateHealthSection({
     };
   }, [aggs.data]);
 
+  // Bug-9408 / F-102-12: empty aggregate list is ambiguous — distinguish
+  // "waiting for source statistics" (had_stats=false) from a genuine empty set.
+  const predictivePreview = useQuery({
+    queryKey: ["predictive-preview", modelId, "model-health"],
+    queryFn: () => optimizerApiClient.getPredictivePreview(modelId),
+    enabled: Boolean(modelId) && !aggs.isLoading && counts.total === 0,
+  });
+
+  const emptyMessage =
+    predictivePreview.data?.had_stats === false
+      ? t("modelHealth.aggHealthWaitingForStats")
+      : t("modelHealth.aggHealthNone");
+
   return (
     <>
       <SectionHeader title={t("modelHealth.sectionAggHealth")} />
-      {aggs.isLoading ? (
+      {aggs.isLoading || (counts.total === 0 && predictivePreview.isLoading) ? (
         <CircularProgress size={20} />
       ) : counts.total === 0 ? (
         <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-          {t("modelHealth.aggHealthNone")}
+          {emptyMessage}
         </Typography>
       ) : (
         <Paper variant="outlined" sx={{ p: 1.5, mb: 2 }}>
@@ -896,7 +987,7 @@ function AggregateRefreshSummarySection({
                   </TableCell>
                   <TableCell>
                     <Chip
-                      label={r.status}
+                      label={runStatusLabel(r.status, t)}
                       size="small"
                       color={
                         r.status === "completed"
@@ -945,23 +1036,52 @@ function OptimiserRunsSection({
   const t = useT();
   const aiRuns = useAIOptimizerRuns("", modelId);
   const ruleRuns = useOptimizerRuns();
+  // Bug-6428: AI runs (AIOptimizerRun) and rule-based sweep runs
+  // (OptimizerRunEntry) have different shapes. Normalise both into one row
+  // model so we never read AI-only fields (started_at/status/id/
+  // aggregates_skipped) off a rule entry — the old code did, producing
+  // "Invalid Date" cells, blank status chips and duplicate React keys.
   const merged = useMemo(() => {
-    const a = (aiRuns.data ?? []).map((r: any) => ({
-      ...r,
+    type MergedRun = {
+      key: string;
+      kind: "ai" | "rule";
+      timestamp: string | null;
+      status: string;
+      created: number;
+      // null renders as an em dash: rule sweeps do not track "skipped".
+      skipped: number | null;
+    };
+    const ai: MergedRun[] = (aiRuns.data ?? []).map((r) => ({
+      key: `ai-${r.id}`,
       kind: "ai",
+      timestamp: r.started_at ?? null,
+      status: r.status ?? "",
+      created: r.aggregates_created ?? 0,
+      skipped: r.aggregates_skipped ?? 0,
     }));
-    const b = (ruleRuns.data ?? []).map((r: any) => ({
-      ...r,
-      kind: "rule",
-    }));
-    const all = [...a, ...b];
-    all.sort(
-      (x, y) =>
-        new Date(y.started_at ?? y.created_at).getTime() -
-        new Date(x.started_at ?? x.created_at).getTime(),
-    );
+    // Rule-run entries are tenant-wide (all-model and scheduled sweeps share
+    // one process-local log with no model_id). Only a per-model manual sweep
+    // is attributable to this model via its triggered_by tag, so scope the
+    // rule rows to this model instead of listing every tenant sweep.
+    const modelTag = `manual_model:${modelId}`;
+    const rule: MergedRun[] = (ruleRuns.data ?? [])
+      .filter((r) => r.triggered_by === modelTag)
+      .map((r, i) => ({
+        key: `rule-${r.ran_at}-${i}`,
+        kind: "rule",
+        timestamp: r.ran_at ?? null,
+        status: r.errors && r.errors.length > 0 ? "failed" : "completed",
+        created: r.aggregates_created ?? 0,
+        skipped: null,
+      }));
+    const all = [...ai, ...rule];
+    all.sort((x, y) => {
+      const tx = x.timestamp ? new Date(x.timestamp).getTime() : 0;
+      const ty = y.timestamp ? new Date(y.timestamp).getTime() : 0;
+      return ty - tx;
+    });
     return all.slice(0, 10);
-  }, [aiRuns.data, ruleRuns.data]);
+  }, [aiRuns.data, ruleRuns.data, modelId]);
 
   return (
     <>
@@ -987,11 +1107,13 @@ function OptimiserRunsSection({
                 </TableCell>
               </TableRow>
             ) : (
-              merged.map((r: any) => (
-                <TableRow key={`${r.kind}-${r.id}`}>
+              merged.map((r) => (
+                <TableRow key={r.key}>
                   <TableCell sx={{ whiteSpace: "nowrap" }}>
                     <Typography variant="caption">
-                      {new Date(r.started_at ?? r.created_at).toLocaleString()}
+                      {r.timestamp && !Number.isNaN(new Date(r.timestamp).getTime())
+                        ? new Date(r.timestamp).toLocaleString()
+                        : "—"}
                     </Typography>
                   </TableCell>
                   <TableCell>
@@ -1003,7 +1125,7 @@ function OptimiserRunsSection({
                   </TableCell>
                   <TableCell>
                     <Chip
-                      label={r.status ?? "—"}
+                      label={r.status ? runStatusLabel(r.status, t) : "—"}
                       size="small"
                       color={
                         r.status === "completed"
@@ -1014,10 +1136,10 @@ function OptimiserRunsSection({
                       }
                     />
                   </TableCell>
+                  <TableCell align="right">{r.created}</TableCell>
                   <TableCell align="right">
-                    {r.aggregates_created ?? r.recommendations_count ?? 0}
+                    {r.skipped === null ? "—" : r.skipped}
                   </TableCell>
-                  <TableCell align="right">{r.aggregates_skipped ?? 0}</TableCell>
                 </TableRow>
               ))
             )}
@@ -1177,28 +1299,83 @@ function InvalidObjectsSection({
   );
 }
 
-function SchemaDriftSection({ modelId }: { modelId: string }) {
+// Change-type i18n key map — friendly, translated labels instead of a raw
+// underscore-split of the enum value.
+const SCHEMA_DRIFT_CHANGE_KEYS: Record<string, string> = {
+  column_added: "modelHealth.driftChangeAdded",
+  column_removed: "modelHealth.driftChangeRemoved",
+  type_changed: "modelHealth.driftChangeTypeChanged",
+};
+
+export function SchemaDriftSection({
+  projectId,
+  modelId,
+}: {
+  projectId: string;
+  modelId: string;
+}) {
   const t = useT();
   const qc = useQueryClient();
 
+  // Include acknowledged events so the section shows drift history with a
+  // clear status, not only the unresolved backlog.
   const events = useQuery({
-    queryKey: ["schema-drift", modelId],
-    queryFn: () => schemaDriftApi.list(modelId, false),
+    queryKey: ["schema-drift", modelId, "all"],
+    queryFn: () => schemaDriftApi.list(modelId, true),
+    refetchInterval: 60000,
+  });
+
+  // Impacted-object surface (Bug-7788): the schema-drift event response does
+  // NOT carry the invalidated dimensions/measures per event. The remediation
+  // pass records the impact as a ModelAlert with
+  // related_object_type="schema_change_event" / related_object_id=event.id.
+  // Join those alerts here to show what each change affected. A structured
+  // per-event impacted-object list remains a backend gap (scope request).
+  const impactAlerts = useQuery({
+    queryKey: ["schema-drift-impact", projectId, modelId],
+    queryFn: () =>
+      alertsApi.list(projectId, modelId, {
+        category: "schema_drift",
+        include_resolved: true,
+        include_dismissed: true,
+        limit: 200,
+      }),
     refetchInterval: 60000,
   });
 
   const acknowledge = useMutation({
     mutationFn: (eventId: string) => schemaDriftApi.acknowledge(eventId),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["schema-drift", modelId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["schema-drift", modelId, "all"] });
+      qc.invalidateQueries({ queryKey: ["schema-drift-impact", projectId, modelId] });
+    },
   });
 
   const rows = events.data?.items ?? [];
+
+  // Map event id -> its impact alert (title/detail describe the affected object).
+  const impactByEvent = useMemo(() => {
+    const m = new Map<string, ModelAlert>();
+    for (const a of impactAlerts.data ?? []) {
+      if (
+        a.related_object_type === "schema_change_event" &&
+        a.related_object_id
+      ) {
+        m.set(a.related_object_id, a);
+      }
+    }
+    return m;
+  }, [impactAlerts.data]);
 
   return (
     <>
       <SectionHeader title={t("modelHealth.schemaDrift")} />
       {events.isLoading ? (
         <CircularProgress size={18} />
+      ) : events.isError ? (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {t("modelHealth.schemaDriftLoadError")}
+        </Alert>
       ) : rows.length === 0 ? (
         <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
           <Stack direction="row" alignItems="center" spacing={1}>
@@ -1218,56 +1395,346 @@ function SchemaDriftSection({ modelId }: { modelId: string }) {
                 <TableCell>{t("modelHealth.colColumn")}</TableCell>
                 <TableCell>{t("modelHealth.colChange")}</TableCell>
                 <TableCell>{t("modelHealth.colBreaking")}</TableCell>
+                <TableCell>{t("modelHealth.colImpact")}</TableCell>
+                <TableCell>{t("modelHealth.colStatus")}</TableCell>
                 <TableCell align="center">{t("modelHealth.colAcknowledge")}</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
-              {rows.map((e: SchemaChangeEvent) => (
-                <TableRow key={e.id}>
-                  <TableCell sx={{ whiteSpace: "nowrap" }}>
-                    <Typography variant="caption">
-                      {new Date(e.detected_at).toLocaleString()}
+              {rows.map((e: SchemaChangeEvent) => {
+                const impact = impactByEvent.get(e.id);
+                const acknowledged = !!e.acknowledged_at;
+                return (
+                  <TableRow key={e.id}>
+                    <TableCell sx={{ whiteSpace: "nowrap" }}>
+                      <Typography variant="caption">
+                        {new Date(e.detected_at).toLocaleString()}
+                      </Typography>
+                    </TableCell>
+                    <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>
+                      {e.table_name ?? "—"}
+                    </TableCell>
+                    <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>
+                      {(e.detail.column_name as string) ?? "—"}
+                    </TableCell>
+                    <TableCell>
+                      <Chip
+                        label={
+                          SCHEMA_DRIFT_CHANGE_KEYS[e.change_type]
+                            ? t(SCHEMA_DRIFT_CHANGE_KEYS[e.change_type])
+                            : e.change_type.replace(/_/g, " ")
+                        }
+                        size="small"
+                        color={
+                          e.change_type === "column_removed"
+                            ? "error"
+                            : e.change_type === "type_changed"
+                            ? "warning"
+                            : "default"
+                        }
+                      />
+                    </TableCell>
+                    <TableCell>
+                      {e.is_breaking ? (
+                        <Chip label={t("modelHealth.breakingChip")} size="small" color="error" variant="outlined" />
+                      ) : (
+                        <Typography variant="caption" color="text.secondary">—</Typography>
+                      )}
+                    </TableCell>
+                    <TableCell sx={{ maxWidth: 280 }}>
+                      {impact ? (
+                        <Tooltip title={impact.detail ?? impact.title}>
+                          <Typography
+                            variant="caption"
+                            sx={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                          >
+                            {impact.title}
+                          </Typography>
+                        </Tooltip>
+                      ) : (
+                        <Typography variant="caption" color="text.secondary">
+                          {t("modelHealth.driftNoImpact")}
+                        </Typography>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {acknowledged ? (
+                        <Chip
+                          label={t("modelHealth.driftStatusAcknowledged")}
+                          size="small"
+                          color="success"
+                          variant="outlined"
+                        />
+                      ) : (
+                        <Chip
+                          label={t("modelHealth.driftStatusNew")}
+                          size="small"
+                          color="warning"
+                        />
+                      )}
+                    </TableCell>
+                    <TableCell align="center">
+                      {acknowledged ? (
+                        <Typography variant="caption" color="text.secondary">—</Typography>
+                      ) : (
+                        <Tooltip title={t("modelHealth.acknowledgeTooltip")}>
+                          <IconButton
+                            size="small"
+                            onClick={() => acknowledge.mutate(e.id)}
+                            disabled={acknowledge.isPending}
+                          >
+                            <CheckCircleIcon fontSize="small" />
+                          </IconButton>
+                        </Tooltip>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
+    </>
+  );
+}
+
+
+// Derived-grain relationship health — one row per declared attribute
+// relationship, showing whether the fast relabel is currently servable (state),
+// when it was last re-checked by the health sweep, and the detail column it
+// accelerates. Health is data-driven: the periodic sweep re-proves the 1:1
+// mapping over the served data; broken/stale means the relabel falls back to
+// ordinary routing until it is healthy again.
+const RELATIONSHIP_STATE_COLOR: Record<
+  string,
+  "default" | "success" | "warning" | "error"
+> = {
+  healthy: "success",
+  broken: "error",
+  error: "error",
+  stale: "warning",
+  pending: "default",
+};
+
+export function RelationshipHealthSection({
+  projectId,
+  modelId,
+}: {
+  projectId: string;
+  modelId: string;
+}) {
+  const t = useT();
+  const health = useQuery({
+    queryKey: ["relationship-health", projectId, modelId],
+    queryFn: () => relationshipHealthApi.list(projectId, modelId),
+    refetchInterval: 60000,
+  });
+  const rows = health.data?.items ?? [];
+
+  return (
+    <>
+      <SectionHeader title={t("modelHealth.relationshipHealth")} />
+      {health.isLoading ? (
+        <CircularProgress size={18} />
+      ) : health.isError ? (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {t("modelHealth.relationshipHealthLoadError")}
+        </Alert>
+      ) : rows.length === 0 ? (
+        <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+          <Typography variant="body2" color="text.secondary">
+            {t("modelHealth.noRelationships")}
+          </Typography>
+        </Paper>
+      ) : (
+        <TableContainer component={Paper} variant="outlined" sx={{ mb: 2 }}>
+          <Table size="small">
+            <TableHead>
+              <TableRow sx={{ bgcolor: "grey.50" }}>
+                <TableCell>{t("modelHealth.colDimension")}</TableCell>
+                <TableCell>{t("modelHealth.colAccelerates")}</TableCell>
+                <TableCell>{t("modelHealth.colCardinality")}</TableCell>
+                <TableCell>{t("modelHealth.colState")}</TableCell>
+                <TableCell>{t("modelHealth.colLastChecked")}</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {rows.map((r: RelationshipHealthItem) => (
+                <TableRow key={r.relationship_id}>
+                  <TableCell>
+                    <Typography variant="body2">
+                      {r.dimension_name ?? r.dimension_id.slice(0, 8)}
                     </Typography>
                   </TableCell>
                   <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>
-                    {e.table_name ?? "—"}
-                  </TableCell>
-                  <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>
-                    {(e.detail.column_name as string) ?? "—"}
+                    {r.detail_column_name ?? "—"}
                   </TableCell>
                   <TableCell>
-                    <Chip
-                      label={e.change_type.replace(/_/g, " ")}
-                      size="small"
-                      color={
-                        e.change_type === "column_removed"
-                          ? "error"
-                          : e.change_type === "type_changed"
-                          ? "warning"
-                          : "default"
-                      }
-                    />
+                    <Typography variant="caption" sx={{ fontFamily: "monospace" }}>
+                      {r.cardinality}
+                    </Typography>
                   </TableCell>
                   <TableCell>
-                    {e.is_breaking ? (
-                      <Chip label={t("modelHealth.breakingChip")} size="small" color="error" variant="outlined" />
-                    ) : (
-                      <Typography variant="caption" color="text.secondary">—</Typography>
-                    )}
-                  </TableCell>
-                  <TableCell align="center">
-                    <Tooltip title={t("modelHealth.acknowledgeTooltip")}>
-                      <IconButton
+                    <Tooltip title={r.error_code ?? ""}>
+                      <Chip
+                        label={t(`modelHealth.relState.${r.state}`)}
                         size="small"
-                        onClick={() => acknowledge.mutate(e.id)}
-                        disabled={acknowledge.isPending}
-                      >
-                        <CheckCircleIcon fontSize="small" />
-                      </IconButton>
+                        color={RELATIONSHIP_STATE_COLOR[r.state] ?? "default"}
+                        variant={r.state === "pending" ? "outlined" : "filled"}
+                      />
                     </Tooltip>
+                  </TableCell>
+                  <TableCell sx={{ whiteSpace: "nowrap" }}>
+                    <Typography variant="caption">
+                      {r.last_checked_at
+                        ? new Date(r.last_checked_at).toLocaleString()
+                        : "—"}
+                    </Typography>
                   </TableCell>
                 </TableRow>
               ))}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
+    </>
+  );
+}
+
+const JOIN_POPULATION_STATUS_COLOR: Record<
+  string,
+  "default" | "success" | "warning" | "error"
+> = {
+  OK: "success",
+  WARNING: "warning",
+  BLOCKED: "error",
+};
+
+/**
+ * Deploy-time join-population evidence. This is deliberately read-only: the
+ * join declaration remains editable in Joins, while this section explains the
+ * last measured status and whether it is stale after a declaration change.
+ */
+export function JoinPopulationHealthSection({
+  projectId,
+  modelId,
+}: {
+  projectId: string;
+  modelId: string;
+}) {
+  const t = useT();
+  const health = useQuery({
+    queryKey: ["join-population-health", projectId, modelId],
+    queryFn: () => joinPopulationHealthApi.get(projectId, modelId),
+    refetchInterval: 60000,
+  });
+  const rows = health.data?.items ?? [];
+
+  return (
+    <>
+      <SectionHeader title={t("modelHealth.joinPopulationHealth")} />
+      <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+        <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap">
+          <Chip
+            label={
+              health.data
+                ? t(`modelHealth.joinPopulationStatus.${health.data.status}`)
+                : t("modelHealth.joinPopulationStatus.PENDING")
+            }
+            size="small"
+            color={JOIN_POPULATION_STATUS_COLOR[health.data?.status ?? ""] ?? "default"}
+            variant={health.data ? "filled" : "outlined"}
+          />
+          {health.data && (
+            <Typography variant="caption" color="text.secondary">
+              {t("modelHealth.joinPopulationCounts", {
+                evaluated: String(health.data.evaluated_count),
+                total: String(health.data.join_count),
+              })}
+            </Typography>
+          )}
+        </Stack>
+        <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+          {t("modelHealth.joinPopulationHelp")}
+        </Typography>
+        {!health.data?.warn_only && health.data?.status === "BLOCKED" && (
+          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.75 }}>
+            {t("modelHealth.joinPopulationEnforced")}
+          </Typography>
+        )}
+      </Paper>
+      {health.isLoading ? (
+        <CircularProgress size={18} />
+      ) : health.isError ? (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {t("modelHealth.joinPopulationHealthLoadError")}
+        </Alert>
+      ) : rows.length === 0 ? (
+        <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+          <Typography variant="body2" color="text.secondary">
+            {t("modelHealth.noJoinPopulationChecks")}
+          </Typography>
+        </Paper>
+      ) : (
+        <TableContainer component={Paper} variant="outlined" sx={{ mb: 2 }}>
+          <Table size="small">
+            <TableHead>
+              <TableRow sx={{ bgcolor: "grey.50" }}>
+                <TableCell>{t("modelHealth.joinPopulationJoin")}</TableCell>
+                <TableCell>{t("modelHealth.joinPopulationType")}</TableCell>
+                <TableCell>{t("modelHealth.joinPopulationParticipation")}</TableCell>
+                <TableCell>{t("modelHealth.joinPopulationClassification")}</TableCell>
+                <TableCell>{t("modelHealth.joinPopulationStatusLabel")}</TableCell>
+                <TableCell>{t("modelHealth.joinPopulationReason")}</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {rows.map((row: JoinPopulationHealthItem) => {
+                const status = row.stale ? "STALE" : row.status ?? "PENDING";
+                const statusColor = row.stale
+                  ? "warning"
+                  : JOIN_POPULATION_STATUS_COLOR[row.status ?? ""] ?? "default";
+                return (
+                  <TableRow key={row.join_id}>
+                    <TableCell>
+                      <Typography variant="body2">
+                        {row.left_table_name ?? "?"} → {row.right_table_name ?? "?"}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {row.left_column_name ?? "?"} = {row.right_column_name ?? "?"}
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      {t(`joins.type${row.join_type.charAt(0).toUpperCase()}${row.join_type.slice(1)}`)}
+                    </TableCell>
+                    <TableCell>
+                      {t(`joins.population${row.population_participation
+                        .split("_")
+                        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+                        .join("")}`)}
+                    </TableCell>
+                    <TableCell>
+                      {row.classification
+                        ? t(`modelHealth.joinPopulationClassification.${row.classification}`)
+                        : t("modelHealth.joinPopulationClassification.unavailable")}
+                    </TableCell>
+                    <TableCell>
+                      <Chip
+                        label={t(`modelHealth.joinPopulationStatus.${status}`)}
+                        size="small"
+                        color={statusColor}
+                        variant={status === "PENDING" ? "outlined" : "filled"}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="caption">
+                        {row.reason ?? t("modelHealth.joinPopulationNoReason")}
+                      </Typography>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         </TableContainer>

@@ -48,7 +48,10 @@ async def test_non_additive_filter_not_in_group_by_falls_to_source_in_matcher():
     against a `(country, region)` aggregate must NOT match: the rewriter would
     group by `country` only and re-aggregate the non-re-aggregatable column at
     coarser grain. The matcher rejects it directly (EXACT_GRAIN_MISMATCH)."""
-    m = make_measure("user_id", is_additive=False)
+    # Bug-5892: default_agg="count_distinct" matches the stored stat so the
+    # rejection is proven to come from the EXACT-GRAIN rule this test
+    # targets, not an incidental stat-type mismatch from the fixture.
+    m = make_measure("user_id", default_agg="count_distinct", is_additive=False)
     agg = make_aggregate(
         ["country", "region"],
         [make_agg_col(m, "count_distinct")],
@@ -72,7 +75,8 @@ async def test_non_additive_filter_not_in_group_by_falls_to_source_in_matcher():
 async def test_non_additive_exact_group_by_still_matches():
     """The legitimate case still accelerates: non-additive measure grouped by
     exactly the aggregate grain (no extra filter dimension)."""
-    m = make_measure("user_id", is_additive=False)
+    # Bug-5892: default_agg="count_distinct" matches the stored stat.
+    m = make_measure("user_id", default_agg="count_distinct", is_additive=False)
     agg = make_aggregate(["country"], [make_agg_col(m, "count_distinct")])
     bq = make_bound_query([make_dimension("country")], [m])
 
@@ -201,3 +205,36 @@ def test_redshift_quantiles_are_exact():
     assert quantile_materialization_is_exact("postgres", "redshift") is True
     # BigQuery remains approximate.
     assert quantile_materialization_is_exact("bigquery", "bigquery") is False
+
+
+# --------------------------------------------------------------------------- #
+# Bug-7019 — variant at non-exact grain raises AggregateRewriteUnsupported     #
+# --------------------------------------------------------------------------- #
+
+def test_bug_7019_variant_at_coarser_grain_raises_unsupported():
+    """Bug-7019: a variant measure that somehow reaches the aggregate rewriter
+    at non-exact grain must raise AggregateRewriteUnsupported (fail loud, fall
+    to source) instead of silently forcing exact-grain semantics (which would
+    emit finer-grain rows than the user's GROUP BY asked for).
+
+    The matcher normally gates this, but the rewriter defence-in-depth must
+    also fail closed, not force a wrong cardinality.
+    """
+    import pytest
+    from src.rewrite.aggregate import rewrite_for_aggregate, AggregateRewriteUnsupported
+
+    variant = make_measure("rev_lag", variant_kind="lag")
+    region = make_dimension("region")
+    country = make_dimension("country")
+
+    # Aggregate at grain [country, region]; query at grain [country] only.
+    agg = make_aggregate(
+        ["country", "region"],
+        [make_agg_col(variant)],
+    )
+    bq = make_bound_query(
+        [country], [variant], grain=["country"],
+    )
+
+    with pytest.raises(AggregateRewriteUnsupported):
+        rewrite_for_aggregate(bq, agg, target_dialect="postgres")

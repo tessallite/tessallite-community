@@ -41,10 +41,13 @@ def _make_cal_mt(cal_table_id: uuid.UUID):
     )
 
 
-def _make_cal_info(cal_table_id: uuid.UUID):
+def _make_cal_info(cal_table_id: uuid.UUID, *, calendar_type: str = "standard",
+                   fiscal_year_start_month: int = 1):
     return types.SimpleNamespace(
         id=cal_table_id,
         date_column="date_key",
+        calendar_type=calendar_type,
+        fiscal_year_start_month=fiscal_year_start_month,
     )
 
 
@@ -123,13 +126,17 @@ def test_date_hierarchy_templates_defined():
 
 @pytest.mark.asyncio
 async def test_batch_date_creates_three_hierarchies(modeler_client):
-    """3 unassigned date columns → 3 hierarchies, 3 aliases created."""
+    """3 unassigned date columns -> 3 hierarchies.
+
+    Bug-6722: for expression-capable calendar types (standard), the
+    hierarchies are created directly on the fact table with no
+    calendar-alias join, so created_aliases == 0.
+    """
     from shared.db.models import CalendarTable, Model, ModelTable
 
     cal_table_id = uuid.uuid4()
     cal_mt = _make_cal_mt(cal_table_id)
     cal_info = _make_cal_info(cal_table_id)
-    date_key_col = _make_date_key_col(cal_mt.id)
 
     col1 = _make_col("order_date")
     col2 = _make_col("ship_date")
@@ -148,24 +155,26 @@ async def test_batch_date_creates_three_hierarchies(modeler_client):
 
     mock_db.get = AsyncMock(side_effect=_get_dispatch)
 
-    # Queries: date key col lookup, then per column:
-    #   hierarchy-name check, alias query, reusable-UDA check,
-    #   then per level (3 for y_m_d): existing-dimension check
-    date_key_result = MagicMock()
-    date_key_result.scalar_one_or_none.return_value = date_key_col
+    # Bug-6722: expression-capable (standard) path creates UDAs directly on
+    # the fact table -- no date-key column lookup, no alias-name query.
+    # Per column: hierarchy-name check, reusable-UDA check,
+    #   then per level (6 for CALENDAR_HIERARCHY_TEMPLATES["standard"]):
+    #   existing-dimension check.
+    # CALENDAR_HIERARCHY_TEMPLATES["standard"] has 6 components:
+    #   year, half_year, quarter, month, week, day.
     hier_name_check = MagicMock()
     hier_name_check.scalar_one_or_none.return_value = None
-    alias_query = MagicMock()
-    alias_query.scalars.return_value.all.return_value = []
     reusable_query = MagicMock()
     reusable_query.all.return_value = []
     dim_check = MagicMock()
     dim_check.scalar_one_or_none.return_value = None
     mock_db.execute = AsyncMock(side_effect=[
-        date_key_result,
-        hier_name_check, alias_query, reusable_query, dim_check, dim_check, dim_check,
-        hier_name_check, alias_query, reusable_query, dim_check, dim_check, dim_check,
-        hier_name_check, alias_query, reusable_query, dim_check, dim_check, dim_check,
+        hier_name_check, reusable_query,
+        dim_check, dim_check, dim_check, dim_check, dim_check, dim_check,
+        hier_name_check, reusable_query,
+        dim_check, dim_check, dim_check, dim_check, dim_check, dim_check,
+        hier_name_check, reusable_query,
+        dim_check, dim_check, dim_check, dim_check, dim_check, dim_check,
     ])
 
     unassigned_attrs = [col1, col2, col3]
@@ -189,7 +198,7 @@ async def test_batch_date_creates_three_hierarchies(modeler_client):
     assert resp.status_code == 201, resp.text
     body = resp.json()
     assert body["created_hierarchies"] == 3
-    assert body["created_aliases"] == 3
+    assert body["created_aliases"] == 0
     assert body["skipped"] == []
 
 
@@ -303,6 +312,77 @@ async def test_batch_date_skips_calendar_table_own_columns(modeler_client):
     assert body["created_hierarchies"] == 0
     assert len(body["skipped"]) == 1
     assert body["skipped"][0]["reason"] == "column belongs to calendar table"
+
+
+@pytest.mark.asyncio
+async def test_batch_date_table_bound_creates_aliases(modeler_client):
+    """Bug-6722: table-bound calendar types (retail_445) still create aliases.
+
+    Expression-capable types (standard) skip the alias+join, but table-bound
+    types need the physical calendar table columns (retail_year, etc.), so
+    they must retain the alias+join path.
+    """
+    from shared.db.models import CalendarTable, Model, ModelTable
+
+    cal_table_id = uuid.uuid4()
+    cal_mt = _make_cal_mt(cal_table_id)
+    cal_info = _make_cal_info(cal_table_id, calendar_type="retail_445")
+    date_key_col = _make_date_key_col(cal_mt.id)
+
+    col1 = _make_col("order_date")
+
+    mock_db = make_mock_db()
+
+    def _get_dispatch(cls, pk):
+        if cls is Model:
+            return _make_model()
+        if cls is ModelTable:
+            return cal_mt
+        if cls is CalendarTable:
+            return cal_info
+        return None
+
+    mock_db.get = AsyncMock(side_effect=_get_dispatch)
+
+    # Table-bound path: date_key lookup, then per column:
+    #   hierarchy-name check, alias-name query, reusable-UDA check,
+    #   then per level (3 for y_m_d): existing-dimension check
+    date_key_result = MagicMock()
+    date_key_result.scalar_one_or_none.return_value = date_key_col
+    hier_name_check = MagicMock()
+    hier_name_check.scalar_one_or_none.return_value = None
+    alias_query = MagicMock()
+    alias_query.scalars.return_value.all.return_value = []
+    reusable_query = MagicMock()
+    reusable_query.all.return_value = []
+    dim_check = MagicMock()
+    dim_check.scalar_one_or_none.return_value = None
+    mock_db.execute = AsyncMock(side_effect=[
+        date_key_result,
+        hier_name_check, alias_query, reusable_query, dim_check, dim_check, dim_check,
+    ])
+
+    with (
+        patch("src.api.hierarchies.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "src.api.hierarchies._get_unassigned_date_cols",
+            AsyncMock(return_value=[col1]),
+        ),
+    ):
+        resp = await modeler_client.post(
+            f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/hierarchies/batch-date",
+            json={
+                "grain": "y_m_d",
+                "calendar_table_id": str(cal_mt.id),
+                "measure_ids": [],
+            },
+        )
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["created_hierarchies"] == 1
+    assert body["created_aliases"] == 1  # table-bound creates alias
+    assert body["skipped"] == []
 
 
 @pytest.mark.asyncio

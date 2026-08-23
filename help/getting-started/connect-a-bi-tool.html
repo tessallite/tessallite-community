@@ -21,6 +21,12 @@
 <h2>Connection details</h2>
 <div class="table-wrapper"><table><thead><tr><th>Setting</th><th>Value</th></tr></thead><tbody><tr><td>Host</td><td><code>localhost</code> (local install) or the hostname provided by your system administrator (GCP)</td></tr><tr><td>Port</td><td><code>5433</code></td></tr><tr><td>Database</td><td>Your workspace slug (e.g. <code>acme</code>)</td></tr><tr><td>Username</td><td>Your email address (e.g. <code>analyst@acme.com</code>)</td></tr><tr><td>Password</td><td>Your Tessallite password</td></tr><tr><td>SSL</td><td>Not required for local installs</td></tr></tbody></table></div>
 <p>The workspace slug is the identifier for your tenant. It is case-sensitive. If you are uncertain of the slug, ask your system administrator.</p>
+<p><strong>Scoping the connection to one model.</strong> The Database field also accepts two longer forms when you want the connection to open on a specific model instead of the whole workspace:</p>
+<ul>
+<li><code>acme/sales</code> — workspace slug plus a model slug.</li>
+<li><code>acme/finance/sales</code> — workspace, project, and model slug, useful when two projects contain models with the same name.</li>
+</ul>
+<p>If the model or project you name does not exist, the connection is refused with a message that tells you the accepted formats, so a typo is easy to spot.</p>
 <h2>Connecting with DBeaver</h2>
 <ol><li>Open DBeaver.</li><li>Click <strong>New Database Connection</strong> (the plug icon in the toolbar).</li><li>In the connection type list, select <strong>PostgreSQL</strong>.</li><li>Enter the <strong>Host</strong>, <strong>Port</strong>, <strong>Database</strong>, <strong>Username</strong>, and <strong>Password</strong> using the values from the table above.</li><li>Click <strong>Test Connection</strong>. A confirmation dialog should appear.</li><li>Click <strong>Finish</strong>.</li><li>The connection appears in the left panel. Expand it to see the available tables. Each model published in the workspace appears as a schema.</li></ol>
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/connect-jdbc-dbeaver.png" alt="DBeaver New Connection dialog with PostgreSQL selected."></figure>

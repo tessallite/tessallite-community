@@ -24,6 +24,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.aggregate_rebuild_trigger import trigger_model_refresh
+from src.cold_start_trigger import trigger_predictive_cold_start
+from shared.auth.identity import user_identity_matches
 from shared.db.models import (
     Model,
     ProjectConnection,
@@ -34,21 +36,63 @@ from shared.model_snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
     SnapshotSchemaError,
     SnapshotVersionError,
+    consistent_read_session,
     prepare_snapshot_for_import,
     rehydrate_into_live,
     snapshot_model,
 )
+from shared.model_snapshot.rehydrator import append_authentic_import_version
+from shared.db.model_write_lock_guard import model_write_lock_exempt
 from shared.model_snapshot.slug_utils import (
     insert_model_with_slug_retry,
     resolve_slug_collision,
     slugify,
 )
-from src.auth.middleware import CurrentUser, forbid_embed_user
+from shared.semantic.graph_order import fact_anchor_violation
+from src.api.personas import seed_technical_persona
+from src.auth.middleware import (
+    CurrentUser,
+    forbid_embed_user,
+    is_human_tenant_admin_or_system_admin,
+)
+from src.licensing_guard import enforce_import_model_cap
 from src.auth.rbac import require_role
 
 router = APIRouter(tags=["import-export"])
 
 EXPORT_FORMAT = "tessallite-model/v1"
+
+# Bug-6264 (import sibling): certification is admin-only governance, conferred
+# only via the certify/deprecate endpoints. The snapshot-import bundle is
+# caller-supplied, unsigned JSON; without this a modeler could hand-author a
+# bundle whose KPIs/named-sets carry ``certification_status: certified`` and
+# mint a born-certified entity — the exact bypass Bug-6264 closes on
+# create/revert/PATCH. For a non-admin importer, force every imported KPI and
+# named-set to ``draft`` before rehydration. Admin importers may restore an
+# admin-conferred status (they already hold certify authority).
+
+
+def _clamp_imported_certification(snapshot: dict, *, is_admin: bool) -> None:
+    """Force any non-draft certification_status on imported KPIs/named-sets to
+    ``draft`` when the importer is not an admin. Mutates *snapshot* in place.
+
+    Bug-6615: clamps ANY present non-draft value, not just the certified/shared/
+    deprecated enum — a hand-authored junk status (e.g. "pending") would
+    otherwise persist verbatim through the rehydrator, bypass the SQL
+    draft-hiding filter (which only excludes exact "draft"), and render to
+    viewers as a pseudo-certified marker. Absent keys are left alone (the DB
+    default is draft).
+    """
+    if is_admin or not isinstance(snapshot, dict):
+        return
+    for key in ("kpis", "named_sets"):
+        for row in snapshot.get(key) or []:
+            if (
+                isinstance(row, dict)
+                and "certification_status" in row
+                and row["certification_status"] != "draft"
+            ):
+                row["certification_status"] = "draft"
 
 # Strong refs to fire-and-forget import-rebuild trigger tasks so the event loop
 # does not GC them mid-flight (F-013-13 pattern).
@@ -58,12 +102,17 @@ _import_rebuild_tasks: set[asyncio.Task] = set()
 def _slugify(text: str) -> str:
     # F-020-19: bound to the 64-char column; suffix headroom is reserved by
     # the shared slug_utils collision helpers, not here.
-    return slugify(text, fallback="imported-model")
+    # Bug-5871 / Bug-5938: use separator="_" to produce BI-safe slugs
+    # (underscores, not hyphens) consistent with all other importers and
+    # the Bug-5513 BI-safe slug validation contract.
+    return slugify(text, fallback="imported_model", separator="_")
 
 
 # ---------------------------------------------------------------------------
-# Authorization (matches versions.py — bootstrap-admin rule)
+# Authorization (binding-only — F-021-04 hard cutover, decision #9)
 # ---------------------------------------------------------------------------
+# There is NO zero-binding bootstrap-admin grant: a project with no binding
+# for the caller denies. Human tenant/system admins still bypass.
 
 async def _ensure_model_access(
     project_id: UUID, model_id: UUID, current_user: CurrentUser, tenant_db: AsyncSession
@@ -74,21 +123,12 @@ async def _ensure_model_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Model {model_id} not found in project {project_id}",
         )
-    if current_user.role in ("system_admin", "tenant_admin"):
+    if is_human_tenant_admin_or_system_admin(current_user):
         return model
     user_identity = current_user.email or current_user.user_id
-    any_binding = (
-        await tenant_db.execute(
-            select(UserAccessBinding).where(
-                UserAccessBinding.project_id == project_id
-            ).limit(1)
-        )
-    ).scalar_one_or_none()
-    if any_binding is None:
-        return model
     rows = await tenant_db.execute(
         select(UserAccessBinding).where(
-            UserAccessBinding.user_identity == user_identity,
+            user_identity_matches(UserAccessBinding.user_identity, user_identity),
             (UserAccessBinding.project_id == project_id)
             | (UserAccessBinding.model_id == model_id),
         )
@@ -104,21 +144,12 @@ async def _ensure_model_access(
 async def _ensure_project_access(
     project_id: UUID, current_user: CurrentUser, tenant_db: AsyncSession
 ) -> None:
-    if current_user.role in ("system_admin", "tenant_admin"):
+    if is_human_tenant_admin_or_system_admin(current_user):
         return
     user_identity = current_user.email or current_user.user_id
-    any_binding = (
-        await tenant_db.execute(
-            select(UserAccessBinding).where(
-                UserAccessBinding.project_id == project_id
-            ).limit(1)
-        )
-    ).scalar_one_or_none()
-    if any_binding is None:
-        return
     rows = await tenant_db.execute(
         select(UserAccessBinding).where(
-            UserAccessBinding.user_identity == user_identity,
+            user_identity_matches(UserAccessBinding.user_identity, user_identity),
             UserAccessBinding.project_id == project_id,
         )
     )
@@ -180,7 +211,20 @@ class ImportResponse(BaseModel):
 @router.get(
     "/projects/{project_id}/models/{model_id}/snapshot-export",
     response_model=ExportPreviewResponse,
-    dependencies=[require_role("viewer")],
+    # Bug-7300 (F-020-03): a model snapshot bundle discloses the full
+    # governance/security configuration — row_security_rules (predicate
+    # expressions, claim names, mapping-table wiring), data_tags / CLS
+    # column classification, and personas with default_filters (data-scoping
+    # values) — plus every measure formula. This is model-authoring output,
+    # not a viewer read: gate it at ``modeler`` to match the sibling
+    # single-model export surface (LookML export, lookml_export.py). A viewer
+    # (the lowest bound role) must not be able to download the exact
+    # row-security predicates and sensitive-column classification that scope
+    # their own access. Model-DEFINITION export stays at modeler+ (user decision
+    # 2026-08-19: only the credential-bearing PROJECT export is admin-gated).
+    # The in-handler _ensure_model_access adds binding-existence defence in
+    # depth (both are bootstrap-free, F-021-04).
+    dependencies=[require_role("modeler")],
 )
 async def export_model(
     project_id: UUID,
@@ -189,7 +233,9 @@ async def export_model(
 ) -> ExportPreviewResponse:
     bundle: Optional[ExportBundle] = None
     connections: list[ConnectionStub] = []
-    async for tenant_db in get_tenant_db(current_user.tenant_id):
+    # Bug-8380: the snapshot, deploy pointer, connection stubs, and response
+    # model metadata form one export bundle and must share one observation point.
+    async with consistent_read_session(current_user.tenant_id) as tenant_db:
         model = await _ensure_model_access(project_id, model_id, current_user, tenant_db)
         snap = await snapshot_model(model_id, tenant_db)
         snap["exported_deployed_version_id"] = (
@@ -269,6 +315,19 @@ async def import_model(
     async for tenant_db in get_tenant_db(current_user.tenant_id):
         await _ensure_project_access(project_id, current_user, tenant_db)
 
+        # Bug-7468: enforce the licensed model cap BEFORE creating the model.
+        from sqlalchemy import func as sa_func
+
+        async def _count_models() -> int:
+            r = await tenant_db.execute(
+                select(sa_func.count()).select_from(Model)
+            )
+            return int(r.scalar() or 0)
+
+        # Bug-6567: pass db so imports and direct creates serialise via
+        # the same advisory lock, preventing concurrent cap bypass.
+        await enforce_import_model_cap(1, _count_models, db=tenant_db)
+
         # Validate provided connection ids actually live in this tenant + project.
         if body.connection_mapping:
             target_ids = {UUID(v) for v in body.connection_mapping.values()}
@@ -316,6 +375,44 @@ async def import_model(
                 ),
             )
 
+        # Bug-8614 / Bug-8134: enforce the deploy fact-anchor contract before
+        # staging the destination model (F-013-11's partial unique index still
+        # caps explicitly declared facts).
+        # The create/update table API guards this with `_assert_at_most_one_
+        # fact` (api/tables.py), but a single-model import bundle bypasses
+        # that schema/endpoint entirely, same as the project-import bundle
+        # this fix was first applied to (project_rehydrator.py::
+        # _validate_bundle). Left unchecked, an invalid multi-table bundle would
+        # reach `insert_model_with_slug_retry` (staging the destination
+        # Model row) and then `rehydrate_into_live` ->
+        # rehydrator.py::_insert_tables_and_columns, whose second per-row
+        # Core INSERT trips the partial unique index and raises a raw
+        # IntegrityError instead of a clean 4xx. Checked here, before any
+        # row (destination Model included) is staged.
+        _anchor_error = fact_anchor_violation(rewritten.get("tables") or [])
+        if _anchor_error:
+            _fact_names = [
+                str(t.get("physical_name") or t.get("alias") or "?")
+                for t in (rewritten.get("tables") or [])
+            ]
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Bundle violates the fact-anchor contract: "
+                    f"{_anchor_error} Tables: {', '.join(_fact_names)}."
+                ),
+            )
+
+        # Bug-6264 (import sibling): a non-admin importer cannot confer the
+        # certified/shared trust signal via a hand-authored bundle — clamp
+        # imported KPIs/named-sets to draft. Root cause lives in the shared
+        # rehydrator (inserts governance verbatim); this closes the only
+        # modeler-reachable, caller-controlled path at the consumer boundary.
+        _is_admin = current_user.role in (
+            "admin", "tenant_admin", "system_admin",
+        )
+        _clamp_imported_certification(rewritten, is_admin=_is_admin)
+
         # Strip the old model row's id/project_id from the snapshot so the
         # rehydrator's scalar-update step doesn't try to overwrite project_id
         # with the source tenant's value (it's not in _MODEL_SCALAR_FIELDS,
@@ -347,39 +444,62 @@ async def import_model(
             # rehydrator rebinds their physical_table_name seed segment to this
             # new model's fresh seed (so a refresh builds a distinct table and
             # never clobbers the source's). Mirrors every sibling importer.
-            await rehydrate_into_live(
-                new_model_id,
-                rewritten,
-                tenant_db,
-                drop_orphan_aggregates=False,
-                force_aggregate_pending=True,
-                force_pocket_stale=True,
-                preserve_destination_seed=True,
-                actor=current_user.email or current_user.user_id,
-            )
+            # Bug-7982 R7 (review round 3, B1): DELIBERATE non-holder. Rehydrates
+            # into a model created in THIS transaction, so nothing else can
+            # reference it yet and there is nothing to serialise against.
+            # Declared explicitly: without it, ONE bundle import emitted 24 benign
+            # warn-mode ERRORs and claimed 24 report keys, muting the guard for
+            # real violations for the whole re-arm window.
+            async with model_write_lock_exempt(
+                tenant_db, "import: wholesale rebuild into a model created in this transaction"
+            ):
+                await rehydrate_into_live(
+                    new_model_id,
+                    rewritten,
+                    tenant_db,
+                    drop_orphan_aggregates=False,
+                    force_aggregate_pending=True,
+                    force_pocket_stale=True,
+                    preserve_destination_seed=True,
+                    actor=current_user.email or current_user.user_id,
+                )
         except (SnapshotSchemaError, SnapshotVersionError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=str(exc),
             )
 
+        # Bug-6138: seed the canonical Technical persona for imported models so
+        # the v1 snapshot below includes it (idempotent — no-op if the bundle
+        # already carried a technical persona).
+        await seed_technical_persona(tenant_db, new_model_id)
+
         deployed_id: Optional[UUID] = None
         if body.deploy_immediately:
             # Save a v1 snapshot of the imported live state and deploy it.
-            from shared.db.models import ModelVersion
-            snap = await snapshot_model(new_model_id, tenant_db)
-            v = ModelVersion(
-                model_id=new_model_id,
-                version_number=1,
-                snapshot_json=snap,
+            #
+            # Bug-7982 R7 (review round 7, F1): this used to construct the
+            # ModelVersion INLINE — a hand-duplicated
+            # ``append_authentic_import_version`` — which meant it wrote
+            # ``model_versions`` (a guarded table that
+            # ``versions.py::revert_to_version`` genuinely DELETEs) with neither
+            # the per-model lock nor the wholesale-rebuild exemption the rest of
+            # this handler declares. Every deploy-on-import claimed the
+            # ``{model_versions}`` report key for the whole re-arm window,
+            # muting the only detector for a real racing writer. Reproduced live
+            # in strict mode. Routing through the helper removes the duplication
+            # AND inherits the exemption it declares for itself, so the fix
+            # cannot be forgotten the way a call-site declaration can. The helper
+            # computes version_number from existing rows; this importer inserts
+            # no history, so it is 1 here exactly as before.
+            deployed_id = await append_authentic_import_version(
+                new_model_id,
+                tenant_db,
                 summary=f"Imported from {body.bundle.exported_from.get('model_id')}",
                 created_by=current_user.email or current_user.user_id,
             )
-            tenant_db.add(v)
-            await tenant_db.flush()
-            new_model.deployed_version_id = v.id
+            new_model.deployed_version_id = deployed_id
             new_model.last_deployed_at = datetime.now(timezone.utc)
-            deployed_id = v.id
 
         await tenant_db.commit()
 
@@ -391,6 +511,21 @@ async def import_model(
         )
         _import_rebuild_tasks.add(_task)
         _task.add_done_callback(_import_rebuild_tasks.discard)
+
+        # Bug-8029: an import that deployed immediately must also kick the
+        # optimizer's durable predictive cold-start pipeline, exactly like the
+        # deploy endpoint does. Fire-and-forget / best-effort / idempotent per
+        # deployed version — never fail or delay the import. Only fire when the
+        # imported model actually landed deployed; the optimizer endpoint no-ops
+        # for an undeployed model, so this gate just avoids a pointless call.
+        if deployed_id is not None:
+            _cs_task = asyncio.create_task(
+                trigger_predictive_cold_start(
+                    current_user.tenant_id, new_model_id
+                )
+            )
+            _import_rebuild_tasks.add(_cs_task)
+            _cs_task.add_done_callback(_import_rebuild_tasks.discard)
 
         out = ImportResponse(
             model_id=new_model_id,

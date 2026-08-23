@@ -6,10 +6,12 @@ import {
 import { Close, ContentCopy, NavigateNext } from '@mui/icons-material';
 import { tokens } from '../../theme';
 import { getDrillOptions, drillThrough } from '../../api/queryRouter';
+import { rowSecurityDeniedAll } from '../../utils/rowSecurity';
 import { getDrillThroughSet } from '../../api/modelService';
 import { ApiError } from '../../api/client';
 import DrillPathPicker from './DrillPathPicker';
 import type { DrillOption, DrillThroughResponse, DrillThroughSet } from '../../types/tessallite';
+import { strings, templates } from '../../i18n/strings';
 
 interface DrillPanelProps {
   open: boolean;
@@ -36,6 +38,8 @@ export default function DrillPanel({
   const [selectedPath, setSelectedPath] = useState('');
   const [result, setResult] = useState<DrillThroughResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  // Bug-8453 / R5 finding F2: row security denied every detail row.
+  const [rowSecurityDenied, setRowSecurityDenied] = useState(false);
   const [page, setPage] = useState(0);
   const [allRows, setAllRows] = useState<Record<string, unknown>[]>([]);
   const [nextCursor, setNextCursor] = useState<string | undefined>(undefined);
@@ -79,6 +83,17 @@ export default function DrillPanel({
     try {
       const cursor = resetResults ? undefined : nextCursor;
       const res = await drillThrough(measureId, { ...context, hierarchy_id: pathId }, cursor);
+      // Bug-8453 / R5 finding F2: an RLS deny-all returns zero detail rows.
+      // An empty drill grid would read as "this cell has no detail", which is
+      // a claim about the business rather than about the user's access.
+      if (rowSecurityDeniedAll(res)) {
+        setResult(null);
+        setAllRows([]);
+        setHasMore(false);
+        setRowSecurityDenied(true);
+        return;
+      }
+      setRowSecurityDenied(false);
       if (resetResults) {
         setAllRows(res.rows);
         setResult(res);
@@ -112,6 +127,19 @@ export default function DrillPanel({
     setLoading(true);
     try {
       const res = await drillThrough(measureId, { ...context, hierarchy_id: selectedPath }, nextCursor);
+      // R6 finding 5: this is the LOAD-MORE path, so rows are already on
+      // screen. Leaving them there under a blanket denial notice showed a
+      // partial extract next to a message implying nothing was visible --
+      // two contradictory statements. Clear the grid so the notice is the
+      // only claim being made, matching the initial-load branch above.
+      if (rowSecurityDeniedAll(res)) {
+        setResult(null);
+        setAllRows([]);
+        setHasMore(false);
+        setNextCursor(undefined);
+        setRowSecurityDenied(true);
+        return;
+      }
       const newRows = [...allRows, ...res.rows];
       setHasMore(res.page.has_more);
       setAllRows(newRows);
@@ -181,7 +209,7 @@ export default function DrillPanel({
     >
       <Box sx={{ display: 'flex', alignItems: 'center', px: 1.5, py: 0.75, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
         <Typography sx={{ fontSize: 13, fontWeight: 700, flex: 1 }}>
-          Drill Through
+          {strings.drill.title}
         </Typography>
         <IconButton size="small" onClick={onClose}>
           <Close sx={{ fontSize: 18 }} />
@@ -226,7 +254,7 @@ export default function DrillPanel({
         <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
           <Box sx={{ px: 1.5, py: 0.5, display: 'flex', alignItems: 'center', gap: 0.5, flexWrap: 'wrap' }}>
             <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, flex: 1 }}>
-              {rows.length} detail rows loaded{hasMore ? ' (more available)' : ''}
+              {templates.drill.detailRowsLoaded(rows.length)}{hasMore ? strings.drill.moreAvailable : ''}
             </Typography>
             <Button
               size="small"
@@ -235,7 +263,7 @@ export default function DrillPanel({
               onClick={handleCopyTsv}
               sx={{ fontSize: 10, minWidth: 'auto', textTransform: 'none' }}
             >
-              Copy TSV
+              {strings.drill.copyTsv}
             </Button>
             <Button
               size="small"
@@ -243,7 +271,7 @@ export default function DrillPanel({
               onClick={() => onInsertSheet(headers, rows)}
               sx={{ fontSize: 10, minWidth: 'auto', textTransform: 'none' }}
             >
-              Insert Sheet
+              {strings.drill.insertSheet}
             </Button>
           </Box>
 
@@ -256,10 +284,10 @@ export default function DrillPanel({
                 onClick={() => setPage(p => p - 1)}
                 sx={{ fontSize: 10, minWidth: 'auto', textTransform: 'none' }}
               >
-                Prev
+                {strings.drill.prev}
               </Button>
               <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>
-                Page {page + 1}/{totalPages}
+                {templates.drill.page(page + 1, totalPages)}
               </Typography>
               <Button
                 size="small"
@@ -268,7 +296,7 @@ export default function DrillPanel({
                 onClick={() => setPage(p => p + 1)}
                 sx={{ fontSize: 10, minWidth: 'auto', textTransform: 'none' }}
               >
-                Next
+                {strings.drill.next}
               </Button>
             </Box>
           )}
@@ -307,17 +335,27 @@ export default function DrillPanel({
                 disabled={loading}
                 sx={{ fontSize: 11, textTransform: 'none', color: tokens.colorPrimary }}
               >
-                Load more rows...
+                {strings.drill.loadMore}
               </Button>
             </Box>
           )}
         </Box>
       )}
 
+      {/* Bug-8453 / R5 finding F2: name the permissions restriction rather
+          than showing an empty drill grid the user reads as "no detail". */}
+      {rowSecurityDenied && !loading && (
+        <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', p: 3 }}>
+          <Typography sx={{ fontSize: 11, color: tokens.colorRed, textAlign: 'center' }}>
+            {strings.drill.rowSecurityDenied}
+          </Typography>
+        </Box>
+      )}
+
       {accessDenied && !loading && (
         <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', p: 3 }}>
           <Typography sx={{ fontSize: 11, color: tokens.colorRed, textAlign: 'center' }}>
-            Access denied. Your persona does not have permission to drill through this measure.
+            {strings.drill.accessDenied}
           </Typography>
         </Box>
       )}
@@ -325,7 +363,7 @@ export default function DrillPanel({
       {!result && !loading && !accessDenied && optionsLoaded && options.length === 0 && (
         <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', p: 3 }}>
           <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, textAlign: 'center' }}>
-            No drill-through paths available for this measure.
+            {strings.drill.noPaths}
           </Typography>
         </Box>
       )}

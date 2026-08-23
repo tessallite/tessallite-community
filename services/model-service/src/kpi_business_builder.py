@@ -14,10 +14,13 @@ The query-router handles dialect translation downstream.
 from __future__ import annotations
 
 import logging
+import math
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from shared.connector_qualify import safe_ident
+from shared.type_family import is_numeric
 
 log = logging.getLogger(__name__)
 
@@ -118,13 +121,18 @@ TIME_WINDOW_PRESETS = {
     "custom_range",
 }
 
+# Bug-5924: top_n/bottom_n were previously listed here and in the frontend
+# BusinessFilterOp union, but the compiler always rejected them ("requires
+# measure-based ranking" — never implemented end to end) and the UI never
+# rendered them as an option. Removed from the public contract rather than
+# left half-advertised; see docs/execution/execution_future-features.md if
+# ranking filters are approved for a later phase.
 FILTER_OPERATORS = {
     "eq", "ne", "gt", "gte", "lt", "lte",
     "in", "not_in",
     "between",
     "like", "not_like",
     "is_null", "is_not_null",
-    "top_n", "bottom_n",
 }
 
 PERIOD_GRAINS = {"day", "week", "month", "quarter", "year"}
@@ -462,8 +470,6 @@ def _validate_filter(
             vals = f.get("values")
             if not vals or not isinstance(vals, list) or len(vals) < 2:
                 errors.append(f"{prefix}: operator 'between' requires values with 2 elements")
-    elif op in ("top_n", "bottom_n"):
-        errors.append(f"{prefix}: operator '{op}' is not yet supported in business KPI filters (requires measure-based ranking)")
 
     return errors
 
@@ -496,6 +502,7 @@ def compile_business_definition(
     dimension_name_map: dict[str, str],
     time_dim_name_map: dict[str, str] | None = None,
     parameter_defaults: dict[str, Any] | None = None,
+    dimension_data_types: dict[str, str] | None = None,
 ) -> CompiledBusinessKpi:
     """Compile a validated business_definition into evaluation artifacts.
 
@@ -511,6 +518,10 @@ def compile_business_definition(
         Map of time dimension UUID string -> column name.
     parameter_defaults : dict | None
         Map of parameter name -> default value.
+    dimension_data_types : dict | None
+        Map of dimension UUID string -> source column data type. Drives
+        column-type-aware literal typing so numeric filters emit bare tokens
+        (Bug-6253). When absent, every literal is quoted as a string.
     """
     formula = defn["formula"]
     formula_type = formula["type"]
@@ -581,6 +592,7 @@ def compile_business_definition(
     if filters and isinstance(filters, list):
         result.filter_predicates = _compile_filters(
             filters, dimension_name_map, parameter_defaults,
+            dimension_data_types,
         )
 
     target = defn.get("target")
@@ -1060,6 +1072,98 @@ def _quote_val(v: Any) -> str:
     return f"'{s}'"
 
 
+# Bug-6253: a finite, *safe* integer/decimal literal — optional leading MINUS,
+# ASCII digits, optional single ``.`` fraction. Mirrors the query-router
+# ``_NUMERIC_LITERAL_RE`` (rewrite/conditions.py): NO exponent, NO leading
+# ``+``, NO surrounding whitespace, ``\Z`` end-anchor, ``re.ASCII`` so
+# non-ASCII digits fail closed rather than emitting an unparseable bare token.
+_NUMERIC_LITERAL_RE = re.compile(r"^-?(\d+(\.\d+)?|\.\d+)\Z", re.ASCII)
+
+
+def _numeric_render(v: Any) -> str | None:
+    """Render *v* to the bare SQL token it would emit, or ``None`` if unsafe.
+
+    Every candidate — native int/float or string — is reduced to a string and
+    validated through the SAME strict grammar (``_NUMERIC_LITERAL_RE``) before
+    it may be emitted bare. This mirrors the query-router and closes three
+    edge cases a bare ``math.isfinite`` check would miss:
+      - a very large int (``10**400``) whose ``float()`` conversion would raise
+        ``OverflowError`` (a 500) — ``str()`` never overflows and the digit
+        string still matches the integer grammar;
+      - a float in scientific form (``1e-07`` -> ``'1e-07'``) — rejected by the
+        exponent-free grammar, so it falls back to a quoted literal (fail-safe);
+      - ``inf`` / ``nan`` floats — rejected.
+    Booleans are rejected outright (``True`` must never render as ``1``).
+    """
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            return None
+        rendered = str(v)
+    elif isinstance(v, int):
+        rendered = str(v)
+    elif isinstance(v, str):
+        rendered = v
+    else:
+        return None
+    return rendered if _NUMERIC_LITERAL_RE.match(rendered) else None
+
+
+def _quote_val_typed(v: Any, col_type: str | None) -> str:
+    """Render a filter literal with column-type-aware typing.
+
+    Against a numeric column a strict numeric literal is emitted bare so
+    strictly-typed connectors (BigQuery, Snowflake, SQL Server) accept the
+    comparison instead of rejecting ``col = '100'``. Every other case — a
+    non-numeric column, or a value that is not a strict numeric literal —
+    falls back to a quoted string literal (fail-safe: a stray value can
+    never break out of the literal).
+    """
+    if is_numeric(col_type):
+        rendered = _numeric_render(v)
+        if rendered is not None:
+            return rendered
+    return _quote_val(v)
+
+
+def _quote_like_val(v: Any) -> str:
+    """Quote *v* as a business "contains" LIKE pattern.
+
+    Bug-5925: the Business Builder summary describes ``like``/``not_like``
+    as "contains" / "does not contain", but the compiler previously passed
+    the user's literal straight through as the LIKE pattern with no
+    wildcards — an exact match, not a contains match, unless the user
+    happened to type ``%`` themselves. This wraps the (escaped) literal in
+    ``%...%`` so the compiled SQL matches the advertised business
+    semantics.
+
+    Wildcard escaping uses a bare backslash (no ``ESCAPE`` clause) rather
+    than ANSI ``LIKE 'pattern' ESCAPE '\\'``: this compiler builds a raw
+    SQL string fragment ahead of the sqlglot-aware dialect pipeline (it is
+    not an AST the query-router can re-transpile per connector — see the
+    "SQL generation" rule against hand-rolled per-connector branching), and
+    BigQuery's LIKE operator does not support the ``ESCAPE`` clause at all
+    (it would be a hard syntax error there), while backslash is already the
+    *implicit* default escape character on postgresql/redshift/bigquery/
+    hadoop_spark. Snowflake and sqlserver do not default to backslash
+    escaping, so a literal ``%``/``_`` inside the search text on those two
+    connectors is not escaped — a narrow, documented edge case (Bug-6017).
+    Because those two dialects have no default escape character, the
+    literal backslash we emit is NOT stripped/interpreted — it stays in
+    the pattern as a literal character the search text does not contain,
+    so the search SILENTLY MATCHES NOTHING for any value containing
+    a percent sign, underscore, or backslash (an under-match /
+    false-empty-result, not an over-match). The primary defect this fixes
+    — "contains" not matching
+    a superstring at all — is fixed on every connector; only search text
+    with those specific characters, on those two connectors, is affected.
+    """
+    s = str(v).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    s = s.replace("'", "''")
+    return f"'%{s}%'"
+
+
 def _is_iso_date(v: Any) -> bool:
     """True if *v* is an ISO date or datetime string (F-017-19).
 
@@ -1087,20 +1191,32 @@ def _compile_filters(
     filters: list[dict],
     dimension_names: dict[str, str],
     parameter_defaults: dict[str, Any] | None,
+    dimension_data_types: dict[str, str] | None = None,
+    *,
+    strict: bool = False,
 ) -> list[str]:
     predicates: list[str] = []
 
     for f in filters:
         did = f.get("dimension_id")
         if not did:
+            if strict:
+                raise ValueError("filter is missing dimension_id")
             continue
         dim_name = dimension_names.get(str(did))
         if not dim_name:
+            if strict:
+                raise ValueError(f"unknown dimension_id {did}")
             continue
 
         col = safe_ident(dim_name)
+        col_type = (dimension_data_types or {}).get(str(did))
         op = f.get("operator", "eq")
         mode = f.get("mode", "fixed")
+        if mode not in {"fixed", "parameter", "relative"}:
+            if strict:
+                raise ValueError(f"unsupported filter mode {mode!r}")
+            mode = "fixed"
 
         if mode == "parameter":
             param_name = f.get("parameter_name", "")
@@ -1109,6 +1225,10 @@ def _compile_filters(
             if parameter_defaults and param_name in parameter_defaults:
                 val = parameter_defaults[param_name]
             if val is None:
+                if strict:
+                    raise ValueError(
+                        f"parameter filter {param_name or '<unnamed>'} has no value"
+                    )
                 continue
             values = [val] if not isinstance(val, list) else val
         elif mode == "relative":
@@ -1117,76 +1237,110 @@ def _compile_filters(
             preset = preset_values[0] if preset_values else None
             if preset:
                 rel_preds = _preset_to_predicates(preset, dim_name)
+                if strict and not rel_preds:
+                    raise ValueError(f"unknown relative preset {preset}")
                 predicates.extend(rel_preds)
+            elif strict:
+                raise ValueError("relative filter is missing a preset")
             continue
         else:
             raw_val = f.get("value")
             values = f.get("values", [raw_val] if raw_val is not None else [])
 
-        pred = _op_to_sql(col, op, values, f)
+        pred = _op_to_sql(col, op, values, f, col_type)
         if pred:
             predicates.append(pred)
+        elif strict:
+            raise ValueError(f"operator {op!r} cannot be compiled")
 
+    if strict and filters and not predicates:
+        raise ValueError("request filters produced no predicates")
     return predicates
 
 
-def _op_to_sql(col: str, op: str, values: list, f: dict) -> str | None:
+def _op_to_sql(
+    col: str, op: str, values: list, f: dict, col_type: str | None = None
+) -> str | None:
+    def q(v: Any) -> str:
+        return _quote_val_typed(v, col_type)
+
     if op == "eq":
         if not values:
             return None
-        return f"{col} = {_quote_val(values[0])}"
+        return f"{col} = {q(values[0])}"
     if op == "ne":
         if not values:
             return None
-        return f"{col} <> {_quote_val(values[0])}"
+        return f"{col} <> {q(values[0])}"
     if op == "gt":
         if not values:
             return None
-        return f"{col} > {_quote_val(values[0])}"
+        return f"{col} > {q(values[0])}"
     if op == "gte":
         if not values:
             return None
-        return f"{col} >= {_quote_val(values[0])}"
+        return f"{col} >= {q(values[0])}"
     if op == "lt":
         if not values:
             return None
-        return f"{col} < {_quote_val(values[0])}"
+        return f"{col} < {q(values[0])}"
     if op == "lte":
         if not values:
             return None
-        return f"{col} <= {_quote_val(values[0])}"
+        return f"{col} <= {q(values[0])}"
     if op == "in":
         if not values:
             return None
-        return f"{col} IN ({', '.join(_quote_val(v) for v in values)})"
+        return f"{col} IN ({', '.join(q(v) for v in values)})"
     if op == "not_in":
         if not values:
             return None
-        return f"{col} NOT IN ({', '.join(_quote_val(v) for v in values)})"
+        return f"{col} NOT IN ({', '.join(q(v) for v in values)})"
     if op == "between":
         if len(values) < 2:
             return None
-        return f"{col} BETWEEN {_quote_val(values[0])} AND {_quote_val(values[1])}"
+        return f"{col} BETWEEN {q(values[0])} AND {q(values[1])}"
     if op == "like":
         if not values:
             return None
-        return f"{col} LIKE {_quote_val(values[0])}"
+        return f"{col} LIKE {_quote_like_val(values[0])}"
     if op == "not_like":
         if not values:
             return None
-        return f"{col} NOT LIKE {_quote_val(values[0])}"
+        return f"{col} NOT LIKE {_quote_like_val(values[0])}"
     if op == "is_null":
         return f"{col} IS NULL"
     if op == "is_not_null":
         return f"{col} IS NOT NULL"
-    if op in ("top_n", "bottom_n"):
-        return None
     return None
 
 
 # ---------------------------------------------------------------------------
 # Summary builder
 # ---------------------------------------------------------------------------
+
+# Every ``summary_tokens`` key whose STRING value is a bare measure NAME.
+#
+# THE producer/consumer contract for measure renames (Bug-9483). ``measure_rename``
+# imports this set to decide which summary strings to rewrite; a private copy
+# there drifted the moment ``compare_measures`` was added, leaving a shipped,
+# wizard-reachable formula family whose summary still named a measure that no
+# longer exists. One owner, exported — the Bug-6574 pattern.
+#
+# Deliberately EXCLUDED:
+#   * ``dimension_name`` — a DIMENSION name; a measure rename must not touch it.
+#   * ``filter_dimensions`` — rendered filter LABELS ("region in EMEA, APAC"),
+#     not bare names; rewriting inside them would corrupt member values.
+# Both exclusions are asserted by the contract test, so widening this set to
+# "every *_name key" cannot happen by accident.
+MEASURE_NAME_SUMMARY_TOKEN_KEYS = frozenset({
+    "measure_name",
+    "numerator_name",
+    "denominator_name",
+    "measure_a_name",
+    "measure_b_name",
+})
+
 
 def _build_summary(
     defn: dict,
@@ -1317,8 +1471,6 @@ def _build_summary(
         "between": "between",
         "like": "contains",
         "not_like": "does not contain",
-        "top_n": "top",
-        "bottom_n": "bottom",
     }
 
     filters = defn.get("filters")

@@ -38,6 +38,26 @@ SET app.date_start = &#x27;2025-01-01&#x27;;
 SET app.date_end = &#x27;2025-12-31&#x27;;</code></pre>
 <p>The <code>app.</code> prefix is required. Session variables persist for the lifetime of the JDBC connection and are cleared when the client disconnects.</p>
 <p>This mechanism works with any PostgreSQL-compatible client: DBeaver, Tableau (custom SQL), psycopg2, JDBC drivers. The gateway captures the SET commands and passes the values to the query router as part of the query context.</p>
+<h3>Setting a multi-value parameter over JDBC</h3>
+<p>A <code>multi_value</code> parameter holds a list, but a <code>SET</code> command can only send one piece of text. There are two ways to write that list.</p>
+<p><strong>The simple way &mdash; separate the values with commas.</strong> Use this when none of your values contain a comma.</p>
+<pre><code>SET app.region = 'EMEA,APAC,AMER';
+SELECT country, SUM(revenue) FROM sales WHERE region IN (@region) GROUP BY country;</code></pre>
+<p>That filters on three regions: <code>EMEA</code>, <code>APAC</code> and <code>AMER</code>.</p>
+<p><strong>The safe way &mdash; write the list as a JSON array.</strong> Use this whenever a value might contain a comma, a quote, or leading/trailing spaces.</p>
+<pre><code>SET app.city = '["New York, NY","Paris"]';
+SELECT store, SUM(revenue) FROM sales WHERE city IN (@city) GROUP BY store;</code></pre>
+<p>That filters on exactly two cities: <code>New York, NY</code> and <code>Paris</code>.</p>
+<p><strong>Why this matters.</strong> With the simple comma form, <code>'New York, NY,Paris'</code> cannot be told apart from three separate values, so the filter would look for <code>New York</code>, <code>NY</code> and <code>Paris</code> &mdash; three cities that are not what you asked for, and no error to warn you. The JSON array form removes the guesswork: whatever is inside each pair of quotes is one value, commas and all.</p>
+<p><strong>Rules for the JSON form</strong></p>
+<ul>
+<li>Wrap the whole list in square brackets and put each value in double quotes.</li>
+<li>Values must be text or numbers. A <code>true</code>/<code>false</code>, a <code>null</code>, a nested list, or an object is rejected with a clear message, because none of those is a filter value.</li>
+<li>Numbers are treated as text, so <code>[10, 20]</code> and <code>'10,20'</code> filter identically.</li>
+<li>The list must contain at least one value. An empty list is rejected &mdash; there is no such thing as a filter on nothing.</li>
+<li>If the text starts with <code>[</code> <strong>or</strong> ends with <code>]</code>, it is treated as attempted JSON. Malformed or partial arrays fail with an error naming the parameter rather than quietly falling back to comma splitting.</li>
+</ul>
+<p><strong>Tip.</strong> Most SQL clients let you build the string in a variable. If your tool escapes quotes differently, run the <code>SET</code> line on its own first and check that the following query returns the row count you expect.</p>
 <h2>Worked example</h2>
 <p>A modeller defines two parameters on the <code>sales</code> model:</p>
 <div class="table-wrapper"><table><thead><tr><th>Name</th><th>Type</th><th>Default</th></tr></thead><tbody><tr><td><code>@region</code></td><td><code>string</code></td><td><code>&quot;ALL&quot;</code></td></tr><tr><td><code>@report_date</code></td><td><code>date_range</code></td><td><code>{&quot;from&quot;: &quot;2025-01-01&quot;, &quot;to&quot;: &quot;2025-12-31&quot;}</code></td></tr></tbody></table></div>

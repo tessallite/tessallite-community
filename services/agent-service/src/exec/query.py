@@ -25,6 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.config.settings import get_settings
 from shared.db.models import Measure, Model
+from shared.security.execute_contract import (
+    row_security_denied_all,
+    security_rules_from_execute_response,
+)
+from src.tools.expressions import _quote_ident
 from src.tools.spec import QueryToolCall
 
 logger = logging.getLogger(__name__)
@@ -115,10 +120,40 @@ class QueryExecution:
     # beyond it (Bug-5351). The narrator must disclose this rather than imply the
     # data is complete.
     truncated: bool = False
+    # Bug-8453: the row-security rule ids the router applied to THIS execution,
+    # and whether they denied EVERY row. Without this the agent cannot tell
+    # "there is no data for that question" (a fact about the business) from
+    # "your row-security policy grants you no rows" (a fact about the caller's
+    # permissions) — and it asserted the former, which is a false statement to
+    # a business user, not merely a missing hint. Rule IDS only; never predicate
+    # SQL, so surfacing it discloses no data and no policy logic.
+    security_rules_applied: tuple[str, ...] = ()
+    row_security_denied: bool = False
 
 
 class QueryExecutionError(RuntimeError):
     """Wraps query-router 4xx/5xx so the pipeline can refuse politely."""
+
+
+class RowSecurityDeniedQueryError(QueryExecutionError):
+    """Bug-8453 / R2 finding B2 — row security denied the caller EVERY row.
+
+    Raised by the ``execute_query`` chokepoint itself rather than left to each
+    caller to notice. There are three call sites (direct query, compound step,
+    recipe step) and only the direct one rendered the denial; the other two
+    consumed the result as data. A deny-all rewrites the query to
+    ``... WHERE 0 = 1``, over which ``COUNT(*)`` still returns a row containing
+    **0**, so a denied step fed a real-looking zero into a combine expression
+    and the agent narrated e.g. "you had 0 orders this period" -- an
+    authoritative false statement about the business, the exact defect
+    Bug-8453 set out to remove from the direct path.
+
+    Subclasses ``QueryExecutionError`` deliberately: both other call sites
+    already catch that and REFUSE, so they inherit fail-closed behaviour rather
+    than needing to remember it, and so does any future caller. A caller that
+    genuinely renders the denial (the direct path, which has narration for it)
+    opts out with ``allow_row_security_denial=True``.
+    """
 
 
 class ModelNotAllowListedError(QueryExecutionError):
@@ -252,10 +287,6 @@ def enforce_execution_scope(
                 + ", ".join(violations)
             )
     return model_uuid
-
-
-def _quote_ident(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
 
 
 def _quote_value(v: Any) -> str:
@@ -395,11 +426,16 @@ async def execute_query(
     jwt_token: str,
     *,
     allowed_model_ids: Collection[UUID],
-    persona_scopes: Mapping[UUID, PersonaFieldScope] | None = None,
+    persona_scopes: Mapping[UUID, PersonaFieldScope] | None,
+    allow_row_security_denial: bool = False,
 ) -> QueryExecution:
     # F-023-07 / F-023-08 — every execution path (direct query, compound
     # step, recipe step) flows through this one enforcement point. The
-    # caller cannot opt out: allowed_model_ids is mandatory.
+    # caller cannot opt out: allowed_model_ids is mandatory. ``persona_scopes``
+    # is the agent-service ProjectPersona field/model scope; it is deliberately
+    # local to this chokepoint and is not serialized as query-router's model
+    # Persona ``persona_id``. Query-router derives its independent model persona
+    # and RLS scope from the authenticated JWT on the request.
     model_uuid = enforce_execution_scope(
         call,
         allowed_model_ids=allowed_model_ids,
@@ -424,8 +460,16 @@ async def execute_query(
     body = {
         "model_id": str(model_uuid),
         "raw_query": sql,
+        # protocol stays "jdbc" -- the parser's strict-syntax and GROUP BY
+        # enforcement branches key off protocol == "jdbc" (see
+        # query-router/src/api/routes.py::_parse); agent-generated SQL is
+        # the same dialect and must not skip that strictness. client_kind
+        # carries the "agent" observability label instead (matches the
+        # headless/plugin client_kind pattern), so QueryLog/metrics can
+        # attribute agent-service traffic without weakening parsing.
         "protocol": "jdbc",
         "include_hidden": False,
+        "client_kind": "agent",
     }
     headers = {"Authorization": f"Bearer {jwt_token}"} if jwt_token else {}
     try:
@@ -443,6 +487,21 @@ async def execute_query(
     data = resp.json()
     # M-001 — the SQL over-fetched cap+1; trim the sentinel and prove truncation.
     rows, truncated = _trim_overfetch(list(data.get("rows") or []), effective_limit(call))
+    # Bug-8453: classify through the shared execute contract, never by testing
+    # "rows is empty" (a deny-all rewrites to WHERE 0 = 1, over which COUNT(*)
+    # still returns a row containing 0).
+    _security_rules = security_rules_from_execute_response(data)
+    _denied = row_security_denied_all(_security_rules)
+    if _denied and not allow_row_security_denial:
+        # Fail closed at the chokepoint (R2 finding B2). Only a caller that can
+        # actually TELL the user about the restriction may proceed with a
+        # denied execution; everyone else must refuse rather than treat
+        # ``WHERE 0 = 1`` output as a measurement.
+        raise RowSecurityDeniedQueryError(
+            "Row-level security denies you access to every row of this model, "
+            "so no result can be produced. This is a permissions restriction, "
+            "not an absence of data."
+        )
     return QueryExecution(
         sql=sql,
         columns=list(data.get("columns") or []),
@@ -454,4 +513,6 @@ async def execute_query(
         pocket_id=data.get("pocket_id"),
         execution_ms=int(data.get("execution_ms") or 0),
         truncated=truncated,
+        security_rules_applied=tuple(sorted(_security_rules)),
+        row_security_denied=_denied,
     )

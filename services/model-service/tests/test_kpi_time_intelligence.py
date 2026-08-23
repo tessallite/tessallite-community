@@ -162,8 +162,13 @@ class TestCompilerVariantIntegration:
         assert "LEAD" in result.select_expr
 
     def test_cagr_produces_power(self):
+        # Bug-6645: CAGR requires month or coarser grain. Supply "year"
+        # via the third argument so the SQL emitter can produce the POWER
+        # expression. Without a grain, day is assumed and rejected.
         ctx = CompilerContext(time_column="order_date")
-        result = compile_expression('cagr(measure("Revenue"), literal(3))', ctx)
+        result = compile_expression(
+            'cagr(measure("Revenue"), literal(3), "year")', ctx
+        )
         assert "POWER" in result.select_expr
 
     def test_pct_change_produces_lag_nullif(self):
@@ -210,14 +215,20 @@ class TestVariantHandlers:
         assert '"order_date"' in result.sql
 
     def test_cagr_handler(self):
+        # Bug-6645: CAGR requires month or coarser grain.
         b = VariantBinding(
             base_expression='SUM("Revenue")',
             fact_date_column='"order_date"',
             n=3,
+            time_grain="year",
         )
         result = emit_variant_expression("cagr", b)
         assert "POWER" in result.sql
-        assert "NULLIF" in result.sql
+        # The zero/negative-base guard is a CASE ... THEN NULL wrapper
+        # (POWER over a non-positive base would be NaN/error, which NULLIF
+        # alone could not prevent).
+        assert "CASE WHEN" in result.sql
+        assert "THEN NULL" in result.sql
 
     def test_pct_change_handler(self):
         b = VariantBinding(

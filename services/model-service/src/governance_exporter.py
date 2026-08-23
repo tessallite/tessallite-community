@@ -9,6 +9,8 @@ Phase 3 (separate):    mapper → platform-specific payload.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from uuid import UUID
 
@@ -22,8 +24,18 @@ from shared.db.models import (
     Project,
     downstream_asset_columns,
 )
-from shared.model_snapshot.governance_graph import GovernanceEdge, GovernanceGraph, GovernanceNode
-from shared.model_snapshot.serialiser import snapshot_model
+from shared.model_snapshot.governance_graph import (
+    GovernanceEdge,
+    GovernanceGraph,
+    GovernanceNode,
+    GovernanceSnapshotIdentity,
+)
+from shared.model_snapshot.consistent_read import consistent_snapshot
+from shared.semantic.calculated_expression import (
+    ExpressionValidationError,
+    parse_expression,
+)
+from shared.semantic.kpi_expression import extract_measure_names
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +70,9 @@ EDGE_DERIVED_FROM = "derived_from"
 EDGE_GOVERNED_BY_TERM = "governed_by_term"
 EDGE_PRODUCES_AGGREGATE = "produces_aggregate"
 EDGE_MATERIALIZED_TO = "materialized_to"
-EDGE_CONSUMED_BY = "consumed_by"
+EDGE_CONSUMED_BY = "consumed_by"  # deprecated alias kept for backward compat
+EDGE_CONSUMED_BY_MODEL = "consumed_by_model"
+EDGE_CONSUMED_BY_COLUMN = "consumed_by_column"
 EDGE_FEEDS_SEMANTIC = "feeds_semantic_field"
 EDGE_USES_MEASURE = "uses_measure"
 EDGE_CLASSIFIED_BY = "classified_by"
@@ -82,19 +96,39 @@ def _display(obj: dict, fields: tuple[str, ...] = ("display_name", "name")) -> s
     return obj.get("id", "?")
 
 
+def _snapshot_content_hash(snap: dict) -> str:
+    """Stable SHA-256 over the exported snapshot payload (F-035-06).
+
+    Identifies the exact content that produced a governance export so a
+    sync-history row can prove which model state was exported — even for a
+    draft export that carries no deployed-version id.
+    """
+    raw = json.dumps(snap, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 async def _snapshot_for_export(
     db: AsyncSession,
     *,
     project_id: UUID,
     model_id: UUID,
     export_draft: bool,
-) -> dict:
+) -> tuple[dict, GovernanceSnapshotIdentity]:
     model = await db.get(Model, model_id)
     if model is None or model.project_id != project_id:
         raise GovernanceExportUnavailable(f"Model {model_id} not found")
 
     if export_draft:
-        return await snapshot_model(model_id, db)
+        # Bug-8380: snapshot under REPEATABLE READ so a concurrent definition
+        # writer cannot produce a mixed-time-state governance export.
+        _tenant_id = db.info.get("tenant_id", "")
+        snap = await consistent_snapshot(_tenant_id, model_id)
+        identity = GovernanceSnapshotIdentity(
+            deployed_version_id=None,
+            export_draft=True,
+            content_hash=_snapshot_content_hash(snap),
+        )
+        return snap, identity
 
     if model.deployed_version_id is None:
         raise GovernanceExportUnavailable(
@@ -109,7 +143,12 @@ async def _snapshot_for_export(
 
     snap = dict(version.snapshot_json)
     snap["exported_deployed_version_id"] = str(model.deployed_version_id)
-    return snap
+    identity = GovernanceSnapshotIdentity(
+        deployed_version_id=str(model.deployed_version_id),
+        export_draft=False,
+        content_hash=_snapshot_content_hash(snap),
+    )
+    return snap, identity
 
 
 def _iter_measure_refs(obj: object) -> set[str]:
@@ -152,9 +191,14 @@ async def build_governance_graph(
     """
     nodes: list[GovernanceNode] = []
     edges: list[GovernanceEdge] = []
+    # F-035-01: governance warnings raised while resolving expression lineage
+    # (an expression that will not parse, or a referenced measure name that
+    # cannot be resolved). Attached to the graph so preview/sync surface them
+    # instead of silently dropping the dependency.
+    expression_warnings: list[dict] = []
 
     # ---- snapshot ---------------------------------------------------------
-    snap = await _snapshot_for_export(
+    snap, snapshot_identity = await _snapshot_for_export(
         db,
         project_id=project_id,
         model_id=model_id,
@@ -175,10 +219,15 @@ async def build_governance_graph(
     lineage_mappings: list[dict] = snap.get("lineage_mappings", [])
 
     # ---- project (domain) node -------------------------------------------
+    # F-035-02: key the domain node on the stable project UUID, not the mutable
+    # slug. Every other node type already uses its UUID; keying the project on
+    # its slug meant a project rename forked the remote identity and stranded
+    # the old lineage. The slug remains a human-readable display property.
     project = await db.get(Project, project_id)
+    project_node_key = _skey("domain", str(project_id))
     if project:
         nodes.append(GovernanceNode(
-            stable_key=_skey(project_slug or project.slug),
+            stable_key=project_node_key,
             object_type=NODE_DOMAIN,
             object_id=str(project.id),
             label=project.display_name,
@@ -186,7 +235,9 @@ async def build_governance_graph(
         ))
 
     # ---- model node -------------------------------------------------------
-    model_node_key = _skey(project_slug or "project", model_slug or model_dict.get("slug", ""))
+    # F-035-02: key the model node on the stable model UUID, not the
+    # project.model slug pair. The slug pair is preserved as a display property.
+    model_node_key = _skey("model", str(model_dict["id"]))
     nodes.append(GovernanceNode(
         stable_key=model_node_key,
         object_type=NODE_SEMANTIC_MODEL,
@@ -202,8 +253,8 @@ async def build_governance_graph(
     ))
     if project:
         edges.append(GovernanceEdge(
-            stable_key=_skey(project_slug or project.slug, "contains", model_node_key),
-            source_key=_skey(project_slug or project.slug),
+            stable_key=_skey(project_node_key, "contains", model_node_key),
+            source_key=project_node_key,
             target_key=model_node_key,
             relationship_type=EDGE_CONTAINS,
         ))
@@ -342,6 +393,27 @@ async def build_governance_graph(
 
     # ---- measure nodes + column → measure edges --------------------------
     meas_keys: dict[str, str] = {}
+    # F-035-01: resolve measure references in calculated-measure and KPI
+    # expressions BY NAME. Build the full name -> stable-key map for every
+    # measure up front (independent of iteration order and the hidden filter)
+    # so a calculated measure can resolve a base measure that appears later
+    # in the list. Resolution is BY NAME ONLY — not display_name — to match
+    # the engine's canonical resolution in model_validator.py, kpi_expression,
+    # and snapshot_resolver (Fable-R2: display_name fallback would create
+    # phantom edges the engine would reject and suppress the F-035-01
+    # governance warning). The orphan-edge filter at the end drops edges
+    # whose target node was excluded from the graph; a reference to an
+    # excluded hidden measure emits an explicit DEPENDENCY_EXCLUDED warning
+    # (Fable-R3).
+    measure_key_by_name: dict[str, str] = {}
+    # Also track ALL measure keys (including hidden) to detect references
+    # to excluded measures vs genuinely missing ones (Fable-R3).
+    _all_measure_keys: dict[str, str] = {}
+    for m in measures:
+        m_key = _skey("measure", str(m["id"]))
+        if m.get("name"):
+            measure_key_by_name[str(m["name"])] = m_key
+        _all_measure_keys[str(m["id"])] = m_key
     if include_business_assets:
         for m in measures:
             if not include_hidden_objects and m.get("is_hidden"):
@@ -391,6 +463,66 @@ async def build_governance_graph(
                         target_key=base_key,
                         relationship_type=EDGE_DERIVED_FROM,
                     ))
+            # F-035-01: calculated-measure → referenced measures (measure("name")
+            # dependency edges). Parse the expression with the SAME canonical
+            # extractor the model validator/rewriter use, so the governance
+            # graph agrees with actual semantic dependencies. A calculated
+            # measure references other measures BY NAME.
+            if m.get("measure_type") == "calculated" and m.get("expression"):
+                m_label = _display(m)
+                try:
+                    parsed = parse_expression(str(m["expression"]))
+                    ref_names = parsed.referenced_names
+                except ExpressionValidationError as exc:
+                    expression_warnings.append({
+                        "code": "CALCULATED_MEASURE_UNPARSED",
+                        "message": (
+                            f"Calculated measure '{m_label}' expression could not "
+                            f"be parsed; its measure dependencies are not exported."
+                        ),
+                        "object": m_label,
+                        "detail": str(exc),
+                    })
+                    ref_names = ()
+                for ref_name in dict.fromkeys(ref_names):
+                    ref_key = measure_key_by_name.get(str(ref_name))
+                    if ref_key and ref_key != m_key:
+                        # Fable-R3: only emit the edge if the target node
+                        # will actually be present in the graph (i.e. in
+                        # meas_keys). If the referenced measure exists but
+                        # was excluded (hidden), warn explicitly instead of
+                        # silently relying on the orphan-edge filter.
+                        if ref_key in meas_keys.values():
+                            edges.append(GovernanceEdge(
+                                stable_key=_skey(m_key, "derived_from", ref_key),
+                                source_key=m_key,
+                                target_key=ref_key,
+                                relationship_type=EDGE_DERIVED_FROM,
+                            ))
+                        else:
+                            expression_warnings.append({
+                                "code": "DEPENDENCY_EXCLUDED",
+                                "message": (
+                                    f"Calculated measure '{m_label}' references "
+                                    f"measure '{ref_name}', which exists but is "
+                                    f"excluded from this export (hidden); the "
+                                    f"dependency edge is not exported."
+                                ),
+                                "object": m_label,
+                                "detail": str(ref_name),
+                            })
+                    elif ref_key is None:
+                        expression_warnings.append({
+                            "code": "MEASURE_EXPRESSION_UNRESOLVED",
+                            "message": (
+                                f"Calculated measure '{m_label}' references "
+                                f"measure '{ref_name}', which could not be "
+                                f"resolved in this model; the dependency edge "
+                                f"is not exported."
+                            ),
+                            "object": m_label,
+                            "detail": str(ref_name),
+                        })
 
     # ---- KPI nodes + KPI → measure edges ---------------------------------
     if include_business_assets:
@@ -422,9 +554,82 @@ async def build_governance_graph(
                 if v
             }
             measure_refs.update(_iter_measure_refs(k.get("business_definition")))
+            # resolved measure stable-keys the KPI already links via stored FKs.
+            linked_measure_keys: set[str] = set()
             for measure_id in sorted(measure_refs):
                 m_key = meas_keys.get(measure_id)
                 if m_key:
+                    linked_measure_keys.add(m_key)
+                    edges.append(GovernanceEdge(
+                        stable_key=_skey(k_key, "uses", m_key),
+                        source_key=k_key,
+                        target_key=m_key,
+                        relationship_type=EDGE_USES_MEASURE,
+                    ))
+            # F-035-01: KPI → measure edges from the KPI *expression*. Many KPIs
+            # (e.g. safe_div(measure("A"), measure("B"))) reference measures
+            # ONLY through their expression string, with no value/goal/target
+            # FK. Parse the expression with the canonical KPI extractor and
+            # emit uses_measure edges for each referenced measure name, so a
+            # governance user can trace the KPI to the measures that determine
+            # it. ``extract_measure_names`` returns [] on an empty/unparseable
+            # expression; emit an explicit warning in that case.
+            kpi_expr = k.get("expression")
+            if kpi_expr:
+                k_label = _display(k)
+                expr_ref_names = extract_measure_names(str(kpi_expr))
+                if not expr_ref_names and str(kpi_expr).strip():
+                    # Non-empty expression that yielded no measure refs: either
+                    # it references only other KPIs, or it did not parse. Warn
+                    # so an incomplete lineage is disclosed, not silent.
+                    from shared.semantic.kpi_expression import (
+                        KPIExpressionError,
+                        parse_kpi_expression,
+                    )
+                    try:
+                        parse_kpi_expression(str(kpi_expr))
+                    except KPIExpressionError as exc:
+                        expression_warnings.append({
+                            "code": "KPI_EXPRESSION_UNPARSED",
+                            "message": (
+                                f"KPI '{k_label}' expression could not be parsed; "
+                                f"its measure dependencies are not exported."
+                            ),
+                            "object": k_label,
+                            "detail": str(exc),
+                        })
+                for ref_name in expr_ref_names:
+                    m_key = measure_key_by_name.get(str(ref_name))
+                    if m_key is None:
+                        expression_warnings.append({
+                            "code": "KPI_EXPRESSION_UNRESOLVED",
+                            "message": (
+                                f"KPI '{k_label}' references measure "
+                                f"'{ref_name}', which could not be resolved in "
+                                f"this model; the dependency edge is not exported."
+                            ),
+                            "object": k_label,
+                            "detail": str(ref_name),
+                        })
+                        continue
+                    # Fable-R3: if the resolved measure is excluded from the
+                    # graph (hidden), warn instead of silently dropping.
+                    if m_key not in meas_keys.values():
+                        expression_warnings.append({
+                            "code": "DEPENDENCY_EXCLUDED",
+                            "message": (
+                                f"KPI '{k_label}' references measure "
+                                f"'{ref_name}', which exists but is excluded "
+                                f"from this export (hidden); the dependency "
+                                f"edge is not exported."
+                            ),
+                            "object": k_label,
+                            "detail": str(ref_name),
+                        })
+                        continue
+                    if m_key in linked_measure_keys:
+                        continue
+                    linked_measure_keys.add(m_key)
                     edges.append(GovernanceEdge(
                         stable_key=_skey(k_key, "uses", m_key),
                         source_key=k_key,
@@ -540,9 +745,9 @@ async def build_governance_graph(
         da_col_links: dict[str, set[str]] = {}
         if da_ids:
             links_q = await db.execute(
-                select(downstream_asset_columns.c.downstream_asset_id,
+                select(downstream_asset_columns.c.asset_id,
                        downstream_asset_columns.c.model_column_id)
-                .where(downstream_asset_columns.c.downstream_asset_id.in_(da_ids))
+                .where(downstream_asset_columns.c.asset_id.in_(da_ids))
             )
             for da_id, col_id in links_q.all():
                 da_col_links.setdefault(str(da_id), set()).add(str(col_id))
@@ -561,22 +766,22 @@ async def build_governance_graph(
                     "notes": da.notes,
                 },
             ))
-            # model → downstream asset
+            # model → downstream asset (asset consumes the model)
             edges.append(GovernanceEdge(
                 stable_key=_skey(model_node_key, "consumed_by", da_key),
                 source_key=model_node_key,
                 target_key=da_key,
-                relationship_type=EDGE_CONSUMED_BY,
+                relationship_type=EDGE_CONSUMED_BY_MODEL,
             ))
-            # downstream asset → specific columns
+            # downstream asset → specific columns (asset uses a column)
             for col_id in da_col_links.get(str(da.id), set()):
                 c_key = column_keys.get(col_id)
                 if c_key:
                     edges.append(GovernanceEdge(
-                        stable_key=_skey(da_key, "uses", c_key),
+                        stable_key=_skey(da_key, "uses_column", c_key),
                         source_key=da_key,
                         target_key=c_key,
-                        relationship_type=EDGE_CONSUMED_BY,
+                        relationship_type=EDGE_CONSUMED_BY_COLUMN,
                     ))
 
     # ---- lineage edges (source column → semantic field) ------------------
@@ -605,9 +810,25 @@ async def build_governance_graph(
                     ))
 
     node_keys = {node.stable_key for node in nodes}
-    edges = [
-        edge for edge in edges
-        if edge.source_key in node_keys and edge.target_key in node_keys
-    ]
+    # Bug-6493: collapse duplicate edge stable keys (e.g. two lineage mappings
+    # that resolve to the same source column -> semantic field pair, differing
+    # only on non-key properties like aggregate_col_id) so edge counts are not
+    # inflated and a live push does not violate the object-mapping unique
+    # constraint on stable_key. Membership is filtered here too; the first
+    # membership-valid occurrence of each stable key wins.
+    seen_edge_keys: set[str] = set()
+    deduped_edges: list[GovernanceEdge] = []
+    for edge in edges:
+        if edge.source_key not in node_keys or edge.target_key not in node_keys:
+            continue
+        if edge.stable_key in seen_edge_keys:
+            continue
+        seen_edge_keys.add(edge.stable_key)
+        deduped_edges.append(edge)
 
-    return GovernanceGraph(nodes=nodes, edges=edges)
+    return GovernanceGraph(
+        nodes=nodes,
+        edges=deduped_edges,
+        snapshot=snapshot_identity,
+        export_warnings=expression_warnings,
+    )

@@ -27,6 +27,7 @@ consumers. All readers go through :func:`list_open_alerts`.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -61,11 +62,40 @@ CATEGORY_REFRESH_FAILURE = "refresh_failure"
 CATEGORY_OPTIMISER_FAILURE = "optimiser_failure"
 CATEGORY_QUERY_FALLBACK = "query_fallback"
 CATEGORY_SCHEMA_DRIFT = "schema_drift"
+# Bug-8768: the periodic full reconciliation found sealed aggregate buckets that
+# diverged from a fresh full rebuild — the source broke the append-only contract
+# an incremental refresh policy declared. Distinct from CATEGORY_REFRESH_FAILURE
+# (a run that errored) and CATEGORY_SCHEMA_DRIFT (model definitions vs deployed
+# snapshot): here the run SUCCEEDED but proved historical data was silently wrong.
+CATEGORY_AGGREGATE_DRIFT = "aggregate_drift"
 
 OBJECT_DIMENSION = "dimension"
 OBJECT_MEASURE = "measure"
 OBJECT_AGGREGATE = "aggregate"
 OBJECT_MODEL = "model"
+# Bug-8114: pocket tables are a distinct acceleration-asset lifecycle from
+# aggregates (operators need to tell "aggregate refresh failed" from "pocket
+# refresh failed" apart to route incidents correctly), so pocket refresh
+# failures get their own related_object_type rather than reusing
+# OBJECT_AGGREGATE.
+OBJECT_POCKET = "pocket"
+
+
+def _compute_detail_hash(title: str, detail: Optional[str] = None) -> str:
+    """Bug-7453: derive a stable hash from the alert content.
+
+    When both ``related_object_type`` and ``related_object_id`` are NULL
+    (model-wide alerts), the NULLS NOT DISTINCT dedup index collapses all
+    rows with the same ``(model_id, category)``. The ``detail_hash``
+    column participates in the dedup index to keep distinct alert content
+    separate. The hash is computed from ``title`` (always present) plus
+    ``detail`` (when provided) so two different failure reasons for the
+    same category create separate alert rows.
+    """
+    payload = title
+    if detail:
+        payload = f"{title}\x00{detail}"
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()[:32]
 
 
 async def record_alert(
@@ -97,6 +127,11 @@ async def record_alert(
 
     now = datetime.now(timezone.utc)
 
+    # Bug-7453: compute a content-derived hash so model-wide alerts
+    # (NULL object type/id) with different content stay distinct in the
+    # dedup index.
+    d_hash = _compute_detail_hash(title, detail)
+
     stmt = (
         select(ModelAlert)
         .where(ModelAlert.model_id == model_id)
@@ -112,6 +147,8 @@ async def record_alert(
         stmt = stmt.where(ModelAlert.related_object_id.is_(None))
     else:
         stmt = stmt.where(ModelAlert.related_object_id == related_object_id)
+    # Bug-7453: include detail_hash in the dedup lookup.
+    stmt = stmt.where(ModelAlert.detail_hash == d_hash)
 
     existing = (await db.execute(stmt.limit(1))).scalar_one_or_none()
 
@@ -132,6 +169,7 @@ async def record_alert(
         category=category,
         title=title,
         detail=detail,
+        detail_hash=d_hash,
         related_object_type=related_object_type,
         related_object_id=related_object_id,
         first_seen_at=now,

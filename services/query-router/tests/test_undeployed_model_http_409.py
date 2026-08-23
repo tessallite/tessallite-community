@@ -97,21 +97,20 @@ async def test_binder_raises_model_not_deployed_for_undeployed_model():
 async def test_binder_returns_normally_when_model_is_deployed():
     from src.semantic.binder import bind_query_to_model
 
+    from src.semantic.snapshot_resolver import DeployedShape
+
     model = types.SimpleNamespace(id="model-1", slug="m", deployed_version_id="v1")
+    shape = DeployedShape(
+        measures=[], dimensions=[], hidden_column_ids=set(),
+        physical_columns_all=set(), physical_columns_visible=set(),
+        hierarchy_rows=[],
+    )
     db = AsyncMock()
 
     with (
         patch("src.semantic.binder._load_model", new=AsyncMock(return_value=model)),
-        patch("src.semantic.binder._load_measures", new=AsyncMock(return_value=[])),
-        patch("src.semantic.binder._load_dimensions", new=AsyncMock(return_value=[])),
-        patch(
-            "src.semantic.binder._load_hierarchy_level_dimensions",
-            new=AsyncMock(return_value=[]),
-        ),
-        patch(
-            "src.semantic.binder._load_hidden_column_ids",
-            new=AsyncMock(return_value=set()),
-        ),
+        patch("src.semantic.binder.resolve_deployed_shape",
+              new=AsyncMock(return_value=shape)),
     ):
         bound = await bind_query_to_model(_logical_query(), db)
 

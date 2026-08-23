@@ -13,14 +13,14 @@ review (S-DRILL run):
   honours the same persona scope as the main query and that the 403
   propagates verbatim (no silent fallback that could leak the column).
 
-* **F-019-17** — the drill embeds ``LIMIT n+1 OFFSET m``. Row security is
+* **F-019-17** — the drill embeds ``LIMIT n+1`` after a keyset predicate. Row security is
   applied by the execute pipeline via **per-scan WHERE injection**
   (``_inject_security_where``), which ANDs the security predicate into the
-  same SELECT that scans the physical table — *before* GROUP BY / LIMIT /
-  OFFSET (Bug-915). The review's premise (an outer ``SELECT * FROM (<planned
+  same SELECT that scans the physical table — *before* GROUP BY / keyset /
+  LIMIT (Bug-915). The review's premise (an outer ``SELECT * FROM (<planned
   -with-LIMIT>) WHERE <pred>`` wrap, inner LIMIT applied first) no longer
   describes the implementation since the F-007-01 rewrite. These tests prove
-  the predicate lands before LIMIT/OFFSET on both drill SQL shapes (leaf and
+  the predicate lands before LIMIT on both drill SQL shapes (leaf and
   hierarchy step-down) — so a page returns up to ``limit`` *allowed* rows,
   ``has_more`` is keyed on the post-security row count, and no allowed row
   beyond the window is unreachable. The predicate is column-name scoped on
@@ -39,7 +39,7 @@ from fastapi import HTTPException
 from shared.security import Principal
 from shared.security.predicate_compiler import CompiledPredicate
 from src.api.drill_routes import DrillThroughRequest, _handle_drill_through
-from src.drill.semantic_builder import encode_cursor
+from src.drill.cursor import CursorOrderTerm, DrillCursorSpec
 from src.routing.router import _inject_security_where
 
 # Async tests opt in individually; the predicate-shape tests below are
@@ -57,9 +57,13 @@ def _pred(expr: str = "region_code = 'NORTH'") -> CompiledPredicate:
 def _build_sql_return(**overrides):
     defaults = dict(
         sql='SELECT "region", "amount" FROM "modely" '
-            'ORDER BY "region", "amount" LIMIT 3 OFFSET 0',
+            'ORDER BY "region", "amount" LIMIT 3',
         model_id_str=str(_uuid()),
-        offset=0,
+        cursor_spec=DrillCursorSpec.build(
+            scope={"fixture": "security"},
+            order_terms=[CursorOrderTerm("region"), CursorOrderTerm("amount", True)],
+            stable=True,
+        ),
         effective_limit=2,
         drill_dim=None,
         drill_mode="leaf",
@@ -72,7 +76,7 @@ def _build_sql_return(**overrides):
     return (
         defaults["sql"],
         defaults["model_id_str"],
-        defaults["offset"],
+        defaults["cursor_spec"],
         defaults["effective_limit"],
         defaults["drill_dim"],
         defaults["drill_mode"],
@@ -96,24 +100,23 @@ def _execute_response(rows=None, columns=None):
 
 
 # ---------------------------------------------------------------------------
-# F-019-17 — RLS predicate lands BEFORE LIMIT/OFFSET on drill SQL shapes
+# F-019-17 — RLS predicate lands BEFORE LIMIT on drill SQL shapes
 # ---------------------------------------------------------------------------
 
 
-def test_rls_predicate_before_limit_offset_on_leaf_drill():
-    """Leaf drill: ``SELECT cols FROM t ORDER BY ... LIMIT n+1 OFFSET m``.
+def test_rls_predicate_before_limit_on_leaf_drill():
+    """Leaf drill: ``SELECT cols FROM t ... ORDER BY ... LIMIT n+1``.
 
     The security predicate must be injected into the scan's WHERE, ahead of
-    LIMIT and OFFSET, so the database applies row security *before* paging.
+    LIMIT, so the database applies row security *before* paging.
     """
     sql = (
         'SELECT "region", "amount" FROM "orders" '
-        'ORDER BY "region", "amount" LIMIT 51 OFFSET 50'
+        'ORDER BY "region", "amount" LIMIT 51'
     )
     out = _inject_security_where(sql, _pred())
     assert "WHERE" in out and "NORTH" in out
     assert out.index("NORTH") < out.index("LIMIT")
-    assert out.index("NORTH") < out.index("OFFSET")
 
 
 def test_rls_predicate_before_limit_on_hierarchy_drill():
@@ -124,7 +127,7 @@ def test_rls_predicate_before_limit_on_hierarchy_drill():
     """
     sql = (
         'SELECT "month", SUM("amount") AS "amount" FROM "orders" '
-        'GROUP BY "month" ORDER BY "month" LIMIT 51 OFFSET 0'
+        'GROUP BY "month" ORDER BY "month" LIMIT 51'
     )
     out = _inject_security_where(sql, _pred())
     assert "WHERE" in out and "NORTH" in out
@@ -137,7 +140,7 @@ def test_rls_predicate_scoped_to_scan_not_projection():
     projection — so a drill that does NOT project the security column is
     still filtered (no spurious under-paging, no leak)."""
     # Projection is region/amount only; security column is region_code.
-    sql = 'SELECT "amount" FROM "orders" LIMIT 51 OFFSET 0'
+    sql = 'SELECT "amount" FROM "orders" LIMIT 51'
     out = _inject_security_where(sql, _pred())
     assert "region_code = 'NORTH'" in out
     assert out.index("region_code") < out.index("LIMIT")
@@ -169,7 +172,7 @@ async def test_drill_has_more_keys_on_post_security_row_count():
 
     with (
         patch("src.api.drill_routes.build_drill_sql",
-              new=AsyncMock(return_value=_build_sql_return(effective_limit=2, offset=0))),
+              new=AsyncMock(return_value=_build_sql_return(effective_limit=2))),
         patch("src.api.drill_routes._handle_execute", new=_fake_execute),
     ):
         resp = await _handle_drill_through(
@@ -180,7 +183,10 @@ async def test_drill_has_more_keys_on_post_security_row_count():
     assert resp.page.has_more is True
     assert len(resp.rows) == 2  # full page of allowed rows, n+1 probe trimmed
     assert all(r["region"] == "NORTH" for r in resp.rows)
-    assert resp.page.next_cursor == encode_cursor(2)
+    spec = _build_sql_return(effective_limit=2)[2]
+    decoded = spec.decode(resp.page.next_cursor)
+    assert decoded is not None
+    assert [value.value for value in decoded] == ["NORTH", 2]
 
 
 @pytest.mark.asyncio
@@ -198,7 +204,7 @@ async def test_drill_last_page_has_more_false_with_fewer_allowed_rows():
 
     with (
         patch("src.api.drill_routes.build_drill_sql",
-              new=AsyncMock(return_value=_build_sql_return(effective_limit=10, offset=0))),
+              new=AsyncMock(return_value=_build_sql_return(effective_limit=10))),
         patch("src.api.drill_routes._handle_execute", new=_fake_execute),
     ):
         resp = await _handle_drill_through(_uuid(), body, db)

@@ -38,6 +38,12 @@ class MeasureRoleMetadata:
     variant_kind: str | None = None
     variant_of_measure: str | None = None
     is_additive: bool | None = None
+    # Bug-8257 (deep-review R6 finding 3): the additivity RULES this
+    # metadata feeds are a documented mirror of
+    # ``shared...dimensions_measures.derive_is_additive``. A semi-additive
+    # behaviour is one of those rules, so the mirror has to carry it or the
+    # catalogue announces a balance measure as additive.
+    semi_additive_behavior: str | None = None
     time_window_kind: str | None = None
     window_size: int | None = None
     calendar_model_table_id: str | None = None
@@ -45,6 +51,8 @@ class MeasureRoleMetadata:
     date_dimension_column_id: str | None = None
     resolved_calendar_id: str | None = None
     resolved_date_col_id: str | None = None
+    cross_model_source_model_id: str | None = None
+    cross_model_source_measure_id: str | None = None
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -88,6 +96,11 @@ class MeasureRoleMetadata:
     @property
     def additivity_notes(self) -> list[str]:
         notes: list[str] = []
+        if self.semi_additive_behavior:
+            # A semi-additive measure (for example, a closing balance) is not
+            # safe to stack or re-aggregate across the semi-additive axis even
+            # when a legacy persisted row still says ``is_additive=True``.
+            notes.append("semi_additive_treated_non_additive")
         if self.is_time_variant and self.is_additive is not True:
             notes.append("time_variant_treated_non_additive")
         if self.measure_type == "calculated" and self.is_additive is not True:
@@ -101,6 +114,8 @@ class MeasureRoleMetadata:
         source_kind = values.get("source_kind") or "unknown"
         if variant_kind:
             source_kind = "time_variant"
+        elif values.get("cross_model_source_model_id") or values.get("cross_model_source_measure_id"):
+            source_kind = "cross_model"
         elif values.get("user_defined_attribute_name") or values.get("user_defined_attribute_id"):
             source_kind = "user_defined_attribute"
         elif values.get("expression"):
@@ -119,6 +134,7 @@ class MeasureRoleMetadata:
             variant_of_measure=values.get("variant_of_measure")
             or values.get("variant_of_measure_id"),
             is_additive=values.get("is_additive"),
+            semi_additive_behavior=values.get("semi_additive_behavior"),
             time_window_kind=values.get("time_window_kind"),
             window_size=window_size if isinstance(window_size, int) else None,
             calendar_model_table_id=values.get("calendar_model_table_id"),
@@ -126,6 +142,8 @@ class MeasureRoleMetadata:
             date_dimension_column_id=values.get("date_dimension_column_id"),
             resolved_calendar_id=values.get("resolved_calendar_id"),
             resolved_date_col_id=values.get("resolved_date_col_id"),
+            cross_model_source_model_id=values.get("cross_model_source_model_id"),
+            cross_model_source_measure_id=values.get("cross_model_source_measure_id"),
             notes=list(values.get("notes") or []),
         )
 
@@ -144,6 +162,8 @@ class MeasureRoleMetadata:
             "needs_calendar": self.needs_calendar,
             "window_size": self.resolved_window_size,
             "is_additive": self.is_additive,
+            "cross_model_source_model_id": self.cross_model_source_model_id,
+            "cross_model_source_measure_id": self.cross_model_source_measure_id,
             "notes": [*self.notes, *self.additivity_notes],
         }
 
@@ -178,4 +198,3 @@ TIME_VARIANT_TRACE = {
     "canonical_order": list(CANONICAL_TIME_VARIANT_ORDER),
     "aliases": dict(TIME_VARIANT_ALIASES),
 }
-

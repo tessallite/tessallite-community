@@ -27,6 +27,7 @@ from src.api.plugin import (
     PluginFilter,
     _build_filters,
     _compute_fingerprint,
+    _resolve_dimension_data_types,
 )
 from src.security.persona_gate import (
     enforce_persona,
@@ -140,6 +141,56 @@ def _fake_db(personas: list | None = None):
 # ---------------------------------------------------------------------------
 # Filter validation (_build_filters)
 # ---------------------------------------------------------------------------
+
+
+class TestResolveDimensionDataTypesSnapshotPin:
+    """F-013-11 (Bug-8521): a DEPLOYED model resolves plugin dimension types
+    from the pinned snapshot's columns_by_id, never from a live ModelColumn
+    read, so a draft column-type edit cannot change the plugin's type chips
+    before the next Deploy."""
+
+    @pytest.mark.asyncio
+    async def test_deployed_reads_snapshot_not_live(self):
+        col_id = uuid.uuid4()
+        dim = types.SimpleNamespace(id=uuid.uuid4(), source_column_id=col_id)
+        # Snapshot pins the column type as "date".
+        shape = types.SimpleNamespace(
+            columns_by_id={str(col_id): {"data_type": "date"}}
+        )
+        # Live db would (wrongly) report "string"; it must NOT be consulted.
+        db = AsyncMock()
+        db.execute.side_effect = AssertionError("live ModelColumn read on deployed")
+
+        out = await _resolve_dimension_data_types(db, [dim], deployed_shape=shape)
+
+        assert out[dim.id] == "date"
+        db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deployed_missing_column_is_none(self):
+        col_id = uuid.uuid4()
+        dim = types.SimpleNamespace(id=uuid.uuid4(), source_column_id=col_id)
+        shape = types.SimpleNamespace(columns_by_id={})
+        db = AsyncMock()
+
+        out = await _resolve_dimension_data_types(db, [dim], deployed_shape=shape)
+
+        assert out[dim.id] is None
+        db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_undeployed_uses_live_join(self):
+        col_id = uuid.uuid4()
+        dim = types.SimpleNamespace(id=uuid.uuid4(), source_column_id=col_id)
+        result = MagicMock()
+        result.all.return_value = [(col_id, "integer")]
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=result)
+
+        out = await _resolve_dimension_data_types(db, [dim], deployed_shape=None)
+
+        assert out[dim.id] == "integer"
+        db.execute.assert_awaited_once()
 
 
 class TestBuildFilters:
@@ -280,7 +331,10 @@ class TestPluginPersonaEnforcement:
         with pytest.raises(HTTPException) as exc:
             enforce_persona(p, bound)
         assert exc.value.status_code == 403
-        assert exc.value.detail["object_name"] == "cost"
+        # F-008-02: the denial fires but does not disclose the object name.
+        assert exc.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"
+        assert "object_name" not in exc.value.detail
+        assert "cost" not in exc.value.detail.get("message", "")
 
     def test_dimension_blocked_by_persona_403(self):
         d_allowed = make_dimension("region")
@@ -291,7 +345,10 @@ class TestPluginPersonaEnforcement:
         with pytest.raises(HTTPException) as exc:
             enforce_persona(p, bound)
         assert exc.value.status_code == 403
-        assert exc.value.detail["object_name"] == "secret"
+        # F-008-02: non-disclosing denial.
+        assert exc.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"
+        assert "object_name" not in exc.value.detail
+        assert "secret" not in exc.value.detail.get("message", "")
 
     def test_allowed_persona_passes(self):
         m = make_measure("revenue")
@@ -537,6 +594,11 @@ def _ep_bound(model=None, dim_specs=None):
     mid = uuid.uuid4()
     bound = MagicMock()
     bound.model = m
+    # F-013-11: these fixtures exercise the LIVE ModelColumn join (they stub
+    # db.execute). A bare MagicMock would make bound.deployed_shape a truthy
+    # mock and route through the snapshot branch; pin None so the live path
+    # runs. The snapshot-pinned path has its own dedicated test below.
+    bound.deployed_shape = None
     bound.resolved_measures = [types.SimpleNamespace(
         id=mid, name="revenue", display_name="Revenue",
         default_agg="sum", format=None,
@@ -846,6 +908,39 @@ class TestPluginEndpoint:
         assert "measure" in resp.json()["detail"].lower()
 
     @pytest.mark.asyncio
+    async def test_non_uuid_model_id_returns_400(self, plugin_client):
+        # Bug-6381: a malformed (non-UUID) model_id must return a clean 400
+        # at the boundary, not a 500 from the downstream UUID parse in
+        # shared.auth.project_access._as_uuid. No DB mock is needed — the
+        # guard fires before any DB / rate-limit work.
+        resp = await plugin_client.post(
+            "/api/v1/plugin/execute",
+            json={
+                "project_id": _EP_PROJECT_ID,
+                "model_id": "not-a-uuid",
+                "measures": ["revenue"],
+            },
+            headers=_ep_auth(),
+        )
+        assert resp.status_code == 400
+        assert "model_id" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_non_uuid_project_id_returns_400(self, plugin_client):
+        # Bug-6381: same guard for a malformed project_id.
+        resp = await plugin_client.post(
+            "/api/v1/plugin/execute",
+            json={
+                "project_id": "12345",
+                "model_id": _EP_MODEL_ID,
+                "measures": ["revenue"],
+            },
+            headers=_ep_auth(),
+        )
+        assert resp.status_code == 400
+        assert "project_id" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
     async def test_response_contract(self, plugin_client):
         model = _ep_model()
         bound = _ep_bound(model)
@@ -886,10 +981,84 @@ class TestPluginEndpoint:
         assert data["query"]["limit"] == 100
 
     @pytest.mark.asyncio
+    async def test_bug_8158_time_dimensions_populated(self, plugin_client):
+        """Bug-8158: ``annotation.timeDimensions`` is POPULATED from the
+        resolved time dimensions, not the literal empty ``{}`` main shipped.
+
+        A dimension flagged ``is_time_dim`` appears in ``timeDimensions`` with
+        its title and physical type; an ordinary dimension does not. Fails
+        pre-fix because ``_build_annotation`` returned ``"timeDimensions": {}``.
+        """
+        model = _ep_model()
+        bound = MagicMock()
+        bound.model = model
+        # F-013-11: exercise the LIVE ModelColumn join (stubbed db.execute);
+        # pin deployed_shape None so the snapshot branch is not taken.
+        bound.deployed_shape = None
+        bound.resolved_measures = [types.SimpleNamespace(
+            id=uuid.uuid4(), name="revenue", display_name="Revenue",
+            default_agg="sum", format=None,
+        )]
+        region_src = uuid.uuid4()
+        date_src = uuid.uuid4()
+        bound.resolved_dimensions = [
+            types.SimpleNamespace(
+                id=uuid.uuid4(), name="region", display_name="Region",
+                source_column_id=region_src, is_time_dim=False,
+            ),
+            types.SimpleNamespace(
+                id=uuid.uuid4(), name="order_date", display_name="Order Date",
+                source_column_id=date_src, is_time_dim=True,
+            ),
+        ]
+        bound.resolved_filters = []
+
+        db = AsyncMock()
+        _stub_dim_types(db, bound, {"region": "string", "order_date": "date"})
+        pipeline = _PipelineMocks(
+            rows=[{"region": "US", "order_date": "2026-01-01", "revenue": 5}],
+            columns=["region", "order_date", "revenue"],
+        )
+
+        with (
+            patch("src.api.plugin.get_tenant_db", _async_gen(db)),
+            patch("src.api.plugin.resolve_execution_persona", AsyncMock(return_value=None)),
+            patch("src.api.plugin.bind_query_to_model", AsyncMock(return_value=bound)),
+            patch("src.api.plugin.route_query", AsyncMock(return_value=MagicMock())),
+            pipeline.applied(),
+        ):
+            resp = await plugin_client.post(
+                "/api/v1/plugin/execute",
+                json={
+                    "project_id": _EP_PROJECT_ID,
+                    "model_id": _EP_MODEL_ID,
+                    "measures": ["revenue"],
+                    "dimensions": ["region", "order_date"],
+                    "limit": 100,
+                },
+                headers=_ep_auth(),
+            )
+
+        assert resp.status_code == 200
+        time_dims = resp.json()["annotation"]["timeDimensions"]
+        # The whole point of Bug-8158: this is no longer an empty map.
+        assert time_dims != {}
+        assert "order_date" in time_dims
+        assert "region" not in time_dims  # ordinary dimension, not a time axis
+        assert time_dims["order_date"]["title"] == "Order Date"
+        assert time_dims["order_date"]["type"] == "date"
+
+    @pytest.mark.asyncio
     async def test_response_carries_route_trace(self, plugin_client):
         """F-025-20: the response must include the route decision (route_type,
         reason, rewritten SQL) so the Excel Query Trace modal can show whether
-        the report hit an aggregate/pocket/source."""
+        the report hit an aggregate/pocket/source.
+
+        Bug-6389: the SQL half of that trace is now entitlement-gated at the
+        ``modeler`` tier, so this asserts the ENTITLED caller still receives the
+        complete trace (the viewer-side withhold is asserted by
+        ``TestBug6389TraceSqlDisclosure``). The F-025-20 intent is unchanged:
+        the trace must be complete for a caller allowed to see it."""
         model = _ep_model()
         bound = _ep_bound(model)
         mock_decision = MagicMock()
@@ -917,17 +1086,111 @@ class TestPluginEndpoint:
                     "measures": ["revenue"],
                     "dimensions": ["region"],
                 },
-                headers=_ep_auth(),
+                headers={"Authorization": f"Bearer {_mint_jwt('tenant_admin')}"},
             )
 
         assert resp.status_code == 200
         route = resp.json()["route"]
         assert route is not None
+        assert route["rewritten_query_redacted"] is False
         assert route["route_type"] == "aggregate"
         assert route["reason"] == "matched daily revenue aggregate"
         assert route["aggregate_id"] == "agg-123"
         assert route["pocket_id"] is None
         assert "SELECT region" in route["rewritten_query"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_field_rejected_422(self, plugin_client):
+        """F-027-01 / Bug-7997: a misspelled top-level field on the plugin
+        request is a 422 naming the field, never silently dropped."""
+        db = AsyncMock()
+        with patch("src.api.plugin.get_tenant_db", _async_gen(db)):
+            resp = await plugin_client.post(
+                "/api/v1/plugin/execute",
+                json={
+                    "project_id": _EP_PROJECT_ID,
+                    "model_id": _EP_MODEL_ID,
+                    "measures": ["revenue"],
+                    "dimentions": ["region"],  # misspelled
+                },
+                headers=_ep_auth(),
+            )
+        assert resp.status_code == 422
+        assert "dimentions" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_capped_result_reports_complete_false(self, plugin_client):
+        """F-027-02 / Bug-7998: when the source returns effective_limit + 1
+        rows (the probe row), the plugin response reports complete=false +
+        has_more=true and trims the page to the requested limit."""
+        model = _ep_model()
+        bound = _ep_bound(model)
+        db = AsyncMock()
+        _stub_dim_types(db, bound, {"region": "string"})
+        # limit=2 -> probe_limit=3 -> source returns 3 rows.
+        rows = [{"region": r, "revenue": i} for i, r in enumerate(["US", "EU", "GB"])]
+        pipeline = _PipelineMocks(rows=rows, columns=["region", "revenue"])
+
+        with (
+            patch("src.api.plugin.get_tenant_db", _async_gen(db)),
+            patch("src.api.plugin.resolve_execution_persona", AsyncMock(return_value=None)),
+            patch("src.api.plugin.bind_query_to_model", AsyncMock(return_value=bound)),
+            patch("src.api.plugin.route_query", AsyncMock(return_value=MagicMock())),
+            pipeline.applied(),
+        ):
+            resp = await plugin_client.post(
+                "/api/v1/plugin/execute",
+                json={
+                    "project_id": _EP_PROJECT_ID,
+                    "model_id": _EP_MODEL_ID,
+                    "measures": ["revenue"],
+                    "dimensions": ["region"],
+                    "limit": 2,
+                },
+                headers=_ep_auth(),
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["has_more"] is True
+        assert data["complete"] is False
+        assert data["row_limit"] == 2
+        assert len(data["data"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_complete_result_reports_complete_true(self, plugin_client):
+        model = _ep_model()
+        bound = _ep_bound(model)
+        db = AsyncMock()
+        _stub_dim_types(db, bound, {"region": "string"})
+        pipeline = _PipelineMocks(
+            rows=[{"region": "US", "revenue": 1}], columns=["region", "revenue"],
+        )
+
+        with (
+            patch("src.api.plugin.get_tenant_db", _async_gen(db)),
+            patch("src.api.plugin.resolve_execution_persona", AsyncMock(return_value=None)),
+            patch("src.api.plugin.bind_query_to_model", AsyncMock(return_value=bound)),
+            patch("src.api.plugin.route_query", AsyncMock(return_value=MagicMock())),
+            pipeline.applied(),
+        ):
+            resp = await plugin_client.post(
+                "/api/v1/plugin/execute",
+                json={
+                    "project_id": _EP_PROJECT_ID,
+                    "model_id": _EP_MODEL_ID,
+                    "measures": ["revenue"],
+                    "dimensions": ["region"],
+                    "limit": 10,
+                },
+                headers=_ep_auth(),
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["complete"] is True
+        assert data["has_more"] is False
+        assert data["row_limit"] == 10
 
     @pytest.mark.asyncio
     async def test_annotation_reports_real_dimension_types(self, plugin_client):
@@ -1075,3 +1338,194 @@ class TestPluginRateLimit:
         assert "retry-after" in second.headers
         assert int(second.headers["retry-after"]) >= 1
         rl._buckets.clear()
+
+
+class TestBug6389TraceSqlDisclosure:
+    """Bug-6389 [SECURITY] — the route trace must not hand the physical
+    rewritten SQL (physical schema/table/column names + the compiled
+    row-security predicate) to a viewer-role caller through the ordinary
+    /plugin/execute response. End-to-end through the real ASGI route, because
+    the defect is a route-wiring one: the helper can be correct while the
+    endpoint still emits the raw decision field."""
+
+    _PHYSICAL_SQL = (
+        'SELECT "region_code", SUM("amount") FROM "acme_aggregates"."agg_sales_v3" '
+        "WHERE (NOT \"region_code\" = 'EMEA') GROUP BY \"region_code\""
+    )
+
+    async def _run(self, plugin_client, role: str):
+        model = _ep_model()
+        bound = _ep_bound(model)
+        mock_decision = MagicMock()
+        mock_decision.route_type = "aggregate"
+        mock_decision.reason = "Row security active (1 rule(s): r1)"
+        mock_decision.aggregate_id = None
+        mock_decision.pocket_id = None
+        mock_decision.rewritten_query = self._PHYSICAL_SQL
+        db = AsyncMock()
+        _stub_dim_types(db, bound, {"region": "string"})
+        pipeline = _PipelineMocks(
+            rows=[{"region": "US", "revenue": 1}], columns=["region", "revenue"],
+        )
+
+        with (
+            patch("src.api.plugin.get_tenant_db", _async_gen(db)),
+            patch("src.api.plugin.resolve_execution_persona", AsyncMock(return_value=None)),
+            patch("src.api.plugin.bind_query_to_model", AsyncMock(return_value=bound)),
+            patch("src.api.plugin.route_query", AsyncMock(return_value=mock_decision)),
+            pipeline.applied(),
+        ):
+            resp = await plugin_client.post(
+                "/api/v1/plugin/execute",
+                json={
+                    "project_id": _EP_PROJECT_ID,
+                    "model_id": _EP_MODEL_ID,
+                    "measures": ["revenue"],
+                    "dimensions": ["region"],
+                },
+                headers={"Authorization": f"Bearer {_mint_jwt(role)}"},
+            )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", ["member", "model_technical"])
+    async def test_viewer_role_gets_no_physical_sql_in_trace(
+        self, plugin_client, role,
+    ):
+        data = await self._run(plugin_client, role)
+        route = data["route"]
+        assert route["rewritten_query"] is None, (
+            f"DISCLOSURE: {role} received physical SQL "
+            f"{route['rewritten_query']!r}"
+        )
+        assert route["rewritten_query_redacted"] is True
+        # Nothing anywhere else in the payload may leak it either.
+        assert "agg_sales_v3" not in resp_text(data)
+        assert "acme_aggregates" not in resp_text(data)
+        # The non-sensitive route facts stay visible.
+        assert route["route_type"] == "aggregate"
+
+    @pytest.mark.asyncio
+    async def test_tenant_admin_still_gets_the_trace_sql(self, plugin_client):
+        """R2 finding B1: ``tenant_admin`` is what the platform's token mint
+        actually issues for an administrator (and what the demo seed creates).
+        The first version of this gate denied exactly this caller, killing the
+        Excel Query Trace SQL panel for its entire intended audience."""
+        data = await self._run(plugin_client, "tenant_admin")
+        route = data["route"]
+        assert route["rewritten_query"] == self._PHYSICAL_SQL
+        assert route["rewritten_query_redacted"] is False
+
+
+def resp_text(payload) -> str:
+    import json as _json
+    return _json.dumps(payload)
+
+
+# ---------------------------------------------------------------------------
+# Bug-8809 / coverage-guard plan Phase 2 — embed disclosure, WIRED
+#
+# ``redact_physical_sql`` (Bug-6389) is the MODELLER-tier gate: it withholds
+# the SQL string and nothing else. The route trace still shipped the router's
+# free-prose reason and the serving artifact's identity to an embed session.
+# Drives the real ASGI route with a real embed token and scans the served body.
+# ---------------------------------------------------------------------------
+
+
+def _mint_embed_jwt() -> str:
+    payload = {
+        "sub": "embed@acme.test",
+        "tenant_id": "acme",
+        "aud": "embed",
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+        "capabilities": ["query"],
+    }
+    return jwt.encode(payload, _settings.JWT_SECRET_KEY, algorithm=_settings.JWT_ALGORITHM)
+
+
+def _ep_embed_auth() -> dict:
+    return {"Authorization": f"Bearer {_mint_embed_jwt()}"}
+
+
+def _leaky_decision():
+    decision = MagicMock()
+    decision.route_type = "aggregate"
+    decision.reason = (
+        "served from aggregate agg_sales_v3 in schema acme_aggregates "
+        "(grain region_code)"
+    )
+    decision.aggregate_id = "agg-uuid-1"
+    decision.pocket_id = "pkt-uuid-1"
+    decision.rewritten_query = (
+        'SELECT "region_code" FROM "acme_aggregates"."agg_sales_v3"'
+    )
+    decision.security_rules_applied = []
+    return decision
+
+
+@pytest.mark.asyncio
+async def test_embed_and_tenant_sessions_receive_identical_route_detail(plugin_client):
+    """An embed principal and a tenant principal get the SAME route detail.
+
+    Decision 2026-08-11, option C
+    (docs/questions/questions_disclosure-by-entitlement-not-auth-method.md):
+    the embed physical-detail withhold was REMOVED because it gated on the
+    token TYPE rather than on entitlement. This test previously asserted the
+    withhold; it now pins the replacement contract and fails against the
+    pre-decision code, where the embed body was stripped and the tenant body
+    was not.
+
+    NOTE the one difference that is DELIBERATELY preserved and therefore
+    excluded from the equality check below: ``rewritten_query`` is still
+    governed by ``redact_physical_sql``, the modeller-tier gate that resolves
+    the caller's PROJECT BINDING. That gate is a separate control with its own
+    coverage (``TestPluginTraceSqlDisclosure`` above) and was not in scope of
+    the option-C removal.
+    """
+    responses = {}
+    for label, headers in (
+        ("embed", _ep_embed_auth()),
+        ("tenant", _ep_auth()),
+    ):
+        model = _ep_model()
+        bound = _ep_bound(model)
+        db = AsyncMock()
+        _stub_dim_types(db, bound, {"region": "string"})
+        pipeline = _PipelineMocks(
+            rows=[{"region": "US", "revenue": 1}], columns=["region", "revenue"],
+        )
+        with (
+            patch("src.api.plugin.get_tenant_db", _async_gen(db)),
+            patch("src.api.plugin.resolve_execution_persona", AsyncMock(return_value=None)),
+            patch("src.api.plugin.bind_query_to_model", AsyncMock(return_value=bound)),
+            patch("src.api.plugin.route_query", AsyncMock(return_value=_leaky_decision())),
+            pipeline.applied(),
+        ):
+            resp = await plugin_client.post(
+                "/api/v1/plugin/execute",
+                json={
+                    "project_id": _EP_PROJECT_ID,
+                    "model_id": _EP_MODEL_ID,
+                    "measures": ["revenue"],
+                    "dimensions": ["region"],
+                },
+                headers=headers,
+            )
+        assert resp.status_code == 200, f"{label}: {resp.text}"
+        responses[label] = resp.json()["route"]
+
+    # Everything the token-type withhold used to strip is now identical.
+    for field in ("route_type", "reason", "aggregate_id", "pocket_id"):
+        assert responses["embed"][field] == responses["tenant"][field], (
+            f"{field!r} still differs by authentication method; disclosure must "
+            f"be decided by entitlement, not by how the caller signed in"
+        )
+    # And it is the REAL detail both receive, not a jointly-stripped one.
+    for label, route in responses.items():
+        assert route["aggregate_id"] == "agg-uuid-1", label
+        assert route["pocket_id"] == "pkt-uuid-1", label
+        assert "agg_sales_v3" in route["reason"], label
+        assert "acme_aggregates" in route["reason"], label
+    # The permanently-false flag went with the control it reported on.
+    assert "reason_redacted" not in responses["embed"]

@@ -13,9 +13,14 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
-from src.dax.member_uname import KEY_PATH, parse_member_keys, unescape_member_key
+from src.dax.member_uname import (
+    KEY_PATH,
+    is_all_member_token,
+    parse_member_keys,
+    unescape_member_key,
+)
 
 # Bracket body that tolerates the SSAS ``]]`` escape inside a bracketed name,
 # mirroring member_uname._BRACKET_BODY. Used to extract member references whose
@@ -32,6 +37,19 @@ logger = logging.getLogger(__name__)
 
 _ROWSET_NS = "urn:schemas-microsoft-com:xml-analysis:rowset"
 _SQL_NS = "urn:schemas-microsoft-com:xml-sql"
+
+
+class DrillthroughResult(NamedTuple):
+    """Outcome of an XMLA DRILLTHROUGH.
+
+    ``next_cursor`` is the opaque keyset continuation token minted by the
+    query-router for the NEXT page, or ``None`` when the result is complete
+    (Bug-8048). It is never interpreted here — the gateway only carries it.
+    """
+
+    xml_body: str
+    warnings: list[str]
+    next_cursor: str | None
 
 
 class DrillThroughResolutionError(ValueError):
@@ -51,11 +69,27 @@ async def handle_drillthrough(
     dimensions_meta: list[dict[str, Any]],
     hierarchy_defs: list[dict[str, Any]],
     persona_id: str | None = None,
-) -> tuple[str, list[str]]:
-    """Execute an XMLA DRILLTHROUGH and return (xml_body, warnings).
+    cursor: str | None = None,
+    session_vars: dict[str, str] | None = None,
+) -> DrillthroughResult:
+    """Execute an XMLA DRILLTHROUGH and return a :class:`DrillthroughResult`.
 
-    Returns the inner XML body (to be wrapped in ``<tns:ExecuteResponse>``)
-    and a list of warning messages (e.g. "Rows trimmed to N").
+    Carries the inner XML body (to be wrapped in ``<tns:ExecuteResponse>``),
+    a list of warning messages (e.g. "Rows trimmed to N"), and the keyset
+    continuation token for the next page.
+
+    Bug-8048: ``cursor`` is an opaque token handed out by a prior DRILLTHROUGH
+    page. When supplied, the query-router continues by keyset (seek) rather
+    than by offset, so pages stay stable while the source is being written to.
+    The gateway never mints, parses or validates the token — the query-router
+    signs it and rejects a tampered or out-of-scope one.
+
+    Wave C #11 / B1: ``session_vars`` carries the Execute's declared XMLA
+    ``<Parameters>`` as ``app.<name>`` → value. The drill query is a
+    result-bearing query of the SAME Execute, so it must be scoped by the same
+    parameters as the MDX path (the query-router resolves them into
+    parameterised row-security / default filters). Absent params it is ``None``
+    and the drill behaves exactly as before.
     """
     measure_name = _extract_measure_name(parsed)
     if not measure_name:
@@ -70,12 +104,17 @@ async def handle_drillthrough(
         parsed, dimensions_meta, hierarchy_defs,
     )
 
-    drillable = await _fetch_drill_options(
-        measure_id, grouping_levels, jwt_token,
+    drillable, drill_failure_warning = await _fetch_drill_options(
+        measure_id, grouping_levels, jwt_token, session_vars=session_vars,
     )
 
     warnings: list[str] = []
     hierarchy_id: str | None = None
+    # Bug-6665: surface the drill-options failure as a SOAP warning so the
+    # client knows the drill grain was not resolved (instead of silently
+    # degrading to leaf-detail drill).
+    if drill_failure_warning:
+        warnings.append(drill_failure_warning)
     if len(drillable) == 1:
         hierarchy_id = drillable[0].get("hierarchy_id")
     elif len(drillable) > 1:
@@ -103,27 +142,32 @@ async def handle_drillthrough(
         hierarchy_id=hierarchy_id,
         limit=limit,
         persona_id=persona_id,
+        cursor=cursor,
+        session_vars=session_vars,
     )
 
     columns = result.get("columns", [])
     rows = result.get("rows", [])
-    has_more = result.get("page", {}).get("has_more", False)
+    page = result.get("page") or {}
+    has_more = page.get("has_more", False)
+    next_cursor = page.get("next_cursor")
     hierarchy_path = result.get("hierarchy_path", [])
 
     columns, rows = _augment_hierarchy_columns(
         columns, rows, hierarchy_path,
     )
 
-    # F-002-17: the RETURN clause is parsed but intentionally not honoured —
-    # the server returns its own curated column set (see
-    # architecture_xmla-drillthrough-parity.md). A client that explicitly
-    # requested RETURN columns otherwise receives a different column set with
-    # no signal. Surface a SOAP <Warning> so the divergence is visible instead
-    # of silent. (Behaviour unchanged: the columns are still server-curated.)
+    # Wave C #4: honour DRILLTHROUGH RETURN as an ordered subset of the already
+    # persona-authorised, server-curated result — POST-PROJECTION. The secured
+    # drill has already run (persona / CLS / RLS applied by the query-router), so
+    # RETURN can only ever NARROW and re-order the curated columns; it can never
+    # widen access. Any requested column that is not present in the returned
+    # curated set (unknown, or CLS-omitted for this persona) faults the WHOLE
+    # request with one uniform error — never a partial/blank projection (#5).
     if getattr(parsed, "return_columns", None):
-        warnings.append(
-            "DRILLTHROUGH RETURN clause is not applied; the server returns its "
-            "own curated detail columns. The requested RETURN columns were ignored."
+        columns, rows = _project_return_columns(
+            parsed.return_columns, columns, rows,
+            dimensions_meta, hierarchy_defs,
         )
     if has_more:
         # F-019-14: report the server-clamped page size, not the raw MAXROWS.
@@ -137,7 +181,88 @@ async def handle_drillthrough(
         )
 
     xml_body = build_drillthrough_rowset(columns, rows)
-    return xml_body, warnings
+    return DrillthroughResult(xml_body, warnings, next_cursor)
+
+
+def _project_return_columns(
+    return_columns: list[list[str]],
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    dimensions_meta: list[dict[str, Any]],
+    hierarchy_defs: list[dict[str, Any]],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Project the curated drill result down to the requested RETURN columns.
+
+    Wave C #4: ``return_columns`` is the parsed DRILLTHROUGH RETURN list (each an
+    ordered list of bracket segments, e.g. ``["Measures", "amount"]`` or
+    ``["geo", "City"]``). Each is canonicalised and resolved against the CURATED
+    ``columns`` the secured drill actually returned. The projection:
+
+      * preserves the client's requested ORDER;
+      * de-duplicates repeated requests (first position wins);
+      * projects each row to exactly the resolved columns.
+
+    Any requested column that does not resolve to a returned curated column —
+    because it does not exist, or because CLS omitted it for this persona — faults
+    the WHOLE request with one uniform error (:class:`DrillThroughResolutionError`,
+    which the Execute path turns into a SOAP client fault). There is never a
+    partial or blank projection.
+    """
+    dim_names = {d.get("name", ""): d for d in dimensions_meta}
+    hier_level_to_dim = _build_hier_level_to_dim(hierarchy_defs, dim_names)
+    curated_lower = {str(c).lower(): str(c) for c in columns}
+
+    projected: list[str] = []
+    seen: set[str] = set()
+    for parts in return_columns:
+        resolved = _canonicalise_return_column(
+            parts, curated_lower, dim_names, hier_level_to_dim,
+        )
+        if resolved is None:
+            ref_repr = ".".join(f"[{p}]" for p in parts) if parts else "[?]"
+            raise DrillThroughResolutionError(
+                f"DRILLTHROUGH RETURN column {ref_repr} is not available in the "
+                "authorised drill-through result (unknown column, or restricted "
+                "for your access). The whole request was refused rather than "
+                "returning a partial result."
+            )
+        if resolved not in seen:
+            seen.add(resolved)
+            projected.append(resolved)
+
+    new_rows = [{c: row.get(c) for c in projected} for row in rows]
+    return projected, new_rows
+
+
+def _canonicalise_return_column(
+    parts: list[str],
+    curated_lower: dict[str, str],
+    dim_names: dict[str, Any],
+    hier_level_to_dim: dict[str, dict[str, str]],
+) -> str | None:
+    """Resolve one RETURN member reference to a returned curated column name.
+
+    Returns the curated column name (original casing) or ``None`` when the
+    reference cannot be resolved against the curated set. Measure references
+    (``[Measures].[X]``) resolve ONLY to a measure column named ``X`` — they never
+    fall through to dimension resolution, so a measure name colliding with a
+    dimension column cannot be mis-matched.
+    """
+    if not parts:
+        return None
+    if (parts[0] or "").lower() == "measures":
+        return curated_lower.get((parts[-1] or "").lower())
+
+    # Dimension / hierarchy-level reference → resolve to its dimension column.
+    hier_name = parts[-2] if len(parts) >= 2 else parts[0]
+    level_name = parts[-1]
+    col = _resolve_dim_column(hier_name, level_name, dim_names, hier_level_to_dim)
+    if col and col.lower() in curated_lower:
+        return curated_lower[col.lower()]
+    # The leaf segment may itself already be the curated (physical) column name.
+    if (level_name or "").lower() in curated_lower:
+        return curated_lower[(level_name or "").lower()]
+    return None
 
 
 def build_drillthrough_rowset(
@@ -195,12 +320,16 @@ def build_drillthrough_rowset(
 # ---------------------------------------------------------------------------
 
 def _extract_measure_name(parsed: ParsedMDX) -> str | None:
-    """Extract the first measure name from the COLUMNS axis."""
+    """Extract the first measure name from the COLUMNS axis.
+
+    Bug-6717: accepts ``]]`` inside bracket bodies and unescapes to the
+    raw technical name.
+    """
     col_expr = parsed.axis_expr("COLUMNS")
     if not col_expr:
         return None
-    m = re.search(r"\[Measures\]\.\[([^\]]+)\]", col_expr, re.IGNORECASE)
-    return m.group(1) if m else None
+    m = re.search(r"\[Measures\]\.\[((?:[^\]]|\]\])+)\]", col_expr, re.IGNORECASE)
+    return m.group(1).replace("]]", "]") if m else None
 
 
 def _find_measure(
@@ -245,7 +374,7 @@ def _extract_grouping_levels(
     # (``parse_member_keys`` unescapes ``]]`` → ``]``). This is the single
     # non-regex seam called out post-Bug-1052.
     where_expr = _extract_where_clause(parsed.raw_mdx)
-    where_members_found = False
+    keyed_refs_found = False
     if where_expr:
         for m in re.finditer(
             r"((?:\[" + _BRACKET_BODY_RE + r"+\]\.)+)(" + KEY_PATH + r")", where_expr
@@ -256,17 +385,26 @@ def _extract_grouping_levels(
                 names, keys, dim_names, hier_level_to_dim
             )
             if new_levels:
-                where_members_found = True
+                keyed_refs_found = True
                 levels.extend(new_levels)
 
-    # Fall back to the tree-sitter members only when the regex found nothing
-    # (e.g. caption-only members the regex grammar above does not cover) so we
-    # never lose a member the parser did capture.
-    if not where_members_found:
-        for wm in parsed.where_members:
-            levels.extend(
-                _member_parts_to_groupings(wm.parts, dim_names, hier_level_to_dim)
-            )
+    # sol review F-CR-02: this used to be all-or-nothing — one key-form match
+    # suppressed the tree-sitter members entirely, so a MIXED slicer such as
+    # ``([geo].[geo].[City].[Berlin], [Date].[business_date].[Year].&[2025])``
+    # kept only the keyed filter and silently dropped Berlin, returning every
+    # city in 2025. Caption-form members are never matched by the regex above
+    # (it requires a ``&[...]`` key path), so they can always be processed
+    # without double-counting. Only KEYED members are still deferred to the
+    # regex when it produced results, because the regex is the ``]]``-aware
+    # grammar and the tree-sitter key token is truncated at the first ``]``
+    # (Bug-1056) — taking both would add a second, wrong filter for the same
+    # level. Identical ``(column, value)`` pairs are deduped below regardless.
+    for wm in parsed.where_members:
+        if keyed_refs_found and any(p.startswith("&") for p in wm.parts):
+            continue
+        levels.extend(
+            _member_parts_to_groupings(wm.parts, dim_names, hier_level_to_dim)
+        )
 
     rows_expr = parsed.axis_expr("ROWS")
     if rows_expr:
@@ -396,6 +534,50 @@ def _member_parts_to_groupings(
     keys = [p[1:] for p in parts if p.startswith("&")]
     names = [p for p in parts if not p.startswith("&")]
     if not keys:
+        # Bug-8047 (XMLA/Excel surface of the grand-total drill): a caption-form
+        # reference to the (All) member — ``[Dim].[Hier].[(All)]``,
+        # ``[Dim].[All]`` and their case variants — is the grand-total
+        # coordinate. It names EVERY member of the hierarchy, so the correct
+        # drill filter on that dimension is NO filter at all. Treated as an
+        # ordinary caption member it produced ``WHERE dim = '(All)'`` (zero
+        # rows) or, when no dimension answered to the segment name, a
+        # DrillThroughResolutionError SOAP fault — either way the grand-total
+        # cell was undrillable, which is the whole point of drilling a total.
+        #
+        # Scoped to the CAPTION branch on purpose. A key-form reference
+        # ``&[All]`` addresses a real data member whose key happens to be the
+        # string "All"; dropping ITS filter would silently widen the drill and
+        # return rows the user never asked for — precisely the failure mode
+        # Bug-3622's fail-loud rule exists to prevent.
+        #
+        # sol review F-CR-01: the token alone is NOT enough to classify. The
+        # synthetic (All) member sits ABOVE every level, so its unique name
+        # never carries a LEVEL segment (``[Dim].[Hier].[All]``,
+        # ``[Dim].[All]``). A reference that DOES name a level uses its
+        # trailing token as a data caption — ``[geo].[geo].[City].[All]`` is
+        # the city literally called "All" and must keep ``city = 'All'``.
+        # Skipping it handed the query-router an unfiltered city coordinate
+        # and returned every city.
+        #
+        # sol recheck (Bug-8047 REOPENED): classifying on "does the leading
+        # path resolve to a dimension column" instead of "does it name a
+        # LEVEL" reopened the original defect for every PLAIN dimension — the
+        # dominant model shape. A plain Tessallite dimension is one column
+        # exposed as its own attribute hierarchy (``cube_model`` ORIGIN_
+        # ATTRIBUTE), so its dimension and hierarchy names always coincide and
+        # the gateway advertises ``[dname].[dname]``. ``hierarchy_defs`` holds
+        # USER-DEFINED hierarchies only, so ``[dname].[dname].[All]`` resolved
+        # through the plain-dimension name fallback, the skip did not fire,
+        # and the grand-total drill was back to ``WHERE dname = 'All'`` —
+        # zero rows.
+        #
+        # The signal is therefore the presence of a genuine LEVEL segment
+        # (:func:`_has_level_segment`), which is structural and independent of
+        # whether the leading path happens to answer to a dimension name.
+        if is_all_member_token(names[-1]) and not _has_level_segment(
+            names[:-1], dim_names, hier_level_to_dim,
+        ):
+            return []
         # Caption form: the last name segment is the member value.
         keys = [names[-1]]
         names = names[:-1]
@@ -426,28 +608,8 @@ def _keyed_ref_to_groupings(
 
     hier_name = names[-2] if len(names) >= 2 else names[0]
     level_name = names[-1]
-
-    # Explicit-level resolution first ([Dim].[Hier].[Level] / [Dim].[Level]).
-    col = _resolve_level_dim(hier_name, level_name, hier_level_to_dim)
-    if col is None and len(names) >= 3:
-        col = _resolve_level_dim(names[0], level_name, hier_level_to_dim)
-
-    # No-level composite path ([Dim].[Hier].&[k0]&[k1]...): the last name
-    # segment is the hierarchy, and the path runs from the root level, so
-    # the named member sits at index len(keys) - 1.
-    if col is None and len(keys) > 1:
-        ordered = _hier_ordered_dims(
-            [level_name, hier_name, names[0]], hier_level_to_dim,
-        )
-        if ordered and len(keys) <= len(ordered):
-            col = ordered[len(keys) - 1]
-
-    # Legacy fallbacks: the level or hierarchy segment names a dimension.
+    col = _resolve_ref_column(names, keys, dim_names, hier_level_to_dim)
     if col is None:
-        col = _resolve_dim_column(
-            hier_name, level_name, dim_names, hier_level_to_dim,
-        )
-    if col is None or col not in dim_names:
         # Bug-3622: fail loud instead of silently dropping the filter. A
         # member ref that names a non-existent level/dimension previously
         # widened the drill (it ran WITHOUT this filter, returning over-broad
@@ -484,6 +646,101 @@ def _keyed_ref_to_groupings(
     return entries
 
 
+def _has_level_segment(
+    names: list[str],
+    dim_names: dict[str, Any],
+    hier_level_to_dim: dict[str, dict[str, str]],
+) -> bool:
+    """Does a caption member's LEADING name path carry an explicit level segment?
+
+    *names* is the member reference minus its trailing caption token, so the
+    question is whether a real hierarchy LEVEL was named before that token.
+    This is the one signal that separates the synthetic grand-total member —
+    which sits above every level and therefore never names one — from a data
+    member whose caption happens to be ``All`` (sol review F-CR-01 / the
+    Bug-8047 reopen).
+
+    Segment COUNT is the primary rule, because it holds regardless of whether
+    the model's level map could be built:
+
+    - ``[Hier]`` (one segment, from ``[Hier].[Member]``) — no level.
+    - ``[Dim].[Hier].[Level]`` (three or more) — the third segment is a level.
+    - Two segments are the ambiguous middle: ``[Dim].[Hier]`` when the member
+      is ``[Dim].[Hier].[Member]``, or ``[Hier].[Level]`` when it is
+      ``[Hier].[Level].[Member]``. Decided in this order, each test only ever
+      turning the answer toward "level":
+
+      1. The hierarchy's level map claims the second segment — a declared
+         level, so a level was named.
+      2. The two segments are IDENTICAL (``[country_code].[country_code]``).
+         Every hierarchy unique name the gateway emits is ``[X].[X]`` (see
+         ``mdschema._rows_hierarchies`` / ``_rows_members``), for plain
+         dimensions and multi-level user hierarchies alike, so identical
+         segments are the hierarchy bracket and no level was named.
+      3. Otherwise the second segment counts as a level when it answers to a
+         dimension name (``[geo].[City]``). That form can only reach here from
+         a client using the ``[Hier].[Level].[Member]`` shorthand, and the
+         check keeps the answer stable even when ``_build_hier_level_to_dim``
+         dropped the hierarchy for an unmatched key attribute.
+
+    Erring toward "there IS a level" is the non-widening direction: it keeps a
+    filter rather than dropping one.
+    """
+    if len(names) < 2:
+        return False
+    if len(names) >= 3:
+        return True
+    if _resolve_level_dim(names[0], names[1], hier_level_to_dim) is not None:
+        return True
+    first = (names[0] or "").strip().lower()
+    second = (names[1] or "").strip().lower()
+    if not second or second == first:
+        return False
+    return second in {k.lower() for k in dim_names}
+
+
+def _resolve_ref_column(
+    names: list[str],
+    keys: list[str],
+    dim_names: dict[str, Any],
+    hier_level_to_dim: dict[str, dict[str, str]],
+) -> str | None:
+    """Resolve a member reference's name path to a dimension column, or None.
+
+    The single, non-raising resolution rule used by
+    :func:`_keyed_ref_to_groupings`, which faults (Bug-3622) when it returns
+    ``None``. Deliberately NOT the (All)-member classifier: "resolves to a
+    column" and "names a level" are different questions, and conflating them
+    reopened Bug-8047 for plain dimensions. See :func:`_has_level_segment`.
+    """
+    if not names:
+        return None
+    hier_name = names[-2] if len(names) >= 2 else names[0]
+    level_name = names[-1]
+
+    # Explicit-level resolution first ([Dim].[Hier].[Level] / [Dim].[Level]).
+    col = _resolve_level_dim(hier_name, level_name, hier_level_to_dim)
+    if col is None and len(names) >= 3:
+        col = _resolve_level_dim(names[0], level_name, hier_level_to_dim)
+
+    # No-level composite path ([Dim].[Hier].&[k0]&[k1]...): the last name
+    # segment is the hierarchy, and the path runs from the root level, so
+    # the named member sits at index len(keys) - 1.
+    if col is None and len(keys) > 1:
+        ordered = _hier_ordered_dims(
+            [level_name, hier_name, names[0]], hier_level_to_dim,
+        )
+        if ordered and len(keys) <= len(ordered):
+            col = ordered[len(keys) - 1]
+
+    # Legacy fallbacks: the level or hierarchy segment names a dimension.
+    if col is None:
+        col = _resolve_dim_column(
+            hier_name, level_name, dim_names, hier_level_to_dim,
+        )
+    return col if col in dim_names else None
+
+
 def _resolve_level_dim(
     hier_name: str,
     level_name: str,
@@ -507,13 +764,31 @@ def _hier_ordered_dims(
 
 
 def _parse_value(raw: str) -> Any:
-    """Try to convert a string value to int/float, else keep as string."""
+    """Convert a member key to int/float only when the round-trip is lossless.
+
+    Bug-6662: the previous implementation blindly coerced every numeric-looking
+    string, so zero-padded keys ('007' -> 7) and scientific-notation strings
+    ('1e5' -> 100000.0) became different values, producing wrong/empty
+    drill-through results. Now we coerce only when ``str(int(raw)) == raw``
+    (or float equivalent), which guarantees no leading zeros are dropped and
+    no scientific notation is reinterpreted.
+
+    Numeric coercion is preserved for legitimately numeric keys (year=2025,
+    month=4) because BigQuery does NOT implicitly coerce STRING to INT64
+    in comparisons -- ``WHERE year = '2025'`` fails against an INT64 column.
+    The lossless round-trip check preserves type fidelity for clean integers
+    while protecting text-typed keys from corruption.
+    """
     try:
-        return int(raw)
+        i = int(raw)
+        if str(i) == raw:
+            return i
     except ValueError:
         pass
     try:
-        return float(raw)
+        f = float(raw)
+        if str(f) == raw:
+            return f
     except ValueError:
         pass
     return raw
@@ -622,15 +897,32 @@ async def _fetch_drill_options(
     measure_id: str,
     grouping_levels: list[dict[str, Any]],
     jwt_token: str,
-) -> list[dict[str, Any]]:
+    *,
+    session_vars: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return ``(drillable_hierarchies, failure_warning_or_None)``.
+
+    Bug-6665: a QueryRouterError was previously swallowed silently,
+    degrading to leaf-detail drill (hierarchy_id=None) with no client
+    warning. The AMBIGUITY case (Bug-4153) emits a warning, but the
+    FAILURE case stayed silent. Now returns the warning text so the
+    caller can attach a SOAP warning on the failure path.
+
+    Wave C #11 / B1: ``session_vars`` is threaded to the router so the whole
+    Execute (options + detail) is scoped by the same declared parameters.
+    """
     try:
         result = await execute_drill_options(
-            measure_id, grouping_levels, jwt_token,
+            measure_id, grouping_levels, jwt_token, session_vars=session_vars,
         )
-        return result.get("hierarchies", [])
+        return result.get("hierarchies", []), None
     except QueryRouterError as exc:
         logger.warning("drill-options failed: %s", exc)
-        return []
+        return [], (
+            "Drill-through hierarchy resolution failed "
+            f"({exc}). Falling back to leaf-detail drill. "
+            "The returned columns may not match the expected drill grain."
+        )
 
 
 async def _fetch_drill_through(
@@ -641,6 +933,8 @@ async def _fetch_drill_through(
     hierarchy_id: str | None,
     limit: int | None,
     persona_id: str | None,
+    cursor: str | None = None,
+    session_vars: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     return await execute_drill_through(
         measure_id=measure_id,
@@ -649,6 +943,8 @@ async def _fetch_drill_through(
         hierarchy_id=hierarchy_id,
         limit=limit,
         persona_id=persona_id,
+        cursor=cursor,
+        session_vars=session_vars,
     )
 
 

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
+  Alert,
   Box,
   Chip,
   CircularProgress,
@@ -26,7 +27,7 @@ export default function SecurityAuditPanel() {
   const [modelIdFilter, setModelIdFilter] = useState("");
   const [page, setPage] = useState(0);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["security-audit", modelIdFilter, page],
     queryFn: () =>
       securityAuditApi.list({
@@ -62,6 +63,21 @@ export default function SecurityAuditPanel() {
 
       {isLoading ? (
         <CircularProgress size={20} />
+      ) : isError ? (
+        // Bug-8145: a failed request used to fall through to the empty-state
+        // message below, which tells the reviewer the opposite of the truth —
+        // an unreadable log reads as "no queries with row security". Render a
+        // distinct error state with retry instead (mirrors AuditLog.tsx).
+        <Alert
+          severity="error"
+          action={
+            <Button color="inherit" size="small" onClick={() => refetch()}>
+              {t("auditLog.retry")}
+            </Button>
+          }
+        >
+          {t("audit.apiFailure")}
+        </Alert>
       ) : items.length === 0 ? (
         <Typography variant="body2" color="text.secondary">
           {t("audit.noQueriesWithRowSecurity")}

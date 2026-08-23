@@ -2,12 +2,14 @@
 title: "Model Translations (i18n)"
 audience: modeller
 area: modelling
-updated: 2026-06-24
+updated: 2026-08-19
 ---
 
 ## What this covers
 
 Model translations let teams use the same governed model in more than one business language. A finance analyst can see "Revenue" while a French-speaking team sees "Chiffre d'affaires"; both labels point to the same measure, the same rules, and the same deployed model. This page explains what translations are for, how users choose a display language, and how an integration team can maintain translations safely.
+
+**Scope: model labels only.** Translations change the display names of your model objects — dimensions, measures, hierarchies, and levels. They do not translate the Tessallite application itself. The application interface — menus, buttons, panel titles, and dialogs — is shown in English, and there is no feature to translate the interface into other languages. Model translations are a separate, supported capability for the business vocabulary you define; the application chrome is English-only by design.
 
 ---
 
@@ -36,7 +38,7 @@ The selected locale is stored in the browser session (Zustand store). It persist
 
 Most teams should treat translations as reference content, not as day-to-day modelling work. The best workflow is to export a list of model objects, have a translator or local business owner review the labels, then load the approved translation set in bulk.
 
-There is no GUI translation editor yet. The REST API is mainly for controlled integration work: importing approved translation files, syncing from a terminology system, or correcting a label during a release. For one-off exploration, keep changes in a staging model first so reviewers can check the wording in context.
+There is no GUI translation editor; model translations are maintained through the REST API. The API is mainly for controlled integration work: importing approved translation files, syncing from a terminology system, or correcting a label during a release. For one-off exploration, keep changes in a staging model first so reviewers can check the wording in context.
 
 ### Upsert a single translation
 

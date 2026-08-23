@@ -8,6 +8,7 @@ import {
 } from "@mui/material";
 import { statusColor } from "../../theme/tokens";
 import { useT } from "../../i18n";
+import { runStatusLabel } from "../../utils/runStatus";
 
 interface Run {
   id: string;
@@ -15,6 +16,7 @@ interface Run {
   started_at: string;
   completed_at?: string | null;
   rows_written?: number | null;
+  refresh_mode?: string;
   triggered_by?: string;
   error_message?: string | null;
 }
@@ -55,8 +57,27 @@ export default function RefreshRunHistory({ runs, limit = 5 }: Props) {
       case "in_progress":
       case "running":
         return t("refreshHistory.running");
+      default: {
+        // F-559-04: the shared run-status labels cover the statuses this
+        // panel's own keys do not (notably "queued"). Anything neither knows
+        // keeps the original capitalised passthrough rather than a raw key.
+        const shared = runStatusLabel(status, t);
+        return shared === status
+          ? status.charAt(0).toUpperCase() + status.slice(1)
+          : shared;
+      }
+    }
+  }
+
+  function friendlyRefreshMode(value: string | undefined): string {
+    if (!value) return "—";
+    switch (value) {
+      case "full":
+        return t("refreshHistory.full");
+      case "incremental":
+        return t("refreshHistory.incremental");
       default:
-        return status.charAt(0).toUpperCase() + status.slice(1);
+        return value.charAt(0).toUpperCase() + value.slice(1);
     }
   }
 
@@ -97,6 +118,15 @@ export default function RefreshRunHistory({ runs, limit = 5 }: Props) {
                 {r.rows_written != null
                   ? t("refreshHistory.rowsWritten", { count: r.rows_written.toLocaleString() })
                   : "—"}
+              </Typography>
+            </TableCell>
+            <TableCell sx={{ py: 0.25, border: 0 }} align="right">
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                data-testid={`refresh-mode-${r.id}`}
+              >
+                {friendlyRefreshMode(r.refresh_mode)}
               </Typography>
             </TableCell>
             <TableCell sx={{ py: 0.25, pr: 0, border: 0 }} align="right">

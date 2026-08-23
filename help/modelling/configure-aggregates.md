@@ -2,7 +2,7 @@
 title: "Configure Aggregates"
 audience: modeller
 area: modelling
-updated: 2026-04-22
+updated: 2026-08-02
 ---
 
 ![Model Builder — Aggregates panel with new aggregate form.](../assets/screencaps/configure-aggregate-form.png)
@@ -77,7 +77,7 @@ In edit mode the drawer header carries a **Refresh now** button that triggers an
 5. Select the **Grain (dimensions)**. Every distinct combination of dimension values becomes one row in the summary table. Dimensions whose value is functionally equivalent to another dimension's value (a redundant partner) are disabled with a tooltip explaining why.
 6. Select the **Measures** to include. The default aggregation function (`SUM`, `AVG`, etc.) shown next to each measure name is what will be computed at create time. Non-additive measures are flagged with a chip.
 7. Optionally enable the advanced statistical columns:
-   - **Include quantile columns (p1, p5, p10, p25, p50, p75, p90, p95, p99)** — lets the router serve `MEDIAN` and `PERCENTILE_CONT`/`PERCENTILE_DISC` queries from the aggregate.
+   - **Include median column (p50)** — lets the router serve `MEDIAN` (the 50th percentile) queries from the aggregate. Other percentiles (p90, p95, p99, and so on) are temporarily not materialised while percentile query routing is being completed; those queries return the correct answer from the source table in the meantime.
    - **Include dispersion-stat columns (STDDEV_POP, STDDEV_SAMP, VAR_POP, VAR_SAMP)** — lets the router serve standard-deviation and variance queries from the aggregate.
    Both are opt-in because they add extra columns per numeric measure, and both can only be served at the aggregate's exact grain (see *How aggregates store data*).
 8. The **Aggregate estimate** card appears live as you change selections, showing the ROI score and any non-additive warnings.
@@ -94,6 +94,8 @@ Editing scope is intentionally narrow:
 
 - **Editable** — schedule (cron + enabled), status (active / retired), include-quantiles and include-stats toggles, refresh-now trigger.
 - **Read-only** — target, grain, measures. The drawer renders these as static chips with the note "*To change the shape, delete this aggregate and create a new one.*" Aggregate shape changes go through delete-and-recreate so the physical table identity matches the definition.
+
+Administrative API clients can change `target_schema`. Moving an aggregate to another target schema marks it stale and clears its last-refresh timestamp. The query router withholds it until a full rebuild succeeds at the new location; submitting the current target schema again does not invalidate the build.
 
 The **Definition** tab shows the AI rationale card when the aggregate was created by the AI optimiser. The **Advanced** tab exposes the rest of the metadata.
 
@@ -112,19 +114,19 @@ Each measure included in an aggregate generates multiple physical columns in the
 | COUNT measure | `count`, `min`, `max` |
 | MIN measure | `min`, `count`, `max` |
 | MAX measure | `max`, `count`, `min` |
-| Any numeric measure, **Include quantiles** on | adds `p1, p5, p10, p25, p50, p75, p90, p95, p99` |
+| Any numeric measure, **Include quantiles** on | adds `p50` (the median). Other percentiles are temporarily not materialised while percentile routing is completed. |
 | Any numeric measure, **Include stats** on | adds `stddev_pop`, `stddev_samp`, `var_pop`, `var_samp` |
 
 **AVG at query time.** AVG is computed at query time from the stored SUM and COUNT columns (`SUM / COUNT`). It is not stored as a separate physical value. This avoids the mathematical error of averaging averages.
 
 **COUNT(\*).** Every aggregate automatically includes a row-count column so that `COUNT(*)` queries can be served directly.
 
-**Median, percentile, and dispersion stats.** `MEDIAN`/`PERCENTILE_CONT`/`PERCENTILE_DISC`, `STDDEV_*`, and `VAR_*` are *not re-aggregatable* — the median of two groups is not the median of their union. They can still be served from an aggregate, but only when:
+**Median, percentile, and dispersion stats.** `MEDIAN`/`PERCENTILE_CONT`/`PERCENTILE_DISC`, `STDDEV_*`, and `VAR_*` are *not re-aggregatable* — the median of two groups is not the median of their union. The median (p50) and the dispersion stats can be served from an aggregate, but only when:
 
 - the aggregate was built with the **Include quantiles** and/or **Include stats** option, and
 - the query's grain matches the aggregate's grain **exactly** (no coarser roll-up).
 
-At any coarser grain, or when the columns were not materialised, the Query Router sends the query to the source table. Two notes on exactness by source engine:
+Non-median percentiles (p90, p95, p99, and the rest) are **temporarily served from the source** even when the aggregate has the quantiles option on: the routing that maps an arbitrary `PERCENTILE_CONT`/`PERCENTILE_DISC` fraction to a stored column is still being completed, so materialising those columns would only add storage and refresh cost without speeding any query up. They are therefore not built for new aggregates yet. The answers stay correct — they just come from the source table. At any coarser grain, or when the columns were not materialised, the Query Router sends the query to the source table. Two notes on exactness by source engine for the median it does materialise:
 
 - **PostgreSQL** quantiles are exact.
 - **Spark** quantiles are exact for a same-engine refresh (Spark source and Spark target). A cross-engine refresh (Spark source into a non-Spark target) cannot guarantee exact quantiles, so they are not materialised and such queries go to the source.
@@ -132,13 +134,44 @@ At any coarser grain, or when the columns were not materialised, the Query Route
 
 **Functions that always hit the source.** Order-dependent or distribution-shaped functions — `MODE`, `STRING_AGG`/`ARRAY_AGG`/`LISTAGG`, and `APPROX_COUNT_DISTINCT` — cannot be served from pre-computed columns and always route to the source table.
 
-**Include all measures.** When the model setting "Include all measures" is enabled (the default), every aggregate includes all model measures. The Optimizer's advisors recommend only the dimension grain in this mode; measures are added automatically at build time. If a new measure is added to the model after an aggregate was built, the lifecycle sweep detects the gap, retires the stale aggregate, and rebuilds it with the full measure set.
+**Include all measures.** This model setting is **off by default**, and new models start with it off. With it off, each summary table holds only the measures the queries that triggered it actually asked for. That is usually what you want: a narrow summary table is faster to build, cheaper to store, and — importantly — much more likely to be usable.
+
+Turn it on when you want every summary table on a model to carry every measure, so that a brand-new question about an existing grouping is answered instantly instead of waiting for the Optimizer to notice it. The trade is size and build time, and one subtler cost worth understanding.
+
+**Why "all measures" is not always better.** A summary table is only allowed to answer a question when it was built over exactly the same set of rows the question would have scanned. Adding a measure that lives on a different table pulls that table into the summary's build, and if joining it drops or duplicates rows, the summary now covers a *different* population — so Tessallite refuses to answer from it and quietly goes back to the source table. Switch the setting on for a model with measures spread across several tables and you can end up with many summary tables that are never used. Tessallite guards against this automatically: when the setting is on, it only adds the measures that fit the same population as the query that triggered the build. But the narrower default avoids the problem entirely.
+
+**Existing summary tables when you change the setting.** Nothing is destroyed the moment you flip the switch.
+
+- **Turning it on** — the next Optimizer sweep rebuilds each live summary table with the wider set of measures.
+- **Turning it off** — new summary tables are built narrow from then on. Summary tables you already have keep every column they were built with, so no report that relies on them stops working. Where an old wide table cannot answer a question, the Optimizer builds a narrow one **next to it** rather than replacing it — the wide table may still be the right answer for a report that asks for all of those measures at once. Tessallite does not delete the old table for you: it stays until the model's summary-table limit pushes it out, or until you retire it yourself from the Aggregates panel.
+
+  **Tip.** If you turned the setting off because a model had many summary tables that were never being used, check the Aggregates panel a few days later. The new narrow tables will show hits; the old wide ones that show none are safe to retire by hand.
+
+If a new measure is added to the model while the setting is on, the lifecycle sweep detects the gap, retires the stale summary table, and rebuilds it — keeping the columns it already had and adding the missing ones.
+
+---
+
+## Enriched aggregates for relabelled queries
+
+When a dimension has a declared, proven **attribute relationship** (for example `country_code` to `country_name`), Tessallite can build an *enriched* aggregate that stores the detail column alongside the key. A query grouped by the detail column is then served from the aggregate built on the key, with identical results — see [Dimension Attribute Relationships](dimension-attribute-relationships.md).
+
+Whether the optimiser builds these enriched aggregates is controlled by a per-model setting, **Derived-expression auto-build** (off, approval, or automatic), on the AI Optimizer tab of [Model Configuration](../admin/model-configuration.md). Leave it off and ordinary aggregates are unaffected; set it to approval or automatic to let the enriched columns be added. A separate system-wide switch controls whether live queries are actually relabelled from them, so nothing changes about routing until both are enabled.
 
 ---
 
 ## Manual versus auto-created aggregates
 
 Manual aggregates are displayed in the Canvas with a solid border on their dashed outline. Auto-created aggregates show an Optimizer badge. Both respond to the same status indicators (Ready, Stale, Refreshing, Error). Manual aggregates are permanent — the Optimizer will not retire them. Auto-created aggregates may be removed by the Optimizer if the query patterns they serve drop off; you receive a notification in the Health tab when this occurs.
+
+---
+
+## Deleting an aggregate
+
+Deleting an aggregate removes both halves: the definition you see in Tessallite **and** the summary table it built on your target database. Tessallite records what needs removing before it deletes the definition, deletes the definition, and only then drops the table — in that order, so there is never a moment where Tessallite still thinks it can answer from a table that has already gone.
+
+If the drop itself does not succeed (the target database is briefly unreachable, for example), the delete still goes through and the table is dropped on a later retry — the record of what to remove is kept.
+
+One case is refused rather than half-done: if Tessallite cannot work out where the summary table actually lives — its target connection has been deleted, or now belongs to a different project — you get an error asking you to repair the connection first, and the aggregate is left alone. Deleting it at that point would leave a table on your database with nothing left in Tessallite pointing at it.
 
 ---
 

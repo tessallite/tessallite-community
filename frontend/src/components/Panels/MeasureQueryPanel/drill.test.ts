@@ -13,6 +13,8 @@ import type {
   DrillThroughResponse,
   HierarchyPathEntry,
 } from "../../../api/types";
+import { buildDrillInvocation, buildInitialGroupingLevels, buildSlicerFilters } from "./drillRequest";
+import type { PivotColumnMeasure } from "./measureColumns";
 
 function dim(name: string, overrides: Partial<Dimension> = {}): Dimension {
   return {
@@ -32,22 +34,6 @@ function dim(name: string, overrides: Partial<Dimension> = {}): Dimension {
   };
 }
 
-function buildInitialGroupingLevels(
-  rowDims: Dimension[],
-  colDims: Dimension[],
-  rowValues: unknown[],
-  colValues: unknown[],
-): DrillThroughFilter[] {
-  const levels: DrillThroughFilter[] = [];
-  rowDims.forEach((d, i) => {
-    levels.push({ column: d.name, op: "eq", value: rowValues[i] });
-  });
-  colDims.forEach((d, i) => {
-    levels.push({ column: d.name, op: "eq", value: colValues[i] });
-  });
-  return levels;
-}
-
 function accumulateDrillLevel(
   existing: DrillThroughFilter[],
   pathEntry: HierarchyPathEntry,
@@ -61,10 +47,9 @@ function accumulateDrillLevel(
 describe("buildInitialGroupingLevels", () => {
   it("builds equality filters for row and col dimensions", () => {
     const levels = buildInitialGroupingLevels(
+      { rowKey: [], colKey: [], rowValues: ["US", 2025], colValues: ["Electronics"], measureValue: 1 },
       [dim("country"), dim("year")],
       [dim("category")],
-      ["US", 2025],
-      ["Electronics"],
     );
     expect(levels).toEqual([
       { column: "country", op: "eq", value: "US" },
@@ -74,15 +59,18 @@ describe("buildInitialGroupingLevels", () => {
   });
 
   it("handles empty dims", () => {
-    const levels = buildInitialGroupingLevels([], [], [], []);
+    const levels = buildInitialGroupingLevels(
+      { rowKey: [], colKey: [], rowValues: [], colValues: [], measureValue: 1 },
+      [],
+      [],
+    );
     expect(levels).toEqual([]);
   });
 
   it("handles null values from pivot cell", () => {
     const levels = buildInitialGroupingLevels(
+      { rowKey: [], colKey: [], rowValues: [null], colValues: [], measureValue: 1 },
       [dim("region")],
-      [],
-      [null],
       [],
     );
     expect(levels).toEqual([{ column: "region", op: "eq", value: null }]);
@@ -92,9 +80,8 @@ describe("buildInitialGroupingLevels", () => {
 describe("hierarchy drill path accumulation", () => {
   it("accumulates levels as user drills deeper", () => {
     const initial = buildInitialGroupingLevels(
+      { rowKey: [], colKey: [], rowValues: [2025], colValues: [], measureValue: 1 },
       [dim("year")],
-      [],
-      [2025],
       [],
     );
 
@@ -160,6 +147,108 @@ describe("drill request shape", () => {
       force_route: "source",
     };
     expect(request.force_route).toBe("source");
+  });
+
+  // Bug-7265: contract test — override_agg must be accepted by
+  // DrillThroughRequest and travel to the backend so hierarchy drill uses
+  // the clicked column's aggregate, not the measure default.
+  it("carries override_agg when the column uses a non-default aggregate", () => {
+    const request: DrillThroughRequest = {
+      grouping_levels: [{ column: "year", op: "eq", value: 2025 }],
+      limit: 50,
+      hierarchy_id: "h-date",
+      override_agg: "AVG",
+    };
+    expect(request.override_agg).toBe("AVG");
+  });
+
+  it("omits override_agg when the column uses the measure default", () => {
+    const request: DrillThroughRequest = {
+      grouping_levels: [{ column: "year", op: "eq", value: 2025 }],
+      limit: 50,
+      hierarchy_id: "h-date",
+    };
+    expect(request.override_agg).toBeUndefined();
+  });
+});
+
+describe("total-cell REST invocation contract (Bug-8047)", () => {
+  const rowDims = [dim("region"), dim("city")];
+  const colDims = [dim("year"), dim("month")];
+  const selectedMeasure = {
+    id: "synthetic-revenue-avg",
+    name: "revenue__avg__0",
+    display_name: "Revenue (Average)",
+    measure_type: "standard",
+    default_agg: "SUM",
+    _measureId: "measure-revenue",
+    _alias: "revenue__avg__0",
+    _agg: "AVG",
+    _baseName: "revenue",
+  } as PivotColumnMeasure;
+  const dimensionsById = new Map([
+    ["status-id", dim("status")],
+    ["date-id", dim("order_date")],
+  ]);
+  const filters = buildSlicerFilters(
+    [
+      { dimensionId: "status-id", op: "in", values: ["Open", "Closed"] },
+      { dimensionId: "date-id", op: "between", values: ["2026-01-01", "2026-01-31"] },
+    ],
+    dimensionsById,
+  );
+  const cases: Array<[string, unknown[], unknown[], DrillThroughFilter[]]> = [
+    ["row subtotal", ["North"], [2024, "Jan"], [
+      { column: "region", op: "eq", value: "North" },
+      { column: "year", op: "eq", value: 2024 },
+      { column: "month", op: "eq", value: "Jan" },
+    ]],
+    ["column subtotal", ["North", "Boston"], [2024], [
+      { column: "region", op: "eq", value: "North" },
+      { column: "city", op: "eq", value: "Boston" },
+      { column: "year", op: "eq", value: 2024 },
+    ]],
+    ["cross subtotal", ["North"], [2024], [
+      { column: "region", op: "eq", value: "North" },
+      { column: "year", op: "eq", value: 2024 },
+    ]],
+    ["row grand total", ["North", "Boston"], [], [
+      { column: "region", op: "eq", value: "North" },
+      { column: "city", op: "eq", value: "Boston" },
+    ]],
+    ["column grand total", [], [2024, "Jan"], [
+      { column: "year", op: "eq", value: 2024 },
+      { column: "month", op: "eq", value: "Jan" },
+    ]],
+    ["grand-grand total", [], [], []],
+  ];
+
+  it.each(cases)("builds the exact %s invocation", (_label, rowValues, colValues, groupingLevels) => {
+    const coord = {
+      rowKey: rowValues.map(String),
+      colKey: colValues.map(String),
+      rowValues,
+      colValues,
+      measureValue: 100,
+    };
+    const invocation = buildDrillInvocation({
+      measure: selectedMeasure,
+      groupingLevels: buildInitialGroupingLevels(coord, rowDims, colDims),
+      filters,
+      limit: 50,
+    });
+    expect(invocation).toEqual({
+      measureId: "measure-revenue",
+      request: {
+        grouping_levels: groupingLevels,
+        filters: [
+          { column: "status", op: "in", value: ["Open", "Closed"] },
+          { column: "order_date", op: "between", value: ["2026-01-01", "2026-01-31"] },
+        ],
+        limit: 50,
+        override_agg: "AVG",
+      },
+    });
   });
 });
 

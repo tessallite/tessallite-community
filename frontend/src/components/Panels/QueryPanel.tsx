@@ -3,15 +3,16 @@
  * execute it against the model. Shows the routing pipeline as a diagram and
  * paginated results when executed.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useT } from "../../i18n";
 import {
   Accordion,
   AccordionDetails,
   AccordionSummary,
   Alert,
+  AlertTitle,
   Box,
   Button,
   Chip,
@@ -57,7 +58,9 @@ import SqlQueryEditor, { formatSql } from "../Sql/SqlQueryEditor";
 import { TIME_VARIANT_NAMES } from "../../constants/timeVariants";
 import CalendarBindingHint from "../CalendarBindingHint";
 import { ui } from "../../theme/tokens";
+import { rowSecurityDeniedAll } from "../../utils/rowSecurity";
 import { useBuilderStore } from "../../store/builderStore";
+import { syncPublishedSessionVars } from "./querySessionVars";
 import {
   extractQueryFieldCompatibilityFromError,
   fieldCompatibilityValidationContextKey,
@@ -163,6 +166,7 @@ export default function QueryPanel() {
 
   const pendingSql = useBuilderStore((s) => s.pendingSql);
   const setPendingSql = useBuilderStore((s) => s.setPendingSql);
+  const consumedPendingSql = useRef<string | null>(null);
   const [sql, setSql] = useState<string>(pendingSql ?? "SELECT 1");
   const [dialect, setDialect] = useState<string>("postgresql");
   const tDialects = useMemo(
@@ -171,14 +175,34 @@ export default function QueryPanel() {
   );
   const [forceRoute, setForceRoute] = useState<"" | "source" | "aggregate" | "pocket">("");
   const [personaId, setPersonaId] = useState<string | null>(null);
+  // Bug-9224: keys are copied verbatim from the deployed catalogue.  The SPA
+  // must not rebuild `app.<parameter>` from the authored name because the
+  // gateway publishes a lower-cased session_var_key.
+  const [sessionVars, setSessionVars] = useState<Record<string, string>>({});
+  const namedObjects = useQuery({
+    queryKey: ["deployedNamedObjects", modelId],
+    queryFn: () => queryRouterApiClient.namedObjects(modelId!),
+    enabled: Boolean(modelId),
+  });
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(25);
 
   useEffect(() => {
-    if (pendingSql) {
-      setSql(pendingSql);
-      setPendingSql(null);
+    const parameters = namedObjects.data?.parameters ?? [];
+    setSessionVars((previous) => syncPublishedSessionVars(previous, parameters));
+  }, [namedObjects.data]);
+
+  useEffect(() => {
+    if (!pendingSql) {
+      consumedPendingSql.current = null;
+      return;
     }
+    if (consumedPendingSql.current === pendingSql) return;
+    consumedPendingSql.current = pendingSql;
+    setSql(pendingSql);
+    setPendingSql(null);
+    setFieldCompatibilityBlockedContextKey(null);
+    void executeQuery(pendingSql);
   }, [pendingSql, setPendingSql]);
 
   const [validating, setValidating] = useState(false);
@@ -297,6 +321,7 @@ export default function QueryPanel() {
           model_id: modelId,
           raw_query: sql,
           dialect,
+          ...(Object.keys(sessionVars).length > 0 ? { session_vars: sessionVars } : {}),
         },
         personaId,
       );
@@ -324,6 +349,7 @@ export default function QueryPanel() {
           raw_query: sql,
           dialect,
           ...(forceRoute ? { force_route: forceRoute } : {}),
+          ...(Object.keys(sessionVars).length > 0 ? { session_vars: sessionVars } : {}),
         },
         personaId,
       );
@@ -337,18 +363,19 @@ export default function QueryPanel() {
     }
   }
 
-  async function handleExecute() {
+  async function executeQuery(queryText: string) {
     if (!modelId) return;
-    if (executeBlockedByValidatedCompatibility) return;
+    if (queryText === sql && executeBlockedByValidatedCompatibility) return;
     clearOutputs();
     setExecuting(true);
     try {
       const result = await queryRouterApiClient.execute(
         {
           model_id: modelId,
-          raw_query: sql,
+          raw_query: queryText,
           dialect,
           ...(forceRoute ? { force_route: forceRoute } : {}),
+          ...(Object.keys(sessionVars).length > 0 ? { session_vars: sessionVars } : {}),
         },
         personaId,
       );
@@ -360,6 +387,10 @@ export default function QueryPanel() {
     } finally {
       setExecuting(false);
     }
+  }
+
+  async function handleExecute() {
+    await executeQuery(sql);
   }
 
   function handleCopy(text: string) {
@@ -374,6 +405,8 @@ export default function QueryPanel() {
     : explainResult?.rewritten_query ?? "";
 
   const allRows = executeResult?.rows ?? [];
+  // Bug-8453: classify via the shared contract, never via allRows.length.
+  const executeRowSecurityDenied = rowSecurityDeniedAll(executeResult);
   const pagedRows = useMemo(
     () => allRows.slice(page * pageSize, page * pageSize + pageSize),
     [allRows, page, pageSize],
@@ -535,6 +568,113 @@ export default function QueryPanel() {
         </FormControl>
       </Box>
 
+      {(namedObjects.data?.parameters.length ?? 0) > 0 && (
+        <Paper variant="outlined" sx={{ p: 1 }}>
+          <Typography variant="caption" fontWeight={700} display="block" sx={{ mb: 0.75 }}>
+            {t("query.deployedParameters")}
+          </Typography>
+          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+            {namedObjects.data?.parameters.map((parameter) =>
+              parameter.sql_usable !== false ? (
+                <TextField
+                  key={parameter.session_var_key}
+                  size="small"
+                  label={parameter.display_name || parameter.name}
+                  value={sessionVars[parameter.session_var_key] ?? ""}
+                  onChange={(event) =>
+                    setSessionVars((previous) => ({
+                      ...previous,
+                      [parameter.session_var_key]: event.target.value,
+                    }))
+                  }
+                  helperText={parameter.description || parameter.name}
+                  inputProps={{ "data-session-var-key": parameter.session_var_key }}
+                  sx={{ minWidth: 180 }}
+                />
+              ) : (
+                <Tooltip
+                  key={parameter.session_var_key}
+                  title={t("query.namedObjectUnavailable", {
+                    name: parameter.canonical_name || parameter.name,
+                    reason:
+                      parameter.unusable_reason || t("query.namedObjectUnavailableUnknown"),
+                  })}
+                >
+                  <span>
+                    <Chip
+                      size="small"
+                      label={parameter.display_name || parameter.name}
+                      disabled
+                      data-session-var-key={parameter.session_var_key}
+                      data-sql-usable="false"
+                    />
+                  </span>
+                </Tooltip>
+              ),
+            )}
+          </Stack>
+        </Paper>
+      )}
+
+      {((namedObjects.data?.named_sets.length ?? 0) > 0 ||
+        (namedObjects.data?.named_queries.length ?? 0) > 0) && (
+        <Paper variant="outlined" sx={{ p: 1 }}>
+          <Typography variant="caption" fontWeight={700} display="block" sx={{ mb: 0.75 }}>
+            {t("query.deployedNamedObjects")}
+          </Typography>
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+            {namedObjects.data?.named_sets.map((namedSet) =>
+              namedSet.sql_usable ? (
+                <Chip
+                  key={`set-${namedSet.name}`}
+                  size="small"
+                  label={namedSet.name}
+                  variant="outlined"
+                  onClick={() => void navigator.clipboard?.writeText(`@${namedSet.name}`)}
+                  title={t("query.copyNamedObject", { name: namedSet.name })}
+                />
+              ) : (
+                <Tooltip
+                  key={`set-${namedSet.name}`}
+                  title={t("query.namedObjectUnavailable", {
+                    name: namedSet.name,
+                    reason: namedSet.unusable_reason || t("query.namedObjectUnavailableUnknown"),
+                  })}
+                >
+                  <span>
+                    <Chip size="small" label={namedSet.name} disabled />
+                  </span>
+                </Tooltip>
+              ),
+            )}
+            {namedObjects.data?.named_queries.map((namedQuery) =>
+              namedQuery.sql_usable ? (
+                <Chip
+                  key={`query-${namedQuery.name}`}
+                  size="small"
+                  label={namedQuery.name}
+                  variant="outlined"
+                  onClick={() => void navigator.clipboard?.writeText(`@${namedQuery.name}`)}
+                  title={t("query.copyNamedObject", { name: namedQuery.name })}
+                />
+              ) : (
+                <Tooltip
+                  key={`query-${namedQuery.name}`}
+                  title={t("query.namedObjectUnavailable", {
+                    name: namedQuery.name,
+                    reason: namedQuery.unusable_reason || t("query.namedObjectUnavailableUnknown"),
+                  })}
+                >
+                  <span>
+                    <Chip size="small" label={namedQuery.name} disabled />
+                  </span>
+                </Tooltip>
+              ),
+            )}
+          </Stack>
+        </Paper>
+      )}
+
       {error && (
         <Alert
           severity="error"
@@ -628,7 +768,11 @@ export default function QueryPanel() {
         <Box>
           <Box display="flex" gap={1} flexWrap="wrap" mb={0.5}>
             <Tooltip
-              title={executeResult.reason || `${t("query.routeType")}: ${executeResult.route_type}`}
+              title={routeReasonLabel(
+                executeResult.route_type,
+                executeResult.reason,
+                t,
+              )}
               placement="top"
               arrow
             >
@@ -652,7 +796,21 @@ export default function QueryPanel() {
             feedback={executeResult.field_compatibility}
             t={t}
           />
-          {allRows.length === 0 ? (
+          {/* Bug-8453: a row-security deny-all previously rendered as a bare
+              empty grid, indistinguishable from "there is genuinely no data".
+              Shown regardless of row count, because a denied query still
+              returns a row for COUNT-shaped SQL (WHERE 0 = 1 -> 0). */}
+          {executeRowSecurityDenied && (
+            <Alert severity="warning" sx={{ mb: 1 }}>
+              <AlertTitle>{t("query.rowSecurityDeniedTitle")}</AlertTitle>
+              {t("query.rowSecurityDeniedBody")}
+            </Alert>
+          )}
+          {/* R5 finding F6: suppress the RESULT too, not just the empty-state
+              text. A denial can return a COUNT row containing 0, and a
+              screenshot of that cell does not travel with the warning above --
+              the same policy the pivot panel applies. */}
+          {executeRowSecurityDenied ? null : allRows.length === 0 ? (
             <Typography variant="caption" color="text.secondary">
               {t("query.noRowsReturned")}
             </Typography>
@@ -790,6 +948,29 @@ function QueryFieldCompatibilityAlert({
       )}
     </Alert>
   );
+}
+
+function routeReasonLabel(
+  routeType: string,
+  reason: string | undefined,
+  t: (key: string) => string,
+): string {
+  // The routing narrative is no longer withheld from any authenticated caller
+  // (decision 2026-08-11, option C), so `reason` is always prose.
+  const localizedReason = reason;
+  const LOCALIZED: Record<string, string> = {
+    source: "query.routeReasonSource",
+    aggregate: "query.routeReasonAggregate",
+    pocket: "query.routeReasonPocket",
+  };
+  const i18nKey = LOCALIZED[routeType];
+  if (i18nKey) {
+    const summary = t(i18nKey);
+    // Bug-6971: surface the router's detailed reason string instead of
+    // discarding it for known route types.
+    return localizedReason ? `${summary}\n${localizedReason}` : summary;
+  }
+  return localizedReason || `${t("query.routeType")}: ${routeType}`;
 }
 
 function routeBadgeLabel(routeType: string, t: (key: string) => string): string {

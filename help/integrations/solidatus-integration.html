@@ -16,7 +16,8 @@
     <h1>Solidatus Integration</h1>
 
     <h2>What it is</h2>
-    <p>The Solidatus integration lets you push your Tessallite semantic model metadata into <strong>Solidatus</strong>, the enterprise lineage and governance graph platform. When connected, Solidatus becomes a visual map of your data landscape — showing where every metric, dimension, KPI, and downstream report comes from.</p>
+    <p>The Solidatus integration builds a Solidatus-shaped lineage graph of your Tessallite semantic model — showing where every metric, dimension, KPI, and downstream report comes from — so you can preview exactly what would land in <strong>Solidatus</strong>, the enterprise lineage and governance graph platform.</p>
+    <p>In this build the integration is a <strong>preview / dry-run</strong> tool. It reads your model and computes the graph locally; it does not send anything to Solidatus. Live push (writing the nodes and edges into your Solidatus instance) is not yet available — see the "Not available yet: live connector" section below.</p>
 
     <h2>Who it is for</h2>
     <ul>
@@ -26,7 +27,7 @@
     </ul>
 
     <h2>What gets exported</h2>
-    <p>When you sync a model to Solidatus, Tessallite exports these objects as graph nodes and edges:</p>
+    <p>When you preview or dry-run a model export, Tessallite maps these objects into Solidatus graph nodes and edges (computed locally — nothing is written to Solidatus yet):</p>
     <div class="table-wrapper"><table>
       <thead><tr><th>Tessallite object</th><th>Solidatus representation</th></tr></thead>
       <tbody>
@@ -121,37 +122,46 @@
       <li>You should see your Tessallite model as a set of interconnected nodes showing the full data lineage from source systems to downstream reports.</li>
     </ol>
 
-    <h2>How sync works (under the hood)</h2>
-    <p>Each time you sync, Tessallite:</p>
+    <h2>Available now: preview and dry run</h2>
+    <p>Everything in this section works today. It reads your model and computes the governance graph locally — nothing is sent to Solidatus.</p>
+    <p>Each time you preview or dry-run, Tessallite:</p>
     <ol>
       <li><strong>Builds a governance graph</strong> — reads every table, column, dimension, measure, KPI, glossary term, downstream asset, aggregate, and data tag from your model.</li>
       <li><strong>Maps to Solidatus format</strong> — converts each Tessallite object into a Solidatus node or edge.</li>
-      <li><strong>Hashes every object</strong> — creates a SHA256 fingerprint of each node and edge.</li>
-      <li><strong>Compares with previous sync</strong> — checks which objects are new, changed, or unchanged since the last sync.</li>
-      <li><strong>Pushes only what changed</strong> — sends only new and updated objects to Solidatus. Unchanged objects are skipped.</li>
-      <li><strong>Saves the mapping</strong> — records which Tessallite objects map to which Solidatus objects, so the next sync can be incremental.</li>
+      <li><strong>Hashes every object</strong> — creates a SHA256 fingerprint of each node and edge, ready to drive an incremental diff once live push exists.</li>
+      <li><strong>Records the run</strong> — saves the run in history with the exact model snapshot it was built from, the node/edge counts, and any governance warnings (for example, a KPI whose expression references a measure that is missing).</li>
     </ol>
-    <p>This means the first sync sends everything, but subsequent syncs only send what changed — making it fast and efficient.</p>
+    <p>The dry run computes what a push <em>would</em> do; it does not contact Solidatus and does not create, update, or deprecate anything remotely.</p>
+    <p><strong>Incremental diff is not available yet.</strong> Live push is not implemented in this build, so no remote mapping is ever saved. With no saved baseline to compare against, every dry run reports all objects as <em>new</em> — it cannot yet show which nodes or edges changed or stayed the same since a previous sync. When live push lands, the fingerprints above will drive an incremental create/update/deprecate diff.</p>
+
+    <h2>Not available yet: live connector</h2>
+    <p>Live validation and live push are <strong>not implemented</strong> in this build. Until a tenant-specific Solidatus client is wired in, the following do NOT happen:</p>
+    <ul>
+      <li><strong>Live push</strong> — the Sync button is disabled and the API returns "not implemented". No node or edge is created or updated in Solidatus.</li>
+      <li><strong>Remote deprecation</strong> — when you remove objects from your model, the dry run records them as removed locally, but nothing is deprecated inside Solidatus, because no remote call is made.</li>
+      <li><strong>Live connection checks</strong> — Test Connection is simulated (see Step 5); a wrong URL or expired token is not caught until live validation exists.</li>
+    </ul>
+    <p>When the live client lands, this page will be updated with the remote push, deprecation, and troubleshooting behaviour it introduces.</p>
 
     <h2>Tips and best practices</h2>
     <ul>
-      <li><strong>Sync after deploy</strong> — The sync exports the deployed version of your model. If you make changes but haven't deployed yet, the sync won't see them (unless you enable "export draft" in the sync options).</li>
-      <li><strong>Run a preview first</strong> — Always preview before syncing to check that the counts make sense.</li>
-      <li><strong>Use dry run for changes</strong> — Before a big model update, run a dry run to see what would change.</li>
-      <li><strong>Check run history</strong> — The run history table shows every sync attempt, including failures. If something goes wrong, check the error message.</li>
+      <li><strong>Export the deployed version</strong> — Preview and dry run use the deployed version of your model by default. If you make changes but haven't deployed yet, they won't appear unless you enable "export draft".</li>
+      <li><strong>Run a preview first</strong> — Always preview to check that the counts make sense.</li>
+      <li><strong>Use dry run before a big change</strong> — See what would change before it changes.</li>
+      <li><strong>Read the governance warnings</strong> — A dry run flags objects missing a description or owner, and KPIs / calculated measures whose expression could not be fully resolved. Fixing these makes the future export complete.</li>
+      <li><strong>Check the recorded snapshot</strong> — Each run records the exact model snapshot it was built from, so you can prove which model version a preview came from.</li>
       <li><strong>Token security</strong> — Your Solidatus API token is encrypted before storage and never returned by the API. If you need to update it, use the Edit button and enter a new token.</li>
-      <li><strong>Deprecate, don't delete</strong> — When you remove objects from your Tessallite model, the sync marks them as deprecated in Solidatus rather than deleting them. This preserves lineage history.</li>
     </ul>
 
-    <h2>Troubleshooting</h2>
+    <h2>Troubleshooting (preview / dry run)</h2>
+    <p>These cover the preview and dry-run surfaces that work today. There is no live troubleshooting yet because no remote call is made.</p>
     <div class="table-wrapper"><table>
       <thead><tr><th>Problem</th><th>Likely cause</th><th>Solution</th></tr></thead>
       <tbody>
         <tr><td>"Connection not found"</td><td>No connection configured</td><td>Click Add Connection first</td></tr>
         <tr><td>"Model not found"</td><td>Not inside a model</td><td>Open a model in Model Builder</td></tr>
-        <tr><td>Sync fails with error</td><td>Invalid token or URL</td><td>Edit the connection and fix the URL/token</td></tr>
         <tr><td>Preview shows 0 nodes</td><td>Model has no objects yet</td><td>Add tables, measures, dimensions first</td></tr>
-        <tr><td>Solidatus doesn't show new objects</td><td>Workspace ID is wrong</td><td>Check the Workspace ID in your connection settings</td></tr>
+        <tr><td>Preview warns about unresolved KPI/measure lineage</td><td>A KPI or calculated-measure expression references a measure that is missing or misspelled</td><td>Open the measure/KPI and fix the reference</td></tr>
         <tr><td>"Model not deployed" warning</td><td>Model has no deployed version</td><td>Deploy the model first, or enable export_draft</td></tr>
       </tbody>
     </table></div>

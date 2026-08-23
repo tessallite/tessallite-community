@@ -17,11 +17,26 @@ network path swallows failures — a beacon outage must never affect the product
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class BeaconConfigError(RuntimeError):
+    """Bug-8374: a FATAL, must-fix beacon-encryption configuration error.
+
+    Raised by the startup validators when a beacon ENC key is set but malformed
+    (not a valid Fernet key), so a misconfigured deploy FAILS FAST at startup
+    instead of silently losing every beacon. Distinct from the valid half-config
+    case (product key set, sink key missing), which is only a WARNING because the
+    two sides may be deployed separately and telemetry recovers once the matching
+    key lands. Startup/cold-start boundaries must NOT catch this — that is the
+    point of raising it.
+    """
 
 # Fields the beacon is ALLOWED to carry. license_id is the only identifier; the
 # rest are non-identifying telemetry the sink already stores. This allow-list is
@@ -30,6 +45,85 @@ ALLOWED_BEACON_FIELDS = ("license_id", "version", "edition", "sent_at")
 
 # Floor on cadence so a misconfigured tiny interval can't hammer the endpoint.
 _MIN_INTERVAL_SECONDS = 60.0
+
+# Bug-8296: optional shared symmetric key (a Fernet key) that encrypts the beacon
+# payload on the wire. Set BEACON_ENC_KEY here on the product AND the SAME value as
+# ISSUER_BEACON_ENC_KEY on the issuer sink; the sink then DROPS any beacon it cannot
+# decrypt. Unset = plaintext (graceful pre-8296 behavior). NEVER hardcode the key —
+# it comes from the environment only.
+_ENC_KEY_ENV = "BEACON_ENC_KEY"
+
+# Bug-8374: the matching issuer-sink env var. Named here only so the product-side
+# startup validator can warn about the half-config trap — a product that encrypts
+# every beacon while the sink is not configured to decrypt silently loses all
+# telemetry. This module never READS the issuer key (that belongs to the sink); it
+# only checks whether the operator remembered to wire it.
+_ISSUER_ENC_KEY_ENV = "ISSUER_BEACON_ENC_KEY"
+
+
+def _beacon_enc_key() -> str | None:
+    value = os.environ.get(_ENC_KEY_ENV, "").strip()
+    return value or None
+
+
+def beacon_startup_validate() -> None:
+    """Bug-8374: fail-fast on an unsafe beacon-encryption configuration (product side).
+
+    ``BEACON_ENC_KEY`` opts the product emitter into Fernet-encrypting every beacon
+    (see ``encrypt_beacon_body``); the issuer sink must hold the SAME key as
+    ``ISSUER_BEACON_ENC_KEY`` or it drops every beacon as undecryptable. Two hazards
+    this catches at startup, before any beacon is silently lost:
+
+      1. **Malformed key.** ``BEACON_ENC_KEY`` is set but is not a valid Fernet key,
+         so every ``encrypt_beacon_body`` call would fail. This RAISES
+         ``BeaconConfigError`` so the caller fails fast — an explicitly misconfigured
+         key must not degrade to silently-lost telemetry.
+      2. **Half-config.** ``BEACON_ENC_KEY`` is set and valid but the operator has
+         not also set ``ISSUER_BEACON_ENC_KEY`` on the sink. The emitter would send
+         ``{"enc": ...}`` while the sink expects plaintext and DROPS every beacon —
+         the worst case, because the operator believes telemetry is flowing. Logged
+         as a strong WARNING naming the missing issuer variable; NOT fatal, because
+         the sink half may be deployed separately and recovers once its key lands.
+
+    Returns ``None`` when the configuration is safe (including the common default:
+    no key set at all, plaintext mode) or a valid half-config; RAISES
+    ``BeaconConfigError`` on hazard (1).
+    """
+    key = os.environ.get(_ENC_KEY_ENV, "").strip()
+    if not key:
+        return None  # plaintext mode (default) — nothing to validate
+    try:
+        from cryptography.fernet import Fernet
+
+        Fernet(key.encode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 — any construction failure == bad key
+        raise BeaconConfigError(
+            f"{_ENC_KEY_ENV} is set but is not a valid Fernet key: {exc}"
+        ) from exc
+    return None
+
+
+def encrypt_beacon_body(payload: dict[str, Any]) -> dict[str, Any]:
+    """Wrap the beacon payload for the wire.
+
+    When ``BEACON_ENC_KEY`` (a Fernet key) is configured, the payload JSON is
+    encrypted with that shared symmetric key and returned as ``{"enc": <token>}``;
+    the issuer sink decrypts it and DROPS anything it cannot decrypt. With no key
+    configured the plaintext payload is returned unchanged, so an unconfigured or
+    older deployment keeps working exactly as before. Reuses the project's existing
+    symmetric primitive (Fernet — the same one that encrypts connection
+    credentials); no bespoke crypto."""
+    key = _beacon_enc_key()
+    if not key:
+        return payload
+    from cryptography.fernet import Fernet  # local import: keeps the module light
+
+    token = (
+        Fernet(key.encode("utf-8"))
+        .encrypt(json.dumps(payload, sort_keys=True, default=str).encode("utf-8"))
+        .decode("ascii")
+    )
+    return {"enc": token}
 
 
 def _now_iso() -> str:
@@ -71,8 +165,12 @@ async def emit_once(
     try:
         import httpx  # local import keeps the module importable where httpx is absent
 
+        # Bug-8296: encrypt the payload when a shared key is configured (else plaintext).
+        # Inside the try so a misconfigured key degrades to a swallowed no-op, never a
+        # raise out of this best-effort emitter.
+        body = encrypt_beacon_body(payload)
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=body)
         ok = 200 <= resp.status_code < 300
         if not ok:
             logger.debug("beacon non-2xx from %s: %s", url, resp.status_code)
@@ -122,17 +220,16 @@ class BeaconEmitter:
         )
 
     async def _run(self) -> None:
-        # Best-effort beacon on startup, then on the configured cadence. The whole
-        # loop is wrapped so a stray error can never crash the host service.
-        try:
-            await self._tick()
-            while True:
-                await asyncio.sleep(self._interval)
+        # Best-effort beacon on startup, then on the configured cadence. Each
+        # tick is isolated so a stray error cannot stop later heartbeats (F-031-18).
+        while True:
+            try:
                 await self._tick()
-        except asyncio.CancelledError:  # clean shutdown
-            raise
-        except Exception:  # noqa: BLE001 — offline tolerance
-            logger.debug("beacon loop stopped on error", exc_info=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — offline tolerance
+                logger.debug("beacon tick failed", exc_info=True)
+            await asyncio.sleep(self._interval)
 
     def start(self) -> bool:
         """Launch the background loop. No-op (returns False) when unconfigured."""
@@ -153,4 +250,12 @@ class BeaconEmitter:
         self._task = None
 
 
-__all__ = ["BeaconEmitter", "emit_once", "build_beacon_payload", "ALLOWED_BEACON_FIELDS"]
+__all__ = [
+    "BeaconEmitter",
+    "BeaconConfigError",
+    "emit_once",
+    "build_beacon_payload",
+    "encrypt_beacon_body",
+    "beacon_startup_validate",
+    "ALLOWED_BEACON_FIELDS",
+]

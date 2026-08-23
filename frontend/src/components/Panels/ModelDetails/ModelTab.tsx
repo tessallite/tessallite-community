@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
-import { useQuery, useQueries } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
   Box,
@@ -29,11 +29,13 @@ import {
   usePersonas,
 } from "../../../api/hooks";
 import {
-  tableAttributesApi,
   glossaryApi,
   queryRouterApiClient,
 } from "../../../api/client";
-import type { TableAttribute } from "../../../api/types_domains/sources_schema";
+import type {
+  ModelTableWithAttributes,
+  TableAttribute,
+} from "../../../api/types_domains/sources_schema";
 import PersonaPicker from "../../Persona/PersonaPicker";
 import AttributeExportMenu from "./AttributeExportMenu";
 import {
@@ -57,6 +59,7 @@ export default function ModelTab() {
   const mid = modelId ?? "";
   const [personaId, setPersonaId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const queryClient = useQueryClient();
 
   const model = useModel(pid, mid);
   const sources = useSources(pid, mid);
@@ -64,6 +67,7 @@ export default function ModelTab() {
     () => (sources.data ?? []).map((s) => s.id),
     [sources.data],
   );
+  const sortedSourceIds = useMemo(() => [...sourceIds].sort(), [sourceIds]);
   const tables = useAllModelTables(pid, mid, sourceIds);
   const dimensions = useDimensions(pid, mid);
   const measures = useMeasures(pid, mid);
@@ -71,15 +75,12 @@ export default function ModelTab() {
   const personas = usePersonas(pid, mid, { forAudience: false });
 
   const tableList = useMemo(() => tables.data ?? [], [tables.data]);
-
-  const attrQueries = useQueries({
-    queries: tableList.map((tb) => ({
-      queryKey: ["tableAttributes", pid, mid, tb.id],
-      queryFn: () => tableAttributesApi.list(pid, mid, tb.id),
-      enabled: !!pid && !!mid && !!tb.id,
-    })),
-  });
-  const attrUpdatedKey = attrQueries.map((q) => q.dataUpdatedAt ?? 0).join("|");
+  const batchRows = queryClient.getQueryData<ModelTableWithAttributes[]>([
+    "allModelTables",
+    pid,
+    mid,
+    sortedSourceIds,
+  ]) ?? [];
 
   const glossary = useQuery({
     queryKey: ["glossary", pid, mid],
@@ -89,12 +90,16 @@ export default function ModelTab() {
 
   const attributesByTable = useMemo(() => {
     const map = new Map<string, TableAttribute[]>();
-    tableList.forEach((tb, i) => {
-      map.set(tb.id, attrQueries[i]?.data ?? []);
-    });
+    for (const row of batchRows) {
+      map.set(row.table.id, row.attributes);
+    }
+    for (const table of tableList) {
+      if (!map.has(table.id)) {
+        map.set(table.id, []);
+      }
+    }
     return map;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tableList, attrUpdatedKey]);
+  }, [batchRows, tableList]);
 
   const selectedPersona = useMemo(
     () => (personas.data ?? []).find((p) => p.id === personaId) ?? null,
@@ -210,8 +215,7 @@ export default function ModelTab() {
   const isLoading =
     model.isLoading ||
     sources.isLoading ||
-    tables.isLoading ||
-    attrQueries.some((q) => q.isLoading);
+    tables.isLoading;
 
   return (
     <Box>

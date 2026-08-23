@@ -83,6 +83,38 @@ class TestCacheGetPut:
         assert cache.get(TENANT, MODEL_ID, KPI_ID_A, user_id="alice", persona_id=persona_b) == {"v": "sales"}
         assert cache.get(TENANT, MODEL_ID, KPI_ID_A, user_id="alice") is None
 
+    def test_different_definition_versions_are_separate(self):
+        # F-017-01: the served definition version (deployed version:epoch) keys
+        # the cache; a new deployed definition must miss the old entry.
+        cache = KpiEvalCache()
+        cache.put(TENANT, MODEL_ID, KPI_ID_A, {"v": "v1"}, definition_version="ver1:1")
+        assert cache.get(TENANT, MODEL_ID, KPI_ID_A, definition_version="ver1:1") == {"v": "v1"}
+        # A redeploy advances the epoch -> new key -> miss.
+        assert cache.get(TENANT, MODEL_ID, KPI_ID_A, definition_version="ver1:2") is None
+
+    def test_data_epoch_bump_invalidates_entry(self):
+        # F-017-03 (Bug-7989): a data refresh bumps Model.data_epoch, which is
+        # folded into the cache key. The next evaluation reads the new epoch,
+        # forms a new key, and misses the pre-refresh entry -- on every replica,
+        # without waiting out the TTL and with no cross-process eviction.
+        cache = KpiEvalCache()
+        cache.put(TENANT, MODEL_ID, KPI_ID_A, {"value": 100}, data_epoch=7)
+        # Same epoch still hits.
+        assert cache.get(TENANT, MODEL_ID, KPI_ID_A, data_epoch=7) == {"value": 100}
+        # After a refresh bumped the epoch, the stale entry is a miss.
+        assert cache.get(TENANT, MODEL_ID, KPI_ID_A, data_epoch=8) is None
+
+    def test_data_epoch_absent_matches_absent(self):
+        # Backward compatibility: entries stored without a data_epoch (legacy /
+        # non-model paths) still round-trip when data_epoch is omitted.
+        cache = KpiEvalCache()
+        cache.put(TENANT, MODEL_ID, KPI_ID_A, {"value": 5})
+        assert cache.get(TENANT, MODEL_ID, KPI_ID_A) == {"value": 5}
+        # An entry keyed with an epoch is distinct from one without.
+        cache.put(TENANT, MODEL_ID, KPI_ID_B, {"value": 6}, data_epoch=0)
+        assert cache.get(TENANT, MODEL_ID, KPI_ID_B) is None
+        assert cache.get(TENANT, MODEL_ID, KPI_ID_B, data_epoch=0) == {"value": 6}
+
 
 class TestCacheTTL:
     def test_expired_entry_returns_none(self):
@@ -209,11 +241,13 @@ class TestKpiCacheKeyComponents:
 
         kpi = SimpleNamespace(
             calc_agg_mode="per_row_then_aggregate", business_definition=None,
+            updated_at=None,
         )
-        calc_mode, filters, time_ctx = _kpi_cache_key_components(kpi)
+        calc_mode, filters, time_ctx, def_ver = _kpi_cache_key_components(kpi)
         assert calc_mode == "per_row_then_aggregate"
         assert filters is None
         assert time_ctx is None
+        assert def_ver is None  # Bug-7242: no updated_at -> None
 
     def test_components_pull_filters_and_time_window(self):
         from types import SimpleNamespace
@@ -224,8 +258,11 @@ class TestKpiCacheKeyComponents:
             "time_window": {"type": "relative", "grain": "month", "n": 3},
             "_compiled": {"where_clause": "region = 'EU'"},  # volatile, excluded
         }
-        kpi = SimpleNamespace(calc_agg_mode="automatic", business_definition=bd)
-        calc_mode, filters, time_ctx = _kpi_cache_key_components(kpi)
+        kpi = SimpleNamespace(
+            calc_agg_mode="automatic", business_definition=bd,
+            updated_at=None,
+        )
+        calc_mode, filters, time_ctx, def_ver = _kpi_cache_key_components(kpi)
         assert calc_mode == "automatic"
         assert filters == bd["filters"]
         assert time_ctx == bd["time_window"]
@@ -243,3 +280,141 @@ class TestKpiCacheKeyComponents:
         cache.put(TENANT, MODEL_ID, KPI_ID_A, {"v": "us"}, filters=f_us)
         assert cache.get(TENANT, MODEL_ID, KPI_ID_A, filters=f_eu) == {"v": "eu"}
         assert cache.get(TENANT, MODEL_ID, KPI_ID_A, filters=f_us) == {"v": "us"}
+
+
+class TestTargetDependencyCacheVersions:
+    """Cross-replica cache identity for target-only KPI dependency closures."""
+
+    @staticmethod
+    def _kpi(kpi_id, name, *, expression="literal(1)", target_expression=None):
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id=kpi_id,
+            name=name,
+            expression=expression,
+            target_expression=target_expression,
+            updated_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        )
+
+    def _target_only_chain(self):
+        leaf = self._kpi(_uid(), "Leaf")
+        middle = self._kpi(
+            _uid(), "Middle", target_expression='kpi("Leaf")',
+        )
+        consumer = self._kpi(
+            _uid(), "Consumer", target_expression='kpi("Middle")',
+        )
+        return consumer, middle, leaf
+
+    def test_update_to_transitive_target_dependency_misses_warmed_entry(self):
+        from src.api.kpis import _kpi_dependency_cache_version
+
+        consumer, middle, leaf = self._target_only_chain()
+        before = _kpi_dependency_cache_version(
+            consumer, {k.name: k for k in (consumer, middle, leaf)},
+            {k.id: k for k in (consumer, middle, leaf)}, "consumer-v1",
+        )
+        cache = KpiEvalCache()
+        cache.put(TENANT, MODEL_ID, consumer.id, "warm", definition_version=before)
+
+        leaf.expression = "literal(2)"
+        after = _kpi_dependency_cache_version(
+            consumer, {k.name: k for k in (consumer, middle, leaf)},
+            {k.id: k for k in (consumer, middle, leaf)}, "consumer-v1",
+        )
+
+        assert after != before
+        assert cache.get(TENANT, MODEL_ID, consumer.id, definition_version=after) is None
+
+    def test_delete_of_transitive_target_dependency_misses_warmed_entry(self):
+        from src.api.kpis import _kpi_dependency_cache_version
+
+        consumer, middle, leaf = self._target_only_chain()
+        before = _kpi_dependency_cache_version(
+            consumer, {k.name: k for k in (consumer, middle, leaf)},
+            {k.id: k for k in (consumer, middle, leaf)}, "consumer-v1",
+        )
+        cache = KpiEvalCache()
+        cache.put(TENANT, MODEL_ID, consumer.id, "warm", definition_version=before)
+
+        after = _kpi_dependency_cache_version(
+            consumer, {k.name: k for k in (consumer, middle)},
+            {k.id: k for k in (consumer, middle)}, "consumer-v1",
+        )
+
+        assert after != before
+        assert cache.get(TENANT, MODEL_ID, consumer.id, definition_version=after) is None
+
+    def test_revert_of_target_dependency_misses_warmed_entry(self):
+        from src.api.kpis import _kpi_dependency_cache_version
+
+        consumer, middle, leaf = self._target_only_chain()
+        before = _kpi_dependency_cache_version(
+            consumer, {k.name: k for k in (consumer, middle, leaf)},
+            {k.id: k for k in (consumer, middle, leaf)}, "consumer-v2",
+        )
+        cache = KpiEvalCache()
+        cache.put(TENANT, MODEL_ID, consumer.id, "warm", definition_version=before)
+
+        middle.target_expression = 'kpi("Prior Leaf")'
+        after = _kpi_dependency_cache_version(
+            consumer, {k.name: k for k in (consumer, middle, leaf)},
+            {k.id: k for k in (consumer, middle, leaf)}, "consumer-v2",
+        )
+
+        assert after != before
+        assert cache.get(TENANT, MODEL_ID, consumer.id, definition_version=after) is None
+
+    def test_composite_child_scoring_change_misses_warmed_parent_entry(self):
+        from src.api.kpis import _kpi_dependency_cache_version
+
+        parent = self._kpi(_uid(), "Composite", expression="literal(0)")
+        parent.kpi_type = "composite"
+        child = self._kpi(_uid(), "Composite child", expression="literal(50)")
+        child.parent_kpi_id = parent.id
+        child.weight = 1.0
+        child.direction = "higher_is_better"
+        child.target_value = 100.0
+        consumer = self._kpi(
+            _uid(), "Composite consumer", expression='kpi("Composite")',
+        )
+        all_kpis = (parent, child, consumer)
+        before = _kpi_dependency_cache_version(
+            consumer, {k.name: k for k in all_kpis},
+            {k.id: k for k in all_kpis}, "composite-v1",
+        )
+        cache = KpiEvalCache()
+        cache.put(TENANT, MODEL_ID, consumer.id, "warm", definition_version=before)
+
+        child.weight = 0.25
+        after = _kpi_dependency_cache_version(
+            consumer, {k.name: k for k in all_kpis},
+            {k.id: k for k in all_kpis}, "composite-v1",
+        )
+
+        assert after != before
+        assert cache.get(TENANT, MODEL_ID, consumer.id, definition_version=after) is None
+
+
+class TestCacheCapacity:
+    def test_lru_eviction_bounds_entries_and_cleans_secondary_indexes(self):
+        cache = KpiEvalCache(max_entries=2)
+        cache.put(TENANT, MODEL_ID, KPI_ID_A, "a")
+        cache.put(TENANT, MODEL_ID, KPI_ID_B, "b")
+        assert cache.get(TENANT, MODEL_ID, KPI_ID_A) == "a"
+
+        third = _uid()
+        cache.put(TENANT, MODEL_ID, third, "c")
+
+        assert cache.size == 2
+        assert cache.get(TENANT, MODEL_ID, KPI_ID_B) is None
+        assert cache.get(TENANT, MODEL_ID, KPI_ID_A) == "a"
+        assert cache.get(TENANT, MODEL_ID, third) == "c"
+        assert str(KPI_ID_B) not in cache._kpi_keys
+        assert all(str(KPI_ID_B) not in owners for owners in cache._key_owners.values())
+
+    def test_cache_capacity_requires_a_positive_limit(self):
+        with pytest.raises(ValueError, match="max_entries"):
+            KpiEvalCache(max_entries=0)

@@ -19,9 +19,21 @@ from shared.semantic.kpi_dependency import (
 pytestmark = pytest.mark.unit
 
 
-def _kpi(name: str, expression: str | None = None) -> dict:
+def _kpi(
+    name: str,
+    expression: str | None = None,
+    target_expression: str | None = None,
+    *,
+    parent_kpi_id=None,
+) -> dict:
     """Helper to create a KPI dict for graph building."""
-    return {"id": uuid.uuid4(), "name": name, "expression": expression}
+    return {
+        "id": uuid.uuid4(),
+        "name": name,
+        "expression": expression,
+        "target_expression": target_expression,
+        "parent_kpi_id": parent_kpi_id,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +52,20 @@ class TestBuildGraph:
             _kpi("B", 'kpi("A") * 100'),
         ])
         assert graph["B"].depends_on == ["A"]
+
+    def test_target_kpi_reference_creates_dep(self):
+        graph = build_graph([
+            _kpi("Target", 'literal(80)'),
+            _kpi("Revenue", 'literal(50)', 'kpi("Target")'),
+        ])
+        assert graph["Revenue"].depends_on == ["Target"]
+
+    def test_value_and_target_dependencies_are_deduplicated(self):
+        graph = build_graph([
+            _kpi("Target", 'literal(80)'),
+            _kpi("Revenue", 'kpi("Target")', 'kpi("Target")'),
+        ])
+        assert graph["Revenue"].depends_on == ["Target"]
 
     def test_multiple_deps(self):
         graph = build_graph([
@@ -70,6 +96,16 @@ class TestBuildGraph:
     def test_empty_list(self):
         graph = build_graph([])
         assert graph == {}
+
+    def test_composite_parent_depends_on_owned_child(self):
+        parent = _kpi("Composite", 'literal(0)')
+        child = _kpi(
+            "Child", 'literal(50)', parent_kpi_id=parent["id"],
+        )
+
+        graph = build_graph([parent, child])
+
+        assert graph["Composite"].depends_on == ["Child"]
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +178,19 @@ class TestDetectCycles:
             cycle_nodes.update(c.cycle_path)
         assert "C" in cycle_nodes
         assert "D" in cycle_nodes
+
+    @pytest.mark.parametrize("dependency_field", ["expression", "target_expression"])
+    def test_child_reference_to_composite_parent_is_cycle(self, dependency_field):
+        parent = _kpi("Composite", 'literal(0)')
+        child = _kpi(
+            "Child", 'literal(50)', parent_kpi_id=parent["id"],
+        )
+        child[dependency_field] = 'kpi("Composite")'
+
+        cycles = detect_cycles(build_graph([parent, child]))
+
+        assert cycles
+        assert {"Composite", "Child"}.issubset(cycles[0].cycle_path)
 
 
 # ---------------------------------------------------------------------------

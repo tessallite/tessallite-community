@@ -3,7 +3,7 @@ name = "agent-service"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.111.0",
+    "fastapi==0.136.1",
     "prometheus-client>=0.20.0",
     "uvicorn[standard]>=0.29.0",
     "sqlalchemy>=2.0.30",
@@ -23,7 +23,7 @@ dependencies = [
     "anthropic>=0.28.0",
     "openai>=1.30.0",
     "PyJWT>=2.8.0",
-    "sqlglot>=23.0.0",
+    "sqlglot>=30.8.0,<31.0.0",
 ]
 
 [dependency-groups]

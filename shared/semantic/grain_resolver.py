@@ -374,13 +374,21 @@ def bound_ident(name: str) -> str:
     table, breaking the matcher's column lookup. The reserved ``__row_count``
     synthetic and any name already within the limit pass through unchanged.
     """
-    if len(name) <= _MAX_IDENT_LEN:
+    if len(name.encode("utf-8")) <= _MAX_IDENT_LEN:
         return name
     import hashlib
 
     digest = hashlib.md5(name.encode("utf-8")).hexdigest()[:6]
-    keep = _MAX_IDENT_LEN - len(digest) - 1
-    return f"{name[:keep]}_{digest}"
+    keep_bytes = _MAX_IDENT_LEN - len(digest) - 1
+    prefix: list[str] = []
+    used = 0
+    for ch in name:
+        size = len(ch.encode("utf-8"))
+        if used + size > keep_bytes:
+            break
+        prefix.append(ch)
+        used += size
+    return f"{''.join(prefix)}_{digest}"
 
 
 # Backwards-compatible private alias (the collision resolver and existing

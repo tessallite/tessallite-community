@@ -25,14 +25,19 @@ import GroupWorkIcon from "@mui/icons-material/GroupWork";
 import VerifiedUserIcon from "@mui/icons-material/VerifiedUser";
 import PaletteIcon from "@mui/icons-material/Palette";
 import ScienceIcon from "@mui/icons-material/Science";
+import VpnKeyIcon from "@mui/icons-material/VpnKey";
+import LockIcon from "@mui/icons-material/Lock";
 import type { Project } from "../../api/types";
 import ConnectionsPanel from "../Panels/ConnectionsPanel";
 import ProjectLLMScreen from "./ProjectLLMScreen";
 import BrandingPanel from "./BrandingPanel";
+import CalendarSettingsPanel from "./CalendarSettingsPanel";
 import DemoTenantPanel from "./DemoTenantPanel";
 import ProjectAgentTabs, { type AgentTabKey } from "./ProjectAgentTabs";
 import UsersAccessPanel from "../Admin/UsersAccessPanel";
 import SecurityAuditPanel from "../Admin/SecurityAuditPanel";
+import SsoSettingsPanel from "../Admin/SsoSettingsPanel";
+import EmbedTokensPanel from "../Admin/EmbedTokensPanel";
 import AuditLog from "../../pages/AuditLog";
 import Webhooks from "../../pages/Webhooks";
 import GroupMappings from "../../pages/GroupMappings";
@@ -44,15 +49,19 @@ type AdminKey =
   | "audit-log"
   | "webhooks"
   | "sso-mappings"
+  | "sso-idp"
+  | "embed-tokens"
   | "security-audit"
   | "demo-tenant";
-type SectionKey = "connections" | "llm-providers" | "branding" | AgentTabKey | AdminKey;
+type SectionKey = "connections" | "llm-providers" | "branding" | "calendar-settings" | AgentTabKey | AdminKey;
 
 const ADMIN_KEYS = new Set<string>([
   "users-access",
   "audit-log",
   "webhooks",
   "sso-mappings",
+  "sso-idp",
+  "embed-tokens",
   "security-audit",
   "demo-tenant",
 ]);
@@ -68,6 +77,7 @@ const ADMIN_SECTIONS = new Set<string>([
   "connections",
   "llm-providers",
   "branding",
+  "calendar-settings",
 ]);
 
 type NavItem = { key: SectionKey; label: string; icon: React.ReactNode };
@@ -98,6 +108,7 @@ export default function ProjectConfigDrawer({
       { key: "connections", label: t("projectNav.connections"), icon: <CableIcon fontSize="small" /> },
       { key: "llm-providers", label: t("projectNav.llm"), icon: <PsychologyIcon fontSize="small" /> },
       { key: "branding", label: t("projectNav.branding"), icon: <PaletteIcon fontSize="small" /> },
+      { key: "calendar-settings", label: t("projectNav.calendarSettings"), icon: <HistoryIcon fontSize="small" /> },
     ],
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }), [t]);
@@ -122,6 +133,8 @@ export default function ProjectConfigDrawer({
       { key: "audit-log", label: t("projectNav.auditLog"), icon: <HistoryIcon fontSize="small" /> },
       { key: "webhooks", label: t("projectNav.webhooks"), icon: <WebhookIcon fontSize="small" /> },
       { key: "sso-mappings", label: t("projectNav.ssoMappings"), icon: <GroupWorkIcon fontSize="small" /> },
+      { key: "sso-idp", label: t("projectNav.ssoIdp"), icon: <VpnKeyIcon fontSize="small" /> },
+      { key: "embed-tokens", label: t("projectNav.embedTokens"), icon: <LockIcon fontSize="small" /> },
       { key: "security-audit", label: t("projectNav.securityAudit"), icon: <VerifiedUserIcon fontSize="small" /> },
       { key: "demo-tenant", label: t("projectNav.demoTenant"), icon: <ScienceIcon fontSize="small" /> },
     ],
@@ -242,6 +255,8 @@ export default function ProjectConfigDrawer({
               <ProjectLLMScreen projectId={projectId} />
             ) : section === "branding" ? (
               <BrandingPanel />
+            ) : section === "calendar-settings" ? (
+              <CalendarSettingsPanel />
             ) : section === "users-access" ? (
               <UsersAccessPanel
                 projectId={projectId}
@@ -253,6 +268,10 @@ export default function ProjectConfigDrawer({
               <Webhooks embedded />
             ) : section === "sso-mappings" ? (
               <GroupMappings embedded />
+            ) : section === "sso-idp" ? (
+              <SsoSettingsPanel />
+            ) : section === "embed-tokens" ? (
+              <EmbedTokensPanel />
             ) : section === "security-audit" ? (
               <SecurityAuditPanel />
             ) : section === "demo-tenant" ? (

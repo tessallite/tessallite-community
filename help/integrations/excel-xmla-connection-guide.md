@@ -2,7 +2,7 @@
 title: "Excel XMLA Connection Guide"
 audience: analyst
 area: Integrations
-updated: 2026-04-17
+updated: 2026-07-02
 ---
 
 ![Excel Data Connection Wizard — server credentials step.](../assets/screencaps/connect-excel-wizard.png)
@@ -17,7 +17,7 @@ Detailed connection reference for Microsoft Excel connecting to Tessallite via t
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| URL | `http://HOST:8080/xmla` | Must include the `/xmla` path segment. |
+| URL | `http://HOST:8080/api/v1/xmla/` | Must include the `/api/v1/xmla/` path and the trailing slash — the connection wizard does not accept the URL without it. |
 | Authentication | HTTP Basic | Tessallite username and password. |
 | Catalog | Workspace slug (e.g., `acme`) | Case-sensitive. Obtain from your Tenant Admin. |
 | Protocol | XMLA 1.1 | Standard Analysis Services protocol. |
@@ -29,7 +29,7 @@ Detailed connection reference for Microsoft Excel connecting to Tessallite via t
 
 1. Open Excel.
 2. Go to **Data** → **Get Data** → **From Other Sources** → **From Analysis Services**.
-3. In **Server name**, enter: `http://HOST:8080/xmla`
+3. In **Server name**, enter: `http://HOST:8080/api/v1/xmla/` (the trailing slash is required).
 4. Under **Log on credentials**, select **Use the following User Name and Password**.
 5. Enter your Tessallite username (email) and password.
 6. Click **Next**.
@@ -88,7 +88,7 @@ To set automatic refresh: **Data** → **Queries & Connections** → right-click
 
 | Problem | Likely cause | Fix |
 |---------|-------------|-----|
-| Cannot connect / "Unable to connect" | Wrong URL format or port blocked | Verify URL is exactly `http://HOST:8080/xmla`. Test with `curl -v http://HOST:8080/xmla`. |
+| Cannot connect / "Unable to connect" | Wrong URL format or port blocked | Verify URL is exactly `http://HOST:8080/api/v1/xmla/` (trailing slash included). Test with `curl -v http://HOST:8080/api/v1/xmla/`. |
 | "Catalog not found" | Wrong workspace slug | Check slug with Tenant Admin (case-sensitive). |
 | "Authentication failed" | Wrong credentials | Reset Tessallite password via Admin panel. |
 | "No cubes found" | No published model | Ask Modeller to save and publish the model in Model Builder. |

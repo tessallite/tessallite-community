@@ -3,14 +3,14 @@ name = "query-router"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.111.0",
+    "fastapi==0.136.1",
     "prometheus-client>=0.20.0",
     "uvicorn[standard]>=0.29.0",
     "sqlalchemy>=2.0.30",
     "asyncpg>=0.29.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
-    "sqlglot>=23.0.0",
+    "sqlglot>=30.8.0,<31.0.0",
     "python-jose[cryptography]>=3.3.0",
     "cryptography>=42.0.0",
     "httpx>=0.27.0",
@@ -22,6 +22,7 @@ dependencies = [
     "pure-sasl>=0.6.2",
     "snowflake-connector-python>=3.6.0",
     "aioodbc>=0.5.0",
+    "croniter>=2.0.0",
 ]
 
 [dependency-groups]
@@ -36,6 +37,8 @@ pythonpath = [".", "../../"]
 testpaths = ["tests"]
 markers = [
     "unit: Unit tests",
-    "integration: Integration tests requiring mocked DB",
+    "integration: Integration tests — mocked DB, or one service + a real Postgres (skip via TESSALLITE_VERSIONING_DB_URL)",
     "e2e: End-to-end tests requiring running services",
+    "real_population_resolvers: disable conftest's synthetic one-relation population world (Bug-8580/Bug-8664); the test asserts what the REAL resolvers do, including their fail-closed behaviour",
+    "real_snapshot_resolver: disable conftest's always-succeeds empty DeployedShape; the test asserts what the REAL snapshot resolver does with a genuine or unusable snapshot_json, including its fail-closed behaviour (Bug-9200/9397)",
 ]

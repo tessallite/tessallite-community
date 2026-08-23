@@ -86,6 +86,10 @@ export interface QueryLog {
   route_type: string;
   aggregate_id: string | null;
   pocket_id?: string | null;
+  // Bug-9172: existing QueryLog timing/byte telemetry can be attributed to a
+  // Named Query. Ordinary rows and historical rows keep these fields null.
+  named_query_id?: string | null;
+  named_query_fallback_reason?: string | null;
   // F-030-20: row-security rules applied to this query (shape varies by rule).
   security_rules_applied?: unknown | null;
   persona_id?: string | null;
@@ -147,6 +151,18 @@ export interface NotificationRouteUpdate {
   enabled?: boolean;
 }
 
+export interface NotificationDelivery {
+  id: string;
+  route_id?: string | null;
+  project_id?: string | null;
+  event_type: string;
+  channel_type: string;
+  target?: string | null;
+  status: string;
+  error_message?: string | null;
+  created_at?: string | null;
+}
+
 export interface QueryMissLog {
   id: string;
   model_id: string;
@@ -166,6 +182,9 @@ export interface HourlyVolume {
   aggregate_hits: number;
   pocket_hits?: number;
   source_hits: number;
+  // Bug-6426: result-cache re-serves for the hour, kept distinct from real
+  // aggregate/pocket acceleration so the bars sum to total.
+  cache_hits?: number;
 }
 export interface RefreshHealthItem {
   aggregate_id: string;
@@ -190,7 +209,19 @@ export interface ModelMetrics {
   aggregate_hits: number;
   pocket_hits?: number;
   source_hits: number;
+  // Bug-6426: queries re-served from the in-TTL result cache. Distinct from
+  // real acceleration; total = aggregate_hits + pocket_hits + source_hits +
+  // cache_hits, so surfacing this closes the "chips don't sum to total" gap.
+  cache_hits?: number;
   hit_rate: number;
+  // Bug-8180: structurally unacceleratable queries (route_type="raw" —
+  // explicit ungrouped flat-row detail pulls) reported as a rate of total
+  // traffic and a raw count, plus an eligibility-scoped hit rate that
+  // excludes them from the denominator.
+  unacceleratable: number;
+  unacceleratable_queries: number;
+  eligible_queries: number;
+  eligible_hit_rate: number;
   bytes_avoided: number;
   hourly_volume: HourlyVolume[];
   refresh_health: RefreshHealthItem[];

@@ -15,13 +15,25 @@ from .manager import LicenseManager, load_manager
 
 
 def build_registry(spec: str) -> KeyRegistry:
-    """Parse ``key_id:base64,key_id:base64`` into a public-key registry."""
+    """Parse ``key_id:base64,key_id:base64`` into a public-key registry.
+
+    F-031-24: a present-but-unparseable fragment fails closed (no silent skip).
+    Duplicate key_ids keep the first entry so the vendor key cannot be replaced
+    by a later fragment in the same spec.
+    """
     reg = KeyRegistry()
     for part in (p.strip() for p in (spec or "").split(",") if p.strip()):
         if ":" not in part:
-            continue
+            raise ValueError(f"unparseable public-key spec fragment: {part!r}")
         key_id, b64 = part.split(":", 1)
-        reg.add_ed25519(key_id.strip(), base64.b64decode(b64.strip()))
+        key_id = key_id.strip()
+        if key_id in reg:
+            continue
+        try:
+            raw = base64.b64decode(b64.strip())
+            reg.add_ed25519(key_id, raw)
+        except Exception as exc:
+            raise ValueError(f"unparseable public-key spec fragment: {part!r}") from exc
     return reg
 
 

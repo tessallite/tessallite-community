@@ -3,6 +3,17 @@
   "model_slug": "modely",
   "model_display_name": "modely",
   "project_brief": "Acme Corp payment processing. Users ask about transactions, revenue, merchant performance, and payment breakdowns.",
+  "term_aliases": {
+    "revenue": "base_amount",
+    "total revenue": "base_amount",
+    "sales": "base_amount",
+    "payments": "transaction_count",
+    "number of payments": "transaction_count",
+    "payment count": "transaction_count",
+    "payment amount": "transaction_amount",
+    "payment value": "transaction_amount",
+    "payments over": "transaction_amount"
+  },
   "measures": [
     "base_amount", "chargeback_amount", "commission_amount", "fee_amount",
     "max_base_amount", "net_amount", "refund_amount", "settlement_amount",

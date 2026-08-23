@@ -402,13 +402,18 @@ def test_declared_keys_are_exposed_to_looker_catalog_probes() -> None:
         table_foreign_keys=foreign_keys,
     )
 
-    # key_column_usage
-    result = cat.execute("SELECT * FROM information_schema.key_column_usage")
+    # key_column_usage — PG-standard 9-column layout (Bug-5552/5553
+    # standardisation for Npgsql): primary keys only; FK columns are derived
+    # by clients from pg_constraint conkey/confkey.
+    result = cat.execute(
+        "SELECT constraint_name, table_name, column_name, ordinal_position "
+        "FROM information_schema.key_column_usage"
+    )
     assert result is not None
     _, rows = result
-    assert [row[2:6] for row in rows] == [
-        ["modelx__payment_transaction", "modelx__payment_transaction_pkey", "payment_id", "1"],
-        ["modelx__dim_account_type", "modelx__dim_account_type_pkey", "account_type_code", "1"],
+    assert [list(row) for row in rows] == [
+        ["modelx__payment_transaction_pkey", "modelx__payment_transaction", "payment_id", "1"],
+        ["modelx__dim_account_type_pkey", "modelx__dim_account_type", "account_type_code", "1"],
     ]
 
     # pg_index
@@ -425,18 +430,23 @@ def test_declared_keys_are_exposed_to_looker_catalog_probes() -> None:
     assert [row[2] for row in constraint_rows] == ["p", "p", "f"]
     assert constraint_rows[-1][3:] == ["16384", "2", "16385", "1"]
 
-    # referential_constraints (foreign keys)
-    result = cat.execute("SELECT * FROM information_schema.referential_constraints")
+    # referential_constraints — PG-standard layout: the FK links to the
+    # referenced table's UNIQUE constraint name, not to inline column names.
+    result = cat.execute(
+        "SELECT constraint_name, unique_constraint_name, match_option, "
+        "update_rule, delete_rule "
+        "FROM information_schema.referential_constraints"
+    )
     assert result is not None
     _, foreign_rows = result
-    assert foreign_rows[0][2:] == [
-        "modelx__payment_transaction",
-        "modelx__payment_transaction_fkey_1",
-        "account_type",
-        "modelx__dim_account_type",
-        "account_type_code",
-        "NO ACTION",
-        "NO ACTION",
+    assert [list(row) for row in foreign_rows] == [
+        [
+            "modelx__payment_transaction_fkey_1",
+            "modelx__dim_account_type_pkey",
+            "NONE",
+            "NO ACTION",
+            "NO ACTION",
+        ]
     ]
 
     cat.close()

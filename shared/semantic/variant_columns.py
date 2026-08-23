@@ -35,13 +35,15 @@ Decision tree (Phase C of the variant pivot, Bug-091):
 """
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Iterator
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.db.models import Dimension, Measure, ModelColumn
+from shared.db.models import CalendarTable, Dimension, Measure, ModelColumn
+from shared.connector_qualify import safe_ident
 from shared.schemas.measure_formats import (
     TIME_VARIANT_NAMES,
     TIME_VARIANTS_NEEDING_CALENDAR,
@@ -50,6 +52,8 @@ from shared.semantic.time_variants_sql import (
     VariantBinding,
     VariantSqlError,
     emit_variant_expression,
+    resolve_effective_variant_anchor,
+    select_finest_time_dimension,
 )
 
 # Variants that can be safely materialised inside a CTAS without a
@@ -70,6 +74,65 @@ class VariantContextError(ValueError):
     """
 
 
+@dataclass(frozen=True)
+class VariantContext:
+    """Resolved CTAS context shared by create and refresh.
+
+    The iterator deliberately yields the historical three values so patched
+    callers and older integrations remain source-compatible while the fourth
+    value, ``time_grain``, keeps source and aggregate window ordering aligned.
+    """
+
+    time_grain_column: str | None
+    source_column_names: dict
+    source_table_ids: dict
+    time_grain: str | None = None
+    calendar_bindings: dict | None = None
+
+    def __iter__(self) -> Iterator:
+        yield self.time_grain_column
+        yield self.source_column_names
+        yield self.source_table_ids
+
+
+@dataclass(frozen=True, slots=True)
+class VariantCalendarBinding:
+    """Calendar metadata needed to reproduce source window ordering in CTAS."""
+
+    calendar_type: str
+    fiscal_year_start_month: int | None
+    calendar_columns: dict[str, str]
+    calendar_model_table_id: object | None
+
+
+_CALENDAR_COLUMN_ATTRS: tuple[tuple[str, str], ...] = (
+    ("date", "date_column"),
+    ("year", "year_column"),
+    ("half", "half_column"),
+    ("quarter", "quarter_column"),
+    ("month", "month_column"),
+    ("week", "week_column"),
+    ("day", "day_column"),
+)
+
+
+def _calendar_binding(calendar: Any, measure: Any) -> VariantCalendarBinding:
+    return VariantCalendarBinding(
+        calendar_type=getattr(calendar, "calendar_type", None) or "standard",
+        fiscal_year_start_month=getattr(
+            calendar, "fiscal_year_start_month", None,
+        ),
+        calendar_columns={
+            key: value
+            for key, attr in _CALENDAR_COLUMN_ATTRS
+            if (value := getattr(calendar, attr, None))
+        },
+        calendar_model_table_id=getattr(
+            measure, "calendar_model_table_id", None,
+        ),
+    )
+
+
 def is_variant(measure: Any) -> bool:
     return getattr(measure, "variant_kind", None) is not None
 
@@ -83,8 +146,8 @@ def _vq(
     if table_aliases and table_id is not None:
         alias = table_aliases.get(table_id)
         if alias:
-            return f'"{alias}"."{col_name}"'
-    return f'"{col_name}"'
+            return f"{safe_ident(alias)}.{safe_ident(col_name)}"
+    return safe_ident(col_name)
 
 
 def render_variant_column_sql(
@@ -99,6 +162,8 @@ def render_variant_column_sql(
     base_source_table_id: UUID | None = None,
     time_grain_source_table_id: UUID | None = None,
     grain_cols: Any | None = None,
+    time_grain: str | None = None,
+    calendar_binding: VariantCalendarBinding | None = None,
 ) -> str:
     """Return the SELECT-list expression for a variant measure column.
 
@@ -171,12 +236,39 @@ def render_variant_column_sql(
             expr = _vq(p, None, table_aliases)
         partition_exprs.append(f"MIN({expr})")
 
+    calendar_alias = "cal"
+    calendar_columns = None
+    if calendar_binding is not None:
+        calendar_columns = calendar_binding.calendar_columns or None
+        calendar_table_id = calendar_binding.calendar_model_table_id
+        if calendar_columns:
+            calendar_alias = (
+                table_aliases.get(calendar_table_id)
+                if table_aliases and calendar_table_id is not None
+                else None
+            )
+        if calendar_columns and calendar_alias is None:
+            raise ValueError(
+                f"variant measure {measure.name!r} requires mapped calendar "
+                f"columns but the calendar table is absent from the CTAS join graph"
+            )
+
     binding = VariantBinding(
         base_expression=base_expression,
         fact_date_column=tg_expr,
         dialect=dialect,
         n=getattr(measure, "variant_n", None),
         partition_by=tuple(partition_exprs),
+        time_grain=time_grain,
+        calendar_alias=calendar_alias,
+        calendar_columns=calendar_columns,
+        calendar_type=(
+            calendar_binding.calendar_type if calendar_binding else None
+        ),
+        fiscal_year_start_month=(
+            calendar_binding.fiscal_year_start_month if calendar_binding else None
+        ),
+        aggregate_calendar_columns=bool(calendar_columns),
     )
     try:
         return emit_variant_expression(kind, binding).sql
@@ -219,15 +311,16 @@ async def resolve_variant_context(
     measures: list[Measure],
     all_dims: list | None = None,
     db: AsyncSession,
-) -> tuple[str | None, dict, dict]:
+) -> VariantContext:
     """Resolve the time-grain column and base source-column names needed
     by the DDL emitters when variant measures are part of the request.
 
     Shared by the optimizer create path and the scheduler refresh path
     (F-009-01) so both resolve variant shape identically.
 
-    Returns ``(time_grain_column, source_column_names, source_table_ids)``.
-    All are ``None`` / empty when no variant measures are present.
+    Returns a :class:`VariantContext`.  Iterating it yields the historical
+    ``(time_grain_column, source_column_names, source_table_ids)`` values;
+    ``time_grain`` is available as a named field for window-order parity.
 
     When ``all_dims`` is provided (includes hierarchy-level virtual dims),
     it is used for time-dimension detection instead of querying only the
@@ -240,18 +333,23 @@ async def resolve_variant_context(
     """
     variant_measures = [m for m in measures if is_variant(m)]
     if not variant_measures:
-        return None, {}, {}
+        return VariantContext(None, {}, {}, None, {})
 
     # Time-grain column: the logical dimension name for the time
     # dimension in ``grain``.  The renderer resolves the physical
     # source column from grain_cols at render time.
     time_grain_column: str | None = None
+    time_grain_source_column_id: object = None
     if grain:
         grain_set = set(grain)
         if all_dims:
             time_dims = [
                 d for d in all_dims
-                if getattr(d, "is_time_dim", False) and d.name in grain_set
+                if (
+                    (getattr(d, "is_time_dim", False)
+                     or getattr(d, "dimension_kind", None) == "time")
+                    and d.name in grain_set
+                )
             ]
         else:
             result = await db.execute(
@@ -262,16 +360,12 @@ async def resolve_variant_context(
                 )
             )
             time_dims = list(result.scalars().all())
-        if time_dims:
-            for dim in time_dims:
-                if getattr(dim, "source_column_id", None) is None:
-                    continue
-                col = await db.get(ModelColumn, dim.source_column_id)
-                if col is not None:
-                    time_grain_column = dim.name
-                    break
-            if time_grain_column is None:
-                time_grain_column = time_dims[0].name
+        selected_time_dim = select_finest_time_dimension(time_dims, grain_set)
+        if selected_time_dim is not None:
+            time_grain_column = selected_time_dim.name
+            time_grain_source_column_id = getattr(
+                selected_time_dim, "source_column_id", None
+            )
 
     if time_grain_column is None:
         names = [m.name for m in variant_measures]
@@ -282,7 +376,9 @@ async def resolve_variant_context(
 
     # Source column names for each variant measure (the base column the
     # window function reads). Variant rows snapshot the base measure's
-    # source_column_id at create time.
+    # source_column_id at create time. Checked before the anchor gate so a
+    # variant with no snapshot fails with the snapshot diagnostic first
+    # (Bug-3591/Bug-1091 API contract); both gates fail closed.
     source_column_names: dict = {}
     source_table_ids: dict = {}
     col_ids = {m.source_column_id for m in variant_measures if m.source_column_id}
@@ -307,4 +403,61 @@ async def resolve_variant_context(
             f"variant measures {missing!r} have no source column snapshot"
         )
 
-    return time_grain_column, source_column_names, source_table_ids
+    # Bug-8293 [WRONG NUMBERS / fail closed]: an anchor with no physical
+    # identity is UNPROVEN. When a variant carries no configured anchor AND
+    # the selected time-grain dimension exposes no source column, nothing
+    # proves the CTAS window would order by the same physical date as the
+    # source route — refuse the CTAS and serve the variant from source.
+    unproven = [
+        m.name
+        for m in variant_measures
+        if not resolve_effective_variant_anchor(m, selected_time_dim).is_proven
+    ]
+    if unproven:
+        raise VariantContextError(
+            f"variant measures {unproven!r} have no proven physical "
+            f"date-anchor identity (no configured anchor and the selected "
+            f"time-grain dimension exposes no source column); they cannot be "
+            f"materialised in this CTAS without route-dependent wrong "
+            f"numbers. Serve them from source."
+        )
+
+    # Bug-8293/F-015-01 [WRONG NUMBERS]: source, CTAS, refresh and serve-time
+    # admission consume the same effective-anchor authority.  This covers the
+    # window family's date_dimension_column_id and the parallel-period family's
+    # resolved_date_col_id (notably pct_change/cagr).  A mismatch means the
+    # source route orders by one physical date while the materialised window
+    # orders by the selected grain anchor, so fail closed before any CTAS.
+    mismatched = [
+        m.name
+        for m in variant_measures
+        if not resolve_effective_variant_anchor(m, selected_time_dim).matches_grain
+    ]
+    if mismatched:
+        raise VariantContextError(
+            f"variant measures {mismatched!r} resolve a date anchor that "
+            f"differs from the aggregate's selected time-grain column; they "
+            f"cannot be materialised in this CTAS without route-dependent "
+            f"wrong numbers. Serve them from source."
+        )
+
+    calendar_bindings: dict = {}
+    for measure in variant_measures:
+        calendar_id = getattr(measure, "resolved_calendar_id", None)
+        if calendar_id is None:
+            continue
+        calendar = await db.get(CalendarTable, calendar_id)
+        if calendar is None:
+            raise VariantContextError(
+                f"variant measure {measure.name!r} resolves calendar "
+                f"{calendar_id!r}, but that calendar is missing"
+            )
+        calendar_bindings[measure.id] = _calendar_binding(calendar, measure)
+
+    return VariantContext(
+        time_grain_column,
+        source_column_names,
+        source_table_ids,
+        getattr(selected_time_dim, "time_grain", None),
+        calendar_bindings,
+    )

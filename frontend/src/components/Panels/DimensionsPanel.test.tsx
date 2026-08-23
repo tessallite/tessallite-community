@@ -11,6 +11,9 @@ import { ConfirmProvider } from "../Confirm";
 const createDimMock = vi.fn();
 const updateDimMock = vi.fn();
 const deleteDimMock = vi.fn();
+// The calendar-association PATCH. Held at module scope so a test can make it
+// reject with a real server 422 body.
+const updateTableMock = vi.fn();
 
 vi.mock("../../api/client", () => ({
   dimensionsApi: {
@@ -19,7 +22,7 @@ vi.mock("../../api/client", () => ({
     delete: (...args: unknown[]) => deleteDimMock(...args),
   },
   modelTablesApi: {
-    update: vi.fn().mockResolvedValue({}),
+    update: (...args: unknown[]) => updateTableMock(...args),
   },
 }));
 
@@ -33,9 +36,23 @@ vi.mock("../../store/builderStore", () => ({
 }));
 
 // DimensionCalendarAssociation pulls its own hooks; stub it out so the test
-// focuses on the dimension editor itself.
+// focuses on the dimension editor itself. The stub still exposes the real
+// `onCalendarSelect` callback (behind a button that only appears when the
+// section is visible) so a test can drive the genuine calendar-binding path
+// instead of reaching into component state.
 vi.mock("../Builder/DimensionCalendarAssociation", () => ({
-  default: () => null,
+  default: ({
+    visible,
+    onCalendarSelect,
+  }: {
+    visible?: boolean;
+    onCalendarSelect?: (calId: string | null, calType: string | null) => void;
+  }) =>
+    visible ? (
+      <button type="button" onClick={() => onCalendarSelect?.("cal-1", "gregorian")}>
+        stub-pick-calendar
+      </button>
+    ) : null,
 }));
 
 // ---------------------------------------------------------------------------
@@ -86,6 +103,10 @@ vi.mock("../../api/hooks", () => ({
   useAllModelTables: () => ({ data: [SAMPLE_TABLE] }),
   useModelSourceStatistics: () => ({ columnStatsMap: {} }),
   useTableAttributes: () => ({ data: SAMPLE_ATTRS, isLoading: false }),
+  // The edit dialog renders the attribute-relationships section, which reads
+  // these hooks. They have no bearing on the display-column picker under test.
+  useAttributeRelationships: () => ({ data: [], isLoading: false }),
+  useJoins: () => ({ data: [], isLoading: false, isError: false }),
 }));
 
 import DimensionsPanel from "./DimensionsPanel";
@@ -144,6 +165,7 @@ describe("DimensionsPanel display-column picker (Bug-5502)", () => {
     createDimMock.mockReset().mockResolvedValue({ id: "new" });
     updateDimMock.mockReset().mockResolvedValue({ id: "d1" });
     deleteDimMock.mockReset().mockResolvedValue({});
+    updateTableMock.mockReset().mockResolvedValue({});
     useDimensionsMock.mockReset();
   });
 
@@ -232,5 +254,98 @@ describe("DimensionsPanel display-column picker (Bug-5502)", () => {
     await waitFor(() => expect(updateDimMock).toHaveBeenCalled());
     const payload = updateDimMock.mock.calls[0][3];
     expect(payload.display_column_name).toBeNull();
+  });
+});
+
+describe("DimensionsPanel surfaces the server's calendar rejection reason", () => {
+  // The calendar binding is a SECOND, non-atomic PATCH issued after the
+  // dimension row is already written. When the server refuses it, the modeller
+  // used to see one fixed sentence regardless of the reason — so "that calendar
+  // belongs to another model" and a transport failure were indistinguishable,
+  // and nothing told the modeller what to change. The body-FK guards answer 422
+  // with a structured detail; that message must reach the dialog.
+  const SERVER_MESSAGE =
+    "calendar_table_id does not reference a calendar table in this model.";
+
+  function bodyFkRejection() {
+    return {
+      response: {
+        status: 422,
+        data: {
+          detail: {
+            error_code: "CALENDAR_TABLE_NOT_IN_MODEL",
+            field: "calendar_table_id",
+            ids: ["cal-1"],
+            message: SERVER_MESSAGE,
+          },
+        },
+      },
+    };
+  }
+
+  beforeEach(() => {
+    createDimMock.mockReset().mockResolvedValue({ id: "new" });
+    updateDimMock.mockReset().mockResolvedValue({ id: "d1" });
+    deleteDimMock.mockReset().mockResolvedValue({});
+    updateTableMock.mockReset().mockResolvedValue({});
+    useDimensionsMock.mockReset();
+  });
+
+  async function openCreateDialogAndPickCalendar(
+    user: ReturnType<typeof userEvent.setup>,
+  ) {
+    await user.click(screen.getByText("Add"));
+    await waitFor(() => expect(screen.getByText("Source Column")).toBeTruthy());
+    await user.type(screen.getByLabelText(/^Name/), "order_date");
+    await selectOption(user, "Table", /customer \(customer\)/);
+    await selectOption(user, "Attribute", "customer_key");
+    // Make the calendar-association section visible, then bind a calendar so
+    // persistCalendarAssociation actually issues its PATCH.
+    await user.click(screen.getByRole("checkbox", { name: /Time dimension/i }));
+    await user.click(await screen.findByText("stub-pick-calendar"));
+  }
+
+  it("renders the server's 422 message, not just the generic sentence", async () => {
+    useDimensionsMock.mockReturnValue({ data: [], isLoading: false });
+    updateTableMock.mockRejectedValue(bodyFkRejection());
+    renderPanel();
+    const user = userEvent.setup();
+
+    await openCreateDialogAndPickCalendar(user);
+    // The dialog's submit button reads "Add" when creating (and so does the
+    // panel toolbar button), so scope the query to the dialog.
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: /^Add$/ }),
+    );
+
+    // The dimension row was written; the calendar PATCH was refused.
+    await waitFor(() => expect(createDimMock).toHaveBeenCalled());
+    await waitFor(() => expect(updateTableMock).toHaveBeenCalled());
+
+    // The specific server reason is what the modeller must act on.
+    expect(await screen.findByText(SERVER_MESSAGE)).toBeTruthy();
+    // The dialog stays open — a refused binding is not a completed save.
+    expect(screen.getByText("Source Column")).toBeTruthy();
+  });
+
+  it("falls back to the generic sentence when the failure carries no message", async () => {
+    useDimensionsMock.mockReturnValue({ data: [], isLoading: false });
+    updateTableMock.mockRejectedValue({ message: "Network Error" });
+    renderPanel();
+    const user = userEvent.setup();
+
+    await openCreateDialogAndPickCalendar(user);
+    // The dialog's submit button reads "Add" when creating (and so does the
+    // panel toolbar button), so scope the query to the dialog.
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: /^Add$/ }),
+    );
+
+    await waitFor(() => expect(updateTableMock).toHaveBeenCalled());
+    expect(
+      await screen.findByText(/linking it to the selected calendar failed/i),
+    ).toBeTruthy();
+    // No server text to show, so the generic sentence is not duplicated.
+    expect(screen.queryByText(SERVER_MESSAGE)).toBeNull();
   });
 });

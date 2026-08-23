@@ -8,7 +8,12 @@ import yaml
 # single, production-wired snapshot diff (used by versions.py). These tests now
 # exercise it directly.
 from shared.model_snapshot.differ import diff_snapshots
-from shared.model_snapshot.yaml_deserialiser import YamlImportError, parse_model_yaml
+from shared.model_snapshot.yaml_deserialiser import (
+    YamlImportError,
+    YamlSyntaxError,
+    parse_model_yaml,
+    parse_project_yaml,
+)
 from shared.model_snapshot.yaml_serialiser import project_to_yaml, snapshot_to_yaml
 
 
@@ -243,31 +248,123 @@ def _make_lossy_snapshot():
     }
 
 
-def test_join_cardinality_roundtrips_non_canonical():
-    """Bug-1097: a `right` join must survive export+import, not collapse to
-    the `many_to_one` default."""
+def test_join_orientation_roundtrips_non_canonical():
+    """Bug-1097: a `right` join must survive export+import, not collapse to a
+    default."""
     snap = _make_lossy_snapshot()
     yaml_str = snapshot_to_yaml(snap, connection_name="wh")
     doc = yaml.safe_load(yaml_str)
-    # Export carries the raw cardinality verbatim (not remapped, not dropped).
+    # Export carries the raw orientation verbatim (not remapped, not dropped).
     assert doc["joins"][0]["type"] == "right"
 
     parsed = parse_model_yaml(yaml_str)
     assert len(parsed["joins"]) == 1
     assert parsed["joins"][0]["join_type"] == "right", (
-        "non-canonical join cardinality must round-trip 1:1, not default to many_to_one"
+        "a declared join orientation must round-trip 1:1, not default"
     )
 
 
-def test_join_cardinality_roundtrips_canonical():
-    """Canonical hyphenated cardinalities still reverse-map correctly."""
+def test_join_cardinality_roundtrips_as_its_own_field():
+    """Cardinality is a SEPARATE exported key from the join type.
+
+    Join orientation (which rows survive) and cardinality (how many rows on
+    each side match) are two orthogonal properties of a join. Exporting only
+    one of them silently loses the other, which is what happened while both
+    shared a single ORM column.
+    """
+    snap = _make_lossy_snapshot()
+    snap["joins"][0]["join_type"] = "left"
+    snap["joins"][0]["cardinality"] = "one_to_many"
+    yaml_str = snapshot_to_yaml(snap, connection_name="wh")
+    doc = yaml.safe_load(yaml_str)
+    assert doc["joins"][0]["type"] == "left"
+    assert doc["joins"][0]["cardinality"] == "one-to-many"
+
+    parsed = parse_model_yaml(yaml_str)
+    assert parsed["joins"][0]["join_type"] == "left"
+    assert parsed["joins"][0]["cardinality"] == "one_to_many"
+
+
+def test_legacy_cardinality_in_type_is_split_not_dropped():
+    """A file written BEFORE the split put the cardinality in ``type``.
+
+    Importing it must (a) keep the cardinality rather than discard it, and
+    (b) give the join a real orientation instead of leaving a cardinality
+    token in the field that decides which rows survive. The inferred
+    orientation is the one that preserves the cardinality label's many side,
+    which reproduces the legacy rendering.
+    """
     snap = _make_lossy_snapshot()
     snap["joins"][0]["join_type"] = "one_to_many"
+    snap["joins"][0].pop("cardinality", None)
     yaml_str = snapshot_to_yaml(snap, connection_name="wh")
     doc = yaml.safe_load(yaml_str)
     assert doc["joins"][0]["type"] == "one-to-many"
+    assert "cardinality" not in doc["joins"][0]
+
     parsed = parse_model_yaml(yaml_str)
-    assert parsed["joins"][0]["join_type"] == "one_to_many"
+    assert parsed["joins"][0]["cardinality"] == "one_to_many", (
+        "the cardinality carried in the legacy ``type`` key was dropped"
+    )
+    assert parsed["joins"][0]["join_type"] == "right", (
+        "one_to_many means the modeller's RIGHT table is the many side, so "
+        "the orientation that preserves it is a RIGHT join"
+    )
+
+
+def test_population_participation_roundtrips_when_declared():
+    """Bug-8615 G1: a deliberately declared population intent is model-defining
+    content. Losing it on an export/import cycle would silently reset a
+    ``population_defining`` join back to elidable, which is a wrong-numbers
+    path once phase G3 reads the flag."""
+    snap = _make_lossy_snapshot()
+    snap["joins"][0]["population_participation"] = "population_defining"
+    yaml_str = snapshot_to_yaml(snap, connection_name="wh")
+    doc = yaml.safe_load(yaml_str)
+    assert doc["joins"][0]["population_participation"] == "population_defining"
+
+    parsed = parse_model_yaml(yaml_str)
+    assert parsed["joins"][0]["population_participation"] == "population_defining"
+
+
+def test_g4_sol_r1_b01_manual_default_participation_provenance_roundtrips():
+    snap = _make_lossy_snapshot()
+    snap["joins"][0]["population_participation"] = "preserve_base_rows"
+    snap["joins"][0]["population_participation_source"] = "manual"
+    yaml_str = snapshot_to_yaml(snap, connection_name="wh")
+    doc = yaml.safe_load(yaml_str)
+    assert doc["joins"][0]["population_participation_source"] == "manual"
+    parsed = parse_model_yaml(yaml_str)
+    assert parsed["joins"][0]["population_participation_source"] == "manual"
+
+
+def test_the_default_population_participation_is_not_written_to_yaml():
+    """An untouched model's YAML must be byte-identical to what it was before
+    this field existed, so a diff of an unrelated edit does not show a spurious
+    join change."""
+    snap = _make_lossy_snapshot()
+    snap["joins"][0]["population_participation"] = "preserve_base_rows"
+    doc = yaml.safe_load(snapshot_to_yaml(snap, connection_name="wh"))
+    assert "population_participation" not in doc["joins"][0]
+
+
+def test_a_yaml_file_without_the_key_imports_as_the_default():
+    """Every file written before this field existed."""
+    snap = _make_lossy_snapshot()
+    snap["joins"][0].pop("population_participation", None)
+    yaml_str = snapshot_to_yaml(snap, connection_name="wh")
+    assert "population_participation" not in yaml_str
+    parsed = parse_model_yaml(yaml_str)
+    assert parsed["joins"][0]["population_participation"] == "preserve_base_rows"
+
+
+def test_an_unknown_population_participation_imports_as_undeclared():
+    """A hand-edited file must not fail the import, and must not be read as an
+    affirmative declaration either."""
+    snap = _make_lossy_snapshot()
+    snap["joins"][0]["population_participation"] = "whatever_the_user_typed"
+    parsed = parse_model_yaml(snapshot_to_yaml(snap, connection_name="wh"))
+    assert parsed["joins"][0]["population_participation"] == "undeclared"
 
 
 def test_hierarchy_uda_level_roundtrips():
@@ -478,6 +575,78 @@ def test_parse_model_yaml_validates_required_fields():
         assert False, "Should have raised"
     except YamlImportError as e:
         assert "model" in e.errors[0].lower()
+
+
+# ---------------------------------------------------------------------------
+# Bug-8139: a genuinely malformed YAML document (not a well-formed document
+# missing a field -- an unparseable one) must raise YamlSyntaxError with
+# line/column, not propagate a raw yaml.YAMLError. Pre-fix, `yaml.safe_load`
+# in parse_model_yaml / parse_project_yaml had no try/except around it at
+# all, so the underlying yaml.scanner.ScannerError / yaml.parser.ParserError
+# escaped uncaught past every handler in yaml_export.py straight to
+# FastAPI's default handler -- a 500, even though the bundle is malformed
+# CLIENT input. These tests fail pre-fix with an *uncaught yaml.YAMLError*
+# (not a clean assertion failure), which is itself the proof: the type the
+# import endpoint's `except YamlImportError` handler is built to catch was
+# never being raised.
+# ---------------------------------------------------------------------------
+
+def test_parse_model_yaml_malformed_syntax_raises_yaml_syntax_error_with_line_col():
+    # A tab character where YAML forbids one -- a reliable scanner error
+    # that PyYAML locates precisely.
+    bad_yaml = "model:\n\tname: test\n"
+    try:
+        parse_model_yaml(bad_yaml)
+        assert False, "Should have raised YamlSyntaxError"
+    except YamlSyntaxError as e:
+        assert e.line == 2
+        assert e.column == 1
+        assert "line 2" in e.errors[0]
+        assert "column 1" in e.errors[0]
+
+
+def test_parse_model_yaml_malformed_syntax_is_a_yaml_import_error():
+    # YamlSyntaxError must satisfy the import endpoint's existing
+    # `except YamlImportError` handler (services/model-service/src/api/
+    # yaml_export.py::import_project_yaml), which maps it to HTTP 422, with
+    # no further change needed there.
+    bad_yaml = "model: [unclosed\n"
+    try:
+        parse_model_yaml(bad_yaml)
+        assert False, "Should have raised"
+    except YamlImportError as e:
+        assert isinstance(e, YamlSyntaxError)
+
+
+def test_parse_project_yaml_malformed_project_content_raises_yaml_syntax_error():
+    bad_project = "project:\n\tname: acme\n"
+    try:
+        parse_project_yaml(bad_project, {})
+        assert False, "Should have raised YamlSyntaxError"
+    except YamlSyntaxError as e:
+        assert e.line is not None
+        assert e.column is not None
+
+
+def test_parse_project_yaml_malformed_model_content_raises_yaml_syntax_error():
+    # A malformed file under models/ must surface the same clean error as a
+    # malformed project.yaml, identified via parse_model_yaml's own check.
+    bad_model = "model:\n\tname: test\n"
+    try:
+        parse_project_yaml(
+            "project:\n  name: acme\n", {"models/bad.yaml": bad_model}
+        )
+        assert False, "Should have raised YamlSyntaxError"
+    except YamlSyntaxError as e:
+        assert e.line is not None
+
+
+def test_yaml_syntax_error_is_caught_by_existing_yaml_import_error_handlers():
+    err = YamlSyntaxError("bad yaml", line=3, column=5)
+    assert isinstance(err, YamlImportError)
+    assert err.errors == ["bad yaml"]
+    assert err.line == 3
+    assert err.column == 5
 
 
 def test_project_yaml_output():

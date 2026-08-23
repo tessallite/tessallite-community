@@ -230,15 +230,20 @@ async def test_collibra_sync_applies_connection_mapping_to_push_payload():
 
 @pytest.mark.anyio
 async def test_solidatus_push_fails_without_real_client_and_decrypts_credentials():
+    # Bug-5987 (F-030-03): run_solidatus_sync now RETURNS the persisted
+    # failed run instead of raising, so the caller (the /sync endpoint)
+    # can report the real run_id instead of a fabricated zero UUID. The
+    # underlying "push is not implemented" failure and the persisted
+    # failed-run bookkeeping are unchanged — only the raise-vs-return
+    # contract changed, so this test now asserts on the returned run.
     conn = _solidatus_conn()
     db, added = _db_for(conn)
 
     with (
         patch("src.solidatus_sync.build_governance_graph", AsyncMock(return_value=_graph())),
         patch("src.solidatus_sync.decrypt_token", return_value="plain-token") as decrypt_token,
-        pytest.raises(NotImplementedError, match="Solidatus non-dry-run sync is not implemented"),
     ):
-        await run_solidatus_sync(
+        run = await run_solidatus_sync(
             db,
             connection_id=conn.id,
             project_id=TEST_PROJECT_ID,
@@ -247,21 +252,25 @@ async def test_solidatus_push_fails_without_real_client_and_decrypts_credentials
         )
 
     decrypt_token.assert_called_once_with(conn.encrypted_credentials)
+    assert run.status == "failed"
+    assert run is added[0]
+    assert "Solidatus non-dry-run sync is not implemented" in run.error_message
     assert added[0].status == "failed"
     assert "Solidatus non-dry-run sync is not implemented" in added[0].error_message
 
 
 @pytest.mark.anyio
 async def test_collibra_push_fails_without_real_client_and_decrypts_credentials():
+    # Bug-6027 (sibling of Bug-5987): same raise-to-return contract change
+    # as the Solidatus case above.
     conn = _collibra_conn()
     db, added = _db_for(conn)
 
     with (
         patch("src.collibra_sync.build_governance_graph", AsyncMock(return_value=_graph())),
         patch("src.collibra_sync.decrypt_token", return_value="plain-token") as decrypt_token,
-        pytest.raises(NotImplementedError, match="Collibra non-dry-run sync is not implemented"),
     ):
-        await run_collibra_sync(
+        run = await run_collibra_sync(
             db,
             connection_id=conn.id,
             project_id=TEST_PROJECT_ID,
@@ -270,6 +279,9 @@ async def test_collibra_push_fails_without_real_client_and_decrypts_credentials(
         )
 
     decrypt_token.assert_called_once_with(conn.encrypted_credentials)
+    assert run.status == "failed"
+    assert run is added[0]
+    assert "Collibra non-dry-run sync is not implemented" in run.error_message
     assert added[0].status == "failed"
     assert "Collibra non-dry-run sync is not implemented" in added[0].error_message
 

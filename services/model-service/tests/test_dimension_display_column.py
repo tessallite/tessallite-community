@@ -24,6 +24,10 @@ from src.api import dimensions as dim_api
 
 pytestmark = pytest.mark.unit
 
+# The path project/model the resolver must forward to the column engine.
+PROJECT_ID = uuid.uuid4()
+MODEL_ID = uuid.uuid4()
+
 
 def _col(col_id: uuid.UUID, table_id: uuid.UUID, name: str) -> types.SimpleNamespace:
     return types.SimpleNamespace(id=col_id, model_table_id=table_id, column_name=name)
@@ -49,6 +53,8 @@ async def test_resolve_display_column_none_when_not_requested():
         source_table_id=uuid.uuid4(),
         source_column_id=uuid.uuid4(),
         user_defined_attribute_id=None,
+        model_id=MODEL_ID,
+        project_id=PROJECT_ID,
     )
     assert out is None
 
@@ -62,6 +68,8 @@ async def test_resolve_display_column_empty_string_clears():
         source_table_id=uuid.uuid4(),
         source_column_id=uuid.uuid4(),
         user_defined_attribute_id=None,
+        model_id=MODEL_ID,
+        project_id=PROJECT_ID,
     )
     assert out is None
 
@@ -74,7 +82,15 @@ async def test_resolve_display_column_resolves_distinct_column(monkeypatch):
     disp_col = _col(disp_id, table_id, "customer_name")
     db = _FakeDB({})
 
-    async def _fake_resolve_column(_db, _table_id, _name, _dt="unknown"):
+    async def _fake_resolve_column(
+        _db, _table_id, _name, _dt="unknown", *,
+        model_id=None, project_id=None, field_name=None,
+    ):
+        # resolve_column now REFUSES to touch a table without the path
+        # model context; assert the resolver forwards it rather than
+        # letting a dropped scope pass unnoticed.
+        assert model_id == MODEL_ID, model_id
+        assert project_id == PROJECT_ID, project_id
         assert _table_id == table_id
         assert _name == "customer_name"
         return disp_col
@@ -86,6 +102,8 @@ async def test_resolve_display_column_resolves_distinct_column(monkeypatch):
         source_table_id=table_id,
         source_column_id=key_id,
         user_defined_attribute_id=None,
+        model_id=MODEL_ID,
+        project_id=PROJECT_ID,
     )
     assert out == disp_id
 
@@ -97,7 +115,15 @@ async def test_resolve_display_column_rejects_same_as_key(monkeypatch):
     same_col = _col(key_id, table_id, "customer_key")
     db = _FakeDB({})
 
-    async def _fake_resolve_column(_db, _table_id, _name, _dt="unknown"):
+    async def _fake_resolve_column(
+        _db, _table_id, _name, _dt="unknown", *,
+        model_id=None, project_id=None, field_name=None,
+    ):
+        # resolve_column now REFUSES to touch a table without the path
+        # model context; assert the resolver forwards it rather than
+        # letting a dropped scope pass unnoticed.
+        assert model_id == MODEL_ID, model_id
+        assert project_id == PROJECT_ID, project_id
         return same_col
 
     monkeypatch.setattr(dim_api, "resolve_column", _fake_resolve_column)
@@ -108,6 +134,8 @@ async def test_resolve_display_column_rejects_same_as_key(monkeypatch):
             source_table_id=table_id,
             source_column_id=key_id,
             user_defined_attribute_id=None,
+            model_id=MODEL_ID,
+            project_id=PROJECT_ID,
         )
     assert exc.value.status_code == 422
     assert "differ" in str(exc.value.detail).lower()
@@ -123,6 +151,8 @@ async def test_resolve_display_column_rejects_uda_dimension():
             source_table_id=None,
             source_column_id=None,
             user_defined_attribute_id=uuid.uuid4(),
+            model_id=MODEL_ID,
+            project_id=PROJECT_ID,
         )
     assert exc.value.status_code == 422
     assert "physical-column" in str(exc.value.detail).lower()
@@ -138,6 +168,8 @@ async def test_resolve_display_column_rejects_without_source_column():
             source_table_id=uuid.uuid4(),
             source_column_id=None,
             user_defined_attribute_id=None,
+            model_id=MODEL_ID,
+            project_id=PROJECT_ID,
         )
     assert exc.value.status_code == 422
 

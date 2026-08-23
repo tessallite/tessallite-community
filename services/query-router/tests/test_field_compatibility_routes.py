@@ -221,6 +221,19 @@ async def test_validate_returns_structured_field_compatibility_for_freeform_sql(
 
 
 @pytest.mark.asyncio
+async def test_validate_skips_field_compatibility_for_force_route_raw(monkeypatch):
+    logical_query, bound, metadata = _fixture()
+    _patch_parse_bind_and_metadata(monkeypatch, logical_query, bound, metadata)
+
+    req = _request(bound.model.id)
+    req.force_route = "raw"
+    response = await _handle_validate(req, _EmptyDB())
+
+    assert response.ok is True
+    assert response.field_compatibility is None
+
+
+@pytest.mark.asyncio
 async def test_validate_warns_without_blocking_for_ambiguous_aggregation_path(monkeypatch):
     logical_query, bound, metadata = _fixture()
     measures, dimensions, tables, columns, joins, udas, aggregates, aggregate_columns = metadata
@@ -387,6 +400,63 @@ async def test_validate_complex_sql_returns_not_analyzed_warning_without_false_p
     assert issue.code == "SEMANTIC_COMPATIBILITY_NOT_ANALYZED"
     assert issue.severity == "warning"
     assert issue.message in response.warnings
+
+
+@pytest.mark.asyncio
+async def test_execute_skips_field_compatibility_for_force_route_raw(monkeypatch):
+    logical_query, bound, metadata = _fixture()
+    _patch_parse_bind_and_metadata(monkeypatch, logical_query, bound, metadata)
+
+    from src.api import routes as routes_mod
+
+    route_called = False
+
+    async def _route_sentinel(*args, **kwargs):
+        nonlocal route_called
+        route_called = True
+        raise HTTPException(status_code=422, detail="sentinel: routing reached")
+
+    monkeypatch.setattr(routes_mod, "route_query", _route_sentinel)
+
+    req = _request(bound.model.id)
+    req.force_route = "raw"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _handle_execute(
+            req,
+            SimpleNamespace(),
+            user_identity="analyst@example.com",
+            tenant_id="tenant-1",
+        )
+
+    assert route_called, "route_query must be reached when force_route=raw"
+    assert exc_info.value.detail == "sentinel: routing reached"
+
+
+@pytest.mark.asyncio
+async def test_explain_skips_field_compatibility_for_force_route_raw(monkeypatch):
+    logical_query, bound, metadata = _fixture()
+    _patch_parse_bind_and_metadata(monkeypatch, logical_query, bound, metadata)
+
+    from src.api import routes as routes_mod
+
+    route_called = False
+
+    async def _route_sentinel(*args, **kwargs):
+        nonlocal route_called
+        route_called = True
+        raise HTTPException(status_code=422, detail="sentinel: routing reached")
+
+    monkeypatch.setattr(routes_mod, "route_query", _route_sentinel)
+
+    req = _request(bound.model.id)
+    req.force_route = "raw"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _handle_explain(req, SimpleNamespace())
+
+    assert route_called, "route_query must be reached when force_route=raw"
+    assert exc_info.value.detail == "sentinel: routing reached"
 
 
 @pytest.mark.asyncio

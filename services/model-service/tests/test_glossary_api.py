@@ -15,10 +15,59 @@ from __future__ import annotations
 
 import types
 import uuid
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import httpx
+
+
+def _route_bootstrap_execute(*, sources, existing, dims, measures, joins,
+                             col_rows=None, stats=None):
+    """Order-independent db.execute router for glossary bootstrap tests.
+
+    Bug-7982 R6 (round 2, BLOCKER): the create-vs-update decision map
+    (GlossaryAttachment query) moved from BEFORE the LLM call to AFTER the lock,
+    which shifted every ordered ``side_effect=[...]`` mock. Routing by the
+    selected entity makes these tests immune to query reordering (and to the lock,
+    which is no-op'd by the autouse fixture)."""
+    from shared.db.models import (
+        DataSource, Dimension, GlossaryAttachment, Join, Measure,
+        ModelColumn, ModelTable, SourceColumnStatistics,
+    )
+    _default = MagicMock()
+    _default.scalars.return_value.all.return_value = []
+    _default.all.return_value = []
+    table = {
+        DataSource.__name__: sources,
+        ModelTable.__name__: sources,
+        GlossaryAttachment.__name__: existing,
+        Dimension.__name__: dims,
+        Measure.__name__: measures,
+        Join.__name__: joins,
+        ModelColumn.__name__: col_rows if col_rows is not None else _default,
+        SourceColumnStatistics.__name__: stats if stats is not None else _default,
+    }
+
+    async def _exec(stmt, *a, **kw):
+        descs = getattr(stmt, "column_descriptions", None) or []
+        ent = descs[0].get("entity") if descs else None
+        return table.get(getattr(ent, "__name__", ""), _default)
+
+    return _exec
+
+
+@pytest.fixture(autouse=True)
+def _noop_model_lock():
+    """Bug-7982 R6: glossary mutating endpoints now acquire the per-model
+    advisory lock (one extra ``db.execute``). These unit tests mock the DB with
+    ORDERED ``execute()`` side-effects that assert on the HANDLER's own queries;
+    the lock's execute would shift that sequence. The lock's real behaviour is
+    covered by ``tests/test_model_lock_coverage.py`` and the live-DB suites, so
+    no-op it here to keep these tests focused on the glossary logic under test."""
+    with patch("src.api.glossary.acquire_model_definition_lock", AsyncMock()):
+        yield
+
 
 from src.api.glossary import (
     _JOB_RETENTION_PER_MODEL,
@@ -30,10 +79,13 @@ from src.api.glossary import (
     _heuristic_definition_for_dimension,
     _heuristic_definition_for_measure,
     _issue_public_token,
+    _mint_glossary_service_token,
     _refresh_source_statistics_background,
+    _run_glossary_bootstrap_job,
     _sample_values_from_item_stats,
     _serialize_job_result,
     _sweep_bootstrap_jobs,
+    _validate_attachment_target,
 )
 
 
@@ -99,6 +151,74 @@ def test_public_token_rejects_missing_jti():
 
     with pytest.raises(Exception):
         _decode_public_token(token)
+
+
+def test_mint_glossary_service_token_uses_typed_service_contract():
+    from shared.auth.jwt import decode_access_token
+
+    token = _mint_glossary_service_token("acme")
+    claims = decode_access_token(token)
+
+    assert claims["sub"] == "service:glossary-bootstrap-service"
+    assert claims["tenant_id"] == "acme"
+    assert claims["role"] == "modeler"  # Bug-7758: minimum-privilege role
+    assert claims["aud"] == "service"
+    assert claims["token_type"] == "service"
+    assert claims["service_principal"] == "glossary-bootstrap-service"
+    assert claims["service_scopes"] == ["optimizer.stats-refresh"]
+
+
+@pytest.mark.asyncio
+async def test_glossary_bootstrap_job_uses_typed_service_raw_token():
+    from shared.auth.jwt import decode_access_token
+
+    captured: dict[str, object] = {}
+    job_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    model_id = uuid.uuid4()
+
+    async def _capture_update(*args, **kwargs):
+        captured.setdefault("updates", []).append((args, kwargs))
+        return True  # Bug-6812: _update_bootstrap_job now returns bool
+
+    async def _capture_refresh(*, source_ids, bearer, low_cardinality_threshold):
+        captured["refresh_token"] = bearer
+        captured["source_ids"] = source_ids
+        captured["threshold"] = low_cardinality_threshold
+
+    async def _capture_bootstrap(project_id_arg, model_id_arg, current_user):
+        captured["bootstrap_project_id"] = project_id_arg
+        captured["bootstrap_model_id"] = model_id_arg
+        captured["bootstrap_user"] = current_user
+        from shared.schemas.pydantic_models import GlossaryBootstrapResponse
+
+        return GlossaryBootstrapResponse(proposed_count=0)
+
+    with (
+        patch("src.api.glossary._update_bootstrap_job", new=_capture_update),
+        patch("src.api.glossary._refresh_source_statistics_background", new=_capture_refresh),
+        patch("src.api.glossary.bootstrap", new=_capture_bootstrap),
+    ):
+        await _run_glossary_bootstrap_job(
+            job_id=job_id,
+            tenant_id="acme",
+            user_id="user@example.com",
+            email="user@example.com",
+            project_id=project_id,
+            model_id=model_id,
+            source_ids=[uuid.uuid4()],
+            max_distinct=25,
+        )
+
+    refresh_claims = decode_access_token(str(captured["refresh_token"]))
+    job_user = captured["bootstrap_user"]
+    bootstrap_claims = decode_access_token(job_user.raw_token)
+    assert refresh_claims["service_principal"] == "glossary-bootstrap-service"
+    assert refresh_claims["role"] == "modeler"  # Bug-7758: minimum-privilege role
+    assert refresh_claims["service_scopes"] == ["optimizer.stats-refresh"]
+    assert bootstrap_claims == refresh_claims
+    assert job_user.role == "modeler"
+    assert getattr(job_user, "_glossary_run_now") is True
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +583,7 @@ class TestCreateEntryDefaults:
         with (
             patch("src.api.glossary.get_tenant_db", _gen),
             patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+            patch("src.api.glossary._validate_attachment_target", AsyncMock()),
         ):
             url = f"/api/v1/projects/{project_id}/models/{model_id}/glossary"
             resp = await client.post(url, json={
@@ -526,6 +647,7 @@ class TestCreateEntryDefaults:
         with (
             patch("src.api.glossary.get_tenant_db", _gen),
             patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+            patch("src.api.glossary._validate_attachment_target", AsyncMock()),
         ):
             url = f"/api/v1/projects/{project_id}/models/{model_id}/glossary"
             resp = await client.post(url, json={
@@ -546,6 +668,75 @@ class TestCreateEntryDefaults:
         entry = glossary_entries[0]
         assert entry.visibility == "hide"
         assert entry.confidence == "medium"
+
+    @pytest.mark.asyncio
+    async def test_create_entry_normalizes_review_visibility_to_show(self, client):
+        """Bug-6261 (Codex R2): manual create produces status='approved', so
+        visibility='review' must be normalised to 'show' -- otherwise the
+        approved entry is excluded from public pages and gateway descriptions."""
+        project_id = uuid.uuid4()
+        model_id = uuid.uuid4()
+        entry_id = uuid.uuid4()
+
+        captured_entries = []
+
+        mock_db = MagicMock()
+        mock_db.add = MagicMock(side_effect=lambda obj: captured_entries.append(obj))
+        mock_db.flush = AsyncMock()
+        mock_db.commit = AsyncMock()
+        mock_db.refresh = AsyncMock()
+
+        reload_entry = types.SimpleNamespace(
+            id=entry_id,
+            model_id=model_id,
+            term="Net Revenue",
+            definition="Total net revenue",
+            context_notes=None,
+            source="user",
+            status="approved",
+            version=1,
+            superseded_by=None,
+            created_by=None,
+            proposed_is_hidden=None,
+            visibility="show",
+            confidence="high",
+            sample_values=None,
+            created_at="2026-05-10T00:00:00Z",
+            updated_at="2026-05-10T00:00:00Z",
+            synonyms=[],
+            attachments=[],
+        )
+        reload_result = MagicMock()
+        reload_result.scalar_one.return_value = reload_entry
+        mock_db.execute = AsyncMock(return_value=reload_result)
+
+        async def _gen(*a, **kw):
+            yield mock_db
+
+        with (
+            patch("src.api.glossary.get_tenant_db", _gen),
+            patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+            patch("src.api.glossary._validate_attachment_target", AsyncMock()),
+        ):
+            url = f"/api/v1/projects/{project_id}/models/{model_id}/glossary"
+            resp = await client.post(url, json={
+                "term": "Net Revenue",
+                "definition": "Total net revenue",
+                "target_type": "measure",
+                "target_id": str(uuid.uuid4()),
+                "visibility": "review",
+            })
+
+        assert resp.status_code == 201
+        glossary_entries = [
+            e for e in captured_entries
+            if hasattr(e, "visibility") and hasattr(e, "term")
+            and getattr(e, "term", None) == "Net Revenue"
+        ]
+        assert len(glossary_entries) >= 1
+        entry = glossary_entries[0]
+        # "review" must be normalised to "show" on an approved entry.
+        assert entry.visibility == "show"
 
 
 class TestUpdateVisibilityConfidence:
@@ -801,12 +992,11 @@ class TestBootstrapSkipBehavior:
     def _mock_db_for_bootstrap(self, model, dims, existing_map, entries_by_id):
         """Build a mock DB that satisfies the bootstrap query pattern.
 
-        Bootstrap runs these queries in order for the synchronous path:
-          1. select ModelTable.source_id -> source ids
-          2. select GlossaryAttachment -> existing_entry_map
-          3. select Dimension -> dims
-          4. select Measure -> empty
-          5. select Join -> empty (table relationships)
+        Bug-7982 R6 (round 2): the GlossaryAttachment ``existing_entry_map`` query
+        moved to AFTER the LLM call, UNDER the lock, so the query ORDER is no longer
+        fixed. ``_route_bootstrap_execute`` routes db.execute by the selected entity
+        (ModelTable/Dimension/Measure/Join/GlossaryAttachment/...), making these
+        tests immune to query reordering — do NOT re-introduce an ordered list.
         """
         mock_db = AsyncMock()
         mock_db.add = MagicMock()
@@ -837,10 +1027,10 @@ class TestBootstrapSkipBehavior:
         r_sources.scalars.return_value.all.return_value = []
 
         mock_db.execute = AsyncMock(
-            side_effect=[
-                r_sources, r_existing, r_dims, r_measures, r_joins,
-                *[MagicMock() for _ in range(10)],
-            ],
+            side_effect=_route_bootstrap_execute(
+                sources=r_sources, existing=r_existing, dims=r_dims,
+                measures=r_measures, joins=r_joins,
+            ),
         )
         return mock_db
 
@@ -934,7 +1124,10 @@ class TestBootstrapSkipBehavior:
         r_stats = MagicMock()
         r_stats.scalars.return_value.all.return_value = [stat]
         mock_db.execute = AsyncMock(
-            side_effect=[r_sources, r_existing, r_dims, r_measures, r_joins, r_col_rows, r_stats],
+            side_effect=_route_bootstrap_execute(
+                sources=r_sources, existing=r_existing, dims=r_dims,
+                measures=r_measures, joins=r_joins, col_rows=r_col_rows, stats=r_stats,
+            ),
         )
 
         async def _gen(*a, **kw):
@@ -1038,7 +1231,10 @@ class TestBootstrapSkipBehavior:
         r_stats = MagicMock()
         r_stats.scalars.return_value.all.return_value = [stat]
         mock_db.execute = AsyncMock(
-            side_effect=[r_sources, r_existing, r_dims, r_measures, r_joins, r_col_rows, r_stats],
+            side_effect=_route_bootstrap_execute(
+                sources=r_sources, existing=r_existing, dims=r_dims,
+                measures=r_measures, joins=r_joins, col_rows=r_col_rows, stats=r_stats,
+            ),
         )
 
         async def _gen(*a, **kw):
@@ -1367,6 +1563,211 @@ class TestVisibilityCascade:
         assert changed == 0
 
 
+class TestBug7253_CrossProjectAttachmentRejection:
+    """Bug-7253 (CF-018-Fable-F01802): glossary attachment targets must be
+    validated against the path model. A dimension/measure/column UUID from
+    another model must be rejected at create time to prevent cross-project
+    hide-cascade and name disclosure."""
+
+    def _fake_db(self, objects: dict):
+        """Return an AsyncMock db whose .get(cls, id) looks up from *objects*
+        keyed as (cls, id) tuples."""
+
+        async def _get(cls, oid):
+            return objects.get((cls, oid))
+
+        db = AsyncMock()
+        db.get = AsyncMock(side_effect=_get)
+        return db
+
+    @pytest.mark.asyncio
+    async def test_same_model_dimension_accepted(self):
+        from shared.db.models import Dimension
+        model_id = uuid.uuid4()
+        dim_id = uuid.uuid4()
+        dim = types.SimpleNamespace(id=dim_id, model_id=model_id)
+        db = self._fake_db({(Dimension, dim_id): dim})
+        # Should not raise
+        await _validate_attachment_target(db, model_id, "dimension", dim_id)
+
+    @pytest.mark.asyncio
+    async def test_foreign_model_dimension_rejected(self):
+        from fastapi import HTTPException
+        from shared.db.models import Dimension
+        model_id = uuid.uuid4()
+        foreign_model_id = uuid.uuid4()
+        dim_id = uuid.uuid4()
+        dim = types.SimpleNamespace(id=dim_id, model_id=foreign_model_id)
+        db = self._fake_db({(Dimension, dim_id): dim})
+        with pytest.raises(HTTPException) as exc_info:
+            await _validate_attachment_target(db, model_id, "dimension", dim_id)
+        assert exc_info.value.status_code == 422
+        assert "dimension" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_dimension_rejected(self):
+        from fastapi import HTTPException
+        model_id = uuid.uuid4()
+        db = self._fake_db({})
+        with pytest.raises(HTTPException) as exc_info:
+            await _validate_attachment_target(db, model_id, "dimension", uuid.uuid4())
+        assert exc_info.value.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_foreign_model_measure_rejected(self):
+        from fastapi import HTTPException
+        from shared.db.models import Measure
+        model_id = uuid.uuid4()
+        foreign_model_id = uuid.uuid4()
+        meas_id = uuid.uuid4()
+        meas = types.SimpleNamespace(id=meas_id, model_id=foreign_model_id)
+        db = self._fake_db({(Measure, meas_id): meas})
+        with pytest.raises(HTTPException) as exc_info:
+            await _validate_attachment_target(db, model_id, "measure", meas_id)
+        assert exc_info.value.status_code == 422
+        assert "measure" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_same_model_measure_accepted(self):
+        from shared.db.models import Measure
+        model_id = uuid.uuid4()
+        meas_id = uuid.uuid4()
+        meas = types.SimpleNamespace(id=meas_id, model_id=model_id)
+        db = self._fake_db({(Measure, meas_id): meas})
+        # Should not raise
+        await _validate_attachment_target(db, model_id, "measure", meas_id)
+
+    @pytest.mark.asyncio
+    async def test_concept_type_always_accepted(self):
+        db = self._fake_db({})
+        # concept attachments have no target_id; should not raise
+        await _validate_attachment_target(db, uuid.uuid4(), "concept", None)
+
+    @pytest.mark.asyncio
+    async def test_none_target_id_accepted(self):
+        db = self._fake_db({})
+        # None target_id short-circuits validation for any target_type
+        await _validate_attachment_target(db, uuid.uuid4(), "dimension", None)
+
+    @pytest.mark.asyncio
+    async def test_foreign_model_column_rejected(self):
+        """R1-F2: _validate_attachment_target must reject a column whose
+        ModelTable belongs to a different model."""
+        from fastapi import HTTPException
+        from shared.db.models import ModelColumn, ModelTable
+        model_id = uuid.uuid4()
+        foreign_model_id = uuid.uuid4()
+        tbl_id = uuid.uuid4()
+        col_id = uuid.uuid4()
+        col = types.SimpleNamespace(id=col_id, model_table_id=tbl_id)
+        tbl = types.SimpleNamespace(id=tbl_id, model_id=foreign_model_id)
+        db = self._fake_db({(ModelColumn, col_id): col, (ModelTable, tbl_id): tbl})
+        with pytest.raises(HTTPException) as exc_info:
+            await _validate_attachment_target(db, model_id, "column", col_id)
+        assert exc_info.value.status_code == 422
+        assert "column" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_same_model_column_accepted(self):
+        """R1-F2: a column whose ModelTable belongs to the path model
+        must be accepted."""
+        from shared.db.models import ModelColumn, ModelTable
+        model_id = uuid.uuid4()
+        tbl_id = uuid.uuid4()
+        col_id = uuid.uuid4()
+        col = types.SimpleNamespace(id=col_id, model_table_id=tbl_id)
+        tbl = types.SimpleNamespace(id=tbl_id, model_id=model_id)
+        db = self._fake_db({(ModelColumn, col_id): col, (ModelTable, tbl_id): tbl})
+        # Should not raise
+        await _validate_attachment_target(db, model_id, "column", col_id)
+
+    @pytest.mark.asyncio
+    async def test_cascade_skips_foreign_column(self):
+        """R1-F1: _cascade_hidden_to_columns must skip column-type targets
+        from other models when model_id is supplied."""
+        model_a = uuid.uuid4()
+        model_b = uuid.uuid4()
+        col_a_id = uuid.uuid4()
+        col_b_id = uuid.uuid4()
+        tbl_a_id = uuid.uuid4()
+        tbl_b_id = uuid.uuid4()
+        from shared.db.models import ModelColumn, ModelTable
+        col_a = types.SimpleNamespace(id=col_a_id, model_table_id=tbl_a_id, is_hidden=False)
+        col_b = types.SimpleNamespace(id=col_b_id, model_table_id=tbl_b_id, is_hidden=False)
+        tbl_a = types.SimpleNamespace(id=tbl_a_id, model_id=model_a)
+        tbl_b = types.SimpleNamespace(id=tbl_b_id, model_id=model_b)
+
+        async def _get(cls, oid):
+            if cls is ModelColumn:
+                if oid == col_a_id:
+                    return col_a
+                if oid == col_b_id:
+                    return col_b
+            if cls is ModelTable:
+                if oid == tbl_a_id:
+                    return tbl_a
+                if oid == tbl_b_id:
+                    return tbl_b
+            return None
+
+        db = AsyncMock()
+        db.get = AsyncMock(side_effect=_get)
+        att_a = types.SimpleNamespace(target_type="column", target_id=col_a_id)
+        att_b = types.SimpleNamespace(target_type="column", target_id=col_b_id)
+
+        changed = await _cascade_hidden_to_columns(
+            db, [att_a, att_b], True, model_id=model_a,
+        )
+        # Only col_a should be hidden; col_b is from model_b
+        assert changed == 1
+        assert col_a.is_hidden is True
+        assert col_b.is_hidden is False
+
+    @pytest.mark.asyncio
+    async def test_cascade_skips_foreign_dimension(self):
+        """_cascade_hidden_to_columns must skip targets from other models
+        when model_id is supplied (Bug-7253 defence in depth)."""
+        model_a = uuid.uuid4()
+        model_b = uuid.uuid4()
+        col_a_id = uuid.uuid4()
+        col_b_id = uuid.uuid4()
+        from shared.db.models import Dimension, ModelColumn
+        dim_a = types.SimpleNamespace(
+            id=uuid.uuid4(), model_id=model_a, source_column_id=col_a_id,
+        )
+        dim_b = types.SimpleNamespace(
+            id=uuid.uuid4(), model_id=model_b, source_column_id=col_b_id,
+        )
+        col_a = types.SimpleNamespace(id=col_a_id, is_hidden=False)
+        col_b = types.SimpleNamespace(id=col_b_id, is_hidden=False)
+
+        async def _get(cls, oid):
+            if cls is Dimension:
+                if oid == dim_a.id:
+                    return dim_a
+                if oid == dim_b.id:
+                    return dim_b
+            if cls is ModelColumn:
+                if oid == col_a_id:
+                    return col_a
+                if oid == col_b_id:
+                    return col_b
+            return None
+
+        db = AsyncMock()
+        db.get = AsyncMock(side_effect=_get)
+        att_a = types.SimpleNamespace(target_type="dimension", target_id=dim_a.id)
+        att_b = types.SimpleNamespace(target_type="dimension", target_id=dim_b.id)
+
+        changed = await _cascade_hidden_to_columns(
+            db, [att_a, att_b], True, model_id=model_a,
+        )
+        # Only dim_a's column should be hidden; dim_b is from model_b
+        assert changed == 1
+        assert col_a.is_hidden is True
+        assert col_b.is_hidden is False
+
+
 class TestDurableBootstrapJobRegistry:
     """F-018-03: bootstrap job status is persisted to the per-tenant DB so any
     replica can answer a poll and the table stays bounded (TTL + per-model cap)."""
@@ -1497,6 +1898,82 @@ class TestDurableBootstrapJobRegistry:
 
         assert resp.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_poll_fails_wedged_stale_job(self, client, _ids):
+        """Bug-6265: a non-terminal job whose updated_at is older than the stale
+        window (the worker died on a restart / CPU throttle) is failed at read
+        time so the panel stops polling forever."""
+        stale_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        job_row = types.SimpleNamespace(
+            id=_ids["job_id"],
+            project_id=_ids["project_id"],
+            model_id=_ids["model_id"],
+            status="generating_glossary",  # non-terminal
+            message="Generating glossary...",
+            result=None,
+            created_at=stale_time,
+            updated_at=stale_time,
+        )
+        mock_db = AsyncMock()
+        mock_db.get = AsyncMock(return_value=job_row)
+
+        async def _gen(*a, **kw):
+            yield mock_db
+
+        with (
+            patch("src.api.glossary.get_tenant_db", _gen),
+            patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+        ):
+            url = (
+                f"/api/v1/projects/{_ids['project_id']}"
+                f"/models/{_ids['model_id']}"
+                f"/glossary/bootstrap/jobs/{_ids['job_id']}"
+            )
+            resp = await client.get(url)
+
+        assert resp.status_code == 200
+        assert resp.json()["job_status"] == "failed"
+        # The watchdog wrote the terminal state back.
+        assert job_row.status == "failed"
+        mock_db.commit.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_poll_keeps_recent_running_job(self, client, _ids):
+        """Bug-6265: a non-terminal job that IS still advancing (recent
+        updated_at) must NOT be failed by the watchdog."""
+        fresh = datetime.now(timezone.utc)
+        job_row = types.SimpleNamespace(
+            id=_ids["job_id"],
+            project_id=_ids["project_id"],
+            model_id=_ids["model_id"],
+            status="generating_glossary",
+            message="Generating glossary...",
+            result=None,
+            created_at=fresh,
+            updated_at=fresh,
+        )
+        mock_db = AsyncMock()
+        mock_db.get = AsyncMock(return_value=job_row)
+
+        async def _gen(*a, **kw):
+            yield mock_db
+
+        with (
+            patch("src.api.glossary.get_tenant_db", _gen),
+            patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+        ):
+            url = (
+                f"/api/v1/projects/{_ids['project_id']}"
+                f"/models/{_ids['model_id']}"
+                f"/glossary/bootstrap/jobs/{_ids['job_id']}"
+            )
+            resp = await client.get(url)
+
+        assert resp.status_code == 200
+        assert resp.json()["job_status"] == "generating_glossary"
+        assert job_row.status == "generating_glossary"
+        mock_db.commit.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # ML17 fixes
@@ -1511,8 +1988,15 @@ def test_formula_guard_neutralises_leading_formula_chars():
     for trigger in ("=HYPERLINK(1)", "+1", "-1", "@SUM", "\t=x", "\rx"):
         out = _formula_guard(trigger)
         assert out.startswith("'"), trigger
-    # Ordinary text is untouched.
+    # F-018-16: a trigger hidden behind leading whitespace is still guarded.
+    for hidden in (" =HYPERLINK(1)", "  +1", "\n=x", " \t@SUM"):
+        out = _formula_guard(hidden)
+        assert out.startswith("'"), repr(hidden)
+        # The original text is preserved verbatim after the quote.
+        assert out == "'" + hidden, repr(hidden)
+    # Ordinary text (including a leading space with no formula) is untouched.
     assert _formula_guard("Total revenue") == "Total revenue"
+    assert _formula_guard("  just spaced text") == "  just spaced text"
     assert _formula_guard(None) == ""
 
 
@@ -1549,7 +2033,11 @@ class TestBulkApprove:
     @pytest.mark.asyncio
     async def test_bulk_approve_updates_sources_and_visibility(self, client, _ids):
         column_id = uuid.uuid4()
-        col = types.SimpleNamespace(id=column_id, is_hidden=False)
+        table_id = uuid.uuid4()
+        col = types.SimpleNamespace(
+            id=column_id, is_hidden=False, model_table_id=table_id,
+        )
+        tbl = types.SimpleNamespace(id=table_id, model_id=_ids["model_id"])
         entry_llm = types.SimpleNamespace(
             id=uuid.uuid4(),
             model_id=_ids["model_id"],
@@ -1557,6 +2045,7 @@ class TestBulkApprove:
             source="llm",
             created_by=None,
             proposed_is_hidden=True,
+            visibility="show",
             attachments=[
                 types.SimpleNamespace(
                     target_type="column",
@@ -1571,12 +2060,22 @@ class TestBulkApprove:
             source="heuristic",
             created_by=None,
             proposed_is_hidden=None,
+            visibility="review",
             attachments=[],
         )
 
+        from shared.db.models import ModelColumn, ModelTable
+
+        async def _get(cls, oid):
+            if cls is ModelColumn and oid == column_id:
+                return col
+            if cls is ModelTable and oid == table_id:
+                return tbl
+            return col  # fallback for the final col flip
+
         mock_db = AsyncMock()
         mock_db.commit = AsyncMock()
-        mock_db.get = AsyncMock(return_value=col)
+        mock_db.get = AsyncMock(side_effect=_get)
         result = MagicMock()
         result.scalars.return_value.all.return_value = [entry_llm, entry_heuristic]
         mock_db.execute = AsyncMock(return_value=result)
@@ -1600,5 +2099,644 @@ class TestBulkApprove:
         assert entry_llm.source == "llm_approved"
         assert entry_heuristic.status == "approved"
         assert entry_heuristic.source == "heuristic"
+        # Bug-6261: approval must promote visibility to "show" so the
+        # heuristic entry reaches the public page, downloads, and gateway
+        # descriptions.  An LLM entry already at "show" stays at "show".
+        assert entry_llm.visibility == "show"
+        assert entry_heuristic.visibility == "show"
         assert col.is_hidden is True
         mock_db.commit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_approve_heuristic_entry_promotes_visibility_review_to_show(
+        self, client, _ids
+    ):
+        """Bug-6261: heuristic entries start with visibility='review'. Approval
+        must promote to 'show' so the entry reaches the public page, downloads,
+        and gateway descriptions (effective_description)."""
+        entry = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            model_id=_ids["model_id"],
+            status="pending_review",
+            source="heuristic",
+            created_by=None,
+            proposed_is_hidden=None,
+            visibility="review",
+            attachments=[],
+        )
+
+        mock_db = AsyncMock()
+        mock_db.commit = AsyncMock()
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = [entry]
+        mock_db.execute = AsyncMock(return_value=result)
+
+        async def _gen(*a, **kw):
+            yield mock_db
+
+        with (
+            patch("src.api.glossary.get_tenant_db", _gen),
+            patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+        ):
+            url = (
+                f"/api/v1/projects/{_ids['project_id']}"
+                f"/models/{_ids['model_id']}/glossary/approve-bulk"
+            )
+            resp = await client.post(url)
+
+        assert resp.status_code == 200
+        assert entry.status == "approved"
+        # The key assertion: visibility promoted from "review" to "show".
+        assert entry.visibility == "show"
+
+    @pytest.mark.asyncio
+    async def test_approve_preserves_explicit_hide_visibility(
+        self, client, _ids
+    ):
+        """Bug-6261 edge case: an entry whose modeller explicitly set
+        visibility='hide' must NOT be promoted to 'show' on approval --
+        'hide' is a deliberate decision to suppress the column."""
+        entry = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            model_id=_ids["model_id"],
+            status="pending_review",
+            source="heuristic",
+            created_by=None,
+            proposed_is_hidden=None,
+            visibility="hide",
+            attachments=[],
+        )
+
+        mock_db = AsyncMock()
+        mock_db.commit = AsyncMock()
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = [entry]
+        mock_db.execute = AsyncMock(return_value=result)
+
+        async def _gen(*a, **kw):
+            yield mock_db
+
+        with (
+            patch("src.api.glossary.get_tenant_db", _gen),
+            patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+        ):
+            url = (
+                f"/api/v1/projects/{_ids['project_id']}"
+                f"/models/{_ids['model_id']}/glossary/approve-bulk"
+            )
+            resp = await client.post(url)
+
+        assert resp.status_code == 200
+        assert entry.status == "approved"
+        # Explicit hide must be preserved.
+        assert entry.visibility == "hide"
+
+
+class TestGlossaryEditVisibility:
+    """Bug-6261 (Codex R1): editing a glossary entry auto-approves it,
+    so the resulting visibility must be normalised the same way as approve."""
+
+    @pytest.fixture
+    def _ids(self):
+        return {"project_id": uuid.uuid4(), "model_id": uuid.uuid4()}
+
+    @pytest.mark.asyncio
+    async def test_edit_heuristic_entry_promotes_review_visibility(
+        self, client, _ids
+    ):
+        """Editing a heuristic entry with visibility='review' produces a
+        new approved version with visibility='show', so it reaches the
+        public page, downloads, and gateway descriptions."""
+        entry_id = uuid.uuid4()
+        existing = types.SimpleNamespace(
+            id=entry_id,
+            model_id=_ids["model_id"],
+            term="Net Revenue",
+            definition="old def",
+            context_notes=None,
+            source="heuristic",
+            status="pending_review",
+            version=1,
+            superseded_by=None,
+            proposed_is_hidden=None,
+            visibility="review",
+            confidence="low",
+            sample_values=None,
+            created_by=None,
+            created_at=None,
+            updated_at=None,
+            synonyms=[],
+            attachments=[],
+        )
+
+        mock_db = AsyncMock()
+        mock_db.commit = AsyncMock()
+        mock_db.flush = AsyncMock()
+
+        exec_result = MagicMock()
+        exec_result.scalar_one_or_none.return_value = existing
+        mock_db.execute = AsyncMock(return_value=exec_result)
+
+        captured_entries = []
+
+        def _capture_add(obj):
+            captured_entries.append(obj)
+
+        mock_db.add = MagicMock(side_effect=_capture_add)
+
+        async def _gen(*a, **kw):
+            yield mock_db
+
+        with (
+            patch("src.api.glossary.get_tenant_db", _gen),
+            patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+            patch("src.api.glossary._reload", AsyncMock(return_value=types.SimpleNamespace(
+                id=uuid.uuid4(),
+                model_id=_ids["model_id"],
+                term="Net Revenue",
+                definition="updated def",
+                context_notes=None,
+                source="user",
+                status="approved",
+                version=2,
+                superseded_by=None,
+                created_by=None,
+                proposed_is_hidden=None,
+                visibility="show",
+                confidence="low",
+                sample_values=None,
+                created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                synonyms=[],
+                attachments=[],
+            ))),
+        ):
+            url = (
+                f"/api/v1/projects/{_ids['project_id']}"
+                f"/models/{_ids['model_id']}/glossary/{entry_id}"
+            )
+            resp = await client.patch(url, json={
+                "definition": "updated def",
+            })
+
+        assert resp.status_code == 200
+        # The first add() call should be the new GlossaryEntry.
+        # Verify its visibility was normalised to "show".
+        new_entry = captured_entries[0]
+        assert new_entry.visibility == "show"
+        assert new_entry.status == "approved"
+
+    @pytest.mark.asyncio
+    async def test_edit_entry_preserves_explicit_hide(self, client, _ids):
+        """Editing an entry with visibility='hide' keeps it hidden even
+        though the edit auto-approves."""
+        entry_id = uuid.uuid4()
+        existing = types.SimpleNamespace(
+            id=entry_id,
+            model_id=_ids["model_id"],
+            term="Internal Code",
+            definition="old def",
+            context_notes=None,
+            source="user",
+            status="approved",
+            version=1,
+            superseded_by=None,
+            proposed_is_hidden=None,
+            visibility="hide",
+            confidence="high",
+            sample_values=None,
+            created_by=None,
+            created_at=None,
+            updated_at=None,
+            synonyms=[],
+            attachments=[],
+        )
+
+        mock_db = AsyncMock()
+        mock_db.commit = AsyncMock()
+        mock_db.flush = AsyncMock()
+
+        exec_result = MagicMock()
+        exec_result.scalar_one_or_none.return_value = existing
+        mock_db.execute = AsyncMock(return_value=exec_result)
+
+        captured_entries = []
+
+        def _capture_add(obj):
+            captured_entries.append(obj)
+
+        mock_db.add = MagicMock(side_effect=_capture_add)
+
+        async def _gen(*a, **kw):
+            yield mock_db
+
+        with (
+            patch("src.api.glossary.get_tenant_db", _gen),
+            patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+            patch("src.api.glossary._reload", AsyncMock(return_value=types.SimpleNamespace(
+                id=uuid.uuid4(),
+                model_id=_ids["model_id"],
+                term="Internal Code",
+                definition="updated def",
+                context_notes=None,
+                source="user",
+                status="approved",
+                version=2,
+                superseded_by=None,
+                created_by=None,
+                proposed_is_hidden=None,
+                visibility="hide",
+                confidence="high",
+                sample_values=None,
+                created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                synonyms=[],
+                attachments=[],
+            ))),
+        ):
+            url = (
+                f"/api/v1/projects/{_ids['project_id']}"
+                f"/models/{_ids['model_id']}/glossary/{entry_id}"
+            )
+            resp = await client.patch(url, json={
+                "definition": "updated def",
+            })
+
+        assert resp.status_code == 200
+        new_entry = captured_entries[0]
+        assert new_entry.visibility == "hide"
+
+
+# ---------------------------------------------------------------------------
+# Bug-7957: Public glossary payload response-contract test
+# ---------------------------------------------------------------------------
+
+# The allowed key sets are locked down here. If a new field is added to the
+# public payload, this test must be updated — the failing assertion is the
+# safety gate that prevents internal identifiers from silently creeping back
+# into the unauthenticated public surface.
+_ALLOWED_MODEL_KEYS = {"display_name", "slug", "description"}
+_ALLOWED_ENTRY_KEYS = {"term", "definition", "context_notes", "synonyms", "version", "updated_at"}
+
+
+@pytest.mark.asyncio
+async def test_public_glossary_payload_contains_only_allowed_keys():
+    """Bug-7957: the public glossary JSON must contain ONLY the allowed
+    fields. No internal object IDs (model.id, attachment target_id, entry
+    id) may appear on the unauthenticated share-link surface."""
+    from src.api.glossary import _build_public_payload
+
+    model_id = uuid.uuid4()
+
+    fake_model = types.SimpleNamespace(
+        id=model_id,
+        slug="test-model",
+        display_name="Test Model",
+        description="Test description",
+    )
+
+    syn = types.SimpleNamespace(synonym="alias1")
+    att = types.SimpleNamespace(
+        target_type="dimension",
+        target_id=uuid.uuid4(),
+    )
+    fake_entry = types.SimpleNamespace(
+        id=uuid.uuid4(),
+        model_id=model_id,
+        term="Revenue",
+        definition="Total revenue",
+        context_notes="Finance context",
+        source="user",
+        status="approved",
+        version=1,
+        superseded_by=None,
+        visibility="show",
+        proposed_is_hidden=None,
+        confidence="high",
+        sample_values=None,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        synonyms=[syn],
+        attachments=[att],
+    )
+
+    mock_db = AsyncMock()
+    mock_db.get = AsyncMock(return_value=fake_model)
+
+    scalars_result = MagicMock()
+    scalars_result.all.return_value = [fake_entry]
+    exec_result = MagicMock()
+    exec_result.scalars.return_value = scalars_result
+    mock_db.execute = AsyncMock(return_value=exec_result)
+
+    async def _gen(*a, **kw):
+        yield mock_db
+
+    with patch("src.api.glossary.get_tenant_db", _gen):
+        payload = await _build_public_payload("test-tenant", model_id)
+
+    # Assert model keys
+    assert set(payload["model"].keys()) == _ALLOWED_MODEL_KEYS, (
+        f"Public model payload has extra keys: {set(payload['model'].keys()) - _ALLOWED_MODEL_KEYS}"
+    )
+    # Assert no model.id leaked
+    assert "id" not in payload["model"]
+
+    # Assert entry keys
+    assert len(payload["entries"]) == 1
+    entry_keys = set(payload["entries"][0].keys())
+    assert entry_keys == _ALLOWED_ENTRY_KEYS, (
+        f"Public entry payload has extra keys: {entry_keys - _ALLOWED_ENTRY_KEYS}"
+    )
+    # Assert no attachments or internal IDs leaked
+    assert "attachments" not in payload["entries"][0]
+    assert "id" not in payload["entries"][0]
+    assert "target_id" not in payload["entries"][0]
+
+    # Positive check: verify expected data is present
+    assert payload["model"]["display_name"] == "Test Model"
+    assert payload["entries"][0]["term"] == "Revenue"
+    assert payload["entries"][0]["synonyms"] == ["alias1"]
+
+
+@pytest.mark.asyncio
+async def test_public_glossary_payload_csv_download_has_no_internal_ids():
+    """Bug-7957: CSV download columns must not include attachments or IDs."""
+    from src.api.glossary import _build_public_payload
+
+    model_id = uuid.uuid4()
+
+    fake_model = types.SimpleNamespace(
+        id=model_id,
+        slug="test-model",
+        display_name="Test Model",
+        description=None,
+    )
+
+    fake_entry = types.SimpleNamespace(
+        id=uuid.uuid4(),
+        model_id=model_id,
+        term="Revenue",
+        definition="Total revenue",
+        context_notes=None,
+        source="user",
+        status="approved",
+        version=1,
+        superseded_by=None,
+        visibility="show",
+        proposed_is_hidden=None,
+        confidence="high",
+        sample_values=None,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        synonyms=[],
+        attachments=[],
+    )
+
+    mock_db = AsyncMock()
+    mock_db.get = AsyncMock(return_value=fake_model)
+
+    scalars_result = MagicMock()
+    scalars_result.all.return_value = [fake_entry]
+    exec_result = MagicMock()
+    exec_result.scalars.return_value = scalars_result
+    mock_db.execute = AsyncMock(return_value=exec_result)
+
+    async def _gen(*a, **kw):
+        yield mock_db
+
+    with patch("src.api.glossary.get_tenant_db", _gen):
+        payload = await _build_public_payload("test-tenant", model_id)
+
+    # The CSV writer uses exactly these keys; confirm no attachment field
+    # is available for accidental inclusion
+    for entry in payload["entries"]:
+        assert "attachments" not in entry
+        assert "id" not in entry
+
+
+# ---------------------------------------------------------------------------
+# Bug-7962: Manual create cascades proposed_is_hidden to ModelColumn
+# ---------------------------------------------------------------------------
+
+class TestManualCreateHiddenCascade:
+    """Bug-7962: manual glossary create with proposed_is_hidden=True must
+    invoke _cascade_hidden_to_columns before commit, so the target column's
+    is_hidden flag is actually flipped. Previously, manual create set
+    status='approved' without invoking the cascade, leaving the column
+    visible despite the modeller selecting 'Hide column'.
+    """
+
+    @pytest.fixture
+    def _ids(self):
+        return {
+            "project_id": uuid.uuid4(),
+            "model_id": uuid.uuid4(),
+            "entry_id": uuid.uuid4(),
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target_type", ["dimension", "measure", "column"])
+    async def test_create_with_hide_invokes_cascade(self, client, _ids, target_type):
+        """Creating a glossary entry with proposed_is_hidden=True must call
+        _cascade_hidden_to_columns for dimension, measure, and column
+        attachment types."""
+        target_id = uuid.uuid4()
+        entry_id = _ids["entry_id"]
+        model_id = _ids["model_id"]
+
+        captured_entries = []
+
+        mock_db = MagicMock()
+        mock_db.add = MagicMock(side_effect=lambda obj: captured_entries.append(obj))
+        mock_db.flush = AsyncMock()
+        mock_db.commit = AsyncMock()
+        mock_db.refresh = AsyncMock()
+
+        reload_entry = types.SimpleNamespace(
+            id=entry_id,
+            model_id=model_id,
+            term="Hidden Dim",
+            definition="Should be hidden",
+            context_notes=None,
+            source="user",
+            status="approved",
+            version=1,
+            superseded_by=None,
+            created_by=None,
+            proposed_is_hidden=True,
+            visibility="show",
+            confidence="high",
+            sample_values=None,
+            created_at="2026-07-21T00:00:00Z",
+            updated_at="2026-07-21T00:00:00Z",
+            synonyms=[],
+            attachments=[],
+        )
+        reload_result = MagicMock()
+        reload_result.scalar_one.return_value = reload_entry
+        mock_db.execute = AsyncMock(return_value=reload_result)
+
+        async def _gen(*a, **kw):
+            yield mock_db
+
+        cascade_calls = []
+
+        async def _mock_cascade(db, attachments, hidden, model_id=None):
+            cascade_calls.append({
+                "attachments": attachments,
+                "hidden": hidden,
+                "model_id": model_id,
+            })
+            return 1
+
+        with (
+            patch("src.api.glossary.get_tenant_db", _gen),
+            patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+            patch("src.api.glossary._validate_attachment_target", AsyncMock()),
+            patch("src.api.glossary._cascade_hidden_to_columns", _mock_cascade),
+        ):
+            url = f"/api/v1/projects/{_ids['project_id']}/models/{model_id}/glossary"
+            resp = await client.post(url, json={
+                "term": "Hidden Dim",
+                "definition": "Should be hidden",
+                "target_type": target_type,
+                "target_id": str(target_id),
+                "proposed_is_hidden": True,
+            })
+
+        assert resp.status_code == 201
+        assert len(cascade_calls) == 1, "cascade must be called exactly once"
+        assert cascade_calls[0]["hidden"] is True
+        assert cascade_calls[0]["model_id"] == model_id
+        # The attachment passed to cascade must have the correct target_type
+        att = cascade_calls[0]["attachments"][0]
+        assert att.target_type == target_type
+        assert att.target_id == target_id
+
+    @pytest.mark.asyncio
+    async def test_create_without_hide_skips_cascade(self, client, _ids):
+        """When proposed_is_hidden is None (not set), cascade must NOT be invoked."""
+        target_id = uuid.uuid4()
+        model_id = _ids["model_id"]
+
+        mock_db = MagicMock()
+        mock_db.add = MagicMock()
+        mock_db.flush = AsyncMock()
+        mock_db.commit = AsyncMock()
+        mock_db.refresh = AsyncMock()
+
+        reload_entry = types.SimpleNamespace(
+            id=_ids["entry_id"],
+            model_id=model_id,
+            term="Visible Dim",
+            definition="Should remain visible",
+            context_notes=None,
+            source="user",
+            status="approved",
+            version=1,
+            superseded_by=None,
+            created_by=None,
+            proposed_is_hidden=None,
+            visibility="show",
+            confidence="high",
+            sample_values=None,
+            created_at="2026-07-21T00:00:00Z",
+            updated_at="2026-07-21T00:00:00Z",
+            synonyms=[],
+            attachments=[],
+        )
+        reload_result = MagicMock()
+        reload_result.scalar_one.return_value = reload_entry
+        mock_db.execute = AsyncMock(return_value=reload_result)
+
+        async def _gen(*a, **kw):
+            yield mock_db
+
+        cascade_calls = []
+
+        async def _mock_cascade(db, attachments, hidden, model_id=None):
+            cascade_calls.append(True)
+            return 0
+
+        with (
+            patch("src.api.glossary.get_tenant_db", _gen),
+            patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+            patch("src.api.glossary._validate_attachment_target", AsyncMock()),
+            patch("src.api.glossary._cascade_hidden_to_columns", _mock_cascade),
+        ):
+            url = f"/api/v1/projects/{_ids['project_id']}/models/{model_id}/glossary"
+            resp = await client.post(url, json={
+                "term": "Visible Dim",
+                "definition": "Should remain visible",
+                "target_type": "dimension",
+                "target_id": str(target_id),
+            })
+
+        assert resp.status_code == 201
+        assert len(cascade_calls) == 0, "cascade must NOT be called when proposed_is_hidden is None"
+
+    @pytest.mark.asyncio
+    async def test_create_with_unhide_invokes_cascade_false(self, client, _ids):
+        """proposed_is_hidden=False (explicit un-hide) must invoke the cascade
+        with hidden=False so the column is made visible."""
+        target_id = uuid.uuid4()
+        model_id = _ids["model_id"]
+
+        mock_db = MagicMock()
+        mock_db.add = MagicMock()
+        mock_db.flush = AsyncMock()
+        mock_db.commit = AsyncMock()
+        mock_db.refresh = AsyncMock()
+
+        reload_entry = types.SimpleNamespace(
+            id=_ids["entry_id"],
+            model_id=model_id,
+            term="Unhidden Dim",
+            definition="Should be visible",
+            context_notes=None,
+            source="user",
+            status="approved",
+            version=1,
+            superseded_by=None,
+            created_by=None,
+            proposed_is_hidden=False,
+            visibility="show",
+            confidence="high",
+            sample_values=None,
+            created_at="2026-07-21T00:00:00Z",
+            updated_at="2026-07-21T00:00:00Z",
+            synonyms=[],
+            attachments=[],
+        )
+        reload_result = MagicMock()
+        reload_result.scalar_one.return_value = reload_entry
+        mock_db.execute = AsyncMock(return_value=reload_result)
+
+        async def _gen(*a, **kw):
+            yield mock_db
+
+        cascade_calls = []
+
+        async def _mock_cascade(db, attachments, hidden, model_id=None):
+            cascade_calls.append({"hidden": hidden})
+            return 1
+
+        with (
+            patch("src.api.glossary.get_tenant_db", _gen),
+            patch("src.api.glossary.ensure_model_in_project", AsyncMock()),
+            patch("src.api.glossary._validate_attachment_target", AsyncMock()),
+            patch("src.api.glossary._cascade_hidden_to_columns", _mock_cascade),
+        ):
+            url = f"/api/v1/projects/{_ids['project_id']}/models/{model_id}/glossary"
+            resp = await client.post(url, json={
+                "term": "Unhidden Dim",
+                "definition": "Should be visible",
+                "target_type": "dimension",
+                "target_id": str(target_id),
+                "proposed_is_hidden": False,
+            })
+
+        assert resp.status_code == 201
+        assert len(cascade_calls) == 1, "cascade must be called for explicit False"
+        assert cascade_calls[0]["hidden"] is False

@@ -24,12 +24,14 @@ import unittest.mock
 
 import pytest
 
+from unittest.mock import AsyncMock, patch
+
 from src.dax.dax_parser import find_kpi_member_functions
 from src.dax.mdx_execute import (
     build_real_execute_response,
     resolve_kpi_property_expr,
 )
-from src.dax.xmla_server import _compute_kpi_status
+from src.dax import xmla_server
 
 
 # ---------------------------------------------------------------------------
@@ -67,13 +69,6 @@ _KPI_WITH_STATUS_LITERAL = {
     **_KPI_HIGHER,
     "status_expression": "-1",
 }
-
-
-async def _make_measure_cell(value):
-    """Factory for a coroutine that returns a constant measure value."""
-    async def _cell(_name):
-        return value
-    return _cell
 
 
 def _mock_snapshot(ts="2024-01-01T00:00:00Z"):
@@ -121,82 +116,63 @@ class TestCubeKpiMdxContract:
 # KPIStatus end-to-end: resolve -> compute -> format response
 # ---------------------------------------------------------------------------
 
+async def _live_kpi_status(kpi: dict, governed: dict):
+    """Drive ``_maybe_resolve_kpi_members`` for KPIStatus with the governed
+    ``/evaluate`` response mocked; return the status cell value."""
+    statement = 'SELECT FROM [modely] WHERE (KPIStatus("aa"))'
+    kpi = dict(kpi, id=kpi.get("id") or "kpi-aa")
+    with patch.object(
+        xmla_server, "get_model_kpis", new=AsyncMock(return_value=[kpi]),
+    ), patch.object(
+        xmla_server, "evaluate_kpi_governed", new=AsyncMock(return_value=governed),
+    ):
+        result = await xmla_server._maybe_resolve_kpi_members(
+            statement=statement,
+            model_id="model-1",
+            project_id="proj-1",
+            tenant_slug="acme",
+            jwt_token="jwt",
+            measures_meta=_MEASURES,
+            dimensions_meta=[],
+            hierarchy_level_dim_map={},
+            hierarchy_default_dim_map={},
+            dim_names=set(),
+            model_slug="modely",
+            persona_id=None,
+            is_technical_view=True,
+        )
+    assert result is not None
+    columns, rows = result
+    return rows[0][columns[0]]
+
+
 class TestKpiStatusE2E:
-    """Verify the full chain: resolve_kpi_property_expr -> _compute_kpi_status
-    -> build_real_execute_response for KPIStatus."""
+    """Bug-6608 un-gated: the live KPIStatus is the governed −1/0/1 RAG verdict
+    from the model-service /evaluate authority (F-025-01), NOT the raw value."""
 
     @pytest.mark.asyncio
-    async def test_status_higher_is_better_above_goal(self):
-        """Value 15000 >= goal 10000, higher_is_better -> status 1 (good)."""
-        measure_cell = await _make_measure_cell(15000.0)
-        status = await _compute_kpi_status(
-            _KPI_HIGHER, "fee_amount", measure_cell, 10000.0,
+    async def test_status_is_governed_verdict_not_raw_value(self):
+        cell = await _live_kpi_status(
+            _KPI_HIGHER, {"value": 15000.0, "status": 1},
         )
-        assert status == 1
+        assert cell == 1
+        assert cell != 15000.0
 
     @pytest.mark.asyncio
-    async def test_status_higher_is_better_in_band(self):
-        """Value 9500 >= goal * 0.9 = 9000 but < goal 10000 -> status 0 (warning)."""
-        measure_cell = await _make_measure_cell(9500.0)
-        status = await _compute_kpi_status(
-            _KPI_HIGHER, "fee_amount", measure_cell, 10000.0,
-        )
-        assert status == 0
-
-    @pytest.mark.asyncio
-    async def test_status_higher_is_better_below_band(self):
-        """Value 5000 < goal * 0.9 = 9000 -> status -1 (poor)."""
-        measure_cell = await _make_measure_cell(5000.0)
-        status = await _compute_kpi_status(
-            _KPI_HIGHER, "fee_amount", measure_cell, 10000.0,
-        )
-        assert status == -1
-
-    @pytest.mark.asyncio
-    async def test_status_lower_is_better_below_goal(self):
-        """Value 5000 <= goal 10000, lower_is_better -> status 1 (good)."""
-        measure_cell = await _make_measure_cell(5000.0)
-        status = await _compute_kpi_status(
-            _KPI_LOWER, "fee_amount", measure_cell, 10000.0,
-        )
-        assert status == 1
-
-    @pytest.mark.asyncio
-    async def test_status_lower_is_better_above_band(self):
-        """Value 20000 > goal * 1.1 = 11000, lower_is_better -> status -1 (poor)."""
-        measure_cell = await _make_measure_cell(20000.0)
-        status = await _compute_kpi_status(
-            _KPI_LOWER, "fee_amount", measure_cell, 10000.0,
-        )
-        assert status == -1
-
-    @pytest.mark.asyncio
-    async def test_status_literal_expression_overrides_band(self):
-        """A numeric-literal status_expression takes precedence over direction bands."""
-        measure_cell = await _make_measure_cell(50000.0)
-        status = await _compute_kpi_status(
-            _KPI_WITH_STATUS_LITERAL, "fee_amount", measure_cell, 10000.0,
-        )
-        # status_expression = "-1" overrides the value-vs-goal result (which would be 1)
-        assert status == -1
+    async def test_status_governed_for_each_verdict(self):
+        for governed_status in (-1, 0, 1):
+            cell = await _live_kpi_status(
+                _KPI_LOWER, {"value": 9500.0, "status": governed_status},
+            )
+            assert cell == governed_status
 
     @pytest.mark.asyncio
     async def test_status_null_value_returns_none(self):
-        """When the measure cell returns None, status is None (not an error)."""
-        measure_cell = await _make_measure_cell(None)
-        status = await _compute_kpi_status(
-            _KPI_HIGHER, "fee_amount", measure_cell, 10000.0,
+        """A governed status of None (no data / no target) is blank."""
+        cell = await _live_kpi_status(
+            _KPI_HIGHER, {"value": None, "status": None},
         )
-        assert status is None
-
-    @pytest.mark.asyncio
-    async def test_status_null_goal_returns_none(self):
-        """When goal is None, status is None."""
-        measure_cell = await _make_measure_cell(15000.0)
-        status = await _compute_kpi_status(
-            _KPI_HIGHER, "fee_amount", measure_cell, None,
-        )
-        assert status is None
+        assert cell is None
 
 
 # ---------------------------------------------------------------------------
@@ -333,47 +309,22 @@ class TestKpiResponseXml:
 # ---------------------------------------------------------------------------
 
 class TestResolverLiveConsistency:
-    """Verify that resolve_kpi_property_expr (catalogue/CASE path) and
-    _compute_kpi_status (live numeric path) agree on direction semantics."""
+    """Bug-6608 un-gated: MDSCHEMA advertises the addressable value MEMBER for
+    KPIStatus (no band CASE); the LIVE cell is the governed −1/0/1 verdict — the
+    two are different roles (member string vs governed value), not the same value."""
 
-    def test_higher_is_better_case_expression_matches_live(self):
-        """The CASE expression for higher_is_better uses >= goal for status 1."""
-        expr = resolve_kpi_property_expr(_KPI_HIGHER, "KPIStatus", _MEASURES)
-        assert expr is not None
-        # The expression should use >= for higher_is_better
-        assert ">= 10000.0" in expr or ">= 10000" in expr
-        # And use >= goal * 0.9 for the warning band
-        assert "0.9" in expr
-
-    def test_lower_is_better_case_expression_matches_live(self):
-        """The CASE expression for lower_is_better uses <= goal for status 1."""
-        expr = resolve_kpi_property_expr(_KPI_LOWER, "KPIStatus", _MEASURES)
-        assert expr is not None
-        assert "<= 10000.0" in expr or "<= 10000" in expr
-        assert "1.1" in expr
+    def test_resolver_status_is_value_member_any_direction(self):
+        for kpi in (_KPI_HIGHER, _KPI_LOWER):
+            expr = resolve_kpi_property_expr(kpi, "KPIStatus", _MEASURES)
+            assert expr == "[Measures].[fee_amount]"
+            assert "CASE" not in expr.upper()
 
     @pytest.mark.asyncio
-    async def test_direction_consistency_higher(self):
-        """Both paths agree: value 15000 >= goal 10000, higher_is_better -> 1."""
-        # Resolver produces a CASE expression
+    async def test_metadata_member_and_live_governed_verdict(self):
+        # Metadata advertises the addressable value member; the live path serves the
+        # governed −1/0/1 verdict (not the raw value).
         expr = resolve_kpi_property_expr(_KPI_HIGHER, "KPIStatus", _MEASURES)
-        assert "WHEN [Measures].[fee_amount] >= 10000.0 THEN 1" in expr
-
-        # Live path computes the same result
-        cell = await _make_measure_cell(15000.0)
-        status = await _compute_kpi_status(
-            _KPI_HIGHER, "fee_amount", cell, 10000.0,
-        )
-        assert status == 1
-
-    @pytest.mark.asyncio
-    async def test_direction_consistency_lower(self):
-        """Both paths agree: value 5000 <= goal 10000, lower_is_better -> 1."""
-        expr = resolve_kpi_property_expr(_KPI_LOWER, "KPIStatus", _MEASURES)
-        assert "WHEN [Measures].[fee_amount] <= 10000.0 THEN 1" in expr
-
-        cell = await _make_measure_cell(5000.0)
-        status = await _compute_kpi_status(
-            _KPI_LOWER, "fee_amount", cell, 10000.0,
-        )
-        assert status == 1
+        assert expr == "[Measures].[fee_amount]"
+        cell = await _live_kpi_status(_KPI_HIGHER, {"value": 15000.0, "status": -1})
+        assert cell == -1
+        assert cell != 15000.0

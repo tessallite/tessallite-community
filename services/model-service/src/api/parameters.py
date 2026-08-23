@@ -13,17 +13,21 @@ Role requirements:
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
-from shared.db.models import ModelParameter
+from shared.db.models import ModelParameter, NamedSet
 from shared.db.session import get_tenant_db
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 from src.api._scope import ensure_model_in_project
+from src.api._model_lock import acquire_model_definition_lock
+from src.api.named_sets import _canonical_ns_identity
 
 router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}/parameters",
@@ -152,13 +156,63 @@ def _coerce_default_value(
             detail="default_value must be a list for a 'multi_value' parameter",
         )
     if param_type == "date_range":
-        if isinstance(default_value, dict):
-            return default_value
+        if not isinstance(default_value, dict):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="default_value must be a {from, to} object for a 'date_range' parameter",
+            )
+        # F-029-06 / F-029-02: reject at write a default that can never succeed
+        # at query time — require both bounds, ISO-8601 dates, ordered, no extra
+        # keys. Mirrors query-router resolver._validate_date_range_obj (the
+        # query-time backstop) so authoring fails early with a clear message.
+        _validate_date_range_default(default_value)
+        return default_value
+    return default_value
+
+
+def _parse_iso_bound_or_422(value: object, side: str) -> datetime:
+    if not isinstance(value, str):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="default_value must be a {from, to} object for a 'date_range' parameter",
+            detail=(
+                f"date_range '{side}' must be an ISO-8601 date string "
+                f"(e.g. '2024-01-01')"
+            ),
         )
-    return default_value
+    try:
+        return datetime.fromisoformat(value.strip())
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"date_range '{side}' is not a valid ISO-8601 date: {value!r}",
+        )
+
+
+def _validate_date_range_default(obj: dict) -> None:
+    if "from" not in obj or "to" not in obj:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="date_range default_value requires both 'from' and 'to' keys",
+        )
+    extra = set(obj) - {"from", "to"}
+    if extra:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "date_range default_value has unexpected key(s): "
+                f"{', '.join(sorted(extra))}; only 'from' and 'to' are allowed"
+            ),
+        )
+    lo = _parse_iso_bound_or_422(obj["from"], "from")
+    hi = _parse_iso_bound_or_422(obj["to"], "to")
+    if lo > hi:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"date_range default_value is inverted: 'from' ({obj['from']!r}) "
+                f"is after 'to' ({obj['to']!r})"
+            ),
+        )
 
 
 class ParameterUpdate(BaseModel):
@@ -215,7 +269,7 @@ def _to_response(p: ModelParameter) -> ParameterResponse:
     )
 
 
-@router.get("", response_model=list[ParameterResponse])
+@router.get("", response_model=list[ParameterResponse], dependencies=[require_role("viewer")])
 async def list_parameters(
     project_id: UUID,
     model_id: UUID,
@@ -244,7 +298,13 @@ async def create_parameter(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> ParameterResponse:
     async for db in get_tenant_db(current_user.tenant_id):
+        # Bug-7982 R6 finding 7: ownership check BEFORE the lock, so an
+        # unauthorized model_id is rejected without contending for the
+        # cluster-wide advisory lock. Bug-7982 finding 3: ModelParameter is
+        # snapshot-owned (truncate-reinserted on revert) and its values feed
+        # resolved query results, so it must serialise with deploy/revert/Save.
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         existing = await db.execute(
             select(ModelParameter).where(
                 ModelParameter.model_id == model_id,
@@ -256,6 +316,24 @@ async def create_parameter(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Parameter '{body.name}' already exists on this model",
             )
+        # Bug-7944/Bug-7928: reciprocal namespace collision check —
+        # parameters and named lists share the @ namespace.
+        canonical = _canonical_ns_identity(body.name)
+        ns_result = await db.execute(
+            select(NamedSet.id, NamedSet.name).where(
+                NamedSet.model_id == model_id,
+            )
+        )
+        for _ns_id, ns_name in ns_result.all():
+            if ns_name.lower() == canonical:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"A named list called '{ns_name}' already exists in this model. "
+                        f"Parameters and named lists share the @ namespace and must have "
+                        f"unique names (case-insensitive)."
+                    ),
+                )
         coerced_default = _coerce_default_value(body.param_type, body.default_value)
         param = ModelParameter(
             model_id=model_id,
@@ -267,7 +345,18 @@ async def create_parameter(
             description=body.description,
         )
         db.add(param)
-        await db.commit()
+        # F-029-17: the SELECT-then-INSERT pre-check above is TOCTOU — two
+        # concurrent creates of the same name both pass it, then one violates
+        # the unique constraint at commit. Map that to a 409 instead of a 500,
+        # matching the pre-check's own conflict response.
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Parameter '{body.name}' already exists on this model",
+            )
         await db.refresh(param)
         return _to_response(param)
 
@@ -286,16 +375,53 @@ async def update_parameter(
 ) -> ParameterResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         param = await db.get(ModelParameter, param_id)
         if param is None or param.model_id != model_id:
             raise HTTPException(status_code=404, detail="Parameter not found")
         updates = body.model_dump(exclude_unset=True)
+        # Determine the effective type after this update (supplied or stored).
+        effective_type = updates.get("param_type", param.param_type)
         # Bug-5314: coerce default_value against the effective param_type
         if "default_value" in updates:
-            effective_type = updates.get("param_type", param.param_type)
             updates["default_value"] = _coerce_default_value(
                 effective_type, updates["default_value"],
             )
+        # Bug-7445: when param_type changes but default_value is NOT in the
+        # update body, revalidate the stored default against the new type.
+        # Without this, a modeler can change type from "string" to "number"
+        # while the stored default is "EMEA", which then fails at query time.
+        if "param_type" in updates and "default_value" not in updates:
+            if param.default_value is not None:
+                _coerce_default_value(effective_type, param.default_value)
+        # Bug-7445: similarly, revalidate stored allowed_values against the
+        # new type when param_type changes but allowed_values is not supplied.
+        if "param_type" in updates and "allowed_values" not in updates:
+            try:
+                _check_allowed_values(effective_type, param.allowed_values)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(e),
+                )
+        # Bug-7944/Bug-7928: namespace collision check on rename.
+        if "name" in updates and updates["name"] != param.name:
+            canonical = _canonical_ns_identity(updates["name"])
+            ns_result = await db.execute(
+                select(NamedSet.id, NamedSet.name).where(
+                    NamedSet.model_id == model_id,
+                )
+            )
+            for _ns_id, ns_name in ns_result.all():
+                if ns_name.lower() == canonical:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"A named list called '{ns_name}' already exists in this model. "
+                            f"Parameters and named lists share the @ namespace and must have "
+                            f"unique names (case-insensitive)."
+                        ),
+                    )
         for key, value in updates.items():
             setattr(param, key, value)
         await db.commit()
@@ -316,6 +442,7 @@ async def delete_parameter(
 ) -> None:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         param = await db.get(ModelParameter, param_id)
         if param is None or param.model_id != model_id:
             raise HTTPException(status_code=404, detail="Parameter not found")

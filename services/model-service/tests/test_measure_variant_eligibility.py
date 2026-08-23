@@ -152,3 +152,164 @@ async def test_create_variant_of_calculated_measure_rejected(client):
 
     assert resp.status_code == 422, resp.text
     assert "calculated" in resp.json()["detail"].lower()
+
+
+class TestSemiAdditiveVariantEligibility:
+    """Bug-6222 (F-015-27): cumulation/window variants of semi-additive
+    measures must be rejected at admission.
+
+    Known value: an account balance measure with semi_additive_behavior=
+    last_non_empty has monthly balances 100 (Jan), 110 (Feb), 120 (Mar).
+    ``balance_ytd`` using SUM OVER returns 100, 210, 330 -- the WRONG
+    answer. The correct YTD of a balance is 100, 110, 120 (the balance
+    itself, since it is already a cumulative position). Rather than emit
+    wrong numbers, the admission gate must reject these variants."""
+
+    def test_variant_reason_rejects_ytd_on_semi_additive(self):
+        """YTD (period_to_date family) must be rejected for semi-additive
+        measures."""
+        from src.api.measures import _variant_reason
+        reason = _variant_reason(
+            "ytd",
+            has_hierarchy=True,
+            units={"year", "quarter", "month"},
+            calcs={"period_to_date", "parallel_period", "moving_window", "lag"},
+            has_calendar_rules=True,
+            semi_additive_behavior="last_non_empty",
+        )
+        assert reason is not None
+        assert "semi-additive" in reason.lower()
+        assert "cumulation" in reason.lower() or "not supported" in reason.lower()
+
+    @pytest.mark.parametrize("kind", ["ytd", "qtd", "mtd", "wtd", "ytd_prior_year"])
+    def test_all_ptd_variants_rejected_on_semi_additive(self, kind):
+        """All period-to-date variants must be blocked on balance measures."""
+        from src.api.measures import _variant_reason
+        reason = _variant_reason(
+            kind,
+            has_hierarchy=True,
+            units={"year", "quarter", "month", "week"},
+            calcs={"period_to_date", "parallel_period", "moving_window", "lag"},
+            has_calendar_rules=True,
+            semi_additive_behavior="last_non_empty",
+        )
+        assert reason is not None, f"{kind} should be ineligible for semi-additive"
+
+    @pytest.mark.parametrize("kind", ["trailing_n", "moving_avg_n"])
+    def test_window_variants_rejected_on_semi_additive(self, kind):
+        """Moving-window variants must be blocked on balance measures.
+        trailing_n of a balance would sum 3 months of balances, giving
+        a meaningless total. moving_avg_n would average them -- also wrong
+        because balances are not additive across periods."""
+        from src.api.measures import _variant_reason
+        reason = _variant_reason(
+            kind,
+            has_hierarchy=True,
+            units={"year", "quarter", "month", "week"},
+            calcs={"period_to_date", "parallel_period", "moving_window", "lag"},
+            has_calendar_rules=True,
+            semi_additive_behavior="last_non_empty",
+            has_date_column=True,
+        )
+        assert reason is not None, f"{kind} should be ineligible for semi-additive"
+        assert "semi-additive" in reason.lower()
+
+    @pytest.mark.parametrize("kind", ["prior_year", "prior_quarter", "prior_month"])
+    def test_prior_variants_allowed_on_semi_additive(self, kind):
+        """Prior-period (parallel_period family) variants ARE meaningful for
+        balances: prior_year of a balance is 'what was the balance last year at
+        this point', which is a valid comparison. These use the hierarchy path,
+        not a window date column."""
+        from src.api.measures import _variant_reason
+        reason = _variant_reason(
+            kind,
+            has_hierarchy=True,
+            units={"year", "quarter", "month", "week"},
+            calcs={"period_to_date", "parallel_period", "moving_window", "lag"},
+            has_calendar_rules=True,
+            semi_additive_behavior="last_non_empty",
+        )
+        assert reason is None, f"{kind} should be eligible for semi-additive"
+
+    def test_lag_allowed_on_semi_additive_with_date_column(self):
+        """F-015-01/02: lag is a WINDOW variant — it orders by a date column,
+        not the hierarchy. It is meaningful for balances (last year's balance
+        at this point) and admissible when a date column is available."""
+        from src.api.measures import _variant_reason
+        reason = _variant_reason(
+            "lag",
+            has_hierarchy=True,
+            units={"year", "quarter", "month", "week"},
+            calcs={"period_to_date", "parallel_period", "moving_window", "lag"},
+            has_calendar_rules=True,
+            semi_additive_behavior="last_non_empty",
+            has_date_column=True,
+        )
+        assert reason is None
+
+    def test_non_semi_additive_measure_ytd_still_allowed(self):
+        """Regular (additive) measures must still admit YTD -- no
+        regression from the semi-additive gate."""
+        from src.api.measures import _variant_reason
+        reason = _variant_reason(
+            "ytd",
+            has_hierarchy=True,
+            units={"year", "quarter", "month"},
+            calcs={"period_to_date", "parallel_period", "moving_window", "lag"},
+            has_calendar_rules=True,
+            semi_additive_behavior=None,
+        )
+        assert reason is None
+
+
+class TestWindowVariantCalendarFreeEligibility:
+    """F-015-02: window variants (lag / trailing_n / moving_avg_n) must be
+    admissible with NO hierarchy and NO calendar, given a date column to order
+    by. The old shared precondition rejected every variant when no hierarchy
+    existed, breaking the advertised calendar-free rolling-measure workflow."""
+
+    @pytest.mark.parametrize("kind", ["lag", "trailing_n", "moving_avg_n"])
+    def test_window_variant_admissible_without_hierarchy(self, kind):
+        from src.api.measures import _variant_reason
+        reason = _variant_reason(
+            kind,
+            has_hierarchy=False,       # no hierarchy at all
+            units=set(),
+            calcs=set(),
+            has_calendar_rules=False,  # no calendar
+            semi_additive_behavior=None,
+            has_date_column=True,      # but a date column exists
+        )
+        assert reason is None, f"{kind} should be admissible without a hierarchy"
+
+    @pytest.mark.parametrize("kind", ["lag", "trailing_n", "moving_avg_n"])
+    def test_window_variant_rejected_without_date_column(self, kind):
+        from src.api.measures import _variant_reason
+        reason = _variant_reason(
+            kind,
+            has_hierarchy=False,
+            units=set(),
+            calcs=set(),
+            has_calendar_rules=False,
+            semi_additive_behavior=None,
+            has_date_column=False,
+        )
+        assert reason is not None
+        assert "date" in reason.lower()
+
+    @pytest.mark.parametrize("kind", ["ytd", "prior_year"])
+    def test_period_aware_still_needs_hierarchy(self, kind):
+        """Period-aware variants must STILL require a hierarchy — the window
+        carve-out must not leak to them."""
+        from src.api.measures import _variant_reason
+        reason = _variant_reason(
+            kind,
+            has_hierarchy=False,
+            units=set(),
+            calcs=set(),
+            has_calendar_rules=False,
+            semi_additive_behavior=None,
+            has_date_column=True,
+        )
+        assert reason is not None
+        assert "hierarchy" in reason.lower()

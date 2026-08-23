@@ -46,6 +46,11 @@ export interface ModelRevalidationReport {
   newly_valid_dimension_count: number;
   newly_valid_measure_count: number;
   newly_valid_aggregate_count: number;
+  unresolved_hierarchy_issue_count: number;
+  failed_pocket_count: number;
+  unacknowledged_schema_drift_count: number;
+  latest_recorded_schema_drift_at: string | null;
+  live_source_checked: boolean;
   measure_warnings?: MeasureWarning[];
 }
 export interface RedundantPartner {
@@ -54,6 +59,64 @@ export interface RedundantPartner {
   partner_physical_table: string;
   join_type: string;
   reason: string;
+}
+
+// ---------------------------------------------------------------------------
+// Dimension attribute relationships (derived-grain routing, spec section 5.3)
+// ---------------------------------------------------------------------------
+// A modeller-declared key-to-detail relationship on a dimension. Distinct from
+// display_column_id (a caption choice). Phase 1b: declaration only, no serving.
+
+/** BIJECTION = exact 1:1 relabel; FUNCTIONAL_N_TO_1 = many keys -> one detail. */
+export type AttributeRelationshipCardinality =
+  | "BIJECTION"
+  | "FUNCTIONAL_N_TO_1";
+
+/**
+ * DECLARED until the (Phase-2) verifier proves/breaks the relationship.
+ * PENDING (Bug-7894): a text (VARCHAR/CHAR/STRING) 1:1 detail proven 1:1 by data
+ * but whose serve-collation fold-safety can only be certified when the passenger
+ * aggregate is built. It is non-serving and clears to VERIFIED after that build —
+ * neither a defect (BROKEN) nor a fault (ERROR).
+ */
+export type AttributeRelationshipStatus =
+  | "DECLARED"
+  | "PENDING"
+  | "VERIFIED"
+  | "BROKEN"
+  | "STALE"
+  | "ERROR";
+
+export interface DimensionAttributeRelationshipCreate {
+  detail_column_name: string;
+  cardinality: AttributeRelationshipCardinality;
+  key_column_name?: string | null;
+  enabled?: boolean;
+}
+
+export interface DimensionAttributeRelationshipUpdate {
+  detail_column_name?: string | null;
+  cardinality?: AttributeRelationshipCardinality | null;
+  key_column_name?: string | null;
+  enabled?: boolean | null;
+}
+
+export interface DimensionAttributeRelationship {
+  id: string;
+  model_id: string;
+  dimension_id: string;
+  key_column_id: string | null;
+  key_column_name: string | null;
+  detail_column_id: string | null;
+  detail_column_name: string | null;
+  cardinality: AttributeRelationshipCardinality;
+  null_policy: string;
+  enabled: boolean;
+  declaration_hash: string;
+  verification_status: AttributeRelationshipStatus;
+  verified_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 export interface Dimension {
   id: string;
@@ -81,6 +144,15 @@ export interface Dimension {
   invalid_reason?: string | null;
   redundant_partner: RedundantPartner | null;
   high_cardinality?: boolean | null;
+  /** Provenance: when this dimension was auto-added as a detail of another
+   *  dimension's bijection relationship, these record the source relationship
+   *  and owning dimension. Null for independently created dimensions. */
+  detail_of_relationship_id?: string | null;
+  detail_of_dimension_id?: string | null;
+  detail_of_dimension_name?: string | null;
+  /** Declared key-to-detail relationships (derived-grain routing). Empty for
+   *  dimensions with no declared relationship. Distinct from display_column. */
+  attribute_relationships?: DimensionAttributeRelationship[];
 }
 export type MeasureFormatToken =
   | "currency"
@@ -95,13 +167,16 @@ export type MeasureFormatToken =
   | "decimal_5"
   | "decimal_6";
 
+// #10: "by_account" is not a supported behaviour (removed from
+// VALID_SEMI_ADDITIVE_BEHAVIORS). It cannot be authored; the account-column
+// field (semi_additive_account_column_id) is retained on the request/response
+// types only for reading pre-existing data.
 export type SemiAdditiveBehavior =
   | "last_non_empty"
   | "first_non_empty"
   | "avg_of_children"
   | "min"
-  | "max"
-  | "by_account";
+  | "max";
 
 export interface MeasureCreate {
   name: string;
@@ -230,10 +305,44 @@ export interface FieldCompatibilityResponse {
 // ---------------------------------------------------------------------------
 // Joins
 // ---------------------------------------------------------------------------
+/**
+ * How many rows on each side of a join match. SEPARATE from `join_type`,
+ * which says which rows survive. Cardinality never changes the generated SQL;
+ * it is fan-out metadata. `null` means the modeller has not declared it.
+ * Mirrors `JoinCardinality` in shared/schemas/domains/aggregates_security.py.
+ */
+export type JoinCardinality =
+  | "one_to_one"
+  | "one_to_many"
+  | "many_to_one"
+  | "many_to_many";
+
+/**
+ * Whether the modeller INTENDS this join's row-filtering / row-multiplying
+ * effect to define the model's population. A THIRD, independent property of
+ * the same join (`join_type` says which rows survive, `cardinality` says how
+ * many rows match, this says whether that effect is deliberate). Governs
+ * whether the join may be elided by a query that does not reference it.
+ * Mirrors `PopulationParticipation` in
+ * shared/schemas/domains/aggregates_security.py.
+ * docs/architecture/architecture_join-population-governance.md contract 2.
+ */
+export type PopulationParticipation =
+  | "preserve_base_rows"
+  | "population_defining"
+  | "enrichment_only"
+  | "undeclared";
+
+export type PopulationParticipationSource = "default" | "manual" | "auto" | string;
+
 export interface JoinCreate {
   left_table_id: string;
   right_table_id: string;
   join_type: "inner" | "left" | "right" | "full";
+  cardinality?: JoinCardinality | null;
+  // Optional on write — the backend defaults to "preserve_base_rows" (the
+  // pre-existing elision behaviour) when omitted.
+  population_participation?: PopulationParticipation;
   left_column_name: string;
   right_column_name: string;
 }
@@ -242,10 +351,18 @@ export interface Join {
   left_table_id: string;
   right_table_id: string;
   join_type: string;
+  cardinality?: string | null;
+  // Always present on read (server default "preserve_base_rows"); free-form
+  // string, not the write-side Literal — a historical/imported row may carry
+  // a value read-side coercion has not yet folded onto the vocabulary.
+  population_participation: string;
+  /** Server-owned provenance; introspection may only revise default-owned rows. */
+  population_participation_source: PopulationParticipationSource;
   left_column_id: string;
   right_column_id: string;
   left_column_name: string | null;
   right_column_name: string | null;
+  warnings?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -292,10 +409,12 @@ export interface AggregateUpdate {
   include_stats?: boolean;
 }
 export interface RefreshPolicyCreate {
-  refresh_mode: "manual" | "scheduled" | "on_demand";
+  refresh_mode: "scheduled" | "incremental";
   cron_expression?: string | null;
   incremental_column?: string | null;
   incremental_lookback?: number | null;
+  incremental_append_only?: boolean;
+  full_rebuild_interval_days?: number | null;
   is_enabled?: boolean;
 }
 export interface RefreshPolicy {
@@ -305,6 +424,8 @@ export interface RefreshPolicy {
   cron_expression: string | null;
   incremental_column: string | null;
   incremental_lookback: number | null;
+  incremental_append_only: boolean;
+  full_rebuild_interval_days: number | null;
   is_enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -334,6 +455,9 @@ export interface PocketCreate {
   defining_sql: string;
   refresh_policy?: "schedule" | "manual" | "event";
   refresh_cron?: string | null;
+  // Bug-7837: send the schedule enabled state atomically on create so the
+  // backend provisions the PocketRefreshPolicy row in one transaction.
+  refresh_policy_enabled?: boolean | null;
   incremental_column?: string | null;
   incremental_lookback_hours?: number | null;
   ttl_days?: number;
@@ -348,6 +472,11 @@ export interface PocketUpdate {
   incremental_lookback_hours?: number | null;
   ttl_days?: number;
   status?: string;
+}
+
+export interface PocketCompoundEdit {
+  definition: PocketUpdate;
+  policy: { cron_expression?: string | null; is_enabled: boolean };
 }
 
 export interface PocketPredicate {
@@ -382,10 +511,22 @@ export interface PocketDefinition {
   last_match_at: string | null;
   hit_count: number;
   time_saved_ms_total: number;
+  // Bug-6991: align to PocketDefinitionResponse (aggregates_security.py).
+  // Derived-grain row manifest (Bug-7359). NOT descriptive since
+  // Bug-8018/Bug-8393: row_manifest.columns records the output columns the
+  // built pocket table exposes and is what admits the pocket under active
+  // row-level security. active_refresh_run_id is the live pointer to the
+  // refresh run those columns describe; the pair is only trusted while the two
+  // agree. Read-only in the UI.
+  row_manifest?: Record<string, unknown> | null;
+  active_refresh_run_id?: string | null;
   created_at: string;
   updated_at: string;
   retired_at: string | null;
   predicates: PocketPredicate[];
+  // Optional child refresh-policy row (PocketRefreshPolicyResponse); null when
+  // the pocket has no schedule configured.
+  refresh_policy_row?: PocketRefreshPolicy | null;
 }
 
 export interface PocketRefreshRun {

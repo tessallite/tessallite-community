@@ -16,7 +16,7 @@ function buildSemanticQuery(items: ZoneItem[], limit = 1000): SemanticQuery | nu
   const filterItems = items.filter(i => i.zone === 'filters');
 
   const filters: QueryFilter[] | undefined = filterItems.length > 0
-    ? filterItems.map(f => ({ member: f.id, operator: f.operator || 'set', values: f.values?.length ? f.values : undefined }))
+    ? filterItems.map(f => ({ dimension: f.id, operator: f.operator || 'set', values: f.values?.length ? f.values : undefined }))
     : undefined;
 
   const query: SemanticQuery = {

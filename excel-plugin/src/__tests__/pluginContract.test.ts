@@ -96,7 +96,7 @@ describe('F-025-01 — Report Builder filter contract (client payload)', () => {
     const query: SemanticQuery = {
       measures: ['base_amount'],
       dimensions: [],
-      filters: [{ member: 'account_type', operator, values: ['CREDIT'] }],
+      filters: [{ dimension: 'account_type', operator, values: ['CREDIT'] }],
       limit: 1000,
     };
     await executeQuery(query, { projectId: 'p1', modelId: 'm1' });
@@ -105,9 +105,8 @@ describe('F-025-01 — Report Builder filter contract (client payload)', () => {
     expect(body.project_id).toBe('p1');
     expect(body.model_id).toBe('m1');
     const filters = body.filters as Array<Record<string, unknown>>;
-    // The server's canonical contract reads `dimension` (not `member`) and
-    // normalizes the Cube-style operator server-side; the client must send the
-    // raw operator + a values array, never a `member` key.
+    // Bug-7386: the client type and the wire format both use `dimension`.
+    // The client must send the raw operator + a values array.
     expect(filters[0]).toEqual({
       dimension: 'account_type',
       operator,
@@ -125,7 +124,7 @@ describe('F-025-01 — Report Builder filter contract (client payload)', () => {
     );
     const query: SemanticQuery = {
       measures: ['base_amount'],
-      filters: [{ member: 'account_type', operator: 'regex', values: ['x'] }],
+      filters: [{ dimension: 'account_type', operator: 'regex', values: ['x'] }],
       dimensions: [],
     };
     await expect(executeQuery(query, { projectId: 'p1', modelId: 'm1' }))

@@ -2,8 +2,78 @@ import { describe, it, expect } from 'vitest';
 import {
   recommendChartType,
   separateColumns,
+  enrichAnnotationTimeDimensions,
   type ChartTypeRecommendation,
 } from '../utils/excelCharts';
+
+describe('enrichAnnotationTimeDimensions (Bug-7416)', () => {
+  it('moves a known time dimension from dimensions into timeDimensions', () => {
+    const annotation = {
+      measures: { revenue: { title: 'Revenue', type: 'sum' } },
+      dimensions: {
+        business_date_month: { title: 'Month', type: 'integer' },
+        region: { title: 'Region', type: 'string' },
+      },
+      timeDimensions: {},
+    };
+    const enriched = enrichAnnotationTimeDimensions(annotation, ['business_date_month']);
+    expect(enriched?.timeDimensions).toHaveProperty('business_date_month');
+    expect(enriched?.dimensions).not.toHaveProperty('business_date_month');
+    expect(enriched?.dimensions).toHaveProperty('region');
+  });
+
+  it('drives recommendChartType to a line chart once the time dim is reclassified', () => {
+    // Before enrichment the backend annotation has an empty timeDimensions map,
+    // so the month column reads as a category and the recommender picks a
+    // column chart. After enrichment it detects the time axis -> line.
+    const headers = ['Month', 'Revenue'];
+    const rows: (string | number)[][] = [
+      ['2024-01', 100], ['2024-02', 200], ['2024-03', 300], ['2024-04', 400],
+    ];
+    const backendAnnotation = {
+      measures: { revenue: { title: 'Revenue', type: 'sum' } },
+      dimensions: { business_date_month: { title: 'Month', type: 'integer' } },
+      timeDimensions: {},
+    };
+    // Sanity: without the time flag the recommender does not see a time axis
+    // (the key 'business_date_month' is not among the headers, so it is a plain
+    // category) — this asserts the enrichment is what unlocks the line chart.
+    const enriched = enrichAnnotationTimeDimensions(backendAnnotation, ['business_date_month']);
+    const rec = recommendChartType(headers, rows, enriched);
+    expect(rec.chartType).toBe('line');
+    expect(rec.confidence).toBe('high');
+  });
+
+  it('is a no-op when no dimension matches a time-dimension name', () => {
+    const annotation = {
+      dimensions: { region: { title: 'Region', type: 'string' } },
+      measures: {},
+      timeDimensions: {},
+    };
+    const enriched = enrichAnnotationTimeDimensions(annotation, ['business_date_month']);
+    expect(enriched).toBe(annotation); // same reference, nothing moved
+  });
+
+  it('is a no-op when the time-dimension name set is empty', () => {
+    const annotation = { dimensions: { d: { title: 'D', type: 'x' } }, measures: {}, timeDimensions: {} };
+    expect(enrichAnnotationTimeDimensions(annotation, [])).toBe(annotation);
+  });
+
+  it('preserves existing timeDimensions entries while adding new ones', () => {
+    const annotation = {
+      dimensions: { d_month: { title: 'Month', type: 'integer' } },
+      measures: {},
+      timeDimensions: { d_year: { title: 'Year', type: 'integer' } },
+    };
+    const enriched = enrichAnnotationTimeDimensions(annotation, ['d_month']);
+    expect(enriched?.timeDimensions).toHaveProperty('d_year');
+    expect(enriched?.timeDimensions).toHaveProperty('d_month');
+  });
+
+  it('returns undefined unchanged for an undefined annotation', () => {
+    expect(enrichAnnotationTimeDimensions(undefined, ['d'])).toBeUndefined();
+  });
+});
 
 describe('excelCharts', () => {
   describe('recommendChartType', () => {

@@ -2,18 +2,23 @@
 title: "Demo tenant: acme-demo"
 audience: all
 area: getting-started
-updated: 2026-06-24
+updated: 2026-07-22
 ---
 
 ## What this covers
 
-`acme-demo` is the comprehensive demo workspace shipped with Tessallite. It exercises every modelling feature against a self-contained dataset so new operators can explore a working install without authoring anything from scratch.
+Tessallite ships with a ready-made demo workspace so a new operator can explore a working install without building anything from scratch. There are two closely related versions of it, and it is worth knowing which one you are looking at:
 
-It supersedes the legacy `acme-test` fixture. `acme-test` scripts remain in `tessallite/scripts/` for backward compatibility, but new code should target `acme-demo`.
+- The **Community demo** is the tenant your installed Community bundle can provision for you. It is named `demo`, uses the project `project-demo`, and contains three models. See "How it gets seeded in the Community bundle" below.
+- The **acme-demo dev fixture** is the fuller workspace used by the Tessallite team for development and testing. It is named `acme-demo`, uses the project `project1`, and contains five models. It is not what the Community installer creates; it is described here because most feature walkthroughs and the test suite reference it.
+
+The rest of this page describes the dev `acme-demo` fixture in detail (the reference for feature walkthroughs), then explains exactly what the Community installer does.
+
+`acme-demo` supersedes the legacy `acme-test` fixture. `acme-test` scripts remain in `tessallite/scripts/` for backward compatibility, but new code should target `acme-demo`.
 
 ---
 
-## What it contains
+## What the dev acme-demo fixture contains
 
 - One project (`project1`).
 - Five models in that project. Two are the primary worked examples used throughout this help and the end-to-end test suite:
@@ -26,12 +31,34 @@ It supersedes the legacy `acme-test` fixture. `acme-test` scripts remain in `tes
 
 ## How it gets seeded in the Community bundle
 
-The signed Community bundle seeds it during `./install.sh`. After the system schema is ready, the installer loads the demo source data and imports the project bundle so a new user has a working tenant immediately.
+Two things are important to get right here, because they differ from the dev fixture above:
 
-1. Source and target schemas are loaded from `deploy/Sample-db/acme-demo/*.sql`.
-2. The acme-demo tenant is reset, the project + four connections are created, then all five models are re-imported from the seed bundle `tessallite/seeds/acme-demo/project.json` (a single project export containing every model; older builds used separate per-model JSON files).
+- The Community installer does **not** create the `acme-demo` tenant with five models. It provisions a smaller demo tenant named **`demo`**, in the project **`project-demo`**, with **three** models: `modely`, `onboarding`, and `inventory`.
+- Seeding is **opt-in**, and **off by default**. A fresh Community install starts empty. This is deliberate: the demo tenant ships fixed, publicly known credentials (`admin@demo.com` / `demo`), and the UI (port 3000) and JDBC (port 5433) ports are reachable, so auto-seeding would place a known login on a reachable surface.
 
-The seed is conditional on `SYSTEM_DATABASE_URL` and `CREDENTIAL_ENCRYPTION_KEY` being present in the generated `.env`. If the seed assets are missing, the installer prints a notice and continues so the platform still starts.
+### Turning the demo on
+
+To include the demo dataset, set this in your `.env` **before** running `./install.sh`:
+
+```
+SEED_DEMO_TENANT=true
+```
+
+Then run the installer normally. When the flag is on, `./install.sh` runs the one demo-reseed path (`deploy/demo-tenant/reseed.py`): it loads the demo source data and seeds the `demo` tenant, project `project-demo`, and its three models — the same path the in-app demo-reseed button uses.
+
+You can also leave the flag off at install time and provision the demo later from the in-app demo-reseed control, without re-running the installer.
+
+### The installer checks its own work
+
+When you ask for the demo (`SEED_DEMO_TENANT=true`), the installer does not just start the containers and declare success. It verifies the demo is actually usable, and **fails the install loudly if it is not**:
+
+1. A failed seed is a failed install — the installer stops with an error instead of reporting success on an empty tenant.
+2. It signs in as the demo admin and confirms the expected number of models exist.
+3. It runs a **real first query** through the gateway (the same JDBC path a BI tool uses) and requires it to return rows. If that query fails or returns nothing, the install fails.
+
+So a "Tessallite Community is running" banner with the demo enabled means a real query already worked, not merely that the containers came up. You can re-run the same style of check any time with `./healthcheck.sh`, which now fails with a non-zero result if any required service (including the scheduler, optimizer, and agent) is down.
+
+The verification thresholds and the demo target (tenant, project, model, and the smoke query) are configurable in `.env` — see the `SEED_DEMO_*` and `DEMO_SMOKE_*` keys in `.env.example` — so you can point the check at a different demo model without editing the installer.
 
 ---
 

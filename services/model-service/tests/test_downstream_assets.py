@@ -48,6 +48,20 @@ def _make_asset(
     )
 
 
+def _asset_lookup_result(asset):
+    """What the handler's scoped asset SELECT returns.
+
+    ``result.scalars().one_or_none()`` — the ORM shape ``scoped_select``
+    produces. A mocked session cannot evaluate the ownership predicate, so
+    these tests only prove the handler surfaces "found" and "not found"
+    correctly; that the predicate itself is right is proved against real
+    Postgres in ``tests/integration/test_read_path_project_scope_db.py``.
+    """
+    result = MagicMock()
+    result.scalars.return_value.one_or_none.return_value = asset
+    return result
+
+
 def _make_query_ref(queried_table="sales", hit_count=5):
     return types.SimpleNamespace(
         id=uuid.uuid4(),
@@ -162,7 +176,11 @@ class TestDeleteDownstreamAsset:
         model = make_model()
         asset = _make_asset()
 
-        db.get = AsyncMock(side_effect=lambda cls, id: model if id == TEST_MODEL_ID else asset)
+        # The asset is looked up through a SCOPED SELECT, not ``db.get``: the
+        # ownership predicate has to be in the query, and ``db.get`` cannot
+        # express one. ``db.get`` still serves the path model.
+        db.get = AsyncMock(return_value=model)
+        db.execute = AsyncMock(return_value=_asset_lookup_result(asset))
 
         with patch("src.api.downstream_assets.get_tenant_db", async_gen_from(db)):
             resp = await client.delete(f"{ASSETS_PREFIX}/{asset.id}")
@@ -173,15 +191,10 @@ class TestDeleteDownstreamAsset:
         db = make_mock_db()
         model = make_model()
 
-        call_count = 0
-        async def _get_side_effect(cls, id):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return model
-            return None
-
-        db.get = AsyncMock(side_effect=_get_side_effect)
+        db.get = AsyncMock(return_value=model)
+        # The scoped SELECT finds nothing — which is the ONE outcome for both
+        # "no such asset" and "another project's asset", by design.
+        db.execute = AsyncMock(return_value=_asset_lookup_result(None))
 
         with patch("src.api.downstream_assets.get_tenant_db", async_gen_from(db)):
             resp = await client.delete(f"{ASSETS_PREFIX}/{uuid.uuid4()}")

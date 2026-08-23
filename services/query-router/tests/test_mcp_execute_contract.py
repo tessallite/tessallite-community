@@ -125,23 +125,103 @@ def test_mcp_protocol_enforces_jdbc_group_by_strictness():
         _parse(body)
 
 
+def test_execute_request_rejects_unrecognised_protocol_values():
+    """Bug-5889: `protocol` used to be an unconstrained `str`. Any value
+    other than jdbc/dax/mcp (a typo, a case variant, or a caller trying to
+    dodge JDBC strictness) must be rejected at the HTTP/schema boundary
+    with a validation error, not silently accepted into a lax parse mode."""
+    from pydantic import ValidationError
+
+    from src.api.routes import ExecuteRequest
+
+    for bad_protocol in ("sql", "JDBC", "Jdbc", "raw", ""):
+        with pytest.raises(ValidationError):
+            ExecuteRequest(
+                model_id="m-1",
+                raw_query="SELECT region, SUM(amount) FROM t",
+                protocol=bad_protocol,
+            )
+
+
+def test_execute_request_accepts_the_three_documented_protocols():
+    from src.api.routes import ExecuteRequest
+
+    for good_protocol in ("jdbc", "dax", "mcp"):
+        body = ExecuteRequest(
+            model_id="m-1",
+            raw_query="SELECT 1",
+            protocol=good_protocol,
+        )
+        assert body.protocol == good_protocol
+
+
 @pytest.mark.asyncio
 async def test_row_limit_clamps_parsed_limit(monkeypatch):
-    """body.row_limit must clamp the parsed query's LIMIT (smaller wins)."""
+    """body.row_limit is the binding cap over a larger parsed LIMIT.
+
+    Bug-7998 / F-027-02: to detect truncation the engine is handed
+    row_limit + 1 (fetch one extra to probe for more rows); the probe row is
+    trimmed from the response. So the SQL LIMIT the binder sees is 11 for a
+    row_limit of 10."""
     captured = await _run_handle_execute(monkeypatch, parsed_limit=1000, row_limit=10)
-    assert captured["limit"] == 10
+    assert captured["limit"] == 11
 
 
 @pytest.mark.asyncio
 async def test_row_limit_applies_when_query_has_no_limit(monkeypatch):
     captured = await _run_handle_execute(monkeypatch, parsed_limit=None, row_limit=25)
-    assert captured["limit"] == 25
+    # row_limit is the binding cap → probe with 26 (see F-027-02 above).
+    assert captured["limit"] == 26
 
 
 @pytest.mark.asyncio
 async def test_smaller_query_limit_wins_over_row_limit(monkeypatch):
+    """The query's OWN smaller LIMIT is the caller's explicit intent, not a
+    server cap — no probe row, no truncation marker."""
     captured = await _run_handle_execute(monkeypatch, parsed_limit=5, row_limit=100)
     assert captured["limit"] == 5
+
+
+@pytest.mark.asyncio
+async def test_truncated_flag_set_when_probe_row_returned(monkeypatch):
+    """Bug-7998 / F-027-02: when the source returns row_limit + 1 rows the
+    ExecuteResponse reports truncated=true, carries the effective row_limit,
+    and trims the response back to exactly row_limit rows."""
+    resp = await _run_handle_execute(
+        monkeypatch, parsed_limit=None, row_limit=3,
+        source_rows=[{"n": i} for i in range(4)],  # cap+1 -> truncated
+        return_response=True,
+    )
+    assert resp.truncated is True
+    assert resp.row_limit == 3
+    assert resp.rows_returned == 3
+    assert len(resp.rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_not_truncated_when_under_cap(monkeypatch):
+    resp = await _run_handle_execute(
+        monkeypatch, parsed_limit=None, row_limit=3,
+        source_rows=[{"n": 0}, {"n": 1}],  # under cap
+        return_response=True,
+    )
+    assert resp.truncated is False
+    assert resp.row_limit == 3
+    assert len(resp.rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_no_row_limit_leaves_truncated_false(monkeypatch):
+    """A caller that supplies no row_limit (JDBC/XMLA) gets truncated=false
+    and row_limit=None — the completeness contract is opt-in and backwards
+    compatible."""
+    resp = await _run_handle_execute(
+        monkeypatch, parsed_limit=None, row_limit=None,
+        source_rows=[{"n": 0}, {"n": 1}],
+        return_response=True,
+    )
+    assert resp.truncated is False
+    assert resp.row_limit is None
 
 
 @pytest.mark.asyncio
@@ -174,9 +254,14 @@ async def _run_handle_execute(
     persona=None,
     persona_id=None,
     forbid_persona_gate: bool = False,
-) -> dict:
-    """Drive _handle_execute with all pipeline seams stubbed; return the
-    state of the logical query as the binder saw it."""
+    source_rows=None,
+    return_response: bool = False,
+):
+    """Drive _handle_execute with all pipeline seams stubbed.
+
+    Returns the captured logical-query state by default; when
+    ``return_response`` is True, returns the ExecuteResponse so completeness
+    fields (truncated / row_limit / trimmed rows) can be asserted."""
     from src.api import routes as routes_mod
     from src.api.routes import ExecuteRequest, _handle_execute
 
@@ -254,8 +339,11 @@ async def _run_handle_execute(
 
     monkeypatch.setattr(routes_mod, "route_query", fake_route)
 
+    _rows = source_rows if source_rows is not None else []
+    _cols = list(_rows[0].keys()) if _rows else []
+
     async def fake_execute(bound, decision, db):
-        return ([], 0, [], "source")
+        return (list(_rows), 0, _cols, "source")
 
     monkeypatch.setattr(routes_mod, "execute_routed_query", fake_execute)
 
@@ -284,16 +372,22 @@ async def _run_handle_execute(
         model_id="m-1",
         # Unique per parameterisation: the module-global result cache keys
         # on raw_query, and a cache hit would skip the bind seam captured
-        # by this harness.
-        raw_query=f"SELECT 1 /* clamp {parsed_limit}/{row_limit} */",
+        # by this harness. Fold in the source-row count too so truncated vs
+        # not-truncated cases with the same limits do not collide.
+        raw_query=(
+            f"SELECT 1 /* clamp {parsed_limit}/{row_limit}/"
+            f"{len(source_rows) if source_rows is not None else 0} */"
+        ),
         protocol="jdbc",
         row_limit=row_limit,
     )
-    await _handle_execute(
+    response = await _handle_execute(
         body,
         _FakeDB(),
         user_identity="user@tenant.com",
         persona_id=persona_id,
         persona=persona,
     )
+    if return_response:
+        return response
     return captured

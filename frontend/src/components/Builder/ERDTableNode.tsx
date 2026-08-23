@@ -625,7 +625,7 @@ function ERDTableNode({ id, data }: { id: string; data: ERDNodeData }) {
       <NodeResizer
         minWidth={200}
         minHeight={150}
-        isVisible={true}
+        isVisible={!readOnly}
         lineStyle={{ borderColor: "transparent" }}
         handleStyle={{
           width: 12,
@@ -635,6 +635,7 @@ function ERDTableNode({ id, data }: { id: string; data: ERDNodeData }) {
           border: "none",
         }}
         onResizeEnd={(_e, params) => {
+          if (readOnly) return;
           window.dispatchEvent(
             new CustomEvent("node-resize-end", {
               detail: { id, w: params.width, h: params.height },

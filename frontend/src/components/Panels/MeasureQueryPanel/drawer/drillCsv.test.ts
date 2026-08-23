@@ -79,6 +79,33 @@ describe("drillRowsToCsv", () => {
     expect(csv).toBe("region,amount\r\n");
   });
 
+  // Bug-7286: a source cell beginning with a spreadsheet formula trigger must be
+  // neutralised so it cannot execute when the drill CSV is opened in Excel.
+  it("neutralises formula-leading source values", () => {
+    const result = makeResult({
+      columns: ["name", "amount"],
+      rows: [
+        { name: "=cmd|'/C calc'!A0", amount: 1 },
+        { name: "@SUM(1,1)", amount: 2 },
+        { name: "+evil", amount: 3 },
+        { name: "-danger", amount: 4 },
+      ],
+    });
+    const csv = drillRowsToCsv(result, ["name", "amount"]);
+    expect(csv).toContain("'=cmd|'/C calc'!A0");
+    expect(csv).toContain("'@SUM(1,1)");
+    expect(csv).toContain("'+evil");
+    expect(csv).toContain("'-danger");
+    // No body cell starts with a bare formula token.
+    const lines = csv.split("\r\n").slice(1).filter(Boolean);
+    for (const line of lines) {
+      const first = line.split(",")[0].replace(/^"|"$/g, "");
+      expect(["=", "+", "@"].includes(first[0] ?? "")).toBe(false);
+    }
+    // Numeric column preserved.
+    expect(csv).toContain(",1\r\n");
+  });
+
   it("preserves hierarchy drill results with drill_dimension", () => {
     const result = makeResult({
       columns: ["month", "amount"],

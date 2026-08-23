@@ -154,9 +154,17 @@ def _dimension(id_, name, source_column_id):
 def _bound_query(resolved_measures, resolved_dimensions=None, grain=None,
                  raw_query=None):
     mid = str(uuid4())
+    # Bug-7803: these tests exercise calc-expansion RENDERING, seeding the
+    # referenced base measures into the FakeDB. The calc-dependency load now
+    # resolves base measures from the DEPLOYED SNAPSHOT for a deployed model
+    # (fail-closed), and the FakeDB carries no ModelVersion snapshot. Model the
+    # world as UNDEPLOYED so the FakeDB's live ``measures`` ARE the authority
+    # (the correct source for an undeployed model) — keeping each rendering
+    # assertion intact. Deploy-authority itself is covered by
+    # test_bug_7803_calc_dependency_snapshot_authority.py.
     model = types.SimpleNamespace(
         id=mid, slug="test", display_name="test",
-        deployed_version_id="v1",
+        deployed_version_id=None,
     )
     dim_names = [d.name for d in (resolved_dimensions or [])]
     lq = LogicalQuery(
@@ -303,3 +311,64 @@ async def test_bare_calc_measure_with_group_by():
     assert 'SUM("t"."net_sales")' in sql
     assert '"gross_margin_pct"' in sql
     assert "GROUP BY" in sql
+
+
+@pytest.mark.asyncio
+async def test_calc_ref_with_inconsistent_semi_additive_default_agg_raises():
+    """F-015-12: a calculated measure that references a base measure whose
+    ``default_agg`` is a semi-additive balance token (last_non_empty) but which
+    carries NO ``semi_additive_behavior`` (a data inconsistency) must fail loud,
+    not silently substitute SUM.  Summing a point-in-time balance is a wrong
+    number; the row must be repaired instead."""
+    fact = _model_table("t-fact", "demo.balances", "b")
+    bal_col = _model_col("c-bal", "t-fact", "closing_balance")
+    cnt_col = _model_col("c-cnt", "t-fact", "day_count")
+
+    # balance measure: SA token in default_agg, but semi_additive_behavior unset.
+    balance = _measure(
+        "m-bal", "balance",
+        default_agg="last_non_empty", source_column_id="c-bal",
+    )
+    days = _measure("m-days", "days", source_column_id="c-cnt")
+    ratio = _measure(
+        "m-ratio", "avg_balance",
+        measure_type="calculated",
+        default_agg="sum",
+        expression='safe_div(measure("balance"), measure("days"))',
+        calc_agg_mode="expression_as_written",
+    )
+
+    db = FakeDB(tables=[fact], columns=[bal_col, cnt_col],
+                measures=[balance, days])
+
+    from src.ir.logical_query import SemanticBindingError
+    with pytest.raises(SemanticBindingError, match="semi-additive balance token"):
+        await _build_source_sql(_bound_query([ratio]), db)
+
+
+@pytest.mark.asyncio
+async def test_calc_outer_with_inconsistent_semi_additive_default_agg_raises():
+    """F-015-12: a per_row_then_aggregate calculated measure whose OWN
+    ``default_agg`` is a semi-additive balance token with no
+    ``semi_additive_behavior`` must fail loud on the outer aggregation step
+    rather than silently wrapping the per-row expression in SUM."""
+    fact = _model_table("t-fact", "demo.line_items", "li")
+    price_col = _model_col("c-price", "t-fact", "price")
+    qty_col = _model_col("c-qty", "t-fact", "qty")
+
+    price = _measure("m-price", "price", source_column_id="c-price")
+    qty = _measure("m-qty", "qty", source_column_id="c-qty")
+    bad = _measure(
+        "m-bad", "bad_total",
+        measure_type="calculated",
+        default_agg="last_non_empty",   # inconsistent SA token as outer agg
+        expression='measure("price") * measure("qty")',
+        calc_agg_mode="per_row_then_aggregate",
+    )
+
+    db = FakeDB(tables=[fact], columns=[price_col, qty_col],
+                measures=[price, qty])
+
+    from src.ir.logical_query import SemanticBindingError
+    with pytest.raises(SemanticBindingError, match="semi-additive balance token"):
+        await _build_source_sql(_bound_query([bad]), db)

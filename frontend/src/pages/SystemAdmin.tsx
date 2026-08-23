@@ -35,6 +35,7 @@ import EditIcon from "@mui/icons-material/EditOutlined";
 import LockResetIcon from "@mui/icons-material/LockReset";
 import SearchIcon from "@mui/icons-material/Search";
 import { adminApi, authApi, tenantsApi } from "../api/client";
+import { meetsPasswordPolicy, showsPasswordPolicyError } from "../auth/passwordPolicy";
 import type { LocalUserRole, Tenant, User } from "../api/types";
 import HelpIconButton from "../components/HelpIconButton";
 
@@ -718,10 +719,16 @@ function UserDialogForm({
       ? t("systemAdmin.resetPassword")
       : t("systemAdmin.newUser");
 
+  // Bug-8184: the server refuses a password that misses the complexity rule,
+  // so refuse it here too rather than letting the operator submit and read the
+  // rule out of a 422.
+  const passwordOk = meetsPasswordPolicy(password);
+  const passwordInvalid = showsPasswordPolicyError(password);
+
   const isValid = (() => {
-    if (isReset) return password.length > 0;
+    if (isReset) return passwordOk;
     if (isEdit) return username.trim() !== "" && email.trim() !== "";
-    return username.trim() !== "" && email.trim() !== "" && password.length > 0;
+    return username.trim() !== "" && email.trim() !== "" && passwordOk;
   })();
 
   return (
@@ -740,6 +747,8 @@ function UserDialogForm({
               margin="normal"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              error={passwordInvalid}
+              helperText={t("errors.form.passwordComplexity")}
               autoFocus
             />
           </>
@@ -774,6 +783,8 @@ function UserDialogForm({
                 margin="normal"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
+                error={passwordInvalid}
+                helperText={t("errors.form.passwordComplexity")}
               />
             )}
             <FormControl fullWidth size="small" margin="normal">

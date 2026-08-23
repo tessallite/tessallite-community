@@ -42,10 +42,27 @@ class CollibraPushNotImplementedError(NotImplementedError):
 class CollibraClient:
     """Collibra client shell used until a tenant-specific API contract is wired."""
 
-    def __init__(self, base_url: str, token: str, timeout_seconds: int = 30):
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        timeout_seconds: int = 30,
+        *,
+        community_id: str = "",
+        domain_id: str = "",
+        asset_type_mapping: dict[str, str] | None = None,
+        relation_type_mapping: dict[str, str] | None = None,
+        responsibility_mapping: dict[str, str] | None = None,
+    ):
+        # Bug-7718: accept connection config for validate contract.
         self._base_url = base_url
         self._token = token
         self._timeout = timeout_seconds
+        self._community_id = community_id
+        self._domain_id = domain_id
+        self._asset_type_mapping = asset_type_mapping or {}
+        self._relation_type_mapping = relation_type_mapping or {}
+        self._responsibility_mapping = responsibility_mapping or {}
 
     async def validate_connection(self) -> CollibraConnectionStatus:
         # No real HTTP client yet: do not assert a pass we cannot prove.
@@ -91,4 +108,16 @@ class CollibraClient:
         raise CollibraPushNotImplementedError(
             "Collibra non-dry-run sync is not implemented for this deployment; "
             "configure a real Collibra client before running push mode."
+        )
+
+    async def deprecate_assets(self, external_ids: list[str]) -> int:
+        """Bug-7526: placeholder for remote deprecation."""
+        raise CollibraPushNotImplementedError(
+            "Remote Collibra deprecation is not implemented for this deployment."
+        )
+
+    async def deprecate_relations(self, external_ids: list[str]) -> int:
+        """Bug-7526: placeholder for remote deprecation."""
+        raise CollibraPushNotImplementedError(
+            "Remote Collibra deprecation is not implemented for this deployment."
         )

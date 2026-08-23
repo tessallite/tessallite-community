@@ -1,4 +1,5 @@
 {
+  "collibra.activate": "Ativar",
   "collibra.addConnection": "Adicionar conexão",
   "collibra.assets": "Ativos",
   "collibra.assetsCount": "{{count}} ativos",
@@ -8,6 +9,7 @@
   "collibra.baseUrlPlaceholder": "https://sua-empresa.collibra.com",
   "collibra.communityChip": "Comunidade: {{value}}",
   "collibra.communityId": "ID da comunidade",
+  "collibra.deactivate": "Desativar",
   "collibra.delete": "Excluir",
   "collibra.deleteFailed": "Falha ao excluir.",
   "collibra.details": "Detalhes",
@@ -22,7 +24,7 @@
   "collibra.loadFailed": "Falha ao carregar conexões do Collibra.",
   "collibra.mode": "Modo",
   "collibra.modeDryRun": "Simulação",
-  "collibra.modePush": "Push",
+  "collibra.modePush": "Enviar",
   "collibra.modeUnknown": "Modo desconhecido",
   "collibra.newConnection": "Nova conexão",
   "collibra.noConnections": "Nenhuma conexão do Collibra configurada. Adicione uma para habilitar a validação e as simulações.",

@@ -21,6 +21,7 @@ import {
 import CheckCircleOutlineIcon from "@mui/icons-material/CheckCircleOutline";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 import RemoveIcon from "@mui/icons-material/Remove";
+import { useT } from "../../../i18n";
 
 export interface RenamePreviewRow {
   type: "dimension" | "measure";
@@ -56,6 +57,7 @@ export default function AttributeRenameDialog({
   onKeep,
   onRevert,
 }: Props) {
+  const t = useT();
   // Editable name per row, keyed by row id.
   const [values, setValues] = useState<Record<string, string>>({});
 
@@ -64,17 +66,18 @@ export default function AttributeRenameDialog({
     setValues(Object.fromEntries(rows.map((r) => [r.id, r.suggested_name])));
   }, [rows]);
 
-  // Compute per-row errors, processing in order so duplicates within the
-  // dialog are caught on the second occurrence.
-  const errors = useMemo<Record<string, string | null>>(() => {
-    const result: Record<string, string | null> = {};
+  // Compute per-row errors as stable codes, processing in order so duplicates
+  // within the dialog are caught on the second occurrence. Codes are mapped to
+  // translated strings at render so the workflow is locale-complete (F-026-05).
+  const errorCodes = useMemo<Record<string, "required" | "inUse" | null>>(() => {
+    const result: Record<string, "required" | "inUse" | null> = {};
     const seen = new Set<string>(takenNames);
     for (const row of rows) {
       const val = (values[row.id] ?? "").trim();
       if (!val) {
-        result[row.id] = "Name is required.";
+        result[row.id] = "required";
       } else if (seen.has(val.toLowerCase())) {
-        result[row.id] = "Already in use.";
+        result[row.id] = "inUse";
       } else {
         result[row.id] = null;
         seen.add(val.toLowerCase());
@@ -83,7 +86,13 @@ export default function AttributeRenameDialog({
     return result;
   }, [values, takenNames, rows]);
 
-  const hasErrors = Object.values(errors).some((e) => e !== null);
+  const errorText = (code: "required" | "inUse" | null): string | null => {
+    if (code === "required") return t("attributeRename.errorRequired");
+    if (code === "inUse") return t("attributeRename.errorInUse");
+    return null;
+  };
+
+  const hasErrors = Object.values(errorCodes).some((e) => e !== null);
 
   function handleApply() {
     const final = rows.map((r) => ({
@@ -96,13 +105,13 @@ export default function AttributeRenameDialog({
 
   const title =
     mode === "alias-change"
-      ? "Review attribute renames"
-      : "Confirm attribute names before saving";
+      ? t("attributeRename.titleAlias")
+      : t("attributeRename.titleNewTable");
 
   const subtitle =
     mode === "alias-change"
-      ? "The alias change affects the names of the following attributes. Edit proposed names or keep current ones."
-      : "The following column names conflict with existing attributes. Adjust names before saving.";
+      ? t("attributeRename.subtitleAlias")
+      : t("attributeRename.subtitleNewTable");
 
   return (
     <Dialog open={open} maxWidth="md" fullWidth>
@@ -114,7 +123,7 @@ export default function AttributeRenameDialog({
 
         {rows.length === 0 ? (
           <Typography variant="body2" color="text.secondary">
-            No renames required.
+            {t("attributeRename.noneRequired")}
           </Typography>
         ) : (
           <TableContainer
@@ -124,18 +133,18 @@ export default function AttributeRenameDialog({
               <TableHead>
                 <TableRow>
                   <TableCell sx={{ fontWeight: 600, fontSize: "0.8rem", bgcolor: "grey.50", width: 90 }}>
-                    Type
+                    {t("attributeRename.colType")}
                   </TableCell>
                   <TableCell sx={{ fontWeight: 600, fontSize: "0.8rem", bgcolor: "grey.50" }}>
-                    Source column
+                    {t("attributeRename.colSourceColumn")}
                   </TableCell>
                   {mode === "alias-change" && (
                     <TableCell sx={{ fontWeight: 600, fontSize: "0.8rem", bgcolor: "grey.50" }}>
-                      Current name
+                      {t("attributeRename.colCurrentName")}
                     </TableCell>
                   )}
                   <TableCell sx={{ fontWeight: 600, fontSize: "0.8rem", bgcolor: "grey.50" }}>
-                    New name
+                    {t("attributeRename.colNewName")}
                   </TableCell>
                   <TableCell sx={{ fontWeight: 600, fontSize: "0.8rem", bgcolor: "grey.50", width: 36 }} />
                 </TableRow>
@@ -143,7 +152,7 @@ export default function AttributeRenameDialog({
               <TableBody>
                 {rows.map((row) => {
                   const val = values[row.id] ?? "";
-                  const err = errors[row.id];
+                  const err = errorText(errorCodes[row.id]);
                   const unchanged = mode === "alias-change" && val.trim() === row.current_name;
                   return (
                     <TableRow key={row.id}>
@@ -174,7 +183,7 @@ export default function AttributeRenameDialog({
                       </TableCell>
                       <TableCell align="center" sx={{ py: 0.5 }}>
                         {unchanged ? (
-                          <Tooltip title="No change from current name">
+                          <Tooltip title={t("attributeRename.statusUnchanged")}>
                             <RemoveIcon sx={{ fontSize: 16, color: "text.disabled" }} />
                           </Tooltip>
                         ) : err ? (
@@ -182,7 +191,7 @@ export default function AttributeRenameDialog({
                             <ErrorOutlineIcon sx={{ fontSize: 16, color: "error.main" }} />
                           </Tooltip>
                         ) : (
-                          <Tooltip title="Valid">
+                          <Tooltip title={t("attributeRename.statusValid")}>
                             <CheckCircleOutlineIcon sx={{ fontSize: 16, color: "success.main" }} />
                           </Tooltip>
                         )}
@@ -197,8 +206,7 @@ export default function AttributeRenameDialog({
 
         {mode === "alias-change" && (
           <Alert severity="info" sx={{ mt: 2 }}>
-            Renamed attributes take effect in connected BI tools after you redeploy the model.
-            Saved queries that reference the old names by string will need to be updated manually.
+            {t("attributeRename.redeployWarning")}
           </Alert>
         )}
       </DialogContent>
@@ -211,7 +219,7 @@ export default function AttributeRenameDialog({
           onClick={onRevert}
           disabled={applying}
         >
-          {mode === "alias-change" ? "Revert alias change" : "Cancel"}
+          {mode === "alias-change" ? t("attributeRename.revertAlias") : t("attributeRename.cancel")}
         </Button>
 
         <Box sx={{ flex: 1 }} />
@@ -223,7 +231,7 @@ export default function AttributeRenameDialog({
             onClick={onKeep}
             disabled={applying}
           >
-            Keep current names
+            {t("attributeRename.keepCurrent")}
           </Button>
         )}
 
@@ -234,7 +242,7 @@ export default function AttributeRenameDialog({
           disabled={hasErrors || applying}
         >
           {applying ? <CircularProgress size={16} sx={{ mr: 1 }} /> : null}
-          Apply renames
+          {t("attributeRename.apply")}
         </Button>
       </DialogActions>
     </Dialog>

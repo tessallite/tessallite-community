@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { partitionJoinsByEndpoints } from "./joinFilter";
+import { countDroppedJoins, partitionJoinsByEndpoints } from "./joinFilter";
 import type { Join } from "../../api/types_domains/dimensions";
 
 function join(id: string, left: string, right: string): Join {
@@ -54,5 +54,10 @@ describe("partitionJoinsByEndpoints", () => {
     const { linked, dropped } = partitionJoinsByEndpoints([], new Set(["t1"]));
     expect(linked).toEqual([]);
     expect(dropped).toEqual([]);
+  });
+
+  it("counts hidden joins for the canvas warning (Bug-9395)", () => {
+    const nodeIds = new Set(["t1", "t2"]);
+    expect(countDroppedJoins([join("j1", "t1", "t2"), join("j2", "t2", "calendar")], nodeIds)).toBe(1);
   });
 });

@@ -23,13 +23,14 @@ def _execute_method(xml_body: str) -> Element:
 @pytest.mark.asyncio
 async def test_handle_discover_members_excel_self_query_survives_member_fetch_failure(monkeypatch):
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
     async def fake_get_model_measures(
         model_id: str,
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{"name": "base_amount", "default_agg": "sum"}]
 
@@ -38,6 +39,7 @@ async def test_handle_discover_members_excel_self_query_survives_member_fetch_fa
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{
             "name": "account_type",
@@ -100,13 +102,14 @@ async def test_handle_discover_members_excel_self_query_survives_member_fetch_fa
 @pytest.mark.asyncio
 async def test_handle_discover_members_excel_children_query_returns_members_for_uda_enriched_dimension(monkeypatch):
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
     async def fake_get_model_measures(
         model_id: str,
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{"name": "base_amount", "default_agg": "sum"}]
 
@@ -115,6 +118,7 @@ async def test_handle_discover_members_excel_children_query_returns_members_for_
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{
             "name": "account_type",
@@ -186,13 +190,14 @@ async def test_handle_discover_members_excel_children_query_returns_members_for_
 @pytest.mark.asyncio
 async def test_handle_execute_excel_member_query_remains_stable_with_uda_metadata(monkeypatch):
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
     async def fake_get_model_measures(
         model_id: str,
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{
             "name": "base_amount",
@@ -205,6 +210,7 @@ async def test_handle_execute_excel_member_query_remains_stable_with_uda_metadat
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{
             "name": "account_type",
@@ -278,13 +284,14 @@ async def test_handle_execute_flat_last_non_empty_uses_hidden_time_grain(monkeyp
     captured: dict[str, str] = {}
 
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
     async def fake_get_model_measures(
         model_id: str,
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{
             "name": "ending_balance",
@@ -297,6 +304,7 @@ async def test_handle_execute_flat_last_non_empty_uses_hidden_time_grain(monkeyp
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [
             {"name": "region"},
@@ -373,13 +381,14 @@ async def test_handle_execute_maps_hierarchy_level_to_dimension_before_query_rou
     captured: dict[str, str] = {}
 
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
     async def fake_get_model_measures(
         model_id: str,
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{"name": "base_amount", "default_agg": "sum"}]
 
@@ -388,6 +397,7 @@ async def test_handle_execute_maps_hierarchy_level_to_dimension_before_query_rou
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{"name": "region_dim", "source_column_id": "col-region"}]
 
@@ -397,6 +407,7 @@ async def test_handle_execute_maps_hierarchy_level_to_dimension_before_query_rou
         jwt_token: str,
         project_id: str = "",
         include_details: bool = True,
+        **kw,
     ):
         return [{
             "id": "h-geo",
@@ -482,13 +493,14 @@ async def test_handle_execute_subselect_filter_reaches_subtotal_grain_queries(mo
     captured_sqls: list[str] = []
 
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
     async def fake_get_model_measures(
         model_id: str,
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{"name": "base_amount", "default_agg": "sum"}]
 
@@ -497,6 +509,7 @@ async def test_handle_execute_subselect_filter_reaches_subtotal_grain_queries(mo
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [
             {"name": "region_dim", "source_column_id": "col-region"},
@@ -510,6 +523,7 @@ async def test_handle_execute_subselect_filter_reaches_subtotal_grain_queries(mo
         jwt_token: str,
         project_id: str = "",
         include_details: bool = True,
+        **kw,
     ):
         return [{
             "id": "h-geo",
@@ -589,13 +603,14 @@ async def test_handle_execute_dax_summarizecolumns_maps_hierarchy_level_before_q
     captured: dict[str, str] = {}
 
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
     async def fake_get_model_measures(
         model_id: str,
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{"name": "base_amount", "default_agg": "sum"}]
 
@@ -604,6 +619,7 @@ async def test_handle_execute_dax_summarizecolumns_maps_hierarchy_level_before_q
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{"name": "region_dim", "source_column_id": "col-region"}]
 
@@ -613,6 +629,7 @@ async def test_handle_execute_dax_summarizecolumns_maps_hierarchy_level_before_q
         jwt_token: str,
         project_id: str = "",
         include_details: bool = True,
+        **kw,
     ):
         return [{
             "id": "h-geo",
@@ -685,13 +702,14 @@ async def test_handle_execute_dax_summarizecolumns_maps_hierarchy_level_before_q
 @pytest.mark.asyncio
 async def test_handle_execute_dax_ambiguous_hierarchy_level_returns_client_fault(monkeypatch):
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
     async def fake_get_model_measures(
         model_id: str,
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{"name": "base_amount", "default_agg": "sum"}]
 
@@ -700,6 +718,7 @@ async def test_handle_execute_dax_ambiguous_hierarchy_level_returns_client_fault
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [
             {"name": "region_a_dim", "source_column_id": "col-region-a"},
@@ -712,6 +731,7 @@ async def test_handle_execute_dax_ambiguous_hierarchy_level_returns_client_fault
         jwt_token: str,
         project_id: str = "",
         include_details: bool = True,
+        **kw,
     ):
         return [
             {
@@ -777,13 +797,14 @@ async def test_handle_execute_dax_ambiguous_hierarchy_level_returns_client_fault
 @pytest.mark.asyncio
 async def test_handle_discover_levels_includes_hierarchy_levels_from_model_service(monkeypatch):
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
     async def fake_get_model_measures(
         model_id: str,
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{"name": "base_amount", "default_agg": "sum"}]
 
@@ -792,6 +813,7 @@ async def test_handle_discover_levels_includes_hierarchy_levels_from_model_servi
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{"name": "account_type"}]
 
@@ -801,6 +823,7 @@ async def test_handle_discover_levels_includes_hierarchy_levels_from_model_servi
         jwt_token: str,
         project_id: str = "",
         include_details: bool = True,
+        **kw,
     ):
         return [{
             "id": "h-1",
@@ -844,13 +867,14 @@ async def test_handle_discover_levels_includes_hierarchy_levels_from_model_servi
 @pytest.mark.asyncio
 async def test_handle_discover_members_for_hierarchy_uses_preview_expansion(monkeypatch):
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return "model-1", "project-1", None
+        return "model-1", "project-1", None, None
 
     async def fake_get_model_measures(
         model_id: str,
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return [{"name": "base_amount", "default_agg": "sum"}]
 
@@ -859,6 +883,7 @@ async def test_handle_discover_members_for_hierarchy_uses_preview_expansion(monk
         tenant_slug: str,
         jwt_token: str,
         project_id: str = "",
+        **kw,
     ):
         return []
 
@@ -868,6 +893,7 @@ async def test_handle_discover_members_for_hierarchy_uses_preview_expansion(monk
         jwt_token: str,
         project_id: str = "",
         include_details: bool = True,
+        **kw,
     ):
         return [{
             "id": "h-geo",
@@ -981,7 +1007,7 @@ async def test_handle_discover_unknown_catalog_returns_xmla_fault(monkeypatch):
     """
 
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return None, "", None
+        return None, "", None, None
 
     monkeypatch.setattr(xmla_server, "_resolve_model_id", fake_resolve_model_id)
 
@@ -1024,7 +1050,7 @@ async def test_handle_discover_server_level_requests_without_catalog(monkeypatch
     """
 
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return None, "", None
+        return None, "", None, None
 
     monkeypatch.setattr(xmla_server, "_resolve_model_id", fake_resolve_model_id)
 
@@ -1059,7 +1085,7 @@ async def test_handle_discover_properties_with_unknown_catalog_faults(monkeypatc
     """
 
     async def fake_resolve_model_id(catalog: str, tenant_slug: str, jwt_token: str):
-        return None, "", None  # unknown catalog
+        return None, "", None, None  # unknown catalog
 
     monkeypatch.setattr(xmla_server, "_resolve_model_id", fake_resolve_model_id)
 

@@ -1,1 +1,1 @@
-﻿"""Pocket table execution helpers."""
+"""Pocket table execution helpers."""

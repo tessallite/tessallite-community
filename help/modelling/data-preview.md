@@ -62,4 +62,4 @@ Use the pagination controls to navigate through the data. The preview fetches ea
 
 ---
 
-← [Impact Analysis](impact-analysis.md) | [Home](../index.md) | [Schema Changes →](schema-changes.md)
+← [KPIs](kpis.md) | [Home](../index.md) | [Schema Changes →](schema-changes.md)

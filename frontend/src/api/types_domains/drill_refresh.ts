@@ -34,6 +34,22 @@ export interface QueryRouterRequest {
   dialect?: string;
   force_route?: "source" | "aggregate" | "pocket";
   persona_id?: string | null;
+  /**
+   * Model-parameter overrides, keyed `app.<lowercased parameter name>` — the
+   * same channel the JDBC gateway fills from `SET app.<name> = <value>`.
+   *
+   * Bug-9224: `ExecuteRequest.session_vars` has existed on the query-router
+   * since F-029-01, but this type omitted it, so the SPA could not send an
+   * override at ALL — a parameterised query always resolved to its deployed
+   * default. Precedence is persona default filter > session var > deployed
+   * default.
+   *
+   * Build the key from `session_var_key` on
+   * `GET /api/v1/models/{model_id}/named-objects` rather than assembling it:
+   * the gateway lower-cases the key (Postgres GUC semantics), so a
+   * hand-built `app.<AuthoredCase>` silently never matches.
+   */
+  session_vars?: Record<string, string> | null;
 }
 export interface TraceStep {
   stage: "parser" | "binder" | "router" | "rewriter" | "executor";
@@ -91,7 +107,7 @@ export interface ExplainResponse {
   aggregate_id: string | null;
   pocket_id?: string | null;
   reason: string;
-  rewritten_query: string;
+  rewritten_query?: string | null;
   requested_measures: string[];
   requested_dimensions: string[];
   grain: string[];
@@ -111,6 +127,25 @@ export interface ExecuteResponse {
   rows_returned: number;
   trace: PipelineTrace;
   field_compatibility?: QueryRouterFieldCompatibilityFeedback | null;
+  // Bug-8103 / F-104-03: backend-authoritative freshness of the served result,
+  // owned by the query-router/gateway serve path. Optional until that lane
+  // populates it; the frontend FreshnessIndicator consumes it defensively.
+  freshness?: ResultFreshness | null;
+  /**
+   * Bug-8449 / Bug-8453: the row-security rule ids the router applied to this
+   * execution (empty when none fired). Rule IDS only — never predicate SQL.
+   * Carries the `__deny_all__` sentinel when row security denied every row, so
+   * a caller can tell "you are not permitted to see anything" from "there is
+   * genuinely no data" instead of rendering both as an empty grid.
+   */
+  security_rules_applied?: string[] | null;
+}
+
+/** Result data-freshness signal (Bug-8103). See FreshnessIndicator. */
+export interface ResultFreshness {
+  last_refreshed_at?: string | null;
+  is_live?: boolean;
+  is_stale?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +164,9 @@ export interface DrillThroughRequest {
   persona_id?: string | null;
   hierarchy_id?: string | null;
   force_route?: "source" | "aggregate" | "pocket" | null;
+  /** Bug-7265: the aggregate function the clicked pivot column uses (e.g. "AVG").
+   *  When omitted the backend falls back to the measure's default_agg. */
+  override_agg?: string | null;
 }
 export interface DrillThroughPageInfo {
   cursor: string;
@@ -164,6 +202,13 @@ export interface DrillThroughResponse {
   execution_ms: number;
   bytes_processed: number;
   rows_returned: number;
+  /**
+   * Bug-8453 / R5 finding F2: the row-security denial channel on the drill
+   * grid. The producer shipped in R4 with NO consumer on any client, so a
+   * drill into a cell whose detail rows are all RLS-denied still read as
+   * "no detail rows" -- a statement about the business, not about access.
+   */
+  security_rules_applied?: string[];
 }
 export interface DrillOptionsRequest {
   grouping_levels?: DrillThroughFilter[];
@@ -200,7 +245,12 @@ export interface DrillJoinPathHop {
 }
 export interface DrillJoinPath {
   hops: DrillJoinPathHop[];
-  cardinality_hint: "many-to-one" | "one-to-many" | "mixed";
+  /**
+   * Read from each join's declared CARDINALITY, not its join type — those
+   * are separate properties. "mixed" also covers a path whose fan-out is
+   * undeclared on any hop.
+   */
+  cardinality_hint: "many-to-one" | "one-to-many" | "one-to-one" | "mixed";
 }
 export interface DrillJoinPathsResponse {
   paths: DrillJoinPath[];
@@ -223,6 +273,8 @@ export interface Persona {
   bypass_row_security: boolean;
   includes_hidden_columns: boolean;
   restricted_column_ids?: string[];
+  cls_blocked_measure_ids?: string[];
+  cls_blocked_dimension_ids?: string[];
   created_at: string;
   updated_at: string;
 }
@@ -237,6 +289,10 @@ export interface PersonaCreate {
   default_filters?: Record<string, unknown>;
   bypass_row_security?: boolean;
   includes_hidden_columns?: boolean;
+  // Bug-7051: persisted atomically with the persona row so create/update
+  // is a single request — no two-step call that can leave a persona
+  // without its intended restrictions.
+  restricted_tag_ids?: string[];
 }
 export interface PersonaUpdate {
   slug?: string;
@@ -249,6 +305,8 @@ export interface PersonaUpdate {
   default_filters?: Record<string, unknown>;
   bypass_row_security?: boolean;
   includes_hidden_columns?: boolean;
+  // Bug-7051: persisted atomically with the persona update.
+  restricted_tag_ids?: string[];
 }
 export interface PersonaResolution {
   persona_id: string;

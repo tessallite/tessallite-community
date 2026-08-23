@@ -147,6 +147,61 @@ def test_model_layer_has_only_use_listed_instruction():
     assert "model" in lower
 
 
+def test_model_layer_excludes_cross_model_measures_from_executable_lists():
+    from src.planning.measure_metadata import MeasureRoleMetadata
+    from src.prompt.assembler import _format_model_layer, _ModelProfile
+    from uuid import uuid4
+
+    profile = _ModelProfile(
+        id=uuid4(), slug="test", display_name="Test Model",
+        overview=None, analytical_capabilities=None,
+        abbreviation_conflict_rules=None, example_questions=[],
+        measure_names=["revenue"],
+        dimension_names=["region"],
+        filterable_where_names=["region", "revenue"],
+        sortable_names=["region", "revenue"],
+        aggregates_summary=[], calendar_aliases=[], dimension_aliases=[],
+        tagged_fields={}, dimension_value_hints={},
+        measure_metadata={
+            "revenue": MeasureRoleMetadata(name="revenue"),
+            "cross_model_margin": MeasureRoleMetadata(
+                name="cross_model_margin",
+                source_kind="cross_model",
+                cross_model_source_model_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                cross_model_source_measure_id="ffffffff-1111-2222-3333-444444444444",
+            ),
+        },
+    )
+
+    result = _format_model_layer([profile])
+
+    measure_line = [l for l in result.split("\n") if "Measures available:" in l][0]
+    filterable_line = [l for l in result.split("\n") if "Filterable where fields:" in l][0]
+    sortable_line = [l for l in result.split("\n") if "Sortable fields:" in l][0]
+    assert "cross_model_margin" not in measure_line
+    assert "cross_model_margin" not in filterable_line
+    assert "cross_model_margin" not in sortable_line
+    assert "Cross-model reference measures are not directly queryable" in result
+    assert "cross_model_margin" in result
+
+
+def test_measure_metadata_infers_cross_model_source_kind():
+    from src.planning.measure_metadata import MeasureRoleMetadata
+
+    metadata = MeasureRoleMetadata.from_mapping(
+        "cross_model_margin",
+        {
+            "cross_model_source_model_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "cross_model_source_measure_id": "ffffffff-1111-2222-3333-444444444444",
+        },
+    )
+
+    assert metadata.source_kind == "cross_model"
+    assert metadata.as_trace()["cross_model_source_model_id"] == (
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    )
+
+
 def test_make_tool_spec_no_chart_type_by_default():
     from src.tools.spec import make_tool_spec
     spec = make_tool_spec("none")
@@ -229,6 +284,13 @@ def test_model_layer_has_selection_rules():
     assert "glossary" in result.lower()
 
 
+def test_task_preamble_marks_grain_shorthand_as_source_fallback():
+    from src.prompt.assembler import _TASK_PREAMBLE
+
+    assert "Grain shorthand is a source-route fallback" in _TASK_PREAMBLE
+    assert "Pre-aggregated rollups" in _TASK_PREAMBLE
+
+
 # --- Glossary retrieval gate tests ---
 
 @pytest.mark.asyncio
@@ -252,12 +314,17 @@ async def test_glossary_retrieval_excludes_review_and_low_confidence():
     entries_result.scalars.return_value.all.return_value = [good_entry]
     syn_result = MagicMock()
     syn_result.scalars.return_value.all.return_value = []
-    db.execute = AsyncMock(side_effect=[entries_result, syn_result])
+    # Bug-7931 refactor — retrieval now also resolves the model slug (3rd query)
+    # so cards can be prefixed with the stable slug instead of the volatile UUID.
+    slug_result = MagicMock()
+    slug_result.all.return_value = [(mid, "sales-model")]
+    db.execute = AsyncMock(side_effect=[entries_result, syn_result, slug_result])
 
     cards = await retrieve_glossary_cards(db, [mid], "revenue")
     assert len(cards) == 1
     assert cards[0].term == "Revenue"
-    assert db.execute.call_count == 2
+    assert cards[0].model_slug == "sales-model"
+    assert db.execute.call_count == 3
 
     stmt = db.execute.call_args_list[0][0][0]
     compiled = str(stmt.compile(compile_kwargs={"literal_binds": True}))
@@ -286,7 +353,9 @@ async def test_glossary_retrieval_accepts_null_metadata_for_legacy_entries():
     entries_result.scalars.return_value.all.return_value = [legacy_entry]
     syn_result = MagicMock()
     syn_result.scalars.return_value.all.return_value = []
-    db.execute = AsyncMock(side_effect=[entries_result, syn_result])
+    slug_result = MagicMock()
+    slug_result.all.return_value = [(mid, "legacy-model")]
+    db.execute = AsyncMock(side_effect=[entries_result, syn_result, slug_result])
 
     cards = await retrieve_glossary_cards(db, [mid], "cost")
     assert len(cards) == 1

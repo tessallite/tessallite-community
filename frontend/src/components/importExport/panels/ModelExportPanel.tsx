@@ -29,7 +29,15 @@ export default function ModelExportPanel({ projectId, onDone }: Props) {
     mutationFn: (modelId: string) =>
       importExportApi.exportModel(projectId, modelId),
     onSuccess: (data) => {
-      const blob = new Blob([JSON.stringify(data.bundle, null, 2)], {
+      // Bug-6292: persist the authoritative connection stub list alongside the
+      // bundle so the import dialog rebinds against the real connection_type
+      // vocabulary instead of re-deriving it (lossily) from the snapshot's
+      // source_type/target_type.
+      const fileContent = {
+        ...data.bundle,
+        connections_required: data.connections_required,
+      };
+      const blob = new Blob([JSON.stringify(fileContent, null, 2)], {
         type: "application/json",
       });
       const url = URL.createObjectURL(blob);

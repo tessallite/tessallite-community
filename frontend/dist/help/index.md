@@ -17,6 +17,10 @@ This library documents Tessallite: what it is, how to connect BI tools, how to b
 
 Connects BI tools to Tessallite via JDBC, XMLA, or the headless API and queries deployed models. Start with [What is Tessallite](getting-started/what-is-tessallite.md), [Workspace Explorer](getting-started/workspace-explorer.md), and [Connect a BI tool](getting-started/connect-a-bi-tool.md).
 
+### End User
+
+Builds dashboards and reports from governed models — in Excel, Power BI, Tableau, or a Jupyter notebook — without touching SQL or the model itself. Start with [Choose Your Connection](analyst-guides/choosing-your-connection.md), then the walkthrough for your tool: [Excel](analyst-guides/build-your-first-excel-dashboard.md), [Power BI](analyst-guides/build-a-power-bi-report.md), [Tableau](analyst-guides/build-a-tableau-dashboard.md), or [Jupyter](analyst-guides/query-tessallite-from-jupyter.md).
+
 ### Modeller
 
 Builds and maintains semantic models: sources, joins, dimensions, measures, calendars, aggregates, pockets, security, lineage, and diagnostics. Start with [Projects and models](concepts/projects-and-models.md) and [Model canvas tour](modelling/model-canvas-tour.md).
@@ -45,6 +49,19 @@ Deploys and operates the Tessallite platform. Start with [Architecture overview]
 - [Connect Excel via XMLA](getting-started/connect-excel.md)
 - [Tessallite Features](getting-started/tessallite-features.md)
 
+## Analyst Guides
+
+End-to-end walkthroughs for the people who consume the models: building dashboards, reports, and analyses in the tools they already use.
+
+- [Choose Your Connection](analyst-guides/choosing-your-connection.md)
+- [Build Your First Excel Dashboard](analyst-guides/build-your-first-excel-dashboard.md)
+- [Build a Report with the Excel Add-in](analyst-guides/build-a-report-with-the-excel-add-in.md)
+- [Excel Formulas That Stay Live](analyst-guides/excel-formulas-that-stay-live.md)
+- [Build a Power BI Report](analyst-guides/build-a-power-bi-report.md)
+- [Build a Tableau Dashboard](analyst-guides/build-a-tableau-dashboard.md)
+- [Query Tessallite from a Jupyter Notebook](analyst-guides/query-tessallite-from-jupyter.md)
+- [Why Your Numbers Match](analyst-guides/why-your-numbers-match.md)
+
 ## Core Concepts
 
 - [Workspaces and Tenants](concepts/workspaces-and-tenants.md)
@@ -56,6 +73,7 @@ Deploys and operates the Tessallite platform. Start with [Architecture overview]
 - [Model Health](concepts/model-health.md)
 - [Roles and Permissions](concepts/roles-and-permissions.md)
 - [Calendar Types](concepts/calendar-types.md)
+- [KPIs (Key Performance Indicators)](concepts/kpis.md)
 
 ## Modelling
 
@@ -71,11 +89,16 @@ Deploys and operates the Tessallite platform. Start with [Architecture overview]
 - [Define Hierarchies](modelling/define-hierarchies.md)
 - [Define Dimensions](modelling/define-dimensions.md)
 - [Dimension Aliases](modelling/dimension-aliases.md)
+- [Dimension Attribute Relationships](modelling/dimension-attribute-relationships.md)
 - [Business Glossary](modelling/business-glossary.md)
 - [Define Measures](modelling/define-measures.md)
+- [Semi-Additive Measures](modelling/semi-additive-measures.md)
 - [Calculated Measures](modelling/calculated-measures.md)
+- [User-Defined Attributes](modelling/define-user-defined-attributes.md)
 - [Configure Time Variants](modelling/configure-time-variants.md)
+- [Understanding Window Functions](modelling/window-functions.md)
 - [Configure Calendar Table](modelling/configure-calendar-table.md)
+- [Fiscal and Retail Year Captions](modelling/configure-calendar-table.md#fiscal-and-retail-year-captions)
 - [Associate Calendar with Dimensions](modelling/associate-calendar-with-dimensions.md)
 - [Multi-Calendar Best Practices](modelling/multi-calendar-best-practices.md)
 - [Measure Query Panel](modelling/measure-query-panel.md)
@@ -101,8 +124,8 @@ Deploys and operates the Tessallite platform. Start with [Architecture overview]
 - [Configure Personas](modelling/configure-personas.md)
 - [Parameterized Filters](modelling/parameterized-filters.md)
 - [Data Quality Rules](modelling/data-quality-rules.md)
-- [Impact Analysis](modelling/impact-analysis.md)
-- [Named Lists](modelling/named-sets.md)
+- [Usage & Downstream Assets](modelling/usage-downstream-assets.md)
+- [Named Queries](modelling/named-queries.md) — MDX Named Sets, Tessallite Named Lists, and Named Queries
 - [KPIs](modelling/kpis.md)
 - [Data Preview](modelling/data-preview.md)
 - [Schema Changes](modelling/schema-changes.md)
@@ -113,6 +136,7 @@ Deploys and operates the Tessallite platform. Start with [Architecture overview]
 - [Export and Import a Model](modelling/export-and-import-a-model.md)
 - [Export and Import a Project](modelling/export-and-import-a-project.md)
 - [Import from dbt](modelling/import-from-dbt.md)
+- [Import from a Semantic Layer Tool](modelling/import-from-semantic-layer.md)
 - [Model Templates](modelling/model-templates.md)
 - [Model Translations (i18n)](modelling/model-translations.md)
 - [Model Details](modelling/model-details.md)
@@ -153,6 +177,8 @@ Deploys and operates the Tessallite platform. Start with [Architecture overview]
 - [Architecture Overview](system-admin/architecture-overview.md)
 - [Deploy Locally](system-admin/deploy-local.md)
 - [Deploy on GCP](system-admin/deploy-gcp.md)
+- [Deploy on Kubernetes](system-admin/deploy-kubernetes.md)
+- [Create a Tenant](system-admin/create-a-tenant.md)
 - [Configure Environment Variables](system-admin/configure-environment-variables.md)
 - [System Configuration](system-admin/system-configuration.md)
 - [Credentials and the .env File](system-admin/credentials-and-env.md)
@@ -166,10 +192,13 @@ Deploys and operates the Tessallite platform. Start with [Architecture overview]
 - [JDBC Connection Guide](integrations/jdbc-connection-guide.md)
 - [Looker Studio Direct Connection](integrations/looker-studio-connection-guide.md)
 - [Optional Looker-hosted LookML Workflow](integrations/looker-studio-via-looker-guide.md)
+- [Looker Cloud Core - Not Required](integrations/looker-cloud-core-connection-guide.md)
 - [LookML Emitter](integrations/lookml-emitter-guide.md)
 - [Excel XMLA Connection Guide](integrations/excel-xmla-connection-guide.md)
 - [Excel PivotTable Features](integrations/excel-pivottable-features.md)
 - [Tessallite Excel Add-in](integrations/excel-add-in.md)
+- [Named List MDX Composition](integrations/named-list-mdx-composition.md)
+- [Named List Parameterisation](integrations/named-list-parameterisation.md)
 - [Power BI Connection Guide](integrations/powerbi-connection-guide.md)
 - [BI Tool Compatibility Matrix](integrations/bi-compatibility.md)
 - [Supported Data Sources](integrations/supported-data-sources.md)
@@ -178,6 +207,7 @@ Deploys and operates the Tessallite platform. Start with [Architecture overview]
 - [Headless API](integrations/headless-api.md)
 - [Embed API](integrations/embed-api.md)
 - [Embed Agent Chat](integrations/embed-agent-chat.md)
+- [MCP Server (Model Context Protocol)](integrations/mcp-server.md)
 - [Solidatus Integration](integrations/solidatus-integration.md)
 - [Collibra Integration](integrations/collibra-integration.md)
 

@@ -8,9 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import httpx
+from shared.config.fastapi_drift import check_fastapi_version_drift
 
-from src.main import app
-from src.auth.middleware import CurrentUser, get_current_user
+check_fastapi_version_drift()
+
+from src.main import app  # noqa: E402
+from src.auth.middleware import CurrentUser, get_current_user  # noqa: E402
 
 
 TEST_TENANT = "test-tenant"

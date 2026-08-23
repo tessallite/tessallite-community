@@ -43,6 +43,7 @@ const PANEL_TITLE_KEYS: Partial<Record<PanelId, string>> = {
   "data-quality": "panels.dataQuality",
   "data-tags": "panels.dataTags",
   impact: "panels.impact",
+  "impact-analysis": "panels.impactAnalysis",
   "schema-changes": "panels.schemaChanges",
   "named-sets": "panels.namedSets",
   "saved-queries": "panels.savedQueries",
@@ -77,7 +78,8 @@ const PANEL_HELP_LINKS: Partial<Record<PanelId, string>> = {
   parameters: "/help/modelling/parameterized-filters.html",
   "data-quality": "/help/modelling/data-quality-rules.html",
   "data-tags": "/help/modelling/data-tags.html",
-  impact: "/help/modelling/impact-analysis.html",
+  impact: "/help/modelling/usage-downstream-assets.html",
+  "impact-analysis": "/help/concepts/query-routing.html",
   "schema-changes": "/help/modelling/schema-changes.html",
   "named-sets": "/help/modelling/named-sets.html",
   "saved-queries": "/help/modelling/query-panel.html",
@@ -162,7 +164,7 @@ export default function Drawer({ children }: Props) {
       PaperProps={{
         sx: {
           pointerEvents: "auto",
-          width: expanded ? "100%" : 820,
+          width: expanded ? "100%" : "min(820px, 100vw)",
         },
       }}
     >

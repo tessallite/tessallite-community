@@ -11,7 +11,7 @@ updated: 2026-04-27
 
 ## What this covers
 
-Every project in Tessallite carries its own configuration drawer — a right-hand pane with nine focused tabs covering connections, LLM provider configurations, and the seven groups that drive the conversational agent. This page explains how to open the drawer, which tab owns what, and the resolver chain that ties project settings to model overrides.
+Every project in Tessallite carries its own configuration drawer — a right-hand pane with focused tabs covering connections, LLM provider configurations, calendar labels, and the groups that drive the conversational agent. Tenant administrators also get the **Calendar labels** tab, where they select the tenant-wide fiscal/NRF `year_label` convention from the backend-advertised choices. Saving affects the next normal calendar rebuild; numeric year keys remain unchanged.
 
 ## Why the drawer
 

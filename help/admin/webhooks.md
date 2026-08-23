@@ -121,10 +121,10 @@ The *Admin > Webhooks* page provides:
 
 - **Endpoint list** — name, URL (domain only, path masked), subscribed event types, active/inactive toggle, and last delivery status.
 - **Active toggle** — disable an endpoint without deleting it. Disabled endpoints stop receiving deliveries immediately.
-- **Edit** — change the name, URL, or event filters.
+- **Edit** — change the name, URL, or event filters. **Changing the URL replaces the signing secret.** A secret is a key cut for one particular door: if the endpoint now points somewhere else, whoever runs the old address must not still be holding a working key. Tessallite therefore cuts a new one whenever you save a different URL — and shows it to you straight away, in the same one-time dialog you saw when you created the endpoint. Copy it before you close that dialog and give it to the new receiver: until the new receiver has it, it cannot verify the signature and will reject every delivery. If you close the dialog without copying the value, press **Rotate secret** to cut another one. Changing only the name or the event filters never touches the secret, and no dialog appears. Deliveries that were already waiting in the queue when you saved are not redirected: each one remembers the address it was queued for, so it still goes to the old receiver. The new address applies to events raised from now on.
 - **Delete** — permanently remove the endpoint and all its delivery history.
 - **Test delivery** — send a synthetic `webhook.test` event to verify connectivity and signature handling.
-- **Rotate secret** — generate a new signing secret. The old secret stops working immediately. Requires confirmation.
+- **Rotate secret** — generate a new signing secret. The old secret stops working immediately; the new secret is shown once so you can copy it to your receiving system.
 
 ### Delivery history
 

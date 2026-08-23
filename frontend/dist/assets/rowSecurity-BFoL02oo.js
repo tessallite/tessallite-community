@@ -1,0 +1,1 @@
+const _="__deny_all__";function l(r){const t=r==null?void 0:r.security_rules_applied;return Array.isArray(t)?t.filter(i=>typeof i=="string"&&i.length>0):[]}function u(r){return l(r).includes(_)}export{u as r};

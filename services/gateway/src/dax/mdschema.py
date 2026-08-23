@@ -13,14 +13,43 @@ from shared.config.bootstrap import system_snapshot_get
 from shared.schemas.measure_formats import format_token_to_mdx
 # Import branding constants from constants for Expert Directive 2.6
 from src.dax.constants import PROVIDER_VERSION, SERVER_NAME
+# Bug-6603: single source of the cube SHAPE (dimension -> hierarchy origin) and the
+# field-list grouping key (standalone dims -> one [Dimensions] group node).
+from src.dax.cube_model import (
+    HIERARCHY_GROUP_NAME,
+    HIERARCHY_GROUP_UNIQUE_NAME,
+    STANDALONE_GROUP_NAME,
+    STANDALONE_GROUP_UNIQUE_NAME,
+    dimension_unique_name_for,
+    hierarchy_origin_for,
+    is_grouped_hierarchy,
+    is_standalone_attribute,
+)
 from src.dax.member_uname import (
     ancestor_key_path_from_parent_chain,
     member_filter_matches,
     parse_member_uname,
     qualify_member_uname,
+    unescape_member_key,
 )
+# Bug-9178: Named Query ``@name`` relations are advertised in the XMLA table
+# rowsets (DBSCHEMA_TABLES / DBSCHEMA_COLUMNS) with the SAME column builder the
+# JDBC catalogue registration uses, so the two channels advertise identical
+# column metadata from the deployed snapshot's ``output_columns``.
+from src.router_client import build_named_query_relation_columns
 
 logger = logging.getLogger(__name__)
+
+
+def _escape_mdx_bracket(name: str) -> str:
+    """Escape ``]`` inside an MDX bracketed identifier by doubling it.
+
+    Bug-6717: MDX identifier escaping requires ``]`` inside ``[...]`` to be
+    doubled (``]]``). A measure name containing ``]`` produces a unique name
+    clients cannot round-trip without this escaping. Aligned with the
+    excel-plugin's ``escapeMdxBracketContent`` helper.
+    """
+    return name.replace("]", "]]")
 
 
 def _meta_created() -> str:
@@ -61,6 +90,7 @@ def build_discover_response(
     hierarchy_defs: list[dict[str, Any]] | None = None,  # kept for caller compat
     named_sets: list[dict[str, Any]] | None = None,
     kpis: list[dict[str, Any]] | None = None,
+    named_queries: list[dict[str, Any]] | None = None,
 ) -> str:
     rtype = request_type.upper()
 
@@ -70,7 +100,7 @@ def build_discover_response(
     rows = _get_rows(
         rtype, catalog_name, model_id, measures, dimensions, endpoint_url,
         properties or {}, restrictions or {}, tenant_models or [], member_data or {},
-        trust_meta or {}, named_sets or [], kpis or [],
+        trust_meta or {}, named_sets or [], kpis or [], named_queries or [],
     )
 
     col_defs = _ROWSETS[rtype]["columns"] if rtype in _ROWSETS else [{"name": k, "type": "string"} for k in (rows[0].keys() if rows else [])]
@@ -426,7 +456,7 @@ def _with_footer(description: str, footer: str) -> str:
     return f"{description}\n{footer}"
 
 
-def _get_rows(rtype, catalog, model_id, measures, dimensions, url, properties, restrictions, tenant_models, member_data, trust_meta, named_sets, kpis):
+def _get_rows(rtype, catalog, model_id, measures, dimensions, url, properties, restrictions, tenant_models, member_data, trust_meta, named_sets, kpis, named_queries):
     if rtype == "DISCOVER_DATASOURCES": return _rows_datasources(url)
     if rtype == "DISCOVER_PROPERTIES": return _rows_properties(restrictions, catalog)
     if rtype == "DISCOVER_LITERALS": return _rows_literals()
@@ -434,8 +464,8 @@ def _get_rows(rtype, catalog, model_id, measures, dimensions, url, properties, r
     if rtype == "MDSCHEMA_CUBES": return _rows_cubes(catalog, tenant_models)
     if rtype == "MDSCHEMA_DIMENSIONS": return _rows_dimensions(catalog, dimensions, member_data, trust_meta)
     if rtype == "MDSCHEMA_MEASURES": return _rows_measures(catalog, measures, trust_meta)
-    if rtype == "DBSCHEMA_TABLES": return _rows_tables(catalog, measures, dimensions, trust_meta)
-    if rtype == "DBSCHEMA_COLUMNS": return _rows_columns(catalog, measures, dimensions, trust_meta)
+    if rtype == "DBSCHEMA_TABLES": return _rows_tables(catalog, measures, dimensions, trust_meta, named_queries)
+    if rtype == "DBSCHEMA_COLUMNS": return _rows_columns(catalog, measures, dimensions, trust_meta, named_queries)
     if rtype == "MDSCHEMA_HIERARCHIES": return _rows_hierarchies(catalog, dimensions, measures, member_data, properties, trust_meta)
     if rtype == "MDSCHEMA_LEVELS": return _rows_levels(catalog, dimensions, member_data, trust_meta)
     if rtype == "MDSCHEMA_MEASUREGROUPS": return _rows_measuregroups(catalog, measures)
@@ -665,20 +695,88 @@ def _effective_hidden(obj: dict) -> bool:
 
 
 def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
-    """MDSCHEMA_DIMENSIONS — one row per non-hidden dimension + Measures.
+    """MDSCHEMA_DIMENSIONS — the field-list group nodes + Measures.
 
-    Phase 1 of the semantic-layer plan: emits the dimension's friendly
-    `display_name` as DIMENSION_CAPTION, the business `description` as
-    DIMENSION_DESCRIPTION, drops dimensions where the cascaded `is_hidden`
-    flag is true, and now correctly marks visible dimensions as visible
-    (the prior implementation hardcoded DIMENSION_IS_VISIBLE to "false").
-    Phase 5: every description is suffixed with the trust footer so
-    Excel tooltips surface freshness / source / owner inline.
+    Bug-6603 (field-list grouping): all STANDALONE attribute dimensions collapse
+    into ONE ``[Dimensions]`` group node (mirroring the excel-plugin's single
+    "Dimensions" section); each user/calendar hierarchy keeps its OWN node (its own
+    group, which preserves its per-dimension time typing); KPIs are their own group
+    natively via MDSCHEMA_KPIS. Grouping is by the DIMENSION_UNIQUE_NAME column only —
+    the individual attribute hierarchies still appear under the group (emitted by
+    ``_rows_hierarchies`` with the unchanged ``[Attr].[Attr]`` unique names), so a
+    standalone dimension is NOT flattened.
+
+    Phase 1: friendly ``display_name`` -> DIMENSION_CAPTION, business description ->
+    DESCRIPTION, cascaded hidden dims dropped, visible dims marked visible.
+    Phase 5: descriptions carry the trust footer.
     """
     rows = []
     footer = _build_trust_footer_xmla(trust_meta)
     visible_dims = [d for d in dims if not _effective_hidden(d)]
-    for i, d in enumerate(visible_dims):
+    standalone_dims = [d for d in visible_dims if is_standalone_attribute(d)]
+    hierarchy_dims = [d for d in visible_dims if not is_standalone_attribute(d)]
+    ordinal = 0
+
+    # One group node for every standalone attribute dimension.
+    if standalone_dims:
+        first_name = standalone_dims[0].get("name", "")
+        rows.append({
+            "CATALOG_NAME": catalog,
+            "SCHEMA_NAME": "",
+            "CUBE_NAME": catalog,
+            "DIMENSION_NAME": STANDALONE_GROUP_NAME,
+            "DIMENSION_UNIQUE_NAME": STANDALONE_GROUP_UNIQUE_NAME,
+            "DIMENSION_GUID": "00000000-0000-0000-0000-000000000000",
+            "DIMENSION_CAPTION": STANDALONE_GROUP_NAME,
+            "DIMENSION_ORDINAL": str(ordinal),
+            # Attributes are not a single time dimension -> 3 (other). Time typing
+            # lives on the calendar hierarchy nodes, which keep their own dimension.
+            "DIMENSION_TYPE": "3",
+            # Cardinality here is the count of grouped attribute hierarchies.
+            "DIMENSION_CARDINALITY": str(len(standalone_dims)),
+            "DEFAULT_HIERARCHY": f"[{_escape_mdx_bracket(first_name)}].[{_escape_mdx_bracket(first_name)}]",
+            "DESCRIPTION": _with_footer("", footer),
+            "IS_VIRTUAL": "false",
+            "IS_READWRITE": "false",
+            "DIMENSION_UNIQUE_SETTINGS": "1",
+            "DIMENSION_MASTER_NAME": STANDALONE_GROUP_NAME,
+            "DIMENSION_IS_VISIBLE": "true",
+        })
+        ordinal += 1
+
+    # Bug-6891: multi-level user/calendar hierarchies collapse into ONE
+    # [Hierarchies] group node; only flat time dimensions keep their own node
+    # (preserving their per-dimension time typing / Excel timeline).
+    grouped_hiers = [d for d in hierarchy_dims if is_grouped_hierarchy(d)]
+    own_node_dims = [d for d in hierarchy_dims if not is_grouped_hierarchy(d)]
+
+    if grouped_hiers:
+        first_hname = grouped_hiers[0].get("name", "")
+        rows.append({
+            "CATALOG_NAME": catalog,
+            "SCHEMA_NAME": "",
+            "CUBE_NAME": catalog,
+            "DIMENSION_NAME": HIERARCHY_GROUP_NAME,
+            "DIMENSION_UNIQUE_NAME": HIERARCHY_GROUP_UNIQUE_NAME,
+            "DIMENSION_GUID": "00000000-0000-0000-0000-000000000000",
+            "DIMENSION_CAPTION": HIERARCHY_GROUP_NAME,
+            "DIMENSION_ORDINAL": str(ordinal),
+            # Mixed content (time and non-time hierarchies) -> 3 (other); level
+            # time typing lives in MDSCHEMA_LEVELS.
+            "DIMENSION_TYPE": "3",
+            "DIMENSION_CARDINALITY": str(len(grouped_hiers)),
+            "DEFAULT_HIERARCHY": f"[{_escape_mdx_bracket(first_hname)}].[{_escape_mdx_bracket(first_hname)}]",
+            "DESCRIPTION": _with_footer("", footer),
+            "IS_VIRTUAL": "false",
+            "IS_READWRITE": "false",
+            "DIMENSION_UNIQUE_SETTINGS": "1",
+            "DIMENSION_MASTER_NAME": HIERARCHY_GROUP_NAME,
+            "DIMENSION_IS_VISIBLE": "true",
+        })
+        ordinal += 1
+
+    # Remaining dims (flat time dimensions) keep their own dimension node.
+    for d in own_node_dims:
         dname = d.get("name", "")
         caption = d.get("display_name") or dname
         description = _with_footer(
@@ -693,13 +791,13 @@ def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
             "SCHEMA_NAME": "",
             "CUBE_NAME": catalog,
             "DIMENSION_NAME": dname,
-            "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+            "DIMENSION_UNIQUE_NAME": dimension_unique_name_for(d),
             "DIMENSION_GUID": "00000000-0000-0000-0000-000000000000",
             "DIMENSION_CAPTION": caption,
-            "DIMENSION_ORDINAL": str(i),
+            "DIMENSION_ORDINAL": str(ordinal),
             "DIMENSION_TYPE": dim_type,
             "DIMENSION_CARDINALITY": card,
-            "DEFAULT_HIERARCHY": f"[{dname}].[{dname}]",
+            "DEFAULT_HIERARCHY": f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]",
             "DESCRIPTION": description,
             "IS_VIRTUAL": "false",
             "IS_READWRITE": "false",
@@ -707,6 +805,8 @@ def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
             "DIMENSION_MASTER_NAME": dname,
             "DIMENSION_IS_VISIBLE": "true",
         })
+        ordinal += 1
+
     # OlaPy also returns a [Measures] dimension
     rows.append({
         "CATALOG_NAME": catalog,
@@ -716,7 +816,7 @@ def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
         "DIMENSION_UNIQUE_NAME": "[Measures]",
         "DIMENSION_GUID": "00000000-0000-0000-0000-000000000000",
         "DIMENSION_CAPTION": "Measures",
-        "DIMENSION_ORDINAL": str(len(visible_dims)),
+        "DIMENSION_ORDINAL": str(ordinal),
         "DIMENSION_TYPE": "2",
         "DIMENSION_CARDINALITY": "0",
         "DEFAULT_HIERARCHY": "[Measures]",
@@ -763,13 +863,16 @@ def _rows_measures(catalog, measures, trust_meta=None):
         )
         folder = m.get("display_folder") or ""
         agg_code = _AGG_TO_XMLA.get((m.get("default_agg") or "sum").lower(), "1")
-        group_name = "default"
+        # Bug-6889: the measure group carries the cube (model) name, matching
+        # SSAS convention. A literal "default" surfaced as a meaningless
+        # folder over every measure in Excel's field list.
+        group_name = catalog
         rows.append({
             "CATALOG_NAME": catalog,
             "SCHEMA_NAME": "",
             "CUBE_NAME": catalog,
             "MEASURE_NAME": mname,
-            "MEASURE_UNIQUE_NAME": f"[Measures].[{mname}]",
+            "MEASURE_UNIQUE_NAME": f"[Measures].[{_escape_mdx_bracket(mname)}]",
             "MEASURE_CAPTION": caption,
             "MEASURE_GUID": "00000000-0000-0000-0000-000000000000",
             "MEASURE_AGGREGATOR": agg_code,
@@ -779,7 +882,11 @@ def _rows_measures(catalog, measures, trust_meta=None):
             "MEASURE_UNITS": "",
             "DESCRIPTION": description,
             "EXPRESSION": "",
-            "MEASURE_IS_VISIBLE": "true",
+            # Bug-6888: KPI goal support measures exist for member resolution
+            # only — invisible so they stay out of the visible field list.
+            "MEASURE_IS_VISIBLE": (
+                "false" if m.get("xmla_support_measure") else "true"
+            ),
             "LEVELS_LIST": "",
             "MEASURE_NAME_SQL_COLUMN_NAME": mname,
             "MEASURE_UNQUALIFIED_CAPTION": caption,
@@ -791,7 +898,7 @@ def _rows_measures(catalog, measures, trust_meta=None):
         })
     return rows
 
-def _rows_tables(catalog, measures, dimensions, trust_meta=None):
+def _rows_tables(catalog, measures, dimensions, trust_meta=None, named_queries=None):
     """
     DBSCHEMA_TABLES — Excel sends this after selecting a database to list
     available tables. In SSAS, each cube appears as a table. We return the
@@ -801,6 +908,16 @@ def _rows_tables(catalog, measures, dimensions, trust_meta=None):
     each row carries a DESCRIPTION populated from the dimension's business
     description.
     Phase 5: descriptions are suffixed with the trust footer.
+
+    Bug-9178: each deployed Named Query is advertised as a first-class
+    ``@name`` table (the same relation shape the JDBC catalogue registers),
+    so Excel / Power BI table enumeration can see and reference it. The
+    ``named_queries`` list is already persona-gated by the caller
+    (``_handle_discover`` suppresses Named Queries on any surface where the
+    persona narrows dimensions — Bug-9178 persona remediation), so this row
+    builder advertises exactly what the caller passes; persona allow-lists /
+    RLS / CLS on the Named Query's DATA are enforced by the query-router at
+    query time, unchanged.
     """
     name = catalog
     now = _meta_modified()
@@ -824,16 +941,49 @@ def _rows_tables(catalog, measures, dimensions, trust_meta=None):
                 footer,
             ),
         })
+    for nq in named_queries or []:
+        if not isinstance(nq, dict):
+            continue
+        nq_name = str(nq.get("name") or "").strip()
+        if not nq_name:
+            continue
+        rows.append({
+            "TABLE_CATALOG": name, "TABLE_NAME": f"@{nq_name}",
+            "TABLE_TYPE": "TABLE",
+            "DATE_CREATED": now, "DATE_MODIFIED": now,
+            "DESCRIPTION": _with_footer(
+                nq.get("description")
+                or f"Named Query @{nq_name} (deployed definition)",
+                footer,
+            ),
+        })
     return rows
 
 
-def _rows_columns(catalog, measures, dimensions, trust_meta=None):
+# Bug-9178: map the gateway catalogue data_type strings emitted by
+# ``build_named_query_relation_columns`` to OLE DB DATA_TYPE codes for the
+# DBSCHEMA_COLUMNS rowset. Codes match the sibling rows: measures -> 5
+# (DBTYPE_R8), dimensions -> 130 (DBTYPE_WSTR).
+_NQ_CATALOGUE_TO_OLE_DB_TYPE: dict[str, str] = {
+    "float8": "5",     # DBTYPE_R8
+    "bool": "11",      # DBTYPE_BOOL
+    "date": "7",       # DBTYPE_DATE
+    "timestamp": "135",  # DBTYPE_DBTIMESTAMP
+}
+
+
+def _rows_columns(catalog, measures, dimensions, trust_meta=None, named_queries=None):
     """DBSCHEMA_COLUMNS — columns within tables.
 
     Phase 1 of the semantic-layer plan: hidden measures and dimensions are
     skipped, and each column carries a DESCRIPTION populated from the
     semantic object's business description.
     Phase 5: descriptions are suffixed with the trust footer.
+
+    Bug-9178: Named Query ``@name`` tables advertise their deployed
+    ``output_columns`` (via ``build_named_query_relation_columns``, the same
+    builder the JDBC catalogue uses) so the two channels agree on column
+    names, ordinals and nullability.
     """
     name = catalog
     rows = []
@@ -864,6 +1014,35 @@ def _rows_columns(catalog, measures, dimensions, trust_meta=None):
             "IS_NULLABLE": "true", "DATA_TYPE": "130",
             "DESCRIPTION": d.get("effective_description") or d.get("description") or "",
         })
+    for nq in named_queries or []:
+        if not isinstance(nq, dict):
+            continue
+        nq_name = str(nq.get("name") or "").strip()
+        if not nq_name:
+            continue
+        rel = f"@{nq_name}"
+        for col in build_named_query_relation_columns(nq):
+            col_name = str(col.get("name") or "").strip()
+            if not col_name:
+                continue
+            data_type = _NQ_CATALOGUE_TO_OLE_DB_TYPE.get(
+                str(col.get("data_type") or "text"), "130",
+            )
+            row: dict[str, str] = {
+                "TABLE_CATALOG": name, "TABLE_NAME": rel,
+                "COLUMN_NAME": col_name,
+                "ORDINAL_POSITION": str(col.get("ordinal_position", 1)),
+                "IS_NULLABLE": "true" if col.get("is_nullable") else "false",
+                "DATA_TYPE": data_type,
+                "DESCRIPTION": _with_footer(
+                    str(col.get("description") or ""), footer,
+                ),
+            }
+            if data_type == "5":
+                # Mirror the measure rows' numeric precision/scale.
+                row["NUMERIC_PRECISION"] = "19"
+                row["NUMERIC_SCALE"] = "4"
+            rows.append(row)
     return rows
 
 
@@ -985,7 +1164,7 @@ def _rows_hierarchies(catalog, dimensions, measures=None, member_data=None, prop
         )
         folder = d.get("display_folder") or ""
         dim_data = member_data.get(dname, {})
-        hier = f"[{dname}].[{dname}]"
+        hier = f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]"
         members_by_level = _dimension_members_by_level(dim_data)
         # Count root-level members for cardinality when available.
         card = str(len(members_by_level.get(0, []))) if members_by_level.get(0) else "6"
@@ -995,7 +1174,10 @@ def _rows_hierarchies(catalog, dimensions, measures=None, member_data=None, prop
         dim_type = "1" if d.get("is_time_dim", False) else "3"
         row = {
             "CATALOG_NAME": name, "CUBE_NAME": name,
-            "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+            # Bug-6603: group column — standalone attrs share [Dimensions]; the
+            # HIERARCHY_UNIQUE_NAME below stays [dname].[dname] so Execute/member
+            # discovery are unaffected.
+            "DIMENSION_UNIQUE_NAME": dimension_unique_name_for(d),
             "HIERARCHY_NAME": dname,
             "HIERARCHY_UNIQUE_NAME": hier,
             "HIERARCHY_CAPTION": caption,
@@ -1011,7 +1193,11 @@ def _rows_hierarchies(catalog, dimensions, measures=None, member_data=None, prop
             "HIERARCHY_ORDINAL": "1",
             "DIMENSION_IS_SHARED": "true",
             "HIERARCHY_IS_VISIBLE": "true",
-            "HIERARCHY_ORIGIN": "1",
+            # Bug-6603: origin 1 (user-defined) only for multi-level model
+            # hierarchies; flat single-column dimensions are attribute
+            # hierarchies (origin 2) so Excel renders them as attribute fields,
+            # not spurious one-level "user hierarchies" (Fable symptom 1).
+            "HIERARCHY_ORIGIN": hierarchy_origin_for(d),
             "INSTANCE_SELECTION": "0",
             "HIERARCHY_DISPLAY_FOLDER": folder,
         }
@@ -1022,7 +1208,7 @@ def _rows_hierarchies(catalog, dimensions, measures=None, member_data=None, prop
     first_measure = ""
     if measures:
         first_measure = measures[0].get("name", "")
-    default_member = f"[Measures].[{first_measure}]" if first_measure else ""
+    default_member = f"[Measures].[{_escape_mdx_bracket(first_measure)}]" if first_measure else ""
     meas_row = {
         "CATALOG_NAME": name, "CUBE_NAME": name,
         "DIMENSION_UNIQUE_NAME": "[Measures]",
@@ -1062,6 +1248,55 @@ def _time_level_type(level_name: str) -> str:
     return _TIME_LEVEL_TYPES.get(level_name.lower(), "0")
 
 
+# Bug-6603: map a calendar level's authoritative ``time_unit`` (the model-service
+# ``HierarchyLevel.time_unit``) to the XMLA MDLEVEL_TYPE. Preferred over the
+# name heuristic so a calendar whose levels are renamed / localised still
+# time-types correctly. Values mirror ``_TIME_LEVEL_TYPES``.
+_TIME_UNIT_LEVEL_TYPES = {
+    "year": "20",
+    "half": "36", "half_year": "36", "semester": "36",
+    "quarter": "68",
+    "month": "132",
+    "week": "516",
+    "day": "1028",
+}
+
+
+def _level_time_type(level_name: str, time_unit: Any = None) -> str:
+    """MDLEVEL_TYPE for a time level: authoritative ``time_unit`` first, then
+    the level-name heuristic. ``hour``/``none``/unknown fall back to 0."""
+    if time_unit:
+        mapped = _TIME_UNIT_LEVEL_TYPES.get(str(time_unit).strip().lower())
+        if mapped:
+            return mapped
+    return _time_level_type(level_name)
+
+
+def _dimension_levels_detailed(dimension: dict, dim_data: dict | None = None) -> list[dict]:
+    """Ordered ``[{name, time_unit}]`` for a dimension's data levels (Bug-6603).
+
+    Mirrors :func:`_dimension_level_names` but preserves each level's
+    ``time_unit`` so time hierarchies emit the correct MDLEVEL_TYPE. Falls
+    back to a single self-named level (flat attribute dimension)."""
+    levels = dimension.get("levels") or (dim_data or {}).get("levels") or []
+    detailed: list[dict] = []
+    if levels:
+        if isinstance(levels[0], dict):
+            ordered = sorted(levels, key=lambda item: int(item.get("ordinal", 0)))
+            for item in ordered:
+                name = str(item.get("name", "")).strip()
+                if name:
+                    detailed.append({"name": name, "time_unit": item.get("time_unit")})
+        else:
+            for item in levels:
+                name = str(item).strip()
+                if name:
+                    detailed.append({"name": name, "time_unit": None})
+    if detailed:
+        return detailed
+    return [{"name": dimension.get("name", ""), "time_unit": None}]
+
+
 def _rows_levels(catalog, dimensions, member_data, trust_meta=None):
     """MDSCHEMA_LEVELS — levels per hierarchy + MeasuresLevel.
     Every hierarchy must have an (All) level at LEVEL_NUMBER=0 (LEVEL_TYPE=1)
@@ -1086,14 +1321,19 @@ def _rows_levels(catalog, dimensions, member_data, trust_meta=None):
         )
         dim_data = member_data.get(dname, {})
         members_by_level = _dimension_members_by_level(dim_data)
-        level_names = _dimension_level_names(d, dim_data)
-        hier = f"[{dname}].[{dname}]"
+        # Bug-6603: carry each level's time_unit so calendar levels type
+        # correctly even when the level names are not the canonical words.
+        level_details = _dimension_levels_detailed(d, dim_data)
+        hier = f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]"
+        # Bug-6603: group column (standalone attrs -> [Dimensions]); hierarchy/level
+        # unique names below are unchanged.
+        dim_uname = dimension_unique_name_for(d)
 
         # (All) level is always level 0 — MSOLAP requires it to match
         # the ALL_MEMBER / DEFAULT_MEMBER declared in MDSCHEMA_HIERARCHIES.
         rows.append({
             "CATALOG_NAME": name, "CUBE_NAME": name,
-            "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+            "DIMENSION_UNIQUE_NAME": dim_uname,
             "HIERARCHY_UNIQUE_NAME": hier,
             "LEVEL_NAME": "(All)",
             "LEVEL_UNIQUE_NAME": f"{hier}.[(All)]",
@@ -1112,18 +1352,19 @@ def _rows_levels(catalog, dimensions, member_data, trust_meta=None):
 
         # Regular hierarchy levels.
         is_time = d.get("is_time_dim", False)
-        for idx, level_name in enumerate(level_names):
+        for idx, level in enumerate(level_details):
+            level_name = level["name"]
             card = str(len(members_by_level.get(idx, [])))
             level_caption = caption if level_name == dname else level_name
             level_type = "0"
             if is_time:
-                level_type = _time_level_type(level_name)
+                level_type = _level_time_type(level_name, level.get("time_unit"))
             rows.append({
                 "CATALOG_NAME": name, "CUBE_NAME": name,
-                "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+                "DIMENSION_UNIQUE_NAME": dim_uname,
                 "HIERARCHY_UNIQUE_NAME": hier,
                 "LEVEL_NAME": level_name,
-                "LEVEL_UNIQUE_NAME": f"{hier}.[{level_name}]",
+                "LEVEL_UNIQUE_NAME": f"{hier}.[{_escape_mdx_bracket(level_name)}]",
                 "LEVEL_CAPTION": level_caption,
                 "LEVEL_NUMBER": str(idx + 1),
                 "LEVEL_CARDINALITY": card,
@@ -1199,7 +1440,7 @@ def _rows_members(
         if not level_filter or level_filter == "[Measures]":
             for m in measures:
                 mname = m.get("name", "")
-                uname = f"[Measures].[{mname}]"
+                uname = f"[Measures].[{_escape_mdx_bracket(mname)}]"
                 if member_filter and member_filter != uname:
                     # Measures don't have a parent-child tree — exact match only
                     continue
@@ -1212,7 +1453,7 @@ def _rows_members(
                     "LEVEL_NUMBER": "0",
                     "MEMBER_ORDINAL": "0",
                     "MEMBER_NAME": mname,
-                    "MEMBER_UNIQUE_NAME": f"[Measures].[{mname}]",
+                    "MEMBER_UNIQUE_NAME": uname,
                     "MEMBER_TYPE": "3",
                     "MEMBER_CAPTION": mname,
                     "CHILDREN_CARDINALITY": "0",
@@ -1225,9 +1466,18 @@ def _rows_members(
 
     # Dimension members from member_data (real database values)
     for d in dimensions:
+        # Bug-6603: hidden dims are absent from MDSCHEMA_DIMENSIONS, so they must not
+        # emit member rows keyed to a DIMENSION_UNIQUE_NAME (incl. the [Dimensions]
+        # group) that the DIMENSIONS rowset never advertised.
+        if _effective_hidden(d):
+            continue
         dname = d.get("name", "")
-        dim_uname = f"[{dname}]"
-        hier = f"[{dname}].[{dname}]"
+        # Bug-6603: DIMENSION_UNIQUE_NAME is the group column (standalone attrs ->
+        # [Dimensions]); the hierarchy uname stays [dname].[dname]. A client that
+        # restricts members by the group DIMENSION_UNIQUE_NAME keeps every standalone
+        # dimension in scope; per-hierarchy narrowing still comes from hier_filter.
+        dim_uname = dimension_unique_name_for(d)
+        hier = f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]"
 
         # Apply DIMENSION_UNIQUE_NAME restriction
         if dim_filter and dim_filter != dim_uname:
@@ -1271,7 +1521,7 @@ def _rows_members(
             rows.append({
                 "CATALOG_NAME": name,
                 "CUBE_NAME": name,
-                "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+                "DIMENSION_UNIQUE_NAME": dim_uname,
                 "HIERARCHY_UNIQUE_NAME": hier,
                 "LEVEL_UNIQUE_NAME": all_level_uname,
                 "LEVEL_NUMBER": "0",
@@ -1292,7 +1542,7 @@ def _rows_members(
             members = members_by_level.get(level_idx, [])
             if not members:
                 continue
-            level_uname = f"{hier}.[{level_name}]"
+            level_uname = f"{hier}.[{_escape_mdx_bracket(level_name)}]"
             # Bug-5431: parent(2)/siblings(4)/ancestors(32) also span levels other
             # than level_filter, so don't filter them out by level here.
             _cross_level_tree_op = bool(
@@ -1318,7 +1568,7 @@ def _rows_members(
                 )
                 mem_uname = (
                     qualify_member_uname(hier, level_name, mem_key_path)
-                    if is_multi_level else f"{hier}.[{mname}]"
+                    if is_multi_level else f"{hier}.[{_escape_mdx_bracket(mname)}]"
                 )
                 matches_self = member_filter_matches(
                     member_filter,
@@ -1410,11 +1660,11 @@ def _rows_members(
                     if level_idx == 0 or not parent_name:
                         parent_uname = all_member_uname
                     else:
-                        parent_uname = f"{hier}.[{parent_name}]"
+                        parent_uname = f"{hier}.[{_escape_mdx_bracket(parent_name)}]"
                 rows.append({
                     "CATALOG_NAME": name,
                     "CUBE_NAME": name,
-                    "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+                    "DIMENSION_UNIQUE_NAME": dim_uname,
                     "HIERARCHY_UNIQUE_NAME": hier,
                     "LEVEL_UNIQUE_NAME": level_uname,
                     "LEVEL_NUMBER": str(level_idx + 1),
@@ -1449,15 +1699,17 @@ def _level_for_member(
 
 
 def _rows_measuregroups(catalog: str, measures: list[dict]) -> list[dict]:
-    """MDSCHEMA_MEASUREGROUPS — all measures belong to the "default" group."""
+    """MDSCHEMA_MEASUREGROUPS — all measures belong to one group named after
+    the cube (model), matching SSAS convention (Bug-6889: a literal "default"
+    group surfaced as a meaningless folder over every measure in Excel)."""
     return [
         {
             "CATALOG_NAME": catalog,
             "CUBE_NAME": catalog,
-            "MEASUREGROUP_NAME": "default",
+            "MEASUREGROUP_NAME": catalog,
             "DESCRIPTION": "-",
             "IS_WRITE_ENABLED": "true",
-            "MEASUREGROUP_CAPTION": "default",
+            "MEASUREGROUP_CAPTION": catalog,
         }
     ]
 
@@ -1467,22 +1719,37 @@ def _rows_measuregroup_dimensions(
     dimensions: list[dict],
     measures: list[dict],
 ) -> list[dict]:
-    """MDSCHEMA_MEASUREGROUP_DIMENSIONS — every dimension belongs to "default"."""
-    rows: list[dict] = []
-    for d in dimensions:
-        dname = d.get("name", "")
+    """MDSCHEMA_MEASUREGROUP_DIMENSIONS — one row per dimension NODE in the
+    cube-named measure group (Bug-6889).
 
-        for gn in ["default"]:
+    Bug-6603: standalone attribute dims collapse into the single ``[Dimensions]``
+    group node, so this rowset emits ONE row for that group (not one per collapsed
+    attribute) plus one row per hierarchy node. Hidden dims are excluded so no row
+    dangles a DIMENSION_UNIQUE_NAME that MDSCHEMA_DIMENSIONS never emitted.
+    """
+    rows: list[dict] = []
+    seen_unames: set[str] = set()
+    for d in dimensions:
+        if _effective_hidden(d):
+            continue
+        dname = d.get("name", "")
+        dim_uname = dimension_unique_name_for(d)
+        if dim_uname in seen_unames:
+            continue
+        seen_unames.add(dim_uname)
+
+        for gn in [catalog]:  # Bug-6889: group is named after the cube
             rows.append({
                 "CATALOG_NAME": catalog,
                 "CUBE_NAME": catalog,
                 "MEASUREGROUP_NAME": gn,
                 "MEASUREGROUP_CARDINALITY": "ONE",
-                "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+                # Bug-6603: group column (standalone attrs -> [Dimensions]).
+                "DIMENSION_UNIQUE_NAME": dim_uname,
                 "DIMENSION_CARDINALITY": "MANY",
                 "DIMENSION_IS_VISIBLE": "true",
                 "DIMENSION_IS_FACT_DIMENSION": "false",
-                "DIMENSION_GRANULARITY": f"[{dname}].[{dname}]",
+                "DIMENSION_GRANULARITY": f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]",
             })
     return rows
 
@@ -1541,21 +1808,48 @@ def _rows_md_properties(
         rows: list[dict] = []
         target_dimensions = []
         for d in dimensions:
+            if _effective_hidden(d):
+                continue
             dname = d.get("name", "")
-            hier = f"[{dname}].[{dname}]"
+            hier = f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]"
             if hier_filter and hier_filter != hier:
                 continue
-            target_dimensions.append((dname, hier, _dimension_level_names(d)))
+            # Bug-6603: carry the group DIMENSION_UNIQUE_NAME (standalone attrs ->
+            # [Dimensions]); the hierarchy uname stays [dname].[dname].
+            target_dimensions.append(
+                (dimension_unique_name_for(d), hier, _dimension_level_names(d))
+            )
 
         if hier_filter and not target_dimensions:
-            dim_match = re.match(r"\[([^\]]+)\]\.\[([^\]]+)\]", hier_filter)
+            # Bug-6746: escape-aware bracket body so a hier_filter naming a
+            # ]-containing dimension parses whole.
+            dim_match = re.match(
+                r"\[((?:[^\]]|\]\])+)\]\.\[(?:[^\]]|\]\])+\]", hier_filter,
+            )
             if dim_match:
-                dname = dim_match.group(1)
-                target_dimensions.append((dname, hier_filter, [dname]))
+                # Raw name for the hidden-name comparison; keep the escaped body
+                # for re-emission.
+                dname_raw = unescape_member_key(dim_match.group(1))
+                dname_escaped = dim_match.group(1)
+                # A filter naming a HIDDEN dim must not resurrect it here: it is
+                # absent from MDSCHEMA_DIMENSIONS, so emitting property rows for it
+                # would dangle an unadvertised DIMENSION_UNIQUE_NAME (Bug-6603).
+                hidden_names = {
+                    d.get("name", "") for d in dimensions if _effective_hidden(d)
+                }
+                if dname_raw not in hidden_names:
+                    # Unknown dimension (not in our list) — fall back to the
+                    # hierarchy's own dimension bracket; grouping is unresolvable here.
+                    target_dimensions.append(
+                        (f"[{dname_escaped}]", hier_filter, [dname_raw])
+                    )
 
-        for dname, hier, level_names in target_dimensions:
+        for dim_uname, hier, level_names in target_dimensions:
             level_unames = [f"{hier}.[(All)]"]
-            level_unames.extend(f"{hier}.[{level_name}]" for level_name in level_names)
+            level_unames.extend(
+                f"{hier}.[{_escape_mdx_bracket(level_name)}]"
+                for level_name in level_names
+            )
             for level_uname in level_unames:
                 for prop_name, data_type in member_props:
                     if not _matches_name_filter(prop_name):
@@ -1563,7 +1857,7 @@ def _rows_md_properties(
                     rows.append({
                         "CATALOG_NAME": name,
                         "CUBE_NAME": name,
-                        "DIMENSION_UNIQUE_NAME": f"[{dname}]",
+                        "DIMENSION_UNIQUE_NAME": dim_uname,
                         "HIERARCHY_UNIQUE_NAME": hier,
                         "LEVEL_UNIQUE_NAME": level_uname,
                         "MEMBER_UNIQUE_NAME": "",
@@ -1627,15 +1921,32 @@ def build_execute_response(catalog_name: str, columns: list[dict[str, Any]], row
 def _rows_sets(catalog: str, named_sets: list[dict[str, Any]]) -> list[dict[str, str]]:
     rows = []
     for ns in named_sets:
+        # Bug-7925: sql_fixed named lists carry no MDX expression and
+        # _inline_named_sets unconditionally skips them at execution time
+        # (xmla_server.py:5215-5231).  Advertising them in MDSCHEMA_SETS
+        # causes Excel to show a set that produces empty axes when used.
+        # Filter them here at the discovery boundary so only MDX-executable
+        # sets appear in the XMLA catalogue; sql_fixed lists remain
+        # available through JDBC / REST / SQL authoring surfaces.
+        if ns.get("list_type") == "sql_fixed":
+            continue
+
         # F-018-13: deprecated sets are already filtered out at the gateway
         # client (router_client.get_model_named_sets). Surface the governance
         # state for the rest so BI users can tell a certified set from a draft:
         # certified/shared sets carry a "[Certified]" marker in the description.
+        # Bug-6264 (authority: model-service named_sets.py:238-241): "shared" is
+        # a certified-EQUIVALENT, admin-only status that must render the marker;
+        # the gateway consumer MUST match the authority or the XMLA catalogue
+        # desyncs from the model-service governance state.
         description = ns.get("description", "") or ""
         status = ns.get("certification_status")
         if status in ("certified", "shared"):
             marker = "[Certified] "
             description = (marker + description).strip()
+        description = _with_footer(
+            description, _build_trust_footer_xmla(ns.get("trust_meta")),
+        )
         rows.append({
             "CATALOG_NAME": catalog,
             "SCHEMA_NAME": "",
@@ -1653,125 +1964,255 @@ def _rows_sets(catalog: str, named_sets: list[dict[str, Any]]) -> list[dict[str,
 
 
 # ---------------------------------------------------------------------------
-# KPI status expression builder (Bug-5254)
+# KPI band annotation (Bug-6608)
 # ---------------------------------------------------------------------------
 
-# Known RAG colours — kept in sync with model-service kpi_threshold.py.
-_BAD_BAND_COLORS = {"#d32f2f", "#757575"}
-_WARN_BAND_COLORS = {"#f57c00", "#e65100", "#9e9e9e"}
-_GOOD_BAND_COLORS = {"#388e3c", "#1565c0", "#0d47a1"}
 
+def _build_kpi_band_annotation(kpi: dict[str, Any]) -> str:
+    """Human-readable band context published on MDSCHEMA_KPIS (informational).
 
-def _band_status_from_color(color: str) -> int | None:
-    """Map a band colour to RAG status (1 / 0 / -1), or None."""
-    c = (color or "").strip().lower()
-    if c in _BAD_BAND_COLORS:
-        return -1
-    if c in _WARN_BAND_COLORS:
-        return 0
-    if c in _GOOD_BAND_COLORS:
-        return 1
-    return None
+    Bug-6608 (un-gated 2026-07-21): the KPI status is now the governed −1/0/1 RAG
+    verdict served by the single model-service authority, and Excel renders the
+    traffic-light graphic over it natively — no "colour it yourself" instruction is
+    needed. This annotation is now purely informational metadata: it summarises the
+    KPI's direction, evaluation type, and bands so a client that surfaces
+    ANNOTATIONS / KPI_DESCRIPTION can show what the verdict is based on. Returns ""
+    when the KPI defines no usable band context or carries an authored status
+    expression (whose verdict is self-describing).
 
-
-def _band_status_from_position(index: int, total: int) -> int:
-    """Positional convention: first = worst (-1), last = best (1)."""
-    if total <= 1:
-        return 0
-    if index == 0:
-        return -1
-    if index == total - 1:
-        return 1
-    return 0
-
-
-def _build_kpi_status_expression(
-    kpi_value: str,
-    kpi_goal: str,
-    bands: list[dict[str, Any]] | None,
-    *,
-    direction: str = "higher_is_better",
-    evaluation_type: str = "percentage_of_target",
-) -> str:
-    """Build an MDX CASE expression that maps a KPI value to -1/0/1.
-
-    Bug-5254: when ``presentation_meta.bands`` are present, the
-    expression uses the band boundaries and colours to derive the
-    correct status rather than hard-coding 90 %/110 % thresholds.
-    When bands are absent, a direction-based heuristic is used as
-    the fallback.
+    Whether a BI client surfaces MDSCHEMA_KPIS ANNOTATIONS / KPI_DESCRIPTION is
+    client-dependent — this is a best-effort metadata channel, not a guaranteed
+    on-screen hint.
     """
-    if not bands or len(bands) < 2:
-        # Fallback: direction-based heuristic (pre-Bug-5254 behaviour
-        # but still correct for KPIs that lack explicit bands).
-        if direction == "lower_is_better":
-            return (
-                f"CASE WHEN {kpi_value} <= {kpi_goal} THEN 1 "
-                f"WHEN {kpi_value} <= {kpi_goal} * 1.1 THEN 0 ELSE -1 END"
-            )
-        return (
-            f"CASE WHEN {kpi_value} >= {kpi_goal} THEN 1 "
-            f"WHEN {kpi_value} >= {kpi_goal} * 0.9 THEN 0 ELSE -1 END"
-        )
+    if str(kpi.get("status_expression") or "").strip():
+        return ""
 
-    # Derive status per band: for absolute_value / absolute_variance /
-    # percentage_variance, colour carries intent; for ratio-based types,
-    # position carries intent (first = worst, last = best).
-    use_color = evaluation_type in (
-        "absolute_value", "absolute_variance", "percentage_variance",
+    pmeta = kpi.get("presentation_meta") or {}
+    bands = pmeta.get("bands")
+    band_dicts = (
+        [b for b in bands if isinstance(b, dict)] if isinstance(bands, list) else []
     )
-    statuses: list[int] = []
-    for i, b in enumerate(bands):
-        if use_color:
-            s = _band_status_from_color(b.get("color", ""))
-            if s is None:
-                s = _band_status_from_position(i, len(bands))
-            statuses.append(s)
+    direction = str(kpi.get("direction") or "").strip()
+    if not band_dicts and not direction:
+        return ""
+
+    parts: list[str] = []
+    if direction:
+        parts.append(f"direction: {direction.replace('_', ' ')}")
+    evaluation_type = str(pmeta.get("evaluation_type") or "").strip()
+    if evaluation_type:
+        parts.append(f"evaluation: {evaluation_type.replace('_', ' ')}")
+
+    band_summaries: list[str] = []
+    for b in band_dicts:
+        lo = b.get("min")
+        hi = b.get("max")
+        label = str(b.get("label") or b.get("color") or "").strip()
+        if lo is None and hi is None:
+            rng = "any"
+        elif lo is None:
+            rng = f"< {hi}"
+        elif hi is None:
+            rng = f">= {lo}"
         else:
-            statuses.append(_band_status_from_position(i, len(bands)))
+            rng = f"{lo} to {hi}"
+        band_summaries.append(f"{rng}: {label}" if label else rng)
 
-    # For absolute_value evaluation, the MDX expression compares the KPI
-    # value directly against band boundaries. For ratio-based evaluation,
-    # it compares value/goal (as a percentage of target).
-    if evaluation_type == "absolute_value":
-        val_expr = kpi_value
-    else:
-        # percentage_of_target: ratio = value / goal * 100
-        val_expr = f"({kpi_value} / {kpi_goal} * 100)"
+    text = "KPI status is the governed traffic-light verdict."
+    if parts:
+        text += " Based on — " + "; ".join(parts) + "."
+    if band_summaries:
+        text += " Bands: " + "; ".join(band_summaries) + "."
+    return text
 
-    # Build a CASE WHEN chain from the bands. Bands are ordered by
-    # ascending min so we test them in order, matching [min, max).
-    clauses: list[str] = []
-    for i, b in enumerate(bands):
-        b_min = b.get("min")
-        b_max = b.get("max")
-        status = statuses[i]
-        if b_min is None and b_max is None:
-            # Catch-all band — will be the ELSE
+
+def resolve_kpi_goal_mdx(
+    kpi: dict[str, Any],
+    measure_map: dict[str, dict[str, Any]],
+) -> str:
+    """Resolve a KPI's goal/target to an EXECUTABLE MDX scalar, or ``""``.
+
+    Single source of truth (used by MDSCHEMA_KPIS ``KPI_GOAL`` and the
+    ``KPIGoal`` member-property path) so the two never drift.
+
+    Bug-6259: a ``measure`` target is identified by ``target_measure_id`` and
+    must render as ``[Measures].[<name>]``. The previous code read the (empty)
+    ``target_expression`` for measure targets, producing an empty or
+    non-executable goal. An ``expression`` (and ``prior_period``) target holds a
+    Tessallite DSL string that is NOT executable MDX — emitting it verbatim
+    advertised non-executable content to BI clients, so it is suppressed here.
+    An empty goal then correctly skips status-expression construction
+    (Bug-5695: no malformed CASE built against a blank goal).
+    """
+    target_type = kpi.get("target_type") or ""
+    target_value = kpi.get("target_value")
+
+    if target_type == "static" and target_value is not None:
+        return str(target_value)
+
+    if target_type == "measure":
+        m = measure_map.get(str(kpi.get("target_measure_id", "")), {})
+        name = (m.get("name", "") if m else "") or ""
+        return f"[Measures].[{_escape_mdx_bracket(name)}]" if name else ""
+
+    if target_type in ("expression", "prior_period"):
+        # Tessallite DSL, not executable MDX -> do not advertise a goal.
+        return ""
+
+    # Legacy path: reference the goal measure by id.
+    goal_m = measure_map.get(str(kpi.get("goal_measure_id", "")), {})
+    name = (goal_m.get("name", "") if goal_m else "") or ""
+    return f"[Measures].[{_escape_mdx_bracket(name)}]" if name else ""
+
+
+def kpi_goal_support_measure_name(kpi: dict[str, Any]) -> str:
+    """Name of the synthetic goal support measure for *kpi* (SSAS convention:
+    ``<KPI caption> Goal``), or "" when the KPI has no caption."""
+    base = kpi.get("display_name") or kpi.get("name", "") or ""
+    return f"{base} Goal" if base else ""
+
+
+def kpi_goal_needs_support_measure(kpi: dict[str, Any], measure_map: dict[str, dict[str, Any]]) -> bool:
+    """True when the KPI's goal resolves to a bare scalar (static target).
+
+    Bug-6888: Excel can only add pivot fields that are real members. A static
+    target rendered as a bare literal in ``KPI_GOAL`` (e.g. ``188914000.0``)
+    gave Excel nothing addable, so the KPI's Target checkbox was unusable. A
+    measure-typed goal already resolves to ``[Measures].[...]`` and needs no
+    synthetic member.
+    """
+    goal = resolve_kpi_goal_mdx(kpi, measure_map)
+    return bool(goal) and not goal.startswith("[Measures].")
+
+
+def kpi_goal_static_value(kpi: dict[str, Any], measure_map: dict[str, dict[str, Any]]) -> str:
+    """The scalar goal value for a static-target KPI (as emitted string)."""
+    goal = resolve_kpi_goal_mdx(kpi, measure_map)
+    return "" if goal.startswith("[Measures].") else goal
+
+
+def kpi_goal_synthetic_measures(
+    kpis: list[dict[str, Any]], measures: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hidden support-measure dicts for static-goal KPIs (Bug-6888).
+
+    Emitted into MDSCHEMA_MEASURES (with ``MEASURE_IS_VISIBLE=false`` via the
+    ``xmla_support_measure`` marker) so the ``[Measures].[<KPI> Goal]`` member
+    advertised in MDSCHEMA_KPIS exists as a resolvable measure for BI clients,
+    without cluttering the visible field list.
+    """
+    measure_map = {str(m.get("id", "")): m for m in measures}
+    # Bug-6942: skip any synthetic name that collides with a real measure.
+    real_names = {(m.get("name") or "").lower() for m in measures if m.get("name")}
+    out: list[dict[str, Any]] = []
+    for kpi in kpis:
+        if not kpi_goal_needs_support_measure(kpi, measure_map):
             continue
-        if b_min is None:
-            clauses.append(f"WHEN {val_expr} < {b_max} THEN {status}")
-        elif b_max is None:
-            clauses.append(f"WHEN {val_expr} >= {b_min} THEN {status}")
-        else:
-            clauses.append(
-                f"WHEN {val_expr} >= {b_min} AND {val_expr} < {b_max} "
-                f"THEN {status}"
+        name = kpi_goal_support_measure_name(kpi)
+        if not name:
+            continue
+        if name.lower() in real_names:
+            logger.warning(
+                "Bug-6942: skipping synthetic KPI goal measure %r -- "
+                "collides with a real measure of the same name.",
+                name,
             )
+            continue
+        out.append({
+            "name": name,
+            "display_name": name,
+            "description": f"Target for KPI {kpi.get('display_name') or kpi.get('name', '')}.",
+            "display_folder": "",
+            "default_agg": "max",
+            "is_hidden": False,
+            "xmla_support_measure": True,
+        })
+    return out
 
-    # Find the catch-all (open-ended) band for the ELSE clause, or
-    # default to 0 (warning).
-    catch_all_status = 0
-    for i, b in enumerate(bands):
-        if b.get("min") is None and b.get("max") is None:
-            catch_all_status = statuses[i]
-            break
 
-    if not clauses:
-        # Degenerate: all bands are catch-all. Return a constant.
-        return str(catch_all_status)
+def kpi_status_support_measure_name(kpi: dict[str, Any]) -> str:
+    """Name of the synthetic governed-status support member for *kpi* (SSAS
+    convention: ``<KPI caption> Status``), or "" when the KPI has no caption."""
+    base = kpi.get("display_name") or kpi.get("name", "") or ""
+    return f"{base} Status" if base else ""
 
-    return f"CASE {' '.join(clauses)} ELSE {catch_all_status} END"
+
+def kpi_status_needs_support_measure(
+    kpi: dict[str, Any], measures: list[dict[str, Any]],
+) -> bool:
+    """True when a synthetic governed-status member should be advertised for *kpi*.
+
+    Bug-8288: a native Excel pivot "Status" checkbox binds the MDSCHEMA_KPIS
+    ``KPI_STATUS`` member DIRECTLY — its MDX carries no ``KPIStatus()`` token, so it
+    bypasses the governed member-function interception and, when that member is the
+    raw VALUE member, the pivot shows the raw business number instead of the
+    governed −1/0/1 verdict. A synthetic ``[Measures].[<caption> Status]`` support
+    member (Bug-6888 goal pattern) whose Execute resolves through the governed
+    authority (``evaluate_kpi_governed``) fixes that. Advertise it only when:
+
+      * the KPI has NO authored ``status_expression`` (an authored expression is
+        already a real, addressable verdict member — keep serving it verbatim), AND
+      * the KPI has a resolvable value member (a hidden-backed / unresolved value
+        advertises no status member either), AND
+      * the KPI has a verdict BASIS — a resolvable target/goal or presentation
+        bands. Without a basis the governed status is always None (no verdict), so
+        advertising a status member + graphic would be misleading noise; such a KPI
+        keeps the raw value member (and no graphic), exactly as before.
+    """
+    if (kpi.get("status_expression") or ""):
+        return False
+    measure_map = {str(m.get("id", "")): m for m in measures}
+    from src.dax.mdx_execute import resolve_kpi_property_expr
+    try:
+        if not resolve_kpi_property_expr(kpi, "KPIValue", measures):
+            return False
+    except ValueError:
+        return False
+    has_goal = bool(resolve_kpi_goal_mdx(kpi, measure_map))
+    bands = (kpi.get("presentation_meta") or {}).get("bands") or []
+    return has_goal or bool(bands)
+
+
+def kpi_status_synthetic_measures(
+    kpis: list[dict[str, Any]], measures: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hidden support-measure dicts for governed-status KPIs (Bug-8288).
+
+    Mirrors ``kpi_goal_synthetic_measures``: the ``[Measures].[<caption> Status]``
+    member advertised in MDSCHEMA_KPIS must exist as a resolvable (hidden) measure
+    row so a BI client can bind it; the XMLA Execute path resolves it to the
+    governed −1/0/1 verdict through ``evaluate_kpi_governed`` (never a SQL column).
+    A synthetic name that collides with a real measure is skipped (Bug-6942 parity)
+    so the real measure's value is never hijacked.
+    """
+    real_names = {(m.get("name") or "").lower() for m in measures if m.get("name")}
+    out: list[dict[str, Any]] = []
+    for kpi in kpis:
+        if not kpi_status_needs_support_measure(kpi, measures):
+            continue
+        name = kpi_status_support_measure_name(kpi)
+        if not name:
+            continue
+        if name.lower() in real_names:
+            logger.warning(
+                "Bug-8288: skipping synthetic KPI status measure %r -- "
+                "collides with a real measure of the same name.",
+                name,
+            )
+            continue
+        out.append({
+            "name": name,
+            "display_name": name,
+            "description": (
+                f"Governed RAG status for KPI "
+                f"{kpi.get('display_name') or kpi.get('name', '')}."
+            ),
+            "display_folder": "",
+            "default_agg": "max",
+            "is_hidden": False,
+            "xmla_support_measure": True,
+        })
+    return out
 
 
 def _rows_kpis(
@@ -1787,35 +2228,41 @@ def _rows_kpis(
     measure_map = {str(m.get("id", "")): m for m in measures}
     # Build KPI name lookup for parent references
     kpi_name_map = {str(k.get("id", "")): k.get("name", "") for k in kpis}
+    # Bug-6702: resolve KPI_VALUE through the SAME resolver the XMLA Execute path
+    # uses (resolve_kpi_property_expr), against the SAME executable `measures`
+    # set, so the advertised member and the Execute measure set can never
+    # disagree. Imported lazily to avoid a module-load import cycle with
+    # mdx_execute (which already imports resolve_kpi_goal_mdx from this module).
+    from src.dax.mdx_execute import resolve_kpi_property_expr
+
+    def _executable_kpi_value(kpi: dict[str, Any]) -> str:
+        # value_measure_id -> [Measures].[<measure>]; a single-measure v2
+        # expression (measure("X")) -> [Measures].[X]; anything else -> "".
+        # The old F-017-23 synthetic `[Measures].[[KPI] <name>]` inline column is
+        # NEVER present in the XMLA measure set (get_model_measures does not inject
+        # it — inline columns are a JDBC-catalogue-only construct), so Execute
+        # refused it with "Measure not available to this persona: [KPI ...".
+        try:
+            return resolve_kpi_property_expr(kpi, "KPIValue", measures) or ""
+        except ValueError:
+            return ""
+
     rows = []
     for kpi in kpis:
         kpi_name = kpi.get("name", "")
-        # v2 expression path
-        expression = kpi.get("expression") or ""
-        if expression:
-            # F-017-23: emit a real MDX member reference, not the Tessallite DSL
-            # string. Tessallite exposes each KPI as a queryable measure column
-            # named "[KPI] <name>" (inline KPI columns / $KPIs), so the member
-            # path is [Measures].[[KPI] <name>]. Excel KPI consumers can resolve
-            # this; the raw DSL string was non-executable decorative metadata.
-            kpi_value = f"[Measures].[[KPI] {kpi_name}]" if kpi_name else ""
-        else:
-            # Legacy path: reference value measure
-            value_m = measure_map.get(str(kpi.get("value_measure_id", "")), {})
-            kpi_value = f"[Measures].[{value_m.get('name', '')}]" if value_m else ""
+        kpi_value = _executable_kpi_value(kpi)
 
-        # Goal / target
-        target_type = kpi.get("target_type") or ""
-        target_value = kpi.get("target_value")
-        if target_type == "static" and target_value is not None:
-            kpi_goal = str(target_value)
-        elif target_type in ("measure", "expression"):
-            target_expr = kpi.get("target_expression") or ""
-            kpi_goal = target_expr if target_expr else ""
-        else:
-            # Legacy path: reference goal measure
-            goal_m = measure_map.get(str(kpi.get("goal_measure_id", "")), {})
-            kpi_goal = f"[Measures].[{goal_m.get('name', '')}]" if goal_m else ""
+        # Goal / target (Bug-6259/Bug-5695): resolve to executable MDX or "".
+        kpi_goal = resolve_kpi_goal_mdx(kpi, measure_map)
+        # Bug-6888: a static target resolves to a bare scalar, which is not a
+        # member and therefore not addable from Excel's KPI field list. Emit
+        # the synthetic goal support member instead; the Execute path resolves
+        # it to the constant, and MDSCHEMA_MEASURES carries a matching hidden
+        # support-measure row (kpi_goal_synthetic_measures).
+        if kpi_goal and not kpi_goal.startswith("[Measures]."):
+            support_name = kpi_goal_support_measure_name(kpi)
+            if support_name:
+                kpi_goal = f"[Measures].[{_escape_mdx_bracket(support_name)}]"
 
         # Composite parent reference
         parent_id = kpi.get("parent_kpi_id")
@@ -1837,35 +2284,74 @@ def _rows_kpis(
             "bullet_chart": "Gauge",
             "rag_bar": "Shapes",
         }
-        status_graphic = status_graphic_map.get(ptype, "Traffic Light")
         trend_graphic = "Standard Arrow"
 
-        # F-017-23 + Bug-5254: build a direction-aware MDX status CASE
-        # expression from the KPI's v2 threshold bands (stored in
-        # ``presentation_meta.bands``). Falls back to the stored legacy
-        # expression when present, or to a direction-based heuristic when
-        # no bands are defined.
+        # Bug-6608 (un-gated 2026-07-21): the KPI live status path now serves the
+        # governed −1/0/1 RAG verdict from the SINGLE model-service authority
+        # (`kpi_threshold.evaluate_threshold`, same as the SPA scorecard and the
+        # Excel custom function). The status is a real verdict again, so KPI_STATUS
+        # advertises an addressable member (authored status expression when present,
+        # else the value member) AND the status graphic is restored — the
+        # report-builder traffic-light iconSet (calibrated for the −1/0/1 domain,
+        # useExcel.ts `kpiIconCriteria`) resolves the governed status cell.
         legacy_status = kpi.get("status_expression") or ""
         legacy_trend = kpi.get("trend_expression") or ""
-        kpi_status = legacy_status
+        # Bug-8288: with no authored status, advertise the synthetic governed
+        # status support member ([Measures].[<caption> Status]) rather than the raw
+        # value member, so a native pivot "Status" checkbox binds a member that the
+        # Execute path resolves to the governed −1/0/1 verdict. Falls back to the
+        # value member only when no support member can be built (name collision,
+        # unresolved value). ``kpi_status_synthetic_measures`` emits the matching
+        # hidden measure row into MDSCHEMA_MEASURES using the SAME predicate, so the
+        # advertised member always exists as a resolvable measure.
+        _status_support = kpi_status_support_measure_name(kpi)
+        _real_lower = {(m.get("name") or "").lower() for m in measures if m.get("name")}
+        use_synthetic_status = (
+            not legacy_status
+            and bool(_status_support)
+            and kpi_status_needs_support_measure(kpi, measures)
+            and _status_support.lower() not in _real_lower
+        )
+        if legacy_status:
+            kpi_status = legacy_status
+        elif use_synthetic_status:
+            kpi_status = f"[Measures].[{_escape_mdx_bracket(_status_support)}]"
+        else:
+            kpi_status = kpi_value
         kpi_trend = legacy_trend
-        if not legacy_status and kpi_value and kpi_goal:
-            pmeta = kpi.get("presentation_meta") or {}
-            bands = pmeta.get("bands")
-            kpi_status = _build_kpi_status_expression(
-                kpi_value, kpi_goal, bands,
-                direction=kpi.get("direction") or "higher_is_better",
-                evaluation_type=pmeta.get("evaluation_type") or "percentage_of_target",
+        band_annotation = _build_kpi_band_annotation(kpi)
+
+        # Bug-8288 (was Bug-6608 un-gated / Fable R1 finding 1): MDSCHEMA_KPIS
+        # KPI_STATUS is an ADDRESSABLE member a native OLAP client (Excel PivotTable
+        # "Status" checkbox) binds DIRECTLY — its MDX carries no KPIStatus() token.
+        # Previously that member was the raw VALUE member, so the graphic was KEPT
+        # SUPPRESSED: a traffic-light icon over a raw business value would clamp a
+        # business number onto the -1/0/1 icon domain (a "misleading verdict by
+        # another name"). Now the member is the synthetic governed status member
+        # (``[Measures].[<caption> Status]``), which the Execute path resolves to the
+        # governed −1/0/1 verdict — a real verdict domain — so the graphic is
+        # advertised again. It stays suppressed only when the status falls back to
+        # the raw value member (no governed member could be built).
+        status_graphic = (
+            status_graphic_map.get(ptype, "Traffic Light")
+            if (legacy_status or use_synthetic_status) else ""
+        )
+
+        kpi_description = kpi.get("description", "") or ""
+        if band_annotation:
+            kpi_description = (
+                f"{kpi_description}\n{band_annotation}" if kpi_description
+                else band_annotation
             )
 
         rows.append({
             "CATALOG_NAME": catalog,
             "SCHEMA_NAME": "",
             "CUBE_NAME": catalog,
-            "MEASUREGROUP_NAME": "default",
+            "MEASUREGROUP_NAME": catalog,  # Bug-6889: group named after the cube
             "KPI_NAME": kpi.get("name", ""),
             "KPI_CAPTION": kpi.get("display_name") or kpi.get("name", ""),
-            "KPI_DESCRIPTION": kpi.get("description", ""),
+            "KPI_DESCRIPTION": kpi_description,
             "KPI_DISPLAY_FOLDER": kpi.get("display_folder", ""),
             "KPI_VALUE": kpi_value,
             "KPI_GOAL": kpi_goal,
@@ -1876,9 +2362,9 @@ def _rows_kpis(
             "KPI_WEIGHT": str(kpi.get("weight", "")) if kpi.get("weight") is not None else "",
             "KPI_CURRENT_TIME_MEMBER": "",
             "KPI_PARENT_KPI_NAME": parent_name,
-            "ANNOTATIONS": "",
+            "ANNOTATIONS": band_annotation,
             "UNARY_OPERATOR": "",
-            "ASSOCIATE_MEASURE_GROUP_NAME": "default",
+            "ASSOCIATE_MEASURE_GROUP_NAME": catalog,
         })
     return rows
 

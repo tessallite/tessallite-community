@@ -80,11 +80,11 @@ Tenant Admin and Modeller are workspace-wide roles. An Analyst role at the works
 
 A user's workspace role is the ceiling for their effective permissions. A Modeller cannot be granted Tenant Admin access at the project level. Change the workspace role first if a higher level is needed.
 
-**Project roles and model versions.** The project-level role also decides what a user may do with a model's version history, because reverting is destructive:
+**Project roles and model versions.** The project-level role also decides what a user may do with a model's version history, because reverting is a high-impact change to the live model:
 
 - A **Viewer** can open the version history and compare past versions.
 - A **Modeller** can additionally save a new version and deploy or undeploy.
-- **Reverting** to an earlier version (which deletes every newer version) requires the project **Admin** role.
+- **Reverting** to an earlier version (which rewrites the live model and moves the deployed pointer — it appends a new version and never deletes any history) requires the project **Admin** role.
 
 See [Save and version a model](../modelling/save-and-version-a-model.md) for the full version workflow.
 

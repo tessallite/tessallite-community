@@ -56,15 +56,31 @@ export const importExportApi = {
       .then((r) => r.data),
 };
 
+export type LookMLExportResult = {
+  blob: Blob;
+  // F-020-04: number of measures the emitter SKIPPED (calculated / variant
+  // measures Looker cannot represent). The server reports it in the
+  // X-Tessallite-LookML-Warnings response header; the panel surfaces it so the
+  // download is not silently partial.
+  warningCount: number;
+};
+
 export const lookmlExportApi = {
-  exportModel: (projectId: string, modelId: string, connection: string) =>
+  exportModel: (
+    projectId: string,
+    modelId: string,
+    connection: string,
+  ): Promise<LookMLExportResult> =>
     api
       .post(
         `${modelBase(projectId, modelId)}/export/lookml`,
         { connection },
         { responseType: "blob" },
       )
-      .then((r) => r.data as Blob),
+      .then((r) => ({
+        blob: r.data as Blob,
+        warningCount: Number(r.headers?.["x-tessallite-lookml-warnings"] ?? 0) || 0,
+      })),
 };
 
 // --- Project-level import/export ---
@@ -121,6 +137,16 @@ export type ProjectImportRequest = {
   override_connections?: boolean;
 };
 
+export type ImportWarning = {
+  code: string;
+  severity: "info" | "warning" | "error";
+  source: string;
+  element: string | null;
+  action: string;
+  params: Record<string, unknown>;
+  detail: string;
+};
+
 export type ProjectImportConnectionAction = {
   export_connection_id: string;
   display_name: string | null;
@@ -163,7 +189,7 @@ export type ProjectImportPlan = {
   connection_actions: ProjectImportConnectionAction[];
   model_slugs: string[];
   post_import_actions: string[];
-  warnings: string[];
+  warnings: ImportWarning[];
 };
 
 export type ProjectImportResponse = {
@@ -173,7 +199,7 @@ export type ProjectImportResponse = {
   models_imported: number;
   models_requiring_deploy: string[];
   post_import_actions: string[];
-  warnings: string[];
+  warnings: ImportWarning[];
   dry_run?: boolean;
   plan?: ProjectImportPlan | null;
 };
@@ -205,7 +231,7 @@ export type DbtImportResponse = {
   models_parsed: number;
   models_created: number;
   model_names: string[];
-  warnings: string[];
+  warnings: ImportWarning[];
   bundle: Record<string, unknown>;
 };
 
@@ -213,7 +239,7 @@ export type CubeImportResponse = {
   models_parsed: number;
   models_created: number;
   model_names: string[];
-  warnings: string[];
+  warnings: ImportWarning[];
   bundle: Record<string, unknown>;
 };
 
@@ -221,7 +247,7 @@ export type AtScaleImportResponse = {
   models_parsed: number;
   models_created: number;
   model_names: string[];
-  warnings: string[];
+  warnings: ImportWarning[];
   bundle: Record<string, unknown>;
 };
 
@@ -244,44 +270,46 @@ export type CatalogImportResponse = {
   warnings: string[];
 };
 
+// F-020-03: dry_run is a query flag on these endpoints. When true the loss /
+// warning report is returned WITHOUT persisting (models_created=0), so the
+// migration engineer can review what will not transfer before committing.
+function importPath(projectId: string, format: string, dryRun: boolean): string {
+  const base = `/api/v1/projects/${encodeURIComponent(projectId)}/import/${format}`;
+  return dryRun ? `${base}?dry_run=true` : base;
+}
+
 export const dbtImportApi = {
-  importDbt: (projectId: string, file: File) => {
+  importDbt: (projectId: string, file: File, dryRun = false) => {
     const form = new FormData();
     form.append("file", file);
     return api
-      .post<DbtImportResponse>(
-        `/api/v1/projects/${encodeURIComponent(projectId)}/import/dbt`,
-        form,
-        { headers: { "Content-Type": "multipart/form-data" } },
-      )
+      .post<DbtImportResponse>(importPath(projectId, "dbt", dryRun), form, {
+        headers: { "Content-Type": "multipart/form-data" },
+      })
       .then((r) => r.data);
   },
 };
 
 export const cubeImportApi = {
-  importCube: (projectId: string, file: File) => {
+  importCube: (projectId: string, file: File, dryRun = false) => {
     const form = new FormData();
     form.append("file", file);
     return api
-      .post<CubeImportResponse>(
-        `/api/v1/projects/${encodeURIComponent(projectId)}/import/cube`,
-        form,
-        { headers: { "Content-Type": "multipart/form-data" } },
-      )
+      .post<CubeImportResponse>(importPath(projectId, "cube", dryRun), form, {
+        headers: { "Content-Type": "multipart/form-data" },
+      })
       .then((r) => r.data);
   },
 };
 
 export const atscaleImportApi = {
-  importAtScale: (projectId: string, file: File) => {
+  importAtScale: (projectId: string, file: File, dryRun = false) => {
     const form = new FormData();
     form.append("file", file);
     return api
-      .post<AtScaleImportResponse>(
-        `/api/v1/projects/${encodeURIComponent(projectId)}/import/atscale`,
-        form,
-        { headers: { "Content-Type": "multipart/form-data" } },
-      )
+      .post<AtScaleImportResponse>(importPath(projectId, "atscale", dryRun), form, {
+        headers: { "Content-Type": "multipart/form-data" },
+      })
       .then((r) => r.data);
   },
 };

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -21,6 +21,7 @@ const createConversationMock = vi.fn();
 const patchConversationMock = vi.fn();
 const deleteConversationMock = vi.fn();
 const setActiveConversationMock = vi.fn();
+const setPendingPersonaIdMock = vi.fn();
 
 vi.mock("../api/agentApi", () => ({
   agentApi: {
@@ -46,12 +47,21 @@ vi.mock("@tessallite/shared-ui", () => ({
   ChatProvider: ({ children }: { children: React.ReactNode }) => (
     <div data-testid="chat-provider">{children}</div>
   ),
-  ChatCanvas: () => <div data-testid="chat-canvas">ChatCanvas</div>,
+  ChatCanvas: ({ disabled }: { disabled?: boolean }) => (
+    <>
+      <div data-testid="chat-canvas" data-disabled={String(Boolean(disabled))}>
+        ChatCanvas
+      </div>
+      <button type="button" disabled={disabled}>Send message</button>
+    </>
+  ),
   TraceDrawer: () => null,
   useConversationStore: vi.fn((selector: (s: Record<string, unknown>) => unknown) =>
     selector({
       activeConversationId: null,
       setActiveConversation: setActiveConversationMock,
+      pendingPersonaId: null,
+      setPendingPersonaId: setPendingPersonaIdMock,
     }),
   ),
 }));
@@ -233,6 +243,8 @@ describe("AgentChat page", () => {
         selector({
           activeConversationId: null,
           setActiveConversation: setActiveConversationMock,
+          pendingPersonaId: null,
+          setPendingPersonaId: setPendingPersonaIdMock,
         }) as never,
     );
     listTurnsMock.mockResolvedValue([]);
@@ -289,9 +301,11 @@ describe("AgentChat page", () => {
   it("renders ChatCanvas inside ChatProvider when a conversation is active", async () => {
     vi.mocked(useConversationStore).mockImplementation(
       (selector: (s: Record<string, unknown>) => unknown) =>
-        selector({
+      selector({
           activeConversationId: "conv-1",
           setActiveConversation: setActiveConversationMock,
+          pendingPersonaId: null,
+          setPendingPersonaId: setPendingPersonaIdMock,
         }) as never,
     );
 
@@ -338,7 +352,209 @@ describe("AgentChat page", () => {
     await userEvent.click(addButton);
 
     await waitFor(() => {
-      expect(createConversationMock).toHaveBeenCalledWith("proj-1");
+      expect(createConversationMock).toHaveBeenCalledWith("proj-1", {
+        persona_id: null,
+      });
+    });
+  });
+
+  it("L13-9196-SPA: sends the selected ProjectPersona on conversation create", async () => {
+    getConfigMock.mockResolvedValue({ enabled: true });
+    listConversationsMock.mockResolvedValue([]);
+    listPersonasMock.mockResolvedValue([
+      {
+        id: "project-persona-1",
+        project_id: "proj-1",
+        name: "Finance analyst",
+        slug: "finance-analyst",
+        description: null,
+        model_scopes: [],
+      },
+    ]);
+    createConversationMock.mockResolvedValue({
+      id: "conv-project-persona",
+      project_id: "proj-1",
+      title: null,
+      pinned_at: null,
+      started_at: "2026-06-20T00:00:00Z",
+      last_active_at: "2026-06-20T00:00:00Z",
+      deleted_at: null,
+      persona_id: "project-persona-1",
+    });
+
+    renderChat();
+    const picker = await screen.findByRole("combobox", {
+      name: "Project persona",
+    });
+    await userEvent.click(picker);
+    await userEvent.click(await screen.findByRole("option", { name: "Finance analyst" }));
+
+    expect(setPendingPersonaIdMock).toHaveBeenCalledWith("project-persona-1");
+    await userEvent.click(screen.getByRole("button", { name: /new/i }));
+
+    await waitFor(() => {
+      expect(createConversationMock).toHaveBeenCalledWith("proj-1", {
+        persona_id: "project-persona-1",
+      });
+    });
+  });
+
+  it("L13-R1-F5 keeps persisted ProjectPersona authority visible and blocks send while saving", async () => {
+    const storeState = {
+      activeConversationId: "conv-1",
+      setActiveConversation: setActiveConversationMock,
+      pendingPersonaId: null,
+      setPendingPersonaId: setPendingPersonaIdMock,
+    };
+    vi.mocked(useConversationStore).mockImplementation(
+      (selector: (s: Record<string, unknown>) => unknown) =>
+        selector(storeState) as never,
+    );
+    getConfigMock.mockResolvedValue({ enabled: true });
+    const conversation = {
+      id: "conv-1",
+      project_id: "proj-1",
+      title: "Active chat",
+      pinned_at: null,
+      started_at: "2026-05-10T00:00:00Z",
+      last_active_at: "2026-05-10T00:00:00Z",
+      persona_id: null,
+    };
+    listConversationsMock.mockResolvedValue([conversation]);
+    listPersonasMock.mockResolvedValue([
+      {
+        id: "project-persona-1",
+        project_id: "proj-1",
+        name: "Finance analyst",
+        slug: "finance-analyst",
+        description: null,
+        model_scopes: [],
+      },
+    ]);
+    let resolvePatch!: (value: typeof conversation) => void;
+    patchConversationMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolvePatch = resolve;
+      }),
+    );
+
+    renderChat();
+    const picker = await screen.findByRole("combobox", {
+      name: "Project persona",
+    });
+    await userEvent.click(picker);
+    await userEvent.click(await screen.findByRole("option", { name: "Finance analyst" }));
+
+    await waitFor(() => {
+      expect(patchConversationMock).toHaveBeenCalledWith(
+        "proj-1",
+        "conv-1",
+        { persona_id: "project-persona-1" },
+      );
+      expect(screen.getByRole("combobox", { name: "Project persona" })).not.toHaveTextContent(
+        "Finance analyst",
+      );
+      expect(screen.getByTestId("chat-canvas")).toHaveAttribute(
+        "data-disabled",
+        "true",
+      );
+    });
+
+    await act(async () => {
+      resolvePatch({ ...conversation, persona_id: "project-persona-1" });
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: "Project persona" })).toHaveTextContent(
+        "Finance analyst",
+      );
+      expect(screen.getByTestId("chat-canvas")).toHaveAttribute(
+        "data-disabled",
+        "false",
+      );
+    });
+  });
+
+  it("L13 F5 restores the persisted ProjectPersona and reports a failed PATCH", async () => {
+    vi.mocked(useConversationStore).mockImplementation(
+      (selector: (s: Record<string, unknown>) => unknown) =>
+        selector({
+          activeConversationId: "conv-1",
+          setActiveConversation: setActiveConversationMock,
+          pendingPersonaId: null,
+          setPendingPersonaId: setPendingPersonaIdMock,
+        }) as never,
+    );
+    getConfigMock.mockResolvedValue({ enabled: true });
+    listConversationsMock.mockResolvedValue([{
+      id: "conv-1", project_id: "proj-1", title: "Active", pinned_at: null,
+      started_at: "2026-05-10T00:00:00Z", last_active_at: "2026-05-10T00:00:00Z",
+      deleted_at: null, persona_id: null,
+    }]);
+    listPersonasMock.mockResolvedValue([{
+      id: "project-persona-1", project_id: "proj-1", name: "Finance analyst",
+      slug: "finance-analyst", description: null, model_scopes: [],
+    }]);
+    patchConversationMock.mockRejectedValueOnce(new Error("persist failed"));
+    renderChat();
+    const picker = await screen.findByRole("combobox", { name: "Project persona" });
+    await userEvent.click(picker);
+    await userEvent.click(await screen.findByRole("option", { name: "Finance analyst" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/previous selection was restored/i));
+    expect(setPendingPersonaIdMock).toHaveBeenLastCalledWith(null);
+  });
+
+  it("L13-R1-F5 blocks direct New/create/send across a ProjectPersona transition", async () => {
+    const storeState = {
+      activeConversationId: "conv-1",
+      setActiveConversation: setActiveConversationMock,
+      pendingPersonaId: null,
+      setPendingPersonaId: setPendingPersonaIdMock,
+    };
+    vi.mocked(useConversationStore).mockImplementation(
+      (selector: (s: Record<string, unknown>) => unknown) =>
+        selector(storeState) as never,
+    );
+    getConfigMock.mockResolvedValue({ enabled: true });
+    listConversationsMock.mockResolvedValue([{
+      id: "conv-1", project_id: "proj-1", title: "Active", pinned_at: null,
+      started_at: "2026-05-10T00:00:00Z", last_active_at: "2026-05-10T00:00:00Z",
+      deleted_at: null, persona_id: null,
+    }]);
+    listPersonasMock.mockResolvedValue([{
+      id: "project-persona-1", project_id: "proj-1", name: "Finance analyst",
+      slug: "finance-analyst", description: null, model_scopes: [],
+    }]);
+    let resolvePatch!: (value: unknown) => void;
+    patchConversationMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolvePatch = resolve;
+    }));
+
+    renderChat();
+    const picker = await screen.findByRole("combobox", { name: "Project persona" });
+    await userEvent.click(picker);
+    await userEvent.click(await screen.findByRole("option", { name: "Finance analyst" }));
+    await waitFor(() => {
+      expect(patchConversationMock).toHaveBeenCalledWith(
+        "proj-1", "conv-1", { persona_id: "project-persona-1" },
+      );
+      expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+      expect(screen.getByTestId("chat-canvas")).toHaveAttribute("data-disabled", "true");
+    });
+
+    const newButton = screen.getByRole("button", { name: /new/i });
+    expect(newButton).toBeDisabled();
+    expect(createConversationMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolvePatch({
+        id: "conv-1", project_id: "proj-1", title: "Active", pinned_at: null,
+        started_at: "2026-05-10T00:00:00Z", last_active_at: "2026-05-10T00:00:00Z",
+        deleted_at: null, persona_id: "project-persona-1",
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Send message" })).not.toBeDisabled();
+      expect(screen.getByRole("button", { name: /new/i })).not.toBeDisabled();
     });
   });
 
@@ -474,6 +690,34 @@ describe("AgentChat shared chat interaction states", () => {
     });
   });
 
+  it("threads a per-send Idempotency-Key to streamMessageRaw (Bug-6521)", async () => {
+    const sse = createSseController();
+    const stream = vi.fn().mockResolvedValue(sse.response);
+    const adapter = makeAdapter({
+      getTurns: vi.fn().mockResolvedValue([]),
+      streamMessageRaw: stream,
+    });
+
+    renderSharedUi(<RealChatCanvas />, adapter);
+
+    const input = await screen.findByLabelText("Message input");
+    await userEvent.type(input, "Show revenue trend");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(stream).toHaveBeenCalledTimes(1);
+    });
+    // 5th positional arg is the idempotency key.
+    const key = stream.mock.calls[0][4];
+    expect(typeof key).toBe("string");
+    expect((key as string).length).toBeGreaterThan(0);
+
+    act(() => {
+      sse.emit("turn.completed", { turn_id: "turn-1" });
+      sse.close();
+    });
+  });
+
   it("keeps failed sends editable and submits retry only once", async () => {
     const adapter = makeAdapter({
       getTurns: vi.fn().mockResolvedValue([]),
@@ -507,6 +751,316 @@ describe("AgentChat shared chat interaction states", () => {
     await waitFor(() => {
       expect(adapter.streamMessageRaw).toHaveBeenCalledTimes(2);
     });
+  });
+
+  it("reconciles a persisted turn on stream onError instead of showing error + retry (Bug-8336)", async () => {
+    // Stream closes WITHOUT a terminal event -> messagesStream raises onError,
+    // but the server DID persist the turn. getTurns returns empty on the
+    // initial load, then the persisted turn once ChatCanvas refetches from
+    // onError. The user must see the answer, NOT an error/retry that would
+    // re-ask the already-answered question.
+    const persistedTurn = makeTurn({
+      id: "turn-persisted",
+      user_message: "What is revenue?",
+      answer_text: "Revenue was 1200.",
+    });
+    const sse = createSseController();
+    const getTurns = vi
+      .fn()
+      .mockResolvedValueOnce([]) // initial load
+      .mockResolvedValue([persistedTurn]); // onError reconcile refetch
+    const stream = vi.fn().mockResolvedValue(sse.response);
+    const adapter = makeAdapter({
+      getTurns,
+      streamMessageRaw: stream,
+    });
+
+    renderSharedUi(<RealChatCanvas />, adapter);
+
+    const input = await screen.findByLabelText("Message input");
+    await userEvent.type(input, "What is revenue?");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(stream).toHaveBeenCalledTimes(1);
+    });
+
+    // Deliver content then close with NO terminal event -> onError path. Note we
+    // do NOT emit a turn_id on turn.started (the production server does not
+    // supply one), so this exercises the real reconcile path: a NEW terminal
+    // turn (not in the loaded-empty prior snapshot) whose text matches the send.
+    act(() => {
+      sse.emit("narration.delta", { text: "Revenue was 1200." });
+      sse.close();
+    });
+
+    // The persisted answer is reconciled onto the screen.
+    await waitFor(() => {
+      expect(screen.getByText("Revenue was 1200.")).toBeTruthy();
+    });
+
+    // No error toast and no retry button are offered. Bug-8370 — the toast
+    // now resolves through the typed StreamErrorCode -> friendly i18n
+    // message map (never the messagesStream.ts raw engine text), so assert
+    // against the current friendly copy rather than a stale literal.
+    expect(
+      screen.queryByText(sharedChatMessages["stream.error.unexpectedEnd"]),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Retry sending message" }),
+    ).toBeNull();
+
+    // A follow-up refetch was made (reconcile), and no duplicate send occurred.
+    expect(getTurns.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(stream).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows error + retry on stream onError when no turn was persisted (Bug-8336)", async () => {
+    // Stream closes with no terminal event and getTurns stays empty -> the
+    // request genuinely failed, so the error toast and retry must appear, and a
+    // retry issues a fresh send (new logical send).
+    const sse = createSseController();
+    const getTurns = vi.fn().mockResolvedValue([]);
+    const stream = vi
+      .fn()
+      .mockResolvedValueOnce(sse.response)
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    const adapter = makeAdapter({
+      getTurns,
+      streamMessageRaw: stream,
+    });
+
+    renderSharedUi(<RealChatCanvas />, adapter);
+
+    const input = await screen.findByLabelText("Message input");
+    await userEvent.type(input, "What is revenue?");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(stream).toHaveBeenCalledTimes(1);
+    });
+
+    act(() => {
+      sse.close(); // EOF, no terminal event, nothing persisted
+    });
+
+    // Error surfaces and the message is kept editable with a retry button.
+    await waitFor(() => {
+      expect(screen.getByLabelText("Message input")).toHaveValue(
+        "What is revenue?",
+      );
+    });
+    // Bug-8370 — the toast shows the typed StreamErrorCode's friendly i18n
+    // message (a real body stream closing with no frames classifies as
+    // 'unexpected_end'), never messagesStream.ts's raw engine text.
+    expect(
+      screen.getByText(sharedChatMessages["stream.error.unexpectedEnd"]),
+    ).toBeTruthy();
+    const retryBtn = await screen.findByRole("button", {
+      name: "Retry sending message",
+    });
+
+    await userEvent.click(retryBtn);
+    await waitFor(() => {
+      expect(stream).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("does NOT reconcile against a non-terminal streaming placeholder row (Bug-8336)", async () => {
+    // The server commits a status="streaming" reservation placeholder with the
+    // real user_message BEFORE the pipeline runs, and list_turns returns it
+    // unfiltered. If the stream dies (orphaned reservation) the refetch finds
+    // that placeholder — but it has no answer, so reconciling against it would
+    // suppress error+retry and strand the user. onError must fall through to
+    // error+retry, not treat the placeholder as a success.
+    const placeholder = makeTurn({
+      id: "turn-placeholder",
+      user_message: "What is revenue?",
+      answer_text: null,
+      status: "streaming",
+    });
+    const sse = createSseController();
+    const getTurns = vi
+      .fn()
+      .mockResolvedValueOnce([]) // initial load
+      .mockResolvedValue([placeholder]); // onError reconcile refetch
+    const stream = vi
+      .fn()
+      .mockResolvedValueOnce(sse.response)
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    const adapter = makeAdapter({ getTurns, streamMessageRaw: stream });
+
+    renderSharedUi(<RealChatCanvas />, adapter);
+
+    const input = await screen.findByLabelText("Message input");
+    await userEvent.type(input, "What is revenue?");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(stream).toHaveBeenCalledTimes(1);
+    });
+
+    act(() => {
+      sse.close(); // orphaned reservation: placeholder persisted, no answer
+    });
+
+    // Error + retry must appear despite the placeholder row existing.
+    const retryBtn = await screen.findByRole("button", {
+      name: "Retry sending message",
+    });
+    expect(screen.getByLabelText("Message input")).toHaveValue(
+      "What is revenue?",
+    );
+    await userEvent.click(retryBtn);
+    await waitFor(() => {
+      expect(stream).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("does NOT reconcile a failed new send against an older identical-text turn (Bug-8336)", async () => {
+    // Re-asking the same question is normal. An OLD completed turn with the same
+    // text must not make a genuinely-failed new send look successful. Here the
+    // stream dies before turn.started (no server id for this send), so
+    // reconciliation falls back to newness+text — and the only matching turn is
+    // the pre-existing one, so it must NOT reconcile.
+    const olderTurn = makeTurn({
+      id: "turn-older",
+      user_message: "What is revenue?",
+      answer_text: "Revenue was 1000 last time.",
+      status: "ok",
+    });
+    const sse = createSseController();
+    const getTurns = vi.fn().mockResolvedValue([olderTurn]); // same before & after
+    const stream = vi
+      .fn()
+      .mockResolvedValueOnce(sse.response)
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    const adapter = makeAdapter({ getTurns, streamMessageRaw: stream });
+
+    // The describe-block beforeEach sets activeConversationId="conv-1", so the
+    // older turn is the initial load (a pre-existing turn for this send).
+    renderSharedUi(<RealChatCanvas />, adapter);
+
+    const input = await screen.findByLabelText("Message input");
+    await userEvent.type(input, "What is revenue?");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(stream).toHaveBeenCalledTimes(1);
+    });
+
+    act(() => {
+      sse.close(); // dies before turn.started -> no server id for this send
+    });
+
+    // The failed new send must surface error + retry, not silently vanish.
+    const retryBtn = await screen.findByRole("button", {
+      name: "Retry sending message",
+    });
+    expect(screen.getByLabelText("Message input")).toHaveValue(
+      "What is revenue?",
+    );
+    await userEvent.click(retryBtn);
+    await waitFor(() => {
+      expect(stream).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("declines to reconcile when the prior-turns cache is unloaded, even on identical text (Bug-8336)", async () => {
+    // Guards the R2-F2 unloaded-cache branch: if the send fires while the turns
+    // query is still in flight (e.g. right after switching conversations), the
+    // snapshot is `undefined`. The text fallback must NOT fire — otherwise an
+    // OLDER identical-text turn revealed by the reconcile refetch would falsely
+    // reconcile a genuinely failed new send. The initial getTurns never
+    // resolves (cache stays undefined at send time); the reconcile refetch
+    // returns a pre-existing identical-text turn. Error + retry must appear.
+    const olderTurn = makeTurn({
+      id: "turn-older",
+      user_message: "What is revenue?",
+      answer_text: "Revenue was 1000 last time.",
+      status: "ok",
+    });
+    const sse = createSseController();
+    // Initial load rejects (retry:false in the test QueryClient) so the query
+    // settles with data === undefined — the cache is UNLOADED at send time. The
+    // reconcile refetch then resolves the pre-existing identical-text turn.
+    const getTurns = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("turns load failed"))
+      .mockResolvedValue([olderTurn]); // reconcile refetch
+    const stream = vi
+      .fn()
+      .mockResolvedValueOnce(sse.response)
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    const adapter = makeAdapter({ getTurns, streamMessageRaw: stream });
+
+    renderSharedUi(<RealChatCanvas />, adapter);
+
+    const input = await screen.findByLabelText("Message input");
+    await userEvent.type(input, "What is revenue?");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(stream).toHaveBeenCalledTimes(1);
+    });
+
+    act(() => {
+      sse.close(); // dies before turn.started; cache was never loaded
+    });
+
+    // Must decline reconcile -> error + retry, not silently drop the send.
+    const retryBtn = await screen.findByRole("button", {
+      name: "Retry sending message",
+    });
+    expect(screen.getByLabelText("Message input")).toHaveValue(
+      "What is revenue?",
+    );
+    await userEvent.click(retryBtn);
+    await waitFor(() => {
+      expect(stream).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("reconciles a persisted clarify turn on onError (Bug-8336)", async () => {
+    // `clarify` is a fully-releasable terminal outcome. If the stream drops
+    // after a clarify turn persists, the user must see the clarifying question,
+    // NOT an error + duplicate-risk retry.
+    const clarifyTurn = makeTurn({
+      id: "turn-clarify",
+      user_message: "Show me sales",
+      answer_text: "Which region did you mean?",
+      status: "clarify",
+    });
+    const sse = createSseController();
+    const getTurns = vi
+      .fn()
+      .mockResolvedValueOnce([]) // initial load (loaded-empty)
+      .mockResolvedValue([clarifyTurn]); // onError reconcile refetch
+    const stream = vi.fn().mockResolvedValue(sse.response);
+    const adapter = makeAdapter({ getTurns, streamMessageRaw: stream });
+
+    renderSharedUi(<RealChatCanvas />, adapter);
+
+    const input = await screen.findByLabelText("Message input");
+    await userEvent.type(input, "Show me sales");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(stream).toHaveBeenCalledTimes(1);
+    });
+
+    act(() => {
+      sse.close(); // no terminal event, but the clarify turn was persisted
+    });
+
+    // The clarifying question is reconciled onto the screen; no error/retry.
+    await waitFor(() => {
+      expect(screen.getByText("Which region did you mean?")).toBeTruthy();
+    });
+    expect(
+      screen.queryByRole("button", { name: "Retry sending message" }),
+    ).toBeNull();
+    expect(stream).toHaveBeenCalledTimes(1);
   });
 
   it("does not expose blocked answer text or judge reasoning and retains safe table and trace actions", async () => {
@@ -575,6 +1129,36 @@ describe("AgentChat shared chat interaction states", () => {
     ).toBeNull();
   });
 
+  // Bug-5960: the blocked/refused detail disclosure was a mouse-only
+  // clickable Box with no accessible button semantics — keyboard-only and
+  // screen-reader users could not discover or operate it.
+  it("exposes the blocked/refused detail disclosure as an accessible, keyboard-operable button", async () => {
+    renderSharedUi(
+      <RealAssistantTurn
+        turn={makeTurn({
+          status: "refused",
+          answer_text: "I cannot help with that request.",
+        })}
+      />,
+    );
+
+    const disclosure = screen.getByRole("button", {
+      name: "This request was refused",
+    });
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    const controlsId = disclosure.getAttribute("aria-controls");
+    expect(controlsId).toBeTruthy();
+    expect(document.getElementById(controlsId!)).toBeTruthy();
+
+    disclosure.focus();
+    expect(disclosure).toHaveFocus();
+    await userEvent.keyboard("{Enter}");
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+
+    await userEvent.keyboard(" ");
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("localizes refused guardrail messages from i18n keys", () => {
     renderSharedUi(
       <RealAssistantTurn
@@ -627,7 +1211,11 @@ describe("AgentChat shared chat interaction states", () => {
     expect(renderedFrame.getAttribute("srcdoc")).toContain(
       "Backend stacked matrix output",
     );
-    expect(renderedFrame.getAttribute("srcdoc")).toContain(
+    // Bug-6584: the iframe must NOT emit a hardcoded /charts.min.css <link>.
+    // Chart styling is supplied inline via the chartsCss prop; a served-URL
+    // <link> only appears when a caller explicitly opts in via chartsCssHref
+    // (this render passes neither), so the Excel task-pane host cannot 404.
+    expect(renderedFrame.getAttribute("srcdoc")).not.toContain(
       'href="/charts.min.css"',
     );
     expect(screen.getByText("0.1s")).toBeTruthy();
@@ -691,6 +1279,9 @@ describe("AgentChat shared chat interaction states", () => {
               name: "transaction_count",
               display_name: "Transaction Count",
               value: "1.0E+5",
+              definition: null,
+              route_type: null,
+              filter_grain: null,
             },
           ],
         })}
@@ -699,6 +1290,119 @@ describe("AgentChat shared chat interaction states", () => {
 
     expect(screen.getByText("Transaction Count: 100,000")).toBeTruthy();
     expect(screen.queryByText(/1\.0E\+5/)).toBeNull();
+  });
+
+  describe("citation provenance dialog (Bug-8181)", () => {
+    function twoCitationTurn() {
+      return makeTurn({
+        citations: [
+          {
+            kind: "measure",
+            id: "revenue",
+            name: "revenue",
+            display_name: "Revenue",
+            value: 4200000,
+            definition: "Total gross revenue recognised in the period.",
+            route_type: "aggregate",
+            filter_grain: "Filtered by country = US · Grouped by business_month",
+          },
+          {
+            kind: "dimension",
+            id: "country",
+            name: "country",
+            display_name: "Country",
+            value: null,
+            definition: null,
+            route_type: "aggregate",
+            filter_grain: null,
+          },
+        ],
+      });
+    }
+
+    it("opens a citation's OWN provenance dialog on click, not the generic trace drawer", async () => {
+      const onOpenTrace = vi.fn();
+      renderSharedUi(
+        <RealAssistantTurn turn={twoCitationTurn()} onOpenTrace={onOpenTrace} />,
+      );
+
+      await userEvent.click(screen.getByText("Revenue: 4,200,000"));
+
+      // The provenance dialog opened with THIS citation's data...
+      const dialog = within(screen.getByRole("dialog"));
+      expect(dialog.getByText("How this number was calculated")).toBeTruthy();
+      expect(
+        dialog.getByText("Total gross revenue recognised in the period."),
+      ).toBeTruthy();
+      expect(
+        dialog.getByText("Filtered by country = US · Grouped by business_month"),
+      ).toBeTruthy();
+      expect(dialog.getByText("Route: aggregate")).toBeTruthy();
+      // ...and clicking a chip never fires the generic trace drawer directly
+      // (that is now an opt-in secondary action from inside the dialog).
+      expect(onOpenTrace).not.toHaveBeenCalled();
+    });
+
+    it("shows the OTHER citation's data when a different chip is clicked", async () => {
+      renderSharedUi(<RealAssistantTurn turn={twoCitationTurn()} />);
+
+      await userEvent.click(screen.getByText("Country"));
+
+      const dialog = within(screen.getByRole("dialog"));
+      expect(dialog.getByText("Dimension: Country")).toBeTruthy();
+      expect(
+        dialog.getByText("No definition recorded for this field."),
+      ).toBeTruthy();
+      expect(
+        dialog.getByText("No filters. This is the unfiltered total."),
+      ).toBeTruthy();
+    });
+
+    it("'View trace' closes the dialog and invokes the host's onOpenTrace", async () => {
+      const onOpenTrace = vi.fn();
+      renderSharedUi(
+        <RealAssistantTurn turn={twoCitationTurn()} onOpenTrace={onOpenTrace} />,
+      );
+
+      await userEvent.click(screen.getByText("Revenue: 4,200,000"));
+      expect(screen.getByRole("dialog")).toBeTruthy();
+
+      await userEvent.click(
+        within(screen.getByRole("dialog")).getByRole("button", {
+          name: "View trace",
+        }),
+      );
+
+      expect(onOpenTrace).toHaveBeenCalledTimes(1);
+      await waitFor(() => {
+        expect(screen.queryByRole("dialog")).toBeNull();
+      });
+    });
+
+    it("omits the 'View trace' action when the host does not wire onOpenTrace", async () => {
+      renderSharedUi(<RealAssistantTurn turn={twoCitationTurn()} />);
+
+      await userEvent.click(screen.getByText("Revenue: 4,200,000"));
+
+      const dialog = within(screen.getByRole("dialog"));
+      expect(dialog.getByText("How this number was calculated")).toBeTruthy();
+      expect(dialog.queryByRole("button", { name: "View trace" })).toBeNull();
+    });
+
+    it("closes on the dialog's own close button", async () => {
+      renderSharedUi(<RealAssistantTurn turn={twoCitationTurn()} />);
+
+      await userEvent.click(screen.getByText("Revenue: 4,200,000"));
+      await userEvent.click(
+        within(screen.getByRole("dialog")).getByRole("button", {
+          name: "Close",
+        }),
+      );
+
+      await waitFor(() => {
+        expect(screen.queryByRole("dialog")).toBeNull();
+      });
+    });
   });
 
   it("disables blocked recovery actions while a send is in flight", () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { sanitizeHtml } from "./sanitize";
+import { sanitizeHtml, csvSafeCell } from "./sanitize";
 
 describe("sanitizeHtml", () => {
   it("strips script tags", () => {
@@ -51,5 +51,37 @@ describe("sanitizeHtml", () => {
 
   it("strips iframe", () => {
     expect(sanitizeHtml('<iframe src="evil.com"></iframe>')).toBe("");
+  });
+});
+
+// Bug-7286 / Bug-7328: spreadsheet formula-injection guard.
+describe("csvSafeCell", () => {
+  it("neutralises every formula-leading trigger", () => {
+    expect(csvSafeCell("=cmd|'/C calc'!A0")).toBe("'=cmd|'/C calc'!A0");
+    expect(csvSafeCell("+cmd")).toBe("'+cmd");
+    expect(csvSafeCell("-cmd")).toBe("'-cmd");
+    expect(csvSafeCell("@SUM(1,1)")).toBe("'@SUM(1,1)");
+    expect(csvSafeCell('=HYPERLINK("https://attacker.example","x")')).toBe(
+      "'=HYPERLINK(\"https://attacker.example\",\"x\")",
+    );
+  });
+
+  it("neutralises leading tab / carriage-return / newline control bytes", () => {
+    expect(csvSafeCell("\t=cmd")).toBe("'\t=cmd");
+    expect(csvSafeCell("\r=cmd")).toBe("'\r=cmd");
+    expect(csvSafeCell("\n=cmd")).toBe("'\n=cmd");
+  });
+
+  it("leaves plain text and interior triggers untouched", () => {
+    expect(csvSafeCell("EMEA")).toBe("EMEA");
+    expect(csvSafeCell("Doe, John")).toBe("Doe, John");
+    expect(csvSafeCell("a=b")).toBe("a=b");
+  });
+
+  it("coerces non-string input and treats null / undefined as empty", () => {
+    expect(csvSafeCell(null)).toBe("");
+    expect(csvSafeCell(undefined)).toBe("");
+    expect(csvSafeCell(42)).toBe("42");
+    expect(csvSafeCell("")).toBe("");
   });
 });

@@ -40,8 +40,8 @@ class ExpressionError(ValueError):
     renderable. Surfaced to the LLM as a tool-call parse error."""
 
 
-# ── quoting (PostgreSQL-canonical; mirrors exec/query.py exactly so legacy
-#    bare-dimension SQL stays byte-for-byte identical) ──────────────────────
+# ── quoting (PostgreSQL-canonical; the single definition for the entire
+#    agent-service — Bug-5753 consolidated the exec/query.py copy here) ────
 def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 

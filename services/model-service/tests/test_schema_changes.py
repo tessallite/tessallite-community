@@ -31,11 +31,13 @@ async def test_acknowledge_sets_timestamp():
     from src.api.schema_changes import _acknowledge_schema_change
 
     db = AsyncMock()
+    model_id = uuid4()
     event = MagicMock()
     event.id = uuid4()
+    event.model_id = model_id
     event.acknowledged_at = None
     db.get = AsyncMock(return_value=event)
-    await _acknowledge_schema_change(db, event_id=event.id)
+    await _acknowledge_schema_change(db, model_id, event_id=event.id)
     assert event.acknowledged_at is not None
 
 
@@ -47,5 +49,5 @@ async def test_acknowledge_missing_event_raises():
     db = AsyncMock()
     db.get = AsyncMock(return_value=None)
     with pytest.raises(HTTPException) as exc_info:
-        await _acknowledge_schema_change(db, event_id=uuid4())
+        await _acknowledge_schema_change(db, uuid4(), event_id=uuid4())
     assert exc_info.value.status_code == 404

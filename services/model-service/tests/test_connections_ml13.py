@@ -19,6 +19,7 @@ import pytest
 
 from src.api.connections import (
     CREDENTIAL_CLEAR_SENTINEL,
+    CREDENTIAL_EMPTY_SENTINEL,
     _classify_table,
     _merge_credentials,
 )
@@ -124,6 +125,42 @@ def test_clear_sentinel_removes_stored_credential():
 def test_clear_sentinel_on_absent_key_is_noop():
     merged = _merge_credentials({"host": "db"}, {"password": CREDENTIAL_CLEAR_SENTINEL})
     assert merged == {"host": "db"}
+
+
+# ---------------------------------------------------------------------------
+# Bug-7162: an explicitly EMPTY credential coordinate must be storable
+# ---------------------------------------------------------------------------
+
+def test_empty_sentinel_sets_stored_credential_to_empty_string():
+    """Bug-7162: ``""`` means "keep stored", so blanking a non-secret
+    coordinate (e.g. dropping an explicit Snowflake role so the account default
+    applies) was unreachable. The sentinel makes it explicit."""
+    existing = {"host": "db", "role": "ANALYST"}
+    merged = _merge_credentials(existing, {"role": CREDENTIAL_EMPTY_SENTINEL})
+    assert merged["role"] == ""
+    assert merged["host"] == "db"
+
+
+def test_empty_sentinel_differs_from_clear_sentinel():
+    """Bug-7162: "present but empty" and "absent" are distinct states; the two
+    sentinels must not collapse into each other."""
+    existing = {"schema": "public"}
+    emptied = _merge_credentials(existing, {"schema": CREDENTIAL_EMPTY_SENTINEL})
+    cleared = _merge_credentials(existing, {"schema": CREDENTIAL_CLEAR_SENTINEL})
+    assert emptied == {"schema": ""}
+    assert cleared == {}
+
+
+def test_empty_sentinel_on_absent_key_adds_empty_value():
+    merged = _merge_credentials({"host": "db"}, {"schema": CREDENTIAL_EMPTY_SENTINEL})
+    assert merged == {"host": "db", "schema": ""}
+
+
+def test_blank_string_still_means_keep_stored_value():
+    """Bug-7162 must not change the default: an omitted/blank field in the edit
+    dialog still means "unchanged", so users need not retype the password."""
+    merged = _merge_credentials({"password": "secret"}, {"password": ""})
+    assert merged["password"] == "secret"
 
 
 # ---------------------------------------------------------------------------

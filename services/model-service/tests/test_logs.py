@@ -161,6 +161,21 @@ async def test_query_logs_client_kind_filter(client):
 
 
 @pytest.mark.anyio
+async def test_query_logs_drill_client_kind_filter(client):
+    # Bug-6430: drill-through REST executions are tagged client_kind="drill" by
+    # the query-router, so the logs API must accept and filter that value.
+    logs = [_make_query_log(client_kind="drill")]
+    db = _mock_db_with_logs(logs, 1)
+    with patch("src.api.logs.get_tenant_db", async_gen_from(db)):
+        resp = await client.get(
+            f"/api/v1/projects/{TEST_PROJECT_ID}/logs/queries",
+            params={"client_kind": "drill"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["items"][0]["client_kind"] == "drill"
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("suffix", ["/queries", "/queries/export"])
 async def test_query_logs_reject_invalid_client_kind(client, suffix):
     resp = await client.get(
@@ -168,6 +183,115 @@ async def test_query_logs_reject_invalid_client_kind(client, suffix):
         params={"client_kind": "unknown_client"},
     )
     assert resp.status_code == 422
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["headless", "agent", "mcp"])
+async def test_query_logs_accept_expanded_client_kinds(client, kind):
+    """Bug-7451 / CF-030-DS-F03002: headless, agent, and mcp must be accepted
+    by the client_kind filter without 422."""
+    logs = [_make_query_log(client_kind=kind)]
+    db = _mock_db_with_logs(logs, 1)
+    with patch("src.api.logs.get_tenant_db", async_gen_from(db)):
+        resp = await client.get(
+            f"/api/v1/projects/{TEST_PROJECT_ID}/logs/queries",
+            params={"client_kind": kind},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["items"][0]["client_kind"] == kind
+
+
+# ---------------------------------------------------------------------------
+# Bug-7451: probe traffic exclusion from user-facing query log
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_query_logs_exclude_probes_by_default(client):
+    """Bug-7451: the default query-log list must exclude introspect route_type
+    and discover_members protocol rows so the user sees only real queries.
+    Verify by capturing the SQL statement and checking for the probe-exclusion
+    WHERE clauses."""
+    logs = [_make_query_log(route_type="source")]
+    db = _mock_db_with_logs(logs, 1)
+    captured = []
+
+    _orig_execute = db.execute
+
+    async def _capture(stmt, *a, **k):
+        captured.append(str(stmt.compile(compile_kwargs={"literal_binds": True}))
+                        if hasattr(stmt, "compile") else str(stmt))
+        return await _orig_execute(stmt, *a, **k)
+
+    db.execute = AsyncMock(side_effect=_capture)
+
+    with patch("src.api.logs.get_tenant_db", async_gen_from(db)):
+        resp = await client.get(
+            f"/api/v1/projects/{TEST_PROJECT_ID}/logs/queries",
+        )
+    assert resp.status_code == 200
+    # The SQL must contain the probe-exclusion filter.
+    combined_sql = " ".join(captured).lower()
+    assert "introspect" in combined_sql, "Default query should exclude introspect route_type"
+    assert "discover_members" in combined_sql, "Default query should exclude discover_members protocol"
+
+
+@pytest.mark.anyio
+async def test_query_logs_include_probes_when_requested(client):
+    """Bug-7451: when include_probes=true, the probe-exclusion filters must NOT
+    be applied, so introspect/discover-members rows are visible."""
+    probe = _make_query_log(route_type="introspect")
+    probe.protocol = "discover_members"
+    db = _mock_db_with_logs([probe], 1)
+    captured = []
+
+    _orig_execute = db.execute
+
+    async def _capture(stmt, *a, **k):
+        captured.append(str(stmt.compile(compile_kwargs={"literal_binds": True}))
+                        if hasattr(stmt, "compile") else str(stmt))
+        return await _orig_execute(stmt, *a, **k)
+
+    db.execute = AsyncMock(side_effect=_capture)
+
+    with patch("src.api.logs.get_tenant_db", async_gen_from(db)):
+        resp = await client.get(
+            f"/api/v1/projects/{TEST_PROJECT_ID}/logs/queries",
+            params={"include_probes": "true"},
+        )
+    assert resp.status_code == 200
+    # The SQL must NOT contain the exclusion filter tokens.
+    combined_sql = " ".join(captured).lower()
+    # When include_probes=true, we should NOT see the NOT IN exclusion clause
+    # for 'introspect' as part of probe filtering.  (The word 'introspect' may
+    # appear in data, but NOT IN ('introspect') should be absent.)
+    assert "not in" not in combined_sql or "introspect" not in combined_sql.split("not in")[1].split(")")[0], \
+        "include_probes=true should not apply probe exclusion"
+
+
+@pytest.mark.anyio
+async def test_csv_export_excludes_probes_by_default(client):
+    """Bug-7451 / Bug-7454: the CSV export must also exclude probe rows by
+    default, matching the list endpoint behaviour."""
+    logs = [_make_query_log(route_type="source")]
+    db = make_mock_db()
+    result_mock = MagicMock()
+    result_mock.scalars.return_value.all.return_value = logs
+    captured = []
+
+    async def _capture(stmt, *a, **k):
+        captured.append(str(stmt.compile(compile_kwargs={"literal_binds": True}))
+                        if hasattr(stmt, "compile") else str(stmt))
+        return result_mock
+
+    db.execute = AsyncMock(side_effect=_capture)
+    with _rbac_role("modeler"):
+        with patch("src.api.logs.get_tenant_db", async_gen_from(db)):
+            resp = await client.get(
+                f"/api/v1/projects/{TEST_PROJECT_ID}/logs/queries/export",
+            )
+    assert resp.status_code == 200
+    combined_sql = " ".join(captured).lower()
+    assert "introspect" in combined_sql, "CSV export should exclude introspect by default"
 
 
 @pytest.mark.anyio

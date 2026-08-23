@@ -6,6 +6,7 @@ import {
   Alert,
   Box,
   Button,
+  Checkbox,
   CircularProgress,
   Collapse,
   Dialog,
@@ -13,6 +14,7 @@ import {
   DialogContent,
   DialogTitle,
   FormControl,
+  FormControlLabel,
   IconButton,
   InputLabel,
   MenuItem,
@@ -41,6 +43,7 @@ import { useQueryLogs, useModelRefreshRuns, useOptimizerRuns, useAIOptimizerRuns
 import { logsApi } from "../../api/client";
 import type { QueryLog, AIOptimizerRun, OptimizerRunEntry } from "../../api/types";
 import { ui, statusColor } from "../../theme/tokens";
+import { runStatusLabel } from "../../utils/runStatus";
 
 type OptimisationRow =
   | { kind: "ai"; at: number; ai: AIOptimizerRun }
@@ -89,7 +92,7 @@ function AIRunRow({
           {run.is_dry_run && <Typography component="span" variant="caption" sx={{ ml: 0.5, px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: ui.mutedBg, color: ui.muted, fontSize: 11 }}>{t("diagnostics.dryRunLabel")}</Typography>}
         </TableCell>
         <TableCell>
-          {(() => { const sc = statusColor(run.status); return <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, fontWeight: 500, fontSize: 11, bgcolor: sc.bg, color: sc.fg }}>{run.status}</Typography>; })()}
+          {(() => { const sc = statusColor(run.status); return <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, fontWeight: 500, fontSize: 11, bgcolor: sc.bg, color: sc.fg }}>{runStatusLabel(run.status, t)}</Typography>; })()}
         </TableCell>
         <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{run.llm_model ?? "--"}</TableCell>
         <TableCell>{run.recommendations_count}</TableCell>
@@ -105,6 +108,7 @@ function AIRunRow({
                 <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: ui.mutedBg, color: ui.muted, fontSize: 11 }}>{t("diagnostics.triggeredLabel")}: {r.triggered_by}</Typography>
                 <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: ui.mutedBg, color: ui.muted, fontSize: 11 }}>{t("diagnostics.providerLabel")}: {r.llm_provider ?? "—"}</Typography>
                 <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: ui.mutedBg, color: ui.muted, fontSize: 11 }}>{t("diagnostics.skippedLabel")}: {r.aggregates_skipped}</Typography>
+                {(r.input_tokens != null || r.output_tokens != null) && <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: ui.mutedBg, color: ui.muted, fontSize: 11 }}>{t("diagnostics.tokensLabel")}: {r.input_tokens ?? 0} / {r.output_tokens ?? 0}</Typography>}
                 {r.completed_at && <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: ui.mutedBg, color: ui.muted, fontSize: 11 }}>{t("diagnostics.completedLabel")}: {new Date(r.completed_at).toLocaleString()}</Typography>}
               </Box>
               {detail.isLoading && <CircularProgress size={16} />}
@@ -238,10 +242,13 @@ export default function DiagnosticsPanel() {
   const [showRawLLM, setShowRawLLM] = useState<string | null>(null);
   const [logStatusFilter, setLogStatusFilter] = useState<string>("all");
   const [logRouteFilter, setLogRouteFilter] = useState<string>("all");
-  const [logClientKindFilter, setLogClientKindFilter] = useState<"all" | "looker_studio" | "looker_cloud">("all");
+  const [logClientKindFilter, setLogClientKindFilter] = useState<string>("all");
   const [logUserFilter, setLogUserFilter] = useState<string>("");
   const [logDateFrom, setLogDateFrom] = useState<string>("");
   const [logDateTo, setLogDateTo] = useState<string>("");
+  // Bug-7451: probe traffic (introspect/discover-members) is excluded by
+  // default.  The checkbox lets a modeler opt in when they need to audit it.
+  const [logIncludeProbes, setLogIncludeProbes] = useState(false);
 
   const queryLogFilters = useMemo(() => ({
     modelId: modelId!,
@@ -253,7 +260,8 @@ export default function DiagnosticsPanel() {
     userIdentity: logUserFilter || undefined,
     dateFrom: logDateFrom || undefined,
     dateTo: logDateTo || undefined,
-  }), [modelId, logStatusFilter, logRouteFilter, logClientKindFilter, logUserFilter, logDateFrom, logDateTo]);
+    includeProbes: logIncludeProbes || undefined,
+  }), [modelId, logStatusFilter, logRouteFilter, logClientKindFilter, logUserFilter, logDateFrom, logDateTo, logIncludeProbes]);
 
   const queryLogs = useQueryLogs(projectId!, queryLogFilters);
 
@@ -369,14 +377,35 @@ export default function DiagnosticsPanel() {
                 id="query-log-client-kind"
                 value={logClientKindFilter}
                 label={t("diagnostics.clientLabel")}
-                onChange={(e) => setLogClientKindFilter(e.target.value as "all" | "looker_studio" | "looker_cloud")}
+                onChange={(e) => setLogClientKindFilter(e.target.value)}
                 sx={{ fontSize: 12, height: 30 }}
               >
                 <MenuItem value="all">{t("diagnostics.clientAll")}</MenuItem>
                 <MenuItem value="looker_studio">{t("diagnostics.clientLookerStudio")}</MenuItem>
                 <MenuItem value="looker_cloud">{t("diagnostics.clientLookerCloud")}</MenuItem>
+                <MenuItem value="plugin">{t("diagnostics.clientPlugin")}</MenuItem>
+                <MenuItem value="drill">{t("diagnostics.clientDrill")}</MenuItem>
+                <MenuItem value="headless">{t("diagnostics.clientHeadless")}</MenuItem>
+                <MenuItem value="agent">{t("diagnostics.clientAgent")}</MenuItem>
+                <MenuItem value="mcp">{t("diagnostics.clientMcp")}</MenuItem>
+                <MenuItem value="kpi">{t("diagnostics.clientKpi")}</MenuItem>
               </Select>
             </FormControl>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  size="small"
+                  checked={logIncludeProbes}
+                  onChange={(e) => setLogIncludeProbes(e.target.checked)}
+                />
+              }
+              label={
+                <Typography variant="caption" sx={{ fontSize: 11 }}>
+                  {t("diagnostics.includeProbesLabel")}
+                </Typography>
+              }
+              sx={{ ml: 0, mr: 0 }}
+            />
             <Tooltip title={t("diagnostics.exportCsvTooltip")}>
               <IconButton size="small" onClick={handleExportCsv}>
                 <DownloadIcon fontSize="small" />
@@ -504,7 +533,7 @@ export default function DiagnosticsPanel() {
                   <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: ui.mutedBg, color: ui.muted, fontSize: 11 }}>{selectedLog.protocol}</Typography>
                   {selectedLog.client_kind && (
                     <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: ui.mutedBg, color: ui.muted, fontSize: 11 }}>
-                      {selectedLog.client_kind === "looker_cloud" ? t("diagnostics.clientLookerCloud") : t("diagnostics.clientLookerStudio")}
+                      {t(`diagnostics.clientKindLabel.${selectedLog.client_kind}`)}
                     </Typography>
                   )}
                 </Box>
@@ -755,7 +784,7 @@ export default function DiagnosticsPanel() {
                           </Tooltip>
                         </TableCell>
                         <TableCell>
-                          {(() => { const sc = statusColor(r.status); return <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, fontWeight: 500, fontSize: 11, bgcolor: sc.bg, color: sc.fg }}>{r.status}</Typography>; })()}
+                          {(() => { const sc = statusColor(r.status); return <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, fontWeight: 500, fontSize: 11, bgcolor: sc.bg, color: sc.fg }}>{runStatusLabel(r.status, t)}</Typography>; })()}
                         </TableCell>
                         <TableCell>{r.refresh_mode}</TableCell>
                         <TableCell align="right">{rowsText}</TableCell>

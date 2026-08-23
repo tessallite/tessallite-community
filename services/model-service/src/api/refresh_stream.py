@@ -20,12 +20,13 @@ import json
 from typing import AsyncGenerator
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
 from shared.db.models import AggregateDefinition, AggregateRefreshRun, PocketDefinition, PocketRefreshRun
 from shared.db.session import get_tenant_db
+from src.api._scope import ensure_model_in_project
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 
@@ -133,8 +134,33 @@ async def stream_refresh_runs(
     model_id: UUID,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> StreamingResponse:
-    return StreamingResponse(
-        _stream_events(model_id, current_user.tenant_id),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    # Bug-8862: prove project -> model BEFORE the response starts. require_role
+    # gates the caller's ROLE on the path project but never proves the model
+    # belongs to it, so without this a caller bound to project A could stream
+    # another project's refresh-run history by substituting model_id.
+    #
+    # The check runs HERE and not inside ``_stream_events``: once the generator
+    # is handed to StreamingResponse the 200 and the SSE content-type are
+    # already committed, so an HTTPException raised in the generator cannot
+    # become a clean 404 — it would surface as a broken stream instead.
+    #
+    # FAIL CLOSED: the ``return`` sits INSIDE the loop and the fall-through
+    # raises. The only path that reaches StreamingResponse is the one that ran
+    # the guard. A guard followed by an unconditional ``return`` outside the
+    # loop would open the stream unchecked if ``get_tenant_db`` ever yielded
+    # zero sessions — unreachable today (it always yields exactly once), but
+    # the wrong shape for a tenant-isolation check, and unlike every other
+    # handler in this service, whose whole body sits inside the loop so a
+    # zero-yield short-circuits to empty rather than to protected data.
+    async for db in get_tenant_db(current_user.tenant_id):
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        return StreamingResponse(
+            _stream_events(model_id, current_user.tenant_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Tenant database unavailable",
     )

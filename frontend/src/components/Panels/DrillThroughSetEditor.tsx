@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -24,6 +24,7 @@ import type {
   ModelTable,
 } from "../../api/types";
 import { useConfirm } from "../Confirm";
+import { recordDelete, recordUpdate } from "../Builder/emitDrawerHistory";
 import { useT } from "../../i18n";
 import { ui } from "../../theme/tokens";
 
@@ -39,6 +40,27 @@ type ApiErrorBody = {
   message?: string;
   invalid_ids?: string[];
 };
+
+function drillThroughSetPayload(
+  set: DrillThroughSet,
+  measureId: string,
+): Record<string, unknown> {
+  return {
+    source_table_id: set.source_table_id,
+    detail_columns: set.detail_columns ?? null,
+    joined_dimension_ids: set.joined_dimension_ids ?? null,
+    row_limit_override: set.row_limit_override ?? null,
+    source_join_path: set.source_join_path ?? null,
+    __measure_id: measureId,
+  };
+}
+
+// Bug-5935 (F-019-04): mirrors DRILL_MAX_ROW_LIMIT in
+// tessallite/shared/drill_limits.py, the single source of truth the shared
+// schema and query-router's runtime clamp both read. Kept in sync manually
+// because this is a TypeScript file and cannot import the Python constant;
+// it exists purely to fail the save client-side before the round trip.
+const ROW_LIMIT_OVERRIDE_MAX = 10000;
 
 export function DrillThroughSetEditor({
   projectId,
@@ -74,6 +96,7 @@ export function DrillThroughSetEditor({
   const [rowLimitOverride, setRowLimitOverride] = useState<string>("");
   const [sourceJoinPath, setSourceJoinPath] = useState<string[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pruneNotice, setPruneNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (!drillQuery.data) return;
@@ -87,6 +110,7 @@ export function DrillThroughSetEditor({
     );
     setSourceJoinPath(drillQuery.data.source_join_path ?? null);
     setError(null);
+    setPruneNotice(null);
   }, [drillQuery.data]);
 
   const effectiveTableId = useMemo(() => {
@@ -147,15 +171,98 @@ export function DrillThroughSetEditor({
     );
   }, [sourceJoinPath, pathOptions]);
 
+  // Bug-5933 (F-019-02): query-router's drill builder can only project
+  // model DIMENSION names in its semantic SQL — a physical column with no
+  // dimension defined over it raises DRILL_DETAIL_COLUMN_NOT_PROJECTABLE at
+  // drill time even though it looks like a normal column here. Restrict the
+  // picker to physical columns that have a dimension over them on the
+  // effective table, so the editor cannot offer a selection the runtime
+  // (and now model-service, see measures.py _validate_detail_columns) will
+  // reject.
+  const projectableColumnIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const d of dimsQuery.data ?? []) {
+      if (d.source_table_id === effectiveTableId && d.source_column_id) {
+        ids.add(d.source_column_id);
+      }
+    }
+    return ids;
+  }, [dimsQuery.data, effectiveTableId]);
+
   const physicalColumns = useMemo(
-    () => (tableAttrs.data ?? []).filter((a) => a.kind === "physical"),
-    [tableAttrs.data],
+    () =>
+      (tableAttrs.data ?? []).filter(
+        (a) => a.kind === "physical" && projectableColumnIds.has(a.id),
+      ),
+    [tableAttrs.data, projectableColumnIds],
   );
 
+  // Bug-5933 (F-019-02) follow-up, found in review: a set saved before this
+  // fix (or whose dimension was later deleted) can carry a detail_columns id
+  // that is no longer projectable. Left in local state, that id is invisible
+  // in the Autocomplete (it is filtered out of `physicalColumns`) but still
+  // gets resubmitted on the next Save, surfacing a confusing
+  // DRILL_DETAIL_COLUMN_NOT_PROJECTABLE error listing a raw UUID the user
+  // never selected and cannot see in the UI. Prune stale ids once the table's
+  // columns and the model's dimensions have both loaded, and tell the user
+  // why, instead of silently carrying an invisible value forward.
+  const prunedForMeasureRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!drillQuery.data) return;
+    if (tableAttrs.data === undefined || dimsQuery.data === undefined) return;
+    if (prunedForMeasureRef.current === measure.id) return;
+    // Guard against a race between the two data sources `physicalColumns`
+    // depends on: `tableAttrs`/`dimsQuery` key off `effectiveTableId`, which
+    // itself derives from `sourceTableId` state — populated by a SEPARATE
+    // effect only after `drillQuery.data` arrives. If `tableAttrs` for the
+    // measure's INTRINSIC table happens to resolve before that population
+    // effect commits, this effect can fire in the same commit where
+    // `drillQuery.data` first shows an override `source_table_id`, comparing
+    // the override's detail columns against the intrinsic table's columns —
+    // wrongly pruning valid ones. Only prune once `effectiveTableId` agrees
+    // with the loaded set's actual table, so `physicalColumns` is guaranteed
+    // to be computed for the same table the loaded `detailColumns` belong to.
+    const loadedTableId = drillQuery.data.source_table_id ?? measure.source_table_id ?? null;
+    if (loadedTableId !== effectiveTableId) return;
+    prunedForMeasureRef.current = measure.id;
+    // Read the SERVER-loaded detail_columns (drillQuery.data), not the local
+    // `detailColumns` state — found in review: on the commit where
+    // drillQuery.data first arrives, the separate populate effect (above)
+    // has only QUEUED setDetailColumns(...); this effect's closure would
+    // still see the pre-hydration `detailColumns` (`[]` on first load), so
+    // computing `stale` from local state made this a permanent no-op on the
+    // common (no-override, warm-cache) path — the exact case it exists to
+    // catch. `drillQuery.data.detail_columns` is available synchronously in
+    // the same render, so it is not subject to the same one-render lag.
+    const validIds = new Set(physicalColumns.map((c) => c.id));
+    const loadedDetailColumns = drillQuery.data.detail_columns ?? [];
+    const stale = loadedDetailColumns.filter((id) => !validIds.has(id));
+    if (stale.length === 0) return;
+    setDetailColumns((prev) => prev.filter((id) => validIds.has(id)));
+    setPruneNotice(
+      t("drillThrough.staleDetailColumnsPruned", { count: stale.length }),
+    );
+  }, [
+    drillQuery.data,
+    tableAttrs.data,
+    dimsQuery.data,
+    physicalColumns,
+    effectiveTableId,
+    measure.id,
+    measure.source_table_id,
+    t,
+  ]);
+
   const updateMut = useMutation({
-    mutationFn: (data: DrillThroughSetUpdate) =>
-      measuresApi.updateDrillThroughSet(projectId, modelId, measure.id, data),
-    onSuccess: (data) => {
+    mutationFn: (vars: { data: DrillThroughSetUpdate; prior: Record<string, unknown> }) =>
+      measuresApi.updateDrillThroughSet(projectId, modelId, measure.id, vars.data),
+    onSuccess: (data, variables) => {
+      recordUpdate(
+        "drillThroughSet",
+        measure.id,
+        variables.prior,
+        { ...variables.data, __measure_id: measure.id },
+      );
       qc.setQueryData(
         ["drillThroughSet", projectId, modelId, measure.id],
         data,
@@ -166,9 +273,10 @@ export function DrillThroughSetEditor({
   });
 
   const resetMut = useMutation({
-    mutationFn: () =>
+    mutationFn: (prior: Record<string, unknown>) =>
       measuresApi.resetDrillThroughSet(projectId, modelId, measure.id),
-    onSuccess: (data: DrillThroughSet) => {
+    onSuccess: (data: DrillThroughSet, prior) => {
+      recordDelete("drillThroughSet", measure.id, prior);
       qc.setQueryData(
         ["drillThroughSet", projectId, modelId, measure.id],
         data,
@@ -206,8 +314,19 @@ export function DrillThroughSetEditor({
     let limit: number | null = null;
     if (rowLimitOverride.trim() !== "") {
       const parsed = Number(rowLimitOverride);
-      if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
-        setError(t("drillThrough.rowLimitError"));
+      // Bug-5935 (F-019-04): the runtime clamps every drill page to
+      // DRILL_MAX_ROW_LIMIT (tessallite/shared/drill_limits.py, currently
+      // 10,000) and the shared schema now rejects a save above that ceiling
+      // (DrillThroughSetUpdate.row_limit_override Field(le=...)). Reject the
+      // same range here so the user sees the problem before saving instead
+      // of after a silent runtime clamp.
+      if (
+        !Number.isFinite(parsed) ||
+        parsed <= 0 ||
+        !Number.isInteger(parsed) ||
+        parsed > ROW_LIMIT_OVERRIDE_MAX
+      ) {
+        setError(t("drillThrough.rowLimitError", { max: ROW_LIMIT_OVERRIDE_MAX }));
         return;
       }
       limit = parsed;
@@ -216,7 +335,7 @@ export function DrillThroughSetEditor({
       setError(t("drillThrough.multipleJoinPaths"));
       return;
     }
-    updateMut.mutate({
+    const data: DrillThroughSetUpdate = {
       source_table_id: sourceTableId,
       detail_columns: detailColumns.length > 0 ? detailColumns : null,
       joined_dimension_ids:
@@ -224,6 +343,12 @@ export function DrillThroughSetEditor({
       row_limit_override: limit,
       source_join_path:
         overrideRequiresPath && sourceJoinPath ? sourceJoinPath : null,
+    };
+    updateMut.mutate({
+      data,
+      prior: drillQuery.data
+        ? drillThroughSetPayload(drillQuery.data, measure.id)
+        : { __measure_id: measure.id },
     });
   };
 
@@ -234,7 +359,13 @@ export function DrillThroughSetEditor({
       confirmLabel: t("drillThrough.reset"),
       destructive: false,
     });
-    if (ok) resetMut.mutate();
+    if (ok) {
+      resetMut.mutate(
+        drillQuery.data
+          ? drillThroughSetPayload(drillQuery.data, measure.id)
+          : { __measure_id: measure.id },
+      );
+    }
   };
 
   return (
@@ -242,6 +373,11 @@ export function DrillThroughSetEditor({
       <Typography variant="subtitle2">{t("drillThrough.configuration")}</Typography>
 
       {error && <Alert severity="error">{error}</Alert>}
+      {!error && pruneNotice && (
+        <Alert severity="warning" onClose={() => setPruneNotice(null)}>
+          {pruneNotice}
+        </Alert>
+      )}
 
       <FormControl size="small" fullWidth>
         <InputLabel id={`dt-source-${measure.id}`}>{t("drillThrough.sourceTableOverride")}</InputLabel>
@@ -348,8 +484,8 @@ export function DrillThroughSetEditor({
         type="number"
         value={rowLimitOverride}
         onChange={(e) => setRowLimitOverride(e.target.value)}
-        helperText={t("drillThrough.rowLimitHelp")}
-        inputProps={{ min: 1, step: 1 }}
+        helperText={t("drillThrough.rowLimitHelp", { max: ROW_LIMIT_OVERRIDE_MAX })}
+        inputProps={{ min: 1, max: ROW_LIMIT_OVERRIDE_MAX, step: 1 }}
       />
 
       <Stack direction="row" spacing={1} justifyContent="flex-end">

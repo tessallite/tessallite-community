@@ -34,6 +34,15 @@ response = requests.get(
     auth=(&quot;user@example.com&quot;, &quot;yourpassword&quot;)
 )
 print(response.json())</code></pre>
+<h2>Personal Access Tokens (for single sign-on users)</h2>
+<p>If you sign in to Tessallite through single sign-on (SAML or OIDC), you do not have a password to type into a BI tool such as Excel or Power BI. Instead, generate a <strong>Personal Access Token</strong> and use it in place of the password.</p>
+<p><strong>How to create one:</strong></p>
+<ol><li>Sign in to the Tessallite web app.</li><li>Open the account menu (top right) and choose <strong>Personal Access Tokens</strong>.</li><li>Click <strong>Generate token</strong>, give it a label (for example, &quot;Excel on my laptop&quot;), and optionally set an expiry.</li><li>Copy the token immediately. It is shown <strong>once</strong> and cannot be retrieved again. Store it somewhere safe, like a password manager.</li></ol>
+<p><strong>How to use one:</strong></p>
+<ul><li>In Excel (Analysis Services / XMLA), Power BI (PostgreSQL connector on port 5433), or any JDBC/SQL client, enter your Tessallite <strong>email</strong> as the username and the <strong>token</strong> as the password.</li><li>The token carries your own permissions. Revoking it, or deactivating your account, stops it working.</li></ul>
+<p><strong>Managing tokens:</strong> the same page lists your tokens (label, a masked preview, when each was created, and when it was last used) and lets you <strong>revoke</strong> any token. A revoked or expired token is refused on its next connection; a BI session already open ends within a short window.</p>
+<blockquote><p>A Personal Access Token is a secret, just like a password. Anyone who has it can query Tessallite as you until it is revoked or expires. Do not paste it into email, chat, or source code.</p></blockquote>
+<p>Password users can also generate a token — it is a convenient way to connect a BI tool without embedding your account password in a connection string.</p>
 <h2>Common authentication errors</h2>
 <div class="table-wrapper"><table><thead><tr><th>HTTP status</th><th>Meaning</th><th>Resolution</th></tr></thead><tbody><tr><td><code>401 Unauthorized</code></td><td>No credentials or wrong credentials</td><td>Verify email and password; confirm Authorization header is sent</td></tr><tr><td><code>403 Forbidden</code></td><td>Credentials correct but role insufficient</td><td>Use an account with the required role</td></tr></tbody></table></div>
 <h2>Security recommendations</h2>

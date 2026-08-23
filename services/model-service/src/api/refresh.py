@@ -8,7 +8,12 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 
-from shared.db.models import AggregateDefinition, AggregateRefreshPolicy, AggregateRefreshRun
+from shared.db.models import (
+    AggregateDefinition,
+    AggregateRefreshPolicy,
+    AggregateRefreshRun,
+    Model,
+)
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import (
     RefreshPolicyCreate,
@@ -16,6 +21,7 @@ from shared.schemas.pydantic_models import (
     RefreshRunResponse,
 )
 from src.auth.middleware import CurrentUser, forbid_embed_user
+from src.auth.rbac import require_role
 
 router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}/aggregates/{agg_id}/refresh",
@@ -29,10 +35,41 @@ model_refresh_router = APIRouter(
 )
 
 
+async def _get_scoped_model(db, project_id: UUID, model_id: UUID) -> Model:
+    """Prove the model belongs to the path project. Mirrors the same helper in
+    ``pockets.py`` and ``row_security.py``."""
+    model = await db.get(Model, model_id)
+    if model is None or model.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Model not found")
+    return model
+
+
+async def _get_scoped_aggregate(
+    db, project_id: UUID, model_id: UUID, agg_id: UUID
+) -> AggregateDefinition:
+    """Prove the full project -> model -> aggregate chain before any read or write.
+
+    Bug-8786: these handlers took ``project_id`` and ``model_id`` as path
+    parameters and never used them, querying by ``agg_id`` alone. RBAC gates the
+    caller's ROLE (Bug-7891) but not resource ownership, so a same-tenant caller
+    authorised for one project could read or mutate another project's refresh
+    policy and run history purely by substituting IDs.
+
+    404 rather than 403 on a mismatch: confirming the resource exists elsewhere
+    in the tenant would itself leak cross-project information.
+    """
+    await _get_scoped_model(db, project_id, model_id)
+    agg = await db.get(AggregateDefinition, agg_id)
+    if agg is None or agg.model_id != model_id:
+        raise HTTPException(status_code=404, detail="Aggregate not found")
+    return agg
+
+
 @router.post(
     "/policy",
     response_model=RefreshPolicyResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[require_role("modeler")],
 )
 async def upsert_refresh_policy(
     project_id: UUID,
@@ -42,6 +79,7 @@ async def upsert_refresh_policy(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> RefreshPolicyResponse:
     async for db in get_tenant_db(current_user.tenant_id):
+        await _get_scoped_aggregate(db, project_id, model_id, agg_id)
         result = await db.execute(
             select(AggregateRefreshPolicy).where(
                 AggregateRefreshPolicy.aggregate_definition_id == agg_id
@@ -61,7 +99,11 @@ async def upsert_refresh_policy(
         return RefreshPolicyResponse.model_validate(policy)
 
 
-@router.get("/policy", response_model=RefreshPolicyResponse)
+@router.get(
+    "/policy",
+    response_model=RefreshPolicyResponse,
+    dependencies=[require_role("viewer")],
+)
 async def get_refresh_policy(
     project_id: UUID,
     model_id: UUID,
@@ -69,6 +111,7 @@ async def get_refresh_policy(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> RefreshPolicyResponse:
     async for db in get_tenant_db(current_user.tenant_id):
+        await _get_scoped_aggregate(db, project_id, model_id, agg_id)
         result = await db.execute(
             select(AggregateRefreshPolicy).where(
                 AggregateRefreshPolicy.aggregate_definition_id == agg_id
@@ -103,7 +146,11 @@ def _serialize_run(
     )
 
 
-@router.get("/runs", response_model=list[RefreshRunResponse])
+@router.get(
+    "/runs",
+    response_model=list[RefreshRunResponse],
+    dependencies=[require_role("viewer")],
+)
 async def list_refresh_runs(
     project_id: UUID,
     model_id: UUID,
@@ -111,8 +158,8 @@ async def list_refresh_runs(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> list[RefreshRunResponse]:
     async for db in get_tenant_db(current_user.tenant_id):
-        agg_def = await db.get(AggregateDefinition, agg_id)
-        table_name = agg_def.physical_table_name if agg_def is not None else None
+        agg_def = await _get_scoped_aggregate(db, project_id, model_id, agg_id)
+        table_name = agg_def.physical_table_name
         result = await db.execute(
             select(AggregateRefreshRun)
             .where(AggregateRefreshRun.aggregate_definition_id == agg_id)
@@ -122,7 +169,11 @@ async def list_refresh_runs(
         return [_serialize_run(r, table_name) for r in result.scalars().all()]
 
 
-@model_refresh_router.get("/runs", response_model=list[RefreshRunResponse])
+@model_refresh_router.get(
+    "/runs",
+    response_model=list[RefreshRunResponse],
+    dependencies=[require_role("viewer")],
+)
 async def list_model_refresh_runs(
     project_id: UUID,
     model_id: UUID,
@@ -130,6 +181,7 @@ async def list_model_refresh_runs(
 ) -> list[RefreshRunResponse]:
     """Return all refresh runs across all aggregates for the model, newest first."""
     async for db in get_tenant_db(current_user.tenant_id):
+        await _get_scoped_model(db, project_id, model_id)
         aggs_result = await db.execute(
             select(AggregateDefinition.id, AggregateDefinition.physical_table_name).where(
                 AggregateDefinition.model_id == model_id

@@ -110,6 +110,7 @@
   "publicGlossary.downloadPdf": "تنزيل PDF",
   "publicGlossary.entryCount": "{{visible}} من {{total}} مُدخَل",
   "publicGlossary.invalidLink": "رابط المشاركة هذا غير صالح أو منتهي الصلاحية. اطلب من مالك النموذج إنشاء رابط جديد.",
+  "publicGlossary.loadError": "تعذر تحميل المصطلحات. يرجى المحاولة لاحقًا أو التواصل مع مالك النموذج.",
   "publicGlossary.noResults": "لا توجد مُدخَلات مسرد مطابقة لبحثك.",
   "publicGlossary.overline": "مسرد Tessallite",
   "publicGlossary.searchPlaceholder": "بحث المصطلحات، التعريفات، المترادفات…",

@@ -15,9 +15,18 @@ import { useT } from "../../i18n";
 import { useAISchedulerConfig, useLLMConfigs } from "../../api/hooks";
 import { aiSchedulerApi } from "../../api/client";
 import { agentApi } from "../../api/agentApi";
+import { extractApiError } from "../../utils/extractApiError";
 import type { ModelAISchedulerConfigUpdate, LLMProviderConfig } from "../../api/types";
 import LLMFunctionAssignments, { type LLMFunctionRow } from "./LLMFunctionAssignments";
 
+/**
+ * The scheduler-config endpoint answers two error shapes. Most failures carry
+ * a plain string `detail`; the body foreign-key scope guards in model-service's
+ * `_scope` family carry the structured `{error_code, field, ids, message}`
+ * object that the whole family uses. Rendering that object straight into an
+ * MUI `<Alert>` throws in React ("Objects are not valid as a React child"), so
+ * the message is unwrapped here rather than assumed to be a string.
+ */
 export default function ModelLLMFunctions({
   projectId,
   modelId,
@@ -56,8 +65,12 @@ export default function ModelLLMFunctions({
       setTimeout(() => setSaved(false), 1500);
       qc.setQueryData(["aiSchedulerConfig", projectId, modelId], data);
     },
-    onError: (err: { response?: { data?: { detail?: string } } }) => {
-      setError(err.response?.data?.detail ?? t("llmFunctions.saveFailed"));
+    // The hand-rolled `detail?: string` unwrap here only ever saw a plain-string
+    // detail: it rendered nothing for FastAPI's list-shaped 422 and nothing for
+    // the structured {error_code, field, message} body-FK detail. Use the shared
+    // helper so every consumer reads the same three shapes.
+    onError: (err: unknown) => {
+      setError(extractApiError(err, t("llmFunctions.saveFailed")));
       if (configQuery.data) {
         setAggregate(configQuery.data.llm_config_id ?? "");
         setGlossary(configQuery.data.glossary_llm_config_id ?? "");

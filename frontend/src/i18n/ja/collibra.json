@@ -1,4 +1,5 @@
 {
+  "collibra.activate": "有効化",
   "collibra.addConnection": "接続を追加",
   "collibra.assets": "アセット",
   "collibra.assetsCount": "{{count}} 件のアセット",
@@ -8,6 +9,7 @@
   "collibra.baseUrlPlaceholder": "https://your-company.collibra.com",
   "collibra.communityChip": "コミュニティ: {{value}}",
   "collibra.communityId": "コミュニティID",
+  "collibra.deactivate": "無効化",
   "collibra.delete": "削除",
   "collibra.deleteFailed": "削除に失敗しました。",
   "collibra.details": "詳細",

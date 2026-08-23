@@ -34,16 +34,42 @@ import DeleteIcon from "@mui/icons-material/Delete";
 import EditIcon from "@mui/icons-material/Edit";
 import AccessTimeIcon from "@mui/icons-material/AccessTime";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
-import { canEditModelConfig } from "../../auth/currentUser";
+import { useCanAuthorModel } from "../../auth/useCanAuthorModel";
 import { dimensionsApi, modelTablesApi } from "../../api/client";
+import { recordCreate, recordUpdate, recordDelete } from "../Builder/emitDrawerHistory";
 import { useAllModelTables, useDimensions, useModelSourceStatistics, useSources, useTableAttributes } from "../../api/hooks";
 import { useConfirm } from "../Confirm";
-import { useBuilderStore } from "../../store/builderStore";
+import { extractApiError } from "../../utils/extractApiError";
 import { ui } from "../../theme/tokens";
 import type { DimensionCreate } from "../../api/types";
 import DimensionCalendarAssociation from "../Builder/DimensionCalendarAssociation";
+import AttributeRelationshipsSection from "./AttributeRelationshipsSection";
 
 const TIME_GRAINS = ["year", "quarter", "month", "week", "day", "hour", "minute"] as const;
+
+/**
+ * Map a persisted dimension to a create-shaped payload so undo/redo can restore
+ * it (Bug-8227). Used to build the inverse op for a delete (re-create) and the
+ * prior-values op for an update.
+ */
+function dimensionToPayload(d: import("../../api/types").Dimension): Record<string, unknown> {
+  // Use ?? null (not ?? undefined) so undo actively resets a newly-set field
+  // back to null via the PATCH (Fable review finding 3).
+  return {
+    name: d.name,
+    display_name: d.display_name || d.name,
+    description: d.description ?? null,
+    display_folder: d.display_folder ?? null,
+    source_table_id: d.source_table_id ?? null,
+    source_column_name: d.source_column_name ?? null,
+    display_column_name: d.display_column_name ?? null,
+    data_type: d.data_type ?? null,
+    user_defined_attribute_id: d.user_defined_attribute_id ?? null,
+    is_time_dim: d.is_time_dim,
+    time_grain: d.time_grain ?? null,
+    calc_expression: d.calc_expression ?? null,
+  };
+}
 
 export default function DimensionsPanel() {
   const { projectId, modelId } = useParams<{
@@ -72,9 +98,21 @@ export default function DimensionsPanel() {
   const [dimCalendarId, setDimCalendarId] = useState<string | null>(null);
   const [dimCalendarType, setDimCalendarType] = useState<string | null>(null);
   const [dimHierarchyLevels, setDimHierarchyLevels] = useState<string[]>([]);
+  // F-026-01: surfaces a failed calendar-association PATCH. The dimension row
+  // itself has been written by the time this fires, so we keep the dialog open
+  // and show a retryable error rather than reporting the combined save as
+  // successful with the calendar binding silently dropped.
+  //
+  // Bug-8904 sibling: this used to be a bare boolean, so the panel rendered one
+  // fixed sentence no matter WHY the PATCH was refused. The body-FK guards
+  // answer 422 with a structured detail ({error_code, field, message}) that
+  // names the actual reason — "that calendar belongs to another model" reads
+  // very differently from a transport failure. Hold the server's own message
+  // so the modeller is told what to fix, with the fixed sentence kept only as
+  // the fallback for a failure that carried no message.
+  const [calendarError, setCalendarError] = useState<string | null>(null);
 
-  const storeReadOnly = useBuilderStore((s) => s.readOnly);
-  const canEdit = canEditModelConfig() && !storeReadOnly;
+  const canEdit = useCanAuthorModel();
   const dimensions = useDimensions(projectId!, modelId!);
   const sources = useSources(projectId!, modelId!);
   const sourceIds = (sources.data ?? []).map((s) => s.id);
@@ -136,68 +174,134 @@ export default function DimensionsPanel() {
   }
 
   /** After creating/updating a dimension, persist the calendar association
-   *  on the source model table if the user selected one (Bug-5245/5297). */
+   *  on the source model table if the user selected one (Bug-5245/5297).
+   *
+   *  F-026-01: this is a second, independent write for a single user intent
+   *  ("this time dimension uses that calendar"). It must NOT be treated as
+   *  best-effort — a discarded failure leaves the persisted model materially
+   *  different from what the modeller configured. On failure it throws so the
+   *  calling onSuccess handler can keep the dialog open and report the error
+   *  instead of closing on a silently-partial save. */
   async function persistCalendarAssociation() {
     if (!dimCalendarId || !dimTableId || !selectedTable) return;
-    try {
-      await modelTablesApi.update(
-        projectId!,
-        modelId!,
-        selectedTable.source_id,
-        dimTableId,
-        { calendar_table_id: dimCalendarId },
-      );
-      qc.invalidateQueries({ queryKey: ["modelTables"] });
-    } catch {
-      // Calendar binding is best-effort; the dimension itself has been saved.
-    }
+    await modelTablesApi.update(
+      projectId!,
+      modelId!,
+      selectedTable.source_id,
+      dimTableId,
+      { calendar_table_id: dimCalendarId },
+    );
+    qc.invalidateQueries({ queryKey: ["modelTables"] });
   }
 
   const createDim = useMutation({
-    mutationFn: () => dimensionsApi.create(projectId!, modelId!, buildDimensionPayload()),
-    onSuccess: async () => {
-      await persistCalendarAssociation();
+    mutationFn: async () => {
+      const payload = buildDimensionPayload();
+      const created = await dimensionsApi.create(projectId!, modelId!, payload);
+      return { created, payload };
+    },
+    onSuccess: async ({ created, payload }) => {
+      // Bug-8227: record the create so undo removes it / redo re-creates it.
+      recordCreate("dimension", created.id, payload as unknown as Record<string, unknown>);
       qc.invalidateQueries({
         queryKey: ["dimensions", projectId, modelId],
       });
+      try {
+        await persistCalendarAssociation();
+      } catch (err) {
+        // Dimension row saved, calendar binding did not. Keep the dialog open
+        // with a retryable error; do not report the combined save as done.
+        // Promote to edit mode on the just-created id so a retry routes to
+        // updateDim + persistCalendarAssociation, not another create (review
+        // finding: duplicate-on-retry).
+        setEditingDimId(created.id);
+        setCalendarError(
+          extractApiError(err, t("dimensions.calendarAssociationFailed")),
+        );
+        return;
+      }
       setDialogOpen(false);
     },
   });
 
   const updateDim = useMutation({
-    mutationFn: () =>
-      dimensionsApi.update(projectId!, modelId!, editingDimId!, buildDimensionPayload()),
-    onSuccess: async () => {
-      await persistCalendarAssociation();
+    mutationFn: async () => {
+      const payload = buildDimensionPayload();
+      const prior = (dimensions.data ?? []).find((d) => d.id === editingDimId);
+      const priorPayload = prior ? dimensionToPayload(prior) : null;
+      await dimensionsApi.update(projectId!, modelId!, editingDimId!, payload);
+      return { id: editingDimId!, payload, priorPayload };
+    },
+    onSuccess: async ({ id, payload, priorPayload }) => {
+      if (priorPayload) {
+        recordUpdate(
+          "dimension",
+          id,
+          priorPayload,
+          payload as unknown as Record<string, unknown>,
+        );
+      }
       qc.invalidateQueries({
         queryKey: ["dimensions", projectId, modelId],
       });
+      try {
+        await persistCalendarAssociation();
+      } catch (err) {
+        setCalendarError(
+          extractApiError(err, t("dimensions.calendarAssociationFailed")),
+        );
+        return;
+      }
       setDialogOpen(false);
       setEditingDimId(null);
     },
   });
 
   const deleteDim = useMutation({
-    mutationFn: (id: string) =>
-      dimensionsApi.delete(projectId!, modelId!, id),
-    onSuccess: () =>
+    mutationFn: async (dim: import("../../api/types").Dimension) => {
+      await dimensionsApi.delete(projectId!, modelId!, dim.id);
+      return dim;
+    },
+    onSuccess: (dim) => {
+      recordDelete(
+        "dimension",
+        dim.id,
+        dimensionToPayload(dim),
+      );
       qc.invalidateQueries({
         queryKey: ["dimensions", projectId, modelId],
-      }),
+      });
+    },
   });
 
+  // Attribute-relationship section binds to the PERSISTED dimension (not the
+  // mid-edit form): a declaration pins the dimension's saved key column and its
+  // detail must live in the saved source table. UDA/calc dims have no physical
+  // key so they get no relationship section.
+  const editingDim = editingDimId
+    ? dimensions.data?.find((d) => d.id === editingDimId)
+    : undefined;
+  const editingDimSourceTableId =
+    editingDim && editingDim.source_column_id
+      ? editingDim.source_table_id
+      : null;
+  const editingDimKeyColumnName =
+    editingDim && editingDim.source_column_id
+      ? editingDim.source_column_name
+      : null;
+
   const confirm = useConfirm();
-  async function handleDeleteDim(id: string, name: string) {
+  async function handleDeleteDim(dim: import("../../api/types").Dimension) {
     const ok = await confirm({
       title: t("dimensions.deleteTitle"),
       message: (
         <span>
-          {t("dimensions.deleteMessage", { name })}
+          {t("dimensions.deleteMessage", { name: dim.name })}
         </span>
       ),
       confirmLabel: t("common.delete"),
     });
-    if (ok) deleteDim.mutate(id);
+    if (ok) deleteDim.mutate(dim);
   }
 
   function tableLabel(tableId: string | null) {
@@ -222,6 +326,7 @@ export default function DimensionsPanel() {
     setDimCalendarId(null);
     setDimCalendarType(null);
     setDimHierarchyLevels([]);
+    setCalendarError(null);
     setDialogOpen(true);
   }
 
@@ -255,6 +360,7 @@ export default function DimensionsPanel() {
     setDimCalendarId(editTable?.calendar_table_id ?? null);
     setDimCalendarType(null);
     setDimHierarchyLevels([]);
+    setCalendarError(null);
     setDialogOpen(true);
   }
 
@@ -351,6 +457,20 @@ export default function DimensionsPanel() {
                           </Typography>
                         </Tooltip>
                       )}
+                      {d.detail_of_dimension_name && (
+                        <Tooltip title={t("attributeRelationships.provenanceTooltip", { name: d.detail_of_dimension_name })}>
+                          <Typography component="span" variant="caption" sx={{ display: "inline-flex", alignItems: "center", gap: 0.25, px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: ui.goldBg, color: ui.goldDark, fontWeight: 500, fontSize: 11 }}>
+                            {t("attributeRelationships.provenanceChip", { name: d.detail_of_dimension_name })}
+                          </Typography>
+                        </Tooltip>
+                      )}
+                      {(d.attribute_relationships?.length ?? 0) > 0 && !d.detail_of_dimension_name && (
+                        <Tooltip title={t("attributeRelationships.pairMarkerTooltip", { count: d.attribute_relationships?.length ?? 0 })}>
+                          <Typography component="span" variant="caption" sx={{ display: "inline-flex", alignItems: "center", gap: 0.25, px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: ui.greenBg, color: ui.green, fontWeight: 500, fontSize: 11 }}>
+                            {t("attributeRelationships.pairMarkerChip", { count: d.attribute_relationships?.length ?? 0 })}
+                          </Typography>
+                        </Tooltip>
+                      )}
                     </Box>
                   </TableCell>
                   {canEdit && (
@@ -366,7 +486,7 @@ export default function DimensionsPanel() {
                     <Tooltip title={t("common.delete")}>
                       <IconButton
                         size="small"
-                        onClick={() => handleDeleteDim(d.id, d.name)}
+                        onClick={() => handleDeleteDim(d)}
                       >
                         <DeleteIcon fontSize="small" />
                       </IconButton>
@@ -568,9 +688,40 @@ export default function DimensionsPanel() {
             }}
           />
 
+          {/* Derived-grain routing: declared key-to-detail relationships.
+              Rendered for any persisted dimension. A relationship pins the
+              dimension's current key column and needs a real detail column in
+              the same source table, so the section itself explains (and blocks)
+              when the dimension has no physical key column (UDA / calc dims). */}
+          {editingDimId && (
+            <AttributeRelationshipsSection
+              projectId={projectId!}
+              modelId={modelId!}
+              dimensionId={editingDimId}
+              sourceTableId={editingDimSourceTableId}
+              keyColumnName={editingDimKeyColumnName}
+              canEdit={canEdit}
+            />
+          )}
+
           {(createDim.isError || updateDim.isError) && (
             <Alert severity="error" sx={{ mt: 1 }}>
               {t(editingDimId ? "dimensions.updateFailed" : "dimensions.createFailed")}
+            </Alert>
+          )}
+          {calendarError && (
+            <Alert severity="error" sx={{ mt: 1 }}>
+              {/* The fixed sentence states what the partial save left behind
+                  (dimension written, calendar not linked) — the server cannot
+                  know that. `calendarError` states WHY the server refused. Both
+                  matter, so render both rather than letting the generic string
+                  swallow the specific reason. */}
+              {t("dimensions.calendarAssociationFailed")}
+              {calendarError !== t("dimensions.calendarAssociationFailed") && (
+                <Box component="span" sx={{ display: "block", mt: 0.5 }}>
+                  {calendarError}
+                </Box>
+              )}
             </Alert>
           )}
         </DialogContent>
@@ -578,7 +729,10 @@ export default function DimensionsPanel() {
           <Button onClick={() => setDialogOpen(false)}>{t("common.cancel")}</Button>
           <Button
             variant="contained"
-            onClick={() => (editingDimId ? updateDim.mutate() : createDim.mutate())}
+            onClick={() => {
+              setCalendarError(null);
+              return editingDimId ? updateDim.mutate() : createDim.mutate();
+            }}
             disabled={!dimName || createDim.isPending || updateDim.isPending}
           >
             {createDim.isPending || updateDim.isPending ? (

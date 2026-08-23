@@ -27,8 +27,8 @@ vi.mock("../i18n", async (importOriginal) => {
 const measure = (name: string): Measure =>
   ({ id: name, name, is_additive: true } as unknown as Measure);
 
-describe("AggregateEstimate quantile note (MEDIUM-1 round 4)", () => {
-  it("does not promise universal exact PERCENTILE_CONT for quantiles", () => {
+describe("AggregateEstimate quantile note (MEDIUM-1 round 4; Bug-5891)", () => {
+  it("advertises only the routable median (p50), not non-median percentiles", () => {
     render(
       <AggregateEstimate
         selectedDimensions={["country"]}
@@ -36,12 +36,15 @@ describe("AggregateEstimate quantile note (MEDIUM-1 round 4)", () => {
         includeQuantiles
       />,
     );
-    const note = screen.getByText(/quantile columns included/i);
+    const note = screen.getByText(/median \(p50\) column included/i);
     // BigQuery materialises APPROX_QUANTILES and Spark uses PERCENTILE(), so the
     // note must not advertise exact PERCENTILE_CONT for every source.
     expect(note.textContent).not.toMatch(/PERCENTILE_CONT/);
     // Exactness is conditional on the source, not universal.
     expect(note.textContent).toMatch(/where the source supports it/i);
+    // Bug-5891: non-median percentiles are not materialised/offered, so the note
+    // must not promise p90/p95/p99.
+    expect(note.textContent).not.toMatch(/p9[059]/);
   });
 
   it("omits the quantile note when quantiles are disabled", () => {
@@ -52,6 +55,6 @@ describe("AggregateEstimate quantile note (MEDIUM-1 round 4)", () => {
         includeQuantiles={false}
       />,
     );
-    expect(screen.queryByText(/quantile columns included/i)).toBeNull();
+    expect(screen.queryByText(/median \(p50\) column included/i)).toBeNull();
   });
 });

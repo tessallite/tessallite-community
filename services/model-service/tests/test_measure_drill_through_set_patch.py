@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from .result_fakes import FakeScalarResult
 
 from shared.db.models import (
     Dimension,
@@ -55,7 +56,7 @@ class _ScalarResult:
         self._items = items
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return list(self._items)
@@ -249,7 +250,9 @@ async def test_get_drill_through_set_404_when_measure_missing(client):
 
 
 @pytest.mark.asyncio
-async def test_get_drill_through_set_400_for_calculated_measure(client):
+async def test_get_drill_through_set_404_for_calculated_measure(client):
+    """Bug-6621(a): calculated measures now return 404 (not 400) so the
+    error code does not function as an existence/type oracle."""
     measure_id = uuid.uuid4()
     measure = _measure(measure_id=measure_id, measure_type="calculated")
     model = make_model()
@@ -260,8 +263,7 @@ async def test_get_drill_through_set_400_for_calculated_measure(client):
     with patch("src.api.measures.get_tenant_db", async_gen_from(db)):
         resp = await client.get(f"{PREFIX}/{measure_id}/drill-through-set")
 
-    assert resp.status_code == 400
-    assert "Calculated" in resp.json()["detail"]
+    assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +327,15 @@ async def test_list_drill_join_paths_does_not_write_when_no_drill_row(client):
         ),
     )
 
-    with patch("src.api.measures.get_tenant_db", async_gen_from(db)):
+    with (
+        patch("src.api.measures.get_tenant_db", async_gen_from(db)),
+        # No effective persona for this caller — the Bug-6614 visibility gate is
+        # a no-op here, leaving the scripted join-edge result for the enumerator.
+        patch(
+            "src.api.measures.resolve_effective_persona",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
         resp = await client.get(
             f"{PREFIX}/{measure_id}/drill-through-set/join-paths",
             params={"source_table_id": str(override_table_id)},
@@ -376,6 +386,38 @@ async def test_patch_row_limit_override(client):
 
 @pytest.mark.asyncio
 async def test_patch_row_limit_override_rejects_zero(client):
+    """Bug-5935 (F-019-04): bounds now live on the DrillThroughSetUpdate
+    schema (Field(ge=1, le=DRILL_MAX_ROW_LIMIT)), so an out-of-range value
+    fails FastAPI body validation (422) before the handler runs — it no
+    longer reaches the old manual ``val <= 0`` check that returned 400."""
+    measure_id = uuid.uuid4()
+
+    resp = await client.patch(
+        f"{PREFIX}/{measure_id}/drill-through-set",
+        json={"row_limit_override": 0},
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_row_limit_override_rejects_above_ceiling(client):
+    """Bug-5935 (F-019-04): a value above the runtime's DRILL_MAX_ROW_LIMIT
+    clamp (10,000) must be rejected at save time, not silently clamped at
+    drill time."""
+    measure_id = uuid.uuid4()
+
+    resp = await client.patch(
+        f"{PREFIX}/{measure_id}/drill-through-set",
+        json={"row_limit_override": 50000},
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_row_limit_override_accepts_ceiling_value(client):
+    """The ceiling itself (10,000) is a valid, accepted value."""
     measure_id = uuid.uuid4()
     measure = _measure(measure_id=measure_id)
     drill = _drill(measure_id=measure_id)
@@ -385,13 +427,19 @@ async def test_patch_row_limit_override_rejects_zero(client):
     db.get = _scripted_get(model=model, measure=measure)
     db.execute = _execute_script(_ScalarResult([drill]))
 
+    async def _refresh(obj):
+        return None
+
+    db.refresh = _refresh
+
     with patch("src.api.measures.get_tenant_db", async_gen_from(db)):
         resp = await client.patch(
             f"{PREFIX}/{measure_id}/drill-through-set",
-            json={"row_limit_override": 0},
+            json={"row_limit_override": 10000},
         )
 
-    assert resp.status_code == 400
+    assert resp.status_code == 200, resp.text
+    assert drill.row_limit_override == 10000
 
 
 @pytest.mark.asyncio
@@ -444,7 +492,8 @@ async def test_patch_detail_columns_happy_path(client):
     db.get = _scripted_get(model=model, measure=measure, table=table, column=column)
     db.execute = _execute_script(
         _ScalarResult([drill]),
-        _ScalarResult([column_id]),
+        _ScalarResult([column_id]),  # table-membership check
+        _ScalarResult([column_id]),  # Bug-5933: dimension-projectability check
     )
 
     async def _refresh(obj):
@@ -460,6 +509,42 @@ async def test_patch_detail_columns_happy_path(client):
 
     assert resp.status_code == 200, resp.text
     assert drill.detail_columns == [str(column_id)]
+
+
+@pytest.mark.asyncio
+async def test_patch_detail_columns_rejects_non_projectable_column(client):
+    """Bug-5933 (F-019-02): a column on the effective table but with no
+    Dimension over it must be rejected at save time — it cannot be projected
+    through the semantic layer, so query-router would fail the drill later
+    with DRILL_DETAIL_COLUMN_NOT_PROJECTABLE."""
+    measure_id = uuid.uuid4()
+    table_id = uuid.uuid4()
+    column_id = uuid.uuid4()
+
+    column = types.SimpleNamespace(id=column_id, model_table_id=table_id)
+    table = types.SimpleNamespace(id=table_id, model_id=TEST_MODEL_ID, physical_name="orders")
+    measure = _measure(measure_id=measure_id, source_column_id=column_id)
+    drill = _drill(measure_id=measure_id)
+    model = make_model()
+
+    db = make_mock_db()
+    db.get = _scripted_get(model=model, measure=measure, table=table, column=column)
+    db.execute = _execute_script(
+        _ScalarResult([drill]),
+        _ScalarResult([column_id]),  # table-membership check passes
+        _ScalarResult([]),  # no Dimension over this column — not projectable
+    )
+
+    with patch("src.api.measures.get_tenant_db", async_gen_from(db)):
+        resp = await client.patch(
+            f"{PREFIX}/{measure_id}/drill-through-set",
+            json={"detail_columns": [str(column_id)]},
+        )
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["detail"]["code"] == "DRILL_DETAIL_COLUMN_NOT_PROJECTABLE"
+    assert str(column_id) in body["detail"]["invalid_ids"]
 
 
 @pytest.mark.asyncio
@@ -487,6 +572,128 @@ async def test_patch_source_table_override_must_belong_to_model(client):
     assert resp.status_code == 400
     body = resp.json()
     assert body["detail"]["code"] == "DRILL_SOURCE_TABLE_NOT_IN_MODEL"
+
+
+@pytest.mark.asyncio
+async def test_patch_source_table_override_auto_resolves_single_join_path(client):
+    """Bug-5932 (F-019-01): saving an override source table with no explicit
+    source_join_path, when exactly one BFS path exists back to the intrinsic
+    fact table, must PERSIST that sole path — not just validate it exists and
+    then leave source_join_path empty. An empty path here always fails at
+    query-router drill time (DRILL_JOIN_PATH_REQUIRED)."""
+    measure_id = uuid.uuid4()
+    fact_table_id = uuid.uuid4()
+    fact_column_id = uuid.uuid4()
+    override_table_id = uuid.uuid4()
+    join_id = uuid.uuid4()
+
+    fact_column = types.SimpleNamespace(id=fact_column_id, model_table_id=fact_table_id)
+    fact_table = types.SimpleNamespace(id=fact_table_id, model_id=TEST_MODEL_ID, physical_name="orders")
+    override_table = types.SimpleNamespace(
+        id=override_table_id, model_id=TEST_MODEL_ID, physical_name="customers"
+    )
+    measure = _measure(measure_id=measure_id, source_column_id=fact_column_id)
+    drill = _drill(measure_id=measure_id)
+    model = make_model()
+
+    join_row = types.SimpleNamespace(
+        id=join_id,
+        left_table_id=override_table_id,
+        right_table_id=fact_table_id,
+        join_type="many_to_one",
+    )
+
+    table_lookup = {fact_table_id: fact_table, override_table_id: override_table}
+    column_lookup = {fact_column_id: fact_column}
+
+    async def _get(cls, key):
+        name = cls.__name__
+        if name == "Model":
+            return model
+        if name == "Measure":
+            return measure
+        if name == "ModelTable":
+            return table_lookup.get(key)
+        if name == "ModelColumn":
+            return column_lookup.get(key)
+        return None
+
+    db = make_mock_db()
+    db.get = AsyncMock(side_effect=_get)
+    # 1) load drill row, 2) Join edges for BFS enumeration (single direct hop)
+    db.execute = _execute_script(
+        _ScalarResult([drill]),
+        _ScalarResult([join_row]),
+    )
+
+    async def _refresh(obj):
+        return None
+
+    db.refresh = _refresh
+
+    with patch("src.api.measures.get_tenant_db", async_gen_from(db)):
+        resp = await client.patch(
+            f"{PREFIX}/{measure_id}/drill-through-set",
+            json={"source_table_id": str(override_table_id)},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert drill.source_join_path == [str(join_id)]
+
+
+@pytest.mark.asyncio
+async def test_patch_source_table_override_rejects_when_zero_join_paths(client):
+    """Bug-5932 (F-019-01) review follow-up: the `else` arm of the same block
+    (paths != 1) must still reject the save with DRILL_OVERRIDE_NO_JOIN_PATH
+    when NO path exists between the override table and the intrinsic fact —
+    only the single-path case auto-resolves."""
+    measure_id = uuid.uuid4()
+    fact_table_id = uuid.uuid4()
+    fact_column_id = uuid.uuid4()
+    override_table_id = uuid.uuid4()
+
+    fact_column = types.SimpleNamespace(id=fact_column_id, model_table_id=fact_table_id)
+    fact_table = types.SimpleNamespace(id=fact_table_id, model_id=TEST_MODEL_ID, physical_name="orders")
+    override_table = types.SimpleNamespace(
+        id=override_table_id, model_id=TEST_MODEL_ID, physical_name="customers"
+    )
+    measure = _measure(measure_id=measure_id, source_column_id=fact_column_id)
+    drill = _drill(measure_id=measure_id)
+    model = make_model()
+
+    table_lookup = {fact_table_id: fact_table, override_table_id: override_table}
+    column_lookup = {fact_column_id: fact_column}
+
+    async def _get(cls, key):
+        name = cls.__name__
+        if name == "Model":
+            return model
+        if name == "Measure":
+            return measure
+        if name == "ModelTable":
+            return table_lookup.get(key)
+        if name == "ModelColumn":
+            return column_lookup.get(key)
+        return None
+
+    db = make_mock_db()
+    db.get = AsyncMock(side_effect=_get)
+    # 1) load drill row, 2) Join edges for BFS enumeration (no edges at all)
+    db.execute = _execute_script(
+        _ScalarResult([drill]),
+        _ScalarResult([]),
+    )
+
+    with patch("src.api.measures.get_tenant_db", async_gen_from(db)):
+        resp = await client.patch(
+            f"{PREFIX}/{measure_id}/drill-through-set",
+            json={"source_table_id": str(override_table_id)},
+        )
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["detail"]["code"] == "DRILL_OVERRIDE_NO_JOIN_PATH"
+    assert drill.source_join_path is None
 
 
 @pytest.mark.asyncio

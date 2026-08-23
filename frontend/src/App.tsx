@@ -1,4 +1,4 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { safeLocalGet } from "./utils/safeLocalStorage";
 import {
   createBrowserRouter,
@@ -15,7 +15,7 @@ import ChunkErrorBoundary from "./components/ChunkErrorBoundary";
 import SessionExpiredOverlay from "./components/SessionExpiredOverlay";
 import { authApi } from "./api/client";
 import { useBuilderStore } from "./store/builderStore";
-import { I18nContext, getMessages } from "./i18n";
+import { I18nContext, getMessages, loadLocale, RTL_LOCALES } from "./i18n";
 import Login from "./pages/Login";
 
 // Route-level code splitting. Login stays eager because it's the landing
@@ -37,6 +37,7 @@ const WelcomeWizard = lazy(
 const GroupMappings = lazy(() => import("./pages/GroupMappings"));
 const SsoCallback = lazy(() => import("./pages/SsoCallback"));
 const WebhooksPage = lazy(() => import("./pages/Webhooks"));
+const AccessTokens = lazy(() => import("./pages/AccessTokens"));
 
 function RouteFallback() {
   return (
@@ -90,7 +91,23 @@ function IndexRedirect() {
 
 function RootShell() {
   const displayLocale = useBuilderStore((s) => s.displayLocale);
+  // Bug-7726: locale bundles are lazy-loaded. Trigger the async load when
+  // the display locale changes, then re-render once the bundle is cached.
+  const [, setLocaleVersion] = useState(0);
+  useEffect(() => {
+    if (displayLocale) {
+      loadLocale(displayLocale).then(() => setLocaleVersion((v) => v + 1));
+    }
+  }, [displayLocale]);
   const messages = getMessages(displayLocale);
+
+  // Bug-6509: keep <html lang> and dir in sync with the active UI locale.
+  useEffect(() => {
+    const lang = displayLocale ? displayLocale.split("-")[0] : "en";
+    document.documentElement.lang = lang;
+    document.documentElement.dir = RTL_LOCALES.has(lang) ? "rtl" : "ltr";
+  }, [displayLocale]);
+
   return (
     <I18nContext.Provider value={messages}>
       <ConfirmProvider>
@@ -122,6 +139,7 @@ const router = createBrowserRouter([
         children: [
           { index: true, element: <IndexRedirect /> },
           { path: "welcome", element: <WelcomeWizard /> },
+          { path: "account/tokens", element: <AccessTokens /> },
           { path: "system", element: <SystemAdmin /> },
           { path: "system/configuration", element: <SystemConfiguration /> },
           { path: "system/license", element: <LicenseEdition /> },

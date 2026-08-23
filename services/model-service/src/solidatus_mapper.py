@@ -41,7 +41,9 @@ SOLIDATUS_EDGE_MAP: dict[str, str] = {
     "governed_by_term": "governed_by",
     "produces_aggregate": "produces",
     "materialized_to": "stored_in",
-    "consumed_by": "consumed_by",
+    "consumed_by": "consumed_by",  # deprecated, kept for backward compat
+    "consumed_by_model": "consumed_by",
+    "consumed_by_column": "uses_column",
     "feeds_semantic_field": "feeds",
     "uses_measure": "uses",
     "classified_by": "classifies",
@@ -95,6 +97,14 @@ def map_graph_to_solidatus(graph: GovernanceGraph) -> SolidatusPayload:
                 "tessallite_object_id": node.object_id,
                 "tessallite_stable_key": node.stable_key,
                 **node.properties,
+                # Bug-6492: carry lifecycle status, owner, and steward through
+                # to the Solidatus node so governance metadata is not silently
+                # dropped. Placed after ``node.properties`` so the canonical
+                # top-level fields are authoritative over any same-named
+                # property. Emitted only when present to avoid null noise.
+                **({"status": node.status} if node.status else {}),
+                **({"owner": node.owner} if node.owner else {}),
+                **({"steward": node.steward} if node.steward else {}),
             },
         )
         for node in graph.nodes

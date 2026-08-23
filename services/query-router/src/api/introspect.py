@@ -23,8 +23,9 @@ from sqlglot import exp
 from shared.auth.middleware import (
     CurrentUser,
     enforce_model_scope,
-    require_capability,
+    require_capability_or_service_scope,
 )
+from shared.auth.service_principal import SCOPE_DATA_QUALITY
 from shared.auth.project_access import load_authorized_model
 from shared.connection_scope import (
     CrossProjectConnectionError,
@@ -33,6 +34,10 @@ from shared.connection_scope import (
 from shared.db.models import DataSource, ProjectConnection, QueryLog
 from shared.db.session import get_tenant_db
 from shared.source_executor import QueryTimeoutError, execute_source_sql
+from shared.source_table_probe import (
+    SOURCE_TABLE_NOT_FOUND_CODE,
+    is_source_table_not_found_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +208,9 @@ async def _log_introspect(
 @router.post("/introspect", response_model=IntrospectResponse)
 async def introspect_query(
     body: IntrospectRequest,
-    current_user: CurrentUser = Depends(require_capability("explore")),
+    current_user: CurrentUser = Depends(
+        require_capability_or_service_scope("explore", SCOPE_DATA_QUALITY)
+    ),
 ) -> IntrospectResponse:
     enforce_model_scope(current_user, body.model_id)
     _assert_read_only(body.raw_sql)
@@ -214,6 +221,7 @@ async def introspect_query(
             current_user,
             model_id=body.model_id,
             min_role="viewer",
+            service_scope_verified=True,  # Bug-8613: scope verified by require_capability_or_service_scope
         )
         conn_obj, err = await _resolve_model_connection(
             db, body.model_id, source_id=body.source_id,
@@ -241,6 +249,20 @@ async def introspect_query(
         except Exception as exc:
             # Bug-5323: log execution errors before raising.
             execution_ms = int((time.monotonic() - t0) * 1000)
+            if is_source_table_not_found_error(exc):
+                await _log_introspect(
+                    db, body.model_id, current_user.email,
+                    body.raw_sql, execution_ms, 0,
+                    error_type=SOURCE_TABLE_NOT_FOUND_CODE,
+                    error_detail=str(exc),
+                )
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": SOURCE_TABLE_NOT_FOUND_CODE,
+                        "message": "The requested source table was not found.",
+                    },
+                ) from exc
             await _log_introspect(
                 db, body.model_id, current_user.email,
                 body.raw_sql, execution_ms, 0,
@@ -265,7 +287,9 @@ async def introspect_query(
 @router.post("/introspect/batch", response_model=IntrospectBatchResponse)
 async def introspect_batch(
     body: IntrospectBatchRequest,
-    current_user: CurrentUser = Depends(require_capability("explore")),
+    current_user: CurrentUser = Depends(
+        require_capability_or_service_scope("explore", SCOPE_DATA_QUALITY)
+    ),
 ) -> IntrospectBatchResponse:
     enforce_model_scope(current_user, body.model_id)
     if len(body.queries) > 20:
@@ -282,6 +306,7 @@ async def introspect_batch(
             current_user,
             model_id=body.model_id,
             min_role="viewer",
+            service_scope_verified=True,  # Bug-8613: scope verified by require_capability_or_service_scope
         )
         conn_obj, err = await _resolve_model_connection(
             db, body.model_id, source_id=body.source_id,

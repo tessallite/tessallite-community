@@ -7,27 +7,33 @@
   xsi:type="TaskPaneApp">
 
   <Id>e3ae536b-1d2f-44fd-bdc4-e01b5a7597d2</Id>
-  <Version>1.0.0.1</Version>
+  <Version>1.0.0.9</Version>
   <ProviderName>Tessallite</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
   <DisplayName DefaultValue="Tessallite"/>
   <Description DefaultValue="Governed semantic layer insights inside Excel."/>
 
-  <IconUrl DefaultValue="https://cloud.tessallite.io/excel-plugin/assets/icon-32.png"/>
-  <HighResolutionIconUrl DefaultValue="https://cloud.tessallite.io/excel-plugin/assets/icon-80.png"/>
+  <IconUrl DefaultValue="https://localhost:3443/excel-plugin/assets/icon-32.png"/>
+  <HighResolutionIconUrl DefaultValue="https://localhost:3443/excel-plugin/assets/icon-80.png"/>
 
-  <SupportUrl DefaultValue="https://cloud.tessallite.io/help/excel-plugin.html"/>
+  <SupportUrl DefaultValue="https://localhost:3443/help/excel-plugin.html"/>
 
   <AppDomains>
-    <AppDomain>https://cloud.tessallite.io</AppDomain>
+    <AppDomain>https://localhost:3443</AppDomain>
   </AppDomains>
 
   <Hosts>
     <Host Name="Workbook"/>
   </Hosts>
 
+  <Requirements>
+    <Sets DefaultMinVersion="1.1">
+      <Set Name="CustomFunctionsRuntime" MinVersion="1.1"/>
+    </Sets>
+  </Requirements>
+
   <DefaultSettings>
-    <SourceLocation DefaultValue="https://cloud.tessallite.io/excel-plugin/index.html"/>
+    <SourceLocation DefaultValue="https://localhost:3443/excel-plugin/index.html"/>
   </DefaultSettings>
 
   <Permissions>ReadWriteDocument</Permissions>
@@ -37,18 +43,20 @@
       <Host xsi:type="Workbook">
         <AllFormFactors>
           <ExtensionPoint xsi:type="CustomFunctions">
-            <CustomFunctions>
-              <Page>
-                <SourceLocation resid="Functions.Page.Url"/>
-              </Page>
-              <Metadata>
-                <SourceLocation resid="Functions.Metadata.Url"/>
-              </Metadata>
-              <Namespace resid="Functions.Namespace"/>
-            </CustomFunctions>
+            <Script>
+              <SourceLocation resid="Functions.Script.Url"/>
+            </Script>
+            <Page>
+              <SourceLocation resid="Functions.Page.Url"/>
+            </Page>
+            <Metadata>
+              <SourceLocation resid="Functions.Metadata.Url"/>
+            </Metadata>
+            <Namespace resid="Functions.Namespace"/>
           </ExtensionPoint>
         </AllFormFactors>
         <DesktopFormFactor>
+          <FunctionFile resid="Functions.Page.Url"/>
           <ExtensionPoint xsi:type="PrimaryCommandSurface">
             <OfficeTab id="TabHome">
               <Group id="Tessallite.Group">
@@ -83,19 +91,20 @@
 
     <Resources>
       <bt:Images>
-        <bt:Image id="Icon16" DefaultValue="https://cloud.tessallite.io/excel-plugin/assets/icon-16.png"/>
-        <bt:Image id="Icon32" DefaultValue="https://cloud.tessallite.io/excel-plugin/assets/icon-32.png"/>
-        <bt:Image id="Icon80" DefaultValue="https://cloud.tessallite.io/excel-plugin/assets/icon-80.png"/>
+        <bt:Image id="Icon16" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-16.png"/>
+        <bt:Image id="Icon32" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-32.png"/>
+        <bt:Image id="Icon80" DefaultValue="https://localhost:3443/excel-plugin/assets/icon-80.png"/>
       </bt:Images>
       <bt:Urls>
-        <bt:Url id="Taskpane.Url" DefaultValue="https://cloud.tessallite.io/excel-plugin/index.html"/>
-        <bt:Url id="Functions.Page.Url" DefaultValue="https://cloud.tessallite.io/excel-plugin/functions.html"/>
-        <bt:Url id="Functions.Metadata.Url" DefaultValue="https://cloud.tessallite.io/excel-plugin/functions.json"/>
+        <bt:Url id="Taskpane.Url" DefaultValue="https://localhost:3443/excel-plugin/index.html"/>
+        <bt:Url id="Functions.Script.Url" DefaultValue="https://localhost:3443/excel-plugin/functions.iife.js"/>
+        <bt:Url id="Functions.Page.Url" DefaultValue="https://localhost:3443/excel-plugin/functions.html"/>
+        <bt:Url id="Functions.Metadata.Url" DefaultValue="https://localhost:3443/excel-plugin/functions.json"/>
       </bt:Urls>
       <bt:ShortStrings>
         <bt:String id="GroupLabel" DefaultValue="Tessallite"/>
         <bt:String id="OpenPane.Label" DefaultValue="Tessallite"/>
-        <bt:String id="Functions.Namespace" DefaultValue="TESS"/>
+        <bt:String id="Functions.Namespace" DefaultValue="TESSALLITE"/>
       </bt:ShortStrings>
       <bt:LongStrings>
         <bt:String id="OpenPane.Tooltip" DefaultValue="Open Tessallite panel."/>

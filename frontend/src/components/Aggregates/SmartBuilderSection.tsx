@@ -118,7 +118,11 @@ export default function SmartBuilderSection({ projectId, modelId, tenantId }: Pr
         min_confidence: minConfidence,
         dry_run: dryRun,
         enable_ai_aggregation: !requireReview,
-        llm_config_id: llmConfigId || undefined,
+        // Send explicit null (not undefined) so selecting "Use project default"
+        // clears a previously-set per-model override. undefined is dropped from
+        // the JSON body and the backend's exclude_unset PUT would keep the old
+        // value, making the reset a silent no-op (Bug-6172).
+        llm_config_id: llmConfigId || null,
       };
       const saved = await aiSchedulerApi.update(projectId, modelId, update);
       qc.setQueryData(["aiSchedulerConfig", projectId, modelId], saved);
@@ -195,7 +199,13 @@ export default function SmartBuilderSection({ projectId, modelId, tenantId }: Pr
     } finally {
       setRunningSweep(false);
     }
-  }, [modelId]);
+    // Bug-7117: `t` was missing from this callback's dependency array, so a
+    // locale switch after mount left this closure holding the translate
+    // function from the render it was created in — sweep result messages
+    // rendered in the stale language until something else re-created the
+    // callback. Every other message-producing callback in this file already
+    // lists `t` (handleSave, handleRunAI); this one did not.
+  }, [modelId, t]);
 
   if (isLoading) return <CircularProgress size={24} />;
 

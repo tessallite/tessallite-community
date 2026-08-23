@@ -23,13 +23,19 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.webhooks.dispatcher import emit_webhook
+from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
+from shared.auth.identity import user_identity_matches
 from shared.config.registry import get_def, surfaced_for_level
 from shared.config.resolver import _read_model, get_setting, set_setting
 from shared.db.models import Model, UserAccessBinding
 from shared.db.session import get_system_db, get_tenant_db
-from src.auth.middleware import CurrentUser, forbid_embed_user
+from src.auth.middleware import (
+    CurrentUser,
+    forbid_embed_user,
+    is_human_tenant_admin_or_system_admin,
+)
 from src.auth.rbac import require_role
+from src.api._model_lock import acquire_model_definition_lock
 
 logger = logging.getLogger(__name__)
 router = APIRouter(
@@ -77,25 +83,15 @@ async def _ensure_model_access(
             detail=f"Model {model_id} not found in project {project_id}",
         )
 
-    if current_user.role in ("system_admin", "tenant_admin"):
+    if is_human_tenant_admin_or_system_admin(current_user):
         return model
 
     user_identity = current_user.email or current_user.user_id
-    # Bootstrap-admin rule: if the project has no bindings at all, the
-    # first authenticated user is treated as implicit admin.
-    any_binding = (
-        await tenant_db.execute(
-            select(UserAccessBinding).where(
-                UserAccessBinding.project_id == project_id
-            ).limit(1)
-        )
-    ).scalar_one_or_none()
-    if any_binding is None:
-        return model
-
+    # Binding-only (F-021-04 hard cutover, decision #9): no zero-binding
+    # bootstrap-admin grant — a project with no binding for this caller denies.
     rows = await tenant_db.execute(
         select(UserAccessBinding).where(
-            UserAccessBinding.user_identity == user_identity,
+            user_identity_matches(UserAccessBinding.user_identity, user_identity),
             (UserAccessBinding.project_id == project_id)
             | (UserAccessBinding.model_id == model_id),
         )
@@ -113,7 +109,11 @@ async def _ensure_model_access(
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.get("", response_model=ModelSettingsListResponse)
+@router.get(
+    "",
+    response_model=ModelSettingsListResponse,
+    dependencies=[require_role("viewer")],
+)
 async def list_model_settings(
     project_id: UUID,
     model_id: UUID,
@@ -174,6 +174,11 @@ async def write_model_setting(
         )
     async for tenant_db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_access(project_id, model_id, current_user, tenant_db)
+        # Bug-7982 finding 7 then 3: auth before lock; ModelSetting is
+        # snapshot-owned (deleted + reinserted on revert, rehydrator step 4) and
+        # model settings feed query/agent semantics, so serialise with
+        # deploy/revert/Save.
+        await acquire_model_definition_lock(tenant_db, model_id)  # Bug-7982 cross-family lock
         try:
             await set_setting(
                 key, body.value,

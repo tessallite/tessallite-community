@@ -26,6 +26,7 @@ import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 
 import { useT } from "../../i18n";
 import { kpisApi } from "../../api/client";
+import { recordCreate, recordUpdate } from "../Builder/emitDrawerHistory";
 import type { Dimension, Kpi, Measure } from "../../api/types";
 import type {
   BusinessDefinition,
@@ -312,9 +313,19 @@ export function KpiBusinessBuilderDialog({
       }
 
       if (editKpi) {
+        // Bug-8227: build the inverse payload from the prior KPI so undo
+        // restores the prior business definition (the Business Builder is
+        // the default KPI "Add" surface and must record undo history).
+        const priorRecord = editKpi as unknown as Record<string, unknown>;
+        const priorPayload: Record<string, unknown> = {};
+        for (const key of Object.keys(payload)) {
+          priorPayload[key] = priorRecord[key] !== undefined ? priorRecord[key] : null;
+        }
         await kpisApi.update(projectId, modelId, editKpi.id, payload);
+        recordUpdate("kpi", editKpi.id, priorPayload, payload as unknown as Record<string, unknown>);
       } else {
-        await kpisApi.create(projectId, modelId, payload);
+        const created = await kpisApi.create(projectId, modelId, payload);
+        recordCreate("kpi", created.id, payload as unknown as Record<string, unknown>);
       }
       onSaved();
       onClose();

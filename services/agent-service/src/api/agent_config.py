@@ -27,14 +27,35 @@ from sqlalchemy import select
 from shared.config.settings import get_settings
 from shared.db.models import (
     AgentJudgeRubric,
+    LLMProviderConfig,
     Model,
     Project,
     ProjectAgentConfig,
     ProjectAgentModel,
     ProjectAgentModelContext,
-    UserAccessBinding,
 )
 from shared.db.session import get_tenant_db
+# The service's ONE body-parameter foreign-key scope predicate; see
+# src/api/_body_scope.py for why the hand-rolled copies were consolidated.
+from src.api._body_scope import ensure_ref_in_project
+# Bug-8349 — reuse the canonical secret generator (plaintext + Fernet-
+# encrypted bytes) so agent-service's auto-generated secret is produced the
+# same way model-service's create_webhook produces one for a brand new
+# WebhookEndpoint, instead of hand-rolling a second secrets.token_urlsafe
+# call site.
+from shared.webhooks.dispatcher import generate_signing_secret
+# Bug-8411 — validate the project's agent webhook event subscription against
+# the single catalogue the dispatcher itself filters on, so the API cannot
+# accept a name no emit site will ever produce.
+from shared.webhooks.agent_event_types import (
+    DEFAULT_AGENT_EVENT_FILTERS,
+    InvalidAgentEventFilters,
+    validate_agent_event_filters,
+)
+# Bug-6045 — refuse an SSRF-unsafe webhook URL at the admin surface (before it
+# is ever stored), reusing the same guard the dispatcher and the platform-wide
+# webhook path use so the acceptance policy cannot drift.
+from shared.webhooks.ssrf import validate_webhook_url
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +142,21 @@ _DEFAULT_RUBRIC_SECTIONS: list[dict] = [
 ]
 from src.auth.middleware import (
     CurrentEmbedUser,
+    CurrentServiceUser,
     CurrentUser,
     forbid_embed_user,
     require_capability,
+    require_service_scope_or_non_embed,
 )
+# Bug-8445 / Bug-8446 — the service's ONE project authorization primitive.
+# Every gate below is a named wrapper over it; see src/auth/project_access.py.
+from src.auth.project_access import (
+    ANY_ROLE,
+    MODELER_BINDING_ROLES,
+    require_project_chat_access,
+    require_project_role,
+)
+from shared.auth.service_principal import SCOPE_AGENT_REFRESH
 from src.derived.context import (
     derive_all_for_project,
     derive_model_context,
@@ -136,7 +168,17 @@ router = APIRouter(prefix="/projects/{project_id}/agent", tags=["agent-config"])
 
 
 # ---------------------------------------------------------------------------
-# RBAC helpers — mirror the model-service pattern
+# RBAC helpers — thin, named wrappers over the service's ONE authorization
+# primitive (Bug-8445 / Bug-8446, ``src/auth/project_access.py``).
+#
+# Each wrapper owns exactly two things: the tier's policy parameters, and this
+# module's ``get_tenant_db`` symbol (which a large number of tests patch, and
+# which resolves from THIS module's globals at call time because the wrapper
+# body references the bare name). The authorization decision itself — admin
+# bypass, principal-type refusal, project predicate, role predicate, canonical
+# identity comparison, and the uniform deny of a binding-less project
+# (F-021-04 cutover, Bug-9442) — lives in one place and cannot drift between
+# copies again.
 # ---------------------------------------------------------------------------
 
 # Bug-1082 — role vocabulary unification. The platform stores exactly one
@@ -147,33 +189,72 @@ router = APIRouter(prefix="/projects/{project_id}/agent", tags=["agent-config"])
 # legacy spelling only; that interim is now removed and every agent-service
 # gate matches the canonical "modeler" alone. "admin" remains a valid
 # project-binding role (distinct from the JWT-level tenant_admin).
-_MODELER_BINDING_ROLES = ("admin", "modeler")
+#
+# Re-exported from the primitive so the vocabulary itself has one home too.
+_MODELER_BINDING_ROLES = MODELER_BINDING_ROLES
 
 
 async def _require_project_modeller(
     project_id: UUID, current_user: CurrentUser
 ) -> None:
-    """Modeller or admin role on the project, or bootstrap path."""
-    if current_user.role == "tenant_admin":
-        return
-    async for db in get_tenant_db(current_user.tenant_id):
-        result = await db.execute(
-            select(UserAccessBinding).where(
-                UserAccessBinding.user_identity == current_user.user_id,
-                UserAccessBinding.role.in_(_MODELER_BINDING_ROLES),
-                (UserAccessBinding.project_id == project_id)
-                | (UserAccessBinding.project_id.is_(None)),
-            ).limit(1)
-        )
-        if result.scalar_one_or_none() is not None:
-            return
-        any_binding = await db.execute(select(UserAccessBinding).limit(1))
-        if any_binding.scalar_one_or_none() is None:
-            return
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
+    """Modeller or admin role on the project (or a human tenant/system admin).
+
+    Configuration tier. F-021-04 HARD CUTOVER (decision #9, Bug-9442): this
+    tier used to bootstrap-open (decision D2) so first-run setup of a brand-new
+    tenant worked before any binding existed. That first-arriver grant is
+    removed — a binding-less project denies every ordinary caller, and only a
+    human tenant/system admin (who passes by role, before any binding lookup)
+    can set the project up or repair it.
+    """
+    await require_project_role(
+        project_id,
+        current_user,
+        db_factory=get_tenant_db,
+        roles=_MODELER_BINDING_ROLES,
         detail="Modeller or Admin access required",
     )
+
+
+async def _authorize_refresh_derived(
+    project_id: UUID, current_user: CurrentUser
+) -> None:
+    """Authorize a call to the derived-context refresh endpoints.
+
+    Bug-6814 (receiving half). The refresh endpoints are reachable two ways:
+
+    * A human modeller/admin from the agent panel — must satisfy
+      ``_require_project_modeller`` exactly as before.
+    * The model-service deploy fan-out, which authenticates with a
+      short-lived internal service token carrying the ``agent.refresh-derived``
+      scope. That token's synthetic subject (``service:model-service-deploy``)
+      matches no ``UserAccessBinding``, so the human modeller gate 403's it in
+      any populated tenant and the deploy-triggered refresh silently fails
+      end-to-end (only a zero-binding bootstrap tenant slipped through).
+
+    A validly-scoped service principal is ALREADY authorized by its verified
+    scope — it must bypass the human binding lookup rather than be forced
+    through it. The bypass is gated STRICTLY on the typed
+    ``CurrentServiceUser`` class carrying ``SCOPE_AGENT_REFRESH`` in its
+    ``service_scopes`` (both of which are set only by
+    ``validate_service_payload`` from a signature-verified service JWT — never
+    from a spoofable header or client-supplied claim). Any non-service caller
+    falls through to the unchanged human modeller gate, so no human
+    authorization path is opened or weakened.
+
+    The route dependency ``require_service_scope_or_non_embed(SCOPE_AGENT_REFRESH)``
+    already rejects a service token lacking the scope before the handler runs;
+    the scope check here is a defence-in-depth re-verification so the bypass
+    can never widen past the exact scope even if a future caller wires this
+    helper behind a different (or missing) gate.
+    """
+    if isinstance(current_user, CurrentServiceUser):
+        if SCOPE_AGENT_REFRESH in getattr(current_user, "service_scopes", ()):
+            return
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Service token scope required",
+        )
+    await _require_project_modeller(project_id, current_user)
 
 
 async def _require_blocked_original_access(
@@ -182,30 +263,19 @@ async def _require_blocked_original_access(
     """F-023-01 (round 2) — strict gate for surfaces that can disclose
     judge-blocked original answers (``/agent/calibration``, ``/agent/log``).
 
-    Unlike ``_require_project_modeller`` this NEVER bootstrap-opens: a
-    tenant with zero ``UserAccessBinding`` rows fails CLOSED. The
-    bootstrap-open posture (accepted-risk decision D2) covers
-    configuration endpoints during first-run setup only — it must not
-    gate content disclosure, because a binding-less tenant would expose
-    blocked originals to every authenticated user. Access requires a
-    privileged role on the JWT (tenant_admin / system_admin) or an
-    explicit admin/modeller binding on the project (or tenant-wide).
+    A tenant with zero ``UserAccessBinding`` rows fails CLOSED. This gate has
+    always denied a binding-less project (it carried the old
+    ``bootstrap_open=False``); F-021-04 HARD CUTOVER (decision #9, Bug-9442)
+    made that behaviour uniform across every tier, so there is no longer a
+    weaker configuration tier to distinguish it from. Access requires a
+    privileged role on the JWT (tenant_admin / system_admin) or an explicit
+    admin/modeller binding on the project (or tenant-wide).
     """
-    if current_user.role in ("tenant_admin", "system_admin"):
-        return
-    async for db in get_tenant_db(current_user.tenant_id):
-        result = await db.execute(
-            select(UserAccessBinding).where(
-                UserAccessBinding.user_identity == current_user.user_id,
-                UserAccessBinding.role.in_(_MODELER_BINDING_ROLES),
-                (UserAccessBinding.project_id == project_id)
-                | (UserAccessBinding.project_id.is_(None)),
-            ).limit(1)
-        )
-        if result.scalar_one_or_none() is not None:
-            return
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
+    await require_project_role(
+        project_id,
+        current_user,
+        db_factory=get_tenant_db,
+        roles=_MODELER_BINDING_ROLES,
         detail=(
             "Tenant admin role or an explicit project Modeller/Admin "
             "binding is required to view judge trace data"
@@ -216,22 +286,32 @@ async def _require_blocked_original_access(
 async def _require_project_viewer(
     project_id: UUID, current_user: CurrentUser
 ) -> None:
-    # Tenant admins have implicit read access to all project agent endpoints.
-    if current_user.role == "tenant_admin":
-        return
-    async for db in get_tenant_db(current_user.tenant_id):
-        result = await db.execute(
-            select(UserAccessBinding).where(
-                UserAccessBinding.user_identity == current_user.user_id,
-            ).limit(1)
-        )
-        if result.scalar_one_or_none() is not None:
-            return
-        any_binding = await db.execute(select(UserAccessBinding).limit(1))
-        if any_binding.scalar_one_or_none() is None:
-            return
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
+    """Read access to this project's agent surfaces.
+
+    Bug-8444 — this gate used to accept ANY ``UserAccessBinding`` row for the
+    caller anywhere in the tenant, with no ``project_id`` predicate, which
+    made it a cross-project read: a user bound only to project B could read
+    project A's agent config. That response body carries ``webhook_url``,
+    and Bug-8350 established that a webhook URL "commonly embeds a bearer
+    token or API key, in the path as much as the query string" — so the leak
+    was a cross-project secret disclosure, not just metadata. It now uses the
+    same project predicate as ``_require_project_modeller`` above (a binding
+    on THIS project, or a tenant-wide binding with a NULL ``project_id``).
+    Bindings written by the platform always carry a ``project_id``
+    (``model-service/src/api/access.py``, ``model-service/src/auth/jit.py``),
+    so the predicate cannot lock out a legitimately-bound reader.
+
+    Any role is still sufficient (this is the read tier, unlike
+    ``_require_project_modeller``). F-021-04 HARD CUTOVER (decision #9,
+    Bug-9442): a binding-less project no longer bootstrap-opens even on this
+    configuration-read surface — an ordinary caller with no binding is denied,
+    the same as every other tier; only a human tenant/system admin passes.
+    """
+    await require_project_role(
+        project_id,
+        current_user,
+        db_factory=get_tenant_db,
+        roles=ANY_ROLE,
         detail="No project binding found",
     )
 
@@ -254,12 +334,18 @@ class AgentConfigUpsert(BaseModel):
     default_locale: Optional[str] = None
     disclosure_text: Optional[str] = None
     webhook_url: Optional[str] = None
+    # Bug-8411 — which agent events the webhook receiver is subscribed to.
+    webhook_event_filters: Optional[list[str]] = Field(
+        default_factory=lambda: list(DEFAULT_AGENT_EVENT_FILTERS)
+    )
     primary_model_id: Optional[UUID] = None
     answer_llm_config_id: Optional[UUID] = None
     judge_llm_config_id: Optional[UUID] = None
     aggregate_llm_config_id: Optional[UUID] = None
     glossary_llm_config_id: Optional[UUID] = None
-    judge_mode: str = Field(default="async", pattern="^(async|sync)$")
+    # F-023-29 / Bug-8148 — default is validated-first ("sync"): the answer is
+    # validated before it is shown. "async" stays an explicit override.
+    judge_mode: str = Field(default="sync", pattern="^(async|sync)$")
     judge_rubric_id: Optional[UUID] = None
     judge_block_visibility: str = Field(
         default="transparent", pattern="^(transparent|opaque)$"
@@ -296,6 +382,10 @@ class AgentConfigResponse(AgentConfigUpsert):
 
     id: UUID
     project_id: UUID
+    # Bug-8553 — this is an ephemeral save result, not persisted state. GET
+    # responses keep the default false; PATCH/PUT set it only for a save that
+    # changed the receiver and rotated an existing signing secret.
+    webhook_secret_rotated: bool = False
 
 
 class AgentConfigPatch(BaseModel):
@@ -311,6 +401,9 @@ class AgentConfigPatch(BaseModel):
     default_locale: Optional[str] = None
     disclosure_text: Optional[str] = None
     webhook_url: Optional[str] = None
+    # Bug-8411 — omitted means "leave the subscription alone" (PATCH
+    # semantics); it must NOT reset to the wildcard default.
+    webhook_event_filters: Optional[list[str]] = None
     primary_model_id: Optional[UUID] = None
     answer_llm_config_id: Optional[UUID] = None
     judge_llm_config_id: Optional[UUID] = None
@@ -350,6 +443,15 @@ class AgentConfigPatch(BaseModel):
     max_compound_steps: Optional[int] = Field(default=None, ge=2, le=5)
 
 
+def _agent_config_response(
+    record: ProjectAgentConfig, *, webhook_secret_rotated: bool = False
+) -> AgentConfigResponse:
+    """Build the response while keeping the rotation signal request-scoped."""
+    return AgentConfigResponse.model_validate(record).model_copy(
+        update={"webhook_secret_rotated": webhook_secret_rotated}
+    )
+
+
 class AgentModelContextUpsert(BaseModel):
     model_overview: Optional[str] = None
     analytical_capabilities: Optional[str] = None
@@ -370,6 +472,180 @@ class AgentModelContextResponse(AgentModelContextUpsert):
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+
+
+def _validate_webhook_url(webhook_url: Optional[str]) -> None:
+    """Bug-6045 — reject an SSRF-unsafe webhook URL at config-write time.
+
+    A blank/None value clears the webhook and is always accepted. A non-blank
+    value must pass the shared SSRF pre-flight (http(s) scheme, no internal
+    hostname, no non-global literal IP); otherwise a 400 is returned so the
+    modeller sees an immediate, clear error rather than a silent send-time
+    DLQ."""
+    if webhook_url is None or not webhook_url.strip():
+        return
+    try:
+        validate_webhook_url(webhook_url)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Webhook URL rejected: {exc}",
+        )
+
+
+def _validate_webhook_event_filters(filters: Optional[list]) -> None:
+    """Bug-8411 — reject an unknown, empty or malformed agent webhook
+    subscription at the API boundary.
+
+    The rule itself lives in ``shared/webhooks/agent_event_types``
+    (``validate_agent_event_filters``) rather than here, because this is not
+    the only write path: project import writes the same column straight from
+    an untyped bundle. Keeping the rule in one place is what stops the two
+    writers drifting — the Codex cross-family gate found them already drifted,
+    with import accepting a JSON string that then read as "deliver
+    everything". This function is just the HTTP-status adapter.
+
+    An EMPTY list is rejected rather than coerced. That is the exact trap
+    Bug-7330 sprang on the platform-wide webhook endpoint: an empty
+    ``event_filters`` list was silently read as match-all, so a subscriber
+    who deliberately deselected every event carried on receiving all of
+    them.
+    """
+    try:
+        validate_agent_event_filters(filters)
+    except InvalidAgentEventFilters as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc),
+        )
+
+
+def _apply_webhook_secret_lifecycle(
+    record: ProjectAgentConfig, *, previous_url: Optional[str]
+) -> bool:
+    """Own the signing secret's whole lifecycle against the receiver it
+    belongs to. Two rules, one function, because they are the same rule.
+
+    **First configuration (Bug-8349).** Auto-generate a signing secret the
+    first time a webhook URL is configured, mirroring model-service's
+    ``create_webhook`` (which always generates one at endpoint-creation time).
+    Without this, ``webhook_signing_secret`` stays NULL until an operator hits
+    ``POST .../rotate-secret``, and every event dispatches unsigned by
+    default — the exact fail-open the dispatcher now refuses to send.
+
+    **Receiver change (Bug-8410).** Rotate the secret whenever the stored
+    ``webhook_url`` changes to a DIFFERENT non-blank value. The previous
+    behaviour reused the existing secret across any number of URL changes, on
+    the stated reasoning that "an existing secret is never silently
+    overwritten by an unrelated config edit". That reasoning is right for an
+    unrelated edit (a ``display_name`` change) and wrong for this one: the
+    secret was generated for, and shared with, receiver A. Leaving it in place
+    when the destination becomes receiver B means A's operator — who has the
+    secret written down — can forge events that B will accept as authentic,
+    and B is verifying with a credential its own operator never issued. A
+    credential is scoped to the party it was shared with; changing the party
+    ends its life.
+
+    The comparison is on the FULL URL, not just scheme+host. A webhook URL's
+    path and query routinely carry the bearer material (Bug-8350's repro put
+    the token in the path), so ``…/hooks/v1`` and ``…/hooks/v2`` on one host
+    can be two different credentials at two different consumers. Comparing
+    less would silently skip the rotation in exactly the case that matters
+    most.
+
+    Consequence, deliberately accepted and consistent with what first-time
+    configuration has always done: the new secret is not known to anyone until
+    the modeller calls ``POST .../rotate-secret``, which is the only surface
+    that returns a plaintext. Until they do, receiver B rejects the signature
+    and the events land in the DLQ with the receiver's own 4xx — visible,
+    recoverable, and never a silent delivery to a party holding the wrong
+    credential. Documented in the user guide and the agent-settings help page.
+    """
+    url = (record.webhook_url or "").strip()
+    if not url:
+        # No receiver configured: nothing to protect, and clearing the URL
+        # must not destroy a secret the modeller may still be re-pointing.
+        return False
+    if record.webhook_signing_secret is None:
+        _plaintext, encrypted = generate_signing_secret()
+        record.webhook_signing_secret = encrypted
+        # The first configuration creates a secret; it does not rotate an
+        # existing receiver credential and therefore does not raise the
+        # Bug-8553 save notice.
+        return False
+    if url != (previous_url or "").strip():
+        _plaintext, encrypted = generate_signing_secret()
+        record.webhook_signing_secret = encrypted
+        logger.warning(
+            "Agent webhook receiver changed for project %s; the signing "
+            "secret was rotated so the previous receiver can no longer sign "
+            "or verify events for this project. Call "
+            "POST /agent/webhook/rotate-secret to obtain the new secret and "
+            "share it with the new receiver.",
+            record.project_id,
+        )
+        return True
+    return False
+
+
+# Every body-supplied foreign key on the agent-config schemas, mapped to the
+# entity that must own it and the noun the rejection names.
+#
+# All six were written straight into ``project_agent_configs`` by a blanket
+# ``setattr`` loop on both PUT and PATCH with nothing proving they belonged to
+# the path project. The caller gate (``_require_project_modeller``) proves only
+# that the caller may act in the PATH project, so a modeller bound to project A
+# could bind project A's agent to:
+#   * project B's ``LLMProviderConfig`` (four fields) — a row carrying a
+#     Fernet-encrypted provider API key and base_url, so every answer, judge,
+#     aggregate and glossary call would run on, and bill to, another project's
+#     provider account;
+#   * project B's ``AgentJudgeRubric`` — B's rubric TEXT is rendered into A's
+#     judge prompt (``src/judge/judge.py`` loads it by id with no scope check),
+#     a cross-project content disclosure;
+#   * project B's ``Model`` as ``primary_model_id`` — inert at prompt time
+#     today (``assembler._apply_model_pin`` only honours a primary that
+#     survived the project allow-list), but a persisted cross-project reference
+#     that project export, cascade delete and the dependency graph all treat as
+#     in-scope.
+#
+# This mapping is a coverage mechanism, so it is itself somewhere an
+# enumeration blind spot can hide: a UUID field added to ``AgentConfigUpsert``
+# or ``AgentConfigPatch`` tomorrow would simply not be guarded, silently.
+# ``tests/test_body_fk_project_scope.py`` therefore enumerates every UUID-typed
+# field on BOTH schemas and fails unless each one is either declared here or
+# named in that test's explicit not-a-foreign-key list.
+_PROJECT_SCOPED_BODY_REFS: dict[str, tuple[type, str]] = {
+    "primary_model_id": (Model, "a model"),
+    "answer_llm_config_id": (LLMProviderConfig, "an LLM provider config"),
+    "judge_llm_config_id": (LLMProviderConfig, "an LLM provider config"),
+    "aggregate_llm_config_id": (LLMProviderConfig, "an LLM provider config"),
+    "glossary_llm_config_id": (LLMProviderConfig, "an LLM provider config"),
+    "judge_rubric_id": (AgentJudgeRubric, "a judge rubric"),
+}
+
+
+async def _validate_body_refs(db, project_id: UUID, fields: dict) -> None:
+    """Prove every body-supplied foreign key in ``fields`` belongs to the path
+    project, before anything is written.
+
+    ``fields`` is the payload as a dict — ``model_dump(exclude_unset=True)`` on
+    the PATCH path, ``model_dump()`` on the PUT path. The guard keys on the
+    field being PRESENT, not on it being truthy, so an explicit ``null``
+    (unbind the LLM config, clear the primary model) stays legal and is
+    validated as "nothing to check" rather than skipped by a falsy test that
+    would also skip a real id of ``UUID(int=0)``.
+    """
+    for field_name, (entity, noun) in _PROJECT_SCOPED_BODY_REFS.items():
+        if field_name not in fields:
+            continue
+        await ensure_ref_in_project(
+            db,
+            entity,
+            ref_id=fields[field_name],
+            project_id=project_id,
+            field_name=field_name,
+            noun=noun,
+        )
 
 
 def _validate_for_enable(body: AgentConfigUpsert, allow_list_count: int) -> None:
@@ -408,7 +684,7 @@ async def get_agent_config(
         record = result.scalar_one_or_none()
         if record is None:
             raise HTTPException(status_code=404, detail="Agent not configured")
-        return AgentConfigResponse.model_validate(record)
+        return _agent_config_response(record)
     raise HTTPException(status_code=500, detail="DB session exhausted")
 
 
@@ -419,6 +695,11 @@ async def patch_agent_config(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> AgentConfigResponse:
     await _require_project_modeller(project_id, current_user)
+    patch_fields = body.model_dump(exclude_unset=True)
+    if "webhook_url" in patch_fields:
+        _validate_webhook_url(patch_fields["webhook_url"])
+    if "webhook_event_filters" in patch_fields:
+        _validate_webhook_event_filters(patch_fields["webhook_event_filters"])
     async for db in get_tenant_db(current_user.tenant_id):
         result = await db.execute(
             select(ProjectAgentConfig).where(
@@ -428,8 +709,20 @@ async def patch_agent_config(
         record = result.scalar_one_or_none()
         if record is None:
             raise HTTPException(status_code=404, detail="Agent not configured")
-        for k, v in body.model_dump(exclude_unset=True).items():
+        # Body-supplied foreign keys, proven to belong to the PATH project
+        # before the setattr loop applies them and before
+        # _apply_webhook_secret_lifecycle can rotate the signing secret on a
+        # request that is about to be refused. The 404 above comes first on
+        # purpose: a missing path resource outranks a bad payload.
+        await _validate_body_refs(db, project_id, patch_fields)
+        # Bug-8410 — capture the receiver this project's signing secret was
+        # issued for BEFORE the patch overwrites it.
+        previous_url = record.webhook_url
+        for k, v in patch_fields.items():
             setattr(record, k, v)
+        webhook_secret_rotated = _apply_webhook_secret_lifecycle(
+            record, previous_url=previous_url
+        )
         if getattr(record, "enabled", False):
             count_result = await db.execute(
                 select(ProjectAgentModel).where(
@@ -441,7 +734,9 @@ async def patch_agent_config(
             _validate_for_enable(full_body, allow_count)
         await db.commit()
         await db.refresh(record)
-        return AgentConfigResponse.model_validate(record)
+        return _agent_config_response(
+            record, webhook_secret_rotated=webhook_secret_rotated
+        )
     raise HTTPException(status_code=500, detail="DB session exhausted")
 
 
@@ -475,10 +770,23 @@ async def upsert_agent_config(
     documented on the route above and partial callers must use PATCH.
     """
     await _require_project_modeller(project_id, current_user)
+    # Bug-6045 — validate the webhook target before it is stored (PUT replaces
+    # the whole resource, so an unset webhook_url resets to None and is fine).
+    _validate_webhook_url(body.webhook_url)
+    # Bug-8411 — same for the event subscription.
+    _validate_webhook_event_filters(body.webhook_event_filters)
     async for db in get_tenant_db(current_user.tenant_id):
         proj = await db.get(Project, project_id)
         if proj is None:
             raise HTTPException(status_code=404, detail="Project not found")
+
+        # Body-supplied foreign keys, proven BEFORE any side effect: before the
+        # ProjectAgentConfig row is added, before the signing-secret lifecycle
+        # runs, and before the first-creation branch INSERTs a default
+        # AgentJudgeRubric. A PUT replaces the whole resource, so every field is
+        # present — an omitted one arrives as an explicit null, which is a legal
+        # unbind and validates as "nothing to check".
+        await _validate_body_refs(db, project_id, body.model_dump())
 
         result = await db.execute(
             select(ProjectAgentConfig).where(
@@ -496,6 +804,9 @@ async def upsert_agent_config(
         _validate_for_enable(body, allow_count)
 
         first_creation = record is None
+        # Bug-8410 — the receiver the current secret was issued for, read
+        # before the replace overwrites it. A brand-new record has none.
+        previous_url = None if first_creation else record.webhook_url
         if record is None:
             record = ProjectAgentConfig(project_id=project_id)
             db.add(record)
@@ -509,6 +820,9 @@ async def upsert_agent_config(
 
         for k, v in incoming.items():
             setattr(record, k, v)
+        webhook_secret_rotated = _apply_webhook_secret_lifecycle(
+            record, previous_url=previous_url
+        )
 
         if first_creation and incoming.get("judge_rubric_id") is None:
             rubric = AgentJudgeRubric(
@@ -522,7 +836,9 @@ async def upsert_agent_config(
 
         await db.commit()
         await db.refresh(record)
-        return AgentConfigResponse.model_validate(record)
+        return _agent_config_response(
+            record, webhook_secret_rotated=webhook_secret_rotated
+        )
     raise HTTPException(status_code=500, detail="DB session exhausted")
 
 
@@ -578,31 +894,53 @@ async def list_selectable_models(
                 detail="Embed token does not grant access to this project",
             )
 
-    # Imported lazily to avoid a circular import at module load (assembler pulls
-    # in pipeline-adjacent modules).
-    from src.prompt.assembler import (
-        _apply_persona_filter,
-        _load_model_profiles,
-        _load_persona_scopes,
-    )
+    # Bug-6556 — use the public facade instead of reaching into private
+    # assembler internals (_load_model_profiles, _load_persona_scopes,
+    # _apply_persona_filter).  Lazy import to avoid a circular import at
+    # module load (assembler pulls in pipeline-adjacent modules).
+    from src.prompt.assembler import load_selectable_models
 
     async for db in get_tenant_db(current_user.tenant_id):
+        # Bug-8460 — the embed-scope check above is NOT authorization for a
+        # regular tenant user: without this, a user bound only to project B
+        # could enumerate project A's agent allow-listed model names. Bug-5951
+        # fixed exactly this residual on the conversation routes
+        # (`conversations._require_project_access_and_agent`) and it was never
+        # propagated to this sibling.
+        #
+        # Bug-8589 HALF A — the gate is the service's CHAT tier, the same one
+        # the conversation routes use. It is embed-aware (the in-chat model
+        # picker must keep working for an embed token) AND refuses a service
+        # principal by type, which the shared terminal it delegates to does
+        # not: this route is gated by `require_capability("chat")`, which has
+        # no `CurrentServiceUser` branch, so a service token minted for an
+        # unrelated scope used to read any project's agent allow-list. Sharing
+        # ONE named tier with the conversation routes is what stops the pair
+        # drifting apart for a third time.
+        await require_project_chat_access(
+            db, current_user, project_id=project_id, min_role="viewer",
+        )
         allow_q = await db.execute(
             select(ProjectAgentModel.model_id).where(
                 ProjectAgentModel.project_id == project_id
             )
         )
         allow_ids = [row for row in allow_q.scalars().all()]
-        profiles = await _load_model_profiles(db, project_id, allow_ids)
 
         persona_id = None
-        if isinstance(current_user, CurrentEmbedUser) and current_user.persona_id:
-            persona_id = UUID(current_user.persona_id)
-        if persona_id is not None:
-            persona_scopes = await _load_persona_scopes(db, persona_id)
-            profiles = _apply_persona_filter(profiles, persona_scopes)
+        embed_model_ids = None
+        if isinstance(current_user, CurrentEmbedUser):
+            if current_user.project_persona_id:
+                persona_id = UUID(current_user.project_persona_id)
+            # Bug-6575 — narrow the picker to the embed token's model_ids
+            # allow-list so it never advertises models the caller could not
+            # query (matches assemble_prompt / the router's enforce_model_scope).
+            embed_model_ids = current_user.model_ids
 
-        return [SelectableModel(id=p.id, name=p.display_name) for p in profiles]
+        models = await load_selectable_models(
+            db, project_id, allow_ids, persona_id, embed_model_ids
+        )
+        return [SelectableModel(id=m.id, name=m.display_name) for m in models]
     raise HTTPException(status_code=500, detail="DB session exhausted")
 
 
@@ -667,12 +1005,14 @@ async def get_model_context(
 async def refresh_derived_context(
     project_id: UUID,
     model_id: UUID,
-    current_user: CurrentUser = Depends(forbid_embed_user),
+    current_user: CurrentUser = Depends(
+        require_service_scope_or_non_embed(SCOPE_AGENT_REFRESH)
+    ),
 ) -> AgentModelContextResponse:
     """Recompute aggregates_summary / calendar_aliases / dimension_aliases
     from current semantic-layer state. Called by the model-service after a
     publish, or directly by the modeller from the agent panel."""
-    await _require_project_modeller(project_id, current_user)
+    await _authorize_refresh_derived(project_id, current_user)
     async for db in get_tenant_db(current_user.tenant_id):
         record = await derive_model_context(db, project_id, model_id)
         if record is None:
@@ -690,9 +1030,11 @@ async def refresh_derived_context(
 )
 async def refresh_all_derived(
     project_id: UUID,
-    current_user: CurrentUser = Depends(forbid_embed_user),
+    current_user: CurrentUser = Depends(
+        require_service_scope_or_non_embed(SCOPE_AGENT_REFRESH)
+    ),
 ) -> list[AgentModelContextResponse]:
-    await _require_project_modeller(project_id, current_user)
+    await _authorize_refresh_derived(project_id, current_user)
     async for db in get_tenant_db(current_user.tenant_id):
         rows = await derive_all_for_project(db, project_id)
         return [AgentModelContextResponse.model_validate(r) for r in rows]

@@ -14,19 +14,33 @@ from ..measure_formats import (
     TIME_VARIANT_NAMES as _TIME_VARIANT_NAMES,
 )
 
+from shared.model_defaults import DEFAULT_INCLUDE_ALL_MEASURES
+
 from ._base import OrmBase
+from .tenants_projects import _validate_non_sensitive_config, redact_config_bag
 
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
+_BI_SAFE_SLUG_RE = r"^[A-Za-z_][A-Za-z0-9_]*$"
+_BI_SAFE_SLUG_MSG = (
+    "Model slug must contain only letters, digits, and underscores, "
+    "and must start with a letter or underscore. "
+    "Hyphens, spaces, and special characters are not allowed because "
+    "BI clients (Excel, Power BI, DBeaver) parse them as operators."
+)
+
+
 class ModelCreate(BaseModel):
-    slug: str = Field(pattern=r"^[a-z0-9_-]+$", max_length=64)
+    slug: str = Field(max_length=64)
     display_name: Optional[str] = Field(default=None, max_length=255)
     description: Optional[str] = None
     refresh_strategy: str = "scheduled"
     aggregations_enabled: bool = True
-    include_all_measures: bool = True
+    # Bug-9409 (F-102-26 = A): all-measure aggregates are an explicit opt-in.
+    # See shared/model_defaults.py.
+    include_all_measures: bool = DEFAULT_INCLUDE_ALL_MEASURES
     max_aggregates: int = 50
     miss_threshold_daily: int = 3
     miss_threshold_weekly: int = 5
@@ -36,6 +50,14 @@ class ModelCreate(BaseModel):
         description="Per-model byte ceiling for pocket tables. NULL = inherit from project.",
     )
 
+    @field_validator("slug")
+    @classmethod
+    def _validate_slug_bi_safe(cls, v: str) -> str:
+        import re
+        if not re.match(_BI_SAFE_SLUG_RE, v):
+            raise ValueError(_BI_SAFE_SLUG_MSG)
+        return v
+
 
 EvictionPolicy = Literal[
     "predicted_first", "lru", "validated_survives", "never_evict"
@@ -43,7 +65,7 @@ EvictionPolicy = Literal[
 
 
 class ModelUpdate(BaseModel):
-    slug: Optional[str] = Field(None, pattern=r"^[a-z0-9_-]+$", max_length=64)
+    slug: Optional[str] = Field(None, max_length=64)
     display_name: Optional[str] = None
     description: Optional[str] = None
     target_id: Optional[uuid.UUID] = None
@@ -82,6 +104,14 @@ class ModelUpdate(BaseModel):
         default=None, ge=1, le=500,
         description="Max distinct values to probe per dimension during glossary bootstrap.",
     )
+
+    @field_validator("slug")
+    @classmethod
+    def _validate_slug_bi_safe(cls, v: Optional[str]) -> Optional[str]:
+        import re
+        if v is not None and not re.match(_BI_SAFE_SLUG_RE, v):
+            raise ValueError(_BI_SAFE_SLUG_MSG)
+        return v
 
 
 class ModelResponse(OrmBase):
@@ -128,6 +158,22 @@ class ModelResponse(OrmBase):
     # to render freshness/source/owner footers in Excel column tooltips
     # and synthetic XMLA info measures.
     trust_meta: Optional[dict[str, Any]] = None
+    # Bug-8101 / F-104-01 (spec D2): whether THIS caller may author (mutate)
+    # the model — i.e. holds modeler-or-higher on it. Populated by the model
+    # detail route from the caller's effective binding (a ``model_viewer`` or
+    # ``viewer`` principal resolves to False). The Model Builder consumes it to
+    # open the model read-only (SAVE/DEPLOY/authoring hidden) for a consumer
+    # role, reusing the query/pivot surface. Advisory only — the backend
+    # require_role("modeler") gate remains authoritative; this just drives UI.
+    # Optional so batch/list responses that do not compute it stay valid.
+    caller_can_author: Optional[bool] = None
+    # G-013-02: whether this caller holds project ADMIN for the model — the
+    # SAME binding precedence the revert route enforces (require_role("admin")).
+    # The Versions dialog gates the Revert button on this so a project-scoped
+    # admin (not only tenant/system admin) sees it, matching the backend.
+    # Advisory only; require_role("admin") stays authoritative. Optional so
+    # list responses that do not compute it stay valid.
+    caller_can_admin: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -141,12 +187,23 @@ class DataSourceCreate(BaseModel):
     default_schema: Optional[str] = None
     config: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("config")
+    @classmethod
+    def _check_config(cls, v: dict[str, Any]) -> dict[str, Any]:
+        # F-014-07 / Bug-9048: last ungated plaintext config bag on create.
+        return _validate_non_sensitive_config(v)
+
 
 class DataSourceUpdate(BaseModel):
     project_connection_id: Optional[uuid.UUID] = None
     display_name: Optional[str] = None
     default_schema: Optional[str] = None
     config: Optional[dict[str, Any]] = None
+
+    @field_validator("config")
+    @classmethod
+    def _check_config(cls, v: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        return _validate_non_sensitive_config(v)
 
 
 class DataSourceResponse(OrmBase):
@@ -159,6 +216,12 @@ class DataSourceResponse(OrmBase):
     config: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("config", mode="after")
+    @classmethod
+    def _redact_config(cls, v: dict[str, Any]) -> dict[str, Any]:
+        # F-014-07: response-side belt for pre-gate rows.
+        return redact_config_bag(v or {})
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +294,9 @@ class CalendarTableResponse(OrmBase):
     created_at: datetime
     updated_at: datetime
     auto_created_aliases: list[str] = []
+    # Present only for server-created reversible history. The client may carry
+    # the opaque token to undo/redo, but never supplies authoritative metadata.
+    history_provenance: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -243,12 +309,23 @@ class DataTargetCreate(BaseModel):
     display_name: str = Field(max_length=255)
     config: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("config")
+    @classmethod
+    def _check_config(cls, v: dict[str, Any]) -> dict[str, Any]:
+        # F-014-07 / Bug-9048: last ungated plaintext config bag on create.
+        return _validate_non_sensitive_config(v)
+
 
 class DataTargetUpdate(BaseModel):
     project_connection_id: Optional[uuid.UUID] = None
     target_type: Optional[str] = None
     display_name: Optional[str] = None
     config: Optional[dict[str, Any]] = None
+
+    @field_validator("config")
+    @classmethod
+    def _check_config(cls, v: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        return _validate_non_sensitive_config(v)
 
 
 class DataTargetResponse(OrmBase):
@@ -261,26 +338,55 @@ class DataTargetResponse(OrmBase):
     created_at: datetime
     updated_at: datetime
 
+    @field_validator("config", mode="after")
+    @classmethod
+    def _redact_config(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return redact_config_bag(v or {})
+
 
 # ---------------------------------------------------------------------------
 # Model Table
 # ---------------------------------------------------------------------------
 
+ModelTableClassification = Literal["fact", "dim_aggregate", "dim_detail"]
+
+
 class ModelTableCreate(BaseModel):
-    source_id: uuid.UUID
-    table_type: str = Field(description="fact | dim_aggregate | dim_detail")
+    """Body for ``POST .../models/{model_id}/sources/{source_id}/tables``.
+
+    Bug-8930 / Bug-8876: this body deliberately carries NEITHER ``source_id``
+    NOR ``calendar_table_id``.
+
+    * ``source_id`` is a PATH parameter. Declaring it in the body too gave the
+      client a field the handler never read, so a caller could pass a different
+      source id, receive a 201, and get a table bound to the path source
+      instead — a silent divergence with no error.
+    * ``calendar_table_id`` is DERIVED, never trusted from a create body. The
+      binding authority is ``calendar.py``
+      (``auto_register_calendar_from_classification``), which resolves the
+      CalendarTable from the table's own classification. The only client-driven
+      binding path is ``PATCH`` via ``ModelTableUpdate.calendar_table_id``,
+      which is ownership-guarded by ``ensure_calendar_table_in_model``
+      (Bug-8878). Accepting it on create would mean adding a second guard for a
+      capability no caller uses.
+    """
+
+    # F-013-08 (Bug-9118): validate the enum at the boundary. A non-canonical
+    # value (e.g. "Fact") persisted as a raw str bypasses the one-fact-per-model
+    # cap, which compares exactly to FACT_TABLE_TYPE ("fact") — a direct API
+    # client could persist a second fact-like table. Reject with 422 instead.
+    table_type: ModelTableClassification = Field(
+        description="fact | dim_aggregate | dim_detail"
+    )
     physical_name: str = Field(max_length=512)
     alias: Optional[str] = Field(default=None, max_length=255, description="Unique alias within the model; auto-generated if omitted. Must match ^[a-z][a-z0-9_]*$ when provided.")
     display_name: str = Field(max_length=255)
     description: Optional[str] = None
-    calendar_table_id: Optional[uuid.UUID] = Field(
-        default=None,
-        description="Set when this ModelTable is a calendar alias. Links to the CalendarTable that carries column meanings used by time-variant measures.",
-    )
 
 
 class ModelTableUpdate(BaseModel):
-    table_type: Optional[str] = None
+    # F-013-08 (Bug-9118): same enum guard as create; None leaves it unchanged.
+    table_type: Optional[ModelTableClassification] = None
     alias: Optional[str] = None
     display_name: Optional[str] = None
     description: Optional[str] = None
@@ -301,5 +407,4 @@ class ModelTableResponse(OrmBase):
     calendar_table_id: Optional[uuid.UUID] = None
     created_at: datetime
     updated_at: datetime
-
 

@@ -23,6 +23,7 @@ vi.mock("../Confirm", () => ({
   useConfirm: () => vi.fn().mockResolvedValue(true),
 }));
 
+import { scratchpadApi } from "../../api/client";
 import ScratchpadPanel from "./ScratchpadPanel";
 
 function renderPanel() {
@@ -62,5 +63,52 @@ describe("ScratchpadPanel data_type select (F-029-14)", () => {
       "date",
       "timestamp",
     ]);
+  });
+});
+
+describe("ScratchpadPanel save-failure message (Bug-8162)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  async function submitAndReadError(err: unknown): Promise<string> {
+    const user = userEvent.setup();
+    vi.mocked(scratchpadApi.create).mockRejectedValueOnce(err);
+    renderPanel();
+    await user.click(await screen.findByText("New"));
+    await user.type(screen.getByLabelText(/Name \(slug\)/), "m1");
+    await user.type(screen.getByLabelText(/Expression/), "amount * 0.9");
+    await user.click(screen.getByRole("button", { name: "Create" }));
+    return (await screen.findByRole("alert")).textContent ?? "";
+  }
+
+  it("says 'could not be reached, retry' on a 503, not 'your expression is wrong'", async () => {
+    // Bug-8162: the server now REFUSES to save while the query validator is
+    // unreachable. Rendering the server's raw detail (or a generic "save
+    // failed") would leave a modeller believing their CORRECT expression was
+    // rejected. The 503 is what tells the two apart.
+    const text = await submitAndReadError({
+      response: {
+        status: 503,
+        data: { detail: "validator_unavailable: the query validator ..." },
+      },
+    });
+    expect(text).toContain("could not be reached");
+    expect(text).toContain("has not been rejected");
+    // The raw server diagnostic must not leak into the UI.
+    expect(text).not.toContain("validator_unavailable:");
+  });
+
+  it("still shows the server's verdict when the expression really is wrong", async () => {
+    // The other half of Bug-8162: a real rejection must keep reading as a
+    // rejection, or an implementation that says "retry" to everything passes.
+    const text = await submitAndReadError({
+      response: {
+        status: 400,
+        data: {
+          detail: "Expression is not valid for this model: unknown column no_such_col",
+        },
+      },
+    });
+    expect(text).toContain("unknown column no_such_col");
+    expect(text).not.toContain("could not be reached");
   });
 });

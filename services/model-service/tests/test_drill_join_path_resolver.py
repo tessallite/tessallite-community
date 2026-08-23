@@ -19,12 +19,13 @@ from src.api.measures import (
 pytestmark = pytest.mark.unit
 
 
-def _join(left, right, jtype="many_to_one") -> types.SimpleNamespace:
+def _join(left, right, jtype="many_to_one", cardinality=None) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         id=uuid.uuid4(),
         left_table_id=left,
         right_table_id=right,
         join_type=jtype,
+        cardinality=cardinality,
     )
 
 
@@ -126,3 +127,98 @@ def test_cardinality_hint_mixed_when_one_hop_inverted():
     # j2 is fact->bridge (right side), so traversal from bridge to fact inverts to one_to_many.
     j2 = _join(fact, bridge, jtype="many_to_one")
     assert _cardinality_hint_from_path([j1, j2], leaf) == "mixed"
+
+
+# ---------------------------------------------------------------------------
+# Join-orientation contract (invariant 3) — the hint reads CARDINALITY, not the
+# orientation field the two properties used to share.
+# ---------------------------------------------------------------------------
+
+
+def test_cardinality_hint_reads_the_declared_cardinality_field():
+    """A join with a real orientation and a declared fan-out classifies.
+
+    Every join the write API has accepted since Bug-7775 carries an
+    orientation token (inner/left/right/full) in ``join_type``. Classifying
+    from that field made all of them "mixed" regardless of their true fan-out,
+    which refused valid drill-through source overrides. The hint now reads
+    ``Join.cardinality``.
+    """
+    fact = uuid.uuid4()
+    leaf = uuid.uuid4()
+    j = _join(leaf, fact, jtype="right", cardinality="many_to_one")
+    assert _cardinality_hint_from_path([j], leaf) == "many-to-one"
+
+
+def test_cardinality_hint_is_mixed_when_the_fan_out_is_undeclared():
+    """Fail-closed: an orientation with no declared cardinality is UNKNOWN.
+
+    Not knowing whether a hop expands is not the same as knowing it does not —
+    an expanding hop repeats the parent measure across child rows.
+    """
+    fact = uuid.uuid4()
+    leaf = uuid.uuid4()
+    j = _join(leaf, fact, jtype="right", cardinality=None)
+    assert _cardinality_hint_from_path([j], leaf) == "mixed"
+
+
+def test_cardinality_hint_still_reads_a_legacy_token_in_join_type():
+    """Invariant 4: a row written before the split keeps working unchanged."""
+    fact = uuid.uuid4()
+    leaf = uuid.uuid4()
+    j = _join(leaf, fact, jtype="many_to_one", cardinality=None)
+    assert _cardinality_hint_from_path([j], leaf) == "many-to-one"
+
+
+def test_cardinality_hint_inverts_the_declared_cardinality_on_reverse_traversal():
+    fact = uuid.uuid4()
+    leaf = uuid.uuid4()
+    # Declared leaf(many) -> fact(one); traversed FROM the fact it expands.
+    j = _join(leaf, fact, jtype="right", cardinality="many_to_one")
+    assert _cardinality_hint_from_path([j], fact) == "one-to-many"
+
+
+# ---------------------------------------------------------------------------
+# Bug-7267 — _validate_join_path rejects reverse-direction hops
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_validate_join_path_rejects_reverse_direction_bug7267():
+    """A join path that traverses a join in reverse (right_table_id matches
+    cursor) should be rejected with DRILL_JOIN_PATH_WRONG_DIRECTION, because
+    the drill SQL builder emits joins in the defined left->right direction
+    and a reverse hop produces incorrect ON conditions."""
+    from fastapi import HTTPException
+    from src.api.measures import _validate_join_path
+
+    fact = uuid.uuid4()
+    leaf = uuid.uuid4()
+    # Join defined as fact -> leaf (left=fact, right=leaf).
+    # Walking from leaf means cursor=leaf matches right_table_id -> reverse hop.
+    j = _join(fact, leaf)
+    db = _db_with_joins([j])
+    effective_table = types.SimpleNamespace(id=leaf)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _validate_join_path(db, [j.id], uuid.uuid4(), effective_table, fact)
+
+    assert exc_info.value.status_code == 400
+    detail = exc_info.value.detail
+    assert detail["code"] == "DRILL_JOIN_PATH_WRONG_DIRECTION"
+    assert str(j.id) in detail["reversed_join_ids"]
+
+
+@pytest.mark.asyncio
+async def test_validate_join_path_accepts_forward_direction_bug7267():
+    """A join path where every hop is forward (cursor matches left_table_id)
+    should pass validation."""
+    from src.api.measures import _validate_join_path
+
+    fact = uuid.uuid4()
+    leaf = uuid.uuid4()
+    j = _join(leaf, fact)
+    db = _db_with_joins([j])
+    effective_table = types.SimpleNamespace(id=leaf)
+
+    # Should not raise
+    await _validate_join_path(db, [j.id], uuid.uuid4(), effective_table, fact)

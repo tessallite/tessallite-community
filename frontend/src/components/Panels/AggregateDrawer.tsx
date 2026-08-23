@@ -529,15 +529,17 @@ export default function AggregateDrawer({
               </>
             )}
 
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={includeQuantiles}
-                  onChange={(_, v) => setIncludeQuantiles(v)}
-                />
-              }
-              label={t("aggregate.includeQuantiles")}
-            />
+            <Tooltip title={t("aggregate.includeQuantilesTooltip")} arrow>
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={includeQuantiles}
+                    onChange={(_, v) => setIncludeQuantiles(v)}
+                  />
+                }
+                label={t("aggregate.includeQuantiles")}
+              />
+            </Tooltip>
 
             <FormControlLabel
               control={
@@ -549,7 +551,7 @@ export default function AggregateDrawer({
               label={t("aggregate.includeStats")}
             />
 
-            {mode === "edit" && status === "active" && (
+            {mode === "edit" && (status === "active" || status === "disabled") && (
               <FormControl size="small" fullWidth>
                 <InputLabel>{t("aggregate.statusLabel")}</InputLabel>
                 <Select
@@ -558,9 +560,17 @@ export default function AggregateDrawer({
                   onChange={(e) => setStatus(e.target.value)}
                 >
                   <MenuItem value="active">{t("aggregate.active")}</MenuItem>
+                  {status === "disabled" && (
+                    <MenuItem value="disabled">{t("aggregate.disabledStatus")}</MenuItem>
+                  )}
                   <MenuItem value="retired">{t("aggregate.retiredStatus")}</MenuItem>
                 </Select>
               </FormControl>
+            )}
+            {mode === "edit" && status === "disabled" && (
+              <Alert severity="warning" variant="outlined" sx={{ py: 0.5 }}>
+                {t("aggregate.disabledAlert")}
+              </Alert>
             )}
             {mode === "edit" && status === "retired" && (
               <Alert severity="info" variant="outlined" sx={{ py: 0.5 }}>

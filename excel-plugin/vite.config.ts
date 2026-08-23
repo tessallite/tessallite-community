@@ -28,6 +28,15 @@ export default defineConfig({
       '@mui/material',
       '@mui/icons-material',
       'dompurify',
+      // Bug-7736: shared-ui carries its own node_modules with zustand,
+      // @tanstack/react-query, echarts, react-markdown, and remark-gfm.
+      // Without deduplication Vite can bundle a second copy of these
+      // singletons, breaking shared state and the query cache.
+      '@tanstack/react-query',
+      'zustand',
+      'echarts',
+      'react-markdown',
+      'remark-gfm',
     ],
   },
   server: {

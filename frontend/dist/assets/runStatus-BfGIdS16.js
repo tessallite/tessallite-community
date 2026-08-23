@@ -1,0 +1,1 @@
+function r(u,e){switch(u){case"queued":return e("runStatus.queued");case"running":case"in_progress":return e("runStatus.running");case"completed":return e("runStatus.completed");case"failed":return e("runStatus.failed");default:return u??""}}export{r};

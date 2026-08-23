@@ -12,9 +12,13 @@ from __future__ import annotations
 
 import secrets
 
+from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
 from shared.config.settings import get_settings
+
+_SPA_CLIENTS = frozenset({"spa", "web"})
+_TOKEN_CLIENTS = frozenset({"excel", "plugin", "pat", "api"})
 
 
 def _cookie_secure() -> bool:
@@ -56,20 +60,41 @@ def clear_auth_cookies(response: Response) -> None:
     response.delete_cookie("csrf_token", path="/")
 
 
+def omit_access_token_in_body(request: Request | None) -> bool:
+    """True when the JSON login body must not echo the JWT (F-021-05).
+
+    The SPA authenticates via the httpOnly cookie. Putting ``access_token`` in
+    JSON duplicates the secret into JS-accessible memory. Excel/plugin clients
+    that cannot use cookies still receive the token when they identify as such.
+    """
+    if request is None:
+        return False
+    client = (request.headers.get("x-tessallite-client") or "").strip().lower()
+    if client in _TOKEN_CLIENTS:
+        return False
+    if client in _SPA_CLIENTS:
+        return True
+    xhr = (request.headers.get("x-requested-with") or "").strip().lower()
+    return xhr in ("xmlhttprequest", "tessallitespa")
+
+
 def login_response(
     *,
     token: str,
     role: str | None,
     tenant_id: str | None,
     max_age_seconds: int,
+    request: Request | None = None,
 ) -> JSONResponse:
     """Build a ``JSONResponse`` with auth cookies set.
 
-    The JSON body returns ``access_token``, ``role``, ``tenant_id``, and
-    ``expires_in``.  The SPA ignores the token (it uses the httpOnly
-    cookie) but non-browser clients like the Excel add-in need it.
+    The JSON body always returns ``role``, ``tenant_id``, and ``expires_in``.
+    ``access_token`` is omitted for the SPA (cookie is the session) and included
+    for Excel/plugin/API clients (F-021-05).
     """
-    body: dict = {"access_token": token, "expires_in": max_age_seconds}
+    body: dict = {"expires_in": max_age_seconds}
+    if not omit_access_token_in_body(request):
+        body["access_token"] = token
     if role:
         body["role"] = role
     if tenant_id:

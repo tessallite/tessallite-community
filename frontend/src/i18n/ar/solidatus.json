@@ -1,8 +1,10 @@
 {
+  "solidatus.activate": "تفعيل",
   "solidatus.addConnection": "إضافة اتصال",
   "solidatus.baseUrl": "عنوان URL الأساسي",
   "solidatus.breakdownHeading": "حسب نوع العقدة",
   "solidatus.baseUrlPlaceholder": "https://customer.solidatus.example.com",
+  "solidatus.deactivate": "إلغاء التفعيل",
   "solidatus.delete": "حذف",
   "solidatus.deleteFailed": "تعذر الحذف",
   "solidatus.details": "تفاصيل",

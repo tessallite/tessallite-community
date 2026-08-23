@@ -8,27 +8,30 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import selectinload
 
 from shared.db.models import (
     CalendarTable,
     DataSource,
     Dimension,
-    HierarchyDefinition,
-    HierarchyLevel,
     Measure,
     ModelColumn,
     ModelTable,
-    UserDefinedAttribute,
 )
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import (
+    ModelTableClassification,
     ModelTableCreate,
     ModelTableResponse,
     ModelTableUpdate,
     TableAnalysisResponse,
+    TableAttributeResponse,
 )
+from shared.semantic.graph_order import FACT_TABLE_TYPE
+from src.api._model_lock import acquire_model_definition_lock
+from src.api._scope import ensure_calendar_table_in_model, ensure_model_in_project
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 
@@ -94,6 +97,124 @@ router = APIRouter(
     tags=["tables"],
 )
 
+# ModelBuilder opens every table node at once.  Keep that consumer off the
+# source-scoped CRUD route so it can hydrate all table attributes in one
+# model-scoped request instead of issuing one attributes request per node
+# (Bug-9158).
+batch_router = APIRouter(
+    prefix="/projects/{project_id}/models/{model_id}/tables",
+    tags=["tables"],
+)
+
+
+class ModelTableWithAttributesResponse(BaseModel):
+    table: ModelTableResponse
+    attributes: list[TableAttributeResponse]
+
+
+def _table_attribute_responses(table: ModelTable) -> list[TableAttributeResponse]:
+    """Serialize physical columns and UDAs for the batch canvas response."""
+    physical = [
+        TableAttributeResponse(
+            kind="physical",
+            id=column.id,
+            table_id=table.id,
+            name=column.column_name,
+            display_name=column.display_name,
+            description=column.description,
+            is_hidden=column.is_hidden,
+            hidden_reason=column.hidden_reason,
+            is_primary_key=column.is_primary_key,
+            data_type=column.data_type,
+            is_user_defined=False,
+            validated=None,
+            validation_error=None,
+        )
+        for column in table.columns
+    ]
+    user_defined = [
+        TableAttributeResponse(
+            kind="user_defined",
+            id=attribute.id,
+            table_id=table.id,
+            name=attribute.name,
+            display_name=None,
+            description=attribute.description,
+            is_hidden=False,
+            is_primary_key=False,
+            data_type=attribute.output_data_type,
+            is_user_defined=True,
+            is_generated=attribute.is_generated,
+            expression=attribute.expression,
+            validated=attribute.validated,
+            validation_error=attribute.validation_error,
+        )
+        for attribute in table.user_defined_attributes
+    ]
+    return sorted(physical + user_defined, key=lambda attribute: attribute.name.lower())
+
+
+async def _get_scoped_source(
+    db, project_id: UUID, model_id: UUID, source_id: UUID
+) -> DataSource:
+    """Prove the project -> model -> source chain before any read or write.
+
+    Bug-8862: see :func:`_get_scoped_table` for why the project link is not
+    optional.
+    """
+    await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+    source = await db.get(DataSource, source_id)
+    if source is None or source.model_id != model_id:
+        raise HTTPException(status_code=404, detail="DataSource not found")
+    return source
+
+
+async def _get_scoped_table(
+    db,
+    project_id: UUID,
+    model_id: UUID,
+    source_id: UUID,
+    table_id: UUID,
+    *,
+    with_columns: bool = False,
+) -> ModelTable:
+    """Prove the full project -> model -> source -> table chain.
+
+    Bug-8862: these handlers took ``project_id`` as a path parameter and never
+    used it, chaining only source -> model. RBAC (``require_role``) reads
+    ``project_id`` from the path and checks the CALLER'S binding for that
+    project; it never proves the nested resource belongs to it. So a same-tenant
+    caller authorised for one project could read or mutate another project's
+    tables purely by substituting ids.
+
+    404 rather than 403 on a mismatch: confirming the resource exists elsewhere
+    in the tenant would itself leak cross-project information.
+
+    The project -> model hop goes through the shared
+    ``_scope.ensure_model_in_project`` rather than a private clone: Bug-8870
+    records that ``refresh.py``/``pockets.py``/``row_security.py`` each carry a
+    byte-equivalent ``_get_scoped_model``, and that two competing names for one
+    primitive is what makes a repo-wide "does every nested handler bind its
+    chain" coverage guard structurally blind to half its targets.
+
+    ``with_columns`` eager-loads ``ModelTable.columns`` for the analyzer paths,
+    which read them outside the lazy-load-safe async context.
+    """
+    await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+    if with_columns:
+        table = (
+            await db.execute(
+                select(ModelTable)
+                .where(ModelTable.id == table_id)
+                .options(selectinload(ModelTable.columns))
+            )
+        ).scalar_one_or_none()
+    else:
+        table = await db.get(ModelTable, table_id)
+    if table is None or table.source_id != source_id or table.model_id != model_id:
+        raise HTTPException(status_code=404, detail="ModelTable not found")
+    return table
+
 
 async def _assert_at_most_one_fact(
     db,
@@ -108,11 +229,11 @@ async def _assert_at_most_one_fact(
     multi-fact models silently produce wrong results today, so this
     constraint closes a real correctness hole.
     """
-    if new_table_type != "fact":
+    if new_table_type != FACT_TABLE_TYPE:
         return
     stmt = select(func.count()).where(
         ModelTable.model_id == model_id,
-        ModelTable.table_type == "fact",
+        ModelTable.table_type == FACT_TABLE_TYPE,
     )
     if exclude_table_id is not None:
         stmt = stmt.where(ModelTable.id != exclude_table_id)
@@ -163,9 +284,11 @@ async def create_table(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> ModelTableResponse:
     async for db in get_tenant_db(current_user.tenant_id):
-        source = await db.get(DataSource, source_id)
-        if source is None or source.model_id != model_id:
-            raise HTTPException(status_code=404, detail="DataSource not found")
+        # Bug-8862: prove project -> model BEFORE taking the model lock, so an
+        # unauthorised caller cannot contend on another project's advisory lock.
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (read-modify-write: entity read UNDER lock)
+        await _get_scoped_source(db, project_id, model_id, source_id)
 
         await _assert_at_most_one_fact(db, model_id, body.table_type)
 
@@ -271,7 +394,7 @@ async def create_table(
         return ModelTableResponse.model_validate(table)
 
 
-@router.get("", response_model=list[ModelTableResponse])
+@router.get("", response_model=list[ModelTableResponse], dependencies=[require_role("viewer")])
 async def list_tables(
     project_id: UUID,
     model_id: UUID,
@@ -279,6 +402,9 @@ async def list_tables(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> list[ModelTableResponse]:
     async for db in get_tenant_db(current_user.tenant_id):
+        # Bug-8862: the WHERE clause below already conjoins ``model_id``, so
+        # proving project -> model is what closes the cross-project read.
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
         autocreated_ids = (
             select(CalendarTable.id).where(CalendarTable.autocreated == True)  # noqa: E712
         ).scalar_subquery()
@@ -292,7 +418,55 @@ async def list_tables(
         return [ModelTableResponse.model_validate(t) for t in result.scalars().all()]
 
 
-@router.get("/{table_id}", response_model=ModelTableResponse)
+@batch_router.get(
+    "/with-attributes",
+    response_model=list[ModelTableWithAttributesResponse],
+    dependencies=[require_role("viewer")],
+)
+async def list_tables_with_attributes(
+    project_id: UUID,
+    model_id: UUID,
+    current_user: CurrentUser = Depends(forbid_embed_user),
+) -> list[ModelTableWithAttributesResponse]:
+    """Return every visible model table and its attributes in one request.
+
+    The Builder canvas renders an attribute list for every table.  The old
+    client fetched the table catalogue per source and then fetched attributes
+    per table, producing a request fan-out proportional to model size.  This
+    endpoint preserves the same autocreated-calendar filtering as
+    ``list_tables`` while using select-in loading for the two attribute
+    collections, so the client has one stable batch contract (Bug-9158).
+    """
+    async for db in get_tenant_db(current_user.tenant_id):
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        autocreated_ids = (
+            select(CalendarTable.id).where(CalendarTable.autocreated == True)  # noqa: E712
+        ).scalar_subquery()
+        result = await db.execute(
+            select(ModelTable)
+            .options(
+                selectinload(ModelTable.columns),
+                selectinload(ModelTable.user_defined_attributes),
+            )
+            .where(
+                ModelTable.model_id == model_id,
+                or_(
+                    ModelTable.calendar_table_id.is_(None),
+                    ModelTable.calendar_table_id.notin_(autocreated_ids),
+                ),
+            )
+            .order_by(ModelTable.alias, ModelTable.id)
+        )
+        return [
+            ModelTableWithAttributesResponse(
+                table=ModelTableResponse.model_validate(table),
+                attributes=_table_attribute_responses(table),
+            )
+            for table in result.scalars().unique().all()
+        ]
+
+
+@router.get("/{table_id}", response_model=ModelTableResponse, dependencies=[require_role("viewer")])
 async def get_table(
     project_id: UUID,
     model_id: UUID,
@@ -301,9 +475,7 @@ async def get_table(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> ModelTableResponse:
     async for db in get_tenant_db(current_user.tenant_id):
-        t = await db.get(ModelTable, table_id)
-        if t is None or t.source_id != source_id or t.model_id != model_id:
-            raise HTTPException(status_code=404, detail="ModelTable not found")
+        t = await _get_scoped_table(db, project_id, model_id, source_id, table_id)
         return ModelTableResponse.model_validate(t)
 
 
@@ -323,10 +495,42 @@ async def update_table(
     from shared.semantic.model_validator import revalidate_model
 
     async for db in get_tenant_db(current_user.tenant_id):
-        t = await db.get(ModelTable, table_id)
-        if t is None or t.source_id != source_id or t.model_id != model_id:
-            raise HTTPException(status_code=404, detail="ModelTable not found")
+        # Bug-8862: prove project -> model BEFORE taking the model lock.
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (read-modify-write: entity read UNDER lock)
+        t = await _get_scoped_table(db, project_id, model_id, source_id, table_id)
         updates = body.model_dump(exclude_unset=True)
+
+        # Bug-8878: ``calendar_table_id`` is a body foreign key applied by the
+        # blanket ``setattr`` loop below. Bug-8862 closed the PATH chain
+        # (project -> model -> source -> table); this is the same defect class
+        # entering through the PAYLOAD, which the path chain cannot reach.
+        # ``calendar_tables.id`` is tenant-schema-wide, so a project-B calendar
+        # id satisfies the FK constraint, and the reference is dereferenced
+        # without an ownership re-check in at least four places: hierarchies.py
+        # (:2966, :3070), hierarchy_health.py (:197-203), measures.py (:434) —
+        # and, in a DIFFERENT SERVICE, query-router
+        # rewrite/calendar_support.py:_resolve_calendar_binding, whose result
+        # reaches rewrite/source_sql.py:3217 as
+        # ``LEFT JOIN <calendar.table_name> AS cal``. An unvalidated value here
+        # therefore does not merely mis-associate a row; it puts another
+        # project's physical table name and column meanings into emitted SQL.
+        #
+        # The check must run BEFORE the setattr loop: the helper's SELECT
+        # autoflushes, so guarding afterwards would send the unvalidated value
+        # to the database before it could be refused.
+        #
+        # An explicit ``null`` is legal and means "unbind" — the helper returns
+        # None for it — so the guard keys on the field being PRESENT, not on it
+        # being truthy.
+        if "calendar_table_id" in updates:
+            await ensure_calendar_table_in_model(
+                db,
+                calendar_table_id=updates["calendar_table_id"],
+                model_id=model_id,
+                project_id=project_id,
+            )
+
         type_changed = (
             "table_type" in updates and updates["table_type"] != t.table_type
         )
@@ -381,79 +585,44 @@ async def delete_table(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> None:
     from shared.semantic.model_validator import revalidate_model
+    from src.api._table_cleanup import (
+        cleanup_table_dependents,
+        is_rls_mapping_integrity_error,
+    )
 
     async for db in get_tenant_db(current_user.tenant_id):
-        t = await db.get(ModelTable, table_id)
-        if t is None or t.source_id != source_id or t.model_id != model_id:
-            raise HTTPException(status_code=404, detail="ModelTable not found")
+        # Bug-8862: prove project -> model BEFORE taking the model lock.
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (read-modify-write: entity read UNDER lock)
+        t = await _get_scoped_table(db, project_id, model_id, source_id, table_id)
 
-        col_ids = (
-            await db.execute(
-                select(ModelColumn.id).where(ModelColumn.model_table_id == table_id)
-            )
-        ).scalars().all()
-
-        uda_ids = (
-            await db.execute(
-                select(UserDefinedAttribute.id).where(
-                    UserDefinedAttribute.table_id == table_id
-                )
-            )
-        ).scalars().all()
-
-        if col_ids:
-            await db.execute(
-                delete(Dimension).where(Dimension.source_column_id.in_(col_ids))
-            )
-            await db.execute(
-                delete(Measure).where(Measure.source_column_id.in_(col_ids))
-            )
-
-        if uda_ids:
-            await db.execute(
-                delete(Dimension).where(
-                    Dimension.user_defined_attribute_id.in_(uda_ids)
-                )
-            )
-            await db.execute(
-                delete(Measure).where(
-                    Measure.user_defined_attribute_id.in_(uda_ids)
-                )
-            )
-            orphaned_hierarchy_ids = (
-                await db.execute(
-                    select(HierarchyLevel.hierarchy_id).where(
-                        HierarchyLevel.key_attribute_id.in_(uda_ids),
-                        HierarchyLevel.key_attribute_source == "user_defined_attribute",
-                    )
-                )
-            ).scalars().all()
-            await db.execute(
-                delete(HierarchyLevel).where(
-                    HierarchyLevel.key_attribute_id.in_(uda_ids),
-                    HierarchyLevel.key_attribute_source == "user_defined_attribute",
-                )
-            )
-            if orphaned_hierarchy_ids:
-                for hid in set(orphaned_hierarchy_ids):
-                    remaining = (
-                        await db.execute(
-                            select(func.count()).where(
-                                HierarchyLevel.hierarchy_id == hid
-                            )
-                        )
-                    ).scalar()
-                    if remaining == 0:
-                        await db.execute(
-                            delete(HierarchyDefinition).where(
-                                HierarchyDefinition.id == hid
-                            )
-                        )
+        # Bug-6225 [SECURITY]: the FK cascade below removes measures/dimensions/
+        # hierarchy levels without touching the persona allow-lists,
+        # default_filters or soft-referencing rows that point at them. Run the
+        # shared strip + purge + hierarchy orphan-sweep BEFORE the rows vanish
+        # (same helper the whole-source delete uses — Bug-7794). The helper also
+        # locks this table row and 409s if it is an RLS mapping table.
+        await cleanup_table_dependents(db, model_id=model_id, table_id=table_id)
 
         await db.delete(t)
-        await db.flush()
-        await revalidate_model(model_id, db)
-        await db.commit()
+        try:
+            await db.flush()
+            await revalidate_model(model_id, db)
+            await db.commit()
+        except IntegrityError as exc:
+            # Safety net: a residual race (an RLS mapping-rule insert past the
+            # guard + row lock) surfaces as a clean 409, not a raw 500.
+            await db.rollback()
+            if is_rls_mapping_integrity_error(exc):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "Cannot delete this table; it is the mapping table for "
+                        "a row-security rule. Retire or re-point those rules "
+                        "first."
+                    ),
+                ) from exc
+            raise
 
 
 @router.post(
@@ -469,18 +638,12 @@ async def analyze_table_endpoint(
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> TableAnalysisResponse:
     """Run heuristic auto-analysis on the table and return suggestions."""
-    from sqlalchemy.orm import selectinload
     from shared.semantic.table_analyzer import analyze_table
 
     async for db in get_tenant_db(current_user.tenant_id):
-        result = await db.execute(
-            select(ModelTable)
-            .where(ModelTable.id == table_id)
-            .options(selectinload(ModelTable.columns))
+        t = await _get_scoped_table(
+            db, project_id, model_id, source_id, table_id, with_columns=True
         )
-        t = result.scalar_one_or_none()
-        if t is None or t.source_id != source_id or t.model_id != model_id:
-            raise HTTPException(status_code=404, detail="ModelTable not found")
         analysis = analyze_table(t)
         return TableAnalysisResponse(
             table_id=analysis.table_id,
@@ -544,9 +707,7 @@ async def rename_preview(
     _validate_alias_format(new_alias)
 
     async for db in get_tenant_db(current_user.tenant_id):
-        t = await db.get(ModelTable, table_id)
-        if t is None or t.source_id != source_id or t.model_id != model_id:
-            raise HTTPException(status_code=404, detail="ModelTable not found")
+        t = await _get_scoped_table(db, project_id, model_id, source_id, table_id)
 
         # Column IDs belonging to this table.
         col_id_rows = (
@@ -626,7 +787,10 @@ class ClassificationOverride(BaseModel):
 
 
 class ApplyClassificationRequest(BaseModel):
-    table_type: str | None = None
+    # Bug-8626: this endpoint is a second public ModelTable.table_type writer,
+    # so it must share the create/update domain rather than accept a free string
+    # such as "Fact" that bypasses the case-sensitive one-fact index.
+    table_type: ModelTableClassification | None = None
     overrides: list[ClassificationOverride] = []
 
 
@@ -654,18 +818,15 @@ async def apply_classification(
     Runs the heuristic analyzer, merges user overrides, then creates
     dimensions and measures for each accepted column.
     """
-    from sqlalchemy.orm import selectinload
     from shared.semantic.table_analyzer import analyze_table
 
     async for db in get_tenant_db(current_user.tenant_id):
-        result = await db.execute(
-            select(ModelTable)
-            .where(ModelTable.id == table_id)
-            .options(selectinload(ModelTable.columns))
+        # Bug-8862: prove project -> model BEFORE taking the model lock.
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
+        t = await _get_scoped_table(
+            db, project_id, model_id, source_id, table_id, with_columns=True
         )
-        t = result.scalar_one_or_none()
-        if t is None or t.source_id != source_id or t.model_id != model_id:
-            raise HTTPException(status_code=404, detail="ModelTable not found")
 
         analysis = analyze_table(t)
         override_map = {o.column_id: o.role for o in body.overrides}
@@ -709,12 +870,16 @@ async def apply_classification(
 
             if role == "dimension" or role == "date_key":
                 if col.column_name not in existing_dims:
+                    # Bug-8864: ``Dimension`` carries no ``data_type`` column
+                    # (``Measure`` does); the dimension's type is read from its
+                    # ``source_column_id``. Passing it raised TypeError in the
+                    # declarative constructor, so this endpoint returned HTTP
+                    # 500 for every dimension/date_key column.
                     db.add(Dimension(
                         model_id=model_id,
                         source_column_id=col.id,
                         name=col.column_name,
                         display_name=col.column_name.replace("_", " ").title(),
-                        data_type=col.data_type or "string",
                         is_time_dim=(role == "date_key"),
                     ))
                     dims_created += 1

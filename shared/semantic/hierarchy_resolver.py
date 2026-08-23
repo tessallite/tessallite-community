@@ -86,6 +86,71 @@ async def load_hierarchy_level_dimensions(
     return out
 
 
+async def load_dimensions_with_hierarchy_levels(
+    model_id: object,
+    db: AsyncSession,
+    dimensions: list[Any],
+) -> list[Any]:
+    """Return the canonical grain vocabulary used by aggregate builders.
+
+    Explicit dimensions retain precedence over hierarchy aliases with the same
+    name. Qualified hierarchy names remain available, while an unambiguous bare
+    level alias is included when it does not collide with an explicit dimension.
+    """
+    combined = list(dimensions)
+    names_seen = {dimension.name for dimension in combined}
+    for hierarchy_level in await load_hierarchy_level_dimensions(model_id, db):
+        if hierarchy_level.name in names_seen:
+            continue
+        combined.append(
+            types.SimpleNamespace(
+                id=hierarchy_level.id,
+                name=hierarchy_level.name,
+                source_column_id=hierarchy_level.source_column_id,
+                user_defined_attribute_id=hierarchy_level.user_defined_attribute_id,
+                is_time_dim=hierarchy_level.is_time_dim,
+            )
+        )
+        names_seen.add(hierarchy_level.name)
+    return combined
+
+
+async def resolve_aggregate_layout_with_hierarchy_levels(
+    model_id: object,
+    db: AsyncSession,
+    dimensions: list[Any],
+    resolver: Any = None,
+    **layout_kwargs: Any,
+) -> tuple[Any, list[Any]]:
+    """Resolve a refresh layout with the creator's hierarchy vocabulary.
+
+    Flat dimensions remain the fast path. Only an unknown grain dimension
+    triggers the hierarchy query and retry; unknown measures and every other
+    resolution error remain fail-closed without changing their meaning.
+    """
+    from shared.semantic.grain_resolver import (
+        GrainResolutionError,
+        resolve_aggregate_layout,
+    )
+    resolve = resolver or resolve_aggregate_layout
+
+    try:
+        return (
+            resolve(dimensions=dimensions, **layout_kwargs),
+            dimensions,
+        )
+    except GrainResolutionError as exc:
+        if not str(exc).startswith("Unknown dimension:"):
+            raise
+        combined = await load_dimensions_with_hierarchy_levels(
+            model_id, db, dimensions
+        )
+        return (
+            resolve(dimensions=combined, **layout_kwargs),
+            combined,
+        )
+
+
 def resolve_hierarchy_dimension_map(
     dimensions_meta: list[dict[str, Any]],
     hierarchy_meta: list[dict[str, Any]],
@@ -187,6 +252,8 @@ def resolve_hierarchy_dimension_map(
 
 
 __all__ = [
+    "load_dimensions_with_hierarchy_levels",
     "load_hierarchy_level_dimensions",
+    "resolve_aggregate_layout_with_hierarchy_levels",
     "resolve_hierarchy_dimension_map",
 ]

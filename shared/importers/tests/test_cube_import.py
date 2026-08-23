@@ -7,6 +7,10 @@ from shared.importers.cube_parser import CubeParseError, parse_cube_yaml, parse_
 from shared.importers.cube_mapper import map_cube_to_tessallite
 
 
+def _details(warnings):
+    return [warning.detail for warning in warnings]
+
+
 SAMPLE_CUBE_YAML = textwrap.dedent("""\
     cubes:
       - name: orders
@@ -178,7 +182,9 @@ class TestCubeMapper:
         assert total["display_name"] == "Total Amount"
         assert total["format"] == "currency"
         avg_m = next(m for m in model["measures"] if m["name"] == "avg_amount")
-        assert avg_m["default_agg"] == "average"
+        # Bug-6591: canonical token is "avg" (the runtime renderer's set), not
+        # the non-canonical "average" that failed late at query time.
+        assert avg_m["default_agg"] == "avg"
 
     def test_dimensions_mapped(self):
         parsed = parse_cube_yaml(SAMPLE_CUBE_YAML)
@@ -200,7 +206,7 @@ class TestCubeMapper:
         result = map_cube_to_tessallite(parsed)
         model = result.bundle["models"][0]
         assert model["joins"] == []
-        join_warnings = [w for w in result.warnings if "join to 'users'" in w]
+        join_warnings = [w for w in _details(result.warnings) if "join to 'users'" in w]
         assert len(join_warnings) == 1
 
     def test_hierarchies_mapped(self):
@@ -254,7 +260,7 @@ class TestCubeMapper:
         """)
         parsed = parse_cube_yaml(yaml_str)
         result = map_cube_to_tessallite(parsed)
-        rolling_warnings = [w for w in result.warnings if "rolling_window" in w]
+        rolling_warnings = [w for w in _details(result.warnings) if "rolling_window" in w]
         assert len(rolling_warnings) == 1
         m = result.bundle["models"][0]["measures"][0]
         assert m["measure_type"] == "calculated"
@@ -282,6 +288,45 @@ class TestCubeMapper:
         dim_names = {d["name"] for d in model["dimensions"]}
         assert "visible" in dim_names
         assert "hidden" not in dim_names
+        assert any(
+            warning.code == "cube.element_skipped"
+            and warning.params == {
+                "element_type": "dimension",
+                "element_name": "hidden",
+                "cube": "test",
+                "reason": "private",
+            }
+            for warning in result.warnings
+        )
+
+    def test_private_measure_is_explicitly_reported(self):
+        yaml_str = textwrap.dedent("""\
+            cubes:
+              - name: orders
+                sql_table: orders
+                measures:
+                  - name: visible_count
+                    type: count
+                  - name: internal_margin
+                    type: sum
+                    sql: internal_margin
+                    public: false
+        """)
+        parsed = parse_cube_yaml(yaml_str)
+        result = map_cube_to_tessallite(parsed)
+        model = result.bundle["models"][0]
+
+        assert {m["name"] for m in model["measures"]} == {"visible_count"}
+        assert any(
+            warning.code == "cube.element_skipped"
+            and warning.params == {
+                "element_type": "measure",
+                "element_name": "internal_margin",
+                "cube": "orders",
+                "reason": "private",
+            }
+            for warning in result.warnings
+        )
 
 
 class TestCubeProject:
@@ -373,7 +418,7 @@ class TestCubePhysicalColumnBinding:
         """)
         parsed = parse_cube_yaml(yaml_str)
         result = map_cube_to_tessallite(parsed)
-        expr_warnings = [w for w in result.warnings if "SQL expression" in w]
+        expr_warnings = [w for w in _details(result.warnings) if "SQL expression" in w]
         assert len(expr_warnings) == 1
         model = result.bundle["models"][0]
         col_names = {c["column_name"] for c in model["columns"]}
@@ -399,7 +444,7 @@ class TestCubePhysicalColumnBinding:
         col_names = {c["column_name"] for c in model["columns"]}
         assert "amount" in col_names
         assert "status" in col_names
-        expr_warnings = [w for w in result.warnings if "SQL expression" in w]
+        expr_warnings = [w for w in _details(result.warnings) if "SQL expression" in w]
         assert len(expr_warnings) == 0
 
     def test_empty_sql_falls_back_to_logical_name(self):
@@ -542,7 +587,7 @@ class TestCubeExplicitHierarchyValidation:
         assert "nonexistent_dim" not in level_names
         for lvl in hier["levels"]:
             assert lvl["key_attribute_id"] is not None
-        skip_warnings = [w for w in result.warnings if "skipped levels" in w]
+        skip_warnings = [w for w in _details(result.warnings) if "skipped levels" in w]
         assert len(skip_warnings) == 1
 
     def test_private_dimension_level_skipped(self):
@@ -605,7 +650,8 @@ class TestCubeMeasureTypes:
         ("count_distinct", "count_distinct"),
         ("count_distinct_approx", "count_distinct"),
         ("sum", "sum"),
-        ("avg", "average"),
+        # Bug-6591: canonical token "avg", not the non-canonical "average".
+        ("avg", "avg"),
         ("min", "min"),
         ("max", "max"),
         ("number", "sum"),
@@ -646,7 +692,7 @@ class TestCubeUnrepresentableMeasures:
         model = result.bundle["models"][0]
         m = next(x for x in model["measures"] if x["name"] == "cumulative_revenue")
         assert m["is_invalid"] is True
-        assert any("running_total" in w for w in result.warnings)
+        assert any("running_total" in w for w in _details(result.warnings))
 
     def test_supported_cube_measure_stays_active(self):
         yaml_str = textwrap.dedent("""\

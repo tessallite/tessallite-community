@@ -14,11 +14,13 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from .result_fakes import FakeScalarResult
 
 from fastapi import HTTPException
 from shared.auth.middleware import CurrentEmbedUser, CurrentUser
 from src.auth.middleware import get_current_user
 from src.api._persona_scope import resolve_effective_persona
+from shared.security.persona_resolver import get_assigned_personas, is_in_audience
 
 from .conftest import (
     NOW,
@@ -51,6 +53,7 @@ def _persona(
     included_hierarchy_ids: list | None = None,
     audience_roles: list | None = None,
     includes_hidden_columns: bool = False,
+    bypass_row_security: bool = False,
 ) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         id=persona_id or uuid.uuid4(),
@@ -64,6 +67,7 @@ def _persona(
         audience_roles=audience_roles if audience_roles is not None else [],
         default_filters={},
         includes_hidden_columns=includes_hidden_columns,
+        bypass_row_security=bypass_row_security,
         created_at=NOW,
         updated_at=NOW,
     )
@@ -139,7 +143,7 @@ class _ScalarResult:
         self._items = list(items)
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return list(self._items)
@@ -152,6 +156,25 @@ class _ScalarResult:
 
 
 _EMPTY = _ScalarResult([])
+
+
+def _persona_resolve_results(persona_obj, *, caller_roles: set[str] | None = None):
+    """Execute results for ``get_assigned_personas`` plus a load when the
+    caller is not in audience (F-008-03 tag lookup + voluntary pick).
+    """
+    roles = caller_roles if caller_roles is not None else set()
+    seq = [_ScalarResult([persona_obj]), _EMPTY]
+    if not is_in_audience(persona_obj, roles):
+        seq.append(_ScalarResult([persona_obj]))
+    return seq
+
+
+def _assigned(*personas):
+    """``get_assigned_personas``: all personas, then tag-id lookup if any."""
+    seq = [_ScalarResult(list(personas))]
+    if personas:
+        seq.append(_EMPTY)
+    return seq
 
 
 def _base_db():
@@ -187,7 +210,7 @@ class TestMeasuresPersonaScope:
         db = _base_db()
         responses = []
         if persona_obj is not None:
-            responses.append(_ScalarResult([persona_obj]))
+            responses.extend(_persona_resolve_results(persona_obj))
         else:
             responses.append(_EMPTY)  # persona assignment query (no assignments)
         responses.append(_EMPTY)  # redundant partners: tables
@@ -262,7 +285,7 @@ class TestDimensionsPersonaScope:
         db = _base_db()
         responses = []
         if persona_obj is not None:
-            responses.append(_ScalarResult([persona_obj]))
+            responses.extend(_persona_resolve_results(persona_obj))
         else:
             responses.append(_EMPTY)  # persona assignment query (no assignments)
         responses.append(_EMPTY)  # redundant partners: tables
@@ -328,7 +351,7 @@ class TestHierarchiesPersonaScope:
         db = _base_db()
         responses = []
         if persona_obj is not None:
-            responses.append(_ScalarResult([persona_obj]))
+            responses.extend(_persona_resolve_results(persona_obj))
         else:
             responses.append(_EMPTY)  # persona assignment query (no assignments)
         responses.append(_ScalarResult(hierarchies or []))  # main query
@@ -613,7 +636,7 @@ class TestAudienceEnforcement:
     async def test_single_assignment_auto_resolves(self):
         p = _persona(audience_roles=["viewer"])
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p])])
+        db.execute = AsyncMock(side_effect=_assigned(p))
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
         result = await resolve_effective_persona(
             db, current_user=user, model_id=TEST_MODEL_ID, requested_persona_id=None,
@@ -625,7 +648,7 @@ class TestAudienceEnforcement:
     async def test_single_assignment_rejects_other(self):
         p = _persona(audience_roles=["viewer"])
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p])])
+        db.execute = AsyncMock(side_effect=_assigned(p))
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
         with pytest.raises(HTTPException) as exc_info:
             await resolve_effective_persona(
@@ -639,7 +662,7 @@ class TestAudienceEnforcement:
         p1 = _persona(audience_roles=["viewer"])
         p2 = _persona(audience_roles=["viewer"])
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p1, p2])])
+        db.execute = AsyncMock(side_effect=_assigned(p1, p2))
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
         with pytest.raises(HTTPException) as exc_info:
             await resolve_effective_persona(
@@ -654,10 +677,7 @@ class TestAudienceEnforcement:
         p1 = _persona(audience_roles=["viewer"])
         p2 = _persona(audience_roles=["viewer"])
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[
-            _ScalarResult([p1, p2]),
-            _ScalarResult([p1]),
-        ])
+        db.execute = AsyncMock(side_effect=_assigned(p1, p2))
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
         result = await resolve_effective_persona(
             db, current_user=user, model_id=TEST_MODEL_ID,
@@ -669,7 +689,7 @@ class TestAudienceEnforcement:
     async def test_unassigned_defaults_to_base(self):
         p_analyst = _persona(audience_roles=["analyst"])
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p_analyst])])
+        db.execute = AsyncMock(side_effect=_assigned(p_analyst))
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
         result = await resolve_effective_persona(
             db, current_user=user, model_id=TEST_MODEL_ID,
@@ -682,7 +702,7 @@ class TestAudienceEnforcement:
         p_analyst = _persona(audience_roles=["analyst"])
         db = AsyncMock()
         db.execute = AsyncMock(side_effect=[
-            _ScalarResult([p_analyst]),
+            *_assigned(p_analyst),
             _ScalarResult([p_analyst]),
         ])
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
@@ -721,7 +741,7 @@ class TestAudienceEnforcement:
         p2 = _persona(audience_roles=["viewer"])
         p3 = _persona(audience_roles=["analyst"])
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p1, p2])])
+        db.execute = AsyncMock(side_effect=_assigned(p1, p2))
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
         with pytest.raises(HTTPException) as exc_info:
             await resolve_effective_persona(
@@ -736,7 +756,7 @@ class TestAudienceEnforcement:
         """Bug-620: CurrentUser with role=None has no audience match → unassigned → base model."""
         p_viewer = _persona(audience_roles=["viewer"])
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p_viewer])])
+        db.execute = AsyncMock(side_effect=_assigned(p_viewer))
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test")
         result = await resolve_effective_persona(
             db, current_user=user, model_id=TEST_MODEL_ID,
@@ -753,7 +773,7 @@ class TestAudienceEnforcement:
             includes_hidden_columns=True, audience_roles=["model_technical"],
         )
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p_tech])])
+        db.execute = AsyncMock(side_effect=_assigned(p_tech))
         user = CurrentUser(user_id="t@test", tenant_id=TEST_TENANT, email="t@test", role="model_technical")
         result = await resolve_effective_persona(
             db, current_user=user, model_id=TEST_MODEL_ID,
@@ -770,7 +790,7 @@ class TestAudienceEnforcement:
         )
         other_id = uuid.uuid4()
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p_tech])])
+        db.execute = AsyncMock(side_effect=_assigned(p_tech))
         user = CurrentUser(user_id="t@test", tenant_id=TEST_TENANT, email="t@test", role="model_technical")
         with pytest.raises(HTTPException) as exc_info:
             await resolve_effective_persona(
@@ -790,7 +810,7 @@ class TestAudienceEnforcement:
         p_tech = _persona(includes_hidden_columns=True, audience_roles=[])
         p_partner = _persona(audience_roles=["viewer"])
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p_tech, p_partner])])
+        db.execute = AsyncMock(side_effect=_assigned(p_tech, p_partner))
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
         result = await resolve_effective_persona(
             db, current_user=user, model_id=TEST_MODEL_ID,
@@ -807,7 +827,7 @@ class TestAudienceEnforcement:
         p_tech = _persona(includes_hidden_columns=True, audience_roles=[])
         p_partner = _persona(audience_roles=["viewer"])
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p_tech, p_partner])])
+        db.execute = AsyncMock(side_effect=_assigned(p_tech, p_partner))
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
         result = await resolve_effective_persona(
             db, current_user=user, model_id=TEST_MODEL_ID,
@@ -823,8 +843,8 @@ class TestAudienceEnforcement:
         p_tech = _persona(includes_hidden_columns=True, audience_roles=[])
         db = AsyncMock()
         db.execute = AsyncMock(side_effect=[
-            _ScalarResult([p_tech]),   # get_assigned_personas
-            _ScalarResult([p_tech]),   # load_persona_or_fail
+            *_assigned(p_tech),
+            _ScalarResult([p_tech]),
         ])
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
         with pytest.raises(HTTPException) as exc_info:
@@ -841,7 +861,7 @@ class TestAudienceEnforcement:
         hidden-columns surface."""
         p_tech = _persona(includes_hidden_columns=True, audience_roles=[])
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p_tech])])
+        db.execute = AsyncMock(side_effect=_assigned(p_tech))
         user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
         result = await resolve_effective_persona(
             db, current_user=user, model_id=TEST_MODEL_ID,
@@ -854,13 +874,115 @@ class TestAudienceEnforcement:
         """Admins/modelers impersonate any persona, including technical."""
         p_tech = _persona(includes_hidden_columns=True, audience_roles=["model_technical"])
         db = AsyncMock()
-        db.execute = AsyncMock(side_effect=[_ScalarResult([p_tech])])
+        db.execute = AsyncMock(side_effect=_assigned(p_tech))
         user = CurrentUser(user_id="a@test", tenant_id=TEST_TENANT, email="a@test", role="tenant_admin")
         result = await resolve_effective_persona(
             db, current_user=user, model_id=TEST_MODEL_ID,
             requested_persona_id=p_tech.id,
         )
         assert result.id == p_tech.id
+
+    # -- Bug-6136 / F-008-30: bypass_row_security is a widening surface --
+
+    @pytest.mark.asyncio
+    async def test_unassigned_viewer_cannot_pick_bypass_persona(self):
+        """A ``bypass_row_security`` persona skips RLS, so it is never a
+        legitimate voluntary pick for a non-privileged, unassigned caller
+        (Bug-6136). The resolver must DENY the escalation."""
+        p_bypass = _persona(bypass_row_security=True, audience_roles=["dashboard_service"])
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=[
+            _ScalarResult([]),          # get_assigned_personas — analyst not in audience
+            _ScalarResult([p_bypass]),  # load_persona_or_fail
+        ])
+        user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
+        with pytest.raises(HTTPException) as exc_info:
+            await resolve_effective_persona(
+                db, current_user=user, model_id=TEST_MODEL_ID,
+                requested_persona_id=p_bypass.id,
+            )
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_unassigned_viewer_cannot_pick_empty_audience_bypass_persona(self):
+        """Bug-6136: empty audience does not make a bypass persona public.
+
+        A regular unassigned caller may voluntarily select a narrowing persona,
+        but a bypass persona widens row access and must be refused even when its
+        audience list is empty.
+        """
+        p_bypass = _persona(bypass_row_security=True, audience_roles=[])
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=[
+            _ScalarResult([]),          # get_assigned_personas
+            _ScalarResult([p_bypass]),  # load_persona_or_fail
+        ])
+        user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
+        with pytest.raises(HTTPException) as exc_info:
+            await resolve_effective_persona(
+                db, current_user=user, model_id=TEST_MODEL_ID,
+                requested_persona_id=p_bypass.id,
+            )
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_empty_audience_bypass_persona_not_auto_assigned(self):
+        """An empty-audience ``bypass_row_security`` persona must NOT be
+        treated as available-to-everyone; a regular user with no other
+        assignment gets the RLS-enforced base model, not the bypass
+        (Bug-6136 — the tenant-wide auto-assign path)."""
+        p_bypass = _persona(bypass_row_security=True, audience_roles=[])
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=_assigned(p_bypass))
+        user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
+        result = await resolve_effective_persona(
+            db, current_user=user, model_id=TEST_MODEL_ID,
+            requested_persona_id=None,
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_empty_audience_bypass_persona_not_in_assigned_list(self):
+        """``get_assigned_personas`` must exclude an empty-audience bypass
+        persona for a regular user (Bug-6136)."""
+        p_bypass = _persona(bypass_row_security=True, audience_roles=[])
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=_assigned(p_bypass))
+        user = CurrentUser(user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer")
+        assigned = await get_assigned_personas(db, user, TEST_MODEL_ID)
+        assert assigned == []
+
+    @pytest.mark.asyncio
+    async def test_bypass_persona_granted_via_explicit_audience(self):
+        """A user whose role IS in the bypass persona's audience list is a
+        legitimate holder and auto-resolves to it (grant, not escalation)."""
+        p_bypass = _persona(bypass_row_security=True, audience_roles=["dashboard_service"])
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=_assigned(p_bypass))
+        user = CurrentUser(
+            user_id="svc@test", tenant_id=TEST_TENANT, email="svc@test",
+            role="dashboard_service",
+        )
+        result = await resolve_effective_persona(
+            db, current_user=user, model_id=TEST_MODEL_ID,
+            requested_persona_id=None,
+        )
+        assert result is not None
+        assert result.id == p_bypass.id
+
+    @pytest.mark.asyncio
+    async def test_privileged_admin_can_still_pick_bypass(self):
+        """Admins/modelers may impersonate a bypass persona (Bug-6136 must
+        not over-restrict the privileged path)."""
+        p_bypass = _persona(bypass_row_security=True, audience_roles=["dashboard_service"])
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=_assigned(p_bypass))
+        user = CurrentUser(user_id="a@test", tenant_id=TEST_TENANT, email="a@test", role="tenant_admin")
+        result = await resolve_effective_persona(
+            db, current_user=user, model_id=TEST_MODEL_ID,
+            requested_persona_id=p_bypass.id,
+        )
+        assert result.id == p_bypass.id
 
 
 # ---------------------------------------------------------------------------
@@ -892,7 +1014,7 @@ class TestHierarchyDimensionFiltering:
     def _mock_db(self, *, persona_obj, hierarchies, all_levels, dimensions):
         db = _base_db()
         responses = []
-        responses.append(_ScalarResult([persona_obj]))
+        responses.extend(_persona_resolve_results(persona_obj))
         responses.append(_ScalarResult(hierarchies))
         responses.append(_ScalarResult(dimensions))
         responses.append(_ScalarResult(all_levels))
@@ -1027,7 +1149,7 @@ class TestHierarchyDetailDimensionFiltering:
             (self.dim_excluded, self.attr_excluded, None),
         ]
         responses = [
-            _ScalarResult([self.persona]),
+            *_persona_resolve_results(self.persona),
             _ScalarResult(dims),
             _ScalarResult([self.lv_allowed, self.lv_excluded]),
             _EMPTY,
@@ -1063,7 +1185,7 @@ class TestHierarchyDetailDimensionFiltering:
             (self.dim_excluded, self.attr_excluded, None),
         ]
         responses = [
-            _ScalarResult([self.persona]),
+            *_persona_resolve_results(self.persona),
             _ScalarResult([self.lv_allowed, self.lv_excluded]),
             _ScalarResult(dims),
             _EMPTY,
@@ -1108,3 +1230,39 @@ class TestHierarchyDetailDimensionFiltering:
         level_names = [lv["name"] for lv in resp.json()]
         assert "Country" in level_names
         assert "City" not in level_names
+
+
+def test_f008_03_empty_audience_narrowing_is_not_everyone():
+    """F-008-03: allow-list + empty audience must NOT match a random viewer."""
+    p = _persona(
+        included_measure_ids=[str(uuid.uuid4())],
+        audience_roles=[],
+    )
+    assert is_in_audience(p, {"viewer", "member"}) is False
+
+
+def test_f008_03_empty_audience_unrestricted_stays_everyone():
+    """Filter-only empty everything + empty audience remains everyone."""
+    p = _persona(audience_roles=[])
+    assert is_in_audience(p, {"viewer"}) is True
+
+
+@pytest.mark.asyncio
+async def test_bug_9263_tag_restriction_query_failure_does_not_treat_personas_as_untagged():
+    """Bug-9263: PersonaTagRestriction lookup failure must not silently
+    treat every persona as untagged (which assigns a CLS-only empty-audience
+    persona to everyone and hides the failure).
+    """
+    p = _persona(audience_roles=[])
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[
+        _ScalarResult([p]),
+        RuntimeError("simulated timeout"),
+    ])
+    user = CurrentUser(
+        user_id="u@test", tenant_id=TEST_TENANT, email="u@test", role="viewer",
+    )
+    with pytest.raises(HTTPException) as exc:
+        await get_assigned_personas(db, user, TEST_MODEL_ID)
+    assert exc.value.status_code == 503
+    assert exc.value.detail["error_code"] == "PERSONA_ASSIGNMENT_UNAVAILABLE"

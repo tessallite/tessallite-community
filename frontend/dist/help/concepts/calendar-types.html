@@ -12,15 +12,17 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Concepts</span> / <span>Calendar Types</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-06</span></div>
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-07-04</span></div>
     <h1>Calendar Types</h1>
 <h2>What this covers</h2>
 <p>Tessallite supports six calendar types that govern how period boundaries (year start, quarter start, etc.) are computed for time-intelligence variants like YTD, prior year, and year-over-year growth. The calendar type is set on the time hierarchy and determines which SQL expressions the query router uses to derive period boundaries. This article explains the six types, when each applies, and how they differ.</p>
 <h2>How period boundaries are computed</h2>
 <p>Tessallite computes period boundaries using SQL expressions derived from the hierarchy&#x27;s calendar type. For standard and ISO calendars, the system uses <code>EXTRACT</code>-based expressions. For fiscal calendars with a shifted year start, it generates CASE expressions that offset the year and quarter. For example, a fiscal year starting in April uses <code>CASE WHEN EXTRACT(MONTH FROM date) &gt;= 4 THEN EXTRACT(YEAR FROM date) ELSE EXTRACT(YEAR FROM date) - 1 END</code> to determine the fiscal year.</p>
 <p>A physical calendar table is <strong>not required</strong> for most calendar types. The system derives boundaries directly from the date column. Calendar tables remain valuable for:</p>
-<ul><li><strong>Retail 4-4-5</strong> — the irregular 4-week/5-week period pattern cannot be expressed as simple date arithmetic.</li><li><strong>Dense date enumeration</strong> — queries that need every date in a range, including dates with no fact rows.</li><li><strong>Custom period definitions</strong> — non-standard boundaries that don&#x27;t follow a formulaic pattern.</li></ul>
+<ul><li><strong>Retail 4-4-5 and Hijri</strong> - these period systems require a physical table because their boundaries cannot be safely inferred from ordinary Gregorian date arithmetic.</li><li><strong>Dense date enumeration</strong> - queries that need every date in a range, including dates with no fact rows.</li><li><strong>Custom period definitions</strong> - non-standard boundaries that don&#x27;t follow a formulaic pattern.</li></ul>
 <p>When a calendar table IS present, the system uses its pre-computed columns instead of expressions for backward compatibility.</p>
+<h2>Calendar table binding rule</h2>
+<p>Standard, fiscal, ISO Week, and Thai Buddhist calendars are expression-capable: Tessallite can compute their period boundaries from the hierarchy's calendar type and the fact date. Retail 4-4-5 and Hijri calendars are table-bound: they require a physical calendar table with real mapped source columns. A physical table is also required for dense date enumeration, custom business period columns, coverage checks, and role-playing calendar aliases.</p>
 <h2>The six calendar types</h2>
 <h3>Standard (Gregorian)</h3>
 <p>The default. Year starts January 1, months are 1-12, quarters are Q1 (Jan-Mar) through Q4 (Oct-Dec). Use this when all your reporting follows the common calendar.</p>
@@ -28,6 +30,7 @@
 <h3>Fiscal</h3>
 <p>Identical structure to standard, but the year starts on a configurable month (e.g., April for many governments and enterprises, July for Australian public sector, October for US federal). A fiscal year starting in April means fiscal Q1 is April-June.</p>
 <p><strong>Who uses it:</strong> Governments, enterprises, universities — any organisation whose financial year does not start in January.</p>
+<p><strong>Year captions:</strong> Fiscal and NRF retail calendars expose <code>year_no</code> (the numeric key) and a caption-only <code>year_label</code>. The tenant setting <code>calendar.fiscal_year_label_format</code> accepts <code>start_year</code> (default), <code>span_short</code>, <code>span_long</code>, <code>span_fy</code>, and <code>end_year</code>; see <a href="../modelling/configure-calendar-table.html">Configure Calendar Table</a> for the examples and the tenant settings endpoint. January-start fiscal calendars always use the plain integer, regardless of the selected token.</p>
 <p><strong>Key concept — fiscal offset:</strong> The fiscal start month shifts all period boundaries. &quot;Fiscal year 2026&quot; with an April start covers April 2025 through March 2026. Forgetting this offset is the most common source of wrong YTD numbers in cross-calendar environments.</p>
 <h3>ISO week (ISO 8601)</h3>
 <p>Weeks start on Monday, numbered 1-52 (occasionally 53). Week 1 is the week containing the first Thursday of January. This means January 1 can fall in ISO week 52 or 53 of the previous year — a subtlety that breaks naive <code>EXTRACT(WEEK FROM date)</code> in many SQL dialects.</p>
@@ -37,6 +40,7 @@
 <p>Because this week-and-period grid <strong>cannot</strong> be derived by ordinary date arithmetic, a retail 4-4-5 calendar <strong>requires a physical calendar table</strong> to be bound to the time hierarchy. Tessallite reads the period and year boundaries straight from that table's pre-computed columns rather than computing them from a formula — which also means the exact retail-year start date is whatever your calendar table defines, not a value Tessallite guesses. If you select the retail calendar type but no calendar table is bound, the query <strong>fails loudly with a clear error</strong> rather than silently falling back to ordinary months and returning wrong numbers.</p>
 <p><strong>Who uses it:</strong> Retail chains, CPG companies, any business that needs like-for-like weekly comparisons across years without the distortion of months having different numbers of days.</p>
 <p><strong>Key concept — period vs month:</strong> In a 4-4-5 calendar, &quot;Period 1&quot; is the first 4-week block of Q1, not January. Retail reports labelled &quot;monthly&quot; are actually period reports. Mixing retail periods with standard months in the same pivot query produces meaningless numbers.</p>
+<p>Retail year captions use the same tenant setting as fiscal calendars, while <code>retail_year</code> remains the numeric grouping and sort key. A normal rebuild is required before an existing table gains <code>year_label</code>; BI metadata falls back to the numeric key until then.</p>
 <h3>Hijri (Islamic)</h3>
 <p>A lunar calendar with 12 months of 29 or 30 days, producing a year of 354 or 355 days. Months shift approximately 11 days earlier each Gregorian year. The conversion between Gregorian and Hijri dates is algorithmic but lossy at the edges: a single Gregorian date can span two Hijri months depending on moon sighting conventions.</p>
 <p><strong>Who uses it:</strong> Islamic finance, Middle Eastern government agencies, any reporting context where Hijri dates are the legal or cultural standard.</p>
@@ -47,7 +51,7 @@
 <h2>Multiple calendar types on a single model</h2>
 <p>A model can use any number of calendar types across its hierarchies. This is common when:</p>
 <ul><li>You report revenue on a fiscal calendar but track logistics on ISO weeks.</li><li>Your sales team uses 4-4-5 periods while finance uses standard months.</li><li>You serve both domestic (Hijri) and international (Gregorian) audiences.</li></ul>
-<p>Each time hierarchy carries its own calendar type. When you create a time hierarchy, you set the calendar type on it. Different hierarchies on the same model can use different calendar types. Physical calendar tables are only needed for types that require them (retail 4-4-5, dense enumeration).</p>
+<p>Each time hierarchy carries its own calendar type. When you create a time hierarchy, you set the calendar type on it. Different hierarchies on the same model can use different calendar types. Physical calendar tables are only needed for table-bound calendar types (retail 4-4-5 and Hijri) or physical-table workflows such as dense enumeration, custom period columns, coverage checks, and role-playing aliases.</p>
 <p><strong>When one is enough:</strong> If all your time-intelligence variants use the same calendar system, one hierarchy with one calendar type is sufficient. Don&#x27;t create extra hierarchies &quot;just in case&quot; — each one adds complexity to the variant resolver.</p>
 <h2>Related</h2>
 <ul><li><a href="../modelling/configure-calendar-table.html">Configure Calendar Table</a></li><li><a href="../modelling/associate-calendar-with-dimensions.html">Associate Calendar with Dimensions</a></li><li><a href="../modelling/configure-time-variants.html">Configure Time Variants</a></li><li><a href="../modelling/multi-calendar-best-practices.html">Multi-Calendar Best Practices</a></li></ul>

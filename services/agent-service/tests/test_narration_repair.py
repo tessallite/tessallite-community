@@ -178,3 +178,66 @@ async def test_sync_judge_failed_repair_reports_costs_but_is_not_accepted():
     assert result.repair_output_tokens == 2
     assert result.judge_outcome.verdict == "fail"
     assert result.actions == []
+
+
+@pytest.mark.asyncio
+async def test_narration_repair_forwards_date_anchor_to_judge():
+    # Integration fix — the narration-repair path re-runs the judge on the
+    # repaired answer. It must forward the per-turn DATE ANCHOR so the re-judge
+    # anchors relative-date verification on the same current date the planner
+    # used (the same gap the four main dispatch paths had).
+    #
+    # Test escape: repair rebuilt the judge call from system_prompt/sections
+    # only and dropped the date anchor. Guard: assert run_judge receives the
+    # date_anchor kwarg here. Tier: T1 (producer/consumer contract).
+    from src.api.conversations import _repair_narration_after_sync_judge_fail
+    from src.pipeline import TurnOutcome
+
+    cfg = types.SimpleNamespace(project_id=uuid.uuid4(), answer_llm_config_id=None)
+    outcome = TurnOutcome(
+        answer_text="Wrong answer.",
+        status="ok",
+        plan={"tool": "query"},
+        semantic_query={"shape": {"shape": "kpi", "narration_facts": {}}},
+        routed_sql=None,
+        route="source",
+        rows_returned=1,
+        guardrail_actions=[],
+        result_sample=[{"amount": 10}],
+        result_row_count=1,
+    )
+    first_judge = JudgeOutcome(
+        verdict="fail",
+        reasoning="Completeness failure.",
+        metrics={"Completeness": 0.2},
+    )
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(return_value="Repaired.")
+    adapter.last_usage = {"input_tokens": 1, "output_tokens": 1}
+    run_judge_mock = AsyncMock(
+        return_value=JudgeOutcome(verdict="pass", reasoning="ok", metrics={})
+    )
+    anchor = "CURRENT_DATE: 2026-07-21 (Tuesday)."
+
+    with (
+        patch("src.api.conversations.resolve_agent_llm_config",
+              AsyncMock(return_value=types.SimpleNamespace(provider="anthropic"))),
+        patch("src.api.conversations.build_adapter", return_value=adapter),
+        patch("src.api.conversations.apply_output_guardrails",
+              return_value=types.SimpleNamespace(text="Repaired.", actions=[])),
+        patch("src.api.conversations.run_judge", run_judge_mock),
+    ):
+        await _repair_narration_after_sync_judge_fail(
+            db=AsyncMock(),
+            cfg=cfg,
+            system_prompt="system",
+            user_message="revenue last month?",
+            outcome=outcome,
+            judge_outcome=first_judge,
+            sample_rows=outcome.result_sample,
+            result_row_count=outcome.result_row_count,
+            conversation_history=[],
+            date_anchor=anchor,
+        )
+
+    assert run_judge_mock.await_args.kwargs["date_anchor"] == anchor

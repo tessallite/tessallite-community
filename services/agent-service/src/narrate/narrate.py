@@ -50,6 +50,45 @@ _GUARD_TRUNCATED = (
     "limited to the first N rows and the complete data extends further."
 )
 
+# R10 — when only the narration sample is capped (the result IS complete and
+# every returned row is delivered to the user, but the narrator sees fewer
+# rows), the narrator must not claim the query was truncated or that data is
+# missing. Instead it must acknowledge it is summarising from a sample and
+# never present any aggregate, extreme, or total derived from that sample as
+# exact/complete.
+# NOTE: distinct wording from _GUARD_TRUNCATED on purpose — saying the data was
+# "limited by a row cap" here would be false, since every row IS in the result.
+# NOTE: says "returned to the user", not "in the data table" — the rendered
+# table/chart is configuration-dependent (include_data_table, chart_max_rows),
+# so a table promise could itself be a false disclosure.
+_GUARD_NARRATOR_SAMPLED = (
+    " You are shown only the first {showing} of {total} rows of a COMPLETE "
+    "result — every returned row is delivered to the user even though you "
+    "cannot see them all. Do not claim the data was truncated, capped, or "
+    "limited, and do not imply rows are missing. Your summary is based on this "
+    "sample: never present any total, sum, average, maximum, minimum, or count "
+    "derived from the sample as an exact figure for the whole result; describe "
+    "such readings as based on the shown rows only."
+)
+
+# R10 (combined case) — the DB row cap (100 default / 1000 trend floor) is far
+# ABOVE the 25-row narration cap, so a truncated result usually still has
+# 100-1000 materialized rows the user receives while the narrator sees 25.
+# _GUARD_TRUNCATED only discloses that rows beyond the DB cap are missing; it
+# does NOT scope the narrator's 25-row view against rows 26..cap, which DO
+# exist and ARE delivered to the user. Without this addendum the narrator may
+# state a peak/largest-item from its 25 rows that the user's own table
+# contradicts. Fired IN ADDITION to _GUARD_TRUNCATED when the sample is also
+# capped. Deliberately does not say "do not claim the data was truncated"
+# (it was) nor "COMPLETE result" (it is not).
+_GUARD_TRUNCATED_SAMPLED = (
+    " Additionally, you are shown only the first {showing} of the {total} "
+    "returned rows. Never present a maximum, minimum, largest or smallest "
+    "item, total, sum, average, or count read from the rows shown to you as "
+    "the extreme or total of the returned result — the returned rows extend "
+    "beyond those you can see."
+)
+
 # Combined form kept for tests that assert on its substrings.
 _NARRATION_GUARD = _GUARD_NO_DERIVE + _GUARD_DATE_RANGE
 
@@ -82,6 +121,35 @@ _TREND_SUMMARIZATION_INSTRUCTION = (
     "5. Direct the user's attention to the rendered chart or data table for the detailed day-to-day values."
 )
 
+# R10 — sampled variant of the trend rules, used whenever the narrator sees
+# fewer rows than were materialized (both the complete-result and the
+# DB-truncated case). Commanding "state the absolute lowest and highest
+# values" (rule 3 above) would order the narrator to present a sample-derived
+# extreme as the true extreme — the exact silent-wrong-number path the R10
+# guards forbid. This variant scopes extremes and trajectory to the shown
+# rows. Wording notes: it says "returned rows/result", never "complete
+# result" (false in the truncated case); it makes no claim about WHICH part
+# of the period the shown rows are (the first rows in RESULT ORDER are the
+# period's end for newest-first sorts, and nothing in particular for
+# unordered output); and it does not promise a rendered table or complete
+# series (both are configuration-dependent).
+_TREND_SUMMARIZATION_INSTRUCTION_SAMPLED = (
+    "\n\nTREND DATA SUMMARY RULES (Crucial for time-series/large datasets):\n"
+    "If the data is a time-series trend containing more than 5 rows:\n"
+    "1. Do NOT list out every single date/time and its corresponding value in prose.\n"
+    "2. State the total range spanned using the \"Date range in the data\" line "
+    "— it is computed from ALL returned rows, not just the rows shown to you.\n"
+    "3. You are shown only the first rows of the returned result: describe the "
+    "lowest and highest values AMONG THE ROWS SHOWN and say so explicitly — "
+    "never call them the absolute peak or valley, because the true extremes "
+    "may lie in rows you cannot see. If deterministic shape facts provide "
+    "peak or trough values, state those instead — they cover all returned rows.\n"
+    "4. Describe the trajectory of the rows shown in natural prose, making "
+    "clear it covers only the portion of the series you can see.\n"
+    "5. Direct the user's attention to the returned results for the detailed "
+    "day-to-day values."
+)
+
 _SHAPE_FACT_RULES = (
     "Use the deterministic shape facts below as the contract for summary claims. "
     "Do not claim a series ends early unless its last_period says so. "
@@ -111,8 +179,56 @@ def _build_format_block(
     currency_symbol: str = "",
     currency_code: str = "",
     truncated: bool = False,
+    sample_capped: bool = False,
+    sample_showing: int = 0,
+    sample_total: int = 0,
+    row_security_denied: bool = False,
 ) -> str:
-    """Return task description + format instruction + concrete example for this turn."""
+    """Return task description + format instruction + concrete example for this turn.
+
+    ``row_security_denied`` (Bug-8453) means the router reported the deny-all
+    row-security sentinel for this execution. It takes priority over
+    ``is_empty``: both produce zero usable rows, but only one of them is true
+    to say out loud.
+
+    ``truncated`` means the DB execution hit a row cap (Bug-5351): rows beyond
+    the cap do not exist in the result and the complete data extends further.
+    ``sample_capped`` means the narrator sees fewer rows than were materialized
+    (R10): the narration prompt is capped at ``_MAX_ROWS_FOR_NARRATION``.
+    Guard selection (R10):
+      * truncated only            -> ``_GUARD_TRUNCATED``
+      * sample_capped only        -> ``_GUARD_NARRATOR_SAMPLED`` (denies a row
+        cap; result is complete)
+      * truncated + sample_capped -> ``_GUARD_TRUNCATED`` plus
+        ``_GUARD_TRUNCATED_SAMPLED`` (row cap IS real, and additionally the
+        narrator must not present shown-row readings as extremes of the
+        returned rows, which extend to the cap)
+    ``sample_showing`` / ``sample_total`` fill the "first N of M" disclosures.
+    """
+    if row_security_denied:
+        # Bug-8453: a row-security deny-all is a fact about the CALLER'S
+        # PERMISSIONS, not about the business. Telling a user "there is no data
+        # for that" when their policy grants them no rows is a false assertion,
+        # and it also hides a misconfigured policy from the person best placed
+        # to report it. Name the restriction; never guess at or describe the
+        # rule contents (the agent is given rule IDS only, no predicate SQL).
+        task = (
+            "Tell the user that no answer can be shown because their "
+            "row-level security permissions do not grant them access to any "
+            "of the underlying rows for this question. Make clear this is a "
+            "permissions restriction, NOT a statement that the data does not "
+            "exist or that the value is zero. Suggest they contact their "
+            "Tessallite administrator if they believe they should have access. "
+            "Do not speculate about what the data would show, do not invent a "
+            "number, and do not describe the security rules themselves. "
+            "Use the tone and language specified in the system prompt."
+        )
+        if output_format == "markup":
+            return task + "\nFormat your answer using markdown."
+        if output_format in ("html", "rich_html"):
+            return task + "\nFormat your answer as HTML."
+        return task + "\nWrite in natural prose without markdown symbols or HTML tags."
+
     if is_empty:
         task = (
             "Tell the user clearly that no data was found for their question. "
@@ -129,6 +245,20 @@ def _build_format_block(
         _GUARD_NO_DERIVE
         + (_GUARD_DATE_RANGE if has_dates else "")
         + (_GUARD_TRUNCATED if truncated else "")
+        + (
+            _GUARD_TRUNCATED_SAMPLED.format(
+                showing=sample_showing, total=sample_total
+            )
+            if truncated and sample_capped
+            else ""
+        )
+        + (
+            _GUARD_NARRATOR_SAMPLED.format(
+                showing=sample_showing, total=sample_total
+            )
+            if sample_capped and not truncated
+            else ""
+        )
     )
     task = (
         "Write a proper conversational answer to the user's question based "
@@ -138,7 +268,17 @@ def _build_format_block(
     )
 
     if has_dates and len(sample_rows) > 5:
-        task += _TREND_SUMMARIZATION_INSTRUCTION
+        # R10 — whenever the narrator sees fewer rows than were materialized
+        # (regardless of DB truncation), it must not be ordered to state
+        # absolute extremes it cannot see; use the shown-rows-scoped variant.
+        # Only when the narrator sees every materialized row are the plain
+        # rules safe: extremes over the shown rows ARE extremes of the
+        # returned result.
+        task += (
+            _TREND_SUMMARIZATION_INSTRUCTION_SAMPLED
+            if sample_capped
+            else _TREND_SUMMARIZATION_INSTRUCTION
+        )
 
     if currency_symbol or currency_code:
         task += (
@@ -238,8 +378,36 @@ def _build_compound_format_block(
     computed: dict,
     output_format: str,
     has_dates: bool = False,
+    sample_capped: bool = False,
+    sample_showing: int = 0,
+    sample_total: int = 0,
+    steps_truncated: bool = False,
 ) -> str:
-    """Return task description + format instruction + example for a compound-query result."""
+    """Return task description + format instruction + example for a compound-query result.
+
+    R10 (compound scope — Lane D review add): the multi-row case renders
+    ``computed.result_rows`` to the narrator, and the producer (pipeline.py)
+    caps that list at its ``_MAX_NARRATE_ROWS`` (env-configurable, default 25);
+    the disclosure numbers below are derived from the payload itself, so they
+    stay correct under any override. When more per-dimension rows were
+    computed than the narrator sees, telling it to "highlight the highest and
+    lowest" would order it to present a sample-derived extreme as the true
+    extreme — the same wrong-numbers-by-omission path the primary path closes.
+
+    Guard selection mirrors Lane D's three-case design on the primary path
+    (``steps_truncated`` = any underlying sub-query hit the DB row cap, so the
+    COMPUTED result derives from partial step data):
+      * steps_truncated only            -> ``_GUARD_TRUNCATED`` (figures are a
+        partial view; complete data extends further)
+      * sample_capped only              -> ``_GUARD_NARRATOR_SAMPLED`` (result
+        IS complete; narrator sees a sample — never claim a cap)
+      * steps_truncated + sample_capped -> ``_GUARD_TRUNCATED`` plus
+        ``_GUARD_TRUNCATED_SAMPLED`` (cap is real AND shown-row readings must
+        not be presented as extremes of the computed rows)
+    The scalar case is a single computed value with no sampling; it carries
+    ``_GUARD_TRUNCATED`` when steps were truncated (the value derives from
+    partial data).
+    """
     label = str(computed.get("label", "result"))
     value = computed.get("value")
     val_str = str(value) if value is not None else ""
@@ -254,21 +422,55 @@ def _build_compound_format_block(
     ) if is_pct else ""
     is_multi_row = bool(computed.get("is_multi_row") and computed.get("result_rows"))
     if is_multi_row:
+        if sample_capped:
+            # Shown-rows-scoped extreme instruction + the applicable partial-
+            # view guard (reused from Lane D's primary-path machinery). Never
+            # orders the narrator to name THE highest/lowest — only the
+            # extremes AMONG THE SHOWN rows, said explicitly.
+            extreme_instruction = (
+                "Present these values clearly — summarise key figures from the "
+                "rows shown, note the highest and lowest AMONG THE ROWS SHOWN "
+                "(say so explicitly — do not call them the overall highest or "
+                "lowest), and describe the overall pattern of the shown rows. "
+            )
+            if steps_truncated:
+                # "COMPLETE result" would be FALSE here — the computed rows
+                # derive from row-capped sub-query data. Disclose the real cap
+                # AND scope shown-row readings (Lane D combined case).
+                sampled_guard = _GUARD_TRUNCATED + _GUARD_TRUNCATED_SAMPLED.format(
+                    showing=sample_showing, total=sample_total
+                )
+            else:
+                sampled_guard = _GUARD_NARRATOR_SAMPLED.format(
+                    showing=sample_showing, total=sample_total
+                )
+        else:
+            extreme_instruction = (
+                "Present these values clearly — summarise key figures, highlight "
+                "the highest and lowest, and note the overall pattern. "
+            )
+            # Narrator sees every computed row; extremes over the shown rows
+            # ARE the extremes of the computed result. When the underlying
+            # steps were truncated the computed result itself is partial —
+            # disclose with the row-cap guard (Lane D truncated-only case).
+            sampled_guard = _GUARD_TRUNCATED if steps_truncated else ""
         task = (
             "Write a proper conversational answer. "
             "The computed results contain per-dimension values in result_rows. "
-            "Present these values clearly — summarise key figures, highlight "
-            "the highest and lowest, and note the overall pattern. "
-            "Use the exact computed values — do not recalculate or approximate. "
-            + guard + pct_rule + " "
+            + extreme_instruction
+            + "Use the exact computed values — do not recalculate or approximate. "
+            + guard + sampled_guard + pct_rule + " "
             "Use the tone and language specified in the system prompt."
         )
     else:
+        # Scalar computed value — no sampling, but a value computed from
+        # row-capped sub-query data is a partial-data figure (R10 review R1-2).
+        scalar_truncation_guard = _GUARD_TRUNCATED if steps_truncated else ""
         task = (
             "Write a proper conversational answer. State the computed result first, "
             "then provide brief context without citing internal step values. "
             "Use the exact computed value — do not recalculate or approximate. "
-            + guard + pct_rule + " "
+            + guard + scalar_truncation_guard + pct_rule + " "
             "Use the tone and language specified in the system prompt."
         )
 
@@ -337,7 +539,37 @@ def _build_narrate_prompt(
 ) -> tuple[str, str]:
     sample = execution.rows[:_MAX_ROWS_FOR_NARRATION]
     total = execution.rows_returned
+    full_row_count = len(execution.rows)
     showing = len(sample)
+
+    # R10 — narrator truncation alignment. Two independent conditions can make
+    # the narrator's view partial, and each needs its OWN, factually-accurate
+    # disclosure (conflating them tells the user a false story either way):
+    #   * execution_truncated — the DB hit a row cap; rows beyond it do NOT
+    #     exist in the result. _GUARD_TRUNCATED: "limited by a row cap,
+    #     complete data extends further" (TRUE only here).
+    #   * sample_capped — the narration prompt shows fewer rows than were
+    #     materialized (_MAX_ROWS_FOR_NARRATION). Alone, it fires
+    #     _GUARD_NARRATOR_SAMPLED ("first N of M of a COMPLETE result; do not
+    #     claim a cap; never present sample-derived aggregates as exact").
+    #     COMBINED with execution_truncated it fires _GUARD_TRUNCATED_SAMPLED
+    #     instead: the DB caps (100/1000) sit far above the 25-row narration
+    #     cap, so rows 26..cap DO exist and DO reach the user — the row-cap
+    #     disclosure alone would not stop the narrator presenting a shown-row
+    #     reading as the extreme of the returned rows.
+    # Every partial view therefore carries a disclosure whose wording matches
+    # reality, closing the wrong-numbers-by-omission path in all three cases.
+    #
+    # sample_total: today rows_returned == len(rows) at the single
+    # QueryExecution construction site (query.py), but this function's whole
+    # job is partial-view disclosure, so it must not silently trust that
+    # invariant. Taking the max means a future producer that pre-caps the
+    # rows list while reporting a larger rows_returned still triggers the
+    # sampled disclosure instead of an unguarded "summarise the sample" path.
+    execution_truncated = bool(getattr(execution, "truncated", False))
+    sample_total = max(full_row_count, total)
+    sample_capped = showing < sample_total
+    effective_truncated = execution_truncated or sample_capped
 
     # ── answer information block ──────────────────────────────────────────
     mf = measure_formats or {}
@@ -353,19 +585,30 @@ def _build_narrate_prompt(
         formatted_sample = sample
         format_hint = ""
 
-    truncated = bool(getattr(execution, "truncated", False))
-    if total == 0:
+    # Bug-8453: the router reported the deny-all row-security sentinel for this
+    # execution. Read defensively so an older/partial QueryExecution still works.
+    row_security_denied = bool(getattr(execution, "row_security_denied", False))
+    if row_security_denied:
+        # Bug-8453: never state "no data" for a permissions denial.
+        row_count = (
+            "No rows are available to this user: row-level security denied "
+            "access to every row for this query. This is a permissions "
+            "restriction, not an absence of data."
+        )
+    elif total == 0:
         row_count = "No data was found for this query."
     else:
         parts = [f"{total} rows returned"]
-        if truncated:
+        if execution_truncated:
             parts.append(
                 "this is the row cap — more rows exist beyond it, so the figures "
                 "below are only the first part of the full set"
             )
-        if showing < total:
-            parts.append(f"{showing} shown — summarise key patterns from the sample")
-        elif not truncated:
+        if sample_capped:
+            parts.append(
+                f"showing {showing} of {sample_total} rows to the narrator"
+            )
+        elif not effective_truncated:
             parts.append("all shown")
         row_count = "; ".join(parts) + "."
 
@@ -382,7 +625,10 @@ def _build_narrate_prompt(
         execution.columns, formatted_sample, output_format,
         is_empty=(total == 0), has_dates=bool(date_ranges),
         currency_symbol=currency_symbol, currency_code=currency_code,
-        truncated=truncated,
+        truncated=execution_truncated,
+        sample_capped=sample_capped,
+        sample_showing=showing, sample_total=sample_total,
+        row_security_denied=row_security_denied,
     )
     instr_parts = [fmt_block]
     if shape_trace:
@@ -490,12 +736,36 @@ def _build_compound_narrate_prompt(
     label = str(computed.get("label", "result"))
     value = computed.get("value")
 
+    # ── narrator-sample disclosure (R10 — compound scope) ─────────────────
+    # The multi-row producer caps computed.result_rows at _MAX_ROWS_FOR_NARRATION
+    # but the full per-dimension result reaches the user (compound table/chart).
+    # result_total_rows carries the true count so a >25-row result triggers the
+    # narrator-sampled disclosure instead of an unguarded "summarise the rows"
+    # path. max() over the shown length is defensive: if a producer ever reports
+    # a smaller total than what it rendered, never claim a cap that isn't real.
+    is_multi_row = bool(computed.get("is_multi_row") and computed.get("result_rows"))
+    sample_showing = len(computed["result_rows"]) if is_multi_row else 0
+    result_total = computed.get("result_total_rows")
+    if not isinstance(result_total, int) or result_total < 0:
+        result_total = sample_showing
+    sample_total = max(sample_showing, result_total)
+    sample_capped = is_multi_row and sample_showing < sample_total
+    # Review R1-2 — any underlying sub-query hit the DB row cap: the computed
+    # result derives from partial step data, so "COMPLETE result" wording is
+    # forbidden and the row-cap guard applies instead.
+    steps_truncated = bool(computed.get("steps_truncated"))
+
     # ── answer information block ──────────────────────────────────────────
     # ── date ranges ───────────────────────────────────────────────────────
     date_ranges = aggregate_date_ranges(step_summaries)
 
     # ── instruction block (first) ─────────────────────────────────────────
-    fmt_block = _build_compound_format_block(computed, output_format, has_dates=bool(date_ranges))
+    fmt_block = _build_compound_format_block(
+        computed, output_format, has_dates=bool(date_ranges),
+        sample_capped=sample_capped,
+        sample_showing=sample_showing, sample_total=sample_total,
+        steps_truncated=steps_truncated,
+    )
     instr_parts = [fmt_block]
     shape_facts = _shape_facts_payload(computed.get("shape") if isinstance(computed, dict) else None)
     if shape_facts:
@@ -506,17 +776,33 @@ def _build_compound_narrate_prompt(
     instruction_block = "## Instructions\n\n" + "\n\n".join(instr_parts)
 
     # ── data block (second) ───────────────────────────────────────────────
-    is_multi_row = bool(computed.get("is_multi_row") and computed.get("result_rows"))
+    # is_multi_row / sample_* already computed above for the format block.
     data_parts = [
         f"User question: {user_message}",
         "This answer was computed across multiple query steps.",
     ]
     if is_multi_row:
         n = len(computed["result_rows"])
-        data_parts.append(
-            f"Computed results ({label}): {n} rows of per-dimension values "
-            f"— see computed.result_rows below (server-calculated — do not recalculate)."
-        )
+        if sample_capped:
+            # Review R1-4 — assert result SIZE, never delivery: what the user
+            # actually receives (table rows, chart points) is configuration-
+            # dependent, so a delivery promise could itself be false.
+            data_parts.append(
+                f"Computed results ({label}): the computed result contains "
+                f"{sample_total} rows of per-dimension values; you are shown "
+                f"only the first {n} (server-calculated — do not recalculate). "
+                f"See computed.result_rows below."
+            )
+        else:
+            data_parts.append(
+                f"Computed results ({label}): {n} rows of per-dimension values "
+                f"— see computed.result_rows below (server-calculated — do not recalculate)."
+            )
+        if steps_truncated:
+            data_parts.append(
+                "Note: one or more underlying sub-queries hit a row cap, so "
+                "the computed rows cover only the returned part of the data."
+            )
     else:
         data_parts.append(
             f"Computed result ({label}): {value} (server-calculated — do not recalculate)."

@@ -106,7 +106,7 @@
 <tr><td><code>explore</code></td><td>Allows the agent to browse model metadata for context.</td></tr>
 </tbody>
 </table>
-<p>The <code>persona_id</code> field locks the session to a specific persona's row-level security filters and column restrictions. The <code>model_ids</code> field restricts which models the agent can query. The <code>project_ids</code> field restricts which projects the embedded session can access; the chat loads only projects in this list.</p>
+<p>The <code>persona_id</code> field locks Query Router access to a model Persona's row-level security filters and column restrictions. The optional <code>project_persona_id</code> field independently locks the agent to a ProjectPersona's field scope. These are separate UUID namespaces: an older token with only <code>persona_id</code> has no ProjectPersona lock. The <code>model_ids</code> field restricts which models the agent can query. The <code>project_ids</code> field restricts which projects the embedded session can access; the chat loads only projects in this list.</p>
 <h2>Choosing a model</h2>
 <p>A project agent can be configured with several semantic models. By default a conversation can draw on every model the agent allows. The <strong>model picker</strong> &mdash; the dataset icon in the strip at the top of the embedded chat &mdash; lets the end user restrict a single conversation to one model.</p>
 <ul>
@@ -114,7 +114,7 @@
 <li>Picking <strong>Project default</strong> clears the restriction and returns the conversation to the project's normal set of models.</li>
 <li>The choice is saved on the conversation, so it persists across reloads and applies to every later turn.</li>
 </ul>
-<p>The picker only ever lists models the session is already entitled to: the project allow-list, further narrowed by the embed token's <code>persona_id</code> and <code>model_ids</code> scope. It can only narrow access, never widen it. If a chosen model later leaves that scope, the conversation silently reverts to the project default. This makes the picker a convenience for focusing an answer on one subject area, not a way to reach data the token does not already permit.</p>
+<p>The picker only ever lists models the session is already entitled to: the project allow-list, further narrowed by the embed token's <code>project_persona_id</code> and <code>model_ids</code> scope. It can only narrow access, never widen it. If a chosen model later leaves that scope, the conversation silently reverts to the project default. This makes the picker a convenience for focusing an answer on one subject area, not a way to reach data the token does not already permit.</p>
 <h2>Theming</h2>
 <p>The conversational client supports light and dark mode. By default it follows the user's system preference. You can override by appending <code>?theme=light</code> or <code>?theme=dark</code> to the embed URL:</p>
 <pre><code>/embed/chat?theme=dark</code></pre>

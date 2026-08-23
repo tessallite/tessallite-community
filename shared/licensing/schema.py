@@ -33,6 +33,16 @@ _REQUIRED = (
     "entitlements",
 )
 
+# Closed set of known issuers, editions, products.  Documents with values outside
+# these sets are rejected as malformed (Bug-7469: semantic validation).
+KNOWN_ISSUERS = frozenset({"tessallite.io"})
+KNOWN_EDITIONS = frozenset({"community", "enterprise"})
+KNOWN_PRODUCTS = frozenset({"tessallite-community", "tessallite-enterprise"})
+
+# Maximum allowable clock skew between issued_at and the verifier's clock (1 day).
+# Licences issued "in the future" beyond this window are rejected.
+_MAX_CLOCK_SKEW_SECONDS = 86400
+
 
 def canonical_bytes(doc: dict[str, Any]) -> bytes:
     """Canonical bytes that the signature covers: the doc minus ``signature``."""
@@ -108,6 +118,50 @@ class License:
             )
         if not isinstance(doc.get("entitlements"), dict):
             raise MalformedLicense("entitlements must be an object")
+
+        # --- Bug-7469: semantic validation (after structural parse) --------
+        # Issuer, edition, product must be known values.
+        issuer = doc.get("issuer")
+        if issuer not in KNOWN_ISSUERS:
+            raise MalformedLicense(f"unknown issuer: {issuer!r}")
+        edition = doc.get("edition")
+        if edition not in KNOWN_EDITIONS:
+            raise MalformedLicense(f"unknown edition: {edition!r}")
+        product = doc.get("product")
+        if product not in KNOWN_PRODUCTS:
+            raise MalformedLicense(f"unknown product: {product!r}")
+
+        # issued_at must be a parseable ISO-8601 timestamp (not raw fromisoformat
+        # which raises ValueError instead of MalformedLicense on garbage).
+        try:
+            issued_at = _parse_ts(doc["issued_at"])
+        except (ValueError, TypeError) as exc:
+            raise MalformedLicense(f"invalid issued_at: {exc}") from exc
+        if issued_at is None:
+            raise MalformedLicense("issued_at must not be null")
+
+        # Reject issued_at more than _MAX_CLOCK_SKEW_SECONDS in the future.
+        now = datetime.now(timezone.utc)
+        if (issued_at - now).total_seconds() > _MAX_CLOCK_SKEW_SECONDS:
+            raise MalformedLicense(
+                f"issued_at {doc['issued_at']!r} is too far in the future"
+            )
+
+        # expires_at, if present, must parse cleanly.
+        if doc.get("expires_at") is not None:
+            try:
+                _parse_ts(doc["expires_at"])
+            except (ValueError, TypeError) as exc:
+                raise MalformedLicense(f"invalid expires_at: {exc}") from exc
+
+        # Entitlement caps must be non-negative integers or null (unlimited).
+        for cap_key in ("own_tenants", "models", "users"):
+            cap = doc["entitlements"].get(cap_key)
+            if cap is not None and (not isinstance(cap, int) or cap < 0):
+                raise MalformedLicense(
+                    f"entitlements.{cap_key} must be a non-negative integer or null"
+                )
+
         return cls(doc=doc)
 
     @classmethod

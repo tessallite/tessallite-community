@@ -5,6 +5,19 @@ import { tokens } from '../../theme';
 
 type ToastSeverity = 'success' | 'error' | 'info' | 'warning';
 
+/**
+ * Bug-6734: one policy for every toast, enforced here so no call site can
+ * override or forget. success/info auto-dismiss in 5 000 ms; warnings in
+ * 10 000 ms; errors persist until the user clicks the close control.
+ * Exported for unit tests to verify the policy mapping.
+ */
+export const AUTO_DISMISS_MS: Record<ToastSeverity, number | null> = {
+  success: 5000,
+  info: 5000,
+  warning: 10000,
+  error: null, // persists until manually closed
+};
+
 interface Toast {
   id: string;
   message: string;
@@ -49,13 +62,17 @@ const severityStyles: Record<ToastSeverity, { bg: string; border: string; icon: 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
 
+  // Bug-6734: auto-dismiss is driven solely by the severity through the
+  // centralized AUTO_DISMISS_MS policy. No call site may pass an ad-hoc
+  // duration -- all toast calls go through this single showToast function.
   const showToast = useCallback((message: string, severity: ToastSeverity = 'info') => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     setToasts(prev => [...prev, { id, message, severity }]);
-    if (severity !== 'error') {
+    const dismissMs = AUTO_DISMISS_MS[severity];
+    if (dismissMs !== null) {
       setTimeout(() => {
         setToasts(prev => prev.filter(t => t.id !== id));
-      }, 4000);
+      }, dismissMs);
     }
   }, []);
 

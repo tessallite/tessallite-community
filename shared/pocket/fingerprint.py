@@ -24,6 +24,7 @@ def fingerprint_shape(
     grain: Iterable[str],
     filter_cols: Iterable[str],
     having_cols: Iterable[str] | None = None,
+    expr_fingerprints: Iterable[str] | None = None,
 ) -> str:
     """SHA-256 (hex[:64]) of a canonical column-shape payload.
 
@@ -31,6 +32,20 @@ def fingerprint_shape(
     ``country = 'GB'`` and ``country = 'US'`` hash identically — the
     router then narrows via predicate-subset matching on the stored
     ``pocket_predicates`` rows.
+
+    ``expr_fingerprints`` (spec §5.1 / I11) carries the derived-grain expression
+    identities of a function-grain query — canonical expression fingerprints for
+    GROUP BY / SELECT / WHERE / HAVING / ORDER occurrences — so two queries that
+    differ only in their inline expression (e.g. ``DATE_TRUNC('month', ts)`` vs
+    ``EXTRACT(month FROM ts)``) hash distinctly instead of colliding on the
+    expression-blind ``has_function_grain`` boolean. Structural expression
+    literals (the ``'month'`` unit, timezone, substring position) are part of
+    each fingerprint; ordinary predicate VALUES are not.
+
+    Byte-identity guarantee: the ``derived_exprs`` key is added to the payload
+    ONLY when ``expr_fingerprints`` is non-empty. Every existing caller that
+    passes no expression fingerprints therefore produces exactly the pre-feature
+    digest — ordinary and source-path fingerprints are unchanged.
     """
     data = {
         "measures": sorted(str(m) for m in measures),
@@ -39,6 +54,11 @@ def fingerprint_shape(
         "filter_cols": sorted(str(c) for c in filter_cols),
         "having_cols": sorted(str(h) for h in (having_cols or [])),
     }
+    _exprs = [str(e) for e in (expr_fingerprints or [])]
+    if _exprs:
+        # Order-preserving: expression order carries meaning (SELECT/GROUP/ORDER
+        # position), unlike the sorted column lists above.
+        data["derived_exprs"] = _exprs
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:64]
 
 

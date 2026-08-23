@@ -6,11 +6,12 @@
  * routed through the query-router; cells are client-pivoted, capped by
  * PIVOT_MAX_CELLS. Cell clicks open the drill-through drawer.
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
+  AlertTitle,
   Box,
   Button,
   Chip,
@@ -39,8 +40,10 @@ import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import SaveIcon from "@mui/icons-material/Save";
 import TableViewIcon from "@mui/icons-material/TableView";
 import { ui } from "../../../theme/tokens";
-import { queryRouterApiClient, savedQueriesApi, pivotViewsApi, scratchpadApi } from "../../../api/client";
-import type { PivotView } from "../../../api/client";
+import { rowSecurityDeniedAll } from "../../../utils/rowSecurity";
+import { buildPivotViewConfig, parsePivotViewSortConfig, queryRouterApiClient, savedQueriesApi, pivotViewsApi, scratchpadApi, glossaryApi } from "../../../api/client";
+import type { MeasureGlossaryInfo } from "./controls/MeasureInfoPopover";
+import type { PivotSort, PivotView } from "../../../api/client";
 import { useDimensions, useFieldCompatibility, useHierarchiesWithLevels, useMeasures, useModel } from "../../../api/hooks";
 import { useBuilderStore } from "../../../store/builderStore";
 import { useModelTranslations, translatedName } from "../../../hooks/useModelTranslations";
@@ -55,8 +58,10 @@ import type {
 } from "../../../api/types";
 import PersonaPicker from "../../Persona/PersonaPicker";
 import PickerBar from "./controls/PickerBar";
+import FreshnessIndicator from "./controls/FreshnessIndicator";
 import SlicerBar from "./controls/SlicerBar";
 import PivotGrid, { type ConditionalFormat, type EmptyCellMode } from "./grid/PivotGrid";
+import { resolvePivotSort } from "./grid/sortState";
 import DrillThroughPanel, {
   type DrillPageSize,
 } from "./drawer/DrillThroughPanel";
@@ -64,7 +69,16 @@ import CalcDrillThroughDrawer from "./drawer/CalcDrillThroughDrawer";
 import ExportMenu from "./export/ExportMenu";
 import { buildPivotSql } from "./sql";
 import { computePivot, evaluatePivotCompatibility } from "./pivot";
+import { routeBadgeLabel } from "./routeLabels";
 import { computeTotals } from "./totals";
+import type { TotalsModel } from "./totals";
+import {
+  needsServerSubtotals,
+  grainSpecsFor,
+  buildGrainSql,
+  assembleServerTotals,
+  type GrainSpec,
+} from "./subtotalRequery";
 import {
   buildColumnMeasures,
   recordCountMeasure,
@@ -73,35 +87,78 @@ import {
   type PivotColumnMeasure,
 } from "./measureColumns";
 import type { CellCoord, DrillContext, Slicer } from "./types";
+import {
+  buildDrillInvocation,
+  buildInitialGroupingLevels as createInitialGroupingLevels,
+  buildSlicerFilters as createSlicerFilters,
+} from "./drillRequest";
 import { PIVOT_MAX_CELLS } from "./types";
 import CalendarBindingHint from "../../CalendarBindingHint";
 import UnsavedDeployWarning from "../../Builder/UnsavedDeployWarning";
 import { useT } from "../../../i18n";
+import PivotErrorAlert from "./PivotErrorAlert";
+import { toPivotError, type PivotPanelError } from "./pivotErrors";
+import {
+  decodeSlicers,
+  decodeConditionalFormat,
+  decodeMeasureSelections,
+  decodeEmptyCellMode,
+  decodeBool,
+  decodePersonaId,
+} from "./pivotConfigDecode";
 
-function extractError(err: unknown, requestFailedMsg: string): string {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response
-    ?.data?.detail;
-  if (detail) {
-    if (typeof detail === "string") return detail;
-    if (typeof detail === "object" && detail !== null) {
-      const d = detail as Record<string, unknown>;
-      if (typeof d.message === "string") return d.message;
-      if (typeof d.detail === "string") return d.detail;
-      return JSON.stringify(detail);
-    }
+// Derive the ordered measure selections a saved view represents. New views
+// store the authoritative ``config.measureSelections``; legacy views only have
+// ``measure_id`` + ``extraMeasureIds`` + ``measureAggOverrides``. Both load
+// (handleLoadView) and publish (handleToggleShare) go through this so their
+// scratchpad/unresolved-measure detection uses identical selection derivation
+// (Bug-6424).
+function selectionsFromView(view: PivotView): MeasureSel[] {
+  const cfg = view.config ?? {};
+  // Bug-8161 (review B2): a malformed persisted config must not crash the loader
+  // — buildColumnMeasures dereferences ``sel.measureId``, so a null/scalar entry
+  // would throw. Sanitize every derivation path here rather than casting blindly.
+  if ("measureSelections" in cfg && Array.isArray(cfg.measureSelections)) {
+    return decodeMeasureSelections(cfg.measureSelections).value;
   }
-  if (err instanceof Error) return err.message;
-  return requestFailedMsg;
+  const extraIds =
+    "extraMeasureIds" in cfg && Array.isArray(cfg.extraMeasureIds)
+      ? (cfg.extraMeasureIds as unknown[]).filter((x): x is string => typeof x === "string")
+      : [];
+  const allIds = view.measure_id ? [view.measure_id, ...extraIds] : extraIds;
+  const ao =
+    "measureAggOverrides" in cfg &&
+    cfg.measureAggOverrides &&
+    typeof cfg.measureAggOverrides === "object" &&
+    !Array.isArray(cfg.measureAggOverrides)
+      ? (cfg.measureAggOverrides as Record<string, unknown>)
+      : {};
+  return allIds.map((id) => ({
+    measureId: id,
+    agg: typeof ao[id] === "string" ? (ao[id] as string) : "",
+  }));
 }
 
-function routeBadgeLabel(routeType: string, t: (key: string) => string): string {
-  // F-004-15: translate the aggregate/pocket route-type values too, not just
-  // "source"; previously the raw English route_type string leaked into the
-  // pivot route badge.
-  if (routeType === "source") return t("pivot.liveSource");
-  if (routeType === "aggregate") return t("pivot.routeAggregate");
-  if (routeType === "pocket") return t("pivot.routePocket");
-  return routeType;
+// Bug-5894 / Bug-6971: show a translated summary for known route types,
+// but also surface the router's detailed reason string when available so
+// the tooltip carries the specific routing decision (e.g., which aggregate
+// was matched). Falls back to the raw reason for unrecognised route_type.
+function routeReasonLabel(
+  routeType: string,
+  reason: string | undefined,
+  t: (key: string, vars?: Record<string, string | number>) => string,
+): string {
+  const LOCALIZED: Record<string, string> = {
+    source: "pivot.routeReasonSource",
+    aggregate: "pivot.routeReasonAggregate",
+    pocket: "pivot.routeReasonPocket",
+  };
+  const i18nKey = LOCALIZED[routeType];
+  if (i18nKey) {
+    const summary = t(i18nKey);
+    return reason ? `${summary}\n${reason}` : summary;
+  }
+  return reason || t("pivot.routeTypeTooltip", { route: routeType });
 }
 
 
@@ -119,6 +176,32 @@ export default function MeasureQueryPanel() {
     queryFn: () => scratchpadApi.list(projectId!, modelId!),
     enabled: Boolean(projectId && modelId),
   });
+
+  // Bug-8102 / F-104-02: approved glossary definitions + synonyms so an analyst
+  // can see what a measure means at selection time. Only approved entries are
+  // surfaced to consumers; attachments link an entry to its measure(s).
+  const glossaryQuery = useQuery({
+    queryKey: ["glossary", projectId, modelId, "approved"],
+    queryFn: () => glossaryApi.list(projectId!, modelId!, "approved"),
+    enabled: Boolean(projectId && modelId),
+  });
+
+  const glossaryByMeasureId = useMemo(() => {
+    const map = new Map<string, MeasureGlossaryInfo>();
+    for (const entry of glossaryQuery.data ?? []) {
+      for (const att of entry.attachments ?? []) {
+        if (att.target_type !== "measure" || !att.target_id) continue;
+        // First approved entry wins; measures rarely have more than one.
+        if (!map.has(att.target_id)) {
+          map.set(att.target_id, {
+            definition: entry.definition,
+            synonyms: entry.synonyms ?? [],
+          });
+        }
+      }
+    }
+    return map;
+  }, [glossaryQuery.data]);
 
   const localizedMeasures = useMemo(() => {
     const raw = measures.data ?? [];
@@ -147,6 +230,28 @@ export default function MeasureQueryPanel() {
     })) as (Measure & { _scratchpad: boolean })[];
     return [...translated, ...scratchpad];
   }, [measures.data, translations.data, scratchpadQuery.data, t]);
+
+  // Ids of the model's real, persistable measures (excludes the synthetic
+  // Record Count and per-user scratchpad measures). Used to derive the legacy
+  // primary ``measure_id`` pointer for a saved view (Bug-6412) and to detect
+  // unresolvable measures on load (Bug-6424).
+  const realMeasureIds = useMemo(
+    () => new Set((measures.data ?? []).map((m) => m.id)),
+    [measures.data],
+  );
+  // Ids of the current user's personal scratchpad measures. A shared view must
+  // not embed these — other users cannot resolve them (Bug-6424).
+  const scratchpadIds = useMemo(
+    () => new Set((scratchpadQuery.data ?? []).map((s) => s.id)),
+    [scratchpadQuery.data],
+  );
+  const selectionsIncludeScratchpad = (sels: MeasureSel[]): boolean =>
+    sels.some((s) => scratchpadIds.has(s.measureId));
+  // The first selection that maps to a real model measure, used as the saved
+  // view's legacy ``measure_id`` pointer. Record Count / scratchpad / empty
+  // selections yield "" — the authoritative list lives in config.
+  const primaryModelMeasureId = (sels: MeasureSel[]): string =>
+    sels.find((s) => realMeasureIds.has(s.measureId))?.measureId ?? "";
 
   const localizedDimensions = useMemo(() => {
     const raw = dimensions.data ?? [];
@@ -185,8 +290,31 @@ export default function MeasureQueryPanel() {
   const [executeResult, setExecuteResult] = useState<ExecuteResponse | null>(
     pivotState.executeResult as ExecuteResponse | null,
   );
-  const [error, setError] = useState<string | null>(pivotState.error);
+  // Structured so a load/save/run failure can lead with a friendly, mapped
+  // message and keep raw backend/transport text behind an accordion (Bug-8182).
+  // Only the friendly message persists to pivotState (a string); the raw detail
+  // is transient and re-derived on the next failure.
+  const [error, setError] = useState<PivotPanelError | null>(
+    pivotState.error ? { message: pivotState.error } : null,
+  );
+  // Bug-8453 / R5 finding F3: DERIVED, never stored. `executeResult` is
+  // persisted in pivotState so results survive panel navigation; a separate
+  // useState for the denial verdict did not, so returning to the panel restored
+  // the result with rowSecurityDenied back to false -- the warning vanished AND
+  // the suppressed pivot came back, rendering the `WHERE 0 = 1` zero as an
+  // authoritative grand total. Deriving it makes that desync impossible, and
+  // matches how the sibling QueryPanel already does it.
+  const rowSecurityDenied = rowSecurityDeniedAll(executeResult);
   const abortRef = useRef<AbortController | null>(null);
+  // F-019-02 (Bug-8046): server-computed non-additive subtotals, keyed by
+  // measure name. Populated by the supplementary-grain effect below; merged into
+  // allTotals so AVG/MIN/MAX/COUNT DISTINCT/calculated measures show real
+  // subtotals instead of an em-dash. A separate abort controller cancels stale
+  // supplementary fetches when the pivot changes.
+  const [serverTotals, setServerTotals] = useState<Map<string, TotalsModel>>(
+    () => new Map(),
+  );
+  const subtotalAbortRef = useRef<AbortController | null>(null);
 
   const [searchParams, setSearchParams] = useSearchParams();
   const hydratedRef = useRef(false);
@@ -204,6 +332,8 @@ export default function MeasureQueryPanel() {
     const qgt = searchParams.get("gt");
     const qecm = searchParams.get("ecm");
     const qcf = searchParams.get("cf");
+    const qfl = searchParams.get("fl");
+    const qpid = searchParams.get("pid");
     if (qms) {
       try {
         const parsed = JSON.parse(qms) as MeasureSel[];
@@ -224,9 +354,12 @@ export default function MeasureQueryPanel() {
     if (qgt === "0") setShowGrandTotals(false);
     if (qecm === "zero" || qecm === "dash") setEmptyCellMode(qecm);
     if (qcf) { try { setConditionalFormat(JSON.parse(qcf)); } catch { /* ignore malformed */ } }
+    // Bug-5712: restore forceLive and personaId from shareable link params
+    if (qfl === "1") setForceLive(true);
+    if (qpid) setPersonaId(qpid);
     if (qms || qm || qr || qc || qem) {
       const next = new URLSearchParams(searchParams);
-      ["ms", "m", "r", "c", "em", "ao", "sl", "sub", "gt", "ecm", "cf", "tab"].forEach((k) => next.delete(k));
+      ["ms", "m", "r", "c", "em", "ao", "sl", "sub", "gt", "ecm", "cf", "fl", "pid", "tab"].forEach((k) => next.delete(k));
       setSearchParams(next, { replace: true });
     }
   }, [searchParams, setSearchParams]);
@@ -238,7 +371,8 @@ export default function MeasureQueryPanel() {
       rowDimIds,
       colDimIds,
       executeResult,
-      error,
+      // Persist only the friendly message; the raw detail is transient.
+      error: error?.message ?? null,
     });
   }, [measureSelections, rowDimIds, colDimIds, executeResult, error, setPivotState]);
 
@@ -253,6 +387,8 @@ export default function MeasureQueryPanel() {
   const [displayOptionsOpen, setDisplayOptionsOpen] = useState(false);
   const [emptyCellMode, setEmptyCellMode] = useState<EmptyCellMode>("blank");
   const [conditionalFormat, setConditionalFormat] = useState<ConditionalFormat>({ kind: "none" });
+  const [pivotSort, setPivotSort] = useState<PivotSort | null>(null);
+  const [sortNotice, setSortNotice] = useState<string | null>(null);
   // F-019-08: the grid's current sorted row order, so the export honours the
   // user's header-click sort instead of the pivot's default order.
   const [exportRowOrder, setExportRowOrder] = useState<string[][] | null>(null);
@@ -261,7 +397,9 @@ export default function MeasureQueryPanel() {
   const [calcDrawerOpen, setCalcDrawerOpen] = useState(false);
   const [drillLoading, setDrillLoading] = useState(false);
   const [drillResult, setDrillResult] = useState<DrillThroughResponse | null>(null);
-  const [drillError, setDrillError] = useState<string | null>(null);
+  // Bug-8182 (review B4): structured so the primary drill surface leads with a
+  // friendly message and keeps raw backend/transport text collapsed.
+  const [drillError, setDrillError] = useState<PivotPanelError | null>(null);
   const [drillContext, setDrillContext] = useState<DrillContext | null>(null);
   const [drillPageSize, setDrillPageSize] = useState<DrillPageSize>(50);
   // Stack of cursors for every page we've loaded except the current one.
@@ -272,7 +410,7 @@ export default function MeasureQueryPanel() {
   const [drillGroupingLevels, setDrillGroupingLevels] = useState<DrillThroughFilter[]>([]);
   const [drillHierarchyId, setDrillHierarchyId] = useState<string | null>(null);
   const [drillHierarchyOptions, setDrillHierarchyOptions] = useState<DrillableHierarchy[]>([]);
-
+  const [drillOverrideAgg, setDrillOverrideAgg] = useState<string | null>(null);
   const hierarchiesWithLevels = useHierarchiesWithLevels(projectId ?? "", modelId ?? "");
 
   type DrillPath = { dimName: string; value: string };
@@ -308,20 +446,53 @@ export default function MeasureQueryPanel() {
       pivotViewsApi
         .list(projectId, modelId)
         .then(setSavedViews)
-        .catch((err) => setError(extractError(err, t("errors.requestFailed"))));
+        .catch((err) => setError(toPivotError(err, t, t("errors.requestFailed"))));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, modelId]);
 
   const handleSaveView = async () => {
     if (!projectId || !modelId || !viewSaveName.trim()) return;
+    // Bug-6424: a shared view must not embed personal scratchpad measures —
+    // other users cannot resolve them, so the view would silently degrade.
+    // Surface it and block the shared save rather than persisting a broken view.
+    if (viewSaveShared && selectionsIncludeScratchpad(measureSelections)) {
+      setError({ message: t("pivot.shareScratchpadBlocked") });
+      return;
+    }
+    const sortIdentityColumns = pivotSort?.target.kind === "column"
+      ? [pivotSort.target.columnKey]
+      : [];
+    const sortIdentityValid = !pivotSort || Boolean(
+      resolvePivotSort(pivotSort, columnMeasures, sortIdentityColumns),
+    );
+    const sortTargetValid = !pivotSort || !pivot || Boolean(
+      resolvePivotSort(pivotSort, columnMeasures, pivot.colKeys),
+    );
+    const sortForSave = sortIdentityValid && sortTargetValid ? pivotSort : null;
+    if (pivotSort && !sortForSave) {
+      setPivotSort(null);
+      setSortNotice(t("pivot.savedSortUnavailable"));
+    }
     try {
       await pivotViewsApi.create(projectId, modelId, {
         name: viewSaveName.trim(),
-        measure_id: measureSelections[0]?.measureId ?? "",
+        // Bug-6412: the legacy primary pointer must be a real model measure or
+        // empty; Record Count / scratchpad / no first measure would otherwise
+        // fail server-side validation. The full selection travels in config.
+        measure_id: primaryModelMeasureId(measureSelections),
         row_dim_ids: pivotState.rowDimIds,
         col_dim_ids: pivotState.colDimIds,
-        config: { emptyCellMode, showSubtotals, showGrandTotals, measureSelections, slicers, conditionalFormat },
+        config: buildPivotViewConfig({
+          emptyCellMode,
+          showSubtotals,
+          showGrandTotals,
+          measureSelections,
+          slicers,
+          conditionalFormat,
+          forceLive,
+          personaId,
+        }, sortForSave),
         is_shared: viewSaveShared,
       });
       const views = await pivotViewsApi.list(projectId, modelId);
@@ -332,23 +503,14 @@ export default function MeasureQueryPanel() {
     } catch (err) {
       // Pivot view save failures used to be unhandled rejections logged only to
       // the console; surface them in the existing error Alert (F-029-17).
-      setError(extractError(err, t("errors.requestFailed")));
+      setError(toPivotError(err, t, t("errors.requestFailed")));
     }
   };
 
   const handleLoadView = (view: PivotView) => {
     const cfg = view.config ?? {};
-    let selections: MeasureSel[];
-    if ("measureSelections" in cfg && Array.isArray(cfg.measureSelections)) {
-      selections = cfg.measureSelections as MeasureSel[];
-    } else {
-      // Back-compat: synthesise selections from the legacy measure_id +
-      // extraMeasureIds + measureAggOverrides config shape.
-      const extraIds = "extraMeasureIds" in cfg ? (cfg.extraMeasureIds as string[]) : [];
-      const allIds = view.measure_id ? [view.measure_id, ...extraIds] : extraIds;
-      const ao = "measureAggOverrides" in cfg ? (cfg.measureAggOverrides as Record<string, string>) : {};
-      selections = allIds.map((id) => ({ measureId: id, agg: ao[id] ?? "" }));
-    }
+    // Includes the legacy-format back-compat synthesis (Bug-6424 helper).
+    const selections = selectionsFromView(view);
     setMeasureSelections(selections);
     setRowDimIds(view.row_dim_ids);
     setColDimIds(view.col_dim_ids);
@@ -358,14 +520,71 @@ export default function MeasureQueryPanel() {
       rowDimIds: view.row_dim_ids,
       colDimIds: view.col_dim_ids,
     });
-    setEmptyCellMode(("emptyCellMode" in cfg ? cfg.emptyCellMode : "blank") as typeof emptyCellMode);
-    setShowSubtotals("showSubtotals" in cfg ? cfg.showSubtotals as boolean : false);
-    setShowGrandTotals("showGrandTotals" in cfg ? cfg.showGrandTotals as boolean : true);
-    setSlicers("slicers" in cfg && Array.isArray(cfg.slicers) ? cfg.slicers as Slicer[] : []);
-    setConditionalFormat("conditionalFormat" in cfg ? cfg.conditionalFormat as ConditionalFormat : { kind: "none" });
+    // Bug-8161 (review B2): decode every loader-consumed field so a historical
+    // malformed config (e.g. a shared view saved before the typed contract) is
+    // coerced to a safe shape instead of crashing SlicerBar/PivotGrid on read.
+    const slicersDecoded = decodeSlicers("slicers" in cfg ? cfg.slicers : undefined);
+    const conditionalFormatDecoded = decodeConditionalFormat(
+      "conditionalFormat" in cfg ? cfg.conditionalFormat : undefined,
+    );
+    const configSanitized = !slicersDecoded.ok || !conditionalFormatDecoded.ok;
+    setEmptyCellMode(decodeEmptyCellMode("emptyCellMode" in cfg ? cfg.emptyCellMode : undefined));
+    setShowSubtotals(decodeBool("showSubtotals" in cfg ? cfg.showSubtotals : undefined, false));
+    setShowGrandTotals(decodeBool("showGrandTotals" in cfg ? cfg.showGrandTotals : undefined, true));
+    setSlicers(slicersDecoded.value);
+    setConditionalFormat(conditionalFormatDecoded.value);
+    const parsedSort = parsePivotViewSortConfig(cfg);
+    const loadedColumns = buildColumnMeasures(selections, availableMeasures, t);
+    const identityColumns = parsedSort.sort?.target.kind === "column"
+      ? [parsedSort.sort.target.columnKey]
+      : [];
+    const loadedSort = parsedSort.sort && resolvePivotSort(parsedSort.sort, loadedColumns, identityColumns)
+      ? parsedSort.sort
+      : null;
+    setPivotSort(loadedSort);
+    setSortNotice(
+      parsedSort.issue === "unsupported-version"
+        ? t("pivot.savedSortUnsupportedVersion")
+        : parsedSort.issue === "invalid-sort" || (parsedSort.sort && !loadedSort)
+          ? t("pivot.savedSortUnavailable")
+          : null,
+    );
+    // Bug-5712: restore forceLive and personaId from saved view config
+    setForceLive(decodeBool("forceLive" in cfg ? cfg.forceLive : undefined, false));
+    setPersonaId(decodePersonaId("personaId" in cfg ? cfg.personaId : undefined));
     setHierarchyDrillPath([]);
     setViewMenuOpen(false);
+    // Review B2: if a historical config carried malformed loader fields we had to
+    // drop, tell the user the view was partially recovered (the specific
+    // missing-measures notice below takes precedence when it also applies).
+    if (configSanitized) {
+      setError({ message: t("pivot.loadViewInvalidConfig") });
+    }
+    // Bug-6424: a shared view authored by another user may reference measures
+    // this user cannot see (their scratchpad measures, or measures removed
+    // since). Detect the unresolvable selections and surface them rather than
+    // letting the corresponding columns vanish silently.
+    const unresolved = selections.filter(
+      (s) =>
+        s.measureId &&
+        s.measureId !== RECORD_COUNT_ID &&
+        !realMeasureIds.has(s.measureId) &&
+        !scratchpadIds.has(s.measureId),
+    );
+    if (unresolved.length > 0) {
+      setError({ message: t("pivot.loadViewMissingMeasures", { count: String(unresolved.length) }) });
+    }
   };
+
+  const handleInvalidPivotSort = useCallback(() => {
+    setPivotSort(null);
+    setSortNotice(t("pivot.savedSortUnavailable"));
+  }, [t]);
+
+  const handlePivotSortChange = useCallback((next: PivotSort | null) => {
+    setPivotSort(next);
+    setSortNotice(null);
+  }, []);
 
   const handleDeleteView = async (viewId: string) => {
     if (!projectId || !modelId) return;
@@ -373,20 +592,28 @@ export default function MeasureQueryPanel() {
       await pivotViewsApi.delete(projectId, modelId, viewId);
       setSavedViews((prev) => prev.filter((v) => v.id !== viewId));
     } catch (err) {
-      setError(extractError(err, t("errors.requestFailed")));
+      setError(toPivotError(err, t, t("errors.requestFailed")));
     }
   };
 
   // Owner-only: publish a personal view to the tenant or pull it back (F-029-22).
   const handleToggleShare = async (view: PivotView) => {
     if (!projectId || !modelId) return;
+    // Bug-6424: publishing (personal -> shared) must not expose a view that
+    // embeds this user's scratchpad measures; other users cannot resolve them.
+    // Derive selections the same way load does (incl. legacy-format views) so
+    // publish-time and load-time detection stay consistent.
+    if (!view.is_shared && selectionsIncludeScratchpad(selectionsFromView(view))) {
+      setError({ message: t("pivot.shareScratchpadBlocked") });
+      return;
+    }
     try {
       const updated = await pivotViewsApi.update(projectId, modelId, view.id, {
         is_shared: !view.is_shared,
       });
       setSavedViews((prev) => prev.map((v) => (v.id === view.id ? updated : v)));
     } catch (err) {
-      setError(extractError(err, t("errors.requestFailed")));
+      setError(toPivotError(err, t, t("errors.requestFailed")));
     }
   };
 
@@ -400,6 +627,9 @@ export default function MeasureQueryPanel() {
     if (!showGrandTotals) params.set("gt", "0");
     if (emptyCellMode !== "blank") params.set("ecm", emptyCellMode);
     if (conditionalFormat.kind !== "none") params.set("cf", JSON.stringify(conditionalFormat));
+    // Bug-5712: include execution mode and persona in shareable links
+    if (forceLive) params.set("fl", "1");
+    if (personaId) params.set("pid", personaId);
     params.set("tab", "pivot");
     const url = `${window.location.origin}${window.location.pathname}?${params}`;
     navigator.clipboard.writeText(url).catch(() => {});
@@ -484,7 +714,7 @@ export default function MeasureQueryPanel() {
     [compatibilityMeasureIds, rowDimIds, colDimIds, slicers, localizedDimensions, fieldCompatibility.data],
   );
   const selectedMeasure = columnMeasures[0] ?? null;
-  const extraMeasures = useMemo<Measure[]>(
+  const extraMeasures = useMemo<PivotColumnMeasure[]>(
     () => columnMeasures.slice(1),
     [columnMeasures],
   );
@@ -688,11 +918,15 @@ export default function MeasureQueryPanel() {
         controller.signal,
       );
       if (!controller.signal.aborted) {
+        // Bug-8453: a row-security deny-all returns HTTP 200 with zero rows,
+        // which this pivot rendered as an ordinary empty result. The denial is
+        // derived from the stored result (see rowSecurityDenied above), so it
+        // survives panel navigation with it.
         setExecuteResult(result);
         setSetupExpanded(false);
       }
     } catch (err) {
-      if (!controller.signal.aborted) setError(extractError(err, t("errors.requestFailed")));
+      if (!controller.signal.aborted) setError(toPivotError(err, t, t("errors.requestFailed")));
     } finally {
       if (!controller.signal.aborted) setExecuting(false);
     }
@@ -718,10 +952,88 @@ export default function MeasureQueryPanel() {
     if (!pivot || (!showSubtotals && !showGrandTotals)) return result;
     const measures = selectedMeasure ? [selectedMeasure, ...extraMeasures] : [];
     for (const m of measures) {
-      result.set(m.name, computeTotals(pivot, m));
+      // F-019-02: a non-additive/non-composable measure uses the server-computed
+      // grain totals when they have arrived; until then computeTotals renders the
+      // NOT_ADDITIVE marker (em-dash), which the effect below replaces with real
+      // numbers. Additive measures always use the fast client-side path.
+      const server = needsServerSubtotals(m) ? serverTotals.get(m.name) : undefined;
+      result.set(m.name, server ?? computeTotals(pivot, m));
     }
     return result;
-  }, [pivot, selectedMeasure, extraMeasures, showSubtotals, showGrandTotals]);
+  }, [pivot, selectedMeasure, extraMeasures, showSubtotals, showGrandTotals, serverTotals]);
+
+  // F-019-02 (Bug-8046): fetch supplementary subtotal grains for non-additive
+  // measures through the same execute route XMLA uses, so web and Excel agree on
+  // AVG/MIN/MAX/COUNT DISTINCT/calculated subtotals. One bounded GROUP BY query
+  // per grain shape; results assembled into a TotalsModel per measure.
+  useEffect(() => {
+    // Reset when the pivot or toggles change; recompute only when needed.
+    if (!pivot || !model.data || (!showSubtotals && !showGrandTotals)) {
+      subtotalAbortRef.current?.abort();
+      setServerTotals((prev) => (prev.size ? new Map() : prev));
+      return;
+    }
+    const measures = selectedMeasure ? [selectedMeasure, ...extraMeasures] : [];
+    const targets = measures.filter((m) => needsServerSubtotals(m));
+    if (targets.length === 0) {
+      setServerTotals((prev) => (prev.size ? new Map() : prev));
+      return;
+    }
+    subtotalAbortRef.current?.abort();
+    // Fable R1 F5: clear stale server totals SYNCHRONOUSLY before the async
+    // fetch starts, so the pivot never transiently shows old-pivot totals
+    // against new-pivot detail cells. computeTotals then shows the
+    // NOT_ADDITIVE marker until fresh grains arrive.
+    setServerTotals(new Map());
+    const controller = new AbortController();
+    subtotalAbortRef.current = controller;
+    const specs = grainSpecsFor(rowDims, colDims);
+    const slicerDims = dimensions.data ?? [];
+
+    (async () => {
+      const next = new Map<string, TotalsModel>();
+      for (const m of targets) {
+        const results = new Map<GrainSpec["id"], import("../../../api/types").ExecuteResponse>();
+        try {
+          for (const spec of specs) {
+            const sql = buildGrainSql(model.data!, m, spec, slicers, slicerDims);
+            const res = await queryRouterApiClient.execute(
+              {
+                model_id: modelId!,
+                raw_query: sql,
+                dialect: "postgresql",
+                ...(forceLive ? { force_route: "source" as const } : {}),
+              },
+              personaId,
+              controller.signal,
+            );
+            if (controller.signal.aborted) return;
+            // Bug-8453 / R3 finding B-2 [wrong numbers]: a denied grain is not
+            // a measurement. COUNT/COALESCE-shaped subtotal grains over
+            // ``WHERE 0 = 1`` return a literal 0, and assembleServerTotals
+            // would render that as an authoritative grand total. Drop the
+            // measure onto the same safe path an execution failure takes (the
+            // NOT_ADDITIVE marker) rather than publishing a fabricated zero.
+            if (rowSecurityDeniedAll(res)) {
+              throw new Error("row_security_denied");
+            }
+            results.set(spec.id, res);
+          }
+        } catch {
+          // A supplementary-grain failure leaves this measure without server
+          // totals; computeTotals then shows the NOT_ADDITIVE marker (safe: no
+          // wrong number). Do not fault the whole pivot.
+          continue;
+        }
+        next.set(m.name, assembleServerTotals(pivot, m, results, t("pivot.nullValue")));
+      }
+      if (!controller.signal.aborted) setServerTotals(next);
+    })();
+
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pivot, model.data, selectedMeasure, extraMeasures, rowDims, colDims,
+      slicers, showSubtotals, showGrandTotals, forceLive, personaId, modelId]);
 
   const cellCount = pivot
     ? Math.max(1, pivot.rowKeys.length) * Math.max(1, pivot.colKeys.length)
@@ -739,27 +1051,7 @@ export default function MeasureQueryPanel() {
   // dimensionId; the drill contract wants the dimension *name* as `column`.
   // The slicer op set maps 1:1 to drill ops except `ne` → `neq`.
   function buildSlicerFilters(): DrillThroughFilter[] {
-    const out: DrillThroughFilter[] = [];
-    for (const s of slicers) {
-      const dim = dimsById.get(s.dimensionId);
-      if (!dim) continue;
-      const op = s.op === "ne" ? "neq" : s.op;
-      if (op === "is_null" || op === "is_not_null") {
-        out.push({ column: dim.name, op });
-      } else if (op === "in") {
-        const vs = s.values.filter((v) => v.length > 0);
-        if (vs.length > 0) out.push({ column: dim.name, op, value: vs });
-      } else if (op === "between") {
-        if (s.values.length >= 2 && s.values[0] && s.values[1]) {
-          out.push({ column: dim.name, op, value: [s.values[0], s.values[1]] });
-        }
-      } else {
-        if (s.values.length > 0 && s.values[0]) {
-          out.push({ column: dim.name, op, value: s.values[0] });
-        }
-      }
-    }
-    return out;
+    return createSlicerFilters(slicers, dimsById);
   }
 
   async function fireDrill(
@@ -768,19 +1060,22 @@ export default function MeasureQueryPanel() {
     cursor: string | null,
     limit: number,
     hierarchyId: string | null,
+    overrideAgg?: string | null,
   ) {
     if (drillMeasure.measure_type === "calculated") return;
-    const filters = buildSlicerFilters();
+    const invocation = buildDrillInvocation({
+      measure: drillMeasure as PivotColumnMeasure,
+      groupingLevels,
+      filters: buildSlicerFilters(),
+      limit,
+      cursor,
+      hierarchyId,
+      forceLive,
+      overrideAggregation: overrideAgg,
+    });
     return queryRouterApiClient.drillThrough(
-      realMeasureId(drillMeasure),
-      {
-        grouping_levels: groupingLevels,
-        ...(filters.length > 0 ? { filters } : {}),
-        limit,
-        ...(cursor ? { cursor } : {}),
-        ...(hierarchyId ? { hierarchy_id: hierarchyId } : {}),
-        ...(forceLive ? { force_route: "source" as const } : {}),
-      },
+      invocation.measureId,
+      invocation.request,
       personaId,
     );
   }
@@ -791,28 +1086,37 @@ export default function MeasureQueryPanel() {
     cursor: string | null,
     limit: number,
     hierarchyId: string | null,
+    overrideAgg?: string | null,
   ) {
     setDrillError(null);
     setDrillLoading(true);
     try {
-      const result = await fireDrill(drillMeasure, groupingLevels, cursor, limit, hierarchyId);
+      const result = await fireDrill(drillMeasure, groupingLevels, cursor, limit, hierarchyId, overrideAgg);
+      // Bug-8453 / R6 finding 1: this is the PRIMARY drill surface -- every
+      // pivot-cell click lands here and feeds DrillThroughPanel. An RLS
+      // deny-all returns zero detail rows, which rendered as "0 rows" and is
+      // indistinguishable from "this cell has no underlying data": a claim
+      // about the business, not about the analyst's access. R5 wired the
+      // calculated-measure sub-drill (DrillMiniPanel) and the Excel drill
+      // panel but missed this one; mirrors DrillMiniPanel's pattern exactly.
+      // Safe to clear: loadDrillPage REPLACES the result on every page
+      // (cursor pagination, no accumulation), so no already-shown rows are
+      // discarded here.
+      if (result && rowSecurityDeniedAll(result)) {
+        setDrillResult(null);
+        setDrillError({ message: t("query.rowSecurityDeniedBody") });
+        return;
+      }
       if (result) setDrillResult(result);
     } catch (err) {
-      setDrillError(extractError(err, t("errors.requestFailed")));
+      setDrillError(toPivotError(err, t, t("drill.loadFailed")));
     } finally {
       setDrillLoading(false);
     }
   }
 
   function buildInitialGroupingLevels(coord: CellCoord): DrillThroughFilter[] {
-    const levels: DrillThroughFilter[] = [];
-    rowDims.forEach((d, i) => {
-      levels.push({ column: d.name, op: "eq", value: coord.rowValues[i] });
-    });
-    colDims.forEach((d, i) => {
-      levels.push({ column: d.name, op: "eq", value: coord.colValues[i] });
-    });
-    return levels;
+    return createInitialGroupingLevels(coord, rowDims, colDims);
   }
 
   async function handleCellClick(coord: CellCoord, clickedMeasure: Measure) {
@@ -827,6 +1131,17 @@ export default function MeasureQueryPanel() {
     setDrillGroupingLevels(levels);
     setDrillHierarchyId(null);
     setDrillHierarchyOptions([]);
+    // Bug-7265: derive override_agg from the clicked column measure's _agg
+    // when it differs from the measure's default_agg. Scratchpad and Record
+    // Count columns never carry a meaningful override.
+    const colMeasure = clickedMeasure as PivotColumnMeasure;
+    const effectiveAgg = colMeasure._agg ?? null;
+    const defaultAgg = (clickedMeasure.default_agg ?? "SUM").toUpperCase();
+    const aggOverride =
+      effectiveAgg && effectiveAgg !== defaultAgg && !colMeasure._scratchpad
+        ? effectiveAgg
+        : null;
+    setDrillOverrideAgg(aggOverride);
     setDrawerOpen(true);
     setDrillResult(null);
     setDrillCursorStack([]);
@@ -842,24 +1157,24 @@ export default function MeasureQueryPanel() {
         const hid = opts.hierarchies[0].hierarchy_id;
         setDrillHierarchyId(hid);
         setDrillLoading(false);
-        await loadDrillPage(clickedMeasure, levels, null, drillPageSize, hid);
+        await loadDrillPage(clickedMeasure, levels, null, drillPageSize, hid, aggOverride);
       } else if (opts.hierarchies.length === 0) {
         setDrillLoading(false);
-        await loadDrillPage(clickedMeasure, levels, null, drillPageSize, null);
+        await loadDrillPage(clickedMeasure, levels, null, drillPageSize, null, aggOverride);
       } else {
-        // multiple hierarchies → picker shown in drawer
+        // multiple hierarchies -> picker shown in drawer
         setDrillLoading(false);
       }
     } catch {
       setDrillLoading(false);
-      await loadDrillPage(clickedMeasure, levels, null, drillPageSize, null);
+      await loadDrillPage(clickedMeasure, levels, null, drillPageSize, null, aggOverride);
     }
   }
 
   async function handleSelectHierarchy(hid: string) {
     if (!drillContext) return;
     setDrillHierarchyId(hid);
-    await loadDrillPage(drillContext.measure, drillGroupingLevels, null, drillPageSize, hid);
+    await loadDrillPage(drillContext.measure, drillGroupingLevels, null, drillPageSize, hid, drillOverrideAgg);
   }
 
   async function handleDrillRow(
@@ -877,7 +1192,7 @@ export default function MeasureQueryPanel() {
     setDrillGroupingLevels(nextLevels);
     setDrillHierarchyId(hierarchyId);
     setDrillCursorStack([]);
-    await loadDrillPage(drillContext.measure, nextLevels, null, drillPageSize, hierarchyId);
+    await loadDrillPage(drillContext.measure, nextLevels, null, drillPageSize, hierarchyId, drillOverrideAgg);
   }
 
   async function handleDrillNextPage() {
@@ -890,6 +1205,7 @@ export default function MeasureQueryPanel() {
       drillResult.page.next_cursor,
       drillPageSize,
       drillHierarchyId,
+      drillOverrideAgg,
     );
   }
 
@@ -898,14 +1214,14 @@ export default function MeasureQueryPanel() {
     const stack = [...drillCursorStack];
     const prevCursor = stack.pop() ?? null;
     setDrillCursorStack(stack);
-    await loadDrillPage(drillContext.measure, drillGroupingLevels, prevCursor, drillPageSize, drillHierarchyId);
+    await loadDrillPage(drillContext.measure, drillGroupingLevels, prevCursor, drillPageSize, drillHierarchyId, drillOverrideAgg);
   }
 
   async function handleDrillPageSizeChange(size: DrillPageSize) {
     setDrillPageSize(size);
     if (!drillContext) return;
     setDrillCursorStack([]);
-    await loadDrillPage(drillContext.measure, drillGroupingLevels, null, size, drillHierarchyId);
+    await loadDrillPage(drillContext.measure, drillGroupingLevels, null, size, drillHierarchyId, drillOverrideAgg);
   }
 
   const isVariantMeasure = Boolean(selectedMeasure?.variant_kind);
@@ -1105,6 +1421,7 @@ export default function MeasureQueryPanel() {
               projectId={projectId ?? ""}
               modelId={modelId ?? ""}
               measures={availableMeasures}
+              glossaryByMeasureId={glossaryByMeasureId}
               dimensions={visibleDimensions}
               selections={measureSelections}
               rowDimIds={rowDimIds}
@@ -1160,9 +1477,29 @@ export default function MeasureQueryPanel() {
         </Alert>
       )}
 
-      {error && <Alert severity="error">{error}</Alert>}
+      {error && <PivotErrorAlert error={error} />}
 
-      {executeResult && (
+      {/* Bug-8453 / R3 finding B-2: shown regardless of row count, because a
+          denied query still returns a row for COUNT-shaped SQL. */}
+      {rowSecurityDenied && (
+        <Alert severity="warning">
+          <AlertTitle>{t("query.rowSecurityDeniedTitle")}</AlertTitle>
+          {t("query.rowSecurityDeniedBody")}
+        </Alert>
+      )}
+
+      {sortNotice && (
+        <Alert severity="warning" onClose={() => setSortNotice(null)}>
+          {sortNotice}
+        </Alert>
+      )}
+
+      {/* R4 finding 4: a denied result still carries a COUNT-shaped 0 from
+          `WHERE 0 = 1`. The warning above tells the truth, but a screenshot
+          of the pivot cell does not travel with it, so suppress the value
+          entirely -- the same doctrine the subtotals loop already applies
+          by refusing to publish a denied grain. */}
+      {executeResult && !rowSecurityDenied && (
         <Paper
           variant="outlined"
           sx={{
@@ -1182,7 +1519,7 @@ export default function MeasureQueryPanel() {
                 {t("pivot.resultsLabel")}
               </Typography>
               <Tooltip
-                title={executeResult.reason || t("pivot.routeTypeTooltip", { route: executeResult.route_type })}
+                title={routeReasonLabel(executeResult.route_type, executeResult.reason, t)}
                 placement="top"
                 arrow
               >
@@ -1196,6 +1533,10 @@ export default function MeasureQueryPanel() {
                   {t("pivot.routeBadge", { route: routeBadgeLabel(executeResult.route_type, t) })}
                 </Typography>
               </Tooltip>
+              <FreshnessIndicator
+                routeType={executeResult.route_type}
+                freshness={executeResult.freshness}
+              />
               <Typography variant="caption" color="text.secondary">
                 {t("pivot.rowsReturned", { count: String(executeResult.rows_returned) })}
               </Typography>
@@ -1419,6 +1760,9 @@ export default function MeasureQueryPanel() {
             showGrandTotals={showGrandTotals}
             emptyCellMode={emptyCellMode}
             conditionalFormat={conditionalFormat}
+            sort={pivotSort}
+            onSortChange={handlePivotSortChange}
+            onSortInvalid={handleInvalidPivotSort}
             onCellClick={handleCellClick}
             drillableRowDims={drillableRowDims}
             drillHierarchyNames={drillHierarchyNames}
@@ -1457,6 +1801,7 @@ export default function MeasureQueryPanel() {
         allMeasures={measures.data ?? []}
         personaId={personaId}
         filters={buildSlicerFilters()}
+        forceLive={forceLive}
         onClose={() => setCalcDrawerOpen(false)}
       />
 
@@ -1535,20 +1880,26 @@ export default function MeasureQueryPanel() {
                     {!v.is_owner && ` — ${t("pivot.sharedByOwner", { owner: v.created_by })}`}
                   </Typography>
                 </Box>
-                {v.is_owner && (
+                {(v.is_owner || v.can_edit) && (
                   <Stack direction="row" gap={0.5} alignItems="center" onClick={(e) => e.stopPropagation()}>
-                    <Tooltip title={v.is_shared ? t("pivot.unshareTooltip") : t("pivot.shareTooltip")}>
-                      <Button size="small" onClick={() => handleToggleShare(v)}>
-                        {v.is_shared ? t("pivot.unshareView") : t("pivot.shareView")}
+                    {/* Publish/unpublish stays owner-only (F-029-22). */}
+                    {v.is_owner && (
+                      <Tooltip title={v.is_shared ? t("pivot.unshareTooltip") : t("pivot.shareTooltip")}>
+                        <Button size="small" onClick={() => handleToggleShare(v)}>
+                          {v.is_shared ? t("pivot.unshareView") : t("pivot.shareView")}
+                        </Button>
+                      </Tooltip>
+                    )}
+                    {/* Bug-5839: a modeler may delete a shared view they do not own. */}
+                    {v.can_edit && (
+                      <Button
+                        size="small"
+                        color="error"
+                        onClick={() => handleDeleteView(v.id)}
+                      >
+                        {t("pivot.deleteView")}
                       </Button>
-                    </Tooltip>
-                    <Button
-                      size="small"
-                      color="error"
-                      onClick={() => handleDeleteView(v.id)}
-                    >
-                      {t("pivot.deleteView")}
-                    </Button>
+                    )}
                   </Stack>
                 )}
               </Stack>

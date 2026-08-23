@@ -1,8 +1,9 @@
 import { useMemo } from 'react';
-import { Box, Typography, Collapse, Skeleton } from '@mui/material';
+import { Box, Typography, Collapse, Skeleton, IconButton } from '@mui/material';
 import { ExpandLess, ExpandMore } from '@mui/icons-material';
 import { tokens } from '../../theme';
-import type { Measure, Zone, GlossaryEntry } from '../../types/tessallite';
+import { strings, templates } from '../../i18n/strings';
+import type { Measure, GlossaryEntry } from '../../types/tessallite';
 import MeasureCard from './MeasureCard';
 
 interface MeasureLibraryProps {
@@ -11,6 +12,9 @@ interface MeasureLibraryProps {
   selectedMeasureIds: string[];
   onToggleMeasure: (measureId: string) => void;
   onAddToValues: (measureId: string) => void;
+  /** Phase A default: insert as TESSALLITE.VALUE() formula (connectionless). */
+  onInsertMeasureAsFunction?: (measureId: string) => void;
+  /** Advanced: insert as CUBEVALUE formula (requires workbook connection). */
   onInsertMeasureAsFormula?: (measureId: string) => void;
   expanded: boolean;
   onToggleExpanded: () => void;
@@ -24,6 +28,7 @@ export default function MeasureLibrary({
   selectedMeasureIds,
   onToggleMeasure,
   onAddToValues,
+  onInsertMeasureAsFunction,
   onInsertMeasureAsFormula,
   expanded,
   onToggleExpanded,
@@ -84,10 +89,19 @@ export default function MeasureLibrary({
         }}
       >
         <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-          Measures ({measures.length})
+          {templates.library.measuresHeader(measures.length)}
         </Typography>
+        {/* Bug-6710: keyboard path to expand/collapse (header Box is mouse-only). */}
         {(measures.length > 0 || loading || searchQuery) && (
-          expanded ? <ExpandLess sx={{ fontSize: 16, color: tokens.colorTextSecondary }} /> : <ExpandMore sx={{ fontSize: 16, color: tokens.colorTextSecondary }} />
+          <IconButton
+            size="small"
+            onClick={(e) => { e.stopPropagation(); onToggleExpanded(); }}
+            aria-expanded={expanded}
+            aria-label={templates.library.toggleSectionAria(expanded, strings.library.measuresSection)}
+            sx={{ width: 24, height: 24, color: tokens.colorTextSecondary }}
+          >
+            {expanded ? <ExpandLess sx={{ fontSize: 16 }} /> : <ExpandMore sx={{ fontSize: 16 }} />}
+          </IconButton>
         )}
       </Box>
       <Collapse in={expanded}>
@@ -99,7 +113,7 @@ export default function MeasureLibrary({
           </Box>
         ) : measures.length === 0 ? (
           <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, px: 1.5, py: 1 }}>
-            {searchQuery ? 'No measures match your search' : 'No measures available'}
+            {searchQuery ? strings.measureLibrary.noSearchMatch : strings.measureLibrary.noItemsAvailable}
           </Typography>
         ) : (
           groupedMeasures.map((group, gi) => (
@@ -119,6 +133,7 @@ export default function MeasureLibrary({
                     checked={selectedMeasureIds.includes(m.id)}
                     onToggle={() => onToggleMeasure(m.id)}
                     onAddToValues={() => onAddToValues(m.id)}
+                    onInsertAsFunction={onInsertMeasureAsFunction ? () => onInsertMeasureAsFunction(m.id) : undefined}
                     onInsertAsFormula={onInsertMeasureAsFormula ? () => onInsertMeasureAsFormula(m.id) : undefined}
                     glossaryEntries={glossaryEntries}
                   />

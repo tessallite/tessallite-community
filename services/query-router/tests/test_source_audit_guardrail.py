@@ -1,9 +1,18 @@
-"""Phase 4.2 — Source audit guard rail tests.
+"""Source audit guard rail + single-execution-gateway tests.
 
-Verifies:
-1. PostgresExecutor._tag() injects the /* tessallite:routed */ comment.
-2. F-027-11: the dispatcher tags routed SQL centrally for ALL dialects.
-3. [SOURCE_AUDIT] logging emits entries when the env flag is set.
+F-014-02 / Bug-7984: routed user-query physical I/O flows through the SINGLE
+public shared gateway ``shared.source_executor.execute_routed_query``. The
+query-router no longer holds its own connector executor classes or opens driver
+connections. These tests verify:
+
+1. The dispatcher tags routed SQL centrally for ALL dialects (F-027-11).
+2. The dispatcher delegates to the shared gateway and preserves the
+   ``(rows, bytes, columns)`` contract.
+3. A placeholder/unconfigured connection is rejected before any connect.
+4. Every routed execution produces a ``[SOURCE_AUDIT]`` trace.
+5. Producer-derived guard: no connector driver is imported directly by the
+   query-router execution package (the single-gateway invariant).
+6. ``[SOURCE_AUDIT]`` redaction behaviour (Bug-7174).
 """
 from __future__ import annotations
 
@@ -13,35 +22,6 @@ from unittest.mock import patch
 import pytest
 
 from src.execution.dispatcher import _ROUTED_MARKER, _tag_routed
-from src.execution.postgres_executor import PostgresExecutor
-
-
-# ---------------------------------------------------------------------------
-# PostgresExecutor._tag()
-# ---------------------------------------------------------------------------
-
-
-def test_tag_injects_routed_comment():
-    sql = 'SELECT "month", SUM("amount") FROM "modely" GROUP BY "month"'
-    tagged = PostgresExecutor._tag(sql)
-    assert tagged.startswith("/* tessallite:routed */")
-    assert sql in tagged
-
-
-def test_tag_idempotent():
-    sql = '/* tessallite:routed */ SELECT 1'
-    assert PostgresExecutor._tag(sql) == sql
-
-
-def test_tag_idempotent_with_leading_whitespace():
-    sql = '  /* tessallite:routed */ SELECT 1'
-    assert PostgresExecutor._tag(sql) == sql
-
-
-def test_tag_preserves_sql_content():
-    sql = "SELECT * FROM foo WHERE x = 'bar'"
-    tagged = PostgresExecutor._tag(sql)
-    assert tagged == f"/* tessallite:routed */ {sql}"
 
 
 # ---------------------------------------------------------------------------
@@ -56,11 +36,9 @@ def test_dispatcher_tag_injects_routed_comment():
     assert sql in tagged
 
 
-def test_dispatcher_tag_idempotent_with_pg_tag():
-    # PostgresExecutor._tag sees SQL already tagged by the dispatcher and
-    # must not double-tag it.
+def test_dispatcher_tag_idempotent():
     once = _tag_routed("SELECT 1")
-    assert PostgresExecutor._tag(once) == once
+    assert _tag_routed(once) == once
 
 
 def test_dispatcher_tag_idempotent_with_leading_whitespace():
@@ -68,58 +46,185 @@ def test_dispatcher_tag_idempotent_with_leading_whitespace():
     assert _tag_routed(sql) == sql
 
 
+# ---------------------------------------------------------------------------
+# F-014-02 — the dispatcher delegates to the shared execution gateway,
+# preserving the (rows, bytes, columns) contract, and passes tagged SQL.
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_execute_on_connection_tags_all_dialects(monkeypatch):
-    """Every connector branch receives SQL carrying the routed marker."""
+async def test_execute_on_connection_delegates_to_shared_gateway(monkeypatch):
     import src.execution.dispatcher as disp
 
-    seen: dict[str, str] = {}
+    seen: dict[str, object] = {}
 
-    class _StubExecutor:
-        def __init__(self, *_a, **_k):
-            pass
+    async def _fake_routed(conn, sql, *, tenant_session=None, tenant_slug=None, max_rows=None):
+        seen["sql"] = sql
+        seen["max_rows"] = max_rows
+        return ([{"a": 1}], 42, ["a"])
 
-        async def execute(self, sql):
-            seen["sql"] = sql
-            return ([], 0, [])
-
-        def execute_sync(self, sql):  # bigquery path (run in thread)
-            seen["sql"] = sql
-            return ([], 0, [])
-
-        def close(self):
-            pass
-
-        @classmethod
-        async def create(cls, *_a, **_k):
-            return cls()
-
-    # Patch each executor import target the dispatcher resolves lazily.
-    import src.execution.snowflake_executor as sf
-    import src.execution.spark_executor as sp
-    import src.execution.sqlserver_executor as ms
-    monkeypatch.setattr(sf, "SnowflakeExecutor", _StubExecutor)
-    monkeypatch.setattr(sp, "SparkExecutor", _StubExecutor)
-    monkeypatch.setattr(ms, "SqlServerExecutor", _StubExecutor)
+    monkeypatch.setattr(disp, "execute_routed_query", _fake_routed)
 
     class _Conn:
-        def __init__(self, ctype):
-            self.connection_type = ctype
+        connection_type = "bigquery"
+        config = {}
 
-    for ctype in ("snowflake", "hadoop_spark", "sqlserver"):
-        seen.clear()
-        await disp.execute_on_connection("SELECT 1", _Conn(ctype), db=None)
-        assert seen["sql"].startswith(_ROUTED_MARKER), ctype
+    rows, byts, cols = await disp.execute_on_connection("SELECT 1", _Conn(), db=None)
+    assert (rows, byts, cols) == ([{"a": 1}], 42, ["a"])
+    # SQL reached the gateway carrying the routed marker.
+    assert str(seen["sql"]).startswith(_ROUTED_MARKER)
+    # The result.max_rows cap is threaded to the gateway (enforced there).
+    assert isinstance(seen["max_rows"], int)
+
+
+@pytest.mark.asyncio
+async def test_execute_on_connection_translates_too_large(monkeypatch):
+    """A shared SourceResultTooLargeError becomes the query-router
+    ResultTooLargeError so the HTTP layer's handling is unchanged."""
+    import src.execution.dispatcher as disp
+    from shared.source_executor import SourceResultTooLargeError
+    from src.ir.logical_query import ResultTooLargeError
+
+    async def _boom(conn, sql, *, tenant_session=None, tenant_slug=None, max_rows=None):
+        raise SourceResultTooLargeError("too big")
+
+    monkeypatch.setattr(disp, "execute_routed_query", _boom)
+
+    class _Conn:
+        connection_type = "postgresql"
+        config = {}
+
+    with pytest.raises(ResultTooLargeError):
+        await disp.execute_on_connection("SELECT 1", _Conn(), db=None)
+
+
+@pytest.mark.asyncio
+async def test_execute_on_connection_rejects_unconfigured_before_connect():
+    """A placeholder connection (config.unconfigured=True) must be rejected by
+    the shared gateway's guard before any connect attempt."""
+    import src.execution.dispatcher as disp
+    from shared.source_executor import UnconfiguredConnectionError
+
+    class _Conn:
+        connection_type = "postgresql"
+        config = {"unconfigured": True}
+        display_name = "placeholder"
+
+    with pytest.raises(UnconfiguredConnectionError):
+        await disp.execute_on_connection("SELECT 1", _Conn(), db=None)
+
+
+@pytest.mark.asyncio
+async def test_execute_on_connection_emits_source_audit(monkeypatch, caplog):
+    """Every routed execution must produce a [SOURCE_AUDIT] trace via the
+    shared gateway. Patch the per-connector shared dispatch so no real driver
+    is opened, but keep the gateway's guard + audit path live."""
+    import shared.source_executor as se_mod
+
+    async def _fake_pg_routed(conn_obj, sql, *, tenant_session=None, max_rows=None, tenant_slug=None):
+        return ([], 0, [])
+
+    monkeypatch.setattr(se_mod, "_execute_pg_routed", _fake_pg_routed)
+    original = se_mod._SOURCE_AUDIT
+    se_mod._SOURCE_AUDIT = True
+    try:
+        import src.execution.dispatcher as disp
+
+        class _Conn:
+            connection_type = "postgresql"
+            config = {}
+            id = None
+            project_id = None
+
+        with caplog.at_level(logging.INFO):
+            await disp.execute_on_connection("SELECT 1", _Conn(), db=None)
+
+        assert any("[SOURCE_AUDIT]" in r.message for r in caplog.records)
+    finally:
+        se_mod._SOURCE_AUDIT = original
+
+
+@pytest.mark.asyncio
+async def test_routed_source_audit_attributes_tenant(monkeypatch, caplog):
+    """Bug-8039/8041: the routed user-query [SOURCE_AUDIT] record must attribute
+    the touch to the canonical TENANT derived from the tenant-bound session — a
+    project UUID is not enough because it can collide across tenants."""
+    import types
+
+    import shared.source_executor as se_mod
+
+    seen = {}
+
+    async def _fake_pg_routed(conn_obj, sql, *, tenant_session=None, max_rows=None, tenant_slug=None):
+        seen["tenant_slug"] = tenant_slug
+        return ([], 0, [])
+
+    monkeypatch.setattr(se_mod, "_execute_pg_routed", _fake_pg_routed)
+    original = se_mod._SOURCE_AUDIT
+    se_mod._SOURCE_AUDIT = True
+    try:
+        import src.execution.dispatcher as disp
+
+        class _Conn:
+            connection_type = "postgresql"
+            config = {}
+            id = "conn-1"
+            project_id = "proj-1"
+
+        # A tenant-bound session carries the slug in session.info['tenant_id'].
+        fake_db = types.SimpleNamespace(info={"tenant_id": "acme-demo"})
+        with caplog.at_level(logging.INFO):
+            await disp.execute_on_connection("SELECT 1", _Conn(), db=fake_db)
+
+        assert seen["tenant_slug"] == "acme-demo", "tenant slug must reach the executor"
+        assert any(
+            "[SOURCE_AUDIT]" in r.message and "tenant=acme-demo" in r.message
+            for r in caplog.records
+        ), "routed audit record must carry tenant=<slug>"
+    finally:
+        se_mod._SOURCE_AUDIT = original
 
 
 # ---------------------------------------------------------------------------
-# [SOURCE_AUDIT] logging
+# F-014-02 producer-derived guard: the single-gateway invariant.
+# ---------------------------------------------------------------------------
+
+
+def test_no_connector_driver_imported_in_query_router_execution():
+    """The query-router execution package must NOT import any source-database
+    driver directly; all physical I/O goes through the shared gateway. This
+    fails if a per-connector executor (opening asyncpg/bigquery/pyhive/etc.) is
+    reintroduced outside the sanctioned shared dialect layer."""
+    import pathlib
+
+    exec_dir = pathlib.Path(__file__).resolve().parents[1] / "src" / "execution"
+    driver_tokens = (
+        "import asyncpg",
+        "from google.cloud import bigquery",
+        "import snowflake.connector",
+        "from pyhive import hive",
+        "import aioodbc",
+    )
+    offenders: list[str] = []
+    for py in exec_dir.glob("*.py"):
+        text = py.read_text(encoding="utf-8")
+        for tok in driver_tokens:
+            if tok in text:
+                offenders.append(f"{py.name}: {tok}")
+    assert not offenders, (
+        "query-router execution package opened a connector driver directly; "
+        "route all physical I/O through shared.source_executor.execute_routed_query "
+        f"instead: {offenders}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# [SOURCE_AUDIT] logging + redaction (Bug-7174)
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture()
 def _enable_source_audit():
-    """Temporarily enable the SOURCE_AUDIT flag in the source_executor module."""
     import shared.source_executor as mod
     original = mod._SOURCE_AUDIT
     mod._SOURCE_AUDIT = True
@@ -129,7 +234,6 @@ def _enable_source_audit():
 
 @pytest.fixture()
 def _disable_source_audit():
-    """Ensure SOURCE_AUDIT is off."""
     import shared.source_executor as mod
     original = mod._SOURCE_AUDIT
     mod._SOURCE_AUDIT = False
@@ -166,3 +270,41 @@ def test_audit_log_truncates_long_sql(_enable_source_audit, caplog):
     audit_records = [r for r in caplog.records if "[SOURCE_AUDIT]" in r.message]
     assert len(audit_records) == 1
     assert len(audit_records[0].message) < len(long_sql) + 100
+
+
+def test_audit_log_redacts_string_literals(_enable_source_audit, caplog):
+    from shared.source_executor import _audit_log
+
+    sql = "SELECT * FROM customers WHERE email='person@example.com' AND name='John Doe'"
+    with caplog.at_level(logging.INFO):
+        _audit_log("execute_source_sql", sql)
+
+    audit_records = [r for r in caplog.records if "[SOURCE_AUDIT]" in r.message]
+    assert len(audit_records) == 1
+    msg = audit_records[0].message
+    assert "person@example.com" not in msg
+    assert "John Doe" not in msg
+    assert "'?'" in msg
+
+
+def test_audit_log_redacts_numeric_literals(_enable_source_audit, caplog):
+    from shared.source_executor import _audit_log
+
+    sql = "SELECT * FROM accounts WHERE balance > 50000 AND account_id = 12345"
+    with caplog.at_level(logging.INFO):
+        _audit_log("execute_source_sql", sql)
+
+    audit_records = [r for r in caplog.records if "[SOURCE_AUDIT]" in r.message]
+    assert len(audit_records) == 1
+    msg = audit_records[0].message
+    assert "50000" not in msg
+    assert "12345" not in msg
+
+
+def test_redact_sql_literals_unit():
+    from shared.source_executor import _redact_sql_literals
+
+    assert "'?'" in _redact_sql_literals("SELECT * FROM t WHERE x = 'hello'")
+    assert "hello" not in _redact_sql_literals("SELECT * FROM t WHERE x = 'hello'")
+    result = _redact_sql_literals("SELECT * FROM t WHERE x = 'it\\'s fine'")
+    assert "it" not in result or "'?'" in result

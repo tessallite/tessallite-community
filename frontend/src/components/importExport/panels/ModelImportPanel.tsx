@@ -18,7 +18,11 @@ import {
   importExportApi,
 } from "../../../api/importExportApi";
 import { useT } from "../../../i18n";
-import { extractStubsFromBundle, readFileAsText } from "../helpers";
+import {
+  type ModelExportFile,
+  readFileAsText,
+  stubsFromExportFile,
+} from "../helpers";
 
 type Props = {
   projectId: string;
@@ -28,7 +32,7 @@ type Props = {
 export default function ModelImportPanel({ projectId, onImported }: Props) {
   const t = useT();
   const qc = useQueryClient();
-  const [bundle, setBundle] = useState<ExportBundle | null>(null);
+  const [exportFile, setExportFile] = useState<ModelExportFile | null>(null);
   const [parseError, setParseError] = useState<string | null>(null);
   const [targetSlug, setTargetSlug] = useState("");
   const [targetName, setTargetName] = useState("");
@@ -41,8 +45,8 @@ export default function ModelImportPanel({ projectId, onImported }: Props) {
   });
 
   const stubs = useMemo(
-    () => (bundle ? extractStubsFromBundle(bundle) : []),
-    [bundle],
+    () => (exportFile ? stubsFromExportFile(exportFile) : []),
+    [exportFile],
   );
 
   async function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -50,25 +54,29 @@ export default function ModelImportPanel({ projectId, onImported }: Props) {
     if (!f) return;
     try {
       const text = await readFileAsText(f);
-      const parsed = JSON.parse(text) as ExportBundle;
+      const parsed = JSON.parse(text) as ModelExportFile;
       if (parsed.export_format !== "tessallite-model/v1") {
         throw new Error(t("importDialog.unrecognizedFormat", { format: parsed.export_format }));
       }
-      setBundle(parsed);
+      setExportFile(parsed);
       setParseError(null);
       setTargetSlug(parsed.model_slug || "");
       setTargetName(parsed.model_display_name || "");
     } catch (err) {
-      setBundle(null);
+      setExportFile(null);
       setParseError(err instanceof Error ? err.message : String(err));
     }
   }
 
   const importMut = useMutation({
     mutationFn: () => {
-      if (!bundle) throw new Error("No bundle loaded");
+      if (!exportFile) throw new Error("No bundle loaded");
+      // Strip the on-disk-only connection stub list before sending the bundle
+      // (Bug-6292): the API contract's ExportBundle has no such field.
+      const bundle: ModelExportFile = { ...exportFile };
+      delete bundle.connections_required;
       return importExportApi.importModel(projectId, {
-        bundle,
+        bundle: bundle as ExportBundle,
         target_project_id: projectId,
         target_slug: targetSlug || null,
         target_display_name: targetName || null,
@@ -83,7 +91,7 @@ export default function ModelImportPanel({ projectId, onImported }: Props) {
   });
 
   const allMapped = stubs.every((s) => Boolean(mapping[s.id]));
-  const canSubmit = Boolean(bundle) && allMapped && !importMut.isPending;
+  const canSubmit = Boolean(exportFile) && allMapped && !importMut.isPending;
 
   return (
     <Stack spacing={2}>
@@ -101,7 +109,7 @@ export default function ModelImportPanel({ projectId, onImported }: Props) {
       </Button>
       {parseError && <Alert severity="error">{parseError}</Alert>}
 
-      {bundle && (
+      {exportFile && (
         <>
           <TextField
             label={t("importDialog.slugLabel")}
@@ -122,11 +130,17 @@ export default function ModelImportPanel({ projectId, onImported }: Props) {
           {connectionsQ.isLoading && <CircularProgress size={20} />}
           {connectionsQ.data &&
             stubs.map((s) => {
-              const compatible = connectionsQ.data.filter(
+              const typeMatched = connectionsQ.data.filter(
                 (c) =>
                   !s.connection_type ||
                   c.connection_type === s.connection_type,
               );
+              // Bug-6292: never dead-end the rebind. If no local connection
+              // matches the stub's type (e.g. a legacy export whose stub type
+              // was derived from the snapshot vocabulary), fall back to
+              // offering every connection so the user can still map manually.
+              const compatible =
+                typeMatched.length > 0 ? typeMatched : connectionsQ.data;
               return (
                 <Box
                   key={s.id}

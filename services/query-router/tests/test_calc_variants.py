@@ -26,6 +26,7 @@ def test_create_rejects_variant_kind_on_calculated_measure():
             calc_agg_mode="expression_as_written",
             variant_kind="trailing_n",
             variant_of_measure_id=uuid.uuid4(),
+            variant_n=3,
         )
     assert "variants on calculated measures are not supported" in str(exc.value)
 

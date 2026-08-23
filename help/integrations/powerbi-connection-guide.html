@@ -12,24 +12,122 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Power BI Connection Guide</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-04-17</span></div>
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-07-10</span></div>
     <h1>Power BI Connection Guide</h1>
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/powerbi-connection-dialog.png" alt="Power BI Desktop — PostgreSQL connection dialog."></figure>
 <h2>What this covers</h2>
-<p>Power BI Desktop can connect to Tessallite using two methods: the PostgreSQL connector (port 5433) or the Analysis Services XMLA connector (port 8080). DirectQuery mode is recommended for both.</p>
-<h2>Method 1 — PostgreSQL connector (port 5433)</h2>
-<ol><li>Open Power BI Desktop.</li><li>Click <strong>Get Data</strong> → <strong>Database</strong> → <strong>PostgreSQL database</strong> → <strong>Connect</strong>.</li><li><strong>Server</strong>: <code>HOST:5433</code> (include the port).</li><li><strong>Database</strong>: workspace slug (e.g., <code>acme</code>).</li><li><strong>Data Connectivity mode</strong>: <strong>DirectQuery</strong>.</li><li>Click <strong>OK</strong>.</li><li>Select <strong>Database</strong> authentication → enter Tessallite username and password.</li><li>Click <strong>Connect</strong>.</li><li>In the Navigator, select tables/views → click <strong>Load</strong> or <strong>Transform Data</strong>.</li></ol>
-<h2>Method 2 — XMLA / Analysis Services connector (port 8080)</h2>
-<ol><li>Open Power BI Desktop.</li><li>Click <strong>Get Data</strong> → <strong>Online Services</strong> → <strong>Analysis Services</strong> → <strong>Connect</strong>.</li><li><strong>Server</strong>: <code>http://HOST:8080/xmla</code></li><li>Select <strong>Connect live</strong> (recommended).</li><li>Click <strong>OK</strong>.</li><li>Select <strong>Basic</strong> authentication → enter Tessallite username and password.</li><li>Select catalog (workspace slug) from the dropdown.</li><li>Select the model name → click <strong>OK</strong>.</li></ol>
+<p>This guide walks you through connecting Power BI Desktop to Tessallite. The supported method is the <strong>PostgreSQL connector</strong> on port 5433, using <strong>DirectQuery</strong> mode so that every visual in your report queries Tessallite in real time and benefits from semantic-layer acceleration.</p>
+<p>A separate section below explains why the Analysis Services connector does not work with Power BI Desktop and what to do if you encounter it.</p>
+<h2>Connect Power BI to Tessallite (PostgreSQL connector)</h2>
+<p>Power BI Desktop connects to Tessallite through the same JDBC gateway that other SQL tools use. Tessallite listens on port 5433 and speaks the PostgreSQL wire protocol, so Power BI treats it as a standard PostgreSQL database.</p>
+<h3>Step-by-step</h3>
+<ol>
+<li>Open <strong>Power BI Desktop</strong>.</li>
+<li>Click <strong>Get Data</strong> on the ribbon (or <strong>File &gt; Get Data</strong>).</li>
+<li>In the list that appears, choose <strong>Database</strong> on the left, then <strong>PostgreSQL database</strong> on the right. Click <strong>Connect</strong>.</li>
+<li>Fill in the connection dialog:
+<ul>
+<li><strong>Server</strong>: your Tessallite host followed by a colon and the port number.
+<ul>
+<li>Local development: <code>localhost:5433</code></li>
+<li>Hosted demo: <code>sql.cloud.tessallite.io:5433</code></li>
+</ul></li>
+<li><strong>Database</strong>: the workspace slug (also called the tenant slug). For example, <code>acme-demo</code>. To connect directly to a single model, you can also use <code>acme-demo/modelx</code> (workspace/model) or <code>acme-demo/project1/modelx</code> (workspace/project/model). See the <a href="jdbc-connection-guide.html">JDBC Connection Guide</a> for the full format reference.</li>
+<li><strong>Data Connectivity mode</strong>: choose <strong>DirectQuery</strong>. This is the recommended setting because it keeps queries flowing through Tessallite at report refresh time, so aggregate routing and acceleration remain active.</li>
+</ul></li>
+<li>Click <strong>OK</strong>.</li>
+<li>Power BI asks for credentials. Choose <strong>Database</strong> as the authentication type.
+<ul>
+<li><strong>User name</strong>: your Tessallite login email (for example, <code>admin@acme-demo.com</code>).</li>
+<li><strong>Password</strong>: your Tessallite password (for example, <code>acme-demo</code> for the demo workspace).</li>
+</ul></li>
+<li>Click <strong>Connect</strong>.</li>
+<li>In the Navigator that appears, you will see the models published in the workspace. Select the tables you want, then click <strong>Load</strong> or <strong>Transform Data</strong>.</li>
+</ol>
+<h3>Worked example using the demo workspace</h3>
+<div class="table-wrapper"><table>
+<thead><tr><th>Field</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>Server</td><td><code>localhost:5433</code></td></tr>
+<tr><td>Database</td><td><code>acme-demo</code></td></tr>
+<tr><td>Data Connectivity mode</td><td>DirectQuery</td></tr>
+<tr><td>Authentication type</td><td>Database</td></tr>
+<tr><td>User name</td><td><code>admin@acme-demo.com</code></td></tr>
+<tr><td>Password</td><td><code>acme-demo</code></td></tr>
+</tbody>
+</table></div>
+<p>After connecting, the Navigator shows every published model in the <code>acme-demo</code> workspace. Select a table (for example, <code>modelx</code>) and click <strong>Load</strong> to start building visuals.</p>
+<h2>What each field means</h2>
+<div class="table-wrapper"><table>
+<thead><tr><th>Field</th><th>What to enter</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Server</td><td><code>HOST:5433</code></td><td>Tells Power BI where the Tessallite gateway is listening. Always include the port number.</td></tr>
+<tr><td>Database</td><td>Workspace slug</td><td>Tells Tessallite which workspace (tenant) you want to query. You can optionally scope it to a single model.</td></tr>
+<tr><td>Data Connectivity mode</td><td>DirectQuery (recommended)</td><td>Keeps queries live so Tessallite can route them through aggregates and pockets for speed.</td></tr>
+<tr><td>Authentication type</td><td>Database</td><td>Tessallite uses email-and-password credentials, which maps to the Database option in Power BI.</td></tr>
+</tbody>
+</table></div>
 <h2>DirectQuery vs Import mode</h2>
-<div class="table-wrapper"><table><thead><tr><th>Mode</th><th>How it works</th><th>Recommendation</th></tr></thead><tbody><tr><td>DirectQuery</td><td>Power BI queries Tessallite at report refresh time. Tessallite routes to the optimal source.</td><td>Recommended. Retains all acceleration benefits.</td></tr><tr><td>Import</td><td>Downloads the full result set and caches locally. Queries run against the cache, not Tessallite.</td><td>For small, infrequently changing datasets only. Loses live acceleration.</td></tr></tbody></table></div>
-<p>DirectQuery mode is required to benefit from Tessallite&#x27;s aggregate routing. In Import mode, acceleration only applies during the import step.</p>
+<div class="table-wrapper"><table>
+<thead><tr><th>Mode</th><th>How it works</th><th>Recommendation</th></tr></thead>
+<tbody>
+<tr><td>DirectQuery</td><td>Power BI sends a query to Tessallite every time a visual refreshes. Tessallite routes to the fastest available path (aggregate, pocket, or source).</td><td>Recommended. You get live acceleration and governed routing.</td></tr>
+<tr><td>Import</td><td>Power BI downloads the full result set once and stores it locally. All visuals query the local cache.</td><td>Use only for small, rarely changing datasets. You lose live acceleration after the import step.</td></tr>
+</tbody>
+</table></div>
+<p>If you choose Import mode, Tessallite&#x27;s aggregate routing still applies during the initial import, but once the data is cached locally, Power BI no longer sends queries to Tessallite. Any new aggregates or data changes will not appear until you re-import.</p>
+<h2>How Power BI queries work with Tessallite</h2>
+<p>Power BI Desktop generates SQL that differs from traditional BI tools. When you drag dimensions and measures onto a visual, Power BI may send a flat SELECT with no GROUP BY clause, table aliases like <code>"$Table"</code>, and column aliases on every column. Tessallite handles all of these patterns automatically.</p>
+<h3>Ungrouped queries (raw route)</h3>
+<p>When Power BI sends a query with no GROUP BY, such as <code>SELECT "region", "amount" FROM "project1"."modelx"</code>, Tessallite detects this and routes it through the <strong>raw path</strong>. The raw path returns individual rows from the source database instead of aggregated results. Joins defined in the model are applied as LEFT JOINs so that all rows from the fact table appear, even when a related dimension table has no matching row.</p>
+<p>If a dimension belongs to a table that is not reachable through the model&#x27;s join graph, the column still appears in the result with a type-preserving NULL value (for example, <code>CAST(NULL AS TEXT)</code> for a text column). This keeps the result schema stable regardless of join topology.</p>
+<h3>Aggregate-only queries</h3>
+<p>If every column in the SELECT is an aggregate function (such as <code>SELECT COUNT(*) FROM "modelx"</code>), Tessallite routes the query through the normal semantic path, not the raw path. This preserves correct aggregation behaviour for summary queries that Power BI generates when computing totals.</p>
+<h3>Grouped queries (normal path)</h3>
+<p>Queries that include a GROUP BY clause follow the standard Tessallite routing: the query-router checks for matching aggregates and pockets, and falls back to the source path when no pre-computed summary covers the query.</p>
+<h3>Table aliases and column aliases</h3>
+<p>Power BI&#x27;s PostgreSQL connector wraps tables with <code>AS "$Table"</code> and adds <code>AS "column_name"</code> on every column. Tessallite strips these automatically before routing.</p>
 <h2>Power BI Gateway for scheduled refresh</h2>
 <p>If Tessallite is on a private network, Power BI Service cannot reach it for scheduled refresh. Install an on-premises data gateway on a machine with network access to the Tessallite host, then associate the dataset with the gateway in Power BI Service.</p>
+<h2>Why the Analysis Services connector does not work with Power BI Desktop</h2>
+<p>Power BI Desktop has two connectors that look like they could talk to Tessallite:</p>
+<ol>
+<li><strong>PostgreSQL database</strong> (the recommended method, described above).</li>
+<li><strong>SQL Server Analysis Services database</strong> (the "Analysis Services" or "SSAS" connector).</li>
+</ol>
+<p>The Analysis Services connector supports <strong>only Windows authentication</strong> (Kerberos/NTLM). This is a documented Microsoft limitation. When you enter a Tessallite XMLA URL and click Connect, Power BI sends a Windows authentication handshake. Tessallite&#x27;s XMLA endpoint expects HTTP Basic credentials (email and password), so the two cannot agree on an authentication method. The connection fails.</p>
+<p>This limitation applies only to Power BI Desktop. <strong>Excel is not affected.</strong> Excel&#x27;s MSOLAP provider speaks HTTP Basic and connects to Tessallite&#x27;s XMLA endpoint without any issue. If you need the Analysis Services experience with hierarchies and DAX, use Excel -- see the <a href="excel-xmla-connection-guide.html">Excel XMLA Connection Guide</a>.</p>
+<h3>What about "Connect live" and other Analysis Services options?</h3>
+<p>All connection modes offered by the Analysis Services connector in Power BI Desktop (Connect live, Import, DirectQuery where available) use the same Windows authentication handshake. Changing the mode does not fix the authentication mismatch.</p>
+<h3>When could this change?</h3>
+<p>A future version of the Tessallite gateway may add Windows authentication (Negotiate/SPNEGO) support, which would allow Power BI Desktop&#x27;s Analysis Services connector to authenticate. This is logged as a future enhancement and is not available today.</p>
 <h2>Troubleshooting</h2>
-<div class="table-wrapper"><table><thead><tr><th>Symptom</th><th>Likely cause</th><th>Resolution</th></tr></thead><tbody><tr><td>Cannot connect (PostgreSQL method)</td><td>Wrong host or port</td><td>Confirm Server field is <code>HOST:5433</code></td></tr><tr><td>Authentication failed</td><td>Wrong credentials or auth type</td><td>Use Database auth with Tessallite email and password</td></tr><tr><td>Cannot connect (XMLA method)</td><td>Wrong URL or port 8080 blocked</td><td>Verify URL is <code>http://HOST:8080/xmla</code></td></tr><tr><td>Scheduled refresh fails in Power BI Service</td><td>Private network</td><td>Install and configure on-premises data gateway</td></tr></tbody></table></div>
+<div class="table-wrapper"><table>
+<thead><tr><th>Symptom</th><th>Likely cause</th><th>Resolution</th></tr></thead>
+<tbody>
+<tr><td>Cannot connect (PostgreSQL method)</td><td>Wrong host or port</td><td>Confirm Server field is <code>HOST:5433</code>.</td></tr>
+<tr><td>Authentication failed</td><td>Wrong credentials or auth type</td><td>Use <strong>Database</strong> auth with your Tessallite email and password. Do not use Windows authentication.</td></tr>
+<tr><td>Analysis Services connector fails after entering credentials</td><td>Windows authentication mismatch</td><td>Power BI Desktop&#x27;s Analysis Services connector only supports Windows authentication. Use the PostgreSQL connector instead (see the steps at the top of this guide).</td></tr>
+<tr><td>Data looks stale after changes in Tessallite</td><td>Import mode is caching old data</td><td>Switch to DirectQuery, or manually refresh the dataset in Import mode.</td></tr>
+<tr><td>Scheduled refresh fails in Power BI Service</td><td>Private network</td><td>Install and configure an on-premises data gateway.</td></tr>
+<tr><td>Ungrouped query returns NULLs for some columns</td><td>Disconnected table in model</td><td>Expected behavior: columns from unreachable tables show typed NULL values.</td></tr>
+<tr><td>COUNT(*) returns unexpected result count</td><td>Aggregate-only guard active</td><td>Aggregate-only queries route through the semantic path, not the raw path.</td></tr>
+</tbody>
+</table></div>
+<h2>Best practices</h2>
+<ul>
+<li><strong>Always use DirectQuery</strong> unless you have a specific reason to import. DirectQuery preserves Tessallite&#x27;s acceleration and governance for every visual refresh.</li>
+<li><strong>Scope the database field</strong> to one model (e.g. <code>acme-demo/modelx</code>) when building a single-model report. This avoids loading all models in the Navigator.</li>
+<li><strong>Do not use the Analysis Services connector</strong> in Power BI Desktop. It will not work with Tessallite&#x27;s authentication. Use the PostgreSQL connector.</li>
+<li><strong>Use Excel for XMLA/DAX features.</strong> If your report needs hierarchies, drill-down, or DAX expressions, connect from Excel using the XMLA endpoint. See the <a href="excel-xmla-connection-guide.html">Excel XMLA Connection Guide</a>.</li>
+</ul>
 <h2>Related</h2>
-<ul><li><a href="jdbc-connection-guide.html">JDBC Connection Guide</a></li><li><a href="excel-xmla-connection-guide.html">Excel XMLA Connection Guide</a></li><li><a href="supported-data-sources.html">Supported Data Sources</a></li><li><a href="../troubleshooting/common-errors.html">Common Errors</a></li></ul>
+<ul>
+<li><a href="jdbc-connection-guide.html">JDBC Connection Guide</a></li>
+<li><a href="excel-xmla-connection-guide.html">Excel XMLA Connection Guide</a></li>
+<li><a href="supported-data-sources.html">Supported Data Sources</a></li>
+<li><a href="../troubleshooting/common-errors.html">Common Errors</a></li>
+</ul>
 <nav class="page-nav"><a href="named-list-parameterisation.html" class="page-nav-btn prev">&larr; Named List Parameterisation</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="supported-data-sources.html" class="page-nav-btn next">Supported Data Sources &rarr;</a></nav>
   </main>
   <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>

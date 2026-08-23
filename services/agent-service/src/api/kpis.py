@@ -30,7 +30,15 @@ from shared.db.models import (
     AgentWebhookDlq,
 )
 from shared.db.session import get_tenant_db
-from src.api.agent_config import _require_blocked_original_access
+# Bug-8459 — `/kpis` and `/cost` shipped with no project gate at all
+# while `/calibration` in this same module was strictly gated; a caller
+# bound only to another project could read any project's agent usage
+# volumes, refusal/blocked rates and spend.
+from src.api.agent_config import (
+    _require_blocked_original_access,
+    _require_project_viewer,
+)
+from src.guardrails.budget import is_reservation_row
 from src.auth.middleware import CurrentUser, forbid_embed_user
 
 router = APIRouter(prefix="/projects/{project_id}/agent", tags=["agent-kpis"])
@@ -55,6 +63,8 @@ async def get_kpis(
     window_days: int = 30,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> AgentKpis:
+    # Bug-8459 — project-scoped read gate (was ungated).
+    await _require_project_viewer(project_id, current_user)
     cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
 
     async for db in get_tenant_db(current_user.tenant_id):
@@ -312,6 +322,8 @@ async def get_cost(
     window_days: int = 30,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> CostReport:
+    # Bug-8459 — project-scoped read gate (was ungated).
+    await _require_project_viewer(project_id, current_user)
     cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
     async for db in get_tenant_db(current_user.tenant_id):
         date_col = func.date_trunc("day", AgentTurn.created_at).label("d")
@@ -368,6 +380,15 @@ async def get_cost(
             .where(
                 AgentCostEntry.project_id == project_id,
                 AgentCostEntry.created_at >= cutoff,
+                # A pessimistic reservation is a budget-enforcement placeholder,
+                # never spend: the turn's real cost is written separately by
+                # ``record_turn_cost``. Counting one double-counts an in-flight
+                # turn, and an ORPHANED reservation (the owning process died
+                # before ``reconcile_budget_reservation`` ran) is money nobody
+                # spent, reported for the whole lookback window and never
+                # corrected. Excluded here for the same reason
+                # ``_today_usage`` excludes the orphans from the daily budget.
+                ~is_reservation_row(),
             )
             .group_by(provider_col)
             .order_by(provider_col)

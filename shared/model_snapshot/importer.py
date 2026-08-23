@@ -19,6 +19,12 @@ import uuid
 from typing import Any
 from uuid import UUID
 
+from shared.semantic.join_keyword import split_join_token
+from shared.semantic.join_orientation_backfill import (
+    backfill_orientation,
+    resolves_no_fan_out,
+)
+
 
 _UUID_LEN = 36
 
@@ -37,9 +43,21 @@ def _fresh() -> str:
     return str(uuid.uuid4())
 
 
-def _collect_pks(snapshot: dict[str, Any]) -> dict[str, str]:
-    """Walk the snapshot and produce {old_uuid: new_uuid} for every PK we know about."""
-    mapping: dict[str, str] = {}
+def _collect_pks(
+    snapshot: dict[str, Any], mapping: dict[str, str] | None = None
+) -> dict[str, str]:
+    """Walk the snapshot and produce {old_uuid: new_uuid} for every PK we know about.
+
+    When ``mapping`` is supplied it is EXTENDED in place (ids already present keep
+    their assigned new id) and returned. This lets a model's live shape and each
+    of its version snapshots share ONE map so a given source id re-keys to the
+    SAME new id everywhere — id continuity a revert relies on to re-attach
+    preserved governance (CLS/RLS/KPI) and to match preserved aggregates by id
+    (Bug-7623 R2). Ids that appear only in a historical version extend the shared
+    map with a fresh id, still self-consistent within that version.
+    """
+    if mapping is None:
+        mapping = {}
 
     # Tables, columns, UDAs, joins, dimensions, measures, sources, targets:
     # each row's "id" is a primary key in its respective table. v2 families
@@ -70,6 +88,11 @@ def _collect_pks(snapshot: dict[str, Any]) -> dict[str, str]:
         "model_parameters",
         "data_quality_rules",
         "entity_translations",
+        # v4 (Bug-7359, derived-grain §5.3) — dimension attribute relationships.
+        # Flat "id" PK; dimension_id / key_column_id / detail_column_id / model_id
+        # are soft references rewritten by the generic UUID pass once the
+        # dimensions / columns / model PKs are in the map.
+        "attribute_relationships",
     ):
         for row in snapshot.get(key, []) or []:
             old = row.get("id")
@@ -135,6 +158,27 @@ def _collect_pks(snapshot: dict[str, Any]) -> dict[str, str]:
         rp = p.get("refresh_policy")
         if isinstance(rp, dict):
             old = rp.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+
+    # Named Queries carry nested artifact and refresh-policy rows. Keep these
+    # ids in the same map as every other snapshot family so project/model
+    # imports rewrite every real source identity before rehydration. The
+    # rehydrator still mints definition/artifact ids defensively (it is not
+    # called only through this importer), but policy ids must be remapped here
+    # because they are nested model content (Bug-9222).
+    for nq in snapshot.get("named_queries", []) or []:
+        old = nq.get("id")
+        if _is_uuid_string(old) and old not in mapping:
+            mapping[old] = _fresh()
+        artifact = nq.get("artifact")
+        if isinstance(artifact, dict):
+            old = artifact.get("id")
+            if _is_uuid_string(old) and old not in mapping:
+                mapping[old] = _fresh()
+        policy = nq.get("refresh_policy")
+        if isinstance(policy, dict):
+            old = policy.get("id")
             if _is_uuid_string(old) and old not in mapping:
                 mapping[old] = _fresh()
 
@@ -240,23 +284,64 @@ def _strip_cross_tenant_only_refs(snapshot: dict[str, Any]) -> None:
             g["created_by"] = None
 
 
+def _normalise_imported_join_orientations(snapshot: dict[str, Any]) -> None:
+    """Apply migration 0194's join policy to a snapshot entering by import.
+
+    Migration 0194 is a one-time repair.  A pre-0194 bundle restored after the
+    migration completed would otherwise recreate a legacy cardinality token in
+    ``join_type`` and remain undeclared forever.  The import rewriter is the
+    shared boundary for both a bundle's live shape and each historical version
+    snapshot, while an ordinary revert bypasses it and remains verbatim.
+
+    The existing backfill policy is authoritative: infer the explicit physical
+    orientation, and move a legacy fan-out token into ``cardinality`` when the
+    bundle does not already carry a usable cardinality declaration.
+    """
+    joins = snapshot.get("joins")
+    if not isinstance(joins, list):
+        return
+    for join in joins:
+        if not isinstance(join, dict):
+            continue
+        raw_join_type = join.get("join_type")
+        orientation = backfill_orientation(raw_join_type)
+        if orientation is None:
+            continue
+        join["join_type"] = orientation
+        _orientation, legacy_cardinality = split_join_token(raw_join_type)
+        if (
+            resolves_no_fan_out(join.get("cardinality"))
+            and legacy_cardinality is not None
+        ):
+            join["cardinality"] = legacy_cardinality
+
+
 def prepare_snapshot_for_import(
     snapshot: dict[str, Any],
     *,
     new_model_id: UUID,
     connection_mapping: dict[str, str] | None = None,
+    shared_pk_map: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Rewrite a snapshot for cross-tenant import.
 
     The returned snapshot is safe to feed into ``rehydrate_into_live``
     against a freshly-created Model row whose id is ``new_model_id``.
 
+    ``shared_pk_map``: when supplied, the PK re-key uses/EXTENDS this map instead
+    of building a fresh one, so a model's live shape and each of its version
+    snapshots re-key identically (Bug-7623 R2 — id continuity a revert needs to
+    re-attach preserved governance and match preserved aggregates by id). The
+    caller passes the SAME dict for the live shape and every version of that
+    model. The model PK is forced to ``new_model_id`` in every case.
+
     Returns (snapshot, missing_connections).
     """
     snapshot = copy.deepcopy(snapshot)
 
-    # Step 1: collect all old PKs and assign new ones.
-    pk_map = _collect_pks(snapshot)
+    # Step 1: collect all old PKs and assign new ones (extending the shared map
+    # when one is provided, so overlapping ids re-key consistently).
+    pk_map = _collect_pks(snapshot, shared_pk_map)
     # Force the model PK to the caller-chosen new id (so the freshly
     # inserted Model row matches what we rehydrate into).
     old_model_id = (snapshot.get("model") or {}).get("id")
@@ -270,6 +355,10 @@ def prepare_snapshot_for_import(
     # scope (these can't survive a tenant boundary).
     _strip_cross_tenant_only_refs(snapshot)
 
-    # Step 4: rebind project_connection_id values via the caller mapping.
+    # Step 4: repair pre-0194 join declarations. This function is used only at
+    # import boundaries, so normal version reverts continue to restore verbatim.
+    _normalise_imported_join_orientations(snapshot)
+
+    # Step 5: rebind project_connection_id values via the caller mapping.
     snapshot, missing = _remap_connections(snapshot, connection_mapping or {})
     return snapshot, missing

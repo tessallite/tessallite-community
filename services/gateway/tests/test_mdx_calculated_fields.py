@@ -258,6 +258,45 @@ def test_unary_negative_add():
     assert rows[0]["Adjusted"] == pytest.approx(490.0)
 
 
+def test_bug6071_leading_unary_minus_on_measure():
+    """Bug-6071: `-[Measures].[X]` (leading unary minus on a MEASURE reference)
+    must negate the measure, not evaluate to blank. A pure numeric sign like
+    `-5` was already handled; the measure-reference case fell through to the
+    None fallback."""
+    calcs = [CalcMember(
+        name="Neg",
+        expression="-[Measures].[Revenue]",
+        calc_type="arithmetic",
+    )]
+    rows = [{"Revenue": 500}]
+    evaluate_calc_members(calcs, rows, ["Revenue"], [])
+    assert rows[0]["Neg"] == pytest.approx(-500.0)
+
+
+def test_bug6071_leading_unary_minus_on_parenthesised_sum():
+    """`-([Measures].[A] + [Measures].[B])` negates the whole sub-expression."""
+    calcs = [CalcMember(
+        name="NegSum",
+        expression="-([Measures].[Revenue] + [Measures].[Cost])",
+        calc_type="arithmetic",
+    )]
+    rows = [{"Revenue": 600, "Cost": 400}]
+    evaluate_calc_members(calcs, rows, ["Revenue", "Cost"], [])
+    assert rows[0]["NegSum"] == pytest.approx(-1000.0)
+
+
+def test_bug6071_unary_minus_measure_null_propagates():
+    """A negated NULL measure stays NULL (not 0), preserving NULL semantics."""
+    calcs = [CalcMember(
+        name="Neg",
+        expression="-[Measures].[Revenue]",
+        calc_type="arithmetic",
+    )]
+    rows = [{"Revenue": None}]
+    evaluate_calc_members(calcs, rows, ["Revenue"], [])
+    assert rows[0]["Neg"] is None
+
+
 # ---------------------------------------------------------------------------
 # D.5 — SOLVE_ORDER
 # ---------------------------------------------------------------------------

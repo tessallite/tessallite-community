@@ -12,6 +12,32 @@ from typing import Any
 import yaml
 
 
+from shared.schemas.domains.aggregates_security import (
+    DEFAULT_POPULATION_PARTICIPATION,
+    coerce_population_participation,
+    coerce_population_participation_source,
+    POPULATION_PARTICIPATION_SOURCE_DEFAULT,
+    persona_filter_value_is_valid,
+)
+from shared.schemas.domains.dimensions_measures import CALCULATED_AGG_MODES
+from shared.security.persona_resolver import (
+    PersonaAudienceNarrowingError,
+    reject_empty_audience_narrowing,
+)
+from shared.semantic.join_keyword import normalise_cardinality, split_join_token
+from shared.model_defaults import DEFAULT_INCLUDE_ALL_MEASURES
+
+# Bug-9390: the historical default aggregation mode for a calculated measure whose
+# YAML omits ``calc_mode``. It MUST match what the compiler assumes when the
+# ``measures.calc_agg_mode`` column is NULL
+# (``shared/semantic/calculated_columns.py`` — ``... or "expression_as_written"``)
+# and what the format specification documents
+# (``docs/architecture/architecture_yaml-model-format.md``). The two modes compute
+# DIFFERENT numbers, so this default is applied only with a surfaced warning
+# (never silently), and a present-but-unrecognised value is rejected rather than
+# guessed. See the calculated-measure block in ``parse_model_yaml``.
+_DEFAULT_CALC_AGG_MODE = "expression_as_written"
+
 _JOIN_TYPE_MAP = {
     "many-to-one": "many_to_one",
     "one-to-many": "one_to_many",
@@ -39,8 +65,59 @@ class YamlImportError(Exception):
         super().__init__(f"{len(errors)} validation error(s): {'; '.join(errors[:5])}")
 
 
+class YamlSyntaxError(YamlImportError):
+    """Bug-8139: the document is not even parseable YAML (bad indentation, an
+    unclosed quote, a tab where YAML forbids one, etc.) — distinct from
+    ``YamlImportError``'s semantic validation errors (a well-formed document
+    missing a required field or shaped wrong).
+
+    ``yaml.safe_load`` raising ``yaml.YAMLError`` on malformed input was
+    never caught here, so it propagated as a raw ``yaml.YAMLError`` past
+    every handler in ``yaml_export.py`` straight to FastAPI's default
+    handler — a 500, even though a malformed bundle is client input, not a
+    server fault. Subclassing ``YamlImportError`` means the existing
+    ``except YamlImportError`` in the import endpoint already maps this to
+    422 with no further change there; ``line``/``column`` (1-indexed, the
+    way editors and CI report them) are carried as attributes so a caller
+    that wants to point the admin at the exact bad line can, instead of a
+    bare "import failed".
+    """
+
+    def __init__(
+        self, message: str, *, line: int | None = None, column: int | None = None
+    ):
+        self.line = line
+        self.column = column
+        super().__init__([message])
+
+
+def _wrap_yaml_syntax_error(exc: "yaml.YAMLError", *, source: str) -> YamlSyntaxError:
+    """Convert a raw ``yaml.YAMLError`` into a ``YamlSyntaxError`` carrying
+    1-indexed line/column when the parser located the problem (a
+    ``yaml.error.MarkedYAMLError`` — the common case: scanner/parser
+    errors). Some ``YAMLError`` subclasses carry no mark; the message still
+    reports the underlying problem in that case, just without a position.
+    """
+    mark = getattr(exc, "problem_mark", None)
+    problem = getattr(exc, "problem", None) or str(exc)
+    if mark is not None:
+        line = mark.line + 1
+        column = mark.column + 1
+        message = (
+            f"{source} is not valid YAML: {problem} (line {line}, column {column})"
+        )
+    else:
+        line = None
+        column = None
+        message = f"{source} is not valid YAML: {problem}"
+    return YamlSyntaxError(message, line=line, column=column)
+
+
 def parse_model_yaml(content: str) -> dict[str, Any]:
-    doc = yaml.safe_load(content)
+    try:
+        doc = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise _wrap_yaml_syntax_error(exc, source="model YAML") from exc
     if not isinstance(doc, dict):
         raise YamlImportError(["YAML root must be a mapping"])
 
@@ -120,11 +197,22 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
                         "column_name": column,
                         "data_type": _DIM_TYPE_MAP.get(d.get("type", "text"), "string"),
                         "is_primary_key": bool(d.get("primary_key", False)),
+                        # Bug-6294: ``hidden`` is a ModelColumn property that the
+                        # API cascades onto the measure/dimension it backs, not a
+                        # Dimension/Measure column — writing it onto the
+                        # dimension row would fail the insert outright. Set it
+                        # where the product actually reads it from.
+                        "is_hidden": bool(d.get("hidden", False)),
                     })
-            elif d.get("primary_key"):
+            else:
                 for existing_column in columns_out:
                     if existing_column["id"] == table_col_to_id[key]:
-                        existing_column["is_primary_key"] = True
+                        if d.get("primary_key"):
+                            existing_column["is_primary_key"] = True
+                        # Hidden is a property of the shared column: if ANY
+                        # field on it is exported hidden, the column is hidden.
+                        if d.get("hidden"):
+                            existing_column["is_hidden"] = True
                         break
 
     measures_sec = doc.get("measures", [])
@@ -143,7 +231,13 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
                         "model_table_id": t_id,
                         "column_name": column,
                         "data_type": "numeric",
+                        "is_hidden": bool(m.get("hidden", False)),
                     })
+            elif m.get("hidden"):
+                for existing_column in columns_out:
+                    if existing_column["id"] == table_col_to_id[key]:
+                        existing_column["is_hidden"] = True
+                        break
 
     def _resolve_or_create_column(table: str, column: str, default_type: str) -> str | None:
         """Return the column id for table.column, creating a column row if
@@ -176,12 +270,19 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
         if right not in table_name_to_id:
             errors.append(f"Join references unknown table '{right}'")
 
-        # Reverse the human-friendly hyphenation for the four canonical
-        # cardinalities; any other value (e.g. directional `right`/`left`)
-        # is preserved verbatim rather than collapsed to a default, so the
-        # source join cardinality round-trips faithfully (Bug-1097).
-        raw_type = j.get("type", "many-to-one")
-        join_type = _JOIN_TYPE_MAP.get(raw_type, raw_type)
+        # ``type`` is the join ORIENTATION and ``cardinality`` the fan-out.
+        # A file written before the join-orientation contract split them can
+        # still carry a hyphenated cardinality in ``type``; ``split_join_token``
+        # routes it to the cardinality field and infers the orientation that
+        # reproduces its historical rendering, so nothing is collapsed to a
+        # default and nothing is silently dropped (Bug-1097). An explicit
+        # ``cardinality`` key always wins over one inferred from ``type``.
+        raw_type = j.get("type", "inner")
+        inferred_join_type, inferred_cardinality = split_join_token(raw_type)
+        join_type = inferred_join_type or _JOIN_TYPE_MAP.get(raw_type, raw_type)
+        cardinality = (
+            normalise_cardinality(j.get("cardinality")) or inferred_cardinality
+        )
         condition = j.get("on", "")
 
         left_col = ""
@@ -215,6 +316,26 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
             "left_column_id": left_col_id,
             "right_column_id": right_col_id,
             "join_type": join_type,
+            "cardinality": cardinality,
+            # Bug-8615 phase G1. An absent key restores the default, which is
+            # what every file written before this field carries — so importing
+            # an older YAML produces exactly the joins it always did. A present
+            # but unrecognised value is coerced to ``undeclared`` rather than
+            # rejected, matching how this format treats every other legacy
+            # token, and surfaces as a validator warning instead of silently
+            # reading as an affirmative declaration.
+            "population_participation": (
+                coerce_population_participation(j["population_participation"])
+                if j.get("population_participation") is not None
+                else DEFAULT_POPULATION_PARTICIPATION
+            ),
+            "population_participation_source": (
+                coerce_population_participation_source(
+                    j["population_participation_source"]
+                )
+                if j.get("population_participation_source") is not None
+                else POPULATION_PARTICIPATION_SOURCE_DEFAULT
+            ),
         })
 
     dims_out = []
@@ -224,7 +345,15 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
         col_id = table_col_to_id.get((table, column))
 
         dim_type = d.get("type", "text")
-        is_time = dim_type == "date"
+        # Bug-6294: ``type: date`` alone cannot distinguish "a time dimension"
+        # from "a plain dimension that happens to sit on a date column". The
+        # exporter now writes an explicit ``time`` flag for the ambiguous case;
+        # prefer it when present and fall back to the type inference for files
+        # written before it existed (and for hand-written files).
+        declared_time = d.get("time")
+        is_time = bool(declared_time) if declared_time is not None else (
+            dim_type == "date"
+        )
 
         dims_out.append({
             "id": gen_id(),
@@ -274,7 +403,69 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
             "default_agg": m.get("aggregation", "sum"),
             "format": m.get("format"),
             "semi_additive_behavior": m.get("semi_additive"),
+            # Bug-6294 + Bug-8257: read back the additivity flag rather than
+            # letting the NOT NULL True column default make every non-additive
+            # measure summable again. Absent (an older or hand-written file) is
+            # NOT "additive": the rehydrator's ``_coerce_measure_additivity``
+            # derives it from the measure's own shape, and passing None lets
+            # that derivation run instead of asserting a default here.
+            "is_additive": m.get("additive"),
         }
+        if row["is_additive"] is None:
+            del row["is_additive"]
+        if measure_type == "calculated":
+            # Bug-6294 + Bug-9390: ``calc_agg_mode`` is REQUIRED by the create API
+            # and it CHANGES THE NUMBER — ``expression_as_written`` combines
+            # pre-aggregated measures (a ratio of sums), ``per_row_then_aggregate``
+            # evaluates at fact grain and then aggregates (a sum of ratios). The
+            # historical default for a file that omits the field is
+            # ``expression_as_written`` (``_DEFAULT_CALC_AGG_MODE``), matching the
+            # compiler's NULL-column behaviour and the documented format contract,
+            # so an older or hand-written file still imports.
+            #
+            # Bug-9390: what was wrong was doing this SILENTLY. A measure a
+            # modeller authored as ``per_row_then_aggregate`` whose YAML dropped
+            # the field would flip to ``expression_as_written`` with no signal —
+            # different numbers, invisibly. Absence now emits a loud, surfaced
+            # warning so the result-affecting assumption is visible and
+            # correctable. A present-but-unrecognised value has no safe coercion
+            # (guessing either mode changes the number), so it is REJECTED
+            # fail-closed — matching ``MeasureCreate``'s validator — rather than
+            # passed through to a raw ``measures_calc_agg_mode_values`` constraint
+            # violation at insert time.
+            # Bug-9525 / PCR-DR-002: key ABSENCE (legacy inference) is distinct
+            # from a PRESENT empty/null/whitespace/unknown value (reject).
+            # Testing truthiness collapsed ``calc_mode: ""`` into the missing
+            # branch and silently inferred a wrong-numbers default.
+            if "calc_mode" not in m:
+                row["calc_agg_mode"] = _DEFAULT_CALC_AGG_MODE
+                warnings.append(
+                    f"Calculated measure '{m.get('name', '')}' has no calc_mode; "
+                    f"assumed '{_DEFAULT_CALC_AGG_MODE}' (the historical default). "
+                    "The two modes compute DIFFERENT numbers: "
+                    "'expression_as_written' combines already-aggregated measures "
+                    "(a ratio of sums), 'per_row_then_aggregate' evaluates the "
+                    "expression at fact-row grain and then aggregates (a sum of "
+                    "ratios). Set calc_mode explicitly if this measure should "
+                    "aggregate per row."
+                )
+            else:
+                raw_calc_mode = m.get("calc_mode")
+                if (
+                    isinstance(raw_calc_mode, str)
+                    and raw_calc_mode in CALCULATED_AGG_MODES
+                ):
+                    row["calc_agg_mode"] = raw_calc_mode
+                else:
+                    # Present but empty, whitespace-only, null, unknown string, or
+                    # non-string YAML scalar/collection. Reject cleanly rather than
+                    # inferring a wrong-numbers default or raising a raw TypeError.
+                    errors.append(
+                        f"Calculated measure '{m.get('name', '')}' has an unrecognised "
+                        f"calc_mode '{raw_calc_mode}'; it must be one of "
+                        f"{sorted(CALCULATED_AGG_MODES)}. These compute different "
+                        "numbers, so the importer will not guess which was intended."
+                    )
 
         if m.get("variant"):
             base_name = m.get("variant_of", "")
@@ -426,6 +617,33 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
 
     personas_out = []
     for p in doc.get("personas", []):
+        # Bug-6294: ``default_filters`` is a NOT NULL JSONB *dict* that the
+        # persona gate reads by key. The format specification documented (and
+        # its example showed) a LIST of {dimension, operator, value} entries,
+        # which the deserialiser would have stored verbatim into that column —
+        # a shape the gate cannot read, so the persona's filtering would
+        # silently not apply. Refuse the import instead; the spec has been
+        # corrected to the mapping form.
+        _filters = p.get("filters")
+        if _filters is not None and not isinstance(_filters, dict):
+            errors.append(
+                f"Persona '{p.get('name', '')}' has a 'filters' value of type "
+                f"{type(_filters).__name__}; it must be a mapping of "
+                "dimension name to filter value. A list here would import as a "
+                "persona whose row filters never apply."
+            )
+            continue
+        default_filters = _filters or {}
+        bad_filter_keys = [
+            k for k, v in default_filters.items()
+            if not persona_filter_value_is_valid(v)
+        ]
+        if bad_filter_keys:
+            errors.append(
+                f"Persona '{p.get('name', '')}' has invalid default-filter "
+                f"operators or shapes for: {', '.join(str(k) for k in bad_filter_keys)}."
+            )
+            continue
         allowed_dim_ids = [
             dim_name_to_id[n] for n in p.get("allowed_dimensions", [])
             if n in dim_name_to_id
@@ -434,6 +652,32 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
             measure_name_to_id[n] for n in p.get("allowed_measures", [])
             if n in measure_name_to_id
         ]
+        raw_audience = p.get("audience_roles")
+        if raw_audience is None:
+            audience_roles: list[str] = []
+        elif not isinstance(raw_audience, list) or any(
+            not isinstance(r, str) for r in raw_audience
+        ):
+            errors.append(
+                f"Persona '{p.get('name', '')}' has an 'audience_roles' value "
+                "that is not a list of role strings."
+            )
+            continue
+        else:
+            audience_roles = list(raw_audience)
+        # Bug-9266 / F-008-03: a narrowing persona with no audience imports
+        # as inert — no regular caller is assigned, so the allow-list never
+        # applies. Refuse here (and again at _insert_personas).
+        try:
+            reject_empty_audience_narrowing(
+                audience_roles,
+                included_measure_ids=allowed_measure_ids,
+                included_dimension_ids=allowed_dim_ids,
+                default_filters=default_filters,
+            )
+        except PersonaAudienceNarrowingError as exc:
+            errors.append(f"Persona '{p.get('name', '')}': {exc}")
+            continue
         slug = p.get("name", "")
         # Persona ORM has no display_name column; NOT NULL name carries the
         # human label (falls back to slug).
@@ -444,9 +688,10 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
             "slug": slug,
             "description": p.get("description"),
             # default_filters is a NOT NULL JSONB dict; never None.
-            "default_filters": p.get("filters") or {},
+            "default_filters": default_filters,
             "included_dimension_ids": allowed_dim_ids,
             "included_measure_ids": allowed_measure_ids,
+            "audience_roles": audience_roles,
         })
 
     if errors:
@@ -467,7 +712,7 @@ def parse_model_yaml(content: str) -> dict[str, Any]:
             "refresh_strategy": model_sec.get("refresh", "manual"),
             "max_aggregates": model_sec.get("max_aggregates", 20),
             "aggregations_enabled": True,
-            "include_all_measures": True,
+            "include_all_measures": DEFAULT_INCLUDE_ALL_MEASURES,
         },
         "tables": tables_out,
         "columns": columns_out,
@@ -490,7 +735,10 @@ def parse_project_yaml(
     project_content: str,
     model_contents: dict[str, str],
 ) -> dict[str, Any]:
-    project_doc = yaml.safe_load(project_content)
+    try:
+        project_doc = yaml.safe_load(project_content)
+    except yaml.YAMLError as exc:
+        raise _wrap_yaml_syntax_error(exc, source="project.yaml") from exc
     if not isinstance(project_doc, dict):
         raise YamlImportError(["project.yaml root must be a mapping"])
 

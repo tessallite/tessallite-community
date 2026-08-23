@@ -68,10 +68,10 @@ How the scripted deploy (`deploy/gcp`) configures each service:
 
 | Cloud Scheduler job | Wakes | What it does |
 |---|---|---|
-| `tessallite-scheduler-hourly-wakeup` | scheduler | Brings the scheduler up so any due refresh jobs fire |
+| `tessallite-scheduler-wakeup` | scheduler | Brings the scheduler up so any due refresh jobs fire |
 | `tessallite-optimizer-wakeup` | optimizer | Brings the optimizer up so its sweeps fire |
 
-Despite the legacy "hourly" in the first job's name, **both fire every 15 minutes**. The deploy enables the `cloudscheduler.googleapis.com` API automatically, and `teardown.sh` removes both jobs.
+Both jobs fire on the cadence set by `SCHEDULER_WAKEUP_CRON` (default `0 * * * *`). The deploy enables the `cloudscheduler.googleapis.com` API automatically, and `teardown.sh` removes both jobs.
 
 **What this means for you as an operator.** Scheduled work runs on the quarter-hour grid, not to the exact second you configured — a job set for 02:07 effectively runs at the next wake-up (02:15). If refreshes look like they are being *missed*, do not suspect the scheduler first: confirm both wake-up jobs exist with `gcloud scheduler jobs list` and are not failing. A disabled or deleted wake-up job is the most common cause of "my aggregates stopped refreshing in the cloud".
 
@@ -113,7 +113,11 @@ Because these are compiled into the JavaScript bundle, the demo password is **no
 
 ## Estimated cost
 
-For light usage (development or small team): an `e2-medium` Compute Engine VM for the database plus Cloud Run on-demand pricing runs approximately $30–60 per month. The VM carries a standing charge (disk ~$0.40/month, static IP reservation ~$0.80/month) even when stopped; Cloud Run costs nothing while idle. Use `suspend.sh` to stop the VM between sessions if you are paying for the instance yourself.
+Cost depends on region, VM shape, disk type and size, reserved external-IP state, Cloud Run traffic, and network egress. Suspending stops VM compute, but the persistent disk and a reserved external IP can continue to incur charges while idle. Check the current [Compute Engine disk pricing](https://cloud.google.com/compute/disks-image-pricing), [external IP pricing](https://cloud.google.com/vpc/network-pricing#ipaddress), and [Cloud Run pricing](https://cloud.google.com/run/pricing) for the deployment region before budgeting. Use `suspend.sh` to stop compute between sessions; do not treat suspension as zero cost.
+
+Suspend and resume now fail closed: success is printed only after the wake-up scheduler
+jobs, public IAM, gateway, database readiness, and VM state have been verified. A partial
+transition exits nonzero; correct the reported state before retrying.
 
 ---
 

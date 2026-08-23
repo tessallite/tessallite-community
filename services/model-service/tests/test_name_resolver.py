@@ -7,6 +7,7 @@ Covers:
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -125,7 +126,7 @@ def _url(project_id, model_id, source_id, table_id):
     )
 
 
-def _build_db(table, col_rows, dims, meas):
+def _build_db(table, col_rows, dims, meas, project_id=None):
     """Minimal async DB mock for the rename-preview handler.
 
     The endpoint issues 3 execute calls in order:
@@ -136,7 +137,11 @@ def _build_db(table, col_rows, dims, meas):
     db = AsyncMock()
     db.info = {"tenant_id": "test-tenant"}
 
-    async def _get(model, pk):
+    async def _get(entity, pk):
+        # Bug-8862: rename-preview now proves project -> model before it reads
+        # the table, so the double must answer the Model lookup too.
+        if entity.__name__ == "Model":
+            return SimpleNamespace(id=pk, project_id=project_id)
         if pk == table.id:
             return table
         return None
@@ -165,7 +170,7 @@ async def test_rename_preview_returns_empty_when_no_conflict(client):
     col_id = uuid.uuid4()
     dim = _dim(col_id, "revenue", model_id)  # name already == col_name → no change
 
-    db = _build_db(table, [_col_row(col_id, "revenue")], [dim], [])
+    db = _build_db(table, [_col_row(col_id, "revenue")], [dim], [], project_id=project_id)
 
     with patch("src.api.tables.get_tenant_db") as mock_gen, \
          patch("src.api.tables._validate_alias_format"):
@@ -193,7 +198,7 @@ async def test_rename_preview_returns_changed_dimension(client):
     # Under new_alias="newco" with no taken names, resolver returns "branch_id".
     dim = _dim(col_id, "sales_branch_id", model_id)
 
-    db = _build_db(table, [_col_row(col_id, "branch_id")], [dim], [])
+    db = _build_db(table, [_col_row(col_id, "branch_id")], [dim], [], project_id=project_id)
 
     with patch("src.api.tables.get_tenant_db") as mock_gen, \
          patch("src.api.tables._validate_alias_format"):
@@ -225,7 +230,15 @@ async def test_rename_preview_404_when_table_not_found(client):
 
     db = AsyncMock()
     db.info = {"tenant_id": "test-tenant"}
-    db.get.return_value = None
+
+    async def _get(entity, pk):
+        # The model resolves correctly; only the table is missing, so the 404
+        # asserted below is the TABLE 404 and not Bug-8862's model 404.
+        if entity.__name__ == "Model":
+            return SimpleNamespace(id=pk, project_id=project_id)
+        return None
+
+    db.get.side_effect = _get
 
     with patch("src.api.tables.get_tenant_db") as mock_gen, \
          patch("src.api.tables._validate_alias_format"):
@@ -239,6 +252,7 @@ async def test_rename_preview_404_when_table_not_found(client):
         )
 
     assert resp.status_code == 404
+    assert resp.json()["detail"] == "ModelTable not found"
 
 
 @pytest.mark.asyncio

@@ -74,4 +74,23 @@ describe("WelcomeWizard", () => {
     }
     expect(screen.getByRole("button", { name: /^finish$/i })).toBeInTheDocument();
   });
+
+  // Bug-7447: completing onboarding failure must show error, not trap user.
+  it("shows error and re-enables controls when completeOnboarding fails", async () => {
+    const { authApi } = await import("../../api/client");
+    (authApi.completeOnboarding as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("network error"),
+    );
+
+    const user = userEvent.setup();
+    renderWizard();
+    // Click Skip All to trigger the completion
+    await user.click(screen.getByText(/skip all/i));
+    // Error message should be displayed
+    expect(
+      await screen.findByText("Could not complete setup. Please try again."),
+    ).toBeInTheDocument();
+    // The Skip All link should be re-enabled (completing=false)
+    expect(screen.getByText(/skip all/i)).not.toBeDisabled();
+  });
 });

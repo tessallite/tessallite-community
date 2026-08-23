@@ -15,6 +15,13 @@ from shared.importers.cube_parser import (
     CubeDefinition,
     CubeParseResult,
 )
+from shared.importers.import_warnings import (
+    ImportWarningResponse,
+    extend_known_import_warnings,
+    make_import_warning,
+)
+from shared.model_snapshot.slug_utils import slugify
+from shared.model_defaults import DEFAULT_INCLUDE_ALL_MEASURES
 
 
 _MEASURE_TYPE_MAP: dict[str, str] = {
@@ -22,7 +29,10 @@ _MEASURE_TYPE_MAP: dict[str, str] = {
     "count_distinct": "count_distinct",
     "count_distinct_approx": "count_distinct",
     "sum": "sum",
-    "avg": "average",
+    # Bug-6591: canonical token is "avg" (VALID_DEFAULT_AGGS), not "average".
+    # "average" saved cleanly but failed late at query time (no AVERAGE() SQL
+    # function); the runtime renderer only understands the canonical set.
+    "avg": "avg",
     "min": "min",
     "max": "max",
 }
@@ -62,7 +72,7 @@ _CUBE_MACRO_RE = re.compile(r"^\{[a-zA-Z_][a-zA-Z0-9_]*\}\.([a-zA-Z_][a-zA-Z0-9_
 @dataclass
 class MapResult:
     bundle: dict[str, Any]
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[ImportWarningResponse] = field(default_factory=list)
 
 
 def map_cube_to_tessallite(
@@ -70,12 +80,17 @@ def map_cube_to_tessallite(
     project_name: str = "cube-import",
     project_display_name: str = "Cube Import",
 ) -> MapResult:
-    warnings: list[str] = list(parsed.warnings)
+    warnings: list[ImportWarningResponse] = []
+    extend_known_import_warnings(warnings, parsed.warnings)
 
     models: list[dict[str, Any]] = []
     for cube in parsed.cubes:
         if not cube.public:
-            warnings.append(f"Cube '{cube.name}' is not public — skipped")
+            warnings.append(make_import_warning(
+                code="cube.cube_skipped",
+                params={"cube": cube.name, "reason": "private"},
+                detail=f"Cube '{cube.name}' is not public — skipped",
+            ))
             continue
         snap = _map_cube(cube, warnings)
         models.append(snap)
@@ -94,7 +109,10 @@ def map_cube_to_tessallite(
     return MapResult(bundle=bundle, warnings=warnings)
 
 
-def _map_cube(cube: CubeDefinition, warnings: list[str]) -> dict[str, Any]:
+def _map_cube(
+    cube: CubeDefinition,
+    warnings: list[ImportWarningResponse],
+) -> dict[str, Any]:
     gen = _id_gen()
     model_id = gen()
     source_id = gen()
@@ -118,13 +136,34 @@ def _map_cube(cube: CubeDefinition, warnings: list[str]) -> dict[str, Any]:
 
     for dim in cube.dimensions:
         if not dim.public:
+            warnings.append(make_import_warning(
+                code="cube.element_skipped",
+                params={
+                    "element_type": "dimension",
+                    "element_name": dim.name,
+                    "cube": cube.name,
+                    "reason": "private",
+                },
+                detail=(
+                    f"Dimension '{dim.name}' in cube '{cube.name}' is private "
+                    "and was skipped"
+                ),
+            ))
             continue
         phys_name, is_expr = _physical_col_name(dim.sql, dim.name)
         if is_expr:
-            warnings.append(
-                f"Dimension '{dim.name}' in cube '{cube.name}' uses an SQL expression — "
-                f"source column binding requires manual setup"
-            )
+            warnings.append(make_import_warning(
+                code="cube.expression_manual",
+                params={
+                    "element_type": "dimension",
+                    "element_name": dim.name,
+                    "cube": cube.name,
+                },
+                detail=(
+                    f"Dimension '{dim.name}' in cube '{cube.name}' uses an SQL "
+                    "expression — source column binding requires manual setup"
+                ),
+            ))
         if phys_name not in phys_col_seen:
             col_id = gen()
             phys_col_seen.add(phys_name)
@@ -140,13 +179,34 @@ def _map_cube(cube: CubeDefinition, warnings: list[str]) -> dict[str, Any]:
 
     for measure in cube.measures:
         if not measure.public:
+            warnings.append(make_import_warning(
+                code="cube.element_skipped",
+                params={
+                    "element_type": "measure",
+                    "element_name": measure.name,
+                    "cube": cube.name,
+                    "reason": "private",
+                },
+                detail=(
+                    f"Measure '{measure.name}' in cube '{cube.name}' is private "
+                    "and was skipped"
+                ),
+            ))
             continue
         phys_name, is_expr = _physical_col_name(measure.sql, measure.name)
         if is_expr:
-            warnings.append(
-                f"Measure '{measure.name}' in cube '{cube.name}' uses an SQL expression — "
-                f"source column binding requires manual setup"
-            )
+            warnings.append(make_import_warning(
+                code="cube.expression_manual",
+                params={
+                    "element_type": "measure",
+                    "element_name": measure.name,
+                    "cube": cube.name,
+                },
+                detail=(
+                    f"Measure '{measure.name}' in cube '{cube.name}' uses an SQL "
+                    "expression — source column binding requires manual setup"
+                ),
+            ))
         if phys_name not in phys_col_seen:
             col_id = gen()
             phys_col_seen.add(phys_name)
@@ -185,28 +245,52 @@ def _map_cube(cube: CubeDefinition, warnings: list[str]) -> dict[str, Any]:
             invalid_reason = (
                 _UNREPRESENTABLE_MEASURE_TYPES[m.measure_type] % m.name
             )
-            warnings.append(invalid_reason)
+            warnings.append(make_import_warning(
+                code="cube.measure_disabled",
+                params={
+                    "measure": m.name,
+                    "cube": cube.name,
+                    "reason": m.measure_type,
+                },
+                detail=invalid_reason,
+            ))
         elif m.measure_type not in _MEASURE_TYPE_MAP:
             invalid_reason = (
                 f"Unsupported measure type '{m.measure_type}' for '{m.name}' "
                 f"in cube '{cube.name}' — imported as a disabled measure "
                 f"(defaulted to 'sum')."
             )
-            warnings.append(invalid_reason)
+            warnings.append(make_import_warning(
+                code="cube.measure_disabled",
+                params={
+                    "measure": m.name,
+                    "cube": cube.name,
+                    "reason": m.measure_type or "unknown",
+                },
+                detail=invalid_reason,
+            ))
 
         measure_type = "standard"
         if m.rolling_window:
             measure_type = "calculated"
-            warnings.append(
-                f"Measure '{m.name}' in cube '{cube.name}' uses rolling_window — "
-                f"manual configuration needed in Tessallite"
-            )
+            warnings.append(make_import_warning(
+                code="cube.rolling_window_manual",
+                params={"measure": m.name, "cube": cube.name},
+                detail=(
+                    f"Measure '{m.name}' in cube '{cube.name}' uses "
+                    "rolling_window — manual configuration needed in Tessallite"
+                ),
+            ))
         if m.multi_stage:
             measure_type = "calculated"
-            warnings.append(
-                f"Measure '{m.name}' in cube '{cube.name}' is multi_stage — "
-                f"review calculation in Tessallite"
-            )
+            warnings.append(make_import_warning(
+                code="cube.multi_stage_manual",
+                params={"measure": m.name, "cube": cube.name},
+                detail=(
+                    f"Measure '{m.name}' in cube '{cube.name}' is multi_stage — "
+                    "review calculation in Tessallite"
+                ),
+            ))
 
         measures_out.append({
             "id": gen(),
@@ -226,19 +310,22 @@ def _map_cube(cube: CubeDefinition, warnings: list[str]) -> dict[str, Any]:
     # F-020-07: Cube joins point at OTHER cubes, which become separate
     # Tessallite models — they cannot be represented as intra-model joins.
     # The previous code emitted rows with `to_cube`/`relationship` columns the
-    # `Join` ORM does not have (and `join_type` values "inner"/"left" instead of
-    # the cardinality enum), so `insert(Join).values(**row)` raised
+    # `Join` ORM does not have, so `insert(Join).values(**row)` raised
     # "Unconsumed column names" and crashed every import of a cube with joins.
     # Drop the join rows and warn per join, matching the dbt foreign-entity
     # approach.
     joins_out: list[dict[str, Any]] = []
     for join in cube.joins:
-        warnings.append(
-            f"Cube '{cube.name}' join to '{join.name}' "
-            f"(relationship '{join.relationship}') skipped — Cube joins "
-            f"reference other cubes, which import as separate Tessallite "
-            f"models. Configure the join manually in the Model Builder."
-        )
+        warnings.append(make_import_warning(
+            code="cube.join_manual",
+            params={"cube": cube.name, "join": join.name},
+            detail=(
+                f"Cube '{cube.name}' join to '{join.name}' "
+                f"(relationship '{join.relationship}') skipped — Cube joins "
+                "reference other cubes, which import as separate Tessallite "
+                "models. Configure the join manually in the Model Builder."
+            ),
+        ))
 
     hier_out: list[dict[str, Any]] = []
     for hier in cube.hierarchies:
@@ -259,10 +346,18 @@ def _map_cube(cube: CubeDefinition, warnings: list[str]) -> dict[str, Any]:
                 "key_attribute_source": "physical_column",
             })
         if skipped:
-            warnings.append(
-                f"Hierarchy '{hier.name}' in cube '{cube.name}': skipped levels "
-                f"{skipped} — dimension not found or not public"
-            )
+            warnings.append(make_import_warning(
+                code="cube.hierarchy_levels_skipped",
+                params={
+                    "hierarchy": hier.name,
+                    "cube": cube.name,
+                    "count": len(skipped),
+                },
+                detail=(
+                    f"Hierarchy '{hier.name}' in cube '{cube.name}': skipped "
+                    f"levels {skipped} — dimension not found or not public"
+                ),
+            ))
         if not levels_out:
             continue
         hier_out.append({
@@ -336,7 +431,7 @@ def _map_cube(cube: CubeDefinition, warnings: list[str]) -> dict[str, Any]:
             "refresh_strategy": "manual",
             "max_aggregates": 20,
             "aggregations_enabled": True,
-            "include_all_measures": True,
+            "include_all_measures": DEFAULT_INCLUDE_ALL_MEASURES,
         },
         "tables": tables,
         "columns": columns,
@@ -367,8 +462,10 @@ def _map_cube(cube: CubeDefinition, warnings: list[str]) -> dict[str, Any]:
 
 
 def _slugify(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", name.lower().strip())
-    return slug.strip("_")
+    # Bug-7622: delegate to the shared BI-safe generator so digit-leading and
+    # symbol-only names produce a valid slug instead of one that later trips
+    # validate_bi_safe_slug and raises an uncaught 500 in the import endpoint.
+    return slugify(name, fallback="cube_model", separator="_")
 
 
 def _humanize(name: str) -> str:

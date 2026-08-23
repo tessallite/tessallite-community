@@ -1,7 +1,10 @@
 """Unit tests for JDBC extended query protocol — parameter binding, substitution, statement caching."""
 from __future__ import annotations
 
+import datetime as _dt
+import decimal
 import struct
+
 import pytest
 
 from src.jdbc import protocol as proto
@@ -82,18 +85,20 @@ class TestParseBindParameters:
         assert params == ["x"]
 
     def test_binary_int4(self):
+        # Wave C #6: binary params are decoded strictly by their DECLARED OID
+        # (never a byte-length guess), so the test declares the type as pgwire does.
         raw = struct.pack("!i", 99)
         payload = _build_bind_payload(format_codes=[1], params=[raw])
-        _, _, params, _ = proto.parse_bind_parameters(payload)
+        _, _, params, _ = proto.parse_bind_parameters(payload, param_oids=[proto.OID_INT4])
         assert params == ["99"]
 
     def test_binary_bool(self):
         payload = _build_bind_payload(format_codes=[1], params=[b"\x01"])
-        _, _, params, _ = proto.parse_bind_parameters(payload)
+        _, _, params, _ = proto.parse_bind_parameters(payload, param_oids=[proto.OID_BOOL])
         assert params == ["true"]
 
         payload = _build_bind_payload(format_codes=[1], params=[b"\x00"])
-        _, _, params, _ = proto.parse_bind_parameters(payload)
+        _, _, params, _ = proto.parse_bind_parameters(payload, param_oids=[proto.OID_BOOL])
         assert params == ["false"]
 
     def test_mixed_format_codes(self):
@@ -102,7 +107,9 @@ class TestParseBindParameters:
             format_codes=[0, 1],
             params=[b"text_val", int_val],
         )
-        _, _, params, _ = proto.parse_bind_parameters(payload)
+        _, _, params, _ = proto.parse_bind_parameters(
+            payload, param_oids=[proto.OID_TEXT, proto.OID_INT4],
+        )
         assert params == ["text_val", "7"]
 
     def test_single_format_code_applies_to_all(self):
@@ -228,41 +235,76 @@ def _row_description_format_codes(msg: bytes) -> list[int]:
 
 
 class TestBug3655NumericDateTimestampLockstep:
-    """Bug-3655 (option b): NUMERIC/DATE/TIMESTAMP columns advertise text
-    format (0) even when binary is requested, and data_row emits text, so the
-    advertised format and the emitted payload stay in lockstep."""
+    """The advertised result format and the emitted payload stay in lockstep.
 
-    def test_row_description_downgrades_numeric_to_text(self):
+    That contract is unchanged; the MECHANISM that upholds it changed with
+    Bug-9433's lane. Bug-3655 originally kept lockstep by DOWNGRADING
+    NUMERIC/DATE/TIME/TIMESTAMP to text format 0 whenever a client asked for
+    binary, because the gateway had no binary encoder for them. That works only
+    for a client that reads the RowDescription the gateway sends alongside the
+    rows. A prepared-statement client (asyncpg, psycopg3) does not: it fixes its
+    result formats from the STATEMENT description at Bind time and never
+    re-reads them, so it asked for binary NUMERIC, received text, and decoded
+    garbage — verified against a real asyncpg client as
+    ``insufficient data in buffer``.
+
+    The gateway now implements the six encoders (``protocol._encode_binary_value``),
+    so a requested binary format is HONOURED rather than declined, and lockstep
+    is proved by decoding the payload back to the exact input value. The
+    downgrade path remains for any OID with no encoder.
+    """
+
+    def test_row_description_honours_binary_for_numeric(self):
         cols = [("revenue", proto.OID_NUMERIC), ("qty", proto.OID_INT4)]
         msg = proto.row_description(cols, result_formats=[1])
-        fmts = _row_description_format_codes(msg)
-        assert fmts[0] == 0       # NUMERIC forced to text
-        assert fmts[1] == 1       # INT4 stays binary
+        assert _row_description_format_codes(msg) == [1, 1]
 
-    def test_row_description_downgrades_date_and_timestamp(self):
+    def test_row_description_honours_binary_for_date_and_timestamp(self):
         cols = [
             ("d", proto.OID_DATE),
             ("ts", proto.OID_TIMESTAMP),
             ("tstz", proto.OID_TIMESTAMPTZ),
         ]
         msg = proto.row_description(cols, result_formats=[1])
-        assert _row_description_format_codes(msg) == [0, 0, 0]
+        assert _row_description_format_codes(msg) == [1, 1, 1]
 
-    def test_data_row_emits_text_for_numeric_when_binary_requested(self):
+    def test_row_description_still_downgrades_an_oid_with_no_encoder(self):
+        """The fail-safe survives: an OID absent from the encoder allow-list is
+        advertised as text so its payload can never be mis-parsed as binary."""
+        unencodable = 3802  # jsonb — the gateway has no binary encoder for it
+        assert unencodable not in proto._BINARY_ENCODABLE_OIDS
+        msg = proto.row_description([("doc", unencodable)], result_formats=[1])
+        assert _row_description_format_codes(msg) == [0]
+        payload = proto.data_row(["{}"], result_formats=[1], col_oids=[unencodable])[5:]
+        vlen = struct.unpack("!I", payload[2:6])[0]
+        assert payload[6:6 + vlen] == b"{}"
+
+    def test_data_row_emits_decodable_binary_numeric_when_binary_requested(self):
         msg = proto.data_row(
             ["123.45"], result_formats=[1], col_oids=[proto.OID_NUMERIC],
         )
         payload = msg[5:]
         vlen = struct.unpack("!I", payload[2:6])[0]
-        assert payload[6:6 + vlen] == b"123.45"   # text, not binary
+        value = payload[6:6 + vlen]
+        assert value != b"123.45", "text payload under a binary format code"
+        ndigits, weight, sign, dscale = struct.unpack("!hhHh", value[:8])
+        digits = [
+            struct.unpack("!h", value[8 + 2 * i:10 + 2 * i])[0]
+            for i in range(ndigits)
+        ]
+        # 123.45 -> base-10000 digit words [123, 4500], weight 0, dscale 2.
+        assert (digits, weight, sign, dscale) == ([123, 4500], 0, 0x0000, 2)
 
-    def test_data_row_emits_text_for_date_when_binary_requested(self):
+    def test_data_row_emits_decodable_binary_date_when_binary_requested(self):
         msg = proto.data_row(
             ["2025-01-15"], result_formats=[1], col_oids=[proto.OID_DATE],
         )
         payload = msg[5:]
         vlen = struct.unpack("!I", payload[2:6])[0]
-        assert payload[6:6 + vlen] == b"2025-01-15"
+        value = payload[6:6 + vlen]
+        assert vlen == 4, "PG binary DATE is a 4-byte day offset"
+        days = struct.unpack("!i", value)[0]
+        assert days == (_dt.date(2025, 1, 15) - _dt.date(2000, 1, 1)).days
 
     def test_row_description_and_data_row_agree_for_mixed_columns(self):
         cols = [
@@ -272,7 +314,6 @@ class TestBug3655NumericDateTimestampLockstep:
         ]
         rd = proto.row_description(cols, result_formats=[1])
         fmts = _row_description_format_codes(rd)
-        # INT4 binary (4 bytes), NUMERIC + TIMESTAMP text.
         dr = proto.data_row(
             ["100.5", "7", "2025-01-15 00:00:00"],
             result_formats=[1],
@@ -280,16 +321,103 @@ class TestBug3655NumericDateTimestampLockstep:
         )
         payload = dr[5:]
         off = 2
-        for i, expected_fmt in enumerate(fmts):
+        widths = []
+        for expected_fmt in fmts:
             vlen = struct.unpack("!I", payload[off:off + 4])[0]
             off += 4
-            val = payload[off:off + vlen]
             off += vlen
-            if i == 1:
-                assert expected_fmt == 1 and vlen == 4   # INT4 binary
-            else:
-                assert expected_fmt == 0                 # text columns
-                assert b"." in val or b"-" in val
+            assert expected_fmt == 1, "every column here has a binary encoder"
+            widths.append(vlen)
+        # INT4 is 4 bytes, TIMESTAMP is an 8-byte microsecond offset, and the
+        # NUMERIC digit array is neither its text form nor a fixed width.
+        assert widths[1] == 4
+        assert widths[2] == 8
+        assert widths[0] != len("100.5")
+
+    def test_unencodable_value_refuses_instead_of_emitting_text(self):
+        """A value that cannot be binary-encoded raises rather than falling back
+        to text bytes, which the client would parse as binary and corrupt."""
+        with pytest.raises(proto.BinaryEncodeError):
+            proto.data_row(
+                ["not-a-number"], result_formats=[1], col_oids=[proto.OID_NUMERIC],
+            )
+        with pytest.raises(proto.BinaryEncodeError):
+            proto.data_row(
+                ["abc"], result_formats=[1], col_oids=[proto.OID_INT4],
+            )
+
+
+def _decode_binary_numeric(payload: bytes) -> decimal.Decimal:
+    """Decode a PG binary NUMERIC payload back to an exact Decimal."""
+    ndigits, weight, sign, _dscale = struct.unpack("!hhHh", payload[:8])
+    digits = [
+        struct.unpack("!h", payload[8 + 2 * i:10 + 2 * i])[0]
+        for i in range(ndigits)
+    ]
+    with decimal.localcontext() as ctx:
+        ctx.prec = 200
+        value = sum(
+            (
+                decimal.Decimal(d) * (decimal.Decimal(10000) ** (weight - i))
+                for i, d in enumerate(digits)
+            ),
+            decimal.Decimal(0),
+        )
+        if sign == proto._NUMERIC_NEG:
+            value = -value
+        return +value
+
+
+class TestL1B1BinaryNumericPrecision:
+    """L1-B1 — binary NUMERIC must not round wide values."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "12345678901234567890123456789",
+            "123456789012345678901234567890",
+            "999999999999999999999999999999.99",
+            "12345678901234567890123456789.123456789",
+            "0.1234567890123456789012345678901",
+            "-99999999999999999999999999999999999999",
+        ],
+    )
+    def test_binary_numeric_preserves_more_than_28_significant_digits(self, text):
+        payload = proto._encode_binary_value(text, proto.OID_NUMERIC)
+        assert _decode_binary_numeric(payload) == decimal.Decimal(text)
+
+    @pytest.mark.parametrize(
+        ("text", "digits", "weight", "dscale"),
+        [
+            ("0.5", [5000], -1, 1),
+            ("0.00005", [5000], -2, 5),
+            ("0.000000001", [1000], -3, 9),
+        ],
+    )
+    def test_sub_one_values_emit_no_leading_zero_digit_word(
+        self, text, digits, weight, dscale
+    ):
+        payload = proto._encode_binary_value(text, proto.OID_NUMERIC)
+        got_ndigits, got_weight, _sign, got_dscale = struct.unpack("!hhHh", payload[:8])
+        got_digits = [
+            struct.unpack("!h", payload[8 + 2 * i:10 + 2 * i])[0]
+            for i in range(got_ndigits)
+        ]
+        assert (got_digits, got_weight, got_dscale) == (digits, weight, dscale)
+        assert _decode_binary_numeric(payload) == decimal.Decimal(text)
+
+    def test_binary_numeric_is_independent_of_ambient_context(self):
+        text = "123456789.987654321"
+        wide = proto._encode_binary_value(text, proto.OID_NUMERIC)
+        with decimal.localcontext() as ctx:
+            ctx.prec = 5
+            narrow = proto._encode_binary_value(text, proto.OID_NUMERIC)
+        assert narrow == wide
+
+    def test_out_of_range_scale_is_typed_binary_error(self):
+        huge_scale = "0." + "1" * 40000
+        with pytest.raises(proto.BinaryEncodeError):
+            proto._encode_binary_value(huge_scale, proto.OID_NUMERIC)
 
 
 # ===================================================================

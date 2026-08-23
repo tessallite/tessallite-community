@@ -9,6 +9,7 @@ Role requirements:
 """
 from __future__ import annotations
 
+import logging
 import secrets
 from typing import Any
 from uuid import UUID
@@ -17,20 +18,27 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 
 from shared.audit.logger import audit
-from shared.webhooks.dispatcher import emit_webhook
+from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
 from shared.db.models import (
     AggregateDefinition,
     DataSource,
+    DataTarget,
     Model,
     ModelVersion,
     ProjectConnection,
 )
 from src.api._cascade_delete import delete_model_cascade
+from src.api._model_lock import acquire_model_definition_lock
+from src.api._scope import ensure_ref_in_model
 from shared.db.session import get_tenant_db
+from shared.physical_cleanup import attempt_scheduled_physical_cleanup
 from shared.schemas.pydantic_models import ModelCreate, ModelResponse, ModelUpdate
 from src.auth.middleware import CurrentEmbedUser, CurrentUser, enforce_model_scope, get_current_user
-from src.auth.rbac import require_role
+from src.auth.rbac import caller_has_role, require_role, resolve_listable_model_scope
+from src.api.personas import seed_technical_persona
 from src.licensing_guard import enforce_create_cap
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/projects/{project_id}/models", tags=["models"])
 
@@ -146,7 +154,9 @@ async def create_model(
             r = await db.execute(select(func.count()).select_from(Model))
             return int(r.scalar() or 0)
 
-        await enforce_create_cap("model", _count_models)
+        # Bug-6567: pass db so the count-then-create is serialised with an
+        # advisory lock, preventing two concurrent model creates at cap-1.
+        await enforce_create_cap("model", _count_models, db=db)
 
         existing = await db.execute(
             select(Model).where(Model.project_id == project_id, Model.slug == body.slug)
@@ -165,6 +175,10 @@ async def create_model(
         model = Model(project_id=project_id, seed=seed, **payload)
         db.add(model)
         await db.flush()
+        # Bug-6138: seed the canonical Technical persona so the hidden-columns
+        # technical catalogue is live from creation, not only for models that
+        # predate migration 0042. Same transaction as the model create.
+        await seed_technical_persona(db, model.id)
         await audit(
             db, action="model.create", severity="info",
             actor_email=current_user.email,
@@ -288,20 +302,26 @@ async def _decorate_models_batch(db, models: list[Model]) -> list[ModelResponse]
 async def list_models(
     project_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
-    _: None = require_role("viewer"),
 ) -> list[ModelResponse]:
+    # Codex-HIGH (Bug-8101 follow-up): authorize AND filter per model so a
+    # MODEL-SCOPED viewer/model_viewer can browse (and only) their granted
+    # model(s). The old require_role("viewer") route dependency 403'd them
+    # because a list request carries no model_id, so only the project-wide
+    # binding was consulted. resolve_listable_model_scope raises 403 when the
+    # caller has no project access and otherwise returns None (all models) or
+    # the exact set of visible model ids.
     _enforce_embed_project_scope(current_user, project_id)
     async for db in get_tenant_db(current_user.tenant_id):
+        visible_scope = await resolve_listable_model_scope(
+            db, current_user, project_id
+        )
         result = await db.execute(
             select(Model).where(Model.project_id == project_id).order_by(Model.slug)
         )
         models = result.scalars().all()
-        embed_ids = None
-        if isinstance(current_user, CurrentEmbedUser) and current_user.model_ids:
-            embed_ids = set(current_user.model_ids)
         visible = [
             m for m in models
-            if embed_ids is None or str(m.id) in embed_ids
+            if visible_scope is None or str(m.id).lower() in visible_scope
         ]
         return await _decorate_models_batch(db, visible)
 
@@ -314,12 +334,27 @@ async def get_model(
     _: None = require_role("viewer"),
 ) -> ModelResponse:
     _enforce_embed_project_scope(current_user, project_id)
-    enforce_model_scope(current_user, str(model_id))
+    enforce_model_scope(current_user, str(model_id), project_id=str(project_id))
     async for db in get_tenant_db(current_user.tenant_id):
         m = await db.get(Model, model_id)
         if m is None or m.project_id != project_id:
             raise HTTPException(status_code=404, detail="Model not found")
-        return await _decorate_response(db, m)
+        response = await _decorate_response(db, m)
+        # Bug-8101 / F-104-01 (spec D2): tell the Model Builder whether this
+        # caller may author the model, so a read-only consumer (model_viewer /
+        # viewer) opens the model read-only instead of the full authoring
+        # canvas. Uses the same binding precedence as require_role; the backend
+        # gate stays authoritative for every mutation.
+        response.caller_can_author = await caller_has_role(
+            db, current_user, project_id, "modeler", model_id=model_id
+        )
+        # G-013-02: same binding precedence the revert route enforces
+        # (require_role("admin")), so the Versions dialog can show Revert to a
+        # project-scoped admin, not only a tenant/system admin.
+        response.caller_can_admin = await caller_has_role(
+            db, current_user, project_id, "admin", model_id=model_id
+        )
+        return response
 
 
 @router.patch(
@@ -334,10 +369,57 @@ async def update_model(
     current_user: CurrentUser = Depends(get_current_user),
 ) -> ModelResponse:
     async for db in get_tenant_db(current_user.tenant_id):
+        # Bug-8437: a revert UPDATEs this row's scalars in place from the
+        # snapshot (rehydrator step 5). Without the per-model definition lock a
+        # rename / display-name / canvas-layout edit made during a revert is
+        # silently discarded, or overwrites the just-restored value — no error,
+        # no audit trail. Detection cannot close a lost update; mutual exclusion
+        # can, which is why ``models`` stays OUT of the runtime write guard's
+        # table set (guarding it would only re-introduce the ``bump_data_epoch``
+        # flood that made the guard self-mute) and the race is closed HERE.
+        #
+        # READ-UNDER-LOCK: the ownership check IS the entity fetch, so the lock
+        # is acquired first and the row is read under it (shared/db/model_lock.py
+        # ordering contract).
+        await acquire_model_definition_lock(db, model_id)
         m = await db.get(Model, model_id)
         if m is None or m.project_id != project_id:
             raise HTTPException(status_code=404, detail="Model not found")
         updates = body.model_dump(exclude_unset=True)
+
+        # ``ModelUpdate.target_id`` is a body foreign key to ``data_targets``,
+        # applied by the blanket ``setattr`` loop below. RBAC proves only that
+        # the caller may act in the PATH project; nothing proved the submitted
+        # target belonged to it, and ``data_targets.id`` is tenant-schema-wide,
+        # so a project-B target satisfies the foreign key and persists.
+        #
+        # This is the model-level twin of the aggregate-level hole Bug-8026
+        # closed in ``aggregates.py::create_aggregate``, and it is the more
+        # dangerous of the two: ``models.target_id`` is the model's DEFAULT
+        # materialisation destination, so it is inherited by aggregates and
+        # pockets created afterwards rather than scoped to one definition. A
+        # DataTarget carries ``project_connection_id`` — live, Fernet-encrypted
+        # source credentials (Bug-5325) — so a foreign value points this model's
+        # CREATE TABLE AS and every scheduled refresh at another project's
+        # source connection.
+        #
+        # Keyed on PRESENCE, not truthiness: an explicit ``null`` means "clear
+        # the default target" and stays legal, exactly as ``targets.py``'s
+        # delete path clears it. The check runs under the definition lock and
+        # BEFORE the setattr loop, because the helper's SELECT autoflushes and a
+        # guard placed afterwards would already have sent the unvalidated value
+        # to the database.
+        if "target_id" in updates:
+            await ensure_ref_in_model(
+                db,
+                DataTarget,
+                ref_id=updates["target_id"],
+                model_id=model_id,
+                project_id=project_id,
+                field_name="target_id",
+                noun="a data target",
+            )
+
         old_slug = m.slug
         new_slug = updates.get("slug")
         if new_slug and new_slug != old_slug:
@@ -358,16 +440,82 @@ async def update_model(
                 updates["display_name"] = new_slug
         if "display_name" in updates and (updates["display_name"] is None or not str(updates["display_name"]).strip()):
             updates["display_name"] = new_slug or m.slug
+
+        # Bug-9409 (F-102-26 = A): a change to ``include_all_measures`` is an
+        # aggregate-shape decision, so record the transition explicitly rather
+        # than leaving it as one entry in a list of field names. The lifecycle it
+        # triggers is the EXISTING one, on the optimizer's next sweep — no new
+        # mechanism and nothing destructive here:
+        #   OFF -> ON : ``creator.backfill_include_all_measures`` retires and
+        #               rebuilds each active aggregate with the wider measure
+        #               set (it runs at the top of every ``_sweep_one_model``).
+        #   ON -> OFF : injection stops, so every subsequent build materialises
+        #               only what the workload asks for. Existing aggregates keep
+        #               their columns — narrowing them here would remove a measure
+        #               a BI client may already be querying. An aggregate the
+        #               row-population gate refuses is NOT retired: the flywheel
+        #               builds the narrow, servable artifact ALONGSIDE it
+        #               (Bug-9209), and the wide one stays active until the
+        #               per-model cap evicts it or an operator retires it. It is
+        #               not dead weight either — a query whose own plan joins all
+        #               of its relations is still served from it, which is why
+        #               superseding it automatically is a product decision
+        #               (docs/questions/questions_unprovable-aggregate-supersession.md),
+        #               not a defect fix.
+        include_all_change: tuple[bool, bool] | None = None
+        if "include_all_measures" in updates:
+            before = bool(m.include_all_measures)
+            after = bool(updates["include_all_measures"])
+            if before != after:
+                include_all_change = (before, after)
+
         for key, val in updates.items():
             setattr(m, key, val)
+        _detail: dict = {"fields": list(updates.keys())}
+        if include_all_change is not None:
+            _detail["include_all_measures"] = {
+                "from": include_all_change[0],
+                "to": include_all_change[1],
+                "aggregate_lifecycle": (
+                    "backfill_widens_active_aggregates_on_next_sweep"
+                    if include_all_change[1]
+                    else "new_builds_narrow_to_the_requested_measures"
+                ),
+            }
+            logger.info(
+                "Model %s include_all_measures %s -> %s; aggregate rebuild is "
+                "handled by the optimizer sweep's existing retire/rebuild path "
+                "(Bug-9409)",
+                model_id, include_all_change[0], include_all_change[1],
+            )
         await audit(
             db, action="model.update", severity="info",
             actor_email=current_user.email,
             target_type="model", target_id=m.id,
             target_name=m.display_name,
-            detail={"fields": list(updates.keys())},
+            detail=_detail,
         )
         await db.commit()
+
+        if "canvas_layout" in updates:
+            try:
+                import asyncio
+                from shared.git.model_repo import commit_layout as git_commit_layout
+                await asyncio.to_thread(
+                    git_commit_layout,
+                    tenant_slug=current_user.tenant_id,
+                    model_slug=m.slug,
+                    layout_json=updates["canvas_layout"],
+                    summary=None,
+                    author_email=current_user.email or current_user.user_id,
+                )
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Git layout commit failed for model %s (non-fatal)",
+                    model_id, exc_info=True,
+                )
+
         await db.refresh(m)
         return await _decorate_response(db, m)
 
@@ -405,6 +553,7 @@ async def delete_model(
             target_name=model_name,
         )
         await db.commit()
+        await attempt_scheduled_physical_cleanup(db)
         await emit_webhook(current_user.tenant_id, "model.deleted", {
             "model_id": str(model_id),
             "model_name": model_name,

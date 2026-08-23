@@ -84,7 +84,7 @@ class TestRunJudge:
 
         captured = {}
 
-        async def _fake_complete(system, user, on_thinking=None):
+        async def _fake_complete(system, user, on_thinking=None, response_json=False, cache_system_prefix=False):
             captured["system"] = system
             captured["user"] = user
             return '{"verdict": "pass", "reasoning": "ok", "metrics": {"accuracy": 1.0}}'
@@ -132,7 +132,7 @@ class TestRunJudge:
         assert "### B) Conversation history" in user_text
         assert "User: hello" in user_text
         assert "Assistant: hi there" in user_text
-        assert "### C) Agent system prompt" in user_text
+        assert "### C) Agent context (models, grounding, glossary the planner saw)" in user_text
         assert "## AVAILABLE MODELS" in user_text
         assert "## 3. AGENT OUTPUT" in user_text
         assert "Revenue is 100" in user_text
@@ -144,7 +144,7 @@ class TestRunJudge:
 
         captured_user = {}
 
-        async def _fake_complete(system, user, on_thinking=None):
+        async def _fake_complete(system, user, on_thinking=None, response_json=False, cache_system_prefix=False):
             captured_user["value"] = user
             return '{"verdict": "pass", "reasoning": "ok", "metrics": {}}'
 
@@ -184,7 +184,7 @@ class TestRunJudge:
 
         captured_user = {}
 
-        async def _fake_complete(system, user, on_thinking=None):
+        async def _fake_complete(system, user, on_thinking=None, response_json=False, cache_system_prefix=False):
             captured_user["value"] = user
             return '{"verdict": "pass", "reasoning": "ok", "metrics": {}}'
 
@@ -233,7 +233,7 @@ class TestRunJudge:
 
         captured_user = {}
 
-        async def _fake_complete(system, user, on_thinking=None):
+        async def _fake_complete(system, user, on_thinking=None, response_json=False, cache_system_prefix=False):
             captured_user["value"] = user
             return '{"verdict": "pass", "reasoning": "ok", "metrics": {}}'
 
@@ -270,7 +270,7 @@ class TestRunJudge:
         from unittest.mock import patch as _patch
         from src.judge.judge import run_judge
 
-        async def _fake_complete(system, user, on_thinking=None):
+        async def _fake_complete(system, user, on_thinking=None, response_json=False, cache_system_prefix=False):
             return '{"verdict": "warn", "reasoning": "ok", "metrics": {}}'
 
         mock_adapter = MagicMock()
@@ -301,6 +301,247 @@ class TestRunJudge:
         assert outcome.provider == "gemini"
         assert outcome.usage_input_tokens == 10
         assert outcome.usage_output_tokens == 5
+
+    @pytest.mark.asyncio
+    async def test_malformed_output_does_not_leak_raw_text_in_reasoning(self):
+        """Bug-6336: when judge output cannot be parsed, the raw LLM text
+        must NOT appear in the user-visible reasoning field."""
+        from unittest.mock import patch as _patch
+        from src.judge.judge import run_judge
+
+        raw_garbage = "I am not JSON, but I contain sensitive internal details 12345"
+
+        async def _fake_complete(system, user, on_thinking=None, response_json=False, cache_system_prefix=False):
+            return raw_garbage
+
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(side_effect=_fake_complete)
+        mock_adapter.last_usage = {"input_tokens": 50, "output_tokens": 30}
+
+        llm_config = types.SimpleNamespace(provider="openai", model_name="gpt-4o")
+        cfg = types.SimpleNamespace(
+            project_id=uuid.uuid4(),
+            judge_rubric_id=None,
+        )
+        db = AsyncMock()
+
+        with (
+            _patch("src.judge.judge.resolve_agent_llm_config",
+                   AsyncMock(return_value=llm_config)),
+            _patch("src.judge.judge.build_adapter", return_value=mock_adapter),
+        ):
+            outcome = await run_judge(
+                db=db, cfg=cfg,
+                system_prompt="## TASK\nTest",
+                user_message="question",
+                plan=None,
+                answer_text="answer",
+                sample_rows=[{"a": 1}],
+            )
+
+        assert outcome.verdict == "unknown"
+        # User-visible reasoning must NOT contain the raw LLM output
+        assert raw_garbage not in outcome.reasoning
+        assert "sensitive internal details" not in outcome.reasoning
+        assert "expected format" in outcome.reasoning
+        # Raw output preserved in debug-only field
+        assert outcome.raw_output is not None
+        assert raw_garbage in outcome.raw_output
+
+    @pytest.mark.asyncio
+    async def test_malformed_output_raw_capture_is_capped(self):
+        """Bug-6336: the debug-only raw_output capture must be truncated to
+        _RAW_OUTPUT_CAP chars so oversized malformed responses cannot bloat
+        logs or memory; the user-visible reasoning stays generic."""
+        from unittest.mock import patch as _patch
+        from src.judge.judge import run_judge, _RAW_OUTPUT_CAP
+
+        raw_garbage = "X" * (_RAW_OUTPUT_CAP * 3)
+
+        async def _fake_complete(system, user, on_thinking=None, response_json=False, cache_system_prefix=False):
+            return raw_garbage
+
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(side_effect=_fake_complete)
+        mock_adapter.last_usage = {}
+
+        llm_config = types.SimpleNamespace(provider="openai", model_name="gpt-4o")
+        cfg = types.SimpleNamespace(
+            project_id=uuid.uuid4(),
+            judge_rubric_id=None,
+        )
+        db = AsyncMock()
+
+        with (
+            _patch("src.judge.judge.resolve_agent_llm_config",
+                   AsyncMock(return_value=llm_config)),
+            _patch("src.judge.judge.build_adapter", return_value=mock_adapter),
+        ):
+            outcome = await run_judge(
+                db=db, cfg=cfg,
+                system_prompt="## TASK\nTest",
+                user_message="question",
+                plan=None,
+                answer_text="answer",
+                sample_rows=[{"a": 1}],
+            )
+
+        assert outcome.verdict == "unknown"
+        assert outcome.raw_output is not None
+        assert len(outcome.raw_output) == _RAW_OUTPUT_CAP
+        assert raw_garbage not in outcome.reasoning
+        assert "expected format" in outcome.reasoning
+
+    @pytest.mark.asyncio
+    async def test_truncated_sample_note_warns_about_unverifiable_claims(self):
+        """R11: when result_row_count > sample size, the prompt must warn
+        the judge that claims about unseen data cannot be verified."""
+        from unittest.mock import patch as _patch
+        from src.judge.judge import run_judge
+
+        captured_user = {}
+        captured_system = {}
+
+        async def _fake_complete(system, user, on_thinking=None, response_json=False, cache_system_prefix=False):
+            captured_system["value"] = system
+            captured_user["value"] = user
+            return '{"verdict": "pass", "reasoning": "ok", "metrics": {}}'
+
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(side_effect=_fake_complete)
+        mock_adapter.last_usage = {}
+
+        llm_config = types.SimpleNamespace(provider="openai", model_name="gpt-4o")
+        cfg = types.SimpleNamespace(
+            project_id=uuid.uuid4(),
+            judge_rubric_id=None,
+        )
+        db = AsyncMock()
+
+        with (
+            _patch("src.judge.judge.resolve_agent_llm_config",
+                   AsyncMock(return_value=llm_config)),
+            _patch("src.judge.judge.build_adapter", return_value=mock_adapter),
+        ):
+            await run_judge(
+                db=db, cfg=cfg,
+                system_prompt="## TASK\nTest",
+                user_message="question",
+                plan=None,
+                answer_text="answer",
+                sample_rows=[{"a": i} for i in range(5)],
+                result_row_count=500,
+            )
+
+        user_text = captured_user["value"]
+        assert "PARTIAL SAMPLE" in user_text
+        assert "cannot be verified" in user_text
+        # Must NOT tell judge to excuse unverifiable claims
+        # (case-insensitive: the old excuse existed in both "Do NOT" and
+        # "Do not" casings across the two prompt halves)
+        assert "do not penalise" not in user_text.lower()
+
+        # The static JUDGE_INSTRUCTIONS half of the R11 flip: the old
+        # edge-case text said "Do not penalise unverifiable claims"; the
+        # new text must forbid treating unseen-row claims as confirmed.
+        system_text = captured_system["value"]
+        system_flat = " ".join(system_text.split())
+        assert "penalise unverifiable" not in system_flat.lower()
+        assert "CANNOT be verified" in system_flat
+        assert "Do not treat such claims as confirmed" in system_flat
+
+    @pytest.mark.asyncio
+    async def test_equal_row_count_omits_partial_sample_note(self):
+        """When sample size equals total, no truncation note should appear."""
+        from unittest.mock import patch as _patch
+        from src.judge.judge import run_judge
+
+        captured_user = {}
+
+        async def _fake_complete(system, user, on_thinking=None, response_json=False, cache_system_prefix=False):
+            captured_user["value"] = user
+            return '{"verdict": "pass", "reasoning": "ok", "metrics": {}}'
+
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(side_effect=_fake_complete)
+        mock_adapter.last_usage = {}
+
+        llm_config = types.SimpleNamespace(provider="openai", model_name="gpt-4o")
+        cfg = types.SimpleNamespace(
+            project_id=uuid.uuid4(),
+            judge_rubric_id=None,
+        )
+        db = AsyncMock()
+
+        with (
+            _patch("src.judge.judge.resolve_agent_llm_config",
+                   AsyncMock(return_value=llm_config)),
+            _patch("src.judge.judge.build_adapter", return_value=mock_adapter),
+        ):
+            await run_judge(
+                db=db, cfg=cfg,
+                system_prompt="## TASK\nTest",
+                user_message="question",
+                plan=None,
+                answer_text="answer",
+                sample_rows=[{"a": 1}, {"a": 2}],
+                result_row_count=2,
+            )
+
+        user_text = captured_user["value"]
+        assert "PARTIAL SAMPLE" not in user_text
+
+    @pytest.mark.asyncio
+    async def test_judge_cap_triggers_partial_sample_note_without_row_count(self):
+        """R11: when result_row_count is None and the judge's own 50-row cap
+        truncates the sample, total falls back to len(sample_rows) and the
+        partial-sample note must still fire with an honest header."""
+        from unittest.mock import patch as _patch
+        from src.judge.judge import run_judge
+
+        captured_user = {}
+
+        async def _fake_complete(system, user, on_thinking=None, response_json=False, cache_system_prefix=False):
+            captured_user["value"] = user
+            return '{"verdict": "pass", "reasoning": "ok", "metrics": {}}'
+
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(side_effect=_fake_complete)
+        mock_adapter.last_usage = {}
+
+        llm_config = types.SimpleNamespace(provider="openai", model_name="gpt-4o")
+        cfg = types.SimpleNamespace(
+            project_id=uuid.uuid4(),
+            judge_rubric_id=None,
+        )
+        db = AsyncMock()
+
+        with (
+            _patch("src.judge.judge.resolve_agent_llm_config",
+                   AsyncMock(return_value=llm_config)),
+            _patch("src.judge.judge.build_adapter", return_value=mock_adapter),
+        ):
+            await run_judge(
+                db=db, cfg=cfg,
+                system_prompt="## TASK\nTest",
+                user_message="question",
+                plan=None,
+                answer_text="answer",
+                sample_rows=[{"a": i} for i in range(60)],
+                result_row_count=None,
+            )
+
+        user_text = captured_user["value"]
+        assert "60 total, showing 50" in user_text
+        assert "PARTIAL SAMPLE" in user_text
+        assert "Only 50 of 60" in user_text
+
+    def test_instructions_contain_illustrative_key_disclaimer(self):
+        """R8: JUDGE_INSTRUCTIONS must warn that example metric keys are
+        illustrative and the model should use rubric section titles."""
+        from src.judge.judge import JUDGE_INSTRUCTIONS
+        assert "illustrative" in JUDGE_INSTRUCTIONS
+        assert "do NOT copy the example keys" in JUDGE_INSTRUCTIONS
 
 
 # ---------------------------------------------------------------------------
@@ -347,41 +588,49 @@ class TestJudgeLlmFallback:
 
     @pytest.mark.asyncio
     async def test_judge_falls_back_to_answer_config(self):
+        """An unset ``judge_llm_config_id`` uses the answer config.
+
+        The session below EVALUATES the emitted predicates rather than
+        returning a canned row. That matters because the config lookup is no
+        longer a ``db.get``: it is a SELECT carrying
+        ``project_id == <path project>``, since a stored id belonging to
+        another project must not resolve to that project's encrypted provider
+        key. The fallback and the scope are asserted together here so the two
+        cannot drift apart.
+        """
         from unittest.mock import patch as _patch
+
+        from shared.db.models import LLMProviderConfig, ProjectAgentConfig
         from shared.llm.config_resolution import resolve_agent_llm_config
 
+        from .test_body_fk_project_scope import _PredicateSession, _llm
+
+        project_id = uuid.uuid4()
         answer_config_id = uuid.uuid4()
-        llm_record = types.SimpleNamespace(
-            id=answer_config_id,
-            provider="openai",
-            model_name="gpt-4o",
-            display_name="GPT-4o",
-            encrypted_api_key=None,
-            base_url=None,
-            temperature=None,
-            max_tokens=None,
-            timeout_seconds=None,
-        )
+        record = _llm(project_id, answer_config_id)
+        record.provider = "openai"
+        record.model_name = "gpt-4o"
 
-        cfg = types.SimpleNamespace(
-            answer_llm_config_id=answer_config_id,
-            judge_llm_config_id=None,
-        )
-
-        db = AsyncMock()
-        cfg_result = MagicMock()
-        cfg_result.scalar_one_or_none.return_value = cfg
-        db.execute = AsyncMock(return_value=cfg_result)
-        db.get = AsyncMock(return_value=llm_record)
+        db = _PredicateSession({
+            ProjectAgentConfig: [
+                ProjectAgentConfig(
+                    id=uuid.uuid4(),
+                    project_id=project_id,
+                    answer_llm_config_id=answer_config_id,
+                    judge_llm_config_id=None,
+                )
+            ],
+            LLMProviderConfig: [record],
+        })
 
         with _patch("shared.llm.adapter.decrypt_api_key", return_value="sk-test"):
-            result = await resolve_agent_llm_config(uuid.uuid4(), "judge", db)
+            result = await resolve_agent_llm_config(project_id, "judge", db)
 
         assert result.provider == "openai"
         assert result.model_name == "gpt-4o"
-        db.get.assert_called_once()
-        call_args = db.get.call_args
-        assert call_args[0][1] == answer_config_id
+        sql = str(db.executed[-1].compile())
+        assert "llm_provider_configs.id =" in sql
+        assert "llm_provider_configs.project_id =" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +712,11 @@ class TestJudgeCostProviderIntegration:
             provider="openai",
         )
 
-        bundle = types.SimpleNamespace(system="## TASK\nTest")
+        bundle = types.SimpleNamespace(
+            system="## TASK\nTest",
+            system_sections=[("## TASK", "Test")],
+            grounding_matches="",
+        )
 
         mock_db = AsyncMock()
         mock_db.get = AsyncMock(return_value=conv_obj)
@@ -477,13 +730,15 @@ class TestJudgeCostProviderIntegration:
             tenant_id="test-tenant",
             user_id=uuid.uuid4(),
             raw_token="fake-jwt",
+            role="member",
         )
+        conv_obj.caller_ref = str(current_user.user_id)
         async def _gen(*a, **kw):
             yield mock_db
 
         with (
             _patch("src.api.conversations.get_tenant_db", _gen),
-            _patch("src.api.conversations._require_agent_enabled",
+            _patch("src.api.conversations._require_project_access_and_agent",
                    AsyncMock(return_value=cfg_row)),
             _patch("src.api.conversations.run_turn",
                    AsyncMock(return_value=outcome)),
@@ -499,7 +754,7 @@ class TestJudgeCostProviderIntegration:
             _patch("src.api.conversations.apply_judge_block"),
             _patch("src.api.conversations.dispatch_event", AsyncMock()),
             _patch("src.api.conversations._redact_trace",
-                   lambda t, c: t),
+                   lambda t, c, **kw: t),
         ):
             await send_message(
                 project_id=project_id,
@@ -507,6 +762,7 @@ class TestJudgeCostProviderIntegration:
                 body=MessageSend(text="Show revenue"),
                 background_tasks=background_tasks,
                 current_user=current_user,
+                idempotency_key=None,
             )
 
         record_cost_mock.assert_called_once()

@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from shared.auth.middleware import CurrentServiceUser
 from shared.security.predicate_compiler import (
     CompiledPredicate,
     Principal,
@@ -107,6 +108,16 @@ class TestDslCompilation:
     def test_rejects_unknown_function(self):
         with pytest.raises(RowSecurityCompileError):
             _compile_dsl_expression("rm_rf('/', '/')")
+
+    def test_f007_01_dimension_in_is_rejected(self):
+        """F-007-01: ``dimension_in`` is not a supported DSL function.
+        Seed predicates must use ``in(...)``. Guard: compiler still rejects
+        the invalid token so a drifted live tenant cannot silently compile.
+        """
+        with pytest.raises(RowSecurityCompileError, match="unknown row-security function"):
+            _compile_dsl_expression(
+                "dimension_in('region.region_code', 'FR', 'EMEA')"
+            )
 
     def test_rejects_unquoted_value(self):
         with pytest.raises(RowSecurityCompileError):
@@ -228,7 +239,13 @@ def _fake_db_with_rules(rules, mapping_table=None):
 
 
 @pytest.mark.asyncio
-async def test_compile_returns_none_when_no_rule_matches():
+async def test_compile_fails_closed_when_role_rule_exists_but_none_matches():
+    """F-007-01: a model that defines a role_predicate rule governs an audience.
+    A principal who matches NO role_predicate rule (typo'd/renamed IdP role, or a
+    genuine non-member) must be DENIED every row — a deny-all predicate — not
+    treated as unrestricted (the old return-None no-op left them reading all
+    rows). ``has_active_rules`` reports the policy active so the router injects
+    the deny."""
     rule = _make_rule_row_predicate(
         "north",
         "region.region_code",
@@ -238,7 +255,281 @@ async def test_compile_returns_none_when_no_rule_matches():
     db = _fake_db_with_rules([rule])
     principal = Principal(user_identity="u@x", roles=frozenset({"viewer"}))
     out = await compile_row_security(uuid.uuid4(), principal, db)
+    assert out is not None
+    # Deny-all predicate admits no row.
+    assert out.sql_expression == "0 = 1"
+    assert has_active_rules(out) is True
+    # Empty security columns -> aggregate/pocket are never RLS-safe (source only).
+    assert out.security_dimension_columns == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["tenant_admin", "modeler", "system_admin"])
+async def test_privileged_role_is_exempt_from_unmatched_audience_denial(role):
+    """Bug-8447 Option B exempts only the unmatched-audience coverage gate."""
+    rule = _make_rule_row_predicate(
+        "north", "region.region_code",
+        "dimension_equals('region.region_code', 'NORTH')", ["member"],
+    )
+    out = await compile_row_security(
+        uuid.uuid4(),
+        Principal(user_identity="admin@x", roles=frozenset({role})),
+        _fake_db_with_rules([rule]),
+    )
     assert out is None
+
+
+@pytest.mark.asyncio
+async def test_privileged_role_still_obeys_rule_that_explicitly_targets_it():
+    rule = _make_rule_row_predicate(
+        "admin-north", "region.region_code",
+        "dimension_equals('region.region_code', 'NORTH')", ["tenant_admin"],
+    )
+    out = await compile_row_security(
+        uuid.uuid4(),
+        Principal(user_identity="admin@x", roles=frozenset({"tenant_admin"})),
+        _fake_db_with_rules([rule]),
+    )
+    assert out is not None
+    assert out.sql_expression != "0 = 1"
+    assert "'NORTH'" in out.sql_expression
+
+
+@pytest.mark.asyncio
+async def test_kpi_service_principal_remains_fail_closed_when_unmatched():
+    rule = _make_rule_row_predicate(
+        "members", "region.region_code",
+        "dimension_equals('region.region_code', 'NORTH')", ["member"],
+    )
+    out = await compile_row_security(
+        uuid.uuid4(),
+        Principal(
+            user_identity="service:kpi-evaluator",
+            roles=frozenset({"kpi_evaluator"}),
+        ),
+        _fake_db_with_rules([rule]),
+    )
+    assert out is not None
+    assert out.sql_expression == "0 = 1"
+
+
+@pytest.mark.asyncio
+async def test_internal_kpi_snapshot_coverage_exemption_preserves_rls_rules():
+    """Bug-9257: the signed KPI snapshot hop may compute the global value,
+    while a normal kpi_evaluator principal remains deny-all and wildcard rules
+    still apply to the explicitly opted-in operation."""
+    unmatched_rule = _make_rule_row_predicate(
+        "members", "region.region_code",
+        "dimension_equals('region.region_code', 'NORTH')", ["member"],
+    )
+    out = await compile_row_security(
+        uuid.uuid4(),
+        Principal(
+            user_identity="service:kpi-snapshot-sweep",
+            roles=frozenset({"kpi_evaluator"}),
+            unmatched_role_coverage_exempt=True,
+        ),
+        _fake_db_with_rules([unmatched_rule]),
+    )
+    assert out is None
+
+    wildcard = _make_rule_row_predicate(
+        "everyone", "region.region_code",
+        "dimension_equals('region.region_code', 'NORTH')", ["*"],
+    )
+    out = await compile_row_security(
+        uuid.uuid4(),
+        Principal(
+            user_identity="service:kpi-snapshot-sweep",
+            roles=frozenset({"kpi_evaluator"}),
+            unmatched_role_coverage_exempt=True,
+        ),
+        _fake_db_with_rules([wildcard]),
+    )
+    assert out is not None
+    assert "NORTH" in out.sql_expression
+
+
+@pytest.mark.asyncio
+async def test_privileged_service_principal_is_exempt_for_full_data_operations():
+    """Privileged internal operations need the same role-based exemption.
+
+    Pocket materialisation, data-quality introspection, and aggregate rebuilds
+    intentionally mint service tokens with a privileged platform role. The
+    service adapter must preserve that role so unmatched audience rules do not
+    accidentally narrow a full-data maintenance operation.
+    """
+    rule = _make_rule_row_predicate(
+        "members", "region.region_code",
+        "dimension_equals('region.region_code', 'NORTH')", ["member"],
+    )
+    service_user = CurrentServiceUser(
+        principal="pocket-refresh",
+        tenant_id="tenant-1",
+        role="system_admin",
+        scopes=["pocket:refresh"],
+    )
+
+    out = await compile_row_security(
+        uuid.uuid4(),
+        Principal.from_current_user(service_user),
+        _fake_db_with_rules([rule]),
+    )
+
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_subjectless_embed_principal_remains_fail_closed_when_unmatched():
+    rule = _make_rule_row_predicate(
+        "members", "region.region_code",
+        "dimension_equals('region.region_code', 'NORTH')", ["member"],
+    )
+    out = await compile_row_security(
+        uuid.uuid4(),
+        Principal(user_identity="embed-user", roles=frozenset()),
+        _fake_db_with_rules([rule]),
+    )
+    assert out is not None
+    assert out.sql_expression == "0 = 1"
+
+
+@pytest.mark.asyncio
+async def test_compile_returns_none_when_model_has_no_role_rules():
+    """A model with only a user_mapping rule (or no role_predicate rules) is not
+    a role-governed audience, so a principal outside it is genuinely
+    unrestricted — compile returns None (no injection)."""
+    rule = _make_rule_user_mapping(
+        "map", "region.region_code", uuid.uuid4(), "user_email", "region_code",
+    )
+    # Principal with no user_identity -> user_mapping does not apply, and there
+    # is no role_predicate rule, so the result is a no-op.
+    db = _fake_db_with_rules([rule])
+    principal = Principal(user_identity="", roles=frozenset({"viewer"}))
+    out = await compile_row_security(uuid.uuid4(), principal, db)
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_compile_multi_role_grants_are_ored():
+    """F-007-03: a principal holding two roles, each with its own grant rule, is
+    entitled to the UNION of those grants — the fragments OR together, not AND
+    (the old AND made a France+Germany manager see the empty intersection)."""
+    r_fr = _make_rule_row_predicate(
+        "france",
+        "region.region_code",
+        "dimension_equals('region.region_code', 'FR')",
+        ["mgr_fr"],
+    )
+    r_de = _make_rule_row_predicate(
+        "germany",
+        "region.region_code",
+        "dimension_equals('region.region_code', 'DE')",
+        ["mgr_de"],
+    )
+    db = _fake_db_with_rules([r_fr, r_de])
+    principal = Principal(
+        user_identity="u@x", roles=frozenset({"mgr_fr", "mgr_de"}),
+    )
+    out = await compile_row_security(uuid.uuid4(), principal, db)
+    assert out is not None
+    # UNION of the two grants: OR, never AND (AND would be the empty set).
+    assert " OR " in out.sql_expression
+    assert " AND " not in out.sql_expression
+    assert "'FR'" in out.sql_expression and "'DE'" in out.sql_expression
+    assert set(out.active_rule_ids) == {str(r_fr.id), str(r_de.id)}
+
+
+@pytest.mark.asyncio
+async def test_compile_wildcard_baseline_ands_with_named_grant():
+    """Fable B2-1: a wildcard ('*') rule is a UNIVERSAL restriction every
+    principal must satisfy. It must AND as a mandatory baseline with the named
+    role grants, NEVER OR with them — OR'ing let a named-role caller bypass the
+    universal floor (e.g. read inactive rows past a wildcard active='true')."""
+    wildcard = _make_rule_row_predicate(
+        "active-floor",
+        "status.active",
+        "dimension_equals('status.active', 'true')",
+        ["*"],
+    )
+    named = _make_rule_row_predicate(
+        "germany",
+        "region.region_code",
+        "dimension_equals('region.region_code', 'DE')",
+        ["mgr_de"],
+    )
+    db = _fake_db_with_rules([wildcard, named])
+    principal = Principal(user_identity="u@x", roles=frozenset({"mgr_de"}))
+    out = await compile_row_security(uuid.uuid4(), principal, db)
+    assert out is not None
+    # The wildcard floor ANDs with the named grant — the caller must satisfy
+    # BOTH active='true' AND region='DE'. It must NOT be OR'd.
+    assert '"active" = \'true\'' in out.sql_expression
+    assert '"region_code" = \'DE\'' in out.sql_expression
+    assert " AND " in out.sql_expression
+    # The wildcard fragment is not inside an OR alternative with the grant.
+    assert "'true' OR" not in out.sql_expression
+    assert "OR \"active\"" not in out.sql_expression
+
+
+@pytest.mark.asyncio
+async def test_compile_wildcard_baseline_ands_with_multirole_grants():
+    """Fable B2-1: wildcard baseline ANDs OUTSIDE the multi-role OR — the
+    effective predicate is wildcard AND (grant_fr OR grant_de)."""
+    wildcard = _make_rule_row_predicate(
+        "active-floor", "status.active",
+        "dimension_equals('status.active', 'true')", ["*"],
+    )
+    r_fr = _make_rule_row_predicate(
+        "france", "region.region_code",
+        "dimension_equals('region.region_code', 'FR')", ["mgr_fr"],
+    )
+    r_de = _make_rule_row_predicate(
+        "germany", "region.region_code",
+        "dimension_equals('region.region_code', 'DE')", ["mgr_de"],
+    )
+    db = _fake_db_with_rules([wildcard, r_fr, r_de])
+    principal = Principal(
+        user_identity="u@x", roles=frozenset({"mgr_fr", "mgr_de"}),
+    )
+    out = await compile_row_security(uuid.uuid4(), principal, db)
+    assert out is not None
+    # Union of FR/DE grants is OR'd, but ANDed with the universal active floor.
+    assert " OR " in out.sql_expression
+    assert '"active" = \'true\'' in out.sql_expression
+    assert " AND " in out.sql_expression
+
+
+@pytest.mark.asyncio
+async def test_compile_denies_when_role_audience_unmatched_but_user_mapping_matches():
+    """Fable B2-2: a model with BOTH a role_predicate rule and a user_mapping
+    rule is role-governed. A principal who matches the user_mapping but NO role
+    rule must be DENIED every row of the role audience — the user_mapping match
+    must NOT satisfy role-audience coverage (which previously left the role
+    dimension unrestricted for that caller)."""
+    role_rule = _make_rule_row_predicate(
+        "france", "region.region_code",
+        "dimension_equals('region.region_code', 'FR')", ["mgr_fr"],
+    )
+    mapping_rule = _make_rule_user_mapping(
+        "dept-map", "dept.code", uuid.uuid4(), "user_email", "dept_code",
+    )
+    db = _fake_db_with_rules(
+        [role_rule, mapping_rule],
+        mapping_table=types.SimpleNamespace(
+            id=mapping_rule.mapping_table_id, physical_name="dept_map",
+            source_id="src-1",
+        ),
+    )
+    # Principal has a valid identity (matches user_mapping) but role 'viewer'
+    # (does NOT match the role rule).
+    principal = Principal(user_identity="bob@x", roles=frozenset({"viewer"}))
+    out = await compile_row_security(uuid.uuid4(), principal, db)
+    assert out is not None
+    # Fail closed: deny-all, NOT the user_mapping predicate alone (which would
+    # leave the region audience unrestricted).
+    assert out.sql_expression == "0 = 1"
+    assert has_active_rules(out) is True
 
 
 @pytest.mark.asyncio
@@ -321,6 +612,114 @@ async def test_compile_user_mapping_emits_in_subquery():
 
 
 # ---------------------------------------------------------------------------
+# Bug-5559: SQL injection via user_identity literal (user_mapping)
+# ---------------------------------------------------------------------------
+
+
+async def _compile_user_mapping_with_identity(user_identity: str, connector: str = "postgresql") -> str:
+    """Helper: compile a user_mapping rule and return the SQL expression."""
+    table = types.SimpleNamespace(
+        id=uuid.uuid4(),
+        physical_name="demo_data.user_region_map",
+    )
+    rule = _make_rule_user_mapping(
+        "per_user_region",
+        "region.region_code",
+        table.id,
+        "user_id",
+        "region_code",
+    )
+    db = _fake_db_with_rules([rule], mapping_table=table)
+    principal = Principal(user_identity=user_identity, roles=frozenset())
+    out = await compile_row_security(uuid.uuid4(), principal, db, connector=connector)
+    assert out is not None
+    return out.sql_expression
+
+
+@pytest.mark.asyncio
+async def test_user_mapping_single_quote_injection():
+    """Bug-5559: single-quote injection attempt must be escaped, not break out."""
+    sql = await _compile_user_mapping_with_identity("'; DROP TABLE users; --")
+    # The injected payload must appear entirely inside the string literal,
+    # never as executable SQL. The literal should contain the escaped quote.
+    assert "DROP TABLE" in sql  # the text is there, but as a string value
+    # The SQL must have exactly two top-level single-quote delimiters around
+    # the user literal (open + close), with the embedded quote doubled.
+    assert "'''; DROP TABLE users; --'" in sql or "''''" in sql
+
+
+@pytest.mark.asyncio
+async def test_user_mapping_backslash_escape_injection_postgresql():
+    """Bug-5559: backslash-quote sequence must not break out on PostgreSQL."""
+    sql = await _compile_user_mapping_with_identity("\\'; DROP TABLE users; --", "postgresql")
+    # In PostgreSQL (standard_conforming_strings=on), backslash is literal.
+    # The entire payload must remain inside the string literal.
+    # Count unescaped SQL statement terminators outside string context:
+    # the WHERE clause should have exactly one = sign for the user_col comparison.
+    assert sql.count("WHERE") == 1
+    assert "DROP TABLE" in sql  # present as data, not as executable SQL
+
+
+@pytest.mark.asyncio
+async def test_user_mapping_backslash_escape_injection_bigquery():
+    """Bug-5559: backslash-quote on BigQuery uses backslash escaping."""
+    sql = await _compile_user_mapping_with_identity("\\'; DROP TABLE users; --", "bigquery")
+    # BigQuery escapes single quotes with backslash inside string literals.
+    # The backslash in the input must also be escaped.
+    assert sql.count("WHERE") == 1
+    assert "DROP TABLE" in sql  # present as data, not as executable SQL
+
+
+@pytest.mark.asyncio
+async def test_user_mapping_nested_double_quote_injection():
+    """Bug-5559: nested doubled quotes must not break literal boundaries."""
+    sql = await _compile_user_mapping_with_identity("a]''b]'; DROP TABLE x; --")
+    assert sql.count("WHERE") == 1
+    assert "DROP TABLE" in sql  # text is inside the literal
+
+
+@pytest.mark.asyncio
+async def test_user_mapping_unicode_escape_injection():
+    """Bug-5559: Unicode apostrophe (U+0027) in identity must be escaped."""
+    # U+0027 is the standard ASCII single quote
+    payload = "admin'; DROP TABLE x"
+    sql = await _compile_user_mapping_with_identity(payload)
+    assert sql.count("WHERE") == 1
+    assert "DROP TABLE" in sql  # present as data
+
+
+@pytest.mark.asyncio
+async def test_user_mapping_normal_email_unchanged():
+    """Bug-5559: normal user_identity values produce identical SQL to before."""
+    sql = await _compile_user_mapping_with_identity("alice@example.com")
+    assert "'alice@example.com'" in sql
+
+
+@pytest.mark.asyncio
+async def test_user_mapping_email_with_apostrophe():
+    """Bug-5559: legitimate O'Brien-style names are properly escaped."""
+    sql = await _compile_user_mapping_with_identity("o'brien@example.com", "postgresql")
+    assert "'o''brien@example.com'" in sql
+
+
+@pytest.mark.asyncio
+async def test_user_mapping_sqlserver_connector():
+    """Bug-5559: SQL Server (tsql) dialect produces correct escaping."""
+    sql = await _compile_user_mapping_with_identity("alice@x", "sqlserver")
+    assert "'alice@x'" in sql
+    # SQL Server uses bracket quoting for identifiers
+    assert "[region_code]" in sql
+
+
+@pytest.mark.asyncio
+async def test_user_mapping_bigquery_normal():
+    """Bug-5559: BigQuery dialect produces correct literal and backtick identifiers."""
+    sql = await _compile_user_mapping_with_identity("alice@x", "bigquery")
+    assert "'alice@x'" in sql
+    assert "`region_code`" in sql
+
+
+# ---------------------------------------------------------------------------
 # has_active_rules — router bypass gate
 # ---------------------------------------------------------------------------
 
@@ -342,3 +741,52 @@ class TestHasActiveRules:
             security_dimension_columns=("r",),
         )
         assert has_active_rules(pred)
+
+
+# ---------------------------------------------------------------------------
+# Bug-7039: mapping_source_ids tracking for cross-source validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compile_user_mapping_tracks_mapping_source_id():
+    """Bug-7039: the compiled predicate must expose the source_id of each
+    user_mapping rule's mapping table so the router can validate
+    cross-source compatibility at routing time."""
+    src_id = uuid.uuid4()
+    table = types.SimpleNamespace(
+        id=uuid.uuid4(),
+        physical_name="demo_data.user_region_map",
+        source_id=src_id,
+    )
+    rule = _make_rule_user_mapping(
+        "per_user_region",
+        "region.region_code",
+        table.id,
+        "user_id",
+        "region_code",
+    )
+    db = _fake_db_with_rules([rule], mapping_table=table)
+    principal = Principal(user_identity="alice@x", roles=frozenset())
+    out = await compile_row_security(uuid.uuid4(), principal, db)
+    assert out is not None
+    assert out.mapping_source_ids == (str(src_id),)
+
+
+@pytest.mark.asyncio
+async def test_role_predicate_has_no_mapping_source_ids():
+    """Role-predicate rules do not reference mapping tables, so
+    mapping_source_ids should be empty."""
+    rule = _make_rule_row_predicate(
+        "north",
+        "region.region_code",
+        "dimension_equals('region.region_code', 'NORTH')",
+        ["region_manager_north"],
+    )
+    db = _fake_db_with_rules([rule])
+    principal = Principal(
+        user_identity="alice@x", roles=frozenset({"region_manager_north"})
+    )
+    out = await compile_row_security(uuid.uuid4(), principal, db)
+    assert out is not None
+    assert out.mapping_source_ids == ()

@@ -7,7 +7,38 @@ export interface PivotFieldMapping {
   filterFields: string[];
 }
 
-function findHierarchy(hierarchyMap: Map<string, Excel.PivotHierarchy>, field: string): Excel.PivotHierarchy | undefined {
+export interface ResolvedPivotFieldMapping {
+  rowFields: Excel.PivotHierarchy[];
+  columnFields: Excel.PivotHierarchy[];
+  dataFields: Excel.PivotHierarchy[];
+  filterFields: Excel.PivotHierarchy[];
+}
+
+const PIVOT_ZONE_LABELS: Record<keyof PivotFieldMapping, string> = {
+  rowFields: 'Rows',
+  columnFields: 'Columns',
+  dataFields: 'Values',
+  filterFields: 'Filters',
+};
+
+export class PivotFieldResolutionError extends Error {
+  readonly unresolvedByZone: Record<keyof PivotFieldMapping, string[]>;
+
+  constructor(unresolvedByZone: Record<keyof PivotFieldMapping, string[]>) {
+    const details = (Object.keys(unresolvedByZone) as Array<keyof PivotFieldMapping>)
+      .filter(zone => unresolvedByZone[zone].length > 0)
+      .map(zone => `${PIVOT_ZONE_LABELS[zone]}: ${unresolvedByZone[zone].join(', ')}`)
+      .join('; ');
+    super(`Cannot create local PivotTable because Excel did not expose requested fields. ${details}`);
+    this.name = 'PivotFieldResolutionError';
+    this.unresolvedByZone = unresolvedByZone;
+  }
+}
+
+export function findPivotHierarchy(
+  hierarchyMap: Map<string, Excel.PivotHierarchy>,
+  field: string,
+): Excel.PivotHierarchy | undefined {
   // F-36: Exact match only (case-insensitive, trimmed). Fuzzy includes() removed.
   const exact = hierarchyMap.get(field);
   if (exact) return exact;
@@ -18,91 +49,40 @@ function findHierarchy(hierarchyMap: Map<string, Excel.PivotHierarchy>, field: s
   return undefined;
 }
 
-export async function insertPivotTableWithMapping(
-  sourceRangeAddress: string,
+export function resolvePivotFieldMapping(
+  hierarchyMap: Map<string, Excel.PivotHierarchy>,
   fieldMapping: PivotFieldMapping,
-  baseSheetName?: string,
-): Promise<Excel.PivotTable> {
-  return await Excel.run(async (context) => {
-    const sheets = context.workbook.worksheets;
-    sheets.load('items/name');
-    await context.sync();
+): ResolvedPivotFieldMapping {
+  const unresolvedByZone: Record<keyof PivotFieldMapping, string[]> = {
+    rowFields: [],
+    columnFields: [],
+    dataFields: [],
+    filterFields: [],
+  };
 
-    const desiredName = baseSheetName || 'Local Pivot';
-    const existingNames = new Set(sheets.items.map(s => s.name));
-    let sheetName = desiredName;
-    let counter = 1;
-    while (existingNames.has(sheetName)) {
-      sheetName = `${desiredName} (${counter})`;
-      counter++;
-    }
-
-    const newSheet = sheets.add(sheetName);
-    newSheet.activate();
-
-    const pivotRange = newSheet.getRange('A1');
-    const pivotTable = newSheet.pivotTables.add(
-      'TessalliteLocalPivot',
-      sourceRangeAddress,
-      pivotRange,
-    );
-
-    pivotTable.load('hierarchies');
-    await context.sync();
-
-    const hierarchies = pivotTable.hierarchies;
-    hierarchies.load('items/name');
-    await context.sync();
-
-    const hierarchyMap = new Map<string, Excel.PivotHierarchy>();
-    for (const item of hierarchies.items) {
-      item.load('name');
-    }
-    await context.sync();
-    for (const item of hierarchies.items) {
-      hierarchyMap.set(item.name, item);
-    }
-
-    for (const field of fieldMapping.rowFields) {
-      const hier = findHierarchy(hierarchyMap, field);
-      if (hier) {
-        pivotTable.rowHierarchies.add(hier);
+  const resolveZone = (zone: keyof PivotFieldMapping): Excel.PivotHierarchy[] => {
+    const resolved: Excel.PivotHierarchy[] = [];
+    for (const field of fieldMapping[zone]) {
+      const hierarchy = findPivotHierarchy(hierarchyMap, field);
+      if (hierarchy) {
+        resolved.push(hierarchy);
+      } else {
+        unresolvedByZone[zone].push(field);
       }
     }
+    return resolved;
+  };
 
-    for (const field of fieldMapping.columnFields) {
-      const hier = findHierarchy(hierarchyMap, field);
-      if (hier) {
-        pivotTable.columnHierarchies.add(hier);
-      }
-    }
+  const resolved = {
+    rowFields: resolveZone('rowFields'),
+    columnFields: resolveZone('columnFields'),
+    dataFields: resolveZone('dataFields'),
+    filterFields: resolveZone('filterFields'),
+  };
 
-    for (const field of fieldMapping.filterFields) {
-      const hier = findHierarchy(hierarchyMap, field);
-      if (hier) {
-        pivotTable.filterHierarchies.add(hier);
-      }
-    }
+  if ((Object.keys(unresolvedByZone) as Array<keyof PivotFieldMapping>).some(zone => unresolvedByZone[zone].length > 0)) {
+    throw new PivotFieldResolutionError(unresolvedByZone);
+  }
 
-    for (const field of fieldMapping.dataFields) {
-      const hier = findHierarchy(hierarchyMap, field);
-      if (hier) {
-        pivotTable.dataHierarchies.add(hier);
-      }
-    }
-
-    await context.sync();
-    return pivotTable;
-  });
-}
-
-export async function insertEmptyPivotTable(
-  sourceRangeAddress: string,
-  baseSheetName?: string,
-): Promise<Excel.PivotTable> {
-  return insertPivotTableWithMapping(
-    sourceRangeAddress,
-    { rowFields: [], columnFields: [], dataFields: [], filterFields: [] },
-    baseSheetName,
-  );
+  return resolved;
 }

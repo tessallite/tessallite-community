@@ -1,3 +1,28 @@
+# Stage 0: Build excel-plugin from source
+# Mirrors the Cloud Run Dockerfile.frontend plugin-builder stage so a fresh
+# clone can build the frontend image without a pre-existing excel-plugin/dist.
+FROM node:20-alpine AS plugin-builder
+
+WORKDIR /plugin
+COPY excel-plugin/package.json excel-plugin/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+
+# excel-plugin/tsconfig.json resolves @tessallite/shared-ui to ../shared-ui
+RUN ln -s /plugin/node_modules /node_modules
+COPY shared-ui/ /shared-ui/
+COPY excel-plugin/ ./
+
+# Build the plugin (tsc + vite -> dist/)
+RUN npm run build
+
+# Generate the production manifest from the template.
+# For local compose deploys the domain defaults to localhost.
+ARG APP_DOMAIN=localhost:3000
+ENV PLUGIN_BASE_URL="http://${APP_DOMAIN}"
+RUN apk add --no-cache gettext && \
+    envsubst '$PLUGIN_BASE_URL' < manifest.xml.template > dist/manifest.xml
+
 # Stage 1: build React app
 FROM node:20-alpine AS builder
 
@@ -60,9 +85,13 @@ ENV VITE_MODEL_SERVICE_URL=$VITE_MODEL_SERVICE_URL
 RUN npm run build
 
 # Stage 2: serve with nginx (same-origin API proxy)
-FROM nginx:1.25-alpine
+FROM nginx:1.31.3-alpine
 
-RUN mkdir -p /etc/nginx/certs && apk add --no-cache openssl
+# Bug-9365 / F-030-01: njs fan-out so SPA /health actually probes gateway,
+# query-router, and model-service. Nested auth_request cannot AND three backends.
+RUN apk add --no-cache openssl nginx-module-njs && \
+    sed -i '1i load_module modules/ngx_http_js_module.so;' /etc/nginx/nginx.conf && \
+    mkdir -p /etc/nginx/certs /etc/nginx/njs
 
 # Self-heal TLS: nginx.conf.template requires a cert unconditionally. This
 # entrypoint hook (run before nginx by the base image) generates a self-signed
@@ -72,7 +101,9 @@ COPY frontend/docker-entrypoint.d/05-ensure-cert.sh /docker-entrypoint.d/05-ensu
 RUN chmod +x /docker-entrypoint.d/05-ensure-cert.sh
 
 COPY --from=builder /app/frontend/dist /usr/share/nginx/html
-COPY excel-plugin/dist /usr/share/nginx/html/excel-plugin
+COPY --from=plugin-builder /plugin/dist /usr/share/nginx/html/excel-plugin
+COPY frontend/njs/health_and.js /etc/nginx/njs/health_and.js
+COPY frontend/njs/00-njs-health.conf /etc/nginx/conf.d/00-njs-health.conf
 
 # The official nginx image processes files under /etc/nginx/templates/
 # through envsubst at container start-up. Restrict substitution to our
@@ -102,11 +133,16 @@ ENV GATEWAY_HOST=gateway
 ENV AGENT_SERVICE_URL=http://agent-service:8000
 ENV AGENT_SERVICE_HOST=agent-service
 
-RUN chown -R nginx:nginx /usr/share/nginx/html /var/cache/nginx /var/log/nginx /etc/nginx/conf.d /etc/nginx/certs && \
+RUN chown -R nginx:nginx /usr/share/nginx/html /var/cache/nginx /var/log/nginx /etc/nginx/conf.d /etc/nginx/certs /etc/nginx/njs && \
     chmod -R 755 /usr/share/nginx/html && \
     touch /var/run/nginx.pid && chown nginx:nginx /var/run/nginx.pid
 USER nginx
 
 EXPOSE 3000 3443
+
+# Bug-7759: embed the source-tree commit SHA so release_bundle provenance
+# checks (Bug-7483/7495) can verify image-to-source alignment.
+ARG GIT_REVISION=""
+LABEL org.opencontainers.image.revision=$GIT_REVISION
 
 CMD ["nginx", "-g", "daemon off;"]

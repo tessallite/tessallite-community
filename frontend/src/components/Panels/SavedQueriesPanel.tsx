@@ -6,11 +6,14 @@ import {
   Alert,
   Box,
   Button,
+  Checkbox,
+  Chip,
   CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
   DialogTitle,
+  FormControlLabel,
   IconButton,
   List,
   ListItem,
@@ -56,7 +59,12 @@ export default function SavedQueriesPanel() {
 
   const [createOpen, setCreateOpen] = useState(false);
   const [editItem, setEditItem] = useState<SavedQuery | null>(null);
-  const [form, setForm] = useState({ name: "", description: "", query_text: "" });
+  const [form, setForm] = useState({
+    name: "",
+    description: "",
+    query_text: "",
+    is_shared: false,
+  });
   const [error, setError] = useState<string | null>(null);
 
   const createMutation = useMutation({
@@ -65,13 +73,24 @@ export default function SavedQueriesPanel() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["savedQueries", projectId, modelId] });
       setCreateOpen(false);
-      setForm({ name: "", description: "", query_text: "" });
+      setForm({
+        name: "",
+        description: "",
+        query_text: "",
+        is_shared: false,
+      });
     },
     onError: (err: unknown) => setError(errorDetail(err, t("savedQueries.saveFailed"))),
   });
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, ...data }: { id: string; name?: string; description?: string; query_text?: string }) =>
+    mutationFn: ({ id, ...data }: {
+      id: string;
+      name?: string;
+      description?: string;
+      query_text?: string;
+      is_shared?: boolean;
+    }) =>
       savedQueriesApi.update(projectId!, modelId!, id, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["savedQueries", projectId, modelId] });
@@ -123,7 +142,12 @@ export default function SavedQueriesPanel() {
           variant="contained"
           startIcon={<AddIcon />}
           onClick={() => {
-            setForm({ name: "", description: "", query_text: "" });
+            setForm({
+              name: "",
+              description: "",
+              query_text: "",
+              is_shared: false,
+            });
             setCreateOpen(true);
           }}
         >
@@ -162,36 +186,54 @@ export default function SavedQueriesPanel() {
                       <ContentCopyIcon fontSize="small" />
                     </IconButton>
                   </Tooltip>
-                  <Tooltip title={t("common.edit")}>
-                    <IconButton
-                      size="small"
-                      onClick={() => {
-                        setEditItem(q);
-                        setForm({
-                          name: q.name,
-                          description: q.description ?? "",
-                          query_text: q.query_text,
-                        });
-                      }}
-                    >
-                      <EditIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
-                  <Tooltip title={t("common.delete")}>
-                    <IconButton
-                      size="small"
-                      onClick={() => handleDelete(q)}
-                      disabled={deleteMutation.isPending}
-                    >
-                      <DeleteIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
+                  {q.can_edit !== false && (
+                    <Tooltip title={t("common.edit")}>
+                      <IconButton
+                        size="small"
+                        onClick={() => {
+                          setEditItem(q);
+                          setForm({
+                            name: q.name,
+                            description: q.description ?? "",
+                            query_text: q.query_text,
+                            is_shared: q.is_shared,
+                          });
+                        }}
+                      >
+                        <EditIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  )}
+                  {q.can_edit !== false && (
+                    <Tooltip title={t("common.delete")}>
+                      <IconButton
+                        size="small"
+                        onClick={() => handleDelete(q)}
+                        disabled={deleteMutation.isPending}
+                      >
+                        <DeleteIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  )}
                 </Stack>
               }
             >
               <ListItemButton sx={{ pr: 18 }}>
                 <ListItemText
-                  primary={q.name}
+                  primary={
+                    <Stack direction="row" spacing={0.75} alignItems="center">
+                      <span>{q.name}</span>
+                      {q.is_shared && (
+                        <Chip
+                          size="small"
+                          variant="outlined"
+                          color="primary"
+                          label={t("savedQueries.sharedBadge")}
+                          sx={{ height: 18, fontSize: "0.65rem" }}
+                        />
+                      )}
+                    </Stack>
+                  }
                   secondary={
                     <>
                       {q.description && (
@@ -243,6 +285,17 @@ export default function SavedQueriesPanel() {
               onChange={(e) => setForm((f) => ({ ...f, query_text: e.target.value }))}
               InputProps={{ sx: { fontFamily: "monospace", fontSize: "0.85rem" } }}
             />
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={form.is_shared}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, is_shared: e.target.checked }))
+                  }
+                />
+              }
+              label={t("savedQueries.shareLabel")}
+            />
           </Stack>
         </DialogContent>
         <DialogActions>
@@ -255,6 +308,7 @@ export default function SavedQueriesPanel() {
                 name: form.name.trim(),
                 description: form.description.trim() || undefined,
                 query_text: form.query_text.trim(),
+                is_shared: form.is_shared,
               })
             }
           >
@@ -293,6 +347,19 @@ export default function SavedQueriesPanel() {
               onChange={(e) => setForm((f) => ({ ...f, query_text: e.target.value }))}
               InputProps={{ sx: { fontFamily: "monospace", fontSize: "0.85rem" } }}
             />
+            {editItem?.is_owner && (
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={form.is_shared}
+                    onChange={(e) =>
+                      setForm((f) => ({ ...f, is_shared: e.target.checked }))
+                    }
+                  />
+                }
+                label={t("savedQueries.shareLabel")}
+              />
+            )}
           </Stack>
         </DialogContent>
         <DialogActions>
@@ -307,6 +374,7 @@ export default function SavedQueriesPanel() {
                 name: form.name.trim(),
                 description: form.description.trim() || undefined,
                 query_text: form.query_text.trim(),
+                ...(editItem.is_owner ? { is_shared: form.is_shared } : {}),
               });
             }}
           >

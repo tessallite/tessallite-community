@@ -2,12 +2,12 @@
 title: "Curate drill-through"
 audience: modeller
 area: modelling
-updated: 2026-04-24
+updated: 2026-07-02
 ---
 
 ## What this is
 
-Every standard measure has a drill-through set the moment it is saved. By default the set returns every column on the underlying fact table. Curation lets the modeller change that default in four directions:
+Every standard measure has a drill-through set the moment it is saved. By default the set returns the cell's grouping dimensions — the dimensions that identify the number the analyst clicked — on the underlying fact table. Curation lets the modeller change that default in four directions:
 
 1. **Detail columns** — narrow the column projection (hide PII, hide internal IDs, hide noise).
 2. **Joined dimensions** — add human-readable text from a dimension table that the fact stores only by surrogate key.
@@ -32,7 +32,7 @@ Calculated measures show no chevron — drill-through on a calculated measure de
 
 ## Detail columns
 
-Pick the columns the analyst should see when they drill into a cell. The picker lists every column on the source fact table; selected entries become the SELECT projection.
+Pick the columns the analyst should see when they drill into a cell. The picker lists the dimension-backed columns on the source fact table; selected entries become the SELECT projection.
 
 - **Empty selection** keeps the default (the cell's grouping dimensions on the source table).
 - Only columns that are exposed as a dimension on the model can be projected — drill-through runs through the semantic layer, so a raw column with no dimension over it is not selectable. Curate from the dimension-backed column set the editor lists.
@@ -48,7 +48,7 @@ Pick the columns the analyst should see when they drill into a cell. The picker 
 Fact tables often store dimensions only by surrogate key — `customer_id`, `product_id`. The drilled rows are then a wall of UUIDs. Joined dimensions fix that by `LEFT JOIN`-ing the dimension table back in for the drill-through query alone.
 
 - The picker lists every dimension defined on the model. Pick the ones whose human-readable column you want surfaced.
-- For each joined dimension the drawer surfaces the column under a display-prefixed alias: `customer__name`, `product__category`. The prefix prevents collisions when two joined dimensions both expose a `name` column.
+- Each joined dimension is projected under its own dimension name (`customer_name`, `product_category`) — the name is the dimension as defined on the model, with no automatic prefix. Give two dimensions distinct names on the model if you need both surfaced side by side.
 - The dimension's base table must have a direct join to the fact (`v1` is single-hop). Multi-hop dimension joins are rejected with `DRILL_DIMENSION_NO_JOIN`. If the modeller needs a multi-hop dimension, route it through the **source-table override** below.
 
 **Why `LEFT JOIN`** — drill-through must surface every fact row even when the dimension key is missing or unmatched. An `INNER JOIN` would silently drop those rows, masking the very data-quality issue the analyst is investigating.
@@ -67,7 +67,20 @@ When the override is set, Tessallite needs to know **how the override table join
 - **Multiple paths** — the picker shows each candidate as `table1 → table2 → table3 [cardinality]`. Save is rejected (`DRILL_OVERRIDE_NO_JOIN_PATH`) until one is chosen.
 - **No path** — an empty picker with a save-blocking error. Either the override is wrong, or a join is missing in the model.
 
-The cardinality hint tells you whether the picked path expands rows (`one-to-many`) or compresses them (`many-to-one`). For drill-through, an expanding path is usually what you want — that is the whole point of going from `orders` to `order_lines`.
+The cardinality hint tells you whether the picked path expands rows (`one-to-many`) or compresses them (`many-to-one`).
+
+### The reconciliation rule for expanding overrides
+
+Drill-through has one promise above all others: **the detail rows must add up to the number the analyst clicked.** An expanding (`one-to-many`) override quietly breaks that promise when the measure being drilled still lives on the *coarser* table.
+
+Walk through it. `sales_amount_sum` measures `sales.amount` — one amount per order. Override the source to `order_lines` and join `orders → order_lines` (one order, many lines). Now every line of a five-line order carries the *same* order-level `amount`. Sum the drilled amount column and you get five times the real figure. The analyst clicks a correct $1,000 total and the drill "explains" it with rows adding to $5,000 — a silent wrong number.
+
+So Tessallite refuses to drill an expanding override when the drilled measure's value column sits on the parent table. The drill returns the coded error `DRILL_EXPANDING_OVERRIDE_MULTIPLIES_MEASURE` instead of a non-reconciling result. To use `order_lines` detail correctly, do one of these:
+
+- **Drill a line-level measure.** Point the drill at a measure whose value column lives on `order_lines` itself (for example a `line_amount` measure). Each line then carries its own value and the rows reconcile.
+- **Pick a non-expanding path.** A `many-to-one` override (a lookup that compresses rows, such as `orders → customers`) never repeats the measure and is always allowed.
+
+An expanding override is still the right tool when you want *line-level detail of a line-level measure*. It is the wrong tool for exploding an order-level measure across its lines.
 
 ---
 
@@ -78,13 +91,13 @@ Per-measure cap on page size. Empty falls back to the global default (currently 
 - The fact is so wide that 1 000 rows × 100 columns swamps the browser. Drop to 250.
 - The fact is so narrow that bumping to 5 000 rows per page improves the analyst's flow.
 
-Negative values, zeros, and non-integers are rejected client-side before the save fires.
+Negative values, zeros, non-integers, and anything above 10 000 are rejected before the save fires — both in the editor and by the server, so a value the runtime would otherwise clamp is never silently accepted.
 
 ---
 
 ## Reset to defaults
 
-The **Reset to defaults** button clears every curation choice and returns the measure to the implicit default (every column, no joins, no override). The implicit drill-through row is preserved — the measure never loses drill-through entirely.
+The **Reset to defaults** button clears every curation choice and returns the measure to the implicit default (the cell's grouping dimensions, no joins, no override). The implicit drill-through row is preserved — the measure never loses drill-through entirely.
 
 The editor confirms before resetting because the change is destructive: previous curations are not retained as a draft.
 
@@ -104,11 +117,11 @@ The editor confirms before resetting because the change is destructive: previous
 
 ## Business examples
 
-**Retail cohort analysis.** `revenue_sum` on the `sales` fact. Modeller curates: detail columns `order_id, store_id, region, ts, gross, net`; joined dimensions `product` (surfaces `product__category` and `product__season`); no source override. An analyst drills into Q3 / EMEA and immediately sees the line-level revenue with the product category the row belongs to — no follow-up query.
+**Retail cohort analysis.** `revenue_sum` on the `sales` fact. Modeller curates: detail columns `order_id, store_id, region, ts, gross, net`; joined dimensions `product_category` and `product_season`; no source override. An analyst drills into Q3 / EMEA and immediately sees the line-level revenue with the product category the row belongs to — no follow-up query.
 
 **Finance transaction audit.** `cash_movement_sum` on `gl_journal`. Modeller curates: source override → `gl_journal_lines` with the `gl_journal_lines → gl_journal` path; row limit 5 000; detail columns include the line-level memo, debit/credit indicator, and counterparty code. Auditors drill on a suspicious month/account cell and walk all 4 800 contributing journal lines without leaving the browser.
 
-**Multi-hop logistics.** `delivery_count` on `deliveries`. Modeller wants detail at the `delivery_events` level (which carries the per-stop scan history). Override source → `delivery_events`; pick the two-hop path `delivery_events → delivery_legs → deliveries`. Joined dimension `route` exposes `route__name`. The drawer now shows every scan event behind a delivery count cell with a human route label.
+**Multi-hop logistics.** `delivery_count` on `deliveries`. Modeller wants detail at the `delivery_events` level (which carries the per-stop scan history). Override source → `delivery_events`; pick the two-hop path `delivery_events → delivery_legs → deliveries`. Joined dimension `route_name` exposes the human route label. The drawer now shows every scan event behind a delivery count cell with a human route label.
 
 ---
 
@@ -124,6 +137,7 @@ Stable error codes returned by the PATCH endpoint. Frontends and integrations sh
 | `DRILL_DIMENSION_NO_JOIN` | Joined dimension's base table has no direct join to the fact |
 | `DRILL_SOURCE_TABLE_NOT_IN_MODEL` | Override source table id does not belong to this model |
 | `DRILL_OVERRIDE_NO_JOIN_PATH` | Override is set but no join path was provided, and the number of candidate paths is not exactly one (zero or several); or a provided join path references unknown joins or is not a contiguous chain from the source table |
+| `DRILL_DETAIL_COLUMN_NOT_PROJECTABLE` | Detail column belongs to the effective table but has no dimension defined over it, so it cannot be projected through the semantic layer — create a dimension for the column first, or drop it from the selection |
 
 ---
 

@@ -35,6 +35,7 @@ import SendIcon from "@mui/icons-material/Send";
 import { notificationsApi } from "../../api/client";
 import type {
   EventTypeOption,
+  NotificationDelivery,
   NotificationRoute,
   NotificationRouteCreate,
 } from "../../api/types";
@@ -77,6 +78,12 @@ export default function AlertsPanel() {
   });
   const eventTypes = eventTypesQuery.data ?? [];
 
+  const deliveries = useQuery({
+    queryKey: ["notification-deliveries", projectId],
+    queryFn: () => notificationsApi.deliveries(projectId!),
+    enabled: Boolean(projectId),
+  });
+
   const toggleEnabled = useMutation({
     mutationFn: ({
       routeId,
@@ -106,11 +113,11 @@ export default function AlertsPanel() {
       setTestingId(route.id);
       setTestResult(null);
       try {
-        await notificationsApi.test(projectId, {
-          event_type: route.event_type,
-          channel_type: route.channel_type,
-          channel_config: route.channel_config,
-        });
+        // Bug-5999: the API redacts a saved Slack route's webhook URL from
+        // every response, so route.channel_config never carries it -- the
+        // test-send must happen against the saved route id, not a config
+        // payload the client cannot fully reconstruct.
+        await notificationsApi.testRoute(projectId, route.id);
         setTestResult({ id: route.id, ok: true, message: t("alerts.testSent") });
       } catch (err: unknown) {
         const detail = (err as { response?: { data?: { detail?: string } } })
@@ -129,8 +136,7 @@ export default function AlertsPanel() {
 
   const eventLabel = (val: string) =>
     eventTypes.find((e) => e.value === val)?.label ?? val;
-  const channelLabel = (val: string) =>
-    CHANNEL_TYPES.find((c) => c.value === val)?.label ?? val;
+  const channelLabel = (val: string) => t(`alerts.channel.${val}`);
 
   function channelTarget(route: NotificationRoute): string {
     if (route.channel_type === "email") {
@@ -139,11 +145,12 @@ export default function AlertsPanel() {
       return "";
     }
     if (route.channel_type === "slack") {
-      const url = route.channel_config?.webhook_url;
-      if (typeof url === "string" && url.length > 30) {
-        return url.slice(0, 30) + "...";
-      }
-      return typeof url === "string" ? url : "";
+      // Bug-5999: the API redacts the plaintext webhook URL (Bug-5945) and
+      // exposes only a boolean flag, so show a masked indicator instead of
+      // trying to read a field that is never present.
+      return route.channel_config?.has_webhook_url
+        ? t("alerts.webhookConfigured")
+        : t("alerts.webhookNotConfigured");
     }
     return "";
   }
@@ -285,6 +292,40 @@ export default function AlertsPanel() {
         </TableContainer>
       )}
 
+      <Typography variant="subtitle2" sx={{ mt: 3, mb: 1 }}>
+        {t("alerts.deliveriesTitle")}
+      </Typography>
+      {(deliveries.data ?? []).length === 0 ? (
+        <Typography variant="body2" color="text.secondary">
+          {t("alerts.deliveriesEmpty")}
+        </Typography>
+      ) : (
+        <TableContainer>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell>{t("alerts.eventTypeLabel")}</TableCell>
+                <TableCell>{t("alerts.channelHeader")}</TableCell>
+                <TableCell>{t("alerts.deliveriesStatus")}</TableCell>
+                <TableCell>{t("alerts.deliveriesWhen")}</TableCell>
+                <TableCell>{t("alerts.deliveriesError")}</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {(deliveries.data as NotificationDelivery[]).map((d) => (
+                <TableRow key={d.id}>
+                  <TableCell>{d.event_type}</TableCell>
+                  <TableCell>{t(`alerts.channel.${d.channel_type}`)}</TableCell>
+                  <TableCell>{d.status}</TableCell>
+                  <TableCell>{d.created_at ?? "—"}</TableCell>
+                  <TableCell>{d.error_message ?? "—"}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
+
       <RouteDialogForm
         dialog={dialog}
         projectId={projectId!}
@@ -321,6 +362,10 @@ function RouteDialogForm({
   const [webhookUrl, setWebhookUrl] = useState("");
   const [enabled, setEnabled] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Bug-5999: the API never returns a saved Slack route's plaintext webhook
+  // URL (Bug-5945). Track whether one is already configured so the form can
+  // let the user leave the field blank on edit instead of forcing re-entry.
+  const [hasExistingWebhook, setHasExistingWebhook] = useState(false);
 
   useEffect(() => {
     setError(null);
@@ -333,12 +378,12 @@ function RouteDialogForm({
         const list = r.channel_config?.recipients;
         setRecipients(Array.isArray(list) ? list.join(", ") : "");
         setWebhookUrl("");
+        setHasExistingWebhook(false);
       } else {
-        setWebhookUrl(
-          typeof r.channel_config?.webhook_url === "string"
-            ? (r.channel_config.webhook_url as string)
-            : "",
-        );
+        // The webhook URL is a redacted secret -- never pre-fill it, only
+        // note that one is already configured.
+        setWebhookUrl("");
+        setHasExistingWebhook(Boolean(r.channel_config?.has_webhook_url));
         setRecipients("");
       }
     } else if (dialog?.kind === "new") {
@@ -347,6 +392,7 @@ function RouteDialogForm({
       setRecipients("");
       setWebhookUrl("");
       setEnabled(true);
+      setHasExistingWebhook(false);
     }
   }, [dialog]);
 
@@ -360,7 +406,12 @@ function RouteDialogForm({
                 .map((s) => s.trim())
                 .filter(Boolean),
             }
-          : { webhook_url: webhookUrl.trim() };
+          : webhookUrl.trim()
+            ? { webhook_url: webhookUrl.trim() }
+            // Bug-5999: blank means "keep the already-configured secret";
+            // the backend preserves the existing encrypted URL when this
+            // key is absent from an edit request.
+            : {};
 
       const body: NotificationRouteCreate = {
         event_type: eventType,
@@ -390,7 +441,7 @@ function RouteDialogForm({
     channelType !== "" &&
     (channelType === "email"
       ? recipients.trim().length > 0
-      : webhookUrl.trim().length > 0);
+      : webhookUrl.trim().length > 0 || (isEdit && hasExistingWebhook));
 
   return (
     <Dialog open={dialog !== null} onClose={onClose} maxWidth="sm" fullWidth>
@@ -449,7 +500,14 @@ function RouteDialogForm({
               fullWidth
               value={webhookUrl}
               onChange={(e) => setWebhookUrl(e.target.value)}
-              helperText={t("alerts.webhookUrlHelperText")}
+              placeholder={
+                hasExistingWebhook ? t("alerts.webhookUrlEditPlaceholder") : undefined
+              }
+              helperText={
+                hasExistingWebhook
+                  ? t("alerts.webhookUrlEditHelperText")
+                  : t("alerts.webhookUrlHelperText")
+              }
             />
           )}
 

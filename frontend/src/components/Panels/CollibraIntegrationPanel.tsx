@@ -89,10 +89,15 @@ function requestErrorMessage(t: T, fallbackKey: string) {
 
 function syncErrorMessage(t: T, message: string | null | undefined) {
   if (!message) return t("collibra.noErrorDetails");
+  // "not implemented" is the deferred connector's placeholder text; show the
+  // friendly fallback for it. Any other message is a real backend error and
+  // must be surfaced verbatim — the old code returned the generic fallback in
+  // both branches, so the actual failure reason was always discarded
+  // (Bug-6494).
   if (message.toLowerCase().includes("not implemented")) {
     return t("collibra.syncFailureFallback");
   }
-  return t("collibra.syncFailureFallback");
+  return message;
 }
 
 export function CollibraIntegrationPanel() {
@@ -192,6 +197,18 @@ export function CollibraIntegrationPanel() {
     }
   }
 
+  // Bug-7720: is_active toggle.
+  async function toggleActive(connection: CollibraConnection) {
+    try {
+      await collibraApi.updateConfig(pid, mid, connection.id, {
+        is_active: !connection.is_active,
+      } as Record<string, unknown>);
+      await refresh();
+    } catch {
+      setError(requestErrorMessage(t, "collibra.saveFailed"));
+    }
+  }
+
   async function runValidate(connection: CollibraConnection) {
     setLoading(true);
     setNotice(null);
@@ -200,31 +217,32 @@ export function CollibraIntegrationPanel() {
         connection_id: connection.id,
       });
       setError(null);
-      setPreview({
-        assets_total: 0,
-        relations_total: 0,
-        attributes_total: 0,
-        responsibilities_total: 0,
-        by_asset_type: {},
-        warnings: result.warnings.map((w) => ({ message: w })),
-      });
+      // Bug-6495: "Test Connection" is a connectivity check, not a content
+      // preview. The validate endpoint returns no asset/relation counts, so it
+      // must NOT populate the preview card — the old code wrote a preview with
+      // fabricated zero counts, overwriting a real preview and reading as
+      // "0 assets". Surface only the connection result (plus any connector
+      // warnings) via the notice; leave the preview card untouched.
+      const warnings = result.warnings ?? [];
+      const warningSuffix =
+        warnings.length > 0 ? ` ${warnings.join("; ")}` : "";
       // ok is tri-state: null => simulated (connector not contacted),
       // false => verified failure, true => verified pass. A simulated
       // result must never read as a green success.
       if (result.simulated || result.ok === null) {
         setNotice({
           severity: "info",
-          message: t("collibra.validationSimulated", { connection: connection.display_name }),
+          message: t("collibra.validationSimulated", { connection: connection.display_name }) + warningSuffix,
         });
       } else if (result.ok === false) {
         setNotice({
           severity: "warning",
-          message: t("collibra.validationReportedIssue", { connection: connection.display_name }),
+          message: t("collibra.validationReportedIssue", { connection: connection.display_name }) + warningSuffix,
         });
       } else {
         setNotice({
-          severity: "success",
-          message: t("collibra.validationVerified", { connection: connection.display_name }),
+          severity: warnings.length > 0 ? "warning" : "success",
+          message: t("collibra.validationVerified", { connection: connection.display_name }) + warningSuffix,
         });
       }
     } catch {
@@ -341,6 +359,11 @@ export function CollibraIntegrationPanel() {
                 </Stack>
               </Box>
               <Stack direction="row" gap={0.5}>
+                <Tooltip title={c.is_active ? t("collibra.deactivate") : t("collibra.activate")}>
+                  <Button size="small" variant="text" onClick={() => toggleActive(c)}>
+                    {c.is_active ? t("collibra.deactivate") : t("collibra.activate")}
+                  </Button>
+                </Tooltip>
                 <Tooltip title={t("collibra.edit")}>
                   <IconButton size="small" onClick={() => openEdit(c)}>
                     <EditIcon fontSize="small" />

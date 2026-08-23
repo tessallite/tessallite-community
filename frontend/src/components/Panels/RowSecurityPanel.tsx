@@ -17,6 +17,11 @@ import {
   MenuItem,
   Stack,
   Switch,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableRow,
   TextField,
   Typography,
 } from "@mui/material";
@@ -26,7 +31,7 @@ import EditIcon from "@mui/icons-material/Edit";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 
 import { rowSecurityApi } from "../../api/client";
-import { useAllModelTables, useDimensions, useRowSecurityRules, useSources } from "../../api/hooks";
+import { useAllModelTables, useDimensions, useModel, useRowSecurityRules, useSources } from "../../api/hooks";
 import type {
   RowSecurityAttributeSource,
   RowSecurityRule,
@@ -35,9 +40,10 @@ import type {
   RowSecurityRuleUpdate,
   RowSecuritySimulateResponse,
 } from "../../api/types";
-import { canEditModelConfig } from "../../auth/currentUser";
 import { useBuilderStore } from "../../store/builderStore";
 import { useConfirm } from "../Confirm";
+import { recordCreate, recordDelete, recordUpdate } from "../Builder/emitDrawerHistory";
+import { extractApiError } from "../../utils/extractApiError";
 
 type DialogMode = "create" | "edit";
 
@@ -114,6 +120,12 @@ function toCreate(form: RuleFormState): RowSecurityRuleCreate {
     mapping_table_id: form.mapping_table_id.trim() || null,
     mapping_user_column: form.mapping_user_column.trim() || null,
     mapping_value_column: form.mapping_value_column.trim() || null,
+    // Bug-5905: user_mapping is not attribute-source-keyed at runtime; the
+    // form no longer exposes these fields for this rule type, so always
+    // send the neutral defaults rather than whatever `form` happens to
+    // hold (e.g. a stale value carried over from editing a pre-fix rule).
+    attribute_source: "jwt_role",
+    attribute_claim_name: null,
   };
 }
 
@@ -134,8 +146,19 @@ function toUpdate(form: RuleFormState, original: RowSecurityRule): RowSecurityRu
   } else {
     base.mapping_user_column = form.mapping_user_column.trim() || null;
     base.mapping_value_column = form.mapping_value_column.trim() || null;
+    // Bug-5905: same neutral-default rationale as toCreate() above.
+    base.attribute_source = "jwt_role";
+    base.attribute_claim_name = null;
   }
   return base;
+}
+
+function ruleToCreatePayload(rule: RowSecurityRule): Record<string, unknown> {
+  return toCreate(fromRule(rule)) as unknown as Record<string, unknown>;
+}
+
+function ruleToUpdatePayload(rule: RowSecurityRule): Record<string, unknown> {
+  return toUpdate(fromRule(rule), rule) as unknown as Record<string, unknown>;
 }
 
 export default function RowSecurityPanel() {
@@ -146,10 +169,11 @@ export default function RowSecurityPanel() {
 
   const rules = useRowSecurityRules(projectId!, modelId!);
   const storeReadOnly = useBuilderStore((s) => s.readOnly);
-  const canManage = canEditModelConfig() && !storeReadOnly;
+  const canManage = !storeReadOnly;  // Bug-8784: backend caller_can_author is authoritative
 
   // Model-aware pickers for dimension_path and mapping_table_id (Bug-5208)
   const dimensionsQuery = useDimensions(projectId!, modelId!);
+  const modelQuery = useModel(projectId!, modelId!);
   const sourcesQuery = useSources(projectId!, modelId!);
   const sourceIds = (sourcesQuery.data ?? []).map((s) => s.id);
   const allTablesQuery = useAllModelTables(projectId!, modelId!, sourceIds);
@@ -168,6 +192,7 @@ export default function RowSecurityPanel() {
   // roles, so an idp_group / claim rule could never be exercised here.
   const [simGroups, setSimGroups] = useState("");
   const [simClaims, setSimClaims] = useState("");
+  const [simProbe, setSimProbe] = useState("");
   const [simResult, setSimResult] = useState<RowSecuritySimulateResponse | null>(null);
   const [simError, setSimError] = useState<string | null>(null);
 
@@ -183,7 +208,10 @@ export default function RowSecurityPanel() {
   const createMutation = useMutation({
     mutationFn: (body: RowSecurityRuleCreate) =>
       rowSecurityApi.create(projectId!, modelId!, body),
-    onSuccess: () => {
+    onSuccess: (created, body) => {
+      // Bug-9395/F-026-10: row-security drawer CRUD is reversible through the
+      // shared Builder history boundary.
+      recordCreate("rowSecurity", created.id, body as unknown as Record<string, unknown>);
       invalidate();
       setDialogOpen(false);
       setFormError(null);
@@ -194,9 +222,10 @@ export default function RowSecurityPanel() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, body }: { id: string; body: RowSecurityRuleUpdate }) =>
+    mutationFn: ({ id, body }: { id: string; body: RowSecurityRuleUpdate; prior: Record<string, unknown> }) =>
       rowSecurityApi.update(projectId!, modelId!, id, body),
-    onSuccess: () => {
+    onSuccess: (_updated, variables) => {
+      recordUpdate("rowSecurity", variables.id, variables.prior, variables.body as unknown as Record<string, unknown>);
       invalidate();
       setDialogOpen(false);
       setFormError(null);
@@ -205,8 +234,12 @@ export default function RowSecurityPanel() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (id: string) => rowSecurityApi.delete(projectId!, modelId!, id),
-    onSuccess: () => invalidate(),
+    mutationFn: ({ id }: { id: string; prior: Record<string, unknown> }) =>
+      rowSecurityApi.delete(projectId!, modelId!, id),
+    onSuccess: (_deleted, variables) => {
+      recordDelete("rowSecurity", variables.id, variables.prior);
+      invalidate();
+    },
   });
 
   const simulateMutation = useMutation({
@@ -222,6 +255,7 @@ export default function RowSecurityPanel() {
           .map((g) => g.trim())
           .filter(Boolean),
         claims: parseClaims(simClaims),
+        probe_query: simProbe.trim() || undefined,
       }),
     onSuccess: (data) => {
       setSimResult(data);
@@ -254,7 +288,11 @@ export default function RowSecurityPanel() {
     if (dialogMode === "create") {
       createMutation.mutate(toCreate(form));
     } else if (editing) {
-      updateMutation.mutate({ id: editing.id, body: toUpdate(form, editing) });
+      updateMutation.mutate({
+        id: editing.id,
+        body: toUpdate(form, editing),
+        prior: ruleToUpdatePayload(editing),
+      });
     }
   }
 
@@ -268,7 +306,7 @@ export default function RowSecurityPanel() {
       ),
       confirmLabel: t("rowSecurity.deleteRuleLabel"),
     });
-    if (ok) deleteMutation.mutate(rule.id);
+    if (ok) deleteMutation.mutate({ id: rule.id, prior: ruleToCreatePayload(rule) });
   }
 
   const busy = createMutation.isPending || updateMutation.isPending;
@@ -286,6 +324,11 @@ export default function RowSecurityPanel() {
             setSimError(null);
             setSimGroups("");
             setSimClaims("");
+            setSimProbe(defaultProbeQuery(
+              modelQuery.data?.slug,
+              rules.data,
+              dimensionsQuery.data,
+            ));
           }}
         >
           {t("rowSecurity.simulateAsUser")}
@@ -304,6 +347,12 @@ export default function RowSecurityPanel() {
 
       <Alert severity="info" sx={{ mb: 1 }}>
         {t("rowSecurity.infoAlert")}
+      </Alert>
+      <Alert severity="info" sx={{ mb: 1 }}>
+        {t("rowSecurity.compositionNote")}
+      </Alert>
+      <Alert severity="warning" sx={{ mb: 1 }}>
+        {t("rowSecurity.limitationsAlert")}
       </Alert>
       {!canManage && (
         <Alert severity="warning" sx={{ mb: 1 }}>
@@ -370,7 +419,16 @@ export default function RowSecurityPanel() {
                       ))}
                       {rule.attribute_source && rule.attribute_source !== "jwt_role" && (
                         <Chip
-                          label={`via ${rule.attribute_source}${rule.attribute_claim_name ? `:${rule.attribute_claim_name}` : ""}`}
+                          label={
+                            rule.attribute_claim_name
+                              ? t("rowSecurity.viaSourceClaim", {
+                                  source: rule.attribute_source,
+                                  claim: rule.attribute_claim_name,
+                                })
+                              : t("rowSecurity.viaSource", {
+                                  source: rule.attribute_source,
+                                })
+                          }
                           size="small"
                           color="info"
                           variant="outlined"
@@ -429,12 +487,20 @@ export default function RowSecurityPanel() {
               size="small"
               value={form.rule_type}
               disabled={dialogMode === "edit"}
-              onChange={(e) =>
+              onChange={(e) => {
+                const nextType = e.target.value as RowSecurityRuleType;
                 setForm({
                   ...form,
-                  rule_type: e.target.value as RowSecurityRuleType,
-                })
-              }
+                  rule_type: nextType,
+                  // Bug-5905: attribute_source/attribute_claim_name are not
+                  // consumed for user_mapping rules and the API rejects a
+                  // non-default value on save — reset them so a value left
+                  // over from a role_predicate edit doesn't block submit.
+                  ...(nextType === "user_mapping"
+                    ? { attribute_source: "jwt_role" as RowSecurityAttributeSource, attribute_claim_name: "" }
+                    : {}),
+                });
+              }}
               helperText={
                 dialogMode === "edit"
                   ? t("rowSecurity.ruleTypeCannotChange")
@@ -538,6 +604,14 @@ export default function RowSecurityPanel() {
                     setForm({ ...form, mapping_value_column: e.target.value })
                   }
                 />
+                {/*
+                  Bug-5905: user_mapping rules always key by user_identity at
+                  runtime (predicate_compiler.py) — attribute_source and
+                  attribute_claim_name are not consumed for this rule type,
+                  and the API now rejects a non-default value on save. Do not
+                  show the selector here; it previously implied a control
+                  that never took effect.
+                */}
               </>
             )}
 
@@ -604,6 +678,15 @@ export default function RowSecurityPanel() {
                 />
               </>
             )}
+            <TextField
+              label={t("rowSecurity.probeQueryLabel")}
+              size="small"
+              multiline
+              minRows={2}
+              value={simProbe}
+              onChange={(e) => setSimProbe(e.target.value)}
+              helperText={t("rowSecurity.probeQueryHelper")}
+            />
             <Button
               variant="outlined"
               onClick={() => simulateMutation.mutate()}
@@ -627,9 +710,50 @@ export default function RowSecurityPanel() {
                     whiteSpace: "pre-wrap",
                   }}
                 >
-                  {simResult.compiled_predicate ??
-                    t("rowSecurity.noRulesMatchMessage")}
+                  {compiledPredicateCopy(simResult.compiled_predicate, t)}
                 </Box>
+                {simResult.executed && (
+                  <Box mt={1}>
+                    <Typography variant="subtitle2">
+                      {t("rowSecurity.probeExecuted", {
+                        route: simResult.route_type || "source",
+                      })}{" "}
+                      {t("rowSecurity.probeRows", {
+                        count: String(simResult.row_count ?? simResult.rows?.length ?? 0),
+                      })}
+                    </Typography>
+                    {simResult.columns && simResult.rows && (
+                      <Table size="small" sx={{ mt: 1 }}>
+                        <TableHead>
+                          <TableRow>
+                            {simResult.columns.map((c) => (
+                              <TableCell key={c}>{c}</TableCell>
+                            ))}
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {simResult.rows.map((row, i) => (
+                            <TableRow key={i}>
+                              {row.map((cell, j) => (
+                                <TableCell key={j}>{String(cell ?? "")}</TableCell>
+                              ))}
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    )}
+                  </Box>
+                )}
+                {/* Bug-8904: the server tells us when it could not resolve the
+                    model's connector and fell back to a default dialect. That
+                    makes the predicate above only approximately right about
+                    identifier quoting — the modeller has to be told, or a
+                    preview that differs from the runtime looks authoritative. */}
+                {simResult.connector_note && (
+                  <Alert severity="warning" sx={{ mt: 1 }}>
+                    {simResult.connector_note}
+                  </Alert>
+                )}
               </Box>
             )}
           </Stack>
@@ -661,13 +785,43 @@ function parseClaims(raw: string): Record<string, string> {
   return out;
 }
 
+/** Server-error text for this panel's alerts.
+ *
+ * Delegates to the shared unwrapper. The local implementation this replaces
+ * did `JSON.stringify(detail)` for any object detail, so the row-security body
+ * guards' structured 422 ({error_code, field, ids, message}) was rendered to
+ * the modeller as raw JSON instead of its `message`, and FastAPI's list-shaped
+ * 422 came out as a stringified array. Callers keep their `|| t(...)` fallback,
+ * so the empty string preserves their existing behaviour.
+ */
 function extractError(err: unknown): string {
-  const anyErr = err as {
-    response?: { data?: { detail?: unknown } };
-    message?: string;
-  };
-  const detail = anyErr?.response?.data?.detail;
-  if (typeof detail === "string") return detail;
-  if (detail && typeof detail === "object") return JSON.stringify(detail);
-  return anyErr?.message ?? "Request failed";
+  return extractApiError(err, "");
+}
+
+function defaultProbeQuery(
+  slug: string | undefined,
+  rules: RowSecurityRule[] | undefined,
+  dimensions: { name: string }[] | undefined,
+): string {
+  const path =
+    (rules ?? []).find((r) => r.is_enabled)?.dimension_path
+    || dimensions?.[0]?.name
+    || "region_code";
+  const col = path.split(".").pop() || path;
+  const table = slug || "model";
+  return `SELECT ${col}, COUNT(*) FROM ${table} GROUP BY ${col} LIMIT 50`;
+}
+
+function compiledPredicateCopy(
+  predicate: string | null | undefined,
+  t: (key: string, vars?: Record<string, string | number>) => string,
+): string {
+  if (predicate == null || predicate === "") {
+    return t("rowSecurity.privilegedExemptionMessage");
+  }
+  const compact = predicate.replace(/\s+/g, " ").trim();
+  if (compact === "0 = 1" || compact === "0=1") {
+    return `${t("rowSecurity.denyAllPredicateMessage")}\n${predicate}`;
+  }
+  return predicate;
 }

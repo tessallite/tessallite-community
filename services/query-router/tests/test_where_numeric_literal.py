@@ -434,6 +434,51 @@ def _build_qualified(raw_query, *, dims, phys, qualified_ctypes, bare_ctypes=Non
     )
 
 
+# ---------------------------------------------------------------------------
+# Bug-5546: an INTEGER column must reject a FRACTIONAL numeric literal. The
+# numeric grammar accepts decimals so FLOAT/NUMERIC columns keep working, but
+# "d_year = 19.99" against INT64 makes BigQuery silently coerce + return an
+# empty result — a type mismatch that must fail loud, not pass silently.
+# ---------------------------------------------------------------------------
+
+
+def test_raw_where_fractional_literal_against_integer_fails_loud():
+    """`d_year = '19.99'` against INT64 fails loud — a fractional literal is not
+    a valid integer member, must not silently coerce to an empty result."""
+    with pytest.raises(SemanticBindingError):
+        _build(
+            "SELECT x FROM t WHERE \"d_year\" = '19.99' OR \"d_year\" = '2000'",
+            dims=["d_year"],
+            phys={"d_year": '"dt"."d_year"'},
+            ctypes={"d_year": "INT64"},
+        )
+
+
+def test_raw_where_fractional_numeric_literal_against_integer_fails_loud():
+    """Same guard for a non-string (dialect-parsed) fractional literal."""
+    with pytest.raises(SemanticBindingError):
+        _build(
+            'SELECT x FROM t WHERE "d_year" = 19.99 OR "d_year" = 2000',
+            dims=["d_year"],
+            phys={"d_year": '"dt"."d_year"'},
+            ctypes={"d_year": "INT64"},
+        )
+
+
+def test_raw_where_fractional_literal_against_float_renders_bare():
+    """A fractional literal against a FLOAT column stays a bare numeric literal
+    — the integer-only guard must not over-reach to true numeric columns."""
+    out = _build(
+        "SELECT x FROM t WHERE \"unit_price\" = '19.99' OR \"unit_price\" = '5.00'",
+        dims=["unit_price"],
+        phys={"unit_price": '"f"."unit_price"'},
+        ctypes={"unit_price": "FLOAT64"},
+    )
+    where = out.split(" WHERE ", 1)[1]
+    assert "19.99" in where and "5.00" in where
+    assert "'19.99'" not in where
+
+
 def test_raw_where_qualified_resolver_types_by_table_column():
     """When the rewritten field carries its table alias, the qualified resolver
     picks the CORRECT (numeric) type even though a same-named semantic/physical

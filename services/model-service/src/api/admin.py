@@ -15,11 +15,14 @@ from fastapi import APIRouter, Body, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.audit.system import system_audit
 from shared.config.bootstrap import system_snapshot_get
 from shared.config.settings import get_settings
 from shared.db.models import (
+    CollibraConnection,
     LLMProviderConfig,
     ProjectConnection,
+    SolidatusConnection,
     SystemTenant,
     WebhookEndpoint,
 )
@@ -28,11 +31,15 @@ from shared.licensing.errors import LicenseError
 from shared.licensing.loader import build_registry
 from shared.licensing.verify import verify_license
 from shared.security.credential_crypto import decrypt_str, re_encrypt_blob
+from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
 from src.auth.middleware import CurrentUser, require_system_admin
 from src.licensing_guard import (
+    clear_license_doc,
     get_license_manager,
     has_installed_license,
     license_public_keys,
+    load_license_doc_from_db,
+    reload_license_manager,
     store_license_doc,
 )
 
@@ -116,6 +123,24 @@ async def migrate_tenant(
 logger = logging.getLogger(__name__)
 
 
+async def _rotate_model_blobs(
+    db: AsyncSession,
+    model_cls,
+    attr_name: str,
+    counter_key: str,
+    rotated: dict[str, int],
+) -> None:
+    rows = (await db.execute(select(model_cls))).scalars().all()
+    for row in rows:
+        blob = getattr(row, attr_name, None)
+        if not blob:
+            continue
+        new_blob, changed = re_encrypt_blob(blob)
+        if changed:
+            setattr(row, attr_name, new_blob)
+            rotated[counter_key] += 1
+
+
 @router.post("/rotate-credentials")
 async def rotate_credentials(
     sys_db: AsyncSession = Depends(get_system_db),
@@ -129,7 +154,14 @@ async def rotate_credentials(
       4. Call this endpoint to re-encrypt everything under the new key.
       5. Remove CREDENTIAL_ENCRYPTION_KEY_PREVIOUS and restart.
     """
-    rotated = {"tenants": 0, "connections": 0, "llm_keys": 0, "webhooks": 0}
+    rotated = {
+        "tenants": 0,
+        "connections": 0,
+        "llm_keys": 0,
+        "webhooks": 0,
+        "solidatus_connections": 0,
+        "collibra_connections": 0,
+    }
     failed_tenants: list[str] = []
 
     tenants = (await sys_db.execute(select(SystemTenant))).scalars().all()
@@ -137,28 +169,41 @@ async def rotate_credentials(
     for t in tenants:
         try:
             async for tenant_db in get_tenant_db(t.slug):
-                conns = (await tenant_db.execute(select(ProjectConnection))).scalars().all()
-                for c in conns:
-                    new_blob, changed = re_encrypt_blob(c.encrypted_credentials)
-                    if changed:
-                        c.encrypted_credentials = new_blob
-                        rotated["connections"] += 1
-
-                llm_cfgs = (await tenant_db.execute(select(LLMProviderConfig))).scalars().all()
-                for lc in llm_cfgs:
-                    if lc.encrypted_api_key:
-                        new_blob, changed = re_encrypt_blob(lc.encrypted_api_key)
-                        if changed:
-                            lc.encrypted_api_key = new_blob
-                            rotated["llm_keys"] += 1
-
-                hooks = (await tenant_db.execute(select(WebhookEndpoint))).scalars().all()
-                for h in hooks:
-                    if h.signing_secret:
-                        new_blob, changed = re_encrypt_blob(h.signing_secret)
-                        if changed:
-                            h.signing_secret = new_blob
-                            rotated["webhooks"] += 1
+                await _rotate_model_blobs(
+                    tenant_db,
+                    ProjectConnection,
+                    "encrypted_credentials",
+                    "connections",
+                    rotated,
+                )
+                await _rotate_model_blobs(
+                    tenant_db,
+                    LLMProviderConfig,
+                    "encrypted_api_key",
+                    "llm_keys",
+                    rotated,
+                )
+                await _rotate_model_blobs(
+                    tenant_db,
+                    WebhookEndpoint,
+                    "signing_secret",
+                    "webhooks",
+                    rotated,
+                )
+                await _rotate_model_blobs(
+                    tenant_db,
+                    SolidatusConnection,
+                    "encrypted_credentials",
+                    "solidatus_connections",
+                    rotated,
+                )
+                await _rotate_model_blobs(
+                    tenant_db,
+                    CollibraConnection,
+                    "encrypted_credentials",
+                    "collibra_connections",
+                    rotated,
+                )
 
                 await tenant_db.commit()
         except Exception:
@@ -222,12 +267,33 @@ async def install_license(
     try:
         lic = verify_license(body, build_registry(license_public_keys()))
     except LicenseError as exc:
+        # Bug-8164: return the STRUCTURED failure taxonomy, not opaque prose, so a
+        # consumer (the admin UI, an automation client) can branch on a stable
+        # ``error_code`` token instead of parsing the human message.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"License rejected: {exc}",
+            detail={"error_code": exc.error_code, "message": f"License rejected: {exc}"},
         )
 
-    await store_license_doc(body, installed_by=getattr(current_user, "email", None))
+    async for sys_db in get_system_db():
+        await store_license_doc(
+            body, installed_by=getattr(current_user, "email", None), db=sys_db
+        )
+        await system_audit(
+            sys_db,
+            action="license.install",
+            severity="critical",
+            actor_email=getattr(current_user, "email", None),
+            target_type="license",
+            target_name=str(getattr(lic, "license_id", "")),
+            detail={"edition": getattr(lic, "edition", None)},
+        )
+        await sys_db.commit()
+        break
+    await reload_license_manager()
+    await emit_webhook("__system__", "license.installed", {
+        "license_id": str(getattr(lic, "license_id", "")),
+    })
 
     logger.warning(
         "[LICENSE] installed license_id=%s edition=%s by=%s",
@@ -236,3 +302,68 @@ async def install_license(
         getattr(current_user, "email", "?"),
     )
     return {"status": "installed", "license": await _license_status()}
+
+
+@router.delete("/license")
+async def uninstall_license(
+    current_user: CurrentUser = Depends(require_system_admin),
+) -> dict:
+    """Remove the installed license (operational revocation, model-service side).
+
+    Bug-6476: gives a system admin an operable path to deactivate a license that
+    was revoked or superseded upstream. Removing it reverts entitlements
+    immediately — to the full product when enforcement is off, or fail-closed
+    unactivated (Community caps deny) when enforcement is on. Upstream/automatic
+    propagation of an issuer-side revocation is a separate control-plane concern.
+    """
+    removed = False
+    async for sys_db in get_system_db():
+        removed = await clear_license_doc(db=sys_db)
+        await system_audit(
+            sys_db,
+            action="license.uninstall",
+            severity="critical",
+            actor_email=getattr(current_user, "email", None),
+            target_type="license",
+            detail={"removed": removed},
+        )
+        await sys_db.commit()
+        break
+    await reload_license_manager()
+    await emit_webhook("__system__", "license.uninstalled", {"removed": removed})
+
+    # A licence mounted via LICENSE_FILE (the Helm/Compose install path,
+    # Bug-5485) is reloaded on the manager reload even after the DB document is
+    # deleted. Detect that so the response does not misleadingly report the
+    # licence as gone. load_license_doc_from_db checks the DB first (now empty)
+    # then falls through to the file. Note this reports the file is PRESENT, not
+    # that it is valid — an expired/untrusted file reloads fail-closed, and the
+    # nested ``license.status`` carries the true activated flag.
+    file_license_present = (await load_license_doc_from_db()) is not None
+
+    if file_license_present:
+        result_status = "file_license_present"
+    elif removed:
+        result_status = "removed"
+    else:
+        result_status = "no_license"
+
+    logger.warning(
+        "[LICENSE] uninstalled license (removed=%s, file_license_present=%s) by=%s",
+        removed,
+        file_license_present,
+        getattr(current_user, "email", "?"),
+    )
+    response = {
+        "status": result_status,
+        "license": await _license_status(),
+    }
+    if file_license_present:
+        response["message"] = (
+            "A licence file mounted via LICENSE_FILE is still present and was "
+            "reloaded after the database licence was removed. Check "
+            "license.status.activated for whether it currently governs "
+            "entitlements, and remove or replace the mounted file at the "
+            "deployment level to fully revoke."
+        )
+    return response

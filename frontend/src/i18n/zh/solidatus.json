@@ -1,8 +1,10 @@
 {
+  "solidatus.activate": "激活",
   "solidatus.addConnection": "添加连接",
   "solidatus.baseUrl": "基础 URL",
   "solidatus.breakdownHeading": "按节点类型",
   "solidatus.baseUrlPlaceholder": "https://customer.solidatus.example.com",
+  "solidatus.deactivate": "停用",
   "solidatus.delete": "删除",
   "solidatus.deleteFailed": "删除失败",
   "solidatus.details": "详情",

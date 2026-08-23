@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useT } from "../../i18n";
@@ -20,6 +20,7 @@ import {
   IconButton,
   InputLabel,
   List,
+  ListItem,
   ListItemButton,
   Menu,
   MenuItem,
@@ -46,6 +47,8 @@ import EditIcon from "@mui/icons-material/Edit";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import { ui } from "../../theme/tokens";
 import { hierarchiesApi } from "../../api/client";
+import { useCanAuthorModel } from "../../auth/useCanAuthorModel";
+import { recordCreate, recordUpdate, recordDelete } from "../Builder/emitDrawerHistory";
 import { useConfirm } from "../Confirm";
 import {
   useAllModelTables,
@@ -66,8 +69,15 @@ import type {
   HierarchyLevelCreate,
   HierarchyTimeCalc,
   HierarchyTimeUnit,
+  HierarchyHealthStatus,
   UnassignedDateColumn,
 } from "../../api/types";
+import {
+  HierarchyHealthIssues,
+  hierarchyDisplayStatus,
+  hierarchyStatusColor,
+  loadHierarchyHealth,
+} from "./hierarchyHealth";
 
 const HIERARCHY_TYPES: HierarchyCreate["type"][] = ["explicit", "date_embedded", "segment"];
 const DATE_TEMPLATES: HierarchyGenerateDateRequest["template"][] = [
@@ -153,6 +163,10 @@ export default function HierarchiesPanel() {
   const t = useT();
   const { projectId, modelId } = useParams<{ projectId: string; modelId: string }>();
   const qc = useQueryClient();
+  // F-026-04: gate every mutation entry point on the shared author capability
+  // (editor role AND not a read-only share link), consistent with the other
+  // authoring panels.
+  const canEdit = useCanAuthorModel();
 
   const hierarchies = useHierarchies(projectId!, modelId!);
   const [selectedHierarchyId, setSelectedHierarchyId] = useState("");
@@ -215,13 +229,17 @@ export default function HierarchiesPanel() {
   );
 
   const healthQuery = useQuery({
-    queryKey: ["hierarchy-health", projectId, modelId],
-    queryFn: () => hierarchiesApi.health(projectId!, modelId!),
+    queryKey: ["hierarchy-health", projectId, modelId, canEdit ? "members" : "metadata"],
+    queryFn: () => loadHierarchyHealth(projectId!, modelId!, canEdit),
     enabled: !!projectId && !!modelId,
   });
-  const healthMap = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const h of healthQuery.data ?? []) m.set(h.hierarchy_id, h.status);
+  // Bug-8291: the probe outcome travels WITH the payload. It is never
+  // re-derived from `canEdit` at render time, because the global role does not
+  // decide whether the model binding actually allowed the probe.
+  const memberProbe = healthQuery.data?.memberProbe ?? null;
+  const healthById = useMemo(() => {
+    const m = new Map<string, HierarchyHealthStatus>();
+    for (const h of healthQuery.data?.entries ?? []) m.set(h.hierarchy_id, h);
     return m;
   }, [healthQuery.data]);
 
@@ -265,6 +283,18 @@ export default function HierarchiesPanel() {
     members: Array<{ key_value: string; level_name: string; level_ordinal: number }>;
   } | null>(null);
 
+  // F-016-13 / Bug-9156: the master-detail preview result is component state, not
+  // a query keyed on the hierarchy, so selecting a different hierarchy left the
+  // previous hierarchy's members/warnings visible under the new selection — a
+  // modeller could mis-edit hierarchy B while reading hierarchy A's members.
+  // Clear the detail-lane state whenever the selected hierarchy changes.
+  useEffect(() => {
+    setPreviewData(null);
+    setPreviewError(null);
+    setPreviewParentKey("");
+    setPreviewLevelOrdinal(0);
+  }, [selectedHierarchyId]);
+
   const refreshHierarchyQueries = () => {
     qc.invalidateQueries({ queryKey: ["hierarchies", projectId, modelId] });
     if (selectedHierarchyId) {
@@ -281,14 +311,20 @@ export default function HierarchiesPanel() {
     // query, so it must be refreshed or the new links stay hidden until the
     // model is closed and reopened.
     qc.invalidateQueries({ queryKey: ["joins", projectId, modelId] });
+    // Bug-8512: every hierarchy/level mutation can change the health verdict
+    // (a new level pair to probe, a fixed dangling key attribute, a removed
+    // empty hierarchy). Without this the status dot and the diagnostics list
+    // kept showing the pre-edit result until the panel was remounted. The
+    // prefix matches both the "members" and "metadata" probe-scoped keys.
+    qc.invalidateQueries({ queryKey: ["hierarchy-health", projectId, modelId] });
     for (const sourceId of sourceIds) {
       qc.invalidateQueries({ queryKey: ["modelTables", projectId, modelId, sourceId] });
     }
   };
 
   const createHierarchy = useMutation({
-    mutationFn: () =>
-      hierarchiesApi.create(projectId!, modelId!, {
+    mutationFn: async () => {
+      const payload = {
         name: newHierarchyName,
         type: newHierarchyType,
         dimension_kind: newHierarchyDimensionKind || null,
@@ -298,8 +334,13 @@ export default function HierarchiesPanel() {
           newCalendarType === "fiscal" && newFiscalStartMonth
             ? Number(newFiscalStartMonth)
             : null,
-      }),
-    onSuccess: (created) => {
+      };
+      const created = await hierarchiesApi.create(projectId!, modelId!, payload);
+      return { created, payload };
+    },
+    onSuccess: ({ created, payload }) => {
+      // Bug-8227: record the create so undo removes it / redo re-creates it.
+      recordCreate("hierarchy", created.id, payload as unknown as Record<string, unknown>);
       refreshHierarchyQueries();
       setSelectedHierarchyId(created.id);
       closeHierarchyDialog();
@@ -307,11 +348,11 @@ export default function HierarchiesPanel() {
   });
 
   const updateHierarchy = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!editingHierarchyId) {
         throw new Error("No hierarchy selected for edit");
       }
-      return hierarchiesApi.update(projectId!, modelId!, editingHierarchyId, {
+      const payload = {
         name: newHierarchyName,
         type: newHierarchyType,
         dimension_kind: newHierarchyDimensionKind || null,
@@ -321,20 +362,59 @@ export default function HierarchiesPanel() {
           newCalendarType === "fiscal" && newFiscalStartMonth
             ? Number(newFiscalStartMonth)
             : null,
-      });
+      };
+      // Bug-8227: capture the prior header so undo restores its field values.
+      const prior = (hierarchies.data ?? []).find((h) => h.id === editingHierarchyId);
+      const priorPayload = prior
+        ? {
+            name: prior.name,
+            type: prior.type,
+            dimension_kind: prior.dimension_kind ?? null,
+            description: prior.description ?? null,
+            calendar_type: prior.calendar_type ?? null,
+            fiscal_year_start_month: prior.fiscal_year_start_month ?? null,
+          }
+        : null;
+      await hierarchiesApi.update(projectId!, modelId!, editingHierarchyId, payload);
+      return { id: editingHierarchyId, payload, priorPayload };
     },
-    onSuccess: () => {
+    onSuccess: ({ id, payload, priorPayload }) => {
+      if (priorPayload) {
+        recordUpdate(
+          "hierarchy",
+          id,
+          priorPayload as unknown as Record<string, unknown>,
+          payload as unknown as Record<string, unknown>,
+        );
+      }
       refreshHierarchyQueries();
       closeHierarchyDialog();
     },
   });
 
   const deleteHierarchy = useMutation({
-    mutationFn: (hierarchyId: string) =>
-      hierarchiesApi.delete(projectId!, modelId!, hierarchyId),
-    onSuccess: (_, hierarchyId) => {
+    mutationFn: async (hierarchy: Hierarchy) => {
+      await hierarchiesApi.delete(projectId!, modelId!, hierarchy.id);
+      return hierarchy;
+    },
+    onSuccess: (hierarchy) => {
+      // Bug-8227: undo re-creates the hierarchy header from its prior values.
+      // NOTE: the re-create restores the hierarchy header only, not its drill
+      // levels (separate rows) — tracked as a follow-up (see intake).
+      recordDelete(
+        "hierarchy",
+        hierarchy.id,
+        {
+          name: hierarchy.name,
+          type: hierarchy.type,
+          dimension_kind: hierarchy.dimension_kind ?? null,
+          description: hierarchy.description ?? undefined,
+          calendar_type: hierarchy.calendar_type ?? null,
+          fiscal_year_start_month: hierarchy.fiscal_year_start_month ?? null,
+        },
+      );
       refreshHierarchyQueries();
-      if (selectedHierarchyId === hierarchyId) {
+      if (selectedHierarchyId === hierarchy.id) {
         setSelectedHierarchyId("");
         setPreviewData(null);
       }
@@ -511,17 +591,17 @@ export default function HierarchiesPanel() {
   });
 
   const confirm = useConfirm();
-  async function handleDeleteHierarchy(id: string, name: string) {
+  async function handleDeleteHierarchy(hierarchy: Hierarchy) {
     const ok = await confirm({
       title: t("hierarchies.deleteConfirm"),
       message: (
         <span>
-          {t("hierarchies.deleteMessage", { name })}
+          {t("hierarchies.deleteMessage", { name: hierarchy.name })}
         </span>
       ),
       confirmLabel: t("hierarchies.delete"),
     });
-    if (ok) deleteHierarchy.mutate(id);
+    if (ok) deleteHierarchy.mutate(hierarchy);
   }
   async function handleDeleteLevel(id: string, lvlName: string) {
     const ok = await confirm({
@@ -675,6 +755,7 @@ export default function HierarchiesPanel() {
 
         {/* Single "New" button opens a menu */}
         <Box sx={{ mb: 1.5 }}>
+          {canEdit && (
           <Button
             size="small"
             variant="contained"
@@ -684,6 +765,7 @@ export default function HierarchiesPanel() {
           >
             {t("hierarchies.new")}
           </Button>
+          )}
           <Menu
             anchorEl={newMenuAnchor}
             open={Boolean(newMenuAnchor)}
@@ -729,6 +811,19 @@ export default function HierarchiesPanel() {
         </Box>
 
         {/* Hierarchy list */}
+        {healthQuery.isError ? (
+          <Alert severity="warning" sx={{ mb: 1 }}>
+            {t("hierarchies.healthLoadFailed")}
+          </Alert>
+        ) : null}
+        {/* Bug-8291: a rejected probe is an access outcome, not a failure, and
+            must be stated once at panel level so the metadata-only statuses
+            below are never read as a full health verdict. */}
+        {memberProbe === "denied" ? (
+          <Alert severity="info" sx={{ mb: 1 }}>
+            {t("hierarchies.memberProbeDeniedNotice")}
+          </Alert>
+        ) : null}
         {hierarchies.isLoading ? (
           <CircularProgress size={20} />
         ) : (hierarchies.data ?? []).length === 0 ? (
@@ -737,18 +832,40 @@ export default function HierarchiesPanel() {
           </Typography>
         ) : (
           <List dense disablePadding>
-            {(hierarchies.data ?? []).map((h) => (
-              <ListItemButton
+            {(hierarchies.data ?? []).map((h) => {
+              const health = healthById.get(h.id);
+              // A backend `ok` only means "healthy" when the member probe ran;
+              // otherwise this is a metadata-only (`partial`) verdict.
+              const displayStatus = hierarchyDisplayStatus(health, memberProbe);
+              const healthLabel = t(
+                displayStatus === "partial" && memberProbe === "probed"
+                  ? "hierarchies.healthStatus.incomplete"
+                  : `hierarchies.healthStatus.${displayStatus}`,
+              );
+              return (
+              // Bug-8291 (a11y): the diagnostics list is a SIBLING of the
+              // selectable row, never a descendant. An ARIA button makes its
+              // subtree presentational, so nesting the list/listitem alerts
+              // inside it flattened every diagnostic into one run-on
+              // accessible name and destroyed the structure this panel exists
+              // to convey.
+              <ListItem
                 key={h.id}
+                disablePadding
+                sx={{
+                  display: "block",
+                  mb: 0.25,
+                  "& .row-actions": { display: "none" },
+                  "&:hover .row-actions": { display: "flex" },
+                }}
+              >
+              <ListItemButton
                 selected={selectedHierarchyId === h.id}
                 onClick={() => setSelectedHierarchyId(h.id)}
                 sx={{
                   borderRadius: 1,
-                  mb: 0.25,
                   pr: 0.5,
                   alignItems: "flex-start",
-                  "& .row-actions": { display: "none" },
-                  "&:hover .row-actions": { display: "flex" },
                   "&.Mui-selected .row-actions": { display: "flex" },
                 }}
               >
@@ -756,18 +873,15 @@ export default function HierarchiesPanel() {
                   <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
                     <Box
                       component="span"
+                      role="img"
+                      aria-label={healthLabel}
                       sx={{
                         width: 7,
                         height: 7,
                         borderRadius: "50%",
                         flexShrink: 0,
                         mt: "2px",
-                        bgcolor:
-                          healthMap.get(h.id) === "error"
-                            ? "error.main"
-                            : healthMap.get(h.id) === "warning"
-                              ? "warning.main"
-                              : "success.main",
+                        bgcolor: hierarchyStatusColor(displayStatus),
                       }}
                     />
                     <Typography variant="body2" fontWeight={500} noWrap sx={{ flex: 1 }}>
@@ -799,6 +913,7 @@ export default function HierarchiesPanel() {
                     </Typography>
                   ) : null}
                 </Box>
+                {canEdit && (
                 <Box
                   className="row-actions"
                   sx={{ display: "none", alignItems: "center", flexShrink: 0, ml: 0.5 }}
@@ -806,6 +921,8 @@ export default function HierarchiesPanel() {
                   <Tooltip title={t("common.edit")}>
                     <IconButton
                       size="small"
+                      aria-label={t("common.edit")}
+                      data-testid={`hierarchy-edit-${h.id}`}
                       onClick={(e) => {
                         e.stopPropagation();
                         openEditHierarchyDialog(h);
@@ -817,17 +934,27 @@ export default function HierarchiesPanel() {
                   <Tooltip title={t("common.delete")}>
                     <IconButton
                       size="small"
+                      aria-label={t("common.delete")}
+                      data-testid={`hierarchy-delete-${h.id}`}
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleDeleteHierarchy(h.id, h.name);
+                        handleDeleteHierarchy(h);
                       }}
                     >
                       <DeleteIcon fontSize="small" />
                     </IconButton>
                   </Tooltip>
                 </Box>
+                )}
               </ListItemButton>
-            ))}
+              <HierarchyHealthIssues
+                hierarchyName={h.name}
+                health={health}
+                memberProbe={memberProbe}
+              />
+              </ListItem>
+              );
+            })}
           </List>
         )}
       </Box>
@@ -956,9 +1083,11 @@ export default function HierarchiesPanel() {
                     {t("hierarchies.drillPathHelp")}
                   </Typography>
                 </Box>
+                {canEdit && (
                 <Button size="small" startIcon={<AddIcon />} onClick={openAddLevelDialog} sx={{ ml: 1, flexShrink: 0 }}>
                   {t("hierarchies.addLevel")}
                 </Button>
+                )}
               </Box>
 
               {sortedLevels.length > 0 ? (
@@ -1071,6 +1200,8 @@ export default function HierarchiesPanel() {
                               )}
                             </TableCell>
                             <TableCell align="right">
+                              {canEdit && (
+                              <>
                               <Tooltip title={t("hierarchies.moveUp")}>
                                 <span>
                                   <IconButton
@@ -1106,6 +1237,8 @@ export default function HierarchiesPanel() {
                                   <DeleteIcon fontSize="small" />
                                 </IconButton>
                               </Tooltip>
+                              </>
+                              )}
                             </TableCell>
                           </TableRow>
                         ))}

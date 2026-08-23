@@ -8,6 +8,7 @@ import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from .result_fakes import FakeScalarResult
 
 from .conftest import TEST_MODEL_ID, TEST_PROJECT_ID, NOW, async_gen_from, client, make_mock_db
 
@@ -22,7 +23,7 @@ class _ScalarResult:
         self._items = items
 
     def scalars(self):
-        return self
+        return FakeScalarResult(self._items)
 
     def all(self):
         return self._items
@@ -150,7 +151,167 @@ async def test_validate_user_defined_attribute_allows_same_table_qualified_refer
     data = resp.json()
     assert data["parse_valid"] is True
     assert data["columns_resolved"] is True
-    assert data["live_validation"]["success"] is True
+    # F-016-03: static validation passing must NOT be reported as a successful
+    # LIVE validation without an execution. In this mock no source is
+    # reachable, so the live probe reports executed=False, success=False —
+    # never the old executed=False/success=True lie.
+    live = data["live_validation"]
+    assert not (live["executed"] is False and live["success"] is True)
+
+
+@pytest.mark.asyncio
+async def test_validate_uda_executes_live_probe_and_reports_success(client):
+    """F-016-03: after static validation passes, the endpoint MUST actually
+    execute the expression against the source and report the real outcome —
+    never executed=False/success=True."""
+    mock_db = make_mock_db()
+    table = types.SimpleNamespace(
+        id=TABLE_ID, model_id=TEST_MODEL_ID, display_name="Payments",
+        alias="payments", physical_name="public.payments",
+        source_id=uuid.uuid4(),
+    )
+    c1 = _col(uuid.uuid4(), "account_code")
+    source = types.SimpleNamespace(id=table.source_id, config={}, default_schema="public")
+
+    async def _get(entity, entity_id):
+        if entity_id == TEST_MODEL_ID:
+            return types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+        if entity_id == TABLE_ID:
+            return table
+        if entity_id == table.source_id:
+            return source
+        return None
+
+    mock_db.get = AsyncMock(side_effect=_get)
+    mock_db.execute = AsyncMock(return_value=_ScalarResult([c1]))
+
+    connection = types.SimpleNamespace(
+        connection_type="postgresql", config={}, encrypted_credentials=None,
+    )
+
+    body = {"expression": "UPPER(account_code)", "output_data_type": "varchar"}
+
+    with (
+        patch("src.api.user_defined_attributes.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "src.api._scope.resolve_source_connection",
+            AsyncMock(return_value=connection),
+        ),
+        patch(
+            "shared.source_executor.execute_source_sql",
+            AsyncMock(return_value=([{"__uda_probe": "ABC"}], ["__uda_probe"])),
+        ),
+    ):
+        resp = await client.post(f"{PREFIX}/validate", json=body)
+
+    assert resp.status_code == 200
+    live = resp.json()["live_validation"]
+    assert live["executed"] is True
+    assert live["success"] is True
+    assert live["sample_value"] == "ABC"
+
+
+@pytest.mark.asyncio
+async def test_validate_uda_probe_valid_on_sqlserver(client):
+    """Bug-8294: the UDA live probe must emit valid T-SQL on a SQL Server source
+    (TOP 1, never the invalid LIMIT the missing dialect-map entry produced)."""
+    mock_db = make_mock_db()
+    table = types.SimpleNamespace(
+        id=TABLE_ID, model_id=TEST_MODEL_ID, display_name="Payments",
+        alias="payments", physical_name="dbo.payments",
+        source_id=uuid.uuid4(),
+    )
+    c1 = _col(uuid.uuid4(), "account_code")
+    source = types.SimpleNamespace(id=table.source_id, config={}, default_schema="dbo")
+
+    async def _get(entity, entity_id):
+        if entity_id == TEST_MODEL_ID:
+            return types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+        if entity_id == TABLE_ID:
+            return table
+        if entity_id == table.source_id:
+            return source
+        return None
+
+    mock_db.get = AsyncMock(side_effect=_get)
+    mock_db.execute = AsyncMock(return_value=_ScalarResult([c1]))
+    connection = types.SimpleNamespace(
+        connection_type="sqlserver", config={}, encrypted_credentials=None,
+    )
+    captured = {}
+
+    async def _exec_source(conn, sql, **kw):
+        captured["sql"] = sql
+        return ([{"__uda_probe": "ABC"}], ["__uda_probe"])
+
+    body = {"expression": "UPPER(account_code)", "output_data_type": "varchar"}
+    with (
+        patch("src.api.user_defined_attributes.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "src.api._scope.resolve_source_connection",
+            AsyncMock(return_value=connection),
+        ),
+        patch(
+            "shared.source_executor.execute_source_sql",
+            AsyncMock(side_effect=_exec_source),
+        ),
+    ):
+        resp = await client.post(f"{PREFIX}/validate", json=body)
+
+    assert resp.status_code == 200
+    assert resp.json()["live_validation"]["executed"] is True
+    # The probe SQL must be valid T-SQL: TOP 1, not LIMIT.
+    assert "TOP 1" in captured["sql"]
+    assert "LIMIT" not in captured["sql"]
+
+
+@pytest.mark.asyncio
+async def test_validate_uda_live_probe_reports_type_error(client):
+    """A type-invalid expression that passes static AST checks must surface as
+    executed=True/success=False when the source rejects it (F-016-03)."""
+    mock_db = make_mock_db()
+    table = types.SimpleNamespace(
+        id=TABLE_ID, model_id=TEST_MODEL_ID, display_name="Payments",
+        alias="payments", physical_name="public.payments",
+        source_id=uuid.uuid4(),
+    )
+    c1 = _col(uuid.uuid4(), "account_code")
+    source = types.SimpleNamespace(id=table.source_id, config={}, default_schema="public")
+
+    async def _get(entity, entity_id):
+        if entity_id == TEST_MODEL_ID:
+            return types.SimpleNamespace(id=TEST_MODEL_ID, project_id=TEST_PROJECT_ID)
+        if entity_id == TABLE_ID:
+            return table
+        if entity_id == table.source_id:
+            return source
+        return None
+
+    mock_db.get = AsyncMock(side_effect=_get)
+    mock_db.execute = AsyncMock(return_value=_ScalarResult([c1]))
+    connection = types.SimpleNamespace(
+        connection_type="postgresql", config={}, encrypted_credentials=None,
+    )
+    body = {"expression": "UPPER(account_code)", "output_data_type": "varchar"}
+
+    with (
+        patch("src.api.user_defined_attributes.get_tenant_db", async_gen_from(mock_db)),
+        patch(
+            "src.api._scope.resolve_source_connection",
+            AsyncMock(return_value=connection),
+        ),
+        patch(
+            "shared.source_executor.execute_source_sql",
+            AsyncMock(side_effect=RuntimeError("function upper(numeric) does not exist")),
+        ),
+    ):
+        resp = await client.post(f"{PREFIX}/validate", json=body)
+
+    assert resp.status_code == 200
+    live = resp.json()["live_validation"]
+    assert live["executed"] is True
+    assert live["success"] is False
+    assert "upper" in (live["error"] or "").lower()
 
 
 def _scope_aware_get_with_attr(table, attr):

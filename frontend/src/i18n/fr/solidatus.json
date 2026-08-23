@@ -1,8 +1,10 @@
 {
+  "solidatus.activate": "Activer",
   "solidatus.addConnection": "Ajouter une connexion",
   "solidatus.baseUrl": "URL de base",
   "solidatus.breakdownHeading": "Par type de nœud",
   "solidatus.baseUrlPlaceholder": "https://customer.solidatus.example.com",
+  "solidatus.deactivate": "Désactiver",
   "solidatus.delete": "Supprimer",
   "solidatus.deleteFailed": "La suppression a échoué.",
   "solidatus.details": "Détails",

@@ -36,15 +36,28 @@ def _make_bound(
     filter_dims: list[str],
     group_by: list[str],
     measures: list[str],
+    *,
+    passthrough: bool = False,
+    bound_filter_names: list[str] | None = None,
 ) -> BoundQuery:
     lq = MagicMock()
     lq.query_fingerprint = "deadbeef" * 8
     lq.raw_query = "SELECT d, COUNT(1) FROM t WHERE f = 'x' GROUP BY d"
     lq.grain = group_by
+    # Real LogicalQuery flags are bools; an ordinary filtered query is not a
+    # passthrough. Set them explicitly so the F-009-20 logger gate reads a real
+    # bool rather than a truthy MagicMock attribute.
+    lq.has_complex_sql = passthrough
+    lq.has_unresolvable_where = passthrough
 
     model = MagicMock()
     model.id = "model-1"
 
+    # F-009-20: the logger keeps a passthrough filter only when its name is a
+    # bound model reference. ``bound_filter_names`` (default: every filter dim)
+    # is the set the binder resolved; anything outside it is an unbound
+    # passthrough name that must be dropped from telemetry.
+    known = set(bound_filter_names) if bound_filter_names is not None else set(filter_dims)
     return BoundQuery(
         logical_query=lq,
         model=model,
@@ -54,17 +67,46 @@ def _make_bound(
             LogicalFilter(dimension_name=d, operator="eq", value="x")
             for d in filter_dims
         ],
+        resolved_dimensions_by_name={d: _dim(d) for d in (set(select_dims) | known)},
     )
 
 
 class _FakeDB:
-    """Minimal async DB stub — captures the object passed to add()."""
+    """Minimal async DB stub for the upsert-based log_query_miss.
+
+    Bug-6726 changed log_query_miss from SELECT-then-INSERT to
+    INSERT ... ON CONFLICT DO UPDATE.  This stub captures the INSERT
+    values from the compiled statement so test assertions can inspect
+    them.
+    """
 
     def __init__(self) -> None:
         self.added: list = []
+        self._insert_params: dict = {}
 
     async def execute(self, stmt):
+        # Extract compiled params from the upsert statement
+        try:
+            from sqlalchemy.dialects.postgresql import dialect as pg_dialect
+            compiled = stmt.compile(dialect=pg_dialect())
+            params = dict(compiled.params)
+            if params and not self._insert_params:
+                self._insert_params = params
+        except Exception:
+            pass
+
         result = MagicMock()
+        # Return occurrence_count=1 (insert path, no variant merge needed)
+        _row = SimpleNamespace(
+            id="fake-id",
+            occurrence_count=1,
+            predicate_variants_json=None,
+            # Bug-8071: RETURNING now also yields the per-reason history.
+            miss_reason_counts_json=None,
+            miss_reason="no_aggregate",
+            first_seen_at="2026-01-01T00:00:00+00:00",
+        )
+        result.fetchone.return_value = _row
         result.scalar_one_or_none.return_value = None
         return result
 
@@ -73,6 +115,11 @@ class _FakeDB:
 
     async def commit(self) -> None:
         pass
+
+    @property
+    def captured(self) -> SimpleNamespace:
+        """Return a namespace of captured INSERT values for test assertions."""
+        return SimpleNamespace(**self._insert_params)
 
 
 @pytest.mark.asyncio
@@ -87,8 +134,7 @@ async def test_filter_dims_included_in_requested_dimensions():
     db = _FakeDB()
     await log_query_miss(db, bound, "no_aggregate")
 
-    assert db.added, "QueryMissLog was not added to the session"
-    obj = db.added[0]
+    obj = db.captured
     assert "department" in obj.requested_dimensions
     assert "manager" in obj.requested_dimensions, (
         "Filter dimension 'manager' missing from requested_dimensions — "
@@ -108,7 +154,7 @@ async def test_filter_dims_included_in_requested_grain():
     db = _FakeDB()
     await log_query_miss(db, bound, "no_aggregate")
 
-    obj = db.added[0]
+    obj = db.captured
     assert "department" in obj.requested_grain
     assert "manager" in obj.requested_grain, (
         "Filter dimension 'manager' missing from requested_grain"
@@ -127,9 +173,99 @@ async def test_multiple_filter_dims_all_captured():
     db = _FakeDB()
     await log_query_miss(db, bound, "no_aggregate")
 
-    obj = db.added[0]
+    obj = db.captured
     assert set(obj.requested_dimensions) == {"product", "region", "manager"}
     assert set(obj.requested_grain) == {"product", "region", "manager"}
+
+
+@pytest.mark.asyncio
+async def test_required_grain_overrides_derived_grain():
+    """F-009-01 / F-030-03 / F-101-06 / F-102-03 (Bug-8773 / Bug-9099): when the
+    execute path forwards the matcher's ``required_grain``, the logged
+    ``requested_grain`` is EXACTLY that set — including DISTINCT / DATE_TRUNC
+    substitutions the matcher applied — not the logger's re-derived
+    ``lq.grain | filter_dims``."""
+    bound = _make_bound(
+        select_dims=["region"],
+        filter_dims=["manager"],
+        group_by=["region"],
+        measures=["base_amount"],
+    )
+    db = _FakeDB()
+    # Matcher required a DATE_TRUNC substitution grain the raw query does not name.
+    await log_query_miss(
+        db, bound, "no_aggregate",
+        required_grain=["order_month", "region", "manager"],
+    )
+
+    obj = db.captured
+    assert set(obj.requested_grain) == {"order_month", "region", "manager"}, (
+        "requested_grain must equal the matcher's required_grain when forwarded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_required_grain_none_falls_back_to_derived():
+    """When the matcher early-returned (required_grain None), the logger keeps
+    its documented lq.grain | filter_dims fallback."""
+    bound = _make_bound(
+        select_dims=["region"],
+        filter_dims=["manager"],
+        group_by=["region"],
+        measures=["base_amount"],
+    )
+    db = _FakeDB()
+    await log_query_miss(db, bound, "no_aggregate", required_grain=None)
+
+    obj = db.captured
+    assert set(obj.requested_grain) == {"region", "manager"}
+
+
+@pytest.mark.asyncio
+async def test_passthrough_unbound_filter_dropped_from_telemetry():
+    """F-009-20 (Bug-8775 sibling): a passthrough / complex-SQL query keeps raw
+    unresolved filter names for the SOURCE rewrite, but those names must not
+    reach optimizer telemetry — a pocket built from a column the model does not
+    have can never match. The bound filter is kept; the unbound one is dropped
+    from predicates and grain."""
+    bound = _make_bound(
+        select_dims=["region"],
+        filter_dims=["region", "ghost_col"],
+        group_by=["region"],
+        measures=["base_amount"],
+        passthrough=True,
+        bound_filter_names=["region"],  # ghost_col is NOT a model column
+    )
+    db = _FakeDB()
+    await log_query_miss(db, bound, "aggregate_skip:passthrough", required_grain=None)
+
+    obj = db.captured
+    predicate_cols = {p["column_name"] for p in obj.predicates_json}
+    assert predicate_cols == {"region"}, (
+        "unbound passthrough filter 'ghost_col' must be dropped from predicates"
+    )
+    assert "ghost_col" not in obj.requested_grain
+    assert "ghost_col" not in obj.requested_dimensions
+
+
+@pytest.mark.asyncio
+async def test_non_passthrough_keeps_all_bound_filters():
+    """F-009-20 guard: the drop applies ONLY on the passthrough path. An ordinary
+    filtered query's filters are all bound by the binder and must be kept."""
+    bound = _make_bound(
+        select_dims=["region"],
+        filter_dims=["manager"],
+        group_by=["region"],
+        measures=["base_amount"],
+        passthrough=False,
+    )
+    db = _FakeDB()
+    await log_query_miss(db, bound, "no_aggregate")
+
+    obj = db.captured
+    predicate_cols = {p["column_name"] for p in obj.predicates_json}
+    assert predicate_cols == {"manager"}
+    assert "manager" in obj.requested_grain
 
 
 @pytest.mark.asyncio
@@ -144,7 +280,7 @@ async def test_no_filter_dims_unchanged():
     db = _FakeDB()
     await log_query_miss(db, bound, "no_aggregate")
 
-    obj = db.added[0]
+    obj = db.captured
     assert set(obj.requested_dimensions) == {"region", "payment_method"}
     assert set(obj.requested_grain) == {"region", "payment_method"}
 
@@ -161,7 +297,7 @@ async def test_filter_dim_already_in_select_not_duplicated():
     db = _FakeDB()
     await log_query_miss(db, bound, "no_aggregate")
 
-    obj = db.added[0]
+    obj = db.captured
     assert obj.requested_dimensions.count("region") == 1, (
         "Dimension appearing in both SELECT and WHERE must not be duplicated"
     )
@@ -174,63 +310,100 @@ async def test_filter_dim_already_in_select_not_duplicated():
 import uuid as _uuid
 
 
-class _FakeDBWithExisting:
-    """DB stub that returns an existing QueryMissLog for execute()."""
+class _FakeDBConflict:
+    """DB stub that simulates the ON CONFLICT (upsert update) path.
 
-    def __init__(self, existing_obj) -> None:
-        self._existing = existing_obj
-        self.added: list = []
+    Returns occurrence_count=2 from the upsert RETURNING so
+    log_query_miss enters the variant-merge branch and fires a
+    follow-up UPDATE.
+    """
+
+    def __init__(self) -> None:
+        self._insert_params: dict = {}
+        self._update_params: dict = {}
+        self._stmts: list = []
+        self._call_count = 0
 
     async def execute(self, stmt):
-        result = MagicMock()
-        result.scalar_one_or_none.return_value = self._existing
-        return result
+        self._call_count += 1
+        self._stmts.append(stmt)
+        try:
+            from sqlalchemy.dialects.postgresql import dialect as pg_dialect
+            compiled = stmt.compile(dialect=pg_dialect())
+            params = dict(compiled.params)
+            if self._call_count == 1:
+                self._insert_params = params
+            else:
+                self._update_params = params
+        except Exception:
+            pass
 
-    def add(self, obj) -> None:
-        self.added.append(obj)
+        result = MagicMock()
+        # First execute -> upsert RETURNING (conflict path)
+        if self._call_count == 1:
+            _row = SimpleNamespace(
+                id=_uuid.uuid4(),
+                occurrence_count=2,  # conflict: existing row incremented
+                predicate_variants_json=[{
+                    "predicate_set_hash": "old",
+                    "predicates": [],
+                    "occurrence_count": 1,
+                    "last_seen_at": "2026-01-01T00:00:00+00:00",
+                }],
+                # Bug-8071: RETURNING now also yields the per-reason history.
+                miss_reason_counts_json=[{
+                    "reason": "no_aggregate",
+                    "occurrence_count": 1,
+                    "first_seen_at": "2026-01-01T00:00:00+00:00",
+                    "last_seen_at": "2026-01-01T00:00:00+00:00",
+                }],
+                miss_reason="no_aggregate",
+                first_seen_at="2026-01-01T00:00:00+00:00",
+            )
+            result.fetchone.return_value = _row
+        return result
 
     async def commit(self) -> None:
         pass
 
+    @property
+    def captured(self) -> SimpleNamespace:
+        """Return a namespace of captured INSERT values for test assertions.
 
-def _existing_miss(grain, measures, candidate_aggregate_id=None):
-    obj = SimpleNamespace()
-    obj.occurrence_count = 3
-    obj.last_seen_at = None
-    obj.miss_reason = "old_reason"
-    obj.requested_grain = list(grain)
-    obj.requested_dimensions = list(grain)
-    obj.requested_measures = list(measures)
-    obj.candidate_aggregate_id = candidate_aggregate_id
-    # F-005-14: the upsert now also maintains a per-literal-variant breakdown.
-    obj.predicate_variants_json = None
-    return obj
+        The INSERT and ON CONFLICT SET clauses use the same computed values
+        for requested_dimensions, requested_grain, requested_measures, and
+        candidate_aggregate_id (None in SET).
+        """
+        return SimpleNamespace(**self._insert_params)
 
 
 @pytest.mark.asyncio
 async def test_existing_miss_log_candidate_aggregate_id_cleared():
     """When an existing miss log has candidate_aggregate_id set but the query
-    still misses, candidate_aggregate_id must be cleared so the optimizer
-    re-queues the pattern."""
-    existing = _existing_miss(
-        grain=["region"],
-        measures=["base_amount"],
-        candidate_aggregate_id=_uuid.uuid4(),
-    )
-    assert existing.candidate_aggregate_id is not None
-
+    still misses, the ON CONFLICT SET clause must reset candidate_aggregate_id
+    to NULL so the optimizer re-queues the pattern."""
     bound = _make_bound(
         select_dims=["region"],
         filter_dims=["manager"],
         group_by=["region"],
         measures=["base_amount"],
     )
-    db = _FakeDBWithExisting(existing)
+    db = _FakeDBConflict()
     await log_query_miss(db, bound, "no_aggregate")
 
-    assert existing.candidate_aggregate_id is None, (
-        "candidate_aggregate_id must be cleared when the query still misses — "
-        "the linked aggregate is not serving it"
+    # Verify the upsert's ON CONFLICT SET clause includes
+    # candidate_aggregate_id (meaning it resets it on every conflict).
+    # The compiled SQL for the first execute() call is the full upsert.
+    upsert_stmt = db._stmts[0] if db._stmts else None
+    assert upsert_stmt is not None, "No statement captured"
+    from sqlalchemy.dialects.postgresql import dialect as pg_dialect
+    sql_text = str(upsert_stmt.compile(dialect=pg_dialect()))
+    # The ON CONFLICT ... DO UPDATE SET ... portion must contain
+    # candidate_aggregate_id to reset it on re-queue.
+    set_clause = sql_text.split("DO UPDATE SET")[1] if "DO UPDATE SET" in sql_text else ""
+    assert "candidate_aggregate_id" in set_clause, (
+        "candidate_aggregate_id must be reset in ON CONFLICT SET — "
+        "the linked aggregate is not serving the query"
     )
 
 
@@ -238,42 +411,33 @@ async def test_existing_miss_log_candidate_aggregate_id_cleared():
 async def test_existing_miss_log_grain_refreshed_with_filter_dims():
     """An existing miss log with an incomplete grain (no filter dims) must
     have its grain updated to the current full grain on upsert."""
-    existing = _existing_miss(
-        grain=["region"],        # incomplete — missing filter dim 'manager'
-        measures=["base_amount"],
-        candidate_aggregate_id=None,
-    )
-
     bound = _make_bound(
         select_dims=["region"],
         filter_dims=["manager"],
         group_by=["region"],
         measures=["base_amount"],
     )
-    db = _FakeDBWithExisting(existing)
+    db = _FakeDBConflict()
     await log_query_miss(db, bound, "no_aggregate")
 
-    assert "manager" in existing.requested_grain, (
+    obj = db.captured
+    assert "manager" in obj.requested_grain, (
         "existing miss log grain must be refreshed to include filter dimensions"
     )
-    assert "manager" in existing.requested_dimensions
+    assert "manager" in obj.requested_dimensions
 
 
 @pytest.mark.asyncio
 async def test_existing_miss_log_measures_refreshed():
     """Measures on an existing miss log are updated to reflect the current query."""
-    existing = _existing_miss(
-        grain=["region"],
-        measures=["base_amount"],
-    )
-
     bound = _make_bound(
         select_dims=["region"],
         filter_dims=[],
         group_by=["region"],
         measures=["base_amount", "transaction_count"],
     )
-    db = _FakeDBWithExisting(existing)
+    db = _FakeDBConflict()
     await log_query_miss(db, bound, "no_aggregate")
 
-    assert "transaction_count" in existing.requested_measures
+    obj = db.captured
+    assert "transaction_count" in obj.requested_measures

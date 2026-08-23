@@ -8,21 +8,85 @@ GET  /tenants/me — tenant user: get own tenant info from JWT.
 from __future__ import annotations
 
 from cryptography.fernet import InvalidToken
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from shared.audit.system import system_audit
+from shared.audit.logger import audit_required
+from shared.config.resolver import get_setting, set_setting
 from shared.config.settings import get_settings
 from shared.db.models import SystemTenant
-from shared.db.session import get_system_db, normalize_tenant_db_url, evict_tenant_engine
+from shared.db.session import (
+    evict_tenant_engine,
+    get_system_db,
+    get_tenant_db,
+    normalize_tenant_db_url,
+)
 from shared.schemas.pydantic_models import TenantCreate, TenantResponse, TenantUpdate
+from shared.semantic.fiscal_year_labels import (
+    FISCAL_YEAR_LABEL_SETTING,
+    extract_fiscal_year_label_format,
+    FISCAL_YEAR_LABEL_FORMATS,
+)
 from shared.security.credential_crypto import decrypt_str, encrypt_str
-from src.auth.middleware import CurrentUser, forbid_embed_user, get_current_user, require_system_admin
+from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
+from src.auth.middleware import (
+    CurrentUser,
+    require_human_user,
+    require_system_admin,
+    require_tenant_admin,
+    is_canonical_human_system_admin,
+)
 from src.licensing_guard import enforce_create_cap, get_license_manager
 
 settings = get_settings()
 router = APIRouter(prefix="/tenants", tags=["tenants"])
+
+
+class FiscalYearLabelFormatRequest(BaseModel):
+    """Tenant setting payload; strict extras keep the JSONB contract closed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    format: str
+
+    @field_validator("format")
+    @classmethod
+    def _validate_format(cls, value: str) -> str:
+        # Let FastAPI turn the registry vocabulary error into a 422 rather than
+        # letting a bad token reach a calendar rebuild.
+        extract_fiscal_year_label_format(value)
+        return value
+
+
+class FiscalYearLabelFormatResponse(FiscalYearLabelFormatRequest):
+    available_formats: list[str] = list(FISCAL_YEAR_LABEL_FORMATS)
+
+
+def _resolve_calendar_target_tenant(tenant_id: str, current_user: CurrentUser) -> str:
+    """Resolve the path target without ever opening the system tenant DB."""
+    if (
+        getattr(current_user, "role", None) == "system_admin"
+        and getattr(current_user, "tenant_id", None) == "__system__"
+        and is_canonical_human_system_admin(current_user)
+    ):
+        if not tenant_id or tenant_id == "__system__":
+            raise HTTPException(status_code=400, detail="A real target tenant is required")
+        return tenant_id
+    if tenant_id != current_user.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="tenant_id does not match the authenticated tenant",
+        )
+    return current_user.tenant_id
+
+
+def _assert_own_tenant(tenant_id: str, current_user: CurrentUser) -> None:
+    """Compatibility guard for callers/tests; system admins resolve targets."""
+    _resolve_calendar_target_tenant(tenant_id, current_user)
 
 
 def _encrypt_db_url(url: str) -> bytes:
@@ -33,6 +97,7 @@ def _encrypt_db_url(url: str) -> bytes:
 @router.post("", response_model=TenantResponse, status_code=status.HTTP_201_CREATED)
 async def create_tenant(
     body: TenantCreate,
+    request: Request,
     sys_db: AsyncSession = Depends(get_system_db),
     _admin: CurrentUser = Depends(require_system_admin),
 ) -> TenantResponse:
@@ -51,7 +116,9 @@ async def create_tenant(
             1 for s in rows.scalars().all() if mgr.classify_tenant(str(s)) != "demo"
         )
 
-    await enforce_create_cap("tenant", _count_own_tenants)
+    # Bug-6567: pass sys_db so the count-then-create is serialised with an
+    # advisory lock, preventing two concurrent tenant creates at cap-1.
+    await enforce_create_cap("tenant", _count_own_tenants, db=sys_db)
 
     # Validate slug uniqueness
     result = await sys_db.execute(
@@ -108,7 +175,20 @@ async def create_tenant(
         is_active=True,
     )
     sys_db.add(tenant)
+    client_ip = request.client.host if request.client else None
     try:
+        await system_audit(
+            sys_db,
+            action="tenant.create",
+            severity="critical",
+            actor_email=_admin.email,
+            target_type="tenant",
+            target_id=tenant.id,
+            target_name=tenant.slug,
+            tenant_slug=tenant.slug,
+            ip_address=client_ip,
+            detail={"display_name": tenant.display_name},
+        )
         await sys_db.commit()
     except IntegrityError:
         await sys_db.rollback()
@@ -138,8 +218,7 @@ async def list_tenants(
 @router.get("/me", response_model=TenantResponse)
 async def get_my_tenant(
     sys_db: AsyncSession = Depends(get_system_db),
-    current_user: CurrentUser = Depends(get_current_user),
-    _: None = Depends(forbid_embed_user),
+    current_user: CurrentUser = Depends(require_human_user),
 ) -> TenantResponse:
     """Tenant user: get info about own tenant (from JWT tenant_id)."""
     from sqlalchemy import select
@@ -150,6 +229,88 @@ async def get_my_tenant(
     if tenant is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
     return TenantResponse.model_validate(tenant)
+
+
+@router.get(
+    "/{tenant_id}/calendar-settings",
+    response_model=FiscalYearLabelFormatResponse,
+)
+async def get_calendar_settings(
+    tenant_id: str,
+    current_user: CurrentUser = Depends(require_tenant_admin),
+) -> FiscalYearLabelFormatResponse:
+    """Read the tenant-wide fiscal/retail year caption convention."""
+    target_tenant_id = _resolve_calendar_target_tenant(tenant_id, current_user)
+    async for tenant_db in get_tenant_db(target_tenant_id):
+        value = await get_setting(
+            FISCAL_YEAR_LABEL_SETTING,
+            tenant_session=tenant_db,
+            tenant_id=target_tenant_id,
+        )
+        try:
+            token = extract_fiscal_year_label_format(value)
+        except ValueError as exc:
+            # A row written outside the registry is corrupt. Do not silently
+            # serve a different label convention; make the operator repair it.
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Stored fiscal year label format is invalid",
+            ) from exc
+        return FiscalYearLabelFormatResponse(format=token)
+    raise HTTPException(status_code=500, detail="DB session exhausted")
+
+
+@router.put(
+    "/{tenant_id}/calendar-settings",
+    response_model=FiscalYearLabelFormatResponse,
+)
+async def update_calendar_settings(
+    tenant_id: str,
+    body: FiscalYearLabelFormatRequest,
+    current_user: CurrentUser = Depends(require_tenant_admin),
+) -> FiscalYearLabelFormatResponse:
+    """Set the tenant caption convention used on the next calendar rebuild."""
+    target_tenant_id = _resolve_calendar_target_tenant(tenant_id, current_user)
+    async for tenant_db in get_tenant_db(target_tenant_id):
+        previous = await get_setting(
+            FISCAL_YEAR_LABEL_SETTING,
+            tenant_session=tenant_db,
+            tenant_id=target_tenant_id,
+        )
+        previous_token = extract_fiscal_year_label_format(previous)
+        await audit_required(
+            tenant_db,
+            action="settings.update",
+            severity="warn",
+            actor_email=current_user.email or current_user.user_id,
+            target_type="tenant_setting",
+            target_name=target_tenant_id,
+            detail={
+                "setting": FISCAL_YEAR_LABEL_SETTING,
+                "before": previous_token,
+                "after": body.format,
+            },
+        )
+        await set_setting(
+            FISCAL_YEAR_LABEL_SETTING,
+            body.model_dump(),
+            actor=current_user.email or current_user.user_id,
+            tenant_session=tenant_db,
+            tenant_id=target_tenant_id,
+            tenant_scope=True,
+        )
+        # ``set_setting`` commits the existing tenant-settings transaction and
+        # invalidates its resolver cache. Re-read so the response is the
+        # persisted effective value, matching the branding/settings APIs.
+        value = await get_setting(
+            FISCAL_YEAR_LABEL_SETTING,
+            tenant_session=tenant_db,
+            tenant_id=target_tenant_id,
+        )
+        return FiscalYearLabelFormatResponse(
+            format=extract_fiscal_year_label_format(value)
+        )
+    raise HTTPException(status_code=500, detail="DB session exhausted")
 
 
 @router.get("/{tenant_id}", response_model=TenantResponse)
@@ -173,6 +334,7 @@ async def get_tenant(
 async def update_tenant(
     tenant_id: str,
     body: TenantUpdate,
+    request: Request,
     sys_db: AsyncSession = Depends(get_system_db),
     _admin: CurrentUser = Depends(require_system_admin),
 ) -> TenantResponse:
@@ -195,6 +357,19 @@ async def update_tenant(
     updates = body.model_dump(exclude_unset=True)
     for key, value in updates.items():
         setattr(tenant, key, value)
+    client_ip = request.client.host if request.client else None
+    await system_audit(
+        sys_db,
+        action="tenant.update",
+        severity="critical",
+        actor_email=_admin.email,
+        target_type="tenant",
+        target_id=tenant.id,
+        target_name=tenant.slug,
+        tenant_slug=tenant.slug,
+        ip_address=client_ip,
+        detail={"display_name": tenant.display_name, "updates": sorted(updates.keys())},
+    )
     await sys_db.commit()
     await sys_db.refresh(tenant)
     return TenantResponse.model_validate(tenant)
@@ -203,6 +378,7 @@ async def update_tenant(
 @router.delete("/{tenant_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_tenant(
     tenant_id: str,
+    request: Request,
     sys_db: AsyncSession = Depends(get_system_db),
     _admin: CurrentUser = Depends(require_system_admin),
 ) -> None:
@@ -214,6 +390,22 @@ async def delete_tenant(
     tenant = result.scalar_one_or_none()
     if tenant is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
+
+    client_ip = request.client.host if request.client else None
+    await system_audit(
+        sys_db,
+        action="tenant.delete",
+        severity="critical",
+        actor_email=_admin.email,
+        target_type="tenant",
+        target_id=tenant.id,
+        target_name=tenant.slug,
+        tenant_slug=tenant.slug,
+        ip_address=client_ip,
+        detail={"display_name": tenant.display_name},
+    )
+    await emit_webhook(tenant.slug, "tenant.deleted", {"slug": tenant.slug})
+    await sys_db.commit()
 
     db_url = normalize_tenant_db_url(decrypt_str(tenant.encrypted_db_url), tenant.slug)
 

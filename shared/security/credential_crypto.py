@@ -117,6 +117,8 @@ def encrypt_json(obj: dict) -> bytes:
 
 
 def decrypt_json(ciphertext: bytes) -> dict:
+    if not ciphertext:
+        return {}
     return json.loads(decrypt_blob(ciphertext).decode("utf-8"))
 
 

@@ -93,6 +93,41 @@ describe("DiagnosticsPanel client-kind telemetry", () => {
   });
 });
 
+describe("DiagnosticsPanel probe exclusion (Bug-7451)", () => {
+  it("passes includeProbes=undefined by default (probes excluded)", () => {
+    renderPanel();
+    // The initial call should NOT pass includeProbes (undefined = excluded).
+    const initialCall = useQueryLogsMock.mock.calls[0];
+    expect(initialCall[1].includeProbes).toBeUndefined();
+  });
+
+  it("passes includeProbes=true when the checkbox is checked", async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    const checkbox = screen.getByRole("checkbox", { name: /include probes/i });
+    await user.click(checkbox);
+    await waitFor(() => {
+      const lastCall = useQueryLogsMock.mock.calls[useQueryLogsMock.mock.calls.length - 1];
+      expect(lastCall[1].includeProbes).toBe(true);
+    });
+  });
+});
+
+describe("DiagnosticsPanel expanded client-kind filter (Bug-7451)", () => {
+  it("shows expanded client-kind options including headless, agent, mcp", async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    fireEvent.mouseDown(screen.getByLabelText("Client"));
+    const options = await screen.findAllByRole("option");
+    const optionTexts = options.map((o) => o.textContent);
+    expect(optionTexts).toContain("Headless");
+    expect(optionTexts).toContain("Agent");
+    expect(optionTexts).toContain("MCP");
+    expect(optionTexts).toContain("Excel Plugin");
+    expect(optionTexts).toContain("Drill-through");
+  });
+});
+
 describe("DiagnosticsPanel AI optimizer run expansion", () => {
   it("renders diagnostics_log entries with code_map when an AI run is expanded", async () => {
     const user = userEvent.setup();
@@ -154,5 +189,53 @@ describe("DiagnosticsPanel AI optimizer run expansion", () => {
 
     // F-011-07: analysis_notes is now rendered in the expanded detail.
     expect(screen.getByText("Reviewed the top miss patterns and recommended one grain.")).toBeInTheDocument();
+  });
+});
+
+describe("DiagnosticsPanel AI run status labels (F-559-04)", () => {
+  it("renders the queued status through i18n, not the raw backend token", async () => {
+    const user = userEvent.setup();
+
+    // Bug-8034: a manual advisor run is durably accepted as `queued` and stays
+    // there until the scheduler's dispatcher claims it, so this is what a user
+    // polling the run history sees straight after triggering a run.
+    useAIOptimizerRunsMock.mockReturnValue({
+      data: [
+        {
+          id: "ai-run-queued",
+          model_id: "model-1",
+          triggered_by: "manual",
+          status: "queued",
+          // Bug-9407-SPA: the shipped advisor's preview mode is visible in
+          // the same status surface as the durable queued state.
+          is_dry_run: true,
+          started_at: "2026-08-11T10:00:00Z",
+          completed_at: null,
+          llm_provider: null,
+          llm_model: "claude-pending-marker",
+          telemetry_snapshot_id: null,
+          recommendations_count: 0,
+          aggregates_created: 0,
+          aggregates_skipped: 0,
+          error_message: null,
+          raw_llm_response: null,
+          analysis_notes: null,
+          diagnostics_log: null,
+          recommendations: [],
+        },
+      ],
+      isLoading: false,
+      isFetching: false,
+      refetch: vi.fn(),
+    });
+    useAIOptimizerRunMock.mockReturnValue({ data: undefined, isLoading: false });
+
+    renderPanel();
+    await user.click(screen.getByRole("tab", { name: /optimisation/i }));
+
+    const row = (await screen.findByText("claude-pending-marker")).closest("tr")!;
+    expect(row.textContent).toContain("Queued");
+    expect(row.textContent).not.toContain("queued");
+    expect(row.textContent).toContain("Dry run");
   });
 });

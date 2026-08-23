@@ -26,6 +26,8 @@
 <h2>Targets</h2>
 <p>A rule targets a specific object within the model:</p>
 <div class="table-wrapper"><table><thead><tr><th><code>target_type</code></th><th>Meaning</th></tr></thead><tbody><tr><td><code>column</code></td><td>A specific <code>ModelColumn</code> row; the rule&#x27;s <code>target_id</code> is the column UUID</td></tr><tr><td><code>dimension</code></td><td>The source column of a dimension; <code>target_id</code> is the dimension UUID</td></tr><tr><td><code>measure</code></td><td>The source column of a standard measure; <code>target_id</code> is the measure UUID</td></tr></tbody></table></div>
+<p>The target must belong to the model you are adding the rule to. If you paste an ID that belongs to a different model &mdash; even another model in the same project &mdash; the rule is refused and nothing is saved. This is deliberate: a rule pointing at another model&#x27;s column would run its check against that model&#x27;s table and store the results, including sample values, under this model.</p>
+<p>If a rule will not save, the usual cause is an ID copied from the wrong model. Re-copy it from the model you are working in.</p>
 <h2>Severity levels</h2>
 <div class="table-wrapper"><table><thead><tr><th>Severity</th><th>Effect on model alerts</th></tr></thead><tbody><tr><td><code>info</code></td><td>No model alert raised</td></tr><tr><td><code>warn</code></td><td>Warning alert raised</td></tr><tr><td><code>error</code></td><td>Error alert raised</td></tr></tbody></table></div>
 <p>When <code>block_on_failure</code> is enabled, any violation produces an error-severity alert regardless of the rule&#x27;s <code>severity</code> setting.</p>
@@ -48,7 +50,7 @@
 <ul><li>Rules run synchronously after each refresh. Many rules on a large fact table will extend refresh time.</li><li><code>custom_sql</code> rules run against the source database using the model&#x27;s source connection. They cannot reference the aggregate schema.</li><li>There is no version history for rule definitions. Deleting a rule also deletes its violation history.</li></ul>
 <h2>Related</h2>
 <ul><li><a href="configure-aggregates.html">Configure aggregates</a></li><li><a href="run-a-refresh.html">Run a refresh</a></li><li><a href="view-diagnostics.html">View diagnostics</a></li></ul>
-<nav class="page-nav"><a href="parameterized-filters.html" class="page-nav-btn prev">&larr; Parameterized Filters</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="impact-analysis.html" class="page-nav-btn next">Impact Analysis &rarr;</a></nav>
+<nav class="page-nav"><a href="parameterized-filters.html" class="page-nav-btn prev">&larr; Parameterized Filters</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="usage-downstream-assets.html" class="page-nav-btn next">Usage &amp; Downstream Assets &rarr;</a></nav>
   </main>
   <footer class="site-footer"><p>Tessallite Help — <a href="../index.html">Back to contents</a></p></footer>
 </body>

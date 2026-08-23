@@ -8,6 +8,7 @@
 import { useState } from "react";
 import { safeLocalGet } from "../../utils/safeLocalStorage";
 import { useT } from "../../i18n";
+import { useCanAuthorModel } from "../../auth/useCanAuthorModel";
 import {
   Alert,
   Box,
@@ -98,8 +99,29 @@ export default function SettingsPanel({ projectId, modelId }: SettingsPanelProps
   const t = useT();
   const [tab, setTab] = useState<SettingsTab>("preferences");
   const showModelTabs = Boolean(projectId && modelId);
+  // Bug-8170: Collibra / Solidatus panels expose admin/modeler-only mutations
+  // (create, activate/deactivate, edit, delete, sync) with no client-side gate
+  // at all — a viewer could open either tab and be offered controls the
+  // backend rejects (api/collibra.py, api/solidatus.py: require_role("admin")
+  // for create/update/delete, require_role("modeler") for validate/sync). This
+  // is a UI gate only, defense-in-depth — the backend role checks above stay
+  // authoritative regardless of this flag.
+  //
+  // Round-2 fix: gate on the server-derived per-model authoring authority
+  // (`useCanAuthorModel()`, backed by `caller_can_author` / builder-store
+  // `readOnly` — the same source every other Model Builder authoring panel
+  // uses), NOT the coarse local role via `canEditModelConfig()`. The
+  // canonical locally-provisioned modeller is local role `member` plus a
+  // per-project `modeler` binding — `modeler` is never a `LocalUser.role`
+  // value — so the coarse check wrongly hid both tabs from an authorized
+  // modeller (Bug-8747 / questions_modeller-authoring-authority-source.md,
+  // decided: fail closed on the per-model signal, no legacy role fallback).
+  const canManageIntegrations = useCanAuthorModel();
   const allTabs: SettingsTab[] = showModelTabs
-    ? ["preferences", "llm", "aggregates", "ai-optimizer", "pocket", "predictive", "limits", "sla", "statistics", "solidatus", "collibra"]
+    ? [
+        "preferences", "llm", "aggregates", "ai-optimizer", "pocket", "predictive", "limits", "sla", "statistics",
+        ...(canManageIntegrations ? (["solidatus", "collibra"] as const) : []),
+      ]
     : ["preferences"];
   const activeTab = allTabs.includes(tab) ? tab : "preferences";
 

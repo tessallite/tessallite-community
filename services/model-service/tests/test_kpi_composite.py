@@ -6,6 +6,7 @@ import uuid
 import pytest
 
 from src.kpi_composite import (
+    COMPOSITE_STATUS_RESTRICTED,
     ChildScore,
     CompositeResult,
     build_composite_children,
@@ -51,8 +52,12 @@ class TestNormalisePctTarget:
         assert result == pytest.approx(5.0)
 
     def test_negative_value(self):
+        # Bug-6254: higher_is_better is floor-clamped like the other directions,
+        # so a negative value against a positive target normalises to 0, not a
+        # negative percentage that escapes the documented [0, 100] contract and
+        # drags the weighted composite below zero.
         result = normalise_pct_target(-10, 100)
-        assert result == pytest.approx(-10.0)
+        assert result == pytest.approx(0.0)
 
     # --- Direction-aware tests ---
 
@@ -532,6 +537,58 @@ class TestErroredChildVsNoData:
         assert [ec.kpi_name for ec in result.errored_children] == ["Broken"]
 
 
+class TestRestrictedChildSemantics:
+    def test_one_restricted_child_fails_closed_without_renormalising(self):
+        children = [
+            ChildScore(
+                "restricted", "Restricted", None, 100,
+                weight=0.4, restricted=True,
+            ),
+            ChildScore("visible", "Visible", 50, 100, weight=0.6),
+        ]
+
+        result = evaluate_composite(children, "pct_target")
+
+        assert result.composite_score is None
+        assert result.status == COMPOSITE_STATUS_RESTRICTED
+        assert result.total_weight_before == pytest.approx(1.0)
+        assert result.total_weight_after == 0.0
+        assert children[0].excluded is True
+        assert children[0].exclude_reason == "row_security_restricted"
+        assert children[1].normalised is None
+        assert children[0].weight == pytest.approx(0.4)
+        assert children[1].weight == pytest.approx(0.6)
+
+    def test_build_children_propagates_restricted_from_cache(self):
+        parent_id = str(uuid.uuid4())
+        restricted_id = str(uuid.uuid4())
+        visible_id = str(uuid.uuid4())
+        all_kpis = [
+            {
+                "id": restricted_id, "name": "Restricted",
+                "parent_kpi_id": parent_id, "weight": 1.0,
+                "direction": "higher_is_better", "target_value": None,
+            },
+            {
+                "id": visible_id, "name": "Visible",
+                "parent_kpi_id": parent_id, "weight": 1.0,
+                "direction": "higher_is_better", "target_value": None,
+            },
+        ]
+        eval_cache = {
+            restricted_id: {
+                "value": None, "target": None, "restricted": True,
+            },
+            visible_id: {
+                "value": 50, "target": 100, "restricted": False,
+            },
+        }
+
+        children = build_composite_children(parent_id, all_kpis, eval_cache)
+
+        assert [child.restricted for child in children] == [True, False]
+        assert evaluate_composite(children).status == COMPOSITE_STATUS_RESTRICTED
+
 # ---------------------------------------------------------------------------
 # build_composite_children
 # ---------------------------------------------------------------------------
@@ -805,6 +862,53 @@ class TestEvaluateCompositeScoreSingle:
             )
 
         assert result.composite_score == pytest.approx(40.0)
+
+    @pytest.mark.asyncio
+    async def test_any_restricted_leaf_fails_single_path_closed(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from src.api.kpis import (
+            ROW_SECURITY_DENY_ALL_RULE_ID,
+            _evaluate_composite_score,
+        )
+
+        parent_id = uuid.uuid4()
+        parent = _ns(id=parent_id, kpi_type="composite", presentation_meta=None)
+        child_a, child_b = _make_children(parent_id)
+
+        db = MagicMock()
+        result_q = MagicMock()
+        result_q.scalars.return_value.all.return_value = [child_a, child_b]
+        db.execute = AsyncMock(return_value=result_q)
+
+        async def fake_single(kpi, *args, **kwargs):
+            if kpi.id == child_a.id:
+                return _ns(
+                    value=None, target=None, status_label="Restricted by row security",
+                    row_security_restricted=True,
+                )
+            return _ns(
+                value=50.0, target=100.0, status_label="On Track",
+                row_security_restricted=None,
+            )
+
+        sink: set[str] = set()
+        with (
+            patch("src.api.kpis._evaluate_single_kpi", side_effect=fake_single),
+            patch("src.api.kpis._build_measure_provider", return_value=MagicMock()),
+        ):
+            result = await _evaluate_composite_score(
+                parent, db, uuid.uuid4(), "modelx", "token", {},
+                model=_ns(fiscal_year_start_month=None),
+                is_privileged=True,
+                effective_persona_id=None,
+                security_sink=sink,
+            )
+
+        assert result.composite_score is None
+        assert result.status == COMPOSITE_STATUS_RESTRICTED
+        assert [child.restricted for child in result.children] == [True, False]
+        assert sink == {ROW_SECURITY_DENY_ALL_RULE_ID}
 
     @pytest.mark.asyncio
     async def test_no_children_returns_none(self):

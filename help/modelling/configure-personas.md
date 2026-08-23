@@ -30,8 +30,8 @@ A model can carry any number of personas. Each is independent. They are never OR
 | `included_measure_ids` | Allow list of measure IDs. An **empty list means no restriction** — every measure is visible. A non-empty list means **only** those measures are visible. |
 | `included_dimension_ids` | Allow list of dimension IDs. Same empty-means-unrestricted rule. |
 | `included_hierarchy_ids` | Allow list of hierarchy IDs. Same rule. |
-| `default_filters` | A small dictionary of `dimension_path → value` (or `dimension_path → {operator: value}`) applied to every query unless the caller has authored their own filter on the same dimension. |
-| `audience_roles` | List of role names. A caller whose JWT carries one of these roles sees this persona listed in the picker. An empty list means "available to everyone" — **except** for personas that show hidden columns, which always need an explicit role match (see below). |
+| `default_filters` | A small dictionary of `dimension_path → value` (or `dimension_path → {operator: value}`) **AND-ed into every query**. The caller cannot override these filters. |
+| `audience_roles` | List of role names. A caller whose JWT carries one of these roles sees this persona listed in the picker. An empty list means "available to everyone" **only when the persona does not narrow visibility**. A persona with an allow-list, default filters, or column restrictions **must** name at least one role — otherwise save is refused (that combination would lock the tenant). Personas that show hidden columns always need an explicit role match. |
 
 Empty allow lists are the **default** and the most common setting for personas that exist only to attach default filters. Non-empty lists switch that axis into restrictive mode.
 
@@ -52,15 +52,15 @@ This means you do not need to maintain both dimension and hierarchy allow lists 
 Every query — from the gateway, the plugin execution endpoint, or internal REST paths — runs through the persona gate **before** row security and before route selection. The gate runs this four-step procedure:
 
 1. **Resolve the persona.** For gateway queries, the catalog name determines the persona. For the Excel plugin, the `persona_id` field in the request body is used. Embedded users always use the persona set in their token. The server determines the effective persona — the client sends a request, but the server decides.
-2. **Check the allow lists.** For each measure in the bound query, confirm its ID is in `included_measure_ids` (or the list is empty). Same for each dimension and hierarchy. The **first** object that falls outside is rejected with the object kind and name in the error detail.
-3. **Merge default filters.** Each `(dimension_path, value)` pair in `default_filters` is added to the query's `WHERE` — unless the caller has already authored their own filter on that dimension, in which case the user's filter wins.
-4. **Proceed to row security.** The persona step does not touch the generated SQL beyond adding filters. Row-security then wraps the plan as usual, and the aggregate/pocket fast paths remain available if neither layer blocks them.
+2. **Check the allow lists.** For each measure in the bound query, confirm its ID is in `included_measure_ids` (or the list is empty). Same for each dimension and hierarchy. The **first** object that falls outside is rejected with a generic `OBJECT_NOT_AVAILABLE` 403 (the error does not name the hidden object).
+3. **Merge default filters.** Each `(dimension_path, value)` pair in `default_filters` is **AND-ed** into the query's `WHERE`. The caller's own filter on the same dimension does **not** replace it — both apply. A user cannot widen a persona's mandatory scope.
+4. **Proceed to row security.** The persona step does not touch the generated SQL beyond adding filters. Row security then adds its own filter to each table scan in the plan, and the aggregate/pocket fast paths remain available to any candidate that can be proved to carry that filter (see [Configure Row Security](configure-row-security.md), step 4).
 
 The gate runs the same logic for every read path — REST, XMLA, JDBC, Excel plugin, MCP — so swapping tool is not a way around it.
 
 > **Advanced SQL is rejected for scoped personas.** Some SQL shapes — subqueries, CTEs (`WITH ...`), `UNION`/set operations, window functions, and similar constructs — cannot be checked column-by-column against a persona's allow lists, default filters, or column restrictions. When the persona carries any of those controls, such a query is rejected with a clear 403 message instead of being run unchecked. Rewrite it as a plain `SELECT` over the model. Personas with no allow lists, no default filters, and no column restrictions (for example the technical persona) keep full SQL freedom.
 
-> **Tip — hidden columns inside aggregate functions.** The persona scope gate checks whether a column appears as a bare value in the SELECT list. Columns wrapped inside aggregate functions like `SUM()`, `AVG()`, or `COUNT()` are resolved as **measure references**, not as standalone columns. This means a hidden column such as `fee_amount` is rejected when written as `SELECT fee_amount FROM ...` but allowed when written as `SELECT SUM(fee_amount) FROM ...`. The same applies to compound expressions like `SELECT SUM(fee_amount) / SUM(base_amount) FROM ...` — both hidden columns are inside aggregation functions and pass the gate. Hidden columns are also allowed in `WHERE` clauses. See [Dimensions and Measures](../concepts/dimensions-and-measures.md#hidden-columns-and-aggregate-expressions) for details.
+> **Tip — hidden columns vs persona allow-lists.** A measure marked **hidden** (`is_hidden`) is dropped from browse lists and from `SELECT *`. Anyone who types the name can still query it. That is curation, not security. To stop a Sales persona from reading cost, put the measure on a persona allow-list (or restrict its column with a data tag). Then both `SELECT fee_amount` and `SELECT SUM(fee_amount)` return `OBJECT_NOT_AVAILABLE`. See [Column-Level Security](column-level-security.md).
 
 ---
 
@@ -70,9 +70,9 @@ The gate runs the same logic for every read path — REST, XMLA, JDBC, Excel plu
 
 - A **scalar**, e.g. `"fiscal_year": 2026`, which is converted to `dim = 2026`.
 - A **list**, e.g. `"region": ["EMEA", "APAC"]`, which is converted to `dim IN (...)`.
-- A **dict** with a single operator key, e.g. `{"gte": 100}`, which is converted to `dim >= 100`. Supported operators: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `between`, `like`, `is_null`, `is_not_null`.
+- A **dict** with a single operator key, e.g. `{"gte": 100}`, which is converted to `dim >= 100`. Supported operators: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `between`, `like`, `not_like`, `is_null`, `is_not_null`. The list operators use a list value in the dict form — `{"not_in": ["EMEA", "APAC"]}` is converted to `dim NOT IN (...)`. (A bare list is shorthand for `in`; `not_in` must use the dict form so the operator is preserved.)
 
-Conflict rule: if the caller's query already has any filter on the same dimension, the persona's default is **skipped**. The user's filter wins. This lets a partner narrow a default filter without having their session collapse to zero rows because of a hidden default they cannot override.
+Conflict rule: if the caller's query already has any filter on the same dimension, the persona's default is **still applied**. Both filters AND together. The user's filter cannot override or drop the persona's mandatory scope.
 
 Unknown operators are ignored silently; the rest of the dictionary still merges. This is deliberate — authoring errors should not block every query from an audience.
 
@@ -96,7 +96,7 @@ The overlay is the single best way to catch mistakes before publishing. Select e
 
 ## Audience roles and persona assignment
 
-The `audience_roles` field on a persona controls which users are **assigned** to it. A user is assigned to a persona when their role appears in the persona's `audience_roles` list, or when the list is empty (available to everyone).
+The `audience_roles` field on a persona controls which users are **assigned** to it. A user is assigned to a persona when their role appears in the persona's `audience_roles` list. An empty list means available to everyone **only when the persona does not narrow visibility**. A narrowing persona (allow-list, default filters, or column restrictions) with an empty audience is refused at save.
 
 **Exception — personas that show hidden columns.** A persona with **Includes hidden columns** turned on (such as the seeded Technical persona) widens what a user can see, so it is never handed out to everyone. It is assigned only to users whose role explicitly appears in its `audience_roles` list. An empty audience list on such a persona assigns it to nobody (admins and modellers can still select it, because they can select any persona).
 
@@ -145,7 +145,7 @@ The `audience_roles` list **does not grant project access**. A user still needs 
 3. Repeat for `Ops` — measures `utilisation`, `throughput`, `lead_time_days`; dimension list empty; audience `ops_manager`.
 4. Repeat for `Partner` — measures `shipments_count`, `delivered_on_time_pct`; dimension allow list excludes `customer.internal_id`, `customer.credit_score`, and the margin-only dimensions; no default filter; audience `partner_integration`.
 5. Select each persona in the **Preview persona** picker on the canvas and confirm that only the intended tables stay in colour.
-6. Issue a test query from the Query Panel as a `partner_integration` user — the Persona picker should show `Partner`, and any attempt to reference a blocked measure should return a 403 with the measure name in the detail.
+6. Issue a test query from the Query Panel as a `partner_integration` user — the Persona picker should show `Partner`, and any attempt to reference a blocked measure should return a 403 `OBJECT_NOT_AVAILABLE`.
 
 ---
 
@@ -155,18 +155,18 @@ When both layers are configured:
 
 1. **Persona runs first.** If it denies the object, the query returns 403 before row security is touched.
 2. **Persona default filters are added.** These become part of the user's WHERE.
-3. **Row security wraps the plan.** The wrap intersects with the persona defaults — the caller sees rows that satisfy **both**.
-4. **Fast paths are disabled only if row security fires.** A persona that only trims the catalogue and adds a default filter does **not** disable aggregates or pockets; a row-security rule does.
+3. **Row security adds its filter to every table scan.** It is added inside each scan, not as an outer wrapper around the finished query, so it always applies before any `LIMIT`. It intersects with the persona defaults — the caller sees rows that satisfy **both**.
+4. **Fast paths still run, but under proof.** A persona that only trims the catalogue and adds a default filter leaves aggregates and pockets fully available. When a row-security rule fires, they are not switched off either — each candidate has to prove it can carry the same filter the source scan would carry (see [Configure Row Security](configure-row-security.md), step 4). One that can is used with the filter injected; one that cannot falls back to source.
 
-In practice: personas are cheap, row security is expensive. Use a persona first to trim the catalogue; add row security only when row-level filtering is also needed.
+In practice: personas are cheap, row security is stricter. Use a persona first to trim the catalogue; add row security only when row-level filtering is also needed — and expect a filtered audience to lose the fast path whenever the security column is not materialised in the aggregate's grain or the pocket's copy.
 
 ### Bypass row security (Phase 8.C.1)
 
 A persona carries a **Bypass row security** flag. When enabled:
 
-- The Router **skips the row-security wrap** for any query bound to this persona.
+- The Router **skips row-security filtering entirely** for any query bound to this persona — no rule is compiled and no predicate is injected.
 - The allow list and audience-role gating **still run**. Per-connection binding still applies.
-- Aggregate and pocket fast paths are **re-enabled** (they are normally disabled whenever a row-security rule fires).
+- Aggregate and pocket fast paths become available **unconditionally**, because with no security predicate to carry there is nothing left to prove. Without bypass they are still available, but only for the candidates that pass the safety proof.
 - Every bypassed execution is tagged with `persona_bypass_row_security=true` in the structured request log for audit. There is no dedicated audit table; existing request logs are the audit surface.
 
 Use this only for internal dashboards that are already scoped through persona allow lists and that need the performance of the aggregate/pocket layer. A red warning appears in the editor while bypass is on, and saving with bypass newly enabled requires an explicit confirmation.
@@ -192,7 +192,7 @@ When a query is bound to persona `X` (through the catalog name), the router pref
 | **Default filters match on dimension name, not ID.** | Renaming a dimension breaks every default filter that references it. | Keep a team-wide convention for dimension names; audit `default_filters` when renaming. |
 | **Audience-role matching is union-based.** | A user carrying multiple roles sees every persona that any of their roles advertises. | Keep role strings narrow; avoid multi-audience superuser JWTs. |
 | **Per-connection binding ships via catalog name.** | Each persona is a separate virtual catalog (`<model.slug>_<persona.slug>`). External BI tools (Excel, Power BI, JDBC clients) pick a persona by connecting to the matching catalog, not by sending a header. | Point each audience's connection string at the persona catalog intended for it. |
-| **No UI for `default_filters` yet.** | The panel shows the dictionary; edits happen through the JSON field or the API. | A full editor ships in Phase 8.B.8+. |
+| **Hidden (`is_hidden`) is browse-only.** | A hidden measure still answers if someone types its name. | Use a persona allow-list or a data-tag restriction when the intent is "this audience must not read it". |
 
 ---
 
@@ -203,8 +203,8 @@ When a query is bound to persona `X` (through the catalog name), the router pref
 | Persona picker is empty for a user who should see one | JWT has no role in the persona's `audience_roles` | Add the role, or edit the persona's audience list. For a hidden-columns persona an empty audience list assigns nobody — add an explicit role |
 | Query returns `PERSONA_COMPLEX_SQL_NOT_ALLOWED` | The query uses subqueries, CTEs, set operations, window functions, or similar constructs under a persona with allow lists or default filters | Rewrite the query as a plain `SELECT` over the model, or run it under an unscoped persona |
 | Regular user cannot reach the technical persona | The user does not carry the `model_technical` role | Set the user's role to `model_technical` in user management (or via an SSO group mapping) |
-| Query returns `PERSONA_OBJECT_NOT_INCLUDED` unexpectedly | A measure/dimension is not in the allow list, but the audience needs it | Add the object's ID to the list, or remove the list to make that axis unrestricted |
-| Default filter does not fire | The caller already has a filter on that dimension | Expected — user-authored filters win. Remove the user filter or change the default's scope |
+| Query returns `OBJECT_NOT_AVAILABLE` unexpectedly | A measure/dimension is not in the allow list, or a column restriction blocks it | Add the object's ID to the list, or remove the list to make that axis unrestricted |
+| Default filter does not fire / user cannot override it | Persona defaults are mandatory AND | Expected — remove or change the persona default, not the user's slicer |
 | 404 `PERSONA_NOT_FOUND` on every query | The request body carries a `persona_id` that belongs to another model, or the persona was deleted | Check the ID; the router checks `persona.model_id == request.model_id` |
 | Persona catalog missing from Excel's database list | Caller's JWT roles do not intersect the persona's `audience_roles`, and the caller is not an admin or modeller | Add the caller's role to `audience_roles`, or grant admin/modeller to allow impersonation |
 | Canvas preview shows every table dimmed | The persona's allow lists are non-empty but the model's measure/dim IDs do not match | Re-select measures and dimensions from the canvas-side picker; IDs changed |

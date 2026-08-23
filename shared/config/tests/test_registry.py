@@ -19,11 +19,16 @@ from shared.config.registry import (
 # ---------------------------------------------------------------------------
 
 def test_registry_levels_match_2026_04_restructure():
-    """After the 2026-04 restructure: System/Project/Model are non-empty.
-    Tenant carries ONLY the deliberate post-restructure additions: audit
-    logging (level + retention) and tenant branding. If you add a
-    tenant-level key, justify it, update this list AND the architecture
-    docs."""
+    """Pin the sanctioned scope of every setting level.
+
+    The tenant scope is deliberately small but is not limited to branding:
+    calendar caption vocabulary, population-reason vocabulary, and
+    observability/version-retention policies are tenant-wide contracts too.
+    The generated configuration reference is produced from the registry and
+    documents these same homes. A new tenant setting must be justified by its
+    producer/consumer and added here in the same change; otherwise this guard
+    must fail.
+    """
     assert all_for_level("system"), "no settings registered at level 'system'"
     assert all_for_level("project"), "no settings registered at level 'project'"
     assert all_for_level("model"), "no settings registered at level 'model'"
@@ -36,9 +41,14 @@ def test_registry_levels_match_2026_04_restructure():
         "branding.logo_url",
         "branding.primary_color",
         "branding.secondary_color",
+        "calendar.fiscal_year_label_format",
+        "query.population_mismatch_reason_mode",
+        "query_log.retention_days",
+        "versions.retention_count",
     ], (
-        "tenant level must contain only the sanctioned audit + branding keys — "
-        "if you add a tenant-only setting, justify and update this test"
+        "tenant level must contain only the sanctioned tenant-wide policy, "
+        "branding keys — justify any new tenant-only setting and update this "
+        "test plus the generated configuration reference"
     )
 
 
@@ -62,14 +72,30 @@ def test_every_non_override_default_is_set():
         )
 
 
+#: Exact keys whose NAME trips the credential heuristic below but which are not
+#: credentials. Exact keys, never patterns, so the list cannot silently absorb a
+#: real secret; each entry carries its reason.
+#:
+#: ``ai_scheduler.daily_token_budget`` (F-011-05 / Bug-9407) — an integer ceiling
+#: on LLM tokens the AI optimiser may spend per UTC day. "Token" here is the
+#: billing unit of a language model, not an authentication credential. Renaming
+#: it to dodge the substring would hide it from the guard rather than answer the
+#: guard, and would cost the operator the unit in the setting's own name.
+_NON_CREDENTIAL_KEYS_MATCHING_THE_HEURISTIC = frozenset({
+    "ai_scheduler.daily_token_budget",
+})
+
+
 def test_no_secret_keys_are_in_the_registry():
     """C-4 decision: credentials live in .env, never in DB-backed settings.
-    Two exemptions:
+    Three exemptions:
       * env_var=True — env-only display rows.
       * sensitive_display=True — per-project secrets stored encrypted at
         rest in ProjectSetting.value_json (e.g. agent.webhook_secret).
         This is an explicit design choice for project-scoped agent
-        credentials that cannot live in .env (per-tenant/per-project)."""
+        credentials that cannot live in .env (per-tenant/per-project).
+      * an exact key in ``_NON_CREDENTIAL_KEYS_MATCHING_THE_HEURISTIC`` — a
+        reviewed false positive of the substring match."""
     forbidden_substrings = (
         "password", "passwd", "secret", "api_key", "private_key", "token",
     )
@@ -78,11 +104,32 @@ def test_no_secret_keys_are_in_the_registry():
             continue
         if definition.sensitive_display:  # encrypted per-project values
             continue
+        if key in _NON_CREDENTIAL_KEYS_MATCHING_THE_HEURISTIC:
+            continue
         for needle in forbidden_substrings:
             assert needle not in key.lower(), (
                 f"setting {key!r} looks like a credential — "
                 "credentials must stay in .env per C-4"
             )
+
+
+def test_credential_heuristic_exemptions_are_live_and_still_needed():
+    """A stale exemption is a hole. Every exempted key must still exist AND
+    still trip the heuristic — otherwise it is silently covering nothing (or,
+    worse, a key that was renamed into something the guard would now catch)."""
+    forbidden_substrings = (
+        "password", "passwd", "secret", "api_key", "private_key", "token",
+    )
+    registry_keys = {key for (_lvl, key) in REGISTRY}
+    for key in sorted(_NON_CREDENTIAL_KEYS_MATCHING_THE_HEURISTIC):
+        assert key in registry_keys, (
+            f"exempted key {key!r} is no longer in the registry — remove the "
+            "exemption rather than leaving a hole"
+        )
+        assert any(n in key.lower() for n in forbidden_substrings), (
+            f"exempted key {key!r} no longer trips the heuristic — the "
+            "exemption is dead and should be removed"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +152,18 @@ def test_get_def_raises_for_wrong_level():
     # auth.jwt_expire_minutes is system-level, not tenant
     with pytest.raises(KeyError):
         get_def("auth.jwt_expire_minutes", "tenant")
+
+
+def test_bug9172_sol_r1_f4_named_query_fallback_threshold_is_governed():
+    """B9172-SOL-R1-F4: health recommendations use a registered setting."""
+    setting = get_def(
+        "named_query.analytics_sustained_fallback_count", "system"
+    )
+    assert setting.default == 3
+    assert setting.type == "int"
+    validate(1, setting)
+    with pytest.raises(ValueError):
+        validate(0, setting)
 
 
 def test_has_key_distinguishes_levels():

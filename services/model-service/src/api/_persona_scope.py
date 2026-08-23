@@ -14,10 +14,38 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.db.models import Dimension, Persona
+from shared.db.models import (
+    Dimension,
+    Persona,
+    PersonaTagRestriction,
+    data_tag_columns,
+)
 from shared.security.persona_resolver import resolve_effective_persona  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+async def get_restricted_column_ids(
+    db: AsyncSession, persona_id: UUID
+) -> set[UUID]:
+    """Return the model-column ids a persona is CLS-restricted from seeing.
+
+    A column is restricted when it carries a data tag that the persona's
+    tag-restriction set denies. Metadata surfaces must fail closed on these
+    columns: the query-router blocks the *values* on every path, but the
+    column *names* leak through catalogue/list endpoints unless callers
+    exclude them here. Returns an empty set when the persona has no
+    restrictions.
+    """
+    rows = await db.execute(
+        select(data_tag_columns.c.model_column_id)
+        .join(
+            PersonaTagRestriction,
+            PersonaTagRestriction.data_tag_id == data_tag_columns.c.tag_id,
+        )
+        .where(PersonaTagRestriction.persona_id == persona_id)
+    )
+    return {cid for cid in rows.scalars().all() if cid is not None}
 
 
 def parse_allowed_ids(raw_ids: list) -> list[UUID] | None:

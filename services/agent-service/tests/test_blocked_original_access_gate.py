@@ -22,7 +22,7 @@ import pytest
 from fastapi import HTTPException
 
 from src.api.agent_config import _require_blocked_original_access
-from src.auth.middleware import CurrentUser, get_current_user
+from src.auth.middleware import CurrentServiceUser, CurrentUser, get_current_user
 from src.main import app
 
 TEST_TENANT = "gate-tenant"
@@ -32,9 +32,18 @@ TEST_PROJECT_ID = uuid.uuid4()
 def _user(role: str) -> CurrentUser:
     return CurrentUser(
         user_id="probe@example.com",
-        tenant_id=TEST_TENANT,
+        tenant_id="__system__" if role == "system_admin" else TEST_TENANT,
         email="probe@example.com",
         role=role,
+    )
+
+
+def _service(role: str = "tenant_admin") -> CurrentServiceUser:
+    return CurrentServiceUser(
+        principal="glossary-bootstrap-service",
+        tenant_id=TEST_TENANT,
+        role=role,
+        scopes=["optimizer.stats-refresh"],
     )
 
 
@@ -100,6 +109,16 @@ class TestStrictGateHelper:
             await _require_blocked_original_access(
                 TEST_PROJECT_ID, _user("system_admin")
             )
+
+    @pytest.mark.asyncio
+    async def test_service_principal_role_does_not_bypass_trace_gate(self):
+        db = _db_with_binding(None)
+        with patch("src.api.agent_config.get_tenant_db", _gen(db)):
+            with pytest.raises(HTTPException) as exc:
+                await _require_blocked_original_access(
+                    TEST_PROJECT_ID, _service("tenant_admin")
+                )
+        assert exc.value.status_code == 403
 
 
 # ---------------------------------------------------------------------------

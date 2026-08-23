@@ -108,4 +108,34 @@ describe("QueryRoutingMetricsSection", () => {
     });
     expect(screen.queryByText(/Pocket savings/i)).not.toBeInTheDocument();
   });
+
+  it("Bug-8180: renders eligible_hit_rate distinctly from the raw hit_rate, plus the unacceleratable_queries count", async () => {
+    // Known values: 100 total, 60 aggregate + 20 pocket hits (raw hit_rate =
+    // 80/100 = 80.0%, unchanged). 15 of those queries are route_type="raw"
+    // (unacceleratable — no aggregate/pocket could ever serve them), so
+    // eligible_queries = 100 - 15 = 85 and eligible_hit_rate = 80/85 = 94.1%.
+    // Before the fix, the panel only ever rendered hit_rate; this proves the
+    // eligibility-scoped figure is ALSO on screen, distinctly, per Bug-8180.
+    metricsMock.mockResolvedValue({
+      ...fullMetrics,
+      total_queries: 100,
+      aggregate_hits: 60,
+      pocket_hits: 20,
+      source_hits: 20,
+      hit_rate: 0.8,
+      unacceleratable: 0.15,
+      unacceleratable_queries: 15,
+      eligible_queries: 85,
+      eligible_hit_rate: 0.9411764705882353,
+    });
+    renderSection();
+
+    await waitFor(() => {
+      expect(screen.getByText("80.0%")).toBeInTheDocument(); // raw hit_rate, unchanged
+    });
+    expect(screen.getByTestId("metrics-eligible-hit-rate")).toHaveTextContent("94.1%");
+    // unacceleratable_queries rendered as its own chip, distinct from every
+    // other figure on screen (100 / 60 / 20 / 20 / 5.0 GB).
+    expect(screen.getByText("15")).toBeInTheDocument();
+  });
 });

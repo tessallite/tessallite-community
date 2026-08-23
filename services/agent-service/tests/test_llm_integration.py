@@ -25,6 +25,7 @@ from src.prompt.assembler import (
     _TERM_RESOLUTION_RULES,
     _format_date_context,
 )
+from src.tools.expressions import ExpressionError, normalize_dimension
 from src.tools.spec import make_tool_spec
 
 # ---------------------------------------------------------------------------
@@ -46,12 +47,26 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-API_URL = os.environ.get("ZAI_API_URL", "")
-API_KEY = os.environ.get("ZAI_API_KEY", "")
-MODEL = os.environ.get("ZAI_MODEL", "GLM-4.6V")
+# Provider-agnostic LLM test config (OpenAI-compatible chat/completions).
+# Precedence: explicit LLM_TEST_* override -> DeepSeek -> z.ai (legacy).
+API_URL = (
+    os.environ.get("LLM_TEST_API_URL")
+    or os.environ.get("DEEPSEEK_API_URL")
+    or os.environ.get("ZAI_API_URL", "")
+)
+API_KEY = (
+    os.environ.get("LLM_TEST_API_KEY")
+    or os.environ.get("DEEPSEEK_API_KEY")
+    or os.environ.get("ZAI_API_KEY", "")
+)
+MODEL = (
+    os.environ.get("LLM_TEST_MODEL")
+    or os.environ.get("DEEPSEEK_MODEL")
+    or os.environ.get("ZAI_MODEL", "deepseek-chat")
+)
 
 skip_no_key = pytest.mark.skipif(
-    not API_KEY, reason="ZAI_API_KEY not set — skipping LLM integration tests"
+    not API_KEY, reason="No LLM test key set (DEEPSEEK_API_KEY/LLM_TEST_API_KEY/ZAI_API_KEY) — skipping LLM integration tests"
 )
 
 # ---------------------------------------------------------------------------
@@ -75,6 +90,7 @@ MODEL_ID = CFG["model_id"]
 MODEL_SLUG = CFG["model_slug"]
 MODEL_DISPLAY_NAME = CFG.get("model_display_name", MODEL_SLUG)
 PROJECT_BRIEF = CFG.get("project_brief", "")
+TERM_ALIASES: dict[str, str] = CFG.get("term_aliases", {})
 
 MEASURES = CFG["measures"]
 DIMENSIONS = CFG["dimensions"]
@@ -136,9 +152,61 @@ def _build_system_prompt() -> str:
         + _model_block()
     )
 
-    grounding = (
-        _TERM_RESOLUTION_RULES + "\n\n"
-        "(no glossary or alias map content)"
+    # Production loads alias maps from the database and injects them
+    # into the GROUNDING section so the LLM resolves ambiguous business
+    # terms to canonical measure/dimension names.  Mirror that here
+    # using the config's ``term_aliases`` dict.
+    if TERM_ALIASES:
+        alias_lines = [
+            f"ALIAS MAP for model {MODEL_ID}:",
+            "Alias map entries are candidate mappings. Use an alias only "
+            "if the target exists in the selected model and the source "
+            "phrase does not exactly match an allowed field name.",
+        ]
+        for phrase, canonical in sorted(TERM_ALIASES.items()):
+            alias_lines.append(f"  '{phrase}' -> {canonical}")
+        grounding = (
+            _TERM_RESOLUTION_RULES + "\n\n"
+            + "\n".join(alias_lines)
+        )
+    else:
+        grounding = (
+            _TERM_RESOLUTION_RULES + "\n\n"
+            "(no glossary or alias map content)"
+        )
+
+    # Test-specific schema enforcement addendum.  The production spec
+    # marks ``limit`` as optional (the production parser defaults it to
+    # 100), but these integration tests validate the raw LLM output
+    # against a strict contract where every field is present.  Force
+    # the LLM to always emit the full shape so any OpenAI-compatible
+    # model (DeepSeek, GLM, etc.) produces the same contract.
+    schema_enforcement = (
+        "\n\n## STRICT FIELD CONTRACT (test harness)\n"
+        "For every \"query\" response you MUST include ALL of the following "
+        "keys with the specified types — never omit any of them:\n"
+        "  - \"model_id\": string (the model UUID)\n"
+        "  - \"measures\": array of strings (at least one)\n"
+        # Bug-8935 — this addendum used to say "array of strings", contradicting
+        # the OUTPUT FORMAT schema injected just above it, which has accepted
+        # grain-shorthand and expression dimension entries since Bug-5349
+        # (commit 396aa01e). It constrains presence and emptiness only; the
+        # entry forms stay owned by the production schema.
+        "  - \"dimensions\": array (may be empty). Each entry must use one of "
+        "the dimension entry forms allowed by the OUTPUT FORMAT schema above: "
+        "a bare \"<dimension name>\" string, a grain shorthand "
+        "{\"name\": \"<date dimension>\", \"grain\": \"...\"}, or an "
+        "expression object\n"
+        "  - \"where\": array (may be empty)\n"
+        "  - \"having\": array (may be empty)\n"
+        "  - \"sort\": array (may be empty)\n"
+        "  - \"limit\": integer 1..1000 — ALWAYS include this field. "
+        "Use the value the user specifies (e.g. 10 for \"top 10\"); "
+        "when the user does not specify a row count, default to 100.\n"
+        "  - \"chart_type\": string (pick the best chart; use \"kpi\" for "
+        "single-value results, \"none\" for data tables)\n"
+        "Do NOT omit \"limit\" or any array field. Every query object must "
+        "contain all eight keys above."
     )
 
     parts = [
@@ -150,6 +218,7 @@ def _build_system_prompt() -> str:
         "", "## CROSS-MODEL RECIPES",
         "(none configured for this project — use the query tool against a single model.)",
         "", "## OUTPUT FORMAT", make_tool_spec("llm"),
+        schema_enforcement,
     ]
     return "\n".join(parts)
 
@@ -200,6 +269,14 @@ def _resolve_template(obj: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 def _call_llm(system: str, user: str) -> str:
+    """Call the LLM with JSON-mode enforcement.
+
+    Uses ``response_format={"type": "json_object"}`` (OpenAI-compatible)
+    so any model (DeepSeek, GLM, etc.) is forced to emit valid JSON
+    rather than free-form prose that might omit required query-plan
+    fields.  The system prompt already describes the full JSON schema;
+    JSON mode guarantees the output is parseable and complete.
+    """
     resp = httpx.post(
         API_URL,
         headers={
@@ -214,6 +291,7 @@ def _call_llm(system: str, user: str) -> str:
             ],
             "max_tokens": 2048,
             "temperature": 0.1,
+            "response_format": {"type": "json_object"},
         },
         timeout=60.0,
     )
@@ -228,6 +306,49 @@ def _parse_llm_json(raw: str) -> dict:
     match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
     assert match, f"No JSON object found in LLM response:\n{raw[:500]}"
     return json.loads(match.group(0))
+
+# ---------------------------------------------------------------------------
+# Dimension entry resolution
+# ---------------------------------------------------------------------------
+
+def _dimension_base_fields(entry: Any, taken: set[str]) -> tuple[str, ...]:
+    """Resolve one ``query.dimensions`` entry to the model dimensions it groups by.
+
+    Since commit 396aa01e (Bug-5349, decisions D4/D5) ``query.dimensions`` is no
+    longer ``list[str]``: ``src/tools/spec.py::_parse_dimensions`` and
+    ``src/tools/expressions.py::normalize_dimension`` accept a bare ``"<name>"``
+    string, a grain shorthand ``{"name": "<date dimension>", "grain": "month"}``,
+    and an expression ``{"expr": <node>, "alias": "<column>"}``.  This harness
+    embeds that same schema (``make_tool_spec``) plus the TREND GRANULARITY rule
+    from ``src/prompt/assembler.py``, which explicitly instructs the model to
+    bucket a raw date dimension with the grain shorthand — so the object forms
+    are contract-conformant output here, not a violation.
+
+    Structural validation is delegated to the production normalizer, so an
+    unknown key, an invalid grain, or an aggregate in a grouping position still
+    fails; every base field the entry references is then checked against the
+    model catalogue, so a hallucinated dimension name still fails in any form.
+    """
+    try:
+        ref = normalize_dimension(entry, taken)
+    except ExpressionError as exc:
+        raise AssertionError(f"Invalid dimension entry {entry!r}: {exc}") from exc
+    fields = ref.base_fields
+    assert fields, f"Dimension entry references no model field: {entry!r}"
+    for field in fields:
+        assert field in DIMENSIONS, \
+            f"Unknown dimension: {field} (from entry {entry!r})"
+    return fields
+
+
+def _query_dimension_fields(q: dict[str, Any]) -> set[str]:
+    """Every model dimension the query groups by, across all three entry forms."""
+    taken: set[str] = set()
+    fields: set[str] = set()
+    for d in q["dimensions"]:
+        fields.update(_dimension_base_fields(d, taken))
+    return fields
+
 
 # ---------------------------------------------------------------------------
 # Validators
@@ -269,8 +390,7 @@ class LLMResult:
 
         for m in q["measures"]:
             assert m in MEASURES, f"Unknown measure: {m}"
-        for d in q["dimensions"]:
-            assert d in DIMENSIONS, f"Unknown dimension: {d}"
+        _query_dimension_fields(q)
         for w in q["where"]:
             assert w["name"] in ALL_FIELDS, f"Unknown where field: {w['name']}"
             assert w["op"] in VALID_WHERE_OPS, f"Invalid where op: {w['op']}"
@@ -303,6 +423,7 @@ def _assert_scenario(scenario: dict[str, Any], result: LLMResult):
         return
 
     q = result.assert_valid_query()
+    dim_fields = _query_dimension_fields(q)
 
     if "expect_measures_contain" in scenario:
         for m in scenario["expect_measures_contain"]:
@@ -311,13 +432,15 @@ def _assert_scenario(scenario: dict[str, Any], result: LLMResult):
 
     if "expect_dimensions_contain" in scenario:
         for d in scenario["expect_dimensions_contain"]:
-            assert d in q["dimensions"], \
-                f"Expected dimension '{d}' in {q['dimensions']}"
+            assert d in dim_fields, \
+                f"Expected dimension '{d}' in {sorted(dim_fields)} " \
+                f"(raw entries: {q['dimensions']})"
 
     if "expect_dimensions_contain_any" in scenario:
-        found = any(d in q["dimensions"] for d in scenario["expect_dimensions_contain_any"])
+        found = any(d in dim_fields for d in scenario["expect_dimensions_contain_any"])
         assert found, \
-            f"Expected one of {scenario['expect_dimensions_contain_any']} in {q['dimensions']}"
+            f"Expected one of {scenario['expect_dimensions_contain_any']} in " \
+            f"{sorted(dim_fields)} (raw entries: {q['dimensions']})"
 
     if "expect_where_field" in scenario:
         field = scenario["expect_where_field"]

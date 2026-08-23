@@ -36,13 +36,19 @@ class TestFormatConstants:
     def test_export_format_matches_between_serialiser_and_rehydrator(self):
         assert SERIALISER_FORMAT == PROJECT_EXPORT_FORMAT
 
-    def test_bundle_version_is_one(self):
-        assert PROJECT_BUNDLE_VERSION == 1
+    def test_bundle_version_is_two(self):
+        # Bug-7623: bumped 1 -> 2 (v2 carries per-version snapshots).
+        assert PROJECT_BUNDLE_VERSION == 2
 
 
 class TestValidateBundle:
     def test_valid_minimal_bundle_passes(self):
+        # Default fixture is v1; still a supported (old) format.
         _validate_bundle(_minimal_bundle())
+
+    def test_v2_bundle_passes(self):
+        # Bug-7623: the new per-version-snapshot format is accepted too.
+        _validate_bundle(_minimal_bundle(schema_version=2))
 
     def test_wrong_export_format_raises(self):
         bundle = _minimal_bundle(export_format="wrong/v1")
@@ -110,6 +116,182 @@ class TestProjectImportError:
     def test_message_preserved(self):
         err = ProjectImportError("test message")
         assert str(err) == "test message"
+
+
+class TestBug6290AgentConfigRoundTrip:
+    """Bug-6290: a project with no agent config must export a bundle that
+    passes validation (and thus re-imports cleanly)."""
+
+    def test_empty_agent_config_shape_passes_validation(self):
+        """The serialiser now emits an empty-but-present shape instead of
+        None, so the validator should accept it."""
+        bundle = _minimal_bundle(
+            included_sections=["agent_config"],
+            agent_config={
+                "config": {},
+                "models": [],
+                "model_contexts": [],
+                "judge_rubrics": [],
+            },
+        )
+        _validate_bundle(bundle)
+
+    def test_backwards_compat_null_agent_config_passes(self):
+        """Bundles exported before the fix carry agent_config=None. The
+        validator should now treat that as 'section absent' rather than
+        rejecting the bundle, so existing bundles can still be imported."""
+        bundle = _minimal_bundle(
+            included_sections=["agent_config"],
+            agent_config=None,
+        )
+        # Previously this raised ProjectImportError; now it should pass.
+        _validate_bundle(bundle)
+
+    def test_non_agent_null_section_still_raises(self):
+        """The backwards-compat exemption is limited to agent_config.
+        Other null sections must still be rejected."""
+        bundle = _minimal_bundle(
+            included_sections=["connections"],
+            connections=None,
+        )
+        with pytest.raises(ProjectImportError, match="connections.*null/missing"):
+            _validate_bundle(bundle)
+
+    def test_serialiser_emits_valid_empty_agent_config(self):
+        """Verify that the empty shape the serialiser emits for a
+        project with no agent config has the expected structure and
+        passes validation."""
+        from shared.model_snapshot.project_serialiser import _AGENT_CONFIG_FIELDS
+        # Reproduce what the serialiser does when cfg is None:
+        empty_shape = {
+            "config": {},
+            "models": [],
+            "model_contexts": [],
+            "judge_rubrics": [],
+        }
+        # The shape must have the four expected keys.
+        assert set(empty_shape.keys()) == {
+            "config", "models", "model_contexts", "judge_rubrics"
+        }
+        # And it must pass bundle validation.
+        bundle = _minimal_bundle(
+            included_sections=["agent_config"],
+            agent_config=empty_shape,
+        )
+        _validate_bundle(bundle)
+
+
+class TestBug6631ModelIdValidation:
+    """Bug-6631: _validate_bundle must reject bundles with missing or
+    duplicate model ids, which would crash or silently corrupt import."""
+
+    def test_missing_model_id_raises(self):
+        bundle = _minimal_bundle(
+            models=[{"model": {}, "data_sources": []}],
+        )
+        with pytest.raises(ProjectImportError, match="missing.*model.id"):
+            _validate_bundle(bundle)
+
+    def test_duplicate_model_id_raises(self):
+        mid = "11111111-1111-1111-1111-111111111111"
+        bundle = _minimal_bundle(
+            models=[
+                {"model": {"id": mid, "name": "A"}, "data_sources": []},
+                {"model": {"id": mid, "name": "B"}, "data_sources": []},
+            ],
+        )
+        with pytest.raises(ProjectImportError, match="Duplicate model id"):
+            _validate_bundle(bundle)
+
+    def test_valid_distinct_model_ids_pass(self):
+        bundle = _minimal_bundle(
+            models=[
+                {"model": {"id": "aaaa-1111", "name": "A"}, "data_sources": []},
+                {"model": {"id": "bbbb-2222", "name": "B"}, "data_sources": []},
+            ],
+        )
+        _validate_bundle(bundle)
+
+
+class TestBug8134OneFactTablePerModel:
+    """Bug-8134: _validate_bundle must reject a model snapshot carrying more
+    than one fact-typed table, BEFORE any row is staged.
+
+    The storage layer enforces at most one fact table per model with a
+    partial unique index (F-013-11, migration 0136:
+    ``uq_model_tables_one_fact_per_model``), and the create/update table
+    API guards it with a check-then-act read (``_assert_at_most_one_fact``
+    in ``services/model-service/src/api/tables.py``). Project import
+    bypasses those endpoints entirely -- the same class of gap
+    ``sanitise_imported_config``'s docstring documents for connection/LLM
+    config bags -- so a hand-crafted or corrupt two-fact-table bundle had
+    nothing rejecting it here. Left unchecked, it would reach
+    ``_insert_tables_and_columns`` (shared/model_snapshot/rehydrator.py),
+    whose per-row Core INSERT for the second fact-typed row trips the
+    partial unique index only AFTER the first fact row (and every sibling
+    row already inserted in that same loop) has been staged into the
+    transaction -- surfacing a raw IntegrityError instead of a clean,
+    actionable error. This test guards the earliest possible rejection
+    point: ``_validate_bundle`` is the very first call in both
+    ``import_project`` and ``plan_project_import``, before the Project row
+    itself (let alone any ModelTable row) is created.
+    """
+
+    @staticmethod
+    def _two_fact_model(model_id: str = "22222222-2222-2222-2222-222222222222") -> dict:
+        return {
+            "model": {"id": model_id, "slug": "twofact", "display_name": "Two Fact"},
+            "tables": [
+                {"id": "t1", "physical_name": "orders", "table_type": "fact"},
+                {"id": "t2", "physical_name": "shipments", "table_type": "fact"},
+            ],
+            "data_sources": [],
+        }
+
+    def test_two_fact_tables_raises_project_import_error(self):
+        bundle = _minimal_bundle(models=[self._two_fact_model()])
+        with pytest.raises(ProjectImportError, match="fact table"):
+            _validate_bundle(bundle)
+
+    def test_error_names_the_offending_tables(self):
+        bundle = _minimal_bundle(models=[self._two_fact_model()])
+        with pytest.raises(ProjectImportError, match="orders.*shipments"):
+            _validate_bundle(bundle)
+
+    def test_single_fact_table_passes(self):
+        model = self._two_fact_model()
+        model["tables"] = [model["tables"][0]]
+        bundle = _minimal_bundle(models=[model])
+        _validate_bundle(bundle)
+
+    def test_bug_8614_multi_table_zero_fact_tables_are_rejected(self):
+        model = self._two_fact_model()
+        model["tables"] = [
+            {"id": "d1", "physical_name": "customers", "table_type": "dim_detail"},
+            {"id": "d2", "physical_name": "regions", "table_type": "dim_detail"},
+        ]
+        bundle = _minimal_bundle(models=[model])
+        with pytest.raises(ProjectImportError, match="exactly one fact table"):
+            _validate_bundle(bundle)
+
+    def test_missing_tables_key_passes(self):
+        # Mirrors TestBug6631ModelIdValidation's fixtures, which omit
+        # "tables" entirely (an older/minimal bundle shape).
+        bundle = _minimal_bundle(
+            models=[{"model": {"id": "aaaa-1111", "name": "A"}, "data_sources": []}],
+        )
+        _validate_bundle(bundle)
+
+    def test_two_fact_tables_across_different_models_each_pass_independently(self):
+        # The constraint is per-model, not per-bundle: two models that each
+        # have exactly one fact table must import fine even though the
+        # bundle as a whole carries two fact-typed rows.
+        model_a = self._two_fact_model("33333333-3333-3333-3333-333333333333")
+        model_a["tables"] = [model_a["tables"][0]]
+        model_b = self._two_fact_model("44444444-4444-4444-4444-444444444444")
+        model_b["tables"] = [model_b["tables"][1]]
+        bundle = _minimal_bundle(models=[model_a, model_b])
+        _validate_bundle(bundle)
 
 
 class TestBundleImmutability:

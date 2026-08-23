@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   classifyJoinEndpoints,
+  isDimTableType,
   isOuterJoinType,
   sameTypeWarningText,
 } from "./joinRules";
@@ -33,11 +34,28 @@ describe("isOuterJoinType (F-026-05)", () => {
   });
 });
 
-// F-026-12: the same-type warning was hardcoded English and built untranslatable
-// "dimension-to-dimension" labels. classifyJoinEndpoints must produce translated
-// labels when a `t` is supplied, and sameTypeWarningText must use the keyed
-// template.
-describe("same-type join warning is translatable (F-026-12)", () => {
+// Bug-7635: isDimTableType must recognise all dim subtypes the API produces
+// (dim_detail, dim_aggregate) and reject non-dim types.
+describe("isDimTableType (Bug-7635)", () => {
+  it("recognises dim_detail and dim_aggregate as dimension types", () => {
+    expect(isDimTableType("dim_detail")).toBe(true);
+    expect(isDimTableType("dim_aggregate")).toBe(true);
+  });
+
+  it("rejects fact, unclassified, calendar, and empty", () => {
+    expect(isDimTableType("fact")).toBe(false);
+    expect(isDimTableType("unclassified")).toBe(false);
+    expect(isDimTableType("calendar")).toBe(false);
+    expect(isDimTableType("")).toBe(false);
+    expect(isDimTableType(null)).toBe(false);
+    expect(isDimTableType(undefined)).toBe(false);
+  });
+});
+
+// F-026-12 / Bug-7635: the same-type warning must use real API domain values
+// (dim_detail, dim_aggregate), not the dead "dimension" literal. Translated
+// labels must be keyed through the translation function.
+describe("same-type join warning with real domain values (F-026-12, Bug-7635)", () => {
   const t = (key: string, vars?: Record<string, string>) => {
     const table: Record<string, string> = {
       "joins.factToFact": "FACT_TO_FACT_XX",
@@ -49,8 +67,14 @@ describe("same-type join warning is translatable (F-026-12)", () => {
     return out;
   };
 
-  it("uses the translated dimension-to-dimension label", () => {
-    const check = classifyJoinEndpoints("dimension", "dimension", t);
+  it("dim_detail <-> dim_detail is same-type with translated label", () => {
+    const check = classifyJoinEndpoints("dim_detail", "dim_detail", t);
+    expect(check.isSameType).toBe(true);
+    expect(check.sameTypeLabel).toBe("DIM_TO_DIM_XX");
+  });
+
+  it("dim_detail <-> dim_aggregate is same-type (cross-dim-subtype)", () => {
+    const check = classifyJoinEndpoints("dim_detail", "dim_aggregate", t);
     expect(check.isSameType).toBe(true);
     expect(check.sameTypeLabel).toBe("DIM_TO_DIM_XX");
   });
@@ -60,8 +84,8 @@ describe("same-type join warning is translatable (F-026-12)", () => {
     expect(check.sameTypeLabel).toBe("FACT_TO_FACT_XX");
   });
 
-  it("fact <-> dimension is not a same-type warning", () => {
-    const check = classifyJoinEndpoints("fact", "dimension", t);
+  it("fact <-> dim_detail is not a same-type warning", () => {
+    const check = classifyJoinEndpoints("fact", "dim_detail", t);
     expect(check.isSameType).toBe(false);
     expect(check.isFactDim).toBe(true);
     expect(check.sameTypeLabel).toBeNull();

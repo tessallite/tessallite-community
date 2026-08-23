@@ -29,22 +29,31 @@ from __future__ import annotations
 import re
 from datetime import date, timedelta
 from typing import Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
+from shared.config.resolver import get_setting
 from shared.config.settings import get_settings
 from shared.db.models import (
+    AggregateDefinition,
     CalendarTable,
+    CalendarHistoryProvenance,
     DataSource,
+    Dimension,
+    Measure,
     Model,
     ModelColumn,
     ModelTable,
+    HierarchyLevel,
+    HierarchyDefinition,
+    Join,
     ProjectConnection,
+    UserDefinedAttributeColumnRef,
 )
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import CalendarTableResponse
@@ -54,14 +63,32 @@ from shared.semantic.calendar_dialects import (
     STANDARD_COLUMNS,
     emit_calendar_ddl,
 )
-from shared.semantic.calendar_types import CALENDAR_TYPES, normalize_calendar_type
+from shared.semantic.calendar_types import (
+    CALENDAR_TYPES,
+    available_calendar_types,
+    is_available_calendar_type,
+    normalize_calendar_type,
+)
+from shared.semantic.fiscal_year_labels import (
+    DEFAULT_FISCAL_YEAR_LABEL_FORMAT,
+    FISCAL_YEAR_LABEL_SETTING,
+    extract_fiscal_year_label_format,
+)
 from shared.source_executor import DDL_CAPABLE_CONNECTORS
+from shared.source_table_probe import (
+    SourceProbeUnavailableError,
+    SourceTableNotFoundError,
+    verify_source_table_exists,
+)
+from src.api._model_lock import acquire_model_definition_lock
 from src.api._scope import resolve_source_connection
 from src.api._table_qualify import qualify_physical_name
 from src.api.hierarchies import (
     _auto_create_date_hierarchies_for_model,
+    _delete_unreferenced_generated_udas,
     _ensure_model_in_project,
     _introspect_batch_via_router,
+    reconcile_generated_calendar_captions,
 )
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
@@ -77,6 +104,11 @@ router = APIRouter(
 
 
 _ALIAS_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# Bug-7206: strict identifier pattern for calendar table names. Each dotted
+# segment must be a valid SQL identifier (alphanumeric, underscores, hyphens).
+# Semicolons, quotes, comments, and other SQL metacharacters are rejected at the
+# API boundary before they can reach the DDL emitter.
+_TABLE_NAME_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-]*$")
 _DEFAULT_ALIAS_BASE = "calendar"
 _CALENDAR_COLUMN_TYPES: dict[str, str] = {
     "date_column": "date",
@@ -87,6 +119,12 @@ _CALENDAR_COLUMN_TYPES: dict[str, str] = {
     "week_column": "integer",
     "day_column": "integer",
 }
+_CALENDAR_COLUMN_FIELDS = tuple(_CALENDAR_COLUMN_TYPES.keys())
+_CALENDAR_YEAR_LABEL_COLUMN = "year_label"
+_CALENDAR_YEAR_LABEL_TYPES = frozenset({"standard", "fiscal", "retail_445"})
+# Only fiscal and NRF calendars need a distinct BI caption. A January-start
+# standard calendar's integer key is already its complete member caption.
+_CALENDAR_CAPTION_TYPES = frozenset({"fiscal", "retail_445"})
 
 _CALENDAR_SLOT_PATTERNS: dict[str, re.Pattern] = {
     "date_column": re.compile(r"date.?key|calendar.?date|date.?id|^date$|^dt$", re.I),
@@ -127,6 +165,31 @@ def _detect_calendar_columns(
                 break
 
     return result
+
+
+def _validate_table_name(table_name: str) -> None:
+    """Bug-7206: reject table names with SQL metacharacters at the API boundary.
+
+    Accepts dotted names (schema.table, project.dataset.table) where each
+    segment is a valid SQL identifier. Raises HTTPException 422 on invalid
+    names.
+    """
+    if not table_name or not table_name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="table_name must not be empty",
+        )
+    segments = table_name.split(".")
+    for segment in segments:
+        if not segment or not _TABLE_NAME_SEGMENT_RE.match(segment):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"Invalid table name segment: {segment!r}. Each part of "
+                    "the table name must start with a letter or underscore "
+                    "and contain only letters, digits, underscores, or hyphens."
+                ),
+            )
 
 
 async def auto_register_calendar_from_classification(
@@ -204,12 +267,29 @@ async def auto_register_calendar_from_classification(
 # ---------------------------------------------------------------------------
 
 
+# Bug-7216: maximum allowed date span for calendar generation (~100 years).
+_MAX_CALENDAR_SPAN_DAYS = 36525
+
+
 class CalendarScriptRequest(BaseModel):
     table_name: str = Field(max_length=512)
     start_date: date
     end_date: date
     calendar_type: str = Field(default="standard")
     fiscal_year_start_month: int = Field(default=1, ge=1, le=12)
+
+    @model_validator(mode="after")
+    def _check_date_span(self):
+        if self.end_date <= self.start_date:
+            raise ValueError("end_date must be after start_date")
+        span = (self.end_date - self.start_date).days
+        if span > _MAX_CALENDAR_SPAN_DAYS:
+            raise ValueError(
+                f"Calendar date span of {span} days exceeds the maximum "
+                f"of {_MAX_CALENDAR_SPAN_DAYS} days (~100 years). "
+                "Reduce the date range."
+            )
+        return self
 
 
 class CalendarScriptResponse(BaseModel):
@@ -232,6 +312,19 @@ class CalendarAutoCreateRequest(BaseModel):
     fiscal_year_start_month: int = Field(default=1, ge=1, le=12)
     calendar_type: str = Field(default="standard")
 
+    @model_validator(mode="after")
+    def _check_date_span(self):
+        if self.end_date <= self.start_date:
+            raise ValueError("end_date must be after start_date")
+        span = (self.end_date - self.start_date).days
+        if span > _MAX_CALENDAR_SPAN_DAYS:
+            raise ValueError(
+                f"Calendar date span of {span} days exceeds the maximum "
+                f"of {_MAX_CALENDAR_SPAN_DAYS} days (~100 years). "
+                "Reduce the date range."
+            )
+        return self
+
 
 class CalendarBindRequest(BaseModel):
     table_name: str = Field(max_length=512)
@@ -247,6 +340,9 @@ class CalendarBindRequest(BaseModel):
     display_name: Optional[str] = Field(default=None, max_length=255)
     fiscal_year_start_month: int = Field(default=1, ge=1, le=12)
     calendar_type: str = Field(default="standard")
+    # Only server-issued auto-create history tokens may populate this field.
+    # Manual binds must leave it absent.
+    history_provenance: Optional[str] = Field(default=None, max_length=64)
 
 
 class CalendarUpdateRequest(BaseModel):
@@ -261,12 +357,21 @@ class CalendarUpdateRequest(BaseModel):
     calendar_type: Optional[str] = None
 
 
+class CalendarUndoRequest(BaseModel):
+    history_provenance: str = Field(min_length=1, max_length=64)
+
+
 class CalendarCoverageResponse(BaseModel):
     """F-016-23: result of comparing a fact date range against the calendar's
     date range. ``covered`` is False when any fact rows fall outside the
     calendar range — those rows would LEFT JOIN to NULL period values and drop
     silently from period rollups, the silent-wrong-number class the
-    architecture doc's near-term item #1 calls out."""
+    architecture doc's near-term item #1 calls out.
+
+    Bug-7197: ``interior_gap`` is True when the calendar covers the outer
+    boundaries but is missing dates within the range (interior gaps).
+    ``calendar_date_count`` and ``expected_date_count`` expose the
+    underlying numbers so the UI can show the gap magnitude."""
 
     covered: bool
     calendar_min: Optional[str] = None
@@ -274,9 +379,13 @@ class CalendarCoverageResponse(BaseModel):
     fact_min: Optional[str] = None
     fact_max: Optional[str] = None
     # "below" (facts predate the calendar), "above" (facts run past it),
-    # "both", or None when fully covered / indeterminate.
+    # "both", "interior" (Bug-7197), or None when fully covered / indeterminate.
     gap: Optional[str] = None
     warning: Optional[str] = None
+    # Bug-7197: interior gap detection
+    interior_gap: Optional[bool] = None
+    calendar_date_count: Optional[int] = None
+    expected_date_count: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -310,9 +419,78 @@ def _normalise_dialect(connection_type: str) -> str:
     )
 
 
-async def _execute_ddl(connection: ProjectConnection, ddl: str) -> None:
+async def _execute_ddl(connection: ProjectConnection, ddl: str, db) -> None:
+    # Bug-8039: the shared pool is tenant-keyed and fails closed without a
+    # canonical tenant identity, so pass the tenant-bound session (its
+    # ``info['tenant_id']`` is the tenant slug) through to the execution gateway.
     from shared.source_executor import execute_source_ddl
-    await execute_source_ddl(connection, ddl)
+    await execute_source_ddl(
+        connection, ddl, tenant_session=db, purpose="calendar_ddl",
+    )
+
+
+async def _invalidate_time_grained_aggregates(db, *, model_id: UUID) -> int:
+    """F-016-01: invalidate aggregates whose grain depends on a time dimension.
+
+    A regenerated calendar shifts period boundaries, so every aggregate grouped
+    at a calendar-derived time grain now holds stale rows. Each SERVABLE
+    ("active") such aggregate is flipped to non-servable ("pending") with its
+    prior status durably preserved in ``refresh_prior_status`` (the same
+    pre-physical-change contract the refresh guard uses), so the query binder
+    (which serves ``status=="active"`` only) stops serving it until a refresh
+    rebuilds it against the new calendar. Runs in the caller's transaction so
+    invalidation commits atomically with the calendar change.
+
+    Returns the number of aggregates invalidated.
+    """
+    # Logical names of this model's time dimensions (grain entries are logical
+    # dimension names). Any aggregate whose grain intersects these is time
+    # grained and therefore calendar-dependent.
+    time_dim_rows = await db.execute(
+        select(Dimension.name).where(
+            Dimension.model_id == model_id,
+            Dimension.is_time_dim.is_(True),
+        )
+    )
+    time_dim_names = {n.lower() for (n,) in time_dim_rows.all() if n}
+    if not time_dim_names:
+        return 0
+
+    agg_rows = await db.execute(
+        select(AggregateDefinition).where(
+            AggregateDefinition.model_id == model_id,
+            AggregateDefinition.status == "active",
+        )
+    )
+    invalidated = 0
+    for agg in agg_rows.scalars().all():
+        grain = {str(g).lower() for g in (agg.grain or [])}
+        if not (grain & time_dim_names):
+            continue
+        # Preserve the durable prior status only if not already mid-flight.
+        if getattr(agg, "refresh_prior_status", None) is None:
+            agg.refresh_prior_status = agg.status
+        agg.status = "pending"
+        invalidated += 1
+    if invalidated:
+        await db.flush()
+    return invalidated
+
+
+def _calendar_period_math_changed(cal, updates: dict) -> bool:
+    """F-016-03: True when an ``update_calendar`` payload changes a calendar's
+    period math — its ``calendar_type``, ``fiscal_year_start_month``, or any
+    period-column map — to a value different from what is stored.
+
+    These are the changes that shift period boundaries, so time-grained
+    aggregates built on the old grain must be invalidated. Editing an unrelated
+    field (e.g. a label) or re-sending the same value returns False, so an
+    aggregate is not needlessly flipped to pending.
+    """
+    for field in ("calendar_type", "fiscal_year_start_month", *_CALENDAR_COLUMN_FIELDS):
+        if field in updates and updates[field] != getattr(cal, field, None):
+            return True
+    return False
 
 
 def _extract_bearer(request: Request) -> str:
@@ -333,19 +511,63 @@ async def _verify_table_exists(
     source_id: UUID,
     bearer: str,
 ) -> None:
-    """Raise HTTPException(404) if the table does not exist on the source.
+    """Raise 404 only for a confirmed missing table, otherwise 503."""
+    try:
+        await verify_source_table_exists(
+            qualified_name,
+            connection,
+            model_id=model_id,
+            source_id=source_id,
+            bearer=bearer,
+        )
+    except SourceTableNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+    except SourceProbeUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "source_table_probe_unavailable: the source table could not be "
+                f"verified; retry shortly ({exc})."
+            ),
+        ) from exc
 
-    The existence probe runs through the query-router ``/introspect``
-    endpoint so that all source-database access is centrally executed,
-    audited (QueryLog), and routed — never issued directly from
-    model-service against the source connection.
+
+async def _verify_calendar_columns(
+    qualified_name: str,
+    connection: ProjectConnection,
+    *,
+    model_id: UUID,
+    source_id: UUID,
+    bearer: str,
+    column_mappings: dict[str, str | None],
+) -> None:
+    """Reject calendar column mappings that the source cannot compile.
+
+    The probe is deliberately routed through query-router introspection, not a
+    direct source connection. ``LIMIT 0`` keeps the check metadata-only while
+    still forcing the source engine to resolve every mapped column.
     """
-    from shared.connector_qualify import quote_table_ref, transpile_preview_sql
+    from shared.connector_qualify import (
+        quote_identifier,
+        quote_table_ref,
+        transpile_preview_sql,
+    )
     from shared.schemas.connection_type import normalize_connection_type
 
+    mapped_columns = sorted({c for c in column_mappings.values() if c})
+    if not mapped_columns:
+        return
+
     connector = normalize_connection_type((connection.connection_type or "").lower())
-    pg_quoted = quote_table_ref("postgresql", qualified_name)
-    canonical = f"SELECT 1 AS chk FROM {pg_quoted} LIMIT 1"
+    pg_table = quote_table_ref("postgresql", qualified_name)
+    projection = ", ".join(
+        f"{quote_identifier('postgresql', col)} AS c{i}"
+        for i, col in enumerate(mapped_columns)
+    )
+    canonical = f"SELECT {projection} FROM {pg_table} LIMIT 0"
     sql = transpile_preview_sql(connector, canonical)
 
     _settings = get_settings()
@@ -359,24 +581,75 @@ async def _verify_table_exists(
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(url, json=body, headers=headers)
-        if resp.status_code >= 400:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Table {qualified_name!r} does not exist on the source database.",
-            )
-        rows = resp.json().get("rows", [])
-    except HTTPException:
+    except Exception as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Could not validate columns for calendar table {qualified_name!r}.",
+        ) from exc
+
+    if resp.status_code >= 400:
+        detail = {
+            "message": (
+                f"Calendar column mapping does not match source table "
+                f"{qualified_name!r}."
+            ),
+            "columns": mapped_columns,
+        }
+        try:
+            payload = resp.json()
+            if payload:
+                detail["source_error"] = payload
+        except Exception:
+            if resp.text:
+                detail["source_error"] = resp.text
+        raise HTTPException(status_code=400, detail=detail)
+
+
+async def _calendar_has_year_label(
+    qualified_name: str,
+    connection: ProjectConnection,
+    *,
+    model_id: UUID,
+    source_id: UUID,
+    bearer: str,
+) -> bool:
+    """Probe the optional caption column through query-router introspection.
+
+    Bind supports both a pre-feature table (no label, so metadata falls back to
+    ``year_no``) and a script-generated/rebuilt table (label present). The
+    optional probe therefore must distinguish a missing column from an
+    unavailable introspection service rather than advertising a column that the
+    source cannot read.
+    """
+    from shared.connector_qualify import (
+        quote_identifier,
+        quote_table_ref,
+        transpile_preview_sql,
+    )
+    from shared.schemas.connection_type import normalize_connection_type
+
+    connector = normalize_connection_type((connection.connection_type or "").lower())
+    pg_table = quote_table_ref("postgresql", qualified_name)
+    canonical = (
+        f"SELECT {quote_identifier('postgresql', _CALENDAR_YEAR_LABEL_COLUMN)} "
+        f"AS {_CALENDAR_YEAR_LABEL_COLUMN} FROM {pg_table} LIMIT 0"
+    )
+    sql = transpile_preview_sql(connector, canonical)
+    try:
+        results = await _introspect_batch_via_router(
+            str(model_id),
+            [("calendar_year_label", sql)],
+            bearer,
+        )
+    except HTTPException as exc:
+        if exc.status_code in (400, 404):
+            return False
         raise
-    except Exception:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Table {qualified_name!r} does not exist on the source database.",
-        )
-    if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Table {qualified_name!r} does not exist on the source database.",
-        )
+    rows, columns, error = results.get("calendar_year_label", ([], [], None))
+    del rows  # The query is LIMIT 0; only metadata is relevant.
+    if error:
+        return False
+    return any(str(column).lower() == _CALENDAR_YEAR_LABEL_COLUMN for column in columns)
 
 
 def _validate_calendar_type(calendar_type: str | None) -> str | None:
@@ -386,14 +659,31 @@ def _validate_calendar_type(calendar_type: str | None) -> str | None:
     ``"banana"``), which downstream ``CALENDAR_COLUMN_SETS.get(...)`` /
     expression-capability checks then silently coerced toward standard-ish
     behaviour. Returns the normalised type; raises 400 on an unknown value.
+
+    Bug-5920: a canonical type whose runtime dependency is not installed in
+    this deployment (currently ``hijri``) is rejected here with a clear,
+    user-facing "not available in this deployment" message instead of
+    being accepted and failing later inside the DDL emitter with a
+    developer-oriented "pip install ..." error.
     """
     normalized = normalize_calendar_type(calendar_type)
-    if normalized is not None and normalized not in CALENDAR_TYPES:
+    if normalized is None:
+        return normalized
+    if normalized not in CALENDAR_TYPES:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"calendar_type {calendar_type!r} is invalid. "
                 f"Must be one of {sorted(CALENDAR_TYPES)}."
+            ),
+        )
+    if not is_available_calendar_type(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"calendar_type {normalized!r} is not available in this "
+                "deployment (its optional runtime dependency is not "
+                "installed). Contact your administrator to enable it."
             ),
         )
     return normalized
@@ -408,6 +698,117 @@ def _validate_alias(alias: str) -> None:
                 "letter and contain only lowercase letters, digits, and "
                 "underscores."
             ),
+        )
+
+
+def _calendar_name_variants(table_name: str) -> set[str]:
+    """Return exact and short physical names for one calendar table."""
+    parts = table_name.split(".")
+    variants = {table_name}
+    if len(parts) >= 3:
+        variants.add(".".join(parts[-2:]))
+    return variants
+
+
+async def _effective_year_label_format(db) -> str:
+    """Resolve and validate the tenant caption token for a calendar rebuild."""
+    value = await get_setting(FISCAL_YEAR_LABEL_SETTING, tenant_session=db)
+    try:
+        return extract_fiscal_year_label_format(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+
+async def _ensure_calendar_year_label_column(
+    db,
+    *,
+    model_table_id: UUID,
+    include: bool,
+    history_capture: dict | None = None,
+) -> ModelColumn | None:
+    """Advertise the optional caption column only after a rebuild emitted it."""
+    if not include:
+        return None
+    existing = (
+        await db.execute(
+            select(ModelColumn).where(
+                ModelColumn.model_table_id == model_table_id,
+                ModelColumn.column_name == _CALENDAR_YEAR_LABEL_COLUMN,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if history_capture is not None:
+            history_capture.setdefault("calendar_alias_columns", []).append({
+                "id": str(existing.id),
+                "model_table_id": str(existing.model_table_id),
+                "column_name": existing.column_name,
+                "display_name": existing.display_name,
+                "description": existing.description,
+                "is_hidden": existing.is_hidden,
+                "hidden_reason": existing.hidden_reason,
+                "is_primary_key": existing.is_primary_key,
+                "data_type": existing.data_type,
+                "is_nullable": existing.is_nullable,
+                "created": False,
+            })
+        return existing
+    column = ModelColumn(
+        model_table_id=model_table_id,
+        column_name=_CALENDAR_YEAR_LABEL_COLUMN,
+        display_name="Year Label",
+        data_type="string",
+        is_nullable=False,
+        is_hidden=False,
+    )
+    db.add(column)
+    await db.flush()
+    if history_capture is not None:
+        history_capture.setdefault("calendar_alias_columns", []).append({
+            "id": str(column.id),
+            "model_table_id": str(column.model_table_id),
+            "column_name": column.column_name,
+            "display_name": column.display_name,
+            "description": column.description,
+            "is_hidden": column.is_hidden,
+            "hidden_reason": column.hidden_reason,
+            "is_primary_key": column.is_primary_key,
+            "data_type": column.data_type,
+            "is_nullable": column.is_nullable,
+            "created": True,
+        })
+    return column
+
+
+async def _ensure_calendar_alias_year_labels(
+    db,
+    *,
+    model_id: UUID,
+    calendar_id: UUID,
+    calendar_type: str,
+    include_year_label: bool | None = None,
+    history_capture: dict | None = None,
+) -> None:
+    """Reconcile every existing calendar alias after a normal rebuild."""
+    include = (
+        calendar_type in _CALENDAR_YEAR_LABEL_TYPES
+        if include_year_label is None else include_year_label
+    )
+    aliases = (
+        await db.execute(
+            select(ModelTable).where(
+                ModelTable.model_id == model_id,
+                ModelTable.calendar_table_id == calendar_id,
+            )
+        )
+    ).scalars().all()
+    for alias in aliases:
+        await _ensure_calendar_year_label_column(
+            db, model_table_id=alias.id, include=include,
+            history_capture=history_capture,
         )
 
 
@@ -442,6 +843,8 @@ async def _create_calendar_alias(
     calendar: CalendarTable,
     alias: Optional[str],
     display_name: Optional[str],
+    include_year_label: bool = False,
+    history_capture: dict | None = None,
 ) -> ModelTable:
     """Create a ModelTable alias for ``calendar`` and pre-populate one
     ModelColumn per non-NULL standard column on the calendar.
@@ -452,25 +855,34 @@ async def _create_calendar_alias(
     # reuse that row instead of creating a duplicate. BQ names can be 3-part
     # (project.dataset.table) while Discover Tables produces 2-part (dataset.table),
     # so check both forms.
-    parts = calendar.table_name.split(".")
-    short_phys = ".".join(parts[-2:]) if len(parts) >= 3 else calendar.table_name
+    name_variants = _calendar_name_variants(calendar.table_name)
     existing_mt = (
         await db.execute(
             select(ModelTable)
             .where(
                 ModelTable.model_id == model_id,
-                or_(
-                    ModelTable.physical_name == calendar.table_name,
-                    ModelTable.physical_name == short_phys,
-                ),
+                ModelTable.physical_name.in_(name_variants),
             )
             .limit(1)
         )
     ).scalar_one_or_none()
 
     if existing_mt is not None:
+        if history_capture is not None:
+            history_capture.setdefault("reused_model_tables", []).append({
+                "id": str(existing_mt.id),
+                "calendar_table_id": (
+                    str(existing_mt.calendar_table_id)
+                    if existing_mt.calendar_table_id is not None else None
+                ),
+                "table_type": existing_mt.table_type,
+            })
         existing_mt.calendar_table_id = calendar.id
         existing_mt.table_type = "calendar"
+        await _ensure_calendar_year_label_column(
+            db, model_table_id=existing_mt.id, include=include_year_label,
+            history_capture=history_capture,
+        )
         await db.flush()
         return existing_mt
 
@@ -543,8 +955,57 @@ async def _create_calendar_alias(
                 is_nullable=False,
             )
         )
+    await _ensure_calendar_year_label_column(
+        db, model_table_id=table.id, include=include_year_label,
+        history_capture=history_capture,
+    )
     await db.flush()
+    if history_capture is not None:
+        history_capture.setdefault("generated_model_table_ids", []).append(table.id)
     return table
+
+
+# ---------------------------------------------------------------------------
+# GET /types — which calendar types are usable in this deployment
+# ---------------------------------------------------------------------------
+
+
+class CalendarTypeAvailability(BaseModel):
+    calendar_type: str
+    available: bool
+
+
+@router.get(
+    "/types",
+    response_model=list[CalendarTypeAvailability],
+    dependencies=[require_role("viewer")],
+)
+async def list_calendar_types(
+    project_id: UUID,
+    model_id: UUID,
+    source_id: UUID,
+    current_user: CurrentUser = Depends(forbid_embed_user),
+) -> list[CalendarTypeAvailability]:
+    """Bug-5920: backend-computed calendar type availability.
+
+    The canonical 6-type vocabulary (``CALENDAR_TYPES``) is fixed, but a
+    type can require an optional runtime dependency that is not installed
+    in every deployment. The frontend must render its calendar-type picker
+    from this endpoint rather than a hardcoded per-type flag, so enabling
+    a type (e.g. installing ``hijri-converter``) takes effect without a
+    frontend code change.
+    """
+    async for db in get_tenant_db(current_user.tenant_id):
+        await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        source = await db.get(DataSource, source_id)
+        if source is None or source.model_id != model_id:
+            raise HTTPException(status_code=404, detail="DataSource not found")
+        available = available_calendar_types()
+        return [
+            CalendarTypeAvailability(calendar_type=t, available=t in available)
+            for t in sorted(CALENDAR_TYPES)
+        ]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -594,17 +1055,24 @@ async def emit_calendar_script(
     body: CalendarScriptRequest,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> CalendarScriptResponse:
+    _validate_table_name(body.table_name)  # Bug-7206
     async for db in get_tenant_db(current_user.tenant_id):
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
         source, connection = await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
         dialect = _normalise_dialect(connection.connection_type)
         calendar_type = _validate_calendar_type(body.calendar_type) or "standard"
+        year_label_format = (
+            await _effective_year_label_format(db)
+            if calendar_type in _CALENDAR_CAPTION_TYPES
+            else DEFAULT_FISCAL_YEAR_LABEL_FORMAT
+        )
         qualified_name = qualify_physical_name(body.table_name, connection, source)
         try:
             ddl = emit_calendar_ddl(
                 dialect, qualified_name, body.start_date, body.end_date,
                 fiscal_year_start_month=body.fiscal_year_start_month,
                 calendar_type=calendar_type,
+                year_label_format=year_label_format,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -634,18 +1102,64 @@ async def auto_create_calendar(
     body: CalendarAutoCreateRequest,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> CalendarTableResponse:
+    _validate_table_name(body.table_name)  # Bug-7206
     async for db in get_tenant_db(current_user.tenant_id):
+        # Bug-7982 completion round: this lock is held across the source DDL
+        # call below (network I/O) BY DESIGN — F-016-01 requires the
+        # destructive DDL to run LAST, after all metadata/hierarchy work has
+        # succeeded and is staged for commit, so a late-acquire (the
+        # refresh_named_list pattern) is not safe here: it would let the
+        # metadata be written non-atomically with the source change it
+        # describes. `acquire_model_definition_lock`'s PostgreSQL
+        # `lock_timeout` (`settings.MODEL_DEFINITION_LOCK_TIMEOUT_SECONDS`)
+        # bounds how long any OTHER writer will wait on this model's lock
+        # instead of hanging indefinitely if this call's DDL is slow or hung.
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         source, connection = await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
         dialect = _normalise_dialect(connection.connection_type)
         calendar_type = _validate_calendar_type(body.calendar_type) or "standard"
+        year_label_format = (
+            await _effective_year_label_format(db)
+            if calendar_type in _CALENDAR_CAPTION_TYPES
+            else DEFAULT_FISCAL_YEAR_LABEL_FORMAT
+        )
         qualified_name = qualify_physical_name(body.table_name, connection, source)
         columns = CALENDAR_COLUMN_SETS.get(calendar_type, STANDARD_COLUMNS)
+
+        # Bug-7208 (codex F1): check for existing registration BEFORE DDL
+        # generation/execution. The DDL is autocommitted on the source, so
+        # rejecting after execution leaves the source table changed while
+        # Tessallite metadata remains stale.
+        _existing_pre = (
+            await db.execute(
+                select(CalendarTable).where(
+                    CalendarTable.data_source_id == source.id,
+                    CalendarTable.table_name == qualified_name,
+                )
+            )
+        ).scalar_one_or_none()
+        if (
+            _existing_pre is not None
+            and _existing_pre.calendar_type is not None
+            and _existing_pre.calendar_type != calendar_type
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot change calendar type from "
+                    f"'{_existing_pre.calendar_type}' to '{calendar_type}' "
+                    "on an existing registration. Delete the calendar "
+                    "and re-create it with the new type instead."
+                ),
+            )
+
         try:
             ddl = emit_calendar_ddl(
                 dialect, qualified_name, body.start_date, body.end_date,
                 fiscal_year_start_month=body.fiscal_year_start_month,
                 calendar_type=calendar_type,
+                year_label_format=year_label_format,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -678,16 +1192,16 @@ async def auto_create_calendar(
                 },
             )
 
-        try:
-            await _execute_ddl(connection, ddl)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail={
-                    "message": f"Calendar DDL execution failed on source: {exc}",
-                    "ddl": ddl,
-                },
-            ) from exc
+        # F-016-01: the source calendar DDL is DESTRUCTIVE (DROP+recreate) and
+        # AUTOCOMMITS on the source, which lives in a DIFFERENT transaction
+        # domain than Tessallite's tenant metadata. Previously the DDL ran here,
+        # BEFORE the metadata + hierarchy work; when hierarchy generation then
+        # failed, only the tenant DB was rolled back, leaving the physical
+        # calendar changed while the metadata reverted — a silent source/metadata
+        # divergence that yields wrong period boundaries. The DDL is now deferred
+        # to the very end, after ALL metadata/hierarchy work has succeeded and is
+        # ready to commit, so any earlier failure leaves the source untouched
+        # (source == old, metadata == old). See the deferred _execute_ddl below.
 
         # Idempotent: re-pressing Generate with the same (source, table_name)
         # refreshes the existing calendar instead of duplicating.
@@ -700,7 +1214,32 @@ async def auto_create_calendar(
             )
         ).scalar_one_or_none()
 
+        history_capture: dict = {
+            "calendar_created": existing is None,
+            "calendar_before": (
+                {
+                    name: getattr(existing, name)
+                    for name in ("dialect", "calendar_type", *_CALENDAR_COLUMN_FIELDS,
+                                 "autocreated", "fiscal_year_start_month")
+                }
+                if existing is not None else None
+            ),
+            "generated_model_table_ids": [],
+            "generated_hierarchy_ids": [],
+            "generated_join_ids": [],
+            "generated_uda_ids": [],
+            "generated_dimension_ids": [],
+            "dimension_display_columns": [],
+            "dimension_source_columns": [],
+            "hierarchy_level_keys": [],
+            "calendar_alias_columns": [],
+            "reused_model_tables": [],
+            "reused_join_ids": [],
+        }
+
         if existing is not None:
+            # Bug-7208: type-change guard runs pre-DDL (above). This branch
+            # only fires when the type matches or existing has no type.
             existing.dialect = dialect
             existing.date_column = columns.get("date_column")
             existing.year_column = columns.get("year_column")
@@ -731,6 +1270,47 @@ async def auto_create_calendar(
                     calendar=cal,
                     alias=body.alias,
                     display_name=body.display_name,
+                    include_year_label=calendar_type in _CALENDAR_YEAR_LABEL_TYPES,
+                    history_capture=history_capture,
+                )
+            else:
+                # An idempotent Generate reuses every alias already linked to
+                # this calendar.  Record the complete pre-write ownership
+                # state, not just the first alias used to drive hierarchy
+                # generation, so the immediate history undo can restore the
+                # exact table metadata without treating it as an unexpected
+                # user alias.
+                existing_aliases = (
+                    await db.execute(
+                        select(ModelTable).where(
+                            ModelTable.model_id == model_id,
+                            ModelTable.calendar_table_id == cal.id,
+                        )
+                    )
+                ).scalars().all()
+                history_capture["reused_model_tables"].extend(
+                    {
+                        "id": str(alias_table.id),
+                        "calendar_table_id": (
+                            str(alias_table.calendar_table_id)
+                            if alias_table.calendar_table_id is not None else None
+                        ),
+                        "table_type": alias_table.table_type,
+                    }
+                    for alias_table in existing_aliases
+                )
+                existing_alias_ids = {alias_table.id for alias_table in existing_aliases}
+                existing_joins = (
+                    await db.execute(
+                        select(Join).where(
+                            Join.model_id == model_id,
+                            (Join.left_table_id.in_(existing_alias_ids)
+                             | Join.right_table_id.in_(existing_alias_ids)),
+                        )
+                    )
+                ).scalars().all()
+                history_capture["reused_join_ids"].extend(
+                    str(join.id) for join in existing_joins
                 )
         else:
             cal = CalendarTable(
@@ -757,13 +1337,23 @@ async def auto_create_calendar(
                 calendar=cal,
                 alias=body.alias,
                 display_name=body.display_name,
+                include_year_label=calendar_type in _CALENDAR_YEAR_LABEL_TYPES,
+                history_capture=history_capture,
             )
 
-        await db.commit()
-        await db.refresh(cal)
+        if calendar_type in _CALENDAR_CAPTION_TYPES:
+            await _ensure_calendar_alias_year_labels(
+                db,
+                model_id=model_id,
+                calendar_id=cal.id,
+                calendar_type=calendar_type,
+                history_capture=history_capture,
+            )
+            await db.flush()
 
-        # Auto-create date hierarchies for unassigned fact-table date columns.
-        # Locate the alias we just created/confirmed for this calendar.
+        # Auto-create date hierarchies for unassigned fact-table date columns,
+        # in the SAME transaction as the calendar. Locate the alias we just
+        # created/confirmed for this calendar.
         alias_mt_row = (
             await db.execute(
                 select(ModelTable)
@@ -781,13 +1371,126 @@ async def auto_create_calendar(
                     db,
                     model_id=model_id,
                     calendar_model_table_id=alias_mt_row.id,
+                    calendar_table_id=cal.id,
+                    history_capture=history_capture,
                 )
-                await db.commit()
-            except Exception as _exc:
-                logger.warning("auto_create_date_hierarchies failed for model %s: %s", model_id, _exc)
+            except Exception as exc:
+                # Bug-6242: do NOT swallow. Roll the whole unit of work back so a
+                # calendar is never committed without its date hierarchy, then
+                # fail loud so the operator sees the failure instead of a
+                # success response over a half-built calendar.
+                # F-016-01: the source DDL has NOT run yet (deferred below), so
+                # this rollback truly leaves BOTH stores at their prior state —
+                # the "changes were rolled back" message is now accurate.
+                await db.rollback()
+                logger.error(
+                    "Calendar auto-create aborted: date-hierarchy generation "
+                    "failed for model %s calendar %s: %s",
+                    model_id, qualified_name, exc, exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        "Automatic date-hierarchy generation failed; no changes "
+                        f"were made to the source or the model. Reason: {exc}. "
+                        "Fix the underlying issue and retry, or bind the calendar "
+                        "and add date hierarchies manually."
+                    ),
+                ) from exc
+
+        await reconcile_generated_calendar_captions(
+            db,
+            model_id=model_id,
+            calendar_table_id=cal.id,
+            calendar_type=calendar_type,
+            history_capture=history_capture,
+        )
+
+        # F-016-01: invalidate every servable aggregate whose grain depends on a
+        # calendar-derived time dimension in this model. A regenerated calendar
+        # changes period boundaries, so any aggregate grouped at a time grain now
+        # holds stale rows. Flip it to non-servable ("pending") with its prior
+        # status preserved, so the binder stops serving it until a refresh
+        # rebuilds it. Done in the SAME tenant transaction as the calendar so
+        # invalidation commits atomically with the metadata.
+        await _invalidate_time_grained_aggregates(db, model_id=model_id)
+
+        # F-016-01: execute the DESTRUCTIVE source DDL LAST — after all metadata
+        # and hierarchy work has succeeded and is staged for commit. On failure
+        # here the tenant transaction is rolled back and the source is left
+        # untouched (source == metadata == old state).
+        try:
+            await _execute_ddl(connection, ddl, db)
+        except Exception as exc:
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "message": (
+                        f"Calendar DDL execution failed on source: {exc}. "
+                        "No changes were made to the model."
+                    ),
+                    "ddl": ddl,
+                },
+            ) from exc
+
+        history_token = uuid4()
+        db.add(CalendarHistoryProvenance(
+            token=history_token,
+            model_id=model_id,
+            data_source_id=source.id,
+            calendar_id=cal.id,
+            physical_table=qualified_name,
+            generated_metadata={
+                "dialect": dialect,
+                "calendar_type": calendar_type,
+                **{name: getattr(cal, name) for name in _CALENDAR_COLUMN_FIELDS},
+                "auto_created_aliases": auto_created_aliases,
+                "calendar_created": history_capture["calendar_created"],
+                "calendar_before": history_capture["calendar_before"],
+                **{
+                    key: [str(value) for value in history_capture[key]]
+                    for key in (
+                        "generated_model_table_ids", "generated_hierarchy_ids",
+                        "generated_join_ids", "generated_uda_ids",
+                        "generated_dimension_ids",
+                    )
+                },
+                "dimension_display_columns": history_capture["dimension_display_columns"],
+                "dimension_source_columns": history_capture["dimension_source_columns"],
+                "hierarchy_level_keys": history_capture["hierarchy_level_keys"],
+                "calendar_alias_columns": history_capture["calendar_alias_columns"],
+                "reused_model_tables": history_capture["reused_model_tables"],
+                "reused_join_ids": history_capture["reused_join_ids"],
+            },
+        ))
+        await db.flush()
+
+        try:
+            await db.commit()
+        except Exception as exc:
+            # Narrow window: the source DDL succeeded but the metadata commit
+            # failed. Surface it explicitly rather than claiming a clean rollback
+            # — the operator must reconcile by re-running Generate (idempotent).
+            await db.rollback()
+            logger.error(
+                "Calendar auto-create: source DDL applied but metadata commit "
+                "failed for model %s calendar %s: %s",
+                model_id, qualified_name, exc, exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "The source calendar table was rebuilt, but saving the model "
+                    "metadata failed. Re-run Generate (it is idempotent) to "
+                    "reconcile the metadata with the source."
+                ),
+            ) from exc
+        await db.refresh(cal)
 
         resp = CalendarTableResponse.model_validate(cal)
         resp.auto_created_aliases = auto_created_aliases
+        resp.history_provenance = {"token": str(history_token)}
         return resp
 
 
@@ -809,10 +1512,17 @@ async def bind_calendar(
     body: CalendarBindRequest,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> CalendarTableResponse:
+    _validate_table_name(body.table_name)  # Bug-7206
     bearer = _extract_bearer(request)
 
     async for db in get_tenant_db(current_user.tenant_id):
+        # Bug-7982 completion round: like auto_create_calendar, this lock is
+        # held across source verification reads (_verify_table_exists /
+        # _verify_calendar_columns — network I/O). `acquire_model_definition_lock`'s
+        # `lock_timeout` bounds how long any OTHER writer waits on this model's
+        # lock if those reads are slow.
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         source, connection = await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
         dialect = body.dialect or _normalise_dialect(connection.connection_type)
         if dialect not in CALENDAR_DIALECTS:
@@ -825,21 +1535,96 @@ async def bind_calendar(
             )
 
         qualified_name = qualify_physical_name(body.table_name, connection, source)
+        provenance = None
+        if getattr(body, "history_provenance", None):
+            try:
+                provenance_token = UUID(body.history_provenance)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail="Invalid calendar history provenance.") from exc
+            provenance = (await db.execute(
+                select(CalendarHistoryProvenance).where(
+                    CalendarHistoryProvenance.token == provenance_token,
+                    CalendarHistoryProvenance.model_id == model_id,
+                    CalendarHistoryProvenance.data_source_id == source.id,
+                )
+            )).scalar_one_or_none()
+            if provenance is None or provenance.calendar_id is not None:
+                raise HTTPException(status_code=409, detail="Calendar history provenance is not valid for redo.")
+            if provenance.physical_table != qualified_name:
+                raise HTTPException(status_code=409, detail="Calendar history provenance does not match this physical table.")
+            expected = provenance.generated_metadata
+            for field, actual in {
+                "dialect": dialect,
+                "calendar_type": calendar_type,
+                **{name: getattr(body, name) for name in _CALENDAR_COLUMN_FIELDS},
+            }.items():
+                recorded = expected.get(field)
+                if recorded is not None and actual is not None and recorded != actual:
+                    raise HTTPException(status_code=409, detail="Calendar history provenance metadata mismatch.")
         await _verify_table_exists(
             qualified_name, connection,
             model_id=model_id, source_id=source.id, bearer=bearer,
         )
+        await _verify_calendar_columns(
+            qualified_name, connection,
+            model_id=model_id, source_id=source.id, bearer=bearer,
+            column_mappings={
+                field: getattr(body, field)
+                for field in _CALENDAR_COLUMN_FIELDS
+            },
+        )
+        include_year_label = False
+        if calendar_type in _CALENDAR_CAPTION_TYPES:
+            include_year_label = await _calendar_has_year_label(
+                qualified_name,
+                connection,
+                model_id=model_id,
+                source_id=source.id,
+                bearer=bearer,
+            )
+
+        history_capture = None
+        if provenance is not None:
+            recorded = provenance.generated_metadata or {}
+            history_capture = {
+                "calendar_created": recorded.get("calendar_created", True),
+                "calendar_before": recorded.get("calendar_before"),
+                "generated_model_table_ids": [],
+                "generated_hierarchy_ids": [],
+                "generated_join_ids": [],
+                "generated_uda_ids": [],
+                "generated_dimension_ids": [],
+                "dimension_display_columns": [],
+                "dimension_source_columns": [],
+                "hierarchy_level_keys": [],
+                "calendar_alias_columns": [],
+                "reused_model_tables": [],
+                "reused_join_ids": [],
+            }
 
         # Idempotent: if a CalendarTable for this (source, table_name) already
         # exists, update its column mappings rather than creating a duplicate.
+        # BigQuery discovery can store dataset.table while a manual bind sends
+        # project.dataset.table; treat those as the same source table.
+        name_variants = _calendar_name_variants(qualified_name)
         existing = (
             await db.execute(
                 select(CalendarTable).where(
                     CalendarTable.data_source_id == source.id,
-                    CalendarTable.table_name == qualified_name,
+                    CalendarTable.table_name.in_(name_variants),
                 )
             )
         ).scalar_one_or_none()
+
+        if (
+            provenance is not None
+            and (provenance.generated_metadata or {}).get("calendar_created", True)
+            and existing is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Calendar history redo found an existing registration; refusing to overwrite it.",
+            )
 
         if existing is not None:
             existing.dialect = dialect
@@ -850,7 +1635,7 @@ async def bind_calendar(
             existing.month_column = body.month_column
             existing.week_column = body.week_column
             existing.day_column = body.day_column
-            existing.autocreated = False
+            existing.autocreated = provenance is not None
             existing.fiscal_year_start_month = body.fiscal_year_start_month
             existing.calendar_type = calendar_type
             cal = existing
@@ -871,18 +1656,51 @@ async def bind_calendar(
                     calendar=cal,
                     alias=body.alias,
                     display_name=body.display_name,
+                    include_year_label=include_year_label,
+                    history_capture=history_capture,
                 )
             else:
-                alias_mt = (
-                    await db.execute(
-                        select(ModelTable)
-                        .where(
-                            ModelTable.model_id == model_id,
-                            ModelTable.calendar_table_id == cal.id,
-                        )
-                        .limit(1)
+                existing_aliases = list((await db.execute(
+                    select(ModelTable).where(
+                        ModelTable.model_id == model_id,
+                        ModelTable.calendar_table_id == cal.id,
                     )
-                ).scalar_one()
+                )).scalars().all())
+                if not existing_aliases:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Calendar alias disappeared while binding history.",
+                    )
+                alias_mt = existing_aliases[0]
+                if history_capture is not None:
+                    # A redo of an existing-calendar Generate must carry the
+                    # same pre-existing aliases into the next undo record.
+                    # Otherwise the second undo would classify those unchanged
+                    # aliases as post-history dependencies and refuse itself.
+                    history_capture["reused_model_tables"].extend(
+                        {
+                            "id": str(alias_table.id),
+                            "calendar_table_id": (
+                                str(alias_table.calendar_table_id)
+                                if alias_table.calendar_table_id is not None else None
+                            ),
+                            "table_type": alias_table.table_type,
+                        }
+                        for alias_table in existing_aliases
+                    )
+                    existing_alias_ids = {alias_table.id for alias_table in existing_aliases}
+                    existing_joins = (
+                        await db.execute(
+                            select(Join).where(
+                                Join.model_id == model_id,
+                                (Join.left_table_id.in_(existing_alias_ids)
+                                 | Join.right_table_id.in_(existing_alias_ids)),
+                            )
+                        )
+                    ).scalars().all()
+                    history_capture["reused_join_ids"].extend(
+                        str(join.id) for join in existing_joins
+                    )
         else:
             cal = CalendarTable(
                 data_source_id=source.id,
@@ -895,7 +1713,7 @@ async def bind_calendar(
                 month_column=body.month_column,
                 week_column=body.week_column,
                 day_column=body.day_column,
-                autocreated=False,
+                autocreated=provenance is not None,
                 fiscal_year_start_month=body.fiscal_year_start_month,
                 calendar_type=calendar_type,
             )
@@ -908,9 +1726,19 @@ async def bind_calendar(
                 calendar=cal,
                 alias=body.alias,
                 display_name=body.display_name,
+                include_year_label=include_year_label,
+                history_capture=history_capture,
             )
-        await db.commit()
-        await db.refresh(cal)
+        if calendar_type in _CALENDAR_CAPTION_TYPES:
+            await _ensure_calendar_alias_year_labels(
+                db,
+                model_id=model_id,
+                calendar_id=cal.id,
+                calendar_type=calendar_type,
+                include_year_label=include_year_label,
+                history_capture=history_capture,
+            )
+            await db.flush()
 
         auto_created_aliases: list[str] = []
         try:
@@ -918,13 +1746,76 @@ async def bind_calendar(
                 db,
                 model_id=model_id,
                 calendar_model_table_id=alias_mt.id,
+                calendar_table_id=cal.id,
+                history_capture=history_capture,
             )
-            await db.commit()
-        except Exception as _exc:
-            logger.warning("auto_create_date_hierarchies failed for model %s: %s", model_id, _exc)
+        except Exception as exc:
+            # Bug-6242: fail loud + roll back instead of swallowing, so a bound
+            # calendar is never persisted without its date hierarchy.
+            await db.rollback()
+            logger.error(
+                "Calendar bind aborted: date-hierarchy generation failed for "
+                "model %s calendar %s: %s",
+                model_id, qualified_name, exc, exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Automatic date-hierarchy generation failed; the calendar "
+                    f"changes were rolled back. Reason: {exc}. Fix the underlying "
+                    "issue and retry, or add the date hierarchies manually."
+                ),
+                ) from exc
+
+        await reconcile_generated_calendar_captions(
+            db,
+            model_id=model_id,
+            calendar_table_id=cal.id,
+            calendar_type=calendar_type,
+            history_capture=history_capture,
+        )
+
+        if provenance is not None and all(
+            key in (provenance.generated_metadata or {})
+            for key in (
+                "calendar_created", "generated_model_table_ids",
+                "generated_hierarchy_ids", "generated_join_ids",
+                "generated_uda_ids", "generated_dimension_ids",
+                "reused_model_tables",
+            )
+        ):
+            # Redo restores the generated serving metadata and must use the
+            # same aggregate invalidation boundary as the original create and
+            # the metadata-only undo.
+            await _invalidate_time_grained_aggregates(db, model_id=model_id)
+
+        if provenance is not None:
+            provenance.calendar_id = cal.id
+            provenance.generated_metadata = {
+                **provenance.generated_metadata,
+                "auto_created_aliases": auto_created_aliases,
+                **{
+                    key: [str(value) for value in history_capture[key]]
+                    for key in (
+                        "generated_model_table_ids", "generated_hierarchy_ids",
+                        "generated_join_ids", "generated_uda_ids",
+                        "generated_dimension_ids",
+                    )
+                },
+                "dimension_display_columns": history_capture["dimension_display_columns"],
+                "dimension_source_columns": history_capture["dimension_source_columns"],
+                "hierarchy_level_keys": history_capture["hierarchy_level_keys"],
+                "calendar_alias_columns": history_capture["calendar_alias_columns"],
+                "reused_model_tables": history_capture["reused_model_tables"],
+                "reused_join_ids": history_capture["reused_join_ids"],
+            }
+        await db.commit()
+        await db.refresh(cal)
 
         resp = CalendarTableResponse.model_validate(cal)
         resp.auto_created_aliases = auto_created_aliases
+        if provenance is not None:
+            resp.history_provenance = {"token": str(provenance.token)}
         return resp
 
 
@@ -949,6 +1840,39 @@ def _build_minmax_sql(connector: str, *, table_name: str, date_col: str) -> str:
     pg_col = quote_identifier("postgresql", date_col)
     canonical = (
         f"SELECT MIN({pg_col}) AS lo, MAX({pg_col}) AS hi FROM {pg_table}"
+    )
+    return transpile_preview_sql(connector, canonical)
+
+
+def _build_gap_count_sql(
+    connector: str,
+    *,
+    table_name: str,
+    date_col: str,
+    range_lo: str,
+    range_hi: str,
+) -> str:
+    """Bug-7197: count distinct dates in the calendar between two date
+    boundaries.  By comparing this count to the expected number of days in
+    the range we can detect interior gaps (missing dates within the range
+    that MIN/MAX alone cannot see).
+
+    All identifiers are connector-quoted; date literals are passed as CAST
+    expressions to avoid dialect-specific date syntax (sqlglot transpiles
+    the canonical PG ``CAST('...' AS DATE)`` to the target dialect)."""
+    from shared.connector_qualify import (
+        quote_identifier,
+        quote_table_ref,
+        transpile_preview_sql,
+    )
+
+    pg_table = quote_table_ref("postgresql", table_name)
+    pg_col = quote_identifier("postgresql", date_col)
+    canonical = (
+        f"SELECT COUNT(DISTINCT {pg_col}) AS cnt "
+        f"FROM {pg_table} "
+        f"WHERE {pg_col} >= CAST('{range_lo}' AS DATE) "
+        f"AND {pg_col} <= CAST('{range_hi}' AS DATE)"
     )
     return transpile_preview_sql(connector, canonical)
 
@@ -1041,20 +1965,114 @@ async def check_calendar_coverage(
                 fact_min=fact_lo, fact_max=fact_hi,
             )
 
-        below = fact_lo < cal_lo
-        above = fact_hi > cal_hi
-        if not below and not above:
+        # Bug-5681: parse date boundary strings into date objects before
+        # comparison. String comparison can give wrong results for dates in
+        # different formats (e.g. "2020-1-5" vs "2020-01-05", or timestamps
+        # with trailing timezone info). The source DB may return dates as
+        # ISO strings, timestamps, or other formats. Parse robustly.
+        from datetime import date as _date_type, datetime as _dt_type
+
+        def _parse_date_boundary(val: str) -> _date_type:
+            """Parse a date string into a date object for comparison."""
+            s = val.strip()
+            # Try ISO date first (YYYY-MM-DD)
+            for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    return _dt_type.strptime(s[:len(fmt.replace('%', '0'))], fmt).date()
+                except (ValueError, IndexError):
+                    continue
+            # Fallback: parse just the date portion (first 10 chars)
+            try:
+                return _dt_type.strptime(s[:10], "%Y-%m-%d").date()
+            except ValueError:
+                # Last resort: return as-is for string comparison (legacy path)
+                raise
+
+        try:
+            fact_lo_d = _parse_date_boundary(fact_lo)
+            fact_hi_d = _parse_date_boundary(fact_hi)
+            cal_lo_d = _parse_date_boundary(cal_lo)
+            cal_hi_d = _parse_date_boundary(cal_hi)
+            below = fact_lo_d < cal_lo_d
+            above = fact_hi_d > cal_hi_d
+        except (ValueError, TypeError):
+            # Parsing failed — fall back to string comparison (original behaviour)
+            below = fact_lo < cal_lo
+            above = fact_hi > cal_hi
+        # Bug-7197: detect interior gaps (missing dates within the range)
+        # by counting distinct calendar dates within the overlapping range.
+        # The overlap range is the intersection of the calendar and fact
+        # ranges — the window where we expect the calendar to have
+        # continuous daily coverage.
+        interior_gap = None
+        cal_date_count = None
+        expected_date_count = None
+        try:
+            overlap_lo = max(cal_lo_d, fact_lo_d)
+            overlap_hi = min(cal_hi_d, fact_hi_d)
+            if overlap_lo <= overlap_hi:
+                expected_days = (overlap_hi - overlap_lo).days + 1
+                gap_sql = _build_gap_count_sql(
+                    connector,
+                    table_name=cal_qualified,
+                    date_col=cal.date_column,
+                    range_lo=overlap_lo.isoformat(),
+                    range_hi=overlap_hi.isoformat(),
+                )
+                gap_results = await _introspect_batch_via_router(
+                    str(model_id), [("gap", gap_sql)], bearer,
+                )
+                gap_rows, _gap_cols, gap_err = gap_results.get(
+                    "gap", ([], [], "no result"),
+                )
+                if not gap_err and gap_rows:
+                    raw_cnt = gap_rows[0].get("cnt")
+                    if raw_cnt is not None:
+                        actual_count = int(raw_cnt)
+                        cal_date_count = actual_count
+                        expected_date_count = expected_days
+                        interior_gap = actual_count < expected_days
+        except (ValueError, TypeError):
+            # Bug-7197: log so operators can see when interior gap detection
+            # fails (e.g. non-integer count, unparseable date boundary).
+            # Falls back to boundary-only detection — not a coverage failure.
+            logger.warning(
+                "Calendar coverage interior gap detection skipped for "
+                "calendar %s: date parsing or count conversion failed",
+                calendar_id,
+                exc_info=True,
+            )
+
+        boundary_gap = below or above
+        if not boundary_gap and not interior_gap:
             return CalendarCoverageResponse(
                 covered=True,
                 calendar_min=cal_lo, calendar_max=cal_hi,
                 fact_min=fact_lo, fact_max=fact_hi,
+                interior_gap=interior_gap,
+                calendar_date_count=cal_date_count,
+                expected_date_count=expected_date_count,
             )
-        gap = "both" if below and above else ("below" if below else "above")
+
         parts = []
         if below:
             parts.append(f"fact rows from {fact_lo} predate the calendar start {cal_lo}")
         if above:
             parts.append(f"fact rows to {fact_hi} run past the calendar end {cal_hi}")
+        if interior_gap:
+            parts.append(
+                f"the calendar has {cal_date_count} dates in the fact range "
+                f"but {expected_date_count} are expected (interior gaps detected)"
+            )
+
+        if boundary_gap and interior_gap:
+            gap_label = "both" if (below and above) else ("below" if below else "above")
+            gap_label = f"{gap_label}+interior"
+        elif interior_gap:
+            gap_label = "interior"
+        else:
+            gap_label = "both" if (below and above) else ("below" if below else "above")
+
         warning = (
             "Some fact dates fall outside the calendar range ("
             + "; ".join(parts)
@@ -1065,7 +2083,10 @@ async def check_calendar_coverage(
             covered=False,
             calendar_min=cal_lo, calendar_max=cal_hi,
             fact_min=fact_lo, fact_max=fact_hi,
-            gap=gap, warning=warning,
+            gap=gap_label, warning=warning,
+            interior_gap=interior_gap,
+            calendar_date_count=cal_date_count,
+            expected_date_count=expected_date_count,
         )
 
     raise HTTPException(status_code=500, detail="DB session exhausted")
@@ -1082,6 +2103,7 @@ async def check_calendar_coverage(
     dependencies=[require_role("modeler")],
 )
 async def update_calendar(
+    request: Request,
     project_id: UUID,
     model_id: UUID,
     source_id: UUID,
@@ -1089,14 +2111,18 @@ async def update_calendar(
     body: CalendarUpdateRequest,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> CalendarTableResponse:
+    bearer = _extract_bearer(request)
     async for db in get_tenant_db(current_user.tenant_id):
         # F-016-12: verify the source belongs to this model/project before
         # mutating, matching the chain every sibling endpoint applies.
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         cal = await db.get(CalendarTable, calendar_id)
         if cal is None or cal.data_source_id != source_id:
             raise HTTPException(status_code=404, detail="CalendarTable not found")
-        await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
+        _source, connection = await _load_source_with_connection(
+            db, source_id, model_id, project_id=project_id
+        )
 
         updates = body.model_dump(exclude_unset=True)
 
@@ -1105,6 +2131,13 @@ async def update_calendar(
         # type's semantics, so the type must be changed by regenerating the
         # table (auto-create), not by re-labelling the registration.
         if "calendar_type" in updates:
+            # Bug-7210: reject explicit null — calendar_type is NOT NULL
+            # in the DB; an explicit null would IntegrityError (500).
+            if updates["calendar_type"] is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="calendar_type cannot be cleared (must be a valid calendar type).",
+                )
             new_type = _validate_calendar_type(updates["calendar_type"])
             updates["calendar_type"] = new_type
             if (
@@ -1122,11 +2155,380 @@ async def update_calendar(
                     ),
                 )
 
+        # Bug-7215: refuse fiscal_year_start_month changes on auto-created
+        # calendars. Fiscal DDL physically materialises year, half, and
+        # quarter using the start month. Changing the metadata without
+        # regenerating the physical table creates a silent contradiction.
+        if "fiscal_year_start_month" in updates:
+            new_fys = updates["fiscal_year_start_month"]
+            # Codex F5: reject explicit null -- the DB column is NOT NULL
+            # and an explicit null would produce an IntegrityError (500).
+            if new_fys is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="fiscal_year_start_month cannot be cleared (must be 1-12).",
+                )
+            if (
+                cal.autocreated
+                and new_fys != getattr(cal, "fiscal_year_start_month", 1)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Changing fiscal_year_start_month on an auto-created "
+                        "calendar would leave the physical table's period columns "
+                        "inconsistent with the new fiscal start. Regenerate the "
+                        "calendar (Generate) with the new fiscal start month "
+                        "instead of editing it here."
+                    ),
+                )
+
+        if any(field in updates for field in _CALENDAR_COLUMN_FIELDS):
+            final_mappings = {
+                field: updates.get(field, getattr(cal, field))
+                for field in _CALENDAR_COLUMN_FIELDS
+            }
+            await _verify_calendar_columns(
+                cal.table_name, connection,
+                model_id=model_id, source_id=source_id, bearer=bearer,
+                column_mappings=final_mappings,
+            )
+
+        # F-016-03: a BOUND calendar's period math (calendar_type, fiscal start,
+        # or period-column map) can change here — auto-created type/fiscal changes
+        # are already 409'd above. When it does, every time-grained aggregate
+        # built on the OLD grain now holds stale rows, so invalidate them with the
+        # same helper + pending/refresh_prior_status contract auto-create uses,
+        # atomically in this transaction. Without this an active aggregate keeps
+        # being served against the new calendar and diverges from source.
+        _calendar_math_changed = _calendar_period_math_changed(cal, updates)
+
         for k, v in updates.items():
             setattr(cal, k, v)
+        if _calendar_math_changed:
+            await _invalidate_time_grained_aggregates(db, model_id=model_id)
         await db.commit()
         await db.refresh(cal)
         return CalendarTableResponse.model_validate(cal)
+
+
+# ---------------------------------------------------------------------------
+# POST /{calendar_id}/undo-auto-create — metadata-only history inverse
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/{calendar_id}/undo-auto-create",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[require_role("modeler")],
+)
+async def undo_auto_created_calendar(
+    project_id: UUID,
+    model_id: UUID,
+    source_id: UUID,
+    calendar_id: UUID,
+    body: CalendarUndoRequest,
+    current_user: CurrentUser = Depends(forbid_embed_user),
+) -> None:
+    """Reverse calendar metadata without touching the physical source table.
+
+    Calendar provisioning can create a spine alias, generated companion
+    aliases, joins, and date hierarchies. History undo must remove those
+    tenant metadata rows in one transaction; replay uses ``bind`` to attach
+    the still-existing physical table and rebuilds the dependent metadata.
+    No source executor or DDL is called by this endpoint.
+    """
+    async for db in get_tenant_db(current_user.tenant_id):
+        await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)
+        await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
+        cal = await db.get(CalendarTable, calendar_id)
+        if cal is None or cal.data_source_id != source_id:
+            raise HTTPException(status_code=404, detail="CalendarTable not found")
+        try:
+            provenance_token = UUID(body.history_provenance)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="Invalid calendar history provenance.") from exc
+        provenance = (await db.execute(
+            select(CalendarHistoryProvenance).where(
+                CalendarHistoryProvenance.token == provenance_token,
+                CalendarHistoryProvenance.model_id == model_id,
+                CalendarHistoryProvenance.data_source_id == source_id,
+            )
+        )).scalar_one_or_none()
+        if (
+            provenance is None
+            or provenance.calendar_id != calendar_id
+            or provenance.physical_table != cal.table_name
+            or not cal.autocreated
+        ):
+            raise HTTPException(status_code=409, detail="Calendar history provenance does not authorize this undo.")
+
+        generated_metadata = provenance.generated_metadata or {}
+        ownership_keys = (
+            "calendar_created",
+            "generated_model_table_ids",
+            "generated_hierarchy_ids",
+            "generated_join_ids",
+            "generated_uda_ids",
+            "generated_dimension_ids",
+            "reused_model_tables",
+        )
+        if all(key in generated_metadata for key in ownership_keys):
+            def _ids(key: str) -> set[UUID]:
+                return {UUID(str(value)) for value in generated_metadata.get(key, [])}
+
+            generated_table_ids = _ids("generated_model_table_ids")
+            generated_hierarchy_ids = _ids("generated_hierarchy_ids")
+            generated_join_ids = _ids("generated_join_ids")
+            generated_dimension_ids = _ids("generated_dimension_ids")
+            reused_table_records = generated_metadata.get("reused_model_tables") or []
+            reused_table_ids = {
+                UUID(str(record["id"]))
+                for record in reused_table_records
+                if isinstance(record, dict) and record.get("id")
+            }
+            reused_join_ids = _ids("reused_join_ids")
+
+            # Reconcile only rows this server-issued history record created.
+            # A user join added after provisioning is a real dependency and
+            # must refuse the undo rather than being swept away by a broad
+            # calendar-table predicate.
+            all_calendar_tables = list((await db.execute(
+                select(ModelTable).where(
+                    ModelTable.model_id == model_id,
+                    ModelTable.calendar_table_id == calendar_id,
+                )
+            )).scalars().all())
+            table_scope = generated_table_ids | reused_table_ids
+            unexpected_aliases = [
+                table for table in all_calendar_tables
+                if table.id not in table_scope
+            ]
+            if unexpected_aliases:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Cannot undo the calendar because a non-generated "
+                        "calendar alias depends on it. Remove that alias first."
+                    ),
+                )
+
+            all_joins = list((await db.execute(
+                select(Join).where(
+                    Join.model_id == model_id,
+                    (
+                        (Join.left_table_id.in_(table_scope)
+                         | Join.right_table_id.in_(table_scope))
+                        if table_scope else Join.id.is_(None)
+                    ),
+                )
+            )).scalars().all())
+            unexpected_joins = [
+                join for join in all_joins
+                if join.id not in generated_join_ids
+                and join.id not in reused_join_ids
+            ]
+            if unexpected_joins:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Cannot undo the calendar because a non-generated join "
+                        "depends on generated calendar metadata. Remove it first."
+                    ),
+                )
+
+            if generated_metadata.get("calendar_created"):
+                dependent_measures = list((await db.execute(
+                    select(Measure.name).where(
+                        Measure.resolved_calendar_id == calendar_id
+                    )
+                )).scalars().all())
+                if dependent_measures:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Cannot undo the calendar because measures depend on "
+                            "it. Remove those dependencies first."
+                        ),
+                    )
+
+            generated_dimensions = list((await db.execute(
+                select(Dimension).where(
+                    Dimension.model_id == model_id,
+                    Dimension.id.in_(generated_dimension_ids)
+                    if generated_dimension_ids else Dimension.id.is_(None),
+                )
+            )).scalars().all())
+            generated_hierarchies = list((await db.execute(
+                select(HierarchyDefinition).where(
+                    HierarchyDefinition.model_id == model_id,
+                    HierarchyDefinition.id.in_(generated_hierarchy_ids)
+                    if generated_hierarchy_ids else HierarchyDefinition.id.is_(None),
+                )
+            )).scalars().all())
+            generated_joins = [
+                join for join in all_joins if join.id in generated_join_ids
+            ]
+            generated_tables = [
+                table for table in all_calendar_tables if table.id in generated_table_ids
+            ]
+
+            # Restore every generated dimension caption pointer to its exact
+            # pre-action value before removing generated rows.  This covers a
+            # reused alias where F1 reconciled an existing hierarchy in place.
+            for record in generated_metadata.get("dimension_display_columns") or []:
+                if not isinstance(record, dict) or not record.get("id"):
+                    continue
+                dimension = await db.get(Dimension, UUID(str(record["id"])))
+                if dimension is not None and dimension.model_id == model_id:
+                    previous_display = record.get("display_column_id")
+                    dimension.display_column_id = (
+                        UUID(str(previous_display)) if previous_display else None
+                    )
+            for record in generated_metadata.get("dimension_source_columns") or []:
+                if not isinstance(record, dict) or not record.get("id"):
+                    continue
+                dimension = await db.get(Dimension, UUID(str(record["id"])))
+                if dimension is not None and dimension.model_id == model_id:
+                    prior_source = record.get("source_column_id")
+                    prior_uda = record.get("user_defined_attribute_id")
+                    dimension.source_column_id = UUID(str(prior_source)) if prior_source else None
+                    dimension.user_defined_attribute_id = UUID(str(prior_uda)) if prior_uda else None
+            for record in generated_metadata.get("hierarchy_level_keys") or []:
+                if not isinstance(record, dict) or not record.get("id"):
+                    continue
+                level = await db.get(HierarchyLevel, UUID(str(record["id"])))
+                if level is not None:
+                    level.key_attribute_id = UUID(str(record["key_attribute_id"]))
+                    level.key_attribute_source = record.get("key_attribute_source") or level.key_attribute_source
+
+            for dimension in generated_dimensions:
+                await db.delete(dimension)
+            for join in generated_joins:
+                await db.delete(join)
+            for hierarchy in generated_hierarchies:
+                await db.delete(hierarchy)
+            for table in generated_tables:
+                await db.delete(table)
+            await db.flush()
+
+            await _delete_unreferenced_generated_udas(
+                db,
+                model_id=model_id,
+                candidate_uda_ids=list(_ids("generated_uda_ids")),
+            )
+
+            # A year_label column created on a reused alias is owned by this
+            # history record.  Remove only those columns, and refuse if a
+            # later modeller dependency still points at one of them.
+            for record in generated_metadata.get("calendar_alias_columns") or []:
+                if not isinstance(record, dict) or not record.get("created"):
+                    continue
+                reused_ids = {
+                    str(item.get("id")) for item in reused_table_records
+                    if isinstance(item, dict) and item.get("id")
+                }
+                if str(record.get("model_table_id")) not in reused_ids:
+                    # Columns on a generated alias are removed by the alias
+                    # cascade above; this inverse owns only reused aliases.
+                    continue
+                try:
+                    column_id = UUID(str(record["id"]))
+                except (KeyError, ValueError):
+                    continue
+                column = await db.get(ModelColumn, column_id)
+                if column is None:
+                    continue
+                references = []
+                for model_column_cls, field in (
+                    (Dimension, Dimension.source_column_id),
+                    (Dimension, Dimension.display_column_id),
+                    (HierarchyLevel, HierarchyLevel.key_attribute_id),
+                    (UserDefinedAttributeColumnRef, UserDefinedAttributeColumnRef.column_id),
+                ):
+                    count = (await db.execute(
+                        select(func.count()).select_from(model_column_cls).where(field == column_id)
+                    )).scalar() or 0
+                    if count:
+                        references.append(model_column_cls.__tablename__)
+                if references:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Cannot undo the calendar because the generated "
+                            f"year_label column has later dependencies: {', '.join(references)}."
+                        ),
+                    )
+                await db.delete(column)
+            await db.flush()
+
+            for record in reused_table_records:
+                if not isinstance(record, dict) or not record.get("id"):
+                    continue
+                table = await db.get(ModelTable, UUID(str(record["id"])))
+                if table is None or table.model_id != model_id:
+                    continue
+                previous_calendar = record.get("calendar_table_id")
+                table.calendar_table_id = (
+                    UUID(str(previous_calendar)) if previous_calendar else None
+                )
+                table.table_type = record.get("table_type") or table.table_type
+
+            if generated_metadata.get("calendar_created"):
+                await db.delete(cal)
+            else:
+                previous = generated_metadata.get("calendar_before") or {}
+                for field in (
+                    "dialect", "calendar_type", *_CALENDAR_COLUMN_FIELDS,
+                    "autocreated", "fiscal_year_start_month",
+                ):
+                    if field in previous:
+                        setattr(cal, field, previous[field])
+
+            await _invalidate_time_grained_aggregates(db, model_id=model_id)
+            provenance.calendar_id = None
+            await db.commit()
+            return
+
+        tables = list((await db.execute(
+            select(ModelTable).where(
+                ModelTable.model_id == model_id,
+                ModelTable.calendar_table_id == calendar_id,
+            )
+        )).scalars().all())
+        table_ids = {table.id for table in tables}
+
+        # The marker is written when calendar provisioning generates a date
+        # hierarchy. It prevents undo from deleting a modeller-authored
+        # hierarchy that happens to use the same calendar alias.
+        hierarchy_rows = list((await db.execute(
+            select(HierarchyDefinition).where(HierarchyDefinition.model_id == model_id)
+        )).scalars().all())
+        generated = [
+            hierarchy for hierarchy in hierarchy_rows
+            if isinstance(hierarchy.date_config, dict)
+            and hierarchy.date_config.get("calendar_table_id") == str(calendar_id)
+        ]
+        joins = (await db.execute(
+            select(Join).where(
+                Join.model_id == model_id,
+                (Join.left_table_id.in_(table_ids) | Join.right_table_id.in_(table_ids))
+                if table_ids else Join.id.is_(None),
+            )
+        )).scalars().all()
+        for join in joins:
+            await db.delete(join)
+        for hierarchy in generated:
+            await db.delete(hierarchy)
+
+        # Deleting the aliases cascades their columns and generated UDAs, and
+        # leaves any physical source table completely untouched.
+        for table in tables:
+            await db.delete(table)
+        await db.delete(cal)
+        provenance.calendar_id = None
+        await db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -1149,9 +2551,47 @@ async def delete_calendar(
     async for db in get_tenant_db(current_user.tenant_id):
         # F-016-12: verify source-to-model/project chain before deleting.
         await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         await _load_source_with_connection(db, source_id, model_id, project_id=project_id)
         cal = await db.get(CalendarTable, calendar_id)
         if cal is None or cal.data_source_id != source_id:
             return
+
+        # Bug-7209: check for dependent references before deletion.
+        dependents: list[str] = []
+        measure_result = await db.execute(
+            select(Measure.name).where(
+                Measure.resolved_calendar_id == calendar_id
+            )
+        )
+        dep_measures = [name for (name,) in measure_result.all()]
+        if dep_measures:
+            dependents.append(
+                f"measures: {', '.join(dep_measures[:10])}"
+                + (f" (+{len(dep_measures) - 10} more)"
+                   if len(dep_measures) > 10 else "")
+            )
+        alias_result = await db.execute(
+            select(ModelTable.alias).where(
+                ModelTable.calendar_table_id == calendar_id
+            )
+        )
+        dep_aliases = [a for (a,) in alias_result.all() if a]
+        if dep_aliases:
+            dependents.append(
+                f"calendar aliases: {', '.join(dep_aliases[:10])}"
+                + (f" (+{len(dep_aliases) - 10} more)"
+                   if len(dep_aliases) > 10 else "")
+            )
+        if dependents:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot delete calendar: it is referenced by "
+                    + "; ".join(dependents)
+                    + ". Remove the references first."
+                ),
+            )
+
         await db.delete(cal)
         await db.commit()

@@ -188,7 +188,11 @@ class TestDiscoverMembersPipeline:
         mock_bind.assert_awaited_once()
         mock_route.assert_awaited_once()
         route_kwargs = mock_route.call_args
-        assert route_kwargs.kwargs.get("force_route") == "source"
+        # Member discovery routes like a normal SELECT DISTINCT: no force_route,
+        # so a covering aggregate can serve it (fast) while filtered pockets are
+        # rejected by the pocket matcher (the query carries no filters) and
+        # restricted personas are forced to source by route_query itself.
+        assert route_kwargs.kwargs.get("force_route") is None
         assert route_kwargs.kwargs.get("principal") is not None
 
         mock_execute.assert_awaited_once()

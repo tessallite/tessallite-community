@@ -229,6 +229,26 @@ class TestScalarPayload:
         f = _one(dimension="year", operator="between", value=[2020, 2025])
         assert f.value == (2020, 2025)
 
+    # -- Bug-6048: a scalar operator (eq/neq/like/contains/gt/...) given a
+    #    list/object `value` must 422, not pass a list through _scalar_value
+    #    that renders as one stringified, never-matching literal.
+    def test_scalar_eq_list_value_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="eq", value=["US"])
+        assert exc.value.status_code == 422
+        assert "scalar" in exc.value.detail.lower()
+
+    def test_scalar_like_list_via_values_field_422(self):
+        # values[0] is itself a list — the nested payload must also 422.
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="like", values=[["US", "CA"]])
+        assert exc.value.status_code == 422
+
+    def test_scalar_neq_dict_value_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="neq", value={"x": 1})
+        assert exc.value.status_code == 422
+
 
 # ---------------------------------------------------------------------------
 # Fail-loud rejections (F-027-10)
@@ -264,6 +284,128 @@ class TestRejections:
             _one(dimension="x", operator="between", values=[1, 2, 3])
         assert exc.value.status_code == 422
         assert "exactly two" in exc.value.detail.lower()
+
+    # -- Bug-5971: null members produce a never-matching IN (NULL) / BETWEEN
+    #    NULL predicate under SQL three-valued logic. Reject loudly and point
+    #    callers to is_null / is_not_null.
+
+    def test_in_null_only_value_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="in", values=[None])
+        assert exc.value.status_code == 422
+        assert "is_null" in exc.value.detail
+        assert "is_not_null" in exc.value.detail
+
+    def test_in_mixed_value_and_null_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="in", values=["US", None])
+        assert exc.value.status_code == 422
+        assert "is_null" in exc.value.detail
+        assert "is_not_null" in exc.value.detail
+
+    def test_not_in_null_only_value_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="not_in", values=[None])
+        assert exc.value.status_code == 422
+        assert "is_null" in exc.value.detail
+        assert "is_not_null" in exc.value.detail
+
+    def test_not_in_mixed_value_and_null_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="not_in", values=["US", None])
+        assert exc.value.status_code == 422
+        assert "is_null" in exc.value.detail
+
+    def test_set_alias_null_member_422(self):
+        """The 'set' -> 'in' alias must inherit the null-member rejection."""
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="set", values=[None])
+        assert exc.value.status_code == 422
+        assert "is_null" in exc.value.detail
+
+    def test_between_null_lower_bound_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="year", operator="between", values=[None, 2025])
+        assert exc.value.status_code == 422
+        assert "is_null" in exc.value.detail
+        assert "is_not_null" in exc.value.detail
+
+    def test_between_null_upper_bound_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="year", operator="between", values=[2020, None])
+        assert exc.value.status_code == 422
+        assert "is_null" in exc.value.detail
+
+    def test_between_both_bounds_null_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="year", operator="between", values=[None, None])
+        assert exc.value.status_code == 422
+        assert "is_null" in exc.value.detail
+
+    # -- Bug-6047: a list payload sent through the scalar `value` field must
+    #    be normalized to the member list (as the between branch already does),
+    #    never wrapped into a nested list that bypasses the null-member guard
+    #    and renders as one stringified, never-matching literal.
+
+    def test_in_null_only_list_via_value_field_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="in", value=[None])
+        assert exc.value.status_code == 422
+        assert "is_null" in exc.value.detail
+        assert "is_not_null" in exc.value.detail
+
+    def test_in_mixed_list_via_value_field_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="in", value=["US", None])
+        assert exc.value.status_code == 422
+        assert "is_null" in exc.value.detail
+
+    def test_not_in_null_only_list_via_value_field_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="not_in", value=[None])
+        assert exc.value.status_code == 422
+        assert "is_null" in exc.value.detail
+
+    def test_in_list_via_value_field_normalizes_to_member_list(self):
+        """The list-in-value payload is the member list itself — it must
+        render as ``IN ('US', 'EU')``, never as one stringified literal."""
+        f = _one(dimension="region", operator="in", value=["US", "EU"])
+        assert (f.operator, f.value) == ("in", ["US", "EU"])
+        assert _render_condition('"region"', f.operator, f.value) == "\"region\" IN ('US', 'EU')"
+
+    def test_in_empty_list_via_value_field_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="in", value=[])
+        assert exc.value.status_code == 422
+        assert "at least one" in exc.value.detail.lower()
+
+    # -- FILTER_FINDING_01: non-scalar members reach the renderer as one
+    #    stringified literal — on text columns a syntactically valid, silently
+    #    never-matching predicate (same degenerate class as Bug-5971).
+
+    def test_in_nested_list_member_via_values_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="in", values=[["US", "EU"]])
+        assert exc.value.status_code == 422
+        assert "scalar" in exc.value.detail.lower()
+
+    def test_in_nested_null_list_member_via_value_field_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="in", value=[[None]])
+        assert exc.value.status_code == 422
+        assert "scalar" in exc.value.detail.lower()
+
+    def test_not_in_dict_member_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="region", operator="not_in", values=[{"v": "US"}])
+        assert exc.value.status_code == 422
+        assert "scalar" in exc.value.detail.lower()
+
+    def test_between_nested_list_bound_422(self):
+        with pytest.raises(HTTPException) as exc:
+            _one(dimension="year", operator="between", values=[[2020], 2025])
+        assert exc.value.status_code == 422
+        assert "scalar" in exc.value.detail.lower()
 
 
 # ---------------------------------------------------------------------------

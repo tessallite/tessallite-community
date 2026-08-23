@@ -6,11 +6,14 @@ from uuid import UUID
 from src.planning.contracts import FieldRole
 from src.planning.enums import AnalyticalShape, AxisRole, ValueRole
 from src.planning.intent import AnalyticalIntent, detect_analytical_intent
+from src.planning.measure_metadata import MeasureRoleMetadata
+from src.planning.roles import infer_field_roles
 from src.planning.validation import (
     apply_shape_contract_repairs,
     validate_shape_contract_before_execution,
 )
 from src.tools.spec import QueryToolCall
+from src.tools.expressions import normalize_dimensions
 
 
 MODEL_ID = "00000000-0000-0000-0000-000000000001"
@@ -303,4 +306,37 @@ def test_non_additive_measure_blocks_stacked_composition():
         ],
     )
 
+    assert any(issue.reason == "composition_requires_additive_values" for issue in issues)
+
+
+def test_semi_additive_measure_blocks_stacked_composition_end_to_end():
+    """Bug-8843: stale additive persistence must not bypass shape validation."""
+    metadata = MeasureRoleMetadata(
+        name="account_balance",
+        default_agg="sum",
+        is_additive=True,
+        semi_additive_behavior="last_non_empty",
+    )
+    roles = infer_field_roles(
+        selected_measures=["account_balance"],
+        selected_dimensions=["region"],
+        dimension_refs=normalize_dimensions(["region"]),
+        result_columns=["region", "account_balance"],
+        result_rows=[{"region": "EU", "account_balance": 90}],
+        model_profiles={},
+        measure_metadata={"account_balance": metadata},
+    )
+
+    issues = validate_shape_contract_before_execution(
+        _query(measures=["account_balance"], dimensions=["region"]),
+        AnalyticalIntent(
+            shape_hint=AnalyticalShape.STACKED_COMPOSITION,
+            wants_composition=True,
+        ),
+        roles,
+    )
+
+    assert "semi_additive_treated_non_additive" in next(
+        role for role in roles if role.name == "account_balance"
+    ).notes
     assert any(issue.reason == "composition_requires_additive_values" for issue in issues)

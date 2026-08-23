@@ -49,13 +49,33 @@ def _query(
 
 
 def _patches(dimensions, measures):
+    """Bug-7979: the model is deployed, so resolve_deployed_shape must return a
+    DeployedShape to exercise the fail-closed path. The shape is built from the
+    test's fixture data."""
+    from src.semantic.snapshot_resolver import DeployedShape
+
     model = types.SimpleNamespace(id="model-1", slug="testmodel", deployed_version_id="v1")
+    # F-003-02: complex-SQL column containment reads the deployed physical
+    # column vocabulary. These fixtures use each dimension/measure NAME as its
+    # physical column name (the raw SQL references those names directly), so
+    # publish them as the model's physical columns; otherwise the new gate would
+    # fail closed on an empty vocabulary for the complex-passthrough cases.
+    _phys = {
+        (getattr(o, "name", "") or "").lower()
+        for o in list(dimensions) + list(measures)
+    }
+    _phys.discard("")
+    shape = DeployedShape(
+        measures=list(measures),
+        dimensions=list(dimensions),
+        hidden_column_ids=set(),
+        physical_columns_all=set(_phys),
+        physical_columns_visible=set(_phys),
+        hierarchy_rows=[],
+    )
     stack = ExitStack()
     stack.enter_context(patch(f"{_P}._load_model", new=AsyncMock(return_value=model)))
-    stack.enter_context(patch(f"{_P}._load_measures", new=AsyncMock(return_value=measures)))
-    stack.enter_context(patch(f"{_P}._load_dimensions", new=AsyncMock(return_value=dimensions)))
-    stack.enter_context(patch(f"{_P}._load_hidden_column_ids", new=AsyncMock(return_value=set())))
-    stack.enter_context(patch(f"{_P}._load_hierarchy_level_dimensions", new=AsyncMock(return_value=[])))
+    stack.enter_context(patch(f"{_P}.resolve_deployed_shape", new=AsyncMock(return_value=shape)))
     return stack
 
 
@@ -167,15 +187,16 @@ async def test_business_complex_sql_accepted_as_passthrough():
     assert bound.has_passthrough_expressions is True
 
 
-async def test_unresolvable_where_allows_unknown_filter():
+async def test_unresolvable_where_raises_on_unknown_extracted_filter():
+    """F-003-12: unresolvable WHERE is not a reason to keep a typo filter."""
     filters = [LogicalFilter("unknown_col", "eq", "X")]
     with _patches([_dim("city_name")], [_meas("revenue")]):
-        bound = await bind_query_to_model(
-            _query(dims=["city_name"], measures=["revenue"],
-                   filters=filters, has_unresolvable_where=True),
-            AsyncMock(),
-        )
-    assert len(bound.resolved_filters) == 1
+        with pytest.raises(SemanticBindingError, match="Unknown filter column"):
+            await bind_query_to_model(
+                _query(dims=["city_name"], measures=["revenue"],
+                       filters=filters, has_unresolvable_where=True),
+                AsyncMock(),
+            )
 
 
 async def test_mixed_valid_invalid_filters_raises_on_invalid():
@@ -258,6 +279,15 @@ async def test_function_wrapped_where_dim_collected():
     assert "payment_method_code" in bound.where_referenced_dimensions
 
 
+async def test_f003_02_function_wrapped_unknown_column_raises():
+    """F-003-02: UPPER(typo_col) must name the unknown column at bind time."""
+    raw = "SELECT payment_reference FROM testmodel WHERE UPPER(typo_col) = 'X'"
+    dims = [_dim("payment_reference")]
+    with _patches(dims, [_meas("revenue")]):
+        with pytest.raises(SemanticBindingError, match="Unknown column: 'typo_col'"):
+            await bind_query_to_model(_where_query(raw), AsyncMock())
+
+
 async def test_or_compound_where_dim_collected():
     """Both branches of an OR-compound predicate are walked, so a dimension that
     appears only inside the function-wrapped branch is still collected."""
@@ -288,8 +318,7 @@ async def test_where_collection_canonicalises_case():
 
 
 async def test_where_collection_ignores_non_model_tokens():
-    """Literals, aliases, and unknown identifiers inside the WHERE are NOT
-    captured — only names present in the model maps are collected."""
+    """F-003-02: unknown WHERE identifiers fail closed (no silent skip)."""
     raw = (
         "SELECT payment_reference FROM modely "
         "WHERE UPPER(payment_method_code) = 'CARD' "
@@ -297,8 +326,21 @@ async def test_where_collection_ignores_non_model_tokens():
     )
     dims = [_dim("payment_reference"), _dim("payment_method_code")]
     with _patches(dims, [_meas("revenue")]):
+        with pytest.raises(SemanticBindingError, match="Unknown column: 'not_a_model_column'"):
+            await bind_query_to_model(_where_query(raw), AsyncMock())
+
+
+async def test_where_collection_ignores_literals_when_columns_are_modelled():
+    """Literals inside a function-wrapped WHERE are not captured as dimensions."""
+    raw = (
+        "SELECT payment_reference FROM modely "
+        "WHERE UPPER(payment_method_code) = 'CARD' "
+        "AND LENGTH(payment_reference) > 0 LIMIT 1"
+    )
+    dims = [_dim("payment_reference"), _dim("payment_method_code")]
+    with _patches(dims, [_meas("revenue")]):
         bound = await bind_query_to_model(_where_query(raw), AsyncMock())
-    assert bound.where_referenced_dimensions == {"payment_method_code"}
+    assert bound.where_referenced_dimensions == {"payment_method_code", "payment_reference"}
 
 
 async def test_where_collection_empty_for_resolvable_where():

@@ -77,6 +77,67 @@ class TestRolePredicateShape:
                 mapping_value_column="v",
             )
 
+    @pytest.mark.parametrize("attribute_source", ["saml_claim", "oidc_scope"])
+    def test_rejects_claim_or_scope_source_without_claim_name(self, attribute_source):
+        # Bug-5904: claim/scope-sourced role predicates must require
+        # attribute_claim_name so rules cannot save inertly.
+        with pytest.raises(ValidationError):
+            RowSecurityRuleCreate(
+                name="claim_backed",
+                dimension_path="region.region_code",
+                rule_type="role_predicate",
+                predicate_expression="dimension_equals('region.region_code', 'NORTH')",
+                applies_to_roles=["finance"],
+                attribute_source=attribute_source,
+            )
+
+    @pytest.mark.parametrize("attribute_source", ["saml_claim", "oidc_scope"])
+    def test_rejects_claim_or_scope_source_with_blank_claim_name(self, attribute_source):
+        # Bug-5904: a whitespace-only claim name is just as inert as a
+        # missing one at runtime (predicate_compiler treats it as falsy).
+        with pytest.raises(ValidationError):
+            RowSecurityRuleCreate(
+                name="claim_backed",
+                dimension_path="region.region_code",
+                rule_type="role_predicate",
+                predicate_expression="dimension_equals('region.region_code', 'NORTH')",
+                applies_to_roles=["finance"],
+                attribute_source=attribute_source,
+                attribute_claim_name="   ",
+            )
+
+    @pytest.mark.parametrize("attribute_source", ["saml_claim", "oidc_scope"])
+    def test_accepts_claim_or_scope_source_with_claim_name(self, attribute_source):
+        # Bug-5904 companion: the legitimate case must still save.
+        r = RowSecurityRuleCreate(
+            name="claim_backed",
+            dimension_path="region.region_code",
+            rule_type="role_predicate",
+            predicate_expression="dimension_equals('region.region_code', 'NORTH')",
+            applies_to_roles=["finance"],
+            attribute_source=attribute_source,
+            attribute_claim_name="department",
+        )
+        assert r.attribute_claim_name == "department"
+
+    @pytest.mark.parametrize("attribute_source", ["saml_claim", "oidc_scope"])
+    def test_trims_padded_claim_name(self, attribute_source):
+        # Bug-5904 hardening: predicate_compiler does an exact-key lookup
+        # (principal.claims.get(claim_name)) at runtime, so a claim name
+        # saved with stray whitespace would never match the real JWT claim
+        # — the same silently-inert-rule class this bug fixes, just via a
+        # near-miss instead of a blank. Normalize at save time.
+        r = RowSecurityRuleCreate(
+            name="claim_backed",
+            dimension_path="region.region_code",
+            rule_type="role_predicate",
+            predicate_expression="dimension_equals('region.region_code', 'NORTH')",
+            applies_to_roles=["finance"],
+            attribute_source=attribute_source,
+            attribute_claim_name="  department  ",
+        )
+        assert r.attribute_claim_name == "department"
+
 
 class TestUserMappingShape:
     def test_accepts_well_formed_user_mapping(self):
@@ -146,6 +207,36 @@ class TestUserMappingShape:
                 applies_to_roles=["nope"],
             )
 
+    def test_rejects_non_default_attribute_source(self):
+        # Bug-5905: user_mapping always keys by user_identity at runtime
+        # (predicate_compiler.py); a non-default attribute_source would be
+        # silently ignored by the compiler, so it must be rejected at save.
+        with pytest.raises(ValidationError):
+            RowSecurityRuleCreate(
+                name="x",
+                dimension_path="y",
+                rule_type="user_mapping",
+                mapping_table_id=uuid.uuid4(),
+                mapping_user_column="u",
+                mapping_value_column="v",
+                attribute_source="saml_claim",
+                attribute_claim_name="claim",
+            )
+
+    def test_rejects_attribute_claim_name_set(self):
+        # Bug-5905: attribute_claim_name is meaningless for user_mapping
+        # even when attribute_source is left at its default.
+        with pytest.raises(ValidationError):
+            RowSecurityRuleCreate(
+                name="x",
+                dimension_path="y",
+                rule_type="user_mapping",
+                mapping_table_id=uuid.uuid4(),
+                mapping_user_column="u",
+                mapping_value_column="v",
+                attribute_claim_name="claim",
+            )
+
 
 class TestRuleTypeAllowList:
     def test_rejects_unknown_rule_type(self):
@@ -205,3 +296,18 @@ class TestUpdatePatchShape:
     def test_update_accepts_known_attribute_source(self):
         upd = RowSecurityRuleUpdate(attribute_source="idp_group")
         assert upd.attribute_source == "idp_group"
+
+    def test_update_trims_padded_claim_name(self):
+        # Bug-5904 hardening, update-path companion to the create-schema
+        # trim test above.
+        upd = RowSecurityRuleUpdate(attribute_claim_name="  department  ")
+        assert upd.attribute_claim_name == "department"
+
+    def test_update_collapses_whitespace_only_claim_name_to_blank(self):
+        # The schema-level trim alone does not reject — the row_security.py
+        # handler rejects a blank effective claim name for a claim-sourced
+        # rule (see test_row_security_api.py Bug-5904 cases); this test
+        # only locks that the schema normalizes whitespace-only input to ""
+        # rather than passing it through unchanged.
+        upd = RowSecurityRuleUpdate(attribute_claim_name="   ")
+        assert upd.attribute_claim_name == ""

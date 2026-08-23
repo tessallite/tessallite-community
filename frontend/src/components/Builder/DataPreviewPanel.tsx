@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useT } from "../../i18n";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -48,6 +48,12 @@ export default function DataPreviewPanel({
   const t = useT();
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(50);
+
+  // Bug-5802: reset pagination when the table changes so the user does not
+  // land on an out-of-range page for a different table.
+  useEffect(() => {
+    setPage(0);
+  }, [tableId]);
 
   const preview = useQuery({
     queryKey: ["table-preview", projectId, modelId, tableId, page, pageSize],

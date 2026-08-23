@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-Security enforcement validator -- end-to-end through the JDBC gateway.
+Security enforcement validator -- JDBC gateway + query-router REST only.
+
+This suite does not claim XMLA, aggregate HIT, pocket, MCP, or agent coverage
+(F-007-07). Those routes need their own live probes.
+
+Re-run trigger (Bug-6037): this suite MUST be re-run whenever any of these
+files change: routing/router.py, semantic/binder.py,
+rewrite/source_sql.py (especially row-security injection), or
+shared/auth/project_access.py. These are the security-enforcement evidence
+gates. Requires: Docker stack up + Claude CLI (or BATCH_REVIEWER=codex).
 
 Creates a disposable copy of modely, sets up a restricted persona and row
 security rules, then runs queries to verify:
@@ -69,7 +78,13 @@ if _ENV_FILE.exists():
             if k not in _IGNORE_FROM_ENV:
                 os.environ.setdefault(k, v.strip())
 
-import psycopg2
+try:
+    import psycopg2  # only needed for the live JDBC path (_run_query_jdbc)
+except ModuleNotFoundError:
+    # Unit tests import the pure validators (_validate_query, QueryResult,
+    # SecurityQuery) from this module without a DB driver present; psycopg2 is
+    # required only when actually executing against the live gateway.
+    psycopg2 = None
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -360,6 +375,14 @@ class QueryResult:
     rows: list[list]
     row_count: int
     error: str | None = None
+    # Bug-9064: TRUE when the failure was the connection itself, not the
+    # product's answer. A scenario that expects the gateway to REFUSE a query
+    # must not score a refusal it never received: an unreachable gateway
+    # produces an ``error`` exactly like a security block does, and scoring
+    # them alike turns "the stack was down" into positive evidence that access
+    # control works. Set only where the connect fails, never where the query
+    # does.
+    transport_error: bool = False
 
 
 def _run_query_jdbc(sql: str, label: str, dbname: str = "") -> QueryResult:
@@ -376,7 +399,7 @@ def _run_query_jdbc(sql: str, label: str, dbname: str = "") -> QueryResult:
         conn.autocommit = True
     except Exception as e:
         return QueryResult(label=label, columns=[], rows=[], row_count=0,
-                           error=f"Connection error: {e}")
+                           error=f"Connection error: {e}", transport_error=True)
     try:
         cur = conn.cursor()
         cur.execute(sql)
@@ -405,7 +428,7 @@ def _run_query_direct(sql: str, label: str) -> QueryResult:
         conn.autocommit = True
     except Exception as e:
         return QueryResult(label=label, columns=[], rows=[], row_count=0,
-                           error=f"Direct connection error: {e}")
+                           error=f"Direct connection error: {e}", transport_error=True)
     try:
         cur = conn.cursor()
         cur.execute(sql)
@@ -518,6 +541,13 @@ def _create_persona(token: str, project_id: str, model_id: str,
                     "included_measure_ids": measure_ids,
                     "included_dimension_ids": dimension_ids,
                     "includes_hidden_columns": includes_hidden,
+                    # Bug-9462 / F-008-03: a visibility-narrowing persona must name
+                    # at least one audience role, else it is assigned to nobody and
+                    # the restriction never applies. This suite's caller is the
+                    # tenant admin (BATCH_TENANT_EMAIL); name that role so the
+                    # restricted persona actually gates the caller's queries — the
+                    # pre-F-008-03 empty-audience behaviour this test relied on.
+                    "audience_roles": ["tenant_admin"],
                 })
     return str(resp.get("id") or resp.get("persona_id", ""))
 
@@ -891,8 +921,44 @@ def _validate_query(q: SecurityQuery, result: QueryResult,
                     direct_result: QueryResult | None = None) -> tuple[str, str]:
     """Validate a single query result. Returns (verdict, reason)."""
     if q.expect == "error":
+        # Bug-9064: a scenario asserting the gateway REFUSES a query is the only
+        # positive evidence in this suite that column/persona access control
+        # rejects anything. A connection failure produces an ``error`` field
+        # identical in shape to a security block, so scoring any error as PASS
+        # made an unreachable gateway indistinguishable from an enforced one --
+        # the suite reported "Correctly blocked: Connection error: ... port 5433"
+        # and counted it toward its own green. Refuse to credit a refusal that
+        # was never received.
+        if result.transport_error:
+            return "FAIL", (
+                f"[ENVIRONMENT_NOT_READY] cannot judge blocking: "
+                f"the gateway was unreachable, so no product answer was "
+                f"observed: {result.error[:80]}"
+            )
         if result.error:
-            return "PASS", f"Correctly blocked: {result.error[:80]}"
+            text = result.error or ""
+            tokens = (
+                "OBJECT_NOT_AVAILABLE",
+                "PERSONA_COMPLEX_SQL_NOT_ALLOWED",
+                "row_security_unsupported_shape",
+                "row_security_misconfigured",
+                # Bug-9462: over the JDBC / PostgreSQL-wire transport (protocol
+                # "jdbc"), a PG error is a MESSAGE string, not an app-level JSON
+                # error_code — so the persona/CLS denial surfaces as the
+                # non-disclosing OBJECT_NOT_AVAILABLE MESSAGE
+                # (persona_gate._PERSONA_DENY_MESSAGE), not the code token. This
+                # phrase is that exact denial message; recognising it is the JDBC
+                # form of the same non-disclosing OBJECT_NOT_AVAILABLE signal (no
+                # less specific — the code is equally used for missing-or-blocked).
+                "not available for this query",
+            )
+            if any(tok.lower() in text.lower() for tok in tokens):
+                return "PASS", f"Correctly blocked: {result.error[:80]}"
+            return "FAIL", (
+                "Expected a product security denial "
+                f"(OBJECT_NOT_AVAILABLE / PERSONA_COMPLEX_SQL_NOT_ALLOWED / "
+                f"row_security_unsupported_shape), got: {result.error[:120]}"
+            )
         return "FAIL", f"Expected error but got {result.row_count} rows"
 
     if q.expect == "rows":
@@ -1180,7 +1246,26 @@ def main() -> int:
             if line.startswith("XFAIL"):
                 print(f"  {line}")
 
-    if total_pass + total_xfail + total_skip == total_scenarios:
+    # Bug-8120 (F-007-08): a SKIP means a client/route/setup path was never
+    # exercised -- a persona or row-security rule that failed to create, drill
+    # preconditions unmet, an allowed measure missing. Counting skips toward the
+    # green let this validator report the security matrix proven when a named
+    # client, source dialect, or change-propagation path had never enforced a
+    # single row. Classify any skip as ENVIRONMENT_NOT_READY and refuse the
+    # green -- a distinct exit code (2) so a caller separates "not ready" from a
+    # real PRODUCT_FAIL (1). A correctly seeded live run produces zero skips.
+    if total_skip > 0:
+        print(
+            f"\nENVIRONMENT_NOT_READY: {total_skip} scenario(s) were skipped and "
+            "never proved enforcement; the security matrix is NOT green."
+        )
+        print("Skipped scenarios:")
+        for line in results_log:
+            if line.startswith("SKIP"):
+                print(f"  {line}")
+        return 2
+
+    if total_pass + total_xfail == total_scenarios:
         print("\nALL_PASS (expected failures tracked as bugs)")
         return 0
 

@@ -16,6 +16,10 @@ All entity IDs are resolved dynamically by name — no hardcoded UUIDs.
 
 Requires live Docker services (model-service :8001, gateway :5433, postgres)
 and the seeded acme-demo tenant.
+
+Run with the explicit profile variables documented in
+test_kpi_business_builder_evaluate.py, including
+TESSALLITE_RUN_LIVE_INTEGRATION=1 and INTEGRATION_TEST_EXCLUSIVE=1.
 """
 from __future__ import annotations
 
@@ -32,24 +36,29 @@ except ImportError:  # pragma: no cover
 
 from .conftest import (
     API_BASE, TENANT_ID, EMAIL, PASSWORD, MODEL_SLUG,
+    LIVE_INTEGRATION_ENABLED, LIVE_INTEGRATION_SKIP_REASON,
     _dimension_id,
 )
+from .live_profile import environment_not_ready
 
 JDBC_HOST = os.environ.get("GATEWAY_JDBC_HOST", "localhost")
 JDBC_PORT = int(os.environ.get("GATEWAY_JDBC_PORT", "5433"))
 
-pytestmark = [pytest.mark.integration]
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not LIVE_INTEGRATION_ENABLED, reason=LIVE_INTEGRATION_SKIP_REASON),
+]
 
 REL = 1e-6  # relative tolerance for float comparison
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _require_kpi_model(_measures):
-    """Skip the whole KPI module when the active model lacks the KPI measures.
+    """Report an unavailable live profile when it lacks the KPI measures.
     These tests assume the dev acme-demo `modelx` (Revenue/net_sales/...); on the
-    demo bundle's `modely` they are absent, so skip cleanly (Bug-5453/5498)."""
+    demo bundle's `modely` they are absent (Bug-5453/5498)."""
     if "net_sales" not in {m.get("name") for m in _measures}:
-        pytest.skip(
+        environment_not_ready(
             "active model lacks KPI measures (net_sales/...) — needs the dev "
             "acme-demo modelx profile (Bug-5453/5498)"
         )
@@ -63,7 +72,7 @@ def _require_kpi_model(_measures):
 @pytest.fixture(scope="module")
 def jdbc():
     if psycopg2 is None:
-        pytest.skip("psycopg2-binary not installed")
+        environment_not_ready("psycopg2-binary is not installed")
     try:
         conn = psycopg2.connect(
             host=JDBC_HOST, port=JDBC_PORT, database=TENANT_ID,
@@ -71,7 +80,7 @@ def jdbc():
         )
         conn.autocommit = True
     except Exception as exc:
-        pytest.skip(f"JDBC gateway not reachable: {exc}")
+        environment_not_ready(f"JDBC gateway is not reachable: {exc}")
     yield conn
     conn.close()
 
@@ -94,10 +103,10 @@ def _scalar(jdbc, sql: str) -> float | None:
         except Exception as exc:  # noqa: BLE001
             # Profile-portable: these baseline queries reference the dev
             # acme-demo `modelx` columns (Revenue/net_sales/...). On the demo
-            # bundle's `modely` they don't exist -> skip cleanly instead of
-            # failing (Bug-5453/5498 tracks full demo-bundle portability).
+            # bundle's `modely` they don't exist -> report an unavailable
+            # profile (Bug-5453/5498 tracks full demo-bundle portability).
             if "Unknown column" in str(exc) or "does not exist" in str(exc):
-                pytest.skip(
+                environment_not_ready(
                     f"baseline SQL column not on the active model ({exc}) — "
                     f"needs the dev acme-demo modelx profile (Bug-5453/5498)"
                 )
@@ -134,6 +143,41 @@ def _create_kpi(kpis_url, headers, payload: dict) -> dict:
     return resp.json()
 
 
+def _save_model(headers, project_id: str, model_id: str) -> None:
+    """Save (create a new version snapshot) so that any entities created since
+    the last save are captured in the snapshot the deploy will point to.
+
+    Bug-8688: without this step, deploy re-deploys the PREVIOUS saved snapshot
+    which predates the newly-created KPI, so the KPI is absent from the
+    deployed snapshot and evaluate returns 404 (Withheld by F-017-01).
+    """
+    save_url = f"{API_BASE}/projects/{project_id}/models/{model_id}/versions"
+    resp = httpx.post(save_url, json={}, headers=headers, timeout=60.0)
+    assert resp.status_code == 200, (
+        f"Save (create version) failed ({resp.status_code}): {resp.text}"
+    )
+
+
+def _deploy_model(headers, project_id: str, model_id: str) -> None:
+    """Save then deploy the model so newly created KPIs appear in the deployed
+    snapshot and can be evaluated through the query gateway.
+
+    Bug-8546: deploy without save meant KPIs were never in the snapshot.
+    Bug-8688: deploy alone re-deploys the previous snapshot which predates any
+    KPIs created since the last save; the save step captures them first.
+    """
+    # Save: create a fresh version snapshot that includes any entities
+    # (KPIs, measures, etc.) created since the last save.
+    _save_model(headers, project_id, model_id)
+    # Deploy: point the model's deployed_version_id to the latest version.
+    deploy_url = f"{API_BASE}/projects/{project_id}/models/{model_id}/deploy"
+    resp = httpx.post(deploy_url, headers=headers, timeout=60.0)
+    # 200 = deployed, 409 = already deployed with same definition — both OK.
+    assert resp.status_code in (200, 409), (
+        f"Deploy failed ({resp.status_code}): {resp.text}"
+    )
+
+
 def _evaluate(kpis_url, headers, kpi_id: str) -> dict:
     resp = httpx.post(
         f"{kpis_url}/{kpi_id}/evaluate", headers=headers, timeout=60.0,
@@ -147,18 +191,89 @@ def _delete_kpi(kpis_url, headers, kpi_id: str) -> None:
     assert resp.status_code == 204, f"Cleanup failed ({resp.status_code}): {resp.text}"
 
 
-@pytest.fixture
-def kpi_factory(headers, kpis_url):
-    created: list[str] = []
+class _KpiLifecycle:
+    """Create KPIs, publish them into the deployed snapshot, evaluate them.
 
-    def make(payload: dict) -> dict:
-        kpi = _create_kpi(kpis_url, headers, payload)
-        created.append(kpi["id"])
+    Bug-8546: without a deploy step, newly created KPIs on a deployed model
+    return 404 from the evaluate endpoint because they are not in the
+    deployed snapshot (F-017-01 serving authority).
+    Bug-8688: any mutation made after the last save (a PATCH re-parenting a
+    child, for instance) also has to be captured before evaluation, or the
+    deployed snapshot is stale.
+
+    Bug-8863: the save+deploy used to run after EVERY create, so a test that
+    builds a 7-KPI chain serialised and deployed seven model snapshots and
+    added seven version rows to the shared live model, when only the last one
+    is ever observable. Publication is now deferred to the first evaluation:
+    one save+deploy per test, after every mutation that test makes. The
+    invariant above is preserved — and enforced rather than assumed, because
+    evaluation only happens through this object, so a pending mutation cannot
+    be evaluated against a stale snapshot.
+    """
+
+    def __init__(self, headers, kpis_url, project_id, model_id):
+        self._headers = headers
+        self._kpis_url = kpis_url
+        self._project_id = project_id
+        self._model_id = model_id
+        self._created: list[str] = []
+        self._pending = False
+
+    def __call__(self, payload: dict) -> dict:
+        kpi = _create_kpi(self._kpis_url, self._headers, payload)
+        self._created.append(kpi["id"])
+        self._pending = True
         return kpi
 
-    yield make
-    for kpi_id in created:
-        _delete_kpi(kpis_url, headers, kpi_id)
+    def mark_dirty(self) -> None:
+        """Record a mutation made outside this factory (e.g. a direct PATCH)
+        so the next evaluation publishes it."""
+        self._pending = True
+
+    def publish(self) -> None:
+        """Save + deploy if anything has changed since the last publication."""
+        if self._pending:
+            _deploy_model(self._headers, self._project_id, self._model_id)
+            self._pending = False
+
+    def evaluate(self, kpi_id: str) -> dict:
+        self.publish()
+        return _evaluate(self._kpis_url, self._headers, kpi_id)
+
+    def evaluate_batch(self, kpi_ids: list[str]) -> dict:
+        self.publish()
+        return _evaluate_batch(self._kpis_url, self._headers, kpi_ids)
+
+    def cleanup(self) -> None:
+        """Delete every KPI this test created, then re-deploy.
+
+        Deletion is attempted for every KPI even if one fails. These tests
+        share a single live model, so a KPI stranded by an early failure
+        changes the state every later run starts from — the shared-state half
+        of Bug-8863. Failures are still surfaced, just after the whole
+        cleanup has been attempted rather than instead of it.
+        """
+        failures: list[str] = []
+        for kpi_id in self._created:
+            try:
+                _delete_kpi(self._kpis_url, self._headers, kpi_id)
+            except Exception as exc:  # noqa: BLE001 - reported below
+                failures.append(f"delete {kpi_id}: {exc}")
+        if self._created:
+            # Re-deploy to remove the deleted KPIs from the snapshot.
+            try:
+                _deploy_model(self._headers, self._project_id, self._model_id)
+            except Exception as exc:  # noqa: BLE001 - reported below
+                failures.append(f"re-deploy after cleanup: {exc}")
+        if failures:
+            raise AssertionError("KPI cleanup incomplete — " + "; ".join(failures))
+
+
+@pytest.fixture
+def kpi_factory(headers, kpis_url, project_id, model_id):
+    factory = _KpiLifecycle(headers, kpis_url, project_id, model_id)
+    yield factory
+    factory.cleanup()
 
 
 def _uname(prefix: str) -> str:
@@ -170,7 +285,7 @@ def _uname(prefix: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_simple_measure_kpi(headers, kpis_url, kpi_factory, jdbc):
+def test_simple_measure_kpi(kpi_factory, jdbc):
     expected = _scalar(jdbc, f'SELECT SUM("Revenue") FROM {MODEL_SLUG}')
     assert expected is not None
 
@@ -179,12 +294,12 @@ def test_simple_measure_kpi(headers, kpis_url, kpi_factory, jdbc):
         "kpi_type": "simple_measure",
         "expression": 'measure("Revenue")',
     })
-    result = _evaluate(kpis_url, headers, kpi["id"])
+    result = kpi_factory.evaluate(kpi["id"])
     assert result["value"] == pytest.approx(expected, rel=REL)
     assert result["formatted_value"] is not None
 
 
-def test_ratio_kpi(headers, kpis_url, kpi_factory, jdbc):
+def test_ratio_kpi(kpi_factory, jdbc):
     net_sales = _scalar(jdbc, f'SELECT SUM("net_sales") FROM {MODEL_SLUG}')
     revenue = _scalar(jdbc, f'SELECT SUM("Revenue") FROM {MODEL_SLUG}')
     assert net_sales is not None and revenue not in (None, 0)
@@ -195,11 +310,11 @@ def test_ratio_kpi(headers, kpis_url, kpi_factory, jdbc):
         "kpi_type": "ratio",
         "expression": 'safe_div(measure("net_sales"), measure("Revenue"))',
     })
-    result = _evaluate(kpis_url, headers, kpi["id"])
+    result = kpi_factory.evaluate(kpi["id"])
     assert result["value"] == pytest.approx(expected, rel=REL)
 
 
-def test_variance_kpi(headers, kpis_url, kpi_factory, jdbc):
+def test_variance_kpi(kpi_factory, jdbc):
     net_sales = _scalar(jdbc, f'SELECT SUM("net_sales") FROM {MODEL_SLUG}')
     revenue = _scalar(jdbc, f'SELECT SUM("Revenue") FROM {MODEL_SLUG}')
     expected = revenue - net_sales
@@ -209,11 +324,11 @@ def test_variance_kpi(headers, kpis_url, kpi_factory, jdbc):
         "kpi_type": "variance",
         "expression": 'measure("Revenue") - measure("net_sales")',
     })
-    result = _evaluate(kpis_url, headers, kpi["id"])
+    result = kpi_factory.evaluate(kpi["id"])
     assert result["value"] == pytest.approx(expected, rel=REL)
 
 
-def test_growth_rate_kpi(headers, kpis_url, kpi_factory, jdbc, dim_business_date_id):
+def test_growth_rate_kpi(kpi_factory, jdbc, dim_business_date_id):
     """Wizard Growth Rate (pct_change) — year grain so the seed data has
     rows in both the current and prior comparison windows."""
     cur = _period_sum(
@@ -235,12 +350,12 @@ def test_growth_rate_kpi(headers, kpis_url, kpi_factory, jdbc, dim_business_date
         "expression": 'pct_change(measure("Revenue"), "year")',
         "time_dimension_id": dim_business_date_id,
     })
-    result = _evaluate(kpis_url, headers, kpi["id"])
+    result = kpi_factory.evaluate(kpi["id"])
     assert result["value"] is not None, "Growth Rate KPI must evaluate (F-017-01)"
     assert result["value"] == pytest.approx(expected, rel=REL)
 
 
-def test_moving_window_kpi(headers, kpis_url, kpi_factory, jdbc, dim_business_date_id):
+def test_moving_window_kpi(kpi_factory, jdbc, dim_business_date_id):
     """Wizard Moving Window (moving_avg over 3 trailing month windows)."""
     sums = [
         _period_sum(
@@ -261,12 +376,12 @@ def test_moving_window_kpi(headers, kpis_url, kpi_factory, jdbc, dim_business_da
         "time_dimension_id": dim_business_date_id,
         "trend_period": "month",
     })
-    result = _evaluate(kpis_url, headers, kpi["id"])
+    result = kpi_factory.evaluate(kpi["id"])
     assert result["value"] is not None, "Moving Window KPI must evaluate (F-017-01)"
     assert result["value"] == pytest.approx(expected, rel=REL)
 
 
-def test_moving_window_quarter_grain(headers, kpis_url, kpi_factory, jdbc, dim_business_date_id):
+def test_moving_window_quarter_grain(kpi_factory, jdbc, dim_business_date_id):
     """Quarter grain must not emit INTERVAL 'n quarter' (F-017-07)."""
     sums = [
         _period_sum(
@@ -286,12 +401,12 @@ def test_moving_window_quarter_grain(headers, kpis_url, kpi_factory, jdbc, dim_b
         "expression": 'moving_avg(measure("Revenue"), "quarter", literal(2))',
         "time_dimension_id": dim_business_date_id,
     })
-    result = _evaluate(kpis_url, headers, kpi["id"])
+    result = kpi_factory.evaluate(kpi["id"])
     assert result["value"] is not None
     assert result["value"] == pytest.approx(expected, rel=REL)
 
 
-def test_composite_kpi(headers, kpis_url, kpi_factory, jdbc):
+def test_composite_kpi(kpi_factory, jdbc):
     """Composite of two weighted children, pct-of-target normalisation.
 
     Child A: revenue with static target = 2x actual  -> score 50
@@ -327,21 +442,14 @@ def test_composite_kpi(headers, kpis_url, kpi_factory, jdbc):
         "weight": 0.4,
     })
 
-    resp = httpx.post(
-        f"{kpis_url}/evaluate-batch",
-        json={"kpi_ids": [parent["id"]]},
-        headers=headers,
-        timeout=60.0,
-    )
-    assert resp.status_code == 200, resp.text
-    results = resp.json()["results"]
+    results = kpi_factory.evaluate_batch([parent["id"]])["results"]
     assert len(results) == 1
     composite_value = results[0]["value"]
     assert composite_value == pytest.approx(40.0, rel=1e-3), (
         f"Composite score should be 0.6*50 + 0.4*25 = 40, got {composite_value}"
     )
 
-    single = _evaluate(kpis_url, headers, parent["id"])
+    single = kpi_factory.evaluate(parent["id"])
     assert single["value"] == pytest.approx(40.0, rel=1e-3), (
         f"Single evaluate of a composite should be 40, got {single['value']}"
     )
@@ -357,13 +465,17 @@ def test_adhoc_growth_rate_preview_matches_saved(
 ):
     """The wizard preview (evaluate-adhoc with time_dimension) must produce
     the same number as the saved KPI evaluation."""
+    # `jdbc` is requested for its gateway-reachability readiness gate, not for
+    # data: without a reachable gateway these assertions are meaningless, and
+    # the helper emits an explicit ENVIRONMENT_NOT_READY result. Do not remove
+    # it as an unused parameter.
     kpi = kpi_factory({
         "name": _uname("it_growth_parity"),
         "kpi_type": "growth_rate",
         "expression": 'pct_change(measure("Revenue"), "year")',
         "time_dimension_id": dim_business_date_id,
     })
-    saved = _evaluate(kpis_url, headers, kpi["id"])
+    saved = kpi_factory.evaluate(kpi["id"])
 
     resp = httpx.post(
         f"{kpis_url}/evaluate-adhoc",
@@ -415,6 +527,10 @@ def test_batch_deep_composite_chain_labels_not_500(headers, kpis_url, kpi_factor
     The depth label is 68 chars (> old String(64)). Batch must return 200 with
     the explicit depth label, not crash on the upsert.
     """
+    # `jdbc` is requested for its gateway-reachability readiness gate, not for
+    # data: without a reachable gateway these assertions are meaningless, and
+    # the helper emits an explicit ENVIRONMENT_NOT_READY result. Do not remove
+    # it as an unused parameter.
     leaf = kpi_factory({
         "name": _uname("it_deep_leaf"),
         "kpi_type": "simple_measure",
@@ -440,7 +556,21 @@ def test_batch_deep_composite_chain_labels_not_500(headers, kpis_url, kpi_factor
         child_id = comp["id"]
         top_id = comp["id"]
 
-    data = _evaluate_batch(kpis_url, headers, [top_id])
+    # Bug-8688: the PATCHes above change parent-child linkages outside the
+    # factory, so the publication has to cover them too. evaluate_batch below
+    # publishes once, after every mutation this test makes, and the final
+    # parent-child topology goes into that single snapshot.
+    #
+    # This call is belt-and-braces, NOT load-bearing: the loop's own creates
+    # already left the publication pending, so removing it would change nothing
+    # here. It is kept so that the "an external mutation must be declared"
+    # contract is visible at the one site in this file that mutates outside the
+    # factory — a future test that PATCHes without creating would need it for
+    # real. Nothing currently fails if it is deleted; that missing guard is
+    # filed as Bug-8890 rather than left implied.
+    kpi_factory.mark_dirty()
+
+    data = kpi_factory.evaluate_batch([top_id])
     top = _result_for(data["results"], top_id)
     assert top["value"] is None, "Over-depth composite must fail loud (null value)"
     assert "deeper than" in (top["status_label"] or ""), (
@@ -448,16 +578,20 @@ def test_batch_deep_composite_chain_labels_not_500(headers, kpis_url, kpi_factor
     )
 
 
-def test_batch_ti_without_time_dimension_labels_not_500(headers, kpis_url, kpi_factory, jdbc):
+def test_batch_ti_without_time_dimension_labels_not_500(kpi_factory, jdbc):
     """Repro (b): a derived time-intelligence KPI saved via the raw API with no
     time dimension (the wizard save-gate is UI-only). The fail-loud label is 69
     chars. Batch must return 200 with the explicit label, not 500."""
+    # `jdbc` is requested for its gateway-reachability readiness gate, not for
+    # data: without a reachable gateway these assertions are meaningless, and
+    # the helper emits an explicit ENVIRONMENT_NOT_READY result. Do not remove
+    # it as an unused parameter.
     kpi = kpi_factory({
         "name": _uname("it_ti_no_dim"),
         "kpi_type": "growth_rate",
         "expression": 'pct_change(measure("Revenue"), "year")',
     })
-    data = _evaluate_batch(kpis_url, headers, [kpi["id"]])
+    data = kpi_factory.evaluate_batch([kpi["id"]])
     res = _result_for(data["results"], kpi["id"])
     assert res["value"] is None
     assert "time dimension" in (res["status_label"] or "").lower(), (
@@ -466,7 +600,7 @@ def test_batch_ti_without_time_dimension_labels_not_500(headers, kpis_url, kpi_f
 
 
 def test_batch_broken_child_does_not_take_down_siblings(
-    headers, kpis_url, kpi_factory, jdbc,
+    kpi_factory, jdbc,
 ):
     """Repro (c): a healthy composite requested alone whose auto-loaded child is
     a broken TI KPI (no time dimension). The batch transitively loads the child,
@@ -502,7 +636,7 @@ def test_batch_broken_child_does_not_take_down_siblings(
         "expression": 'measure("Revenue")',
     })
 
-    data = _evaluate_batch(kpis_url, headers, [parent["id"], standalone["id"]])
+    data = kpi_factory.evaluate_batch([parent["id"], standalone["id"]])
     results = data["results"]
 
     sa_res = _result_for(results, standalone["id"])

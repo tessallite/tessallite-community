@@ -47,6 +47,32 @@ async def test_system_value_wins_over_default():
 
 
 @pytest.mark.asyncio
+async def test_g5_join_threshold_uses_explicit_system_override_not_default():
+    """G5 resolver boundary: deploy policy reads the system tier.
+
+    Test escape: a tenant-only deploy resolver call previously ignored stored
+    system overrides and silently used the registry default. Guard: resolve
+    the exact G5 key once without a system session and once with a real
+    system-session-shaped resolver, asserting the values differ. Tier: T3.
+    """
+    from shared.semantic.join_population_validator import (
+        DEFAULT_ROW_EFFECT_WARNING_THRESHOLD,
+        SETTING_ROW_EFFECT_THRESHOLD,
+    )
+
+    default_value = await get_setting(SETTING_ROW_EFFECT_THRESHOLD)
+    explicit_system = _mk_session_returning(0.25)
+    overridden_value = await get_setting(
+        SETTING_ROW_EFFECT_THRESHOLD,
+        system_session=explicit_system,
+    )
+
+    assert default_value == DEFAULT_ROW_EFFECT_WARNING_THRESHOLD
+    assert overridden_value == 0.25
+    assert overridden_value != default_value
+
+
+@pytest.mark.asyncio
 async def test_model_value_wins_over_system_for_dual_level_key():
     """For a key defined at both system and model (e.g. ``result.max_rows``),
     the model-level value wins when a model_id is in scope.

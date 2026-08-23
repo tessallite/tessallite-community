@@ -4,6 +4,14 @@ Resolves the single source ProjectConnection for a model's tables and
 detects whether source and target databases are the same connection.
 When tables span multiple source connections, the model is rejected
 for aggregate materialization (multi-source aggregates are unsupported).
+
+This module owns the ``model -> source ProjectConnection`` relation in BOTH
+directions. ``shared/artifact_target_binding.py`` needs the forward direction
+under row locks (to re-prove a build's source identity) and the reverse
+direction (to find every model a connection edit re-points), so both live here
+next to :func:`resolve_source_connection` rather than being re-derived there —
+a second implementation of "which connection is this model's source" is exactly
+the drift that let the source side go uncovered (Bug-8602).
 """
 from __future__ import annotations
 
@@ -17,6 +25,96 @@ from shared.connection_scope import assert_connection_in_project
 from shared.db.models import DataSource, Model, ModelTable, ProjectConnection
 
 logger = logging.getLogger(__name__)
+
+
+async def source_connection_ids_for_model(
+    model_id: UUID,
+    db: AsyncSession,
+    *,
+    lock_for_update: bool = False,
+) -> list[UUID]:
+    """Distinct ``DataSource.project_connection_id`` values a model reads from.
+
+    ``lock_for_update`` takes a row lock on the DataSource rows only (``FOR
+    UPDATE OF data_sources``), so a build finalising its source binding blocks a
+    concurrent re-point of the pointer it is about to re-prove — the source-side
+    counterpart of the target binding's ``with_for_update`` on ``DataTarget``.
+
+    The lock is applied WITHOUT ``DISTINCT`` because PostgreSQL rejects
+    ``SELECT DISTINCT ... FOR UPDATE``; de-duplication happens in Python, which
+    is equivalent here (the row set is one row per model table).
+    """
+    stmt = (
+        select(DataSource.project_connection_id)
+        .join(ModelTable, ModelTable.source_id == DataSource.id)
+        .where(ModelTable.model_id == model_id)
+    )
+    if lock_for_update:
+        stmt = stmt.with_for_update(of=DataSource)
+    else:
+        stmt = stmt.distinct()
+    rows = (await db.execute(stmt)).scalars().all()
+
+    ordered: list[UUID] = []
+    seen: set = set()
+    for conn_id in rows:
+        if conn_id is None or conn_id in seen:
+            continue
+        seen.add(conn_id)
+        ordered.append(conn_id)
+    return ordered
+
+
+async def model_ids_for_source_connection(
+    connection_id: UUID,
+    db: AsyncSession,
+) -> list[UUID]:
+    """Every model whose tables read FROM ``connection_id`` (Bug-8602).
+
+    The reverse of :func:`source_connection_ids_for_model`, and the enumeration
+    the control-plane invalidator needs: an edit to this connection's endpoint
+    changes which database every one of these models' artifacts was built from.
+
+    Deliberately keyed on ``ModelTable.source_id`` rather than
+    ``DataSource.model_id``: the FROM clause is assembled from the model's
+    TABLES, so a DataSource row that belongs to a model but is referenced by no
+    table cannot have contributed to any build. Conversely a table pointing at
+    another model's DataSource (legacy/imported rows) IS a real read of this
+    connection and must be caught.
+    """
+    rows = (
+        await db.execute(
+            select(ModelTable.model_id)
+            .join(DataSource, ModelTable.source_id == DataSource.id)
+            .where(DataSource.project_connection_id == connection_id)
+            .distinct()
+        )
+    ).scalars().all()
+    return [model_id for model_id in rows if model_id is not None]
+
+
+async def model_ids_reading_source(
+    source_id: UUID,
+    db: AsyncSession,
+) -> list[UUID]:
+    """Every model whose tables read through DataSource ``source_id``.
+
+    Normally exactly the DataSource's owning model, but ``ModelTable.source_id``
+    carries no composite FK back to ``(model_id, source_id)``, so a legacy or
+    imported table CAN reference another model's DataSource — a state
+    :func:`model_ids_for_source_connection` already declares it must catch. A
+    re-point handler that invalidated only the owning model would leave the
+    borrowing model's artifacts serving from the previous database, so the two
+    enumerations are kept aligned (round-2 review of Bug-8602).
+    """
+    rows = (
+        await db.execute(
+            select(ModelTable.model_id)
+            .where(ModelTable.source_id == source_id)
+            .distinct()
+        )
+    ).scalars().all()
+    return [m for m in rows if m is not None]
 
 
 async def resolve_source_connection(
@@ -37,13 +135,7 @@ async def resolve_source_connection(
         multiple source connections (cross-source aggregation is not
         supported).
     """
-    result = await db.execute(
-        select(DataSource.project_connection_id)
-        .join(ModelTable, ModelTable.source_id == DataSource.id)
-        .where(ModelTable.model_id == model_id)
-        .distinct()
-    )
-    conn_ids = [row[0] for row in result.all()]
+    conn_ids = await source_connection_ids_for_model(model_id, db)
 
     if not conn_ids:
         raise ValueError(

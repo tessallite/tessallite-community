@@ -24,7 +24,11 @@ from sqlalchemy import desc, func, select
 
 from shared.db.models import AgentConversation, AgentTurn, ProjectAgentConfig
 from shared.db.session import get_tenant_db
-from src.auth.middleware import CurrentUser, forbid_embed_user
+from src.auth.middleware import (
+    CurrentUser,
+    forbid_embed_user,
+    is_human_tenant_admin,
+)
 from src.api.agent_config import _require_blocked_original_access
 
 logger = logging.getLogger(__name__)
@@ -163,7 +167,7 @@ async def get_agent_log(
 
         items = [LogTurnRow(**dict(row._mapping)) for row in rows.all()]
 
-        is_tenant_admin = current_user.role == "tenant_admin"
+        is_tenant_admin = is_human_tenant_admin(current_user)
         if not is_tenant_admin:
             for item in items:
                 item.answer_text = None

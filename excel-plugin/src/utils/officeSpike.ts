@@ -6,6 +6,8 @@
  *          Must be executed manually inside an Excel host.
  */
 
+import { rangeHasContent, rangesOverlap, type CellRange } from './insertGuard';
+
 export interface CompatibilityMatrix {
   host: string;
   platform: string;
@@ -40,36 +42,100 @@ export function detectHost(): { host: string; platform: string } {
   return { host, platform };
 }
 
+/**
+ * Bug-6737 (REOPENED): the table insert has TWO commit points inside a single
+ * Excel.run. The first sync commits cell data + formatting; the second sync
+ * commits the Excel table object (filter dropdowns, alternating row colors,
+ * header styling). If the second sync fails (e.g., the range overlaps an
+ * existing table object -- Bug-6736), the data is already visible but the
+ * function threw, propagating as "Insert failed" to the caller.
+ *
+ * Fix: return { address, tableObjectFailed } so the caller knows the data
+ * was written even if the table object step failed. The table object is
+ * cosmetic (filter dropdowns, alternating rows); the data values are the
+ * user's primary concern.
+ */
+export interface InsertResultTableOutcome {
+  address: string | null;
+  tableObjectFailed: boolean;
+}
+
+/**
+ * Bug-7397 R6: a PINNED write target. When supplied, insertResultTable writes
+ * to exactly this sheet + start cell and NEVER re-reads the selection or the
+ * active worksheet. The caller (doInsertAndTag) resolves this target and the
+ * table lock key from ONE host sample, so the location that is locked is the
+ * location that is written -- closing the two-sample TOCTOU the deep-review
+ * reproduced (a selection move, or a concurrent chart/pivot insert activating
+ * a different sheet, between the anchor pre-read and the write).
+ */
+export interface PinnedInsertTarget {
+  sheetName: string;
+  startRow: number;
+  startCol: number;
+}
+
 export async function insertResultTable(
   headers: string[],
   rows: (string | number)[][],
   formatTokens?: Record<string, string>,
   useActiveCell?: boolean,
-): Promise<string | null> {
-  return await Excel.run(async (context) => {
-    const sheet = context.workbook.worksheets.getActiveWorksheet();
+  /**
+   * Bug-6735 / R1 Finding 1: when the user confirms the overwrite prompt,
+   * the retry must position at the same active cell WITHOUT re-checking
+   * for existing data (which would throw OVERWRITE_WARNING again in an
+   * infinite loop). `forceOverwrite` = true means "use active cell, skip
+   * the data check". Previously the retry passed `useActiveCell=false`,
+   * which silently relocated the table to (0,0) / A1.
+   */
+  forceOverwrite?: boolean,
+  // Bug-7397 R6: the pinned write location (see PinnedInsertTarget). Required
+  // for the exclusion guarantee; the legacy self-resolving path is kept only
+  // for the Excel-undefined / no-target degraded case.
+  pinnedTarget?: PinnedInsertTarget,
+): Promise<InsertResultTableOutcome> {
+  let savedAddress: string | null = null;
+  let tableObjectFailed = false;
 
-    let startRow = 0;
-    let startCol = 0;
+  await Excel.run(async (context) => {
+    // Bug-7397 R6: target the PINNED sheet by name (not getActiveWorksheet), so
+    // a concurrent op that changes the active sheet after the caller resolved
+    // the lock key cannot redirect this write to a different sheet than the
+    // one the lock protects.
+    const sheet = pinnedTarget
+      ? context.workbook.worksheets.getItem(pinnedTarget.sheetName)
+      : context.workbook.worksheets.getActiveWorksheet();
 
-    if (useActiveCell) {
-      const activeRange = context.workbook.getSelectedRange();
-      activeRange.load(['rowIndex', 'columnIndex', 'values']);
-      await context.sync();
+    let startRow = pinnedTarget ? pinnedTarget.startRow : 0;
+    let startCol = pinnedTarget ? pinnedTarget.startCol : 0;
 
-      startRow = activeRange.rowIndex;
-      startCol = activeRange.columnIndex;
+    if (useActiveCell || forceOverwrite) {
+      if (!pinnedTarget) {
+        // Legacy self-resolving path (no pinned target available).
+        const activeRange = context.workbook.getSelectedRange();
+        activeRange.load(['rowIndex', 'columnIndex', 'values']);
+        await context.sync();
+        startRow = activeRange.rowIndex;
+        startCol = activeRange.columnIndex;
+      }
 
-      const targetRange = sheet.getRangeByIndexes(startRow, startCol, rows.length + 1, headers.length);
-      targetRange.load('values');
-      await context.sync();
+      if (!forceOverwrite) {
+        const targetRange = sheet.getRangeByIndexes(startRow, startCol, rows.length + 1, headers.length);
+        // Bug-8344: the fifth site of the same occupancy class. A values-only
+        // probe reads a cell holding `=IF(B1>0,B1,"")` as empty and drops the
+        // OVERWRITE_WARNING, destroying the formula. Both channels, through the
+        // one shared helper — the reason the helper exists rather than a
+        // per-site `.some()`.
+        targetRange.load('values,formulas');
+        await context.sync();
 
-      const hasExistingData = targetRange.values.some(
-        (row: (string | number)[][]) => row.some((cell: unknown) => cell !== null && cell !== undefined && cell !== ''),
-      );
+        const hasExistingData = rangeHasContent(
+          targetRange.values as unknown[][], targetRange.formulas as unknown[][],
+        );
 
-      if (hasExistingData) {
-        throw new Error('OVERWRITE_WARNING');
+        if (hasExistingData) {
+          throw new Error('OVERWRITE_WARNING');
+        }
       }
     }
 
@@ -91,16 +157,76 @@ export async function insertResultTable(
       }
     }
 
+    // Phase 1: commit cell data + number formatting (critical).
     await context.sync();
+    savedAddress = range.address;
 
-    const tableRange = sheet.getRangeByIndexes(startRow, startCol, rows.length + 1, colCount);
-    const table = sheet.tables.add(tableRange, true);
-    table.style = 'TableStyleMedium2';
-    table.getHeaderRowRange().format.font.bold = true;
-    await context.sync();
+    // Phase 2: create the Excel table object (non-critical cosmetic step).
+    // Bug-6737 (REOPENED): if tables.add fails (e.g., overlapping an
+    // existing table -- Bug-6736, or any host-specific limitation), the
+    // data values are already committed. The table object adds filter
+    // dropdowns and alternating row styling but is not required for the
+    // data to be correct and usable.
+    //
+    // Bug-6736: detect and remove any existing table object overlapping the
+    // target range before calling tables.add, so a re-insert onto the same
+    // region cleanly replaces the previous table instead of leaving a
+    // half-mutated sheet. sheet.tables.items is loaded and checked for
+    // overlap; any overlapping table is deleted before the new one is
+    // created. If deletion or detection itself fails, fall through to the
+    // original catch (cosmetic-only failure).
+    try {
+      const tableRange = sheet.getRangeByIndexes(startRow, startCol, rows.length + 1, colCount);
 
-    return range.address;
+      // Attempt to clear any overlapping table objects first.
+      // Bug-6736 R1 Finding 5: reuse the pure, unit-tested rangesOverlap()
+      // from insertGuard.ts instead of hand-rolling rectangle math inline.
+      try {
+        sheet.tables.load('items');
+        await context.sync();
+        const targetCellRange: CellRange = {
+          sheet: '',
+          rowStart: startRow,
+          colStart: startCol,
+          rowCount: rows.length + 1,
+          colCount,
+        };
+        for (const existingTable of sheet.tables.items) {
+          const existingRange = existingTable.getRange();
+          existingRange.load(['rowIndex', 'columnIndex', 'rowCount', 'columnCount']);
+          await context.sync();
+          const existingCellRange: CellRange = {
+            sheet: '',
+            rowStart: existingRange.rowIndex,
+            colStart: existingRange.columnIndex,
+            rowCount: existingRange.rowCount,
+            colCount: existingRange.columnCount,
+          };
+          if (rangesOverlap(targetCellRange, existingCellRange)) {
+            // Bug-6736 R1 Finding 1: Table.delete() removes the table AND
+            // clears its underlying cell data. Since Phase 1 already wrote
+            // new values into this range, delete() would destroy them.
+            // convertToRange() removes only the table object (filters,
+            // alternating row styling) while preserving cell values.
+            existingTable.convertToRange();
+            await context.sync();
+          }
+        }
+      } catch {
+        // Detection/deletion failed — proceed with the tables.add attempt.
+        // The worst case is the original Bug-6736 behavior (caught below).
+      }
+
+      const table = sheet.tables.add(tableRange, true);
+      table.style = 'TableStyleMedium2';
+      table.getHeaderRowRange().format.font.bold = true;
+      await context.sync();
+    } catch {
+      tableObjectFailed = true;
+    }
   });
+
+  return { address: savedAddress, tableObjectFailed };
 }
 
 const FORMAT_MAP: Record<string, string> = {

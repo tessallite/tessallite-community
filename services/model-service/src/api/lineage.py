@@ -9,19 +9,25 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 
 from shared.db.models import (
     AggregateDefinition,
     DataSource,
     DataTarget,
+    Dimension,
     DownstreamAsset,
+    KPI,
     LineageMapping,
+    Measure,
     Model,
     ModelColumn,
     ModelTable,
+    UserDefinedAttribute,
 )
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import LineageEdge, LineageGraphResponse, LineageNode
+from src.api.lineage_derive import build_semantic_lineage
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 
@@ -73,10 +79,27 @@ async def get_lineage_graph(
             select(LineageMapping).where(LineageMapping.model_id == model_id)
         )
         lineage_rows = lineage_result.scalars().all()
-        source_column_ids = sorted(
-            {row.source_column_id for row in lineage_rows if row.source_column_id},
-            key=str,
-        )
+
+        # Bug-8073: the semantic half of the graph is DERIVED from the model's
+        # own definitions. It used to come exclusively from LineageMapping rows,
+        # which no production code path writes, so an ordinary model rendered
+        # sources/aggregates/targets and zero field or column nodes — a
+        # populated-looking graph missing exactly the dependencies a modeller
+        # needs before a breaking edit.
+        measures = (await db.execute(
+            select(Measure).where(Measure.model_id == model_id)
+        )).scalars().all()
+        dimensions = (await db.execute(
+            select(Dimension).where(Dimension.model_id == model_id)
+        )).scalars().all()
+        kpis = (await db.execute(
+            select(KPI).where(KPI.model_id == model_id)
+        )).scalars().all()
+        udas = (await db.execute(
+            select(UserDefinedAttribute)
+            .options(selectinload(UserDefinedAttribute.column_refs))
+            .where(UserDefinedAttribute.model_id == model_id)
+        )).scalars().all()
 
         # Per-source table count for the source tooltip
         table_counts_result = await db.execute(
@@ -91,20 +114,18 @@ async def get_lineage_graph(
             .where(DownstreamAsset.model_id == model_id)
         )
         downstream_asset_count: int = asset_count_result.scalar() or 0
-        source_column_rows: dict[UUID, tuple[ModelColumn, ModelTable]] = {}
-        if source_column_ids:
-            source_columns_result = await db.execute(
-                select(ModelColumn, ModelTable)
-                .join(ModelTable, ModelColumn.model_table_id == ModelTable.id)
-                .where(
-                    ModelColumn.id.in_(source_column_ids),
-                    ModelTable.model_id == model_id,
-                )
-            )
-            source_column_rows = {
-                column.id: (column, table)
-                for column, table in source_columns_result.all()
-            }
+        # Every column of this model, so a derived reference can resolve without
+        # a second round trip per field. A referenced id absent from this map is
+        # skipped rather than emitted as a dangling node.
+        source_columns_result = await db.execute(
+            select(ModelColumn, ModelTable)
+            .join(ModelTable, ModelColumn.model_table_id == ModelTable.id)
+            .where(ModelTable.model_id == model_id)
+        )
+        source_column_rows: dict[UUID, tuple[ModelColumn, ModelTable]] = {
+            column.id: (column, table)
+            for column, table in source_columns_result.all()
+        }
 
         nodes: list[LineageNode] = []
         edges: list[LineageEdge] = []
@@ -203,56 +224,18 @@ async def get_lineage_graph(
                 )
             )
 
-        # Lineage mappings: source column → semantic field → model.
-        emitted_columns: set[UUID] = set()
-        emitted_fields: set[str] = set()
-        for row in lineage_rows:
-            if row.source_column_id:
-                column_table = source_column_rows.get(row.source_column_id)
-                if column_table and row.source_column_id not in emitted_columns:
-                    column, table = column_table
-                    emitted_columns.add(row.source_column_id)
-                    nodes.append(
-                        LineageNode(
-                            id=f"col:{column.id}",
-                            type="column",
-                            label=column.display_name or column.column_name,
-                            description="Source column feeding semantic fields.",
-                            meta={
-                                "Table": table.display_name or table.alias or table.physical_name,
-                                "Column": column.column_name,
-                                "Data type": column.data_type,
-                                "Hidden": "yes" if column.is_hidden else "no",
-                            },
-                        )
-                    )
-                field_id = f"field:{row.semantic_field_type}:{row.semantic_field_name}"
-                if field_id not in emitted_fields:
-                    emitted_fields.add(field_id)
-                    nodes.append(
-                        LineageNode(
-                            id=field_id,
-                            type="field",
-                            label=row.semantic_field_name,
-                            description="Semantic field exposed by the model.",
-                            meta={
-                                "Field type": row.semantic_field_type,
-                            },
-                        )
-                    )
-                    edges.append(
-                        LineageEdge(
-                            source=field_id,
-                            target=str(model_id),
-                            label="defined by",
-                        )
-                    )
-                edges.append(
-                    LineageEdge(
-                        source=f"col:{row.source_column_id}",
-                        target=field_id,
-                        label="feeds",
-                    )
-                )
+        # Semantic layer: derived from the live definitions, with LineageMapping
+        # rows folded in as enrichment (see src/api/lineage_derive.py).
+        semantic_nodes, semantic_edges = build_semantic_lineage(
+            model_id=model_id,
+            measures=measures,
+            dimensions=dimensions,
+            kpis=kpis,
+            udas=udas,
+            columns_by_id=source_column_rows,
+            lineage_rows=lineage_rows,
+        )
+        nodes.extend(semantic_nodes)
+        edges.extend(semantic_edges)
 
         return LineageGraphResponse(nodes=nodes, edges=edges)

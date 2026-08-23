@@ -78,6 +78,13 @@ Tessallite connects to BigQuery via the google-cloud-bigquery Python client libr
 
 **Default dataset**: The dataset specified in the connection.
 
+**Aggregate and pocket targets**: A target always uses the project configured
+on its BigQuery connection. Enter a bare dataset name such as `analytics`; do
+not enter `project.dataset` or a different target project. To use data in a
+different project, ask a BigQuery administrator to create a view in this
+connection's project that reads the external table with its fully-qualified
+name, then target that local view/project.
+
 ---
 
 ## Snowflake

@@ -41,6 +41,25 @@ _KEY_SEGMENT_RE = re.compile(rf'\&\[({_BRACKET_BODY}+)\]')
 _CAPTION_RE = re.compile(rf'^\s*\[({_BRACKET_BODY}+)\]\s*$')
 
 
+_FIRST_BRACKET_RE = re.compile(rf'^\[({_BRACKET_BODY}+)\]')
+
+
+def first_bracket_body(uname: str | None) -> str | None:
+    """Return the (unescaped) body of the FIRST bracketed token of a unique name.
+
+    ``[Dim].[Hier].[West]`` / ``[Dim].[Hier]`` / ``[Dim]`` all yield ``Dim``.
+    Bracket-aware, so a name carrying a literal ``.`` (``[Sales.Region]``) or an
+    escaped ``]]`` is decoded correctly -- unlike ``split(".")[0].strip("[]")``,
+    which mis-parses dotted names. Returns ``None`` when nothing parses.
+    """
+    if not uname:
+        return None
+    m = _FIRST_BRACKET_RE.match(uname.strip())
+    if not m:
+        return None
+    return unescape_member_key(m.group(1))
+
+
 def escape_member_key(key: str) -> str:
     """Escape a raw key for embedding in a bracketed segment (``]`` → ``]]``)."""
     return key.replace("]", "]]")
@@ -64,10 +83,12 @@ def qualify_member_uname(
     the full ancestor key path: ``[Cal].[Cal].[Month].&[2025]&[4]``.
 
     Keys containing ``]`` are escaped as ``]]`` so the emitted uname
-    round-trips through :func:`parse_member_keys` (Bug-1052).
+    round-trips through :func:`parse_member_keys` (Bug-1052). Bug-6746: the
+    ``level_name`` body is escaped the same way (``hier_bracket`` is already an
+    emitted, escaped bracket expression).
     """
     keys = "".join(f"&[{escape_member_key(k)}]" for k in key_path)
-    return f"{hier_bracket}.[{level_name}].{keys}"
+    return f"{hier_bracket}.[{escape_member_key(level_name)}].{keys}"
 
 
 def parse_member_keys(keys_text: str) -> list[str]:
@@ -127,6 +148,34 @@ _BARE_TAIL_RE = re.compile(rf'^\[({_BRACKET_BODY}+)\]$')
 def _norm_all(token: str) -> bool:
     """True if a bare member token denotes the (All) member in either form."""
     return token in ("All", "(All)")
+
+
+def is_all_member_token(token: str | None) -> bool:
+    """True when a bare member token denotes a hierarchy's (All) member.
+
+    Accepts every spelling BI clients are known to emit: the MEMBER form
+    ``All``, the LEVEL form ``(All)``, and any case variant. Bug-5519 round-2
+    established that Excel and Power BI send both forms and that clients may
+    lower-case them; ``mdx_execute._member_axis_kind`` and
+    ``mdx_calc_members._extract_all_pinned_dims`` already compare
+    case-insensitively for exactly that reason. This is the callable form of
+    that same rule, so a consumer never re-derives it inline.
+
+    Only those two exact spellings. sol review F-CR-01: the first version used
+    ``strip("()")``, which also classified ``All)``, ``(All`` and ``((All))``
+    as the grand total. Those are ordinary captions, and a consumer that drops
+    a filter for them widens the result set silently — the one outcome this
+    recognizer must never cause.
+
+    Deliberately NOT wired into the private ``_norm_all`` used by
+    :func:`parse_member_uname`, which is case-SENSITIVE. Widening that one
+    would change member discovery (``mdschema``) and axis resolution
+    (``xmla_server``) in the same breath; that divergence is tracked
+    separately rather than folded into an unrelated change.
+    """
+    if token is None:
+        return False
+    return token.strip().lower() in ("all", "(all)")
 
 
 def parse_member_uname(uname: str | None) -> ParsedMemberName:

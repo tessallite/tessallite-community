@@ -64,8 +64,8 @@ class GovernanceEdge(BaseModel):
     relationship_type: str
     """Tessallite domain type: contains, contains_table, contains_column,
     defines_dimension, defines_measure, derived_from, governed_by_term,
-    produces_aggregate, materialized_to, consumed_by, feeds_semantic_field,
-    uses_measure, classified_by, stored_in."""
+    produces_aggregate, materialized_to, consumed_by_model, consumed_by_column,
+    feeds_semantic_field, uses_measure, classified_by, stored_in."""
 
     label: str | None = None
     """Optional human-readable edge label."""
@@ -74,8 +74,37 @@ class GovernanceEdge(BaseModel):
     """Additional edge metadata."""
 
 
+class GovernanceSnapshotIdentity(BaseModel):
+    """Identity of the exact model snapshot a governance graph was built from.
+
+    Lets sync-history rows prove which deployed model version produced a
+    preview or (future) remote change — the audit property F-035-06 requires.
+    """
+
+    deployed_version_id: str | None = None
+    """UUID of the ``ModelVersion`` exported, or ``None`` for a draft export."""
+
+    export_draft: bool = False
+    """True when the graph was built from live draft state, not a deployed version."""
+
+    content_hash: str
+    """Stable SHA-256 over the exported snapshot payload — identifies the exact
+    content even for a draft export that has no version id."""
+
+
 class GovernanceGraph(BaseModel):
     """Complete governance export for one Tessallite model."""
 
     nodes: list[GovernanceNode]
     edges: list[GovernanceEdge]
+
+    snapshot: GovernanceSnapshotIdentity | None = None
+    """Identity of the snapshot the graph was built from (F-035-06). ``None``
+    only for synthetic graphs that were not produced by the exporter."""
+
+    export_warnings: list[dict[str, Any]] = []
+    """Governance warnings raised while building the graph (F-035-01) — e.g. a
+    calculated-measure or KPI expression that could not be parsed or whose
+    referenced measure could not be resolved. Surfaced alongside the structural
+    warnings from ``validate_governance_graph`` so incomplete lineage is
+    disclosed rather than silent."""

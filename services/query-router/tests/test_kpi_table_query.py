@@ -429,6 +429,49 @@ class TestKpiPersonaLineageHelpers:
         assert _kpi_allowed_by_persona(kpi, {str(uuid.uuid4())}, {}) is False
         assert _kpi_allowed_by_persona(kpi, {str(tmid)}, {}) is True
 
+    # --- Bug-6139: CLS column-restriction gate -----------------------------
+
+    def test_kpi_withheld_when_lineage_touches_restricted_column(self):
+        from src.api.routes import _kpi_allowed_by_persona
+
+        mid = str(uuid.uuid4())
+        kpi = _kpi_def(expression='measure("Revenue")')
+        # No measure allow-list restriction, but Revenue's measure id is in the
+        # CLS-blocked set (its column closure reaches a restricted column) ->
+        # withhold, even though the allow-list gate alone would serve it.
+        assert _kpi_allowed_by_persona(
+            kpi, None, {"Revenue": mid}, cls_blocked_measure_ids=frozenset({mid}),
+        ) is False
+
+    def test_kpi_served_when_lineage_clear_of_restricted_columns(self):
+        from src.api.routes import _kpi_allowed_by_persona
+
+        mid = str(uuid.uuid4())
+        other = str(uuid.uuid4())
+        kpi = _kpi_def(expression='measure("Revenue")')
+        assert _kpi_allowed_by_persona(
+            kpi, None, {"Revenue": mid}, cls_blocked_measure_ids=frozenset({other}),
+        ) is True
+
+    def test_cls_gate_applies_to_target_measure_id(self):
+        from src.api.routes import _kpi_allowed_by_persona
+
+        tmid = uuid.uuid4()
+        kpi = _kpi_def(target_measure_id=tmid)
+        assert _kpi_allowed_by_persona(
+            kpi, None, {}, cls_blocked_measure_ids=frozenset({str(tmid)}),
+        ) is False
+
+    def test_cls_gate_fails_closed_on_unresolved_name(self):
+        from src.api.routes import _kpi_allowed_by_persona
+
+        kpi = _kpi_def(expression='measure("Ghost")')
+        # A CLS restriction is active but the referenced measure cannot be
+        # resolved to an id — cannot verify it is clear, so fail closed.
+        assert _kpi_allowed_by_persona(
+            kpi, None, {}, cls_blocked_measure_ids=frozenset({str(uuid.uuid4())}),
+        ) is False
+
 
 class TestKpiTableQueryGateAndObserve:
     @pytest.mark.asyncio
@@ -481,8 +524,15 @@ class TestKpiTableQueryGateAndObserve:
                 (kpi_rev, _kpi_def(expression='measure("Revenue")')),
                 (kpi_cost, _kpi_def(expression='measure("Cost")')),
             ]),
+            # Bug-6139: CLS gate first probes the persona's tag restrictions.
+            # This persona has none, so the CLS helper short-circuits after a
+            # single (empty) lookup and only the measure allow-list gate applies.
+            _ScalarsResult([]),
             # measure name -> id lookup
             _ScalarsResult([("Revenue", revenue_mid), ("Cost", cost_mid)]),
+            # Bug-6139: all-KPI name map for nested kpi() lineage resolution.
+            # These KPIs have no nested refs, so an empty map is sufficient.
+            _ScalarsResult([]),
             # Model load for observation
             _ScalarsResult([], scalar=_fake_model(model_id)),
         ])
@@ -542,3 +592,222 @@ class TestKpiTableQueryGateAndObserve:
 
         assert exc_info.value.status_code == 404
         assert model_id in exc_info.value.detail
+
+
+# ---------------------------------------------------------------------------
+# Bug-6930 — $KPIs fails closed under active row-level security.
+#
+# kpi_latest holds a value pre-aggregated across ALL rows, so a row-restricted
+# principal must not read it. When the principal has any active row-security rule
+# on the model (and the persona carries no authorised bypass), EVERY KPI row is
+# withheld — the pre-aggregated value cannot be re-filtered per-row at serve time.
+# ---------------------------------------------------------------------------
+
+
+def _patch_rls(monkeypatch, *, active: bool, raises: bool = False):
+    """Patch the row-security authority used by _handle_kpi_table_query."""
+    from src.api import routes as routes_mod
+    from shared.security import RowSecurityCompileError
+
+    async def fake_compile(*_a, **_kw):
+        if raises:
+            raise RowSecurityCompileError("cannot compile")
+        return object() if active else None
+
+    def fake_has_active(compiled):
+        return compiled is not None
+
+    monkeypatch.setattr(routes_mod, "compile_row_security", fake_compile)
+    monkeypatch.setattr(routes_mod, "has_active_rules", fake_has_active)
+
+
+class TestKpiTableQueryRowSecurity:
+    @pytest.mark.asyncio
+    async def test_active_rls_withholds_all_kpis(self, monkeypatch):
+        """A row-restricted principal gets an EMPTY scorecard, not global totals."""
+        from src.api.routes import _handle_kpi_table_query
+
+        captured = _patch_observation(monkeypatch)
+        _patch_rls(monkeypatch, active=True)
+        model_id = str(uuid.uuid4())
+        principal = types.SimpleNamespace(user_identity="u@t.com", roles=[], groups=[], claims={})
+
+        # withhold path skips the KPILatest fetch + gating; only the model load
+        # for observation runs.
+        db = _StatefulDB([
+            _ScalarsResult([], scalar=_fake_model(model_id)),
+        ])
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=None, principal=principal,
+            user_identity="u@t.com", tenant_id="acme",
+        )
+
+        assert resp.rows == [], "row-restricted principal must see NO KPI rows"
+        assert resp.rows_returned == 0
+        # The zero-row read is still observed for audit.
+        assert captured["log_query"] == 1
+        assert captured["audit"] == 1
+
+    @pytest.mark.asyncio
+    async def test_rls_compile_error_fails_closed(self, monkeypatch):
+        """If row security cannot be compiled, fail closed (withhold all)."""
+        from src.api.routes import _handle_kpi_table_query
+
+        _patch_observation(monkeypatch)
+        _patch_rls(monkeypatch, active=False, raises=True)
+        model_id = str(uuid.uuid4())
+        principal = types.SimpleNamespace(user_identity="u@t.com", roles=[], groups=[], claims={})
+
+        db = _StatefulDB([
+            _ScalarsResult([], scalar=_fake_model(model_id)),
+        ])
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=None, principal=principal,
+            user_identity="u@t.com", tenant_id="acme",
+        )
+        assert resp.rows == []
+
+    @pytest.mark.asyncio
+    async def test_bypass_persona_still_served(self, monkeypatch):
+        """A persona with authorised bypass_row_security still sees KPIs even with
+        active rules — the bypass is a deliberate, granted exemption."""
+        from src.api.routes import _handle_kpi_table_query
+
+        _patch_observation(monkeypatch)
+        _patch_rls(monkeypatch, active=True)
+        model_id = str(uuid.uuid4())
+        principal = types.SimpleNamespace(user_identity="a@t.com", roles=[], groups=[], claims={})
+        persona = types.SimpleNamespace(
+            id=uuid.uuid4(), included_measure_ids=None, bypass_row_security=True,
+        )
+
+        kpi_a = _kpi_latest("Revenue KPI")
+        db = _StatefulDB([
+            _ScalarsResult([(kpi_a, _kpi_def())]),   # KPILatest fetch runs
+            # Bug-6139 CLS gate probes the persona's tag restrictions (none here).
+            _ScalarsResult([]),
+            _ScalarsResult([], scalar=_fake_model(model_id)),
+        ])
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=persona, principal=principal,
+            user_identity="a@t.com", tenant_id="acme",
+        )
+        assert {r["kpi_name"] for r in resp.rows} == {"Revenue KPI"}
+
+    @pytest.mark.asyncio
+    async def test_no_active_rls_serves_normally(self, monkeypatch):
+        """An unrestricted principal (no active rules) sees KPIs as before."""
+        from src.api.routes import _handle_kpi_table_query
+
+        _patch_observation(monkeypatch)
+        _patch_rls(monkeypatch, active=False)
+        model_id = str(uuid.uuid4())
+        principal = types.SimpleNamespace(user_identity="u@t.com", roles=[], groups=[], claims={})
+
+        kpi_a = _kpi_latest("Revenue KPI")
+        db = _StatefulDB([
+            _ScalarsResult([(kpi_a, _kpi_def())]),
+            _ScalarsResult([], scalar=_fake_model(model_id)),
+        ])
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=None, principal=principal,
+            user_identity="u@t.com", tenant_id="acme",
+        )
+        assert {r["kpi_name"] for r in resp.rows} == {"Revenue KPI"}
+
+
+# ---------------------------------------------------------------------------
+# Bug-8305 — $KPIs kpi_name is DEPLOYED-SNAPSHOT-authoritative
+# ---------------------------------------------------------------------------
+
+class _StatefulDBWithGet(_StatefulDB):
+    """``_StatefulDB`` plus ``db.get`` — returns scripted objects by class name
+    so the Bug-8305 deployed-snapshot name lookup can be exercised."""
+
+    def __init__(self, results, *, get_by_class=None):
+        super().__init__(results)
+        self._get_by_class = get_by_class or {}
+
+    async def get(self, cls, _pk):
+        return self._get_by_class.get(getattr(cls, "__name__", None))
+
+
+class TestKpiNameSnapshotAuthority:
+    @pytest.mark.asyncio
+    async def test_kpi_name_uses_deployed_snapshot_not_live_latest(self, monkeypatch):
+        """Bug-8305: a DRAFT rename (reflected in kpi_latest.kpi_name via a
+        scorecard evaluation) must NOT leak into $KPIs. The served name comes
+        from the DEPLOYED version snapshot. Reverting the fix (serving
+        kpi_latest.kpi_name) would make this assert 'RENAMED-DRAFT' and fail."""
+        from src.api.routes import _handle_kpi_table_query
+        from shared.db.models import Model, ModelVersion
+
+        _patch_observation(monkeypatch)
+        model_id = str(uuid.uuid4())
+        kpi_id = uuid.uuid4()
+
+        latest = _kpi_latest("RENAMED-DRAFT")  # live/draft name after a rename
+        latest.kpi_id = kpi_id
+
+        # Deployed snapshot froze the KPI under its published name.
+        version = types.SimpleNamespace(
+            snapshot_json={"kpis": [{"id": str(kpi_id), "name": "Published Revenue"}]}
+        )
+        model = types.SimpleNamespace(deployed_version_id="v1")
+
+        db = _StatefulDBWithGet(
+            [
+                _ScalarsResult([(latest, _kpi_def())]),
+                _ScalarsResult([], scalar=_fake_model(model_id)),
+            ],
+            get_by_class={"Model": model, "ModelVersion": version},
+        )
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=None, user_identity="u@t.com", tenant_id="acme",
+        )
+
+        assert [r["kpi_name"] for r in resp.rows] == ["Published Revenue"]
+        # The value stays sourced from kpi_latest (unchanged by this fix).
+        assert resp.rows[0]["value"] == 100.0
+
+    @pytest.mark.asyncio
+    async def test_kpi_name_falls_back_to_latest_when_snapshot_lacks_entry(self, monkeypatch):
+        """When the deployed snapshot has no entry for a KPI (e.g. a legacy
+        snapshot predating KPI serialisation), the served name falls back to
+        kpi_latest.kpi_name — the fix must not blank out unmatched KPIs."""
+        from src.api.routes import _handle_kpi_table_query
+
+        _patch_observation(monkeypatch)
+        model_id = str(uuid.uuid4())
+        kpi_id = uuid.uuid4()
+
+        latest = _kpi_latest("Latest Name")
+        latest.kpi_id = kpi_id
+
+        version = types.SimpleNamespace(snapshot_json={"kpis": []})  # no entry
+        model = types.SimpleNamespace(deployed_version_id="v1")
+
+        db = _StatefulDBWithGet(
+            [
+                _ScalarsResult([(latest, _kpi_def())]),
+                _ScalarsResult([], scalar=_fake_model(model_id)),
+            ],
+            get_by_class={"Model": model, "ModelVersion": version},
+        )
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=None, user_identity="u@t.com", tenant_id="acme",
+        )
+
+        assert [r["kpi_name"] for r in resp.rows] == ["Latest Name"]

@@ -6,17 +6,24 @@ schema_version and used a "sources" key the rehydrator never reads.
 
 Bug-5266: slug-collision retry must use a SAVEPOINT so the placeholder
 ProjectConnection flushed before the retry loop is not rolled back.
+
+Bug-5561: catalog importer now delegates slug allocation to the shared
+``insert_model_with_slug_retry`` from ``slug_utils.py``.
+
+Bug-5724: SSRF defence-in-depth (IPv6-mapped, is_private, follow_redirects).
 """
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from src.api.catalog_import import _catalog_to_bundle, _slug_with_headroom, _slugify
+from shared.model_snapshot.slug_utils import slug_with_suffix
+from src.api.catalog_import import _catalog_to_bundle, _is_ssrf_blocked, _slugify
 
 
 _TABLES = [
@@ -73,14 +80,79 @@ def test_table_type_is_documented_not_unclassified():
 
 def test_slug_headroom_keeps_suffix_under_64_chars():
     # F-020-19: a 64-char slug plus a collision suffix must not overflow the
-    # String(64) column.
+    # String(64) column. Bug-5561: now uses the shared slug_with_suffix.
     long_slug = "a" * 64
-    assert len(f"{_slug_with_headroom(long_slug, 12)}_12") <= 64
+    assert len(slug_with_suffix(long_slug, 12)) <= 64
 
 
 def test_slugify_bounds_length_and_falls_back():
     assert _slugify("x" * 200) == "x" * 64
     assert _slugify("!!!") == "catalog_model"
+
+
+def test_slugify_digit_leading_is_bi_safe():
+    # Bug-7622: a catalog table/model named with a digit-leading name (e.g.
+    # "123_orders") must slugify to a BI-safe slug, not one that later trips
+    # validate_bi_safe_slug and 500s the endpoint.
+    from shared.model_snapshot.slug_utils import validate_bi_safe_slug
+
+    slug = _slugify("123_orders")
+    assert slug == "_123_orders"
+    validate_bi_safe_slug(slug)  # must not raise
+
+
+def test_slugify_symbol_only_falls_back_bi_safe():
+    from shared.model_snapshot.slug_utils import validate_bi_safe_slug
+
+    slug = _slugify("$$$")
+    assert slug == "catalog_model"
+    validate_bi_safe_slug(slug)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Bug-5937: catalog import must require HTTPS by default (the request sends
+# an Authorization bearer token to the supplied URL).
+# ---------------------------------------------------------------------------
+
+
+class TestValidateCatalogUrlTransportSecurity:
+    def test_https_url_accepted_by_default(self):
+        from src.api.catalog_import import _validate_catalog_url
+        assert _validate_catalog_url("https://catalog.example.com") == "https://catalog.example.com"
+
+    def test_http_url_rejected_by_default(self):
+        from src.api.catalog_import import _validate_catalog_url
+        with pytest.raises(ValueError, match="https"):
+            _validate_catalog_url("http://catalog.example.com")
+
+    def test_http_url_accepted_when_operator_opts_in(self, monkeypatch):
+        from shared.config.settings import get_settings
+        from src.api.catalog_import import _validate_catalog_url
+
+        monkeypatch.setattr(get_settings(), "CATALOG_IMPORT_ALLOW_HTTP", True)
+        assert _validate_catalog_url("http://catalog.internal") == "http://catalog.internal"
+
+    def test_http_rejected_again_after_opt_in_disabled(self, monkeypatch):
+        # Regression guard: the flag must be re-checked per call, not cached
+        # from a prior enabled state.
+        from shared.config.settings import get_settings
+        from src.api.catalog_import import _validate_catalog_url
+
+        monkeypatch.setattr(get_settings(), "CATALOG_IMPORT_ALLOW_HTTP", True)
+        _validate_catalog_url("http://catalog.internal")
+        monkeypatch.setattr(get_settings(), "CATALOG_IMPORT_ALLOW_HTTP", False)
+        with pytest.raises(ValueError, match="https"):
+            _validate_catalog_url("http://catalog.internal")
+
+    def test_http_opt_in_does_not_bypass_ssrf_host_block(self, monkeypatch):
+        # The transport-encryption flag must not weaken the separate
+        # host/IP SSRF checks (_BLOCKED_HOSTS / _is_ssrf_blocked).
+        from shared.config.settings import get_settings
+        from src.api.catalog_import import _validate_catalog_url
+
+        monkeypatch.setattr(get_settings(), "CATALOG_IMPORT_ALLOW_HTTP", True)
+        with pytest.raises(ValueError, match="not allowed"):
+            _validate_catalog_url("http://localhost")
 
 
 # ---------------------------------------------------------------------------
@@ -132,75 +204,103 @@ def _make_import_db(*, fail_flush_count=0):
 
 @pytest.mark.asyncio
 async def test_slug_collision_retry_preserves_placeholder_connection():
-    """Bug-5266: when a slug collision triggers an IntegrityError on the
-    model flush, the retry must use a SAVEPOINT (begin_nested) so that
-    the placeholder ProjectConnection flushed earlier is NOT rolled back.
+    """Bug-5266 / Bug-5561: when a slug collision triggers an IntegrityError
+    on the model flush, the shared ``insert_model_with_slug_retry`` must use
+    a SAVEPOINT (begin_nested) so that the placeholder ProjectConnection
+    flushed earlier is NOT rolled back.
 
-    Before this fix, ``await db.rollback()`` destroyed the entire
-    transaction including default_conn_id, leaving dangling FK references
-    in the rehydrated model's data_sources.
+    The catalog importer now delegates to the shared utility; this test
+    verifies the SAVEPOINT contract through that utility directly.
     """
-    from tests.conftest import TEST_PROJECT_ID, async_gen_from
-
-    # Import the route module so we can patch its dependencies
-    from src.api import catalog_import as _mod
-
-    project_id = TEST_PROJECT_ID
-    # Build a minimal bundle via the public helper
-    bundle, tbl_count, dim_count, meas_count = _catalog_to_bundle(
-        [
-            {
-                "name": "t1",
-                "description": "",
-                "fields": [
-                    {"name": "amount", "data_type": "decimal(18,2)", "description": ""},
-                    {"name": "region", "data_type": "varchar", "description": ""},
-                ],
-            }
-        ],
-        str(uuid.uuid4()),
-        "test_model",
-        "Test Model",
-    )
+    from shared.model_snapshot.slug_utils import insert_model_with_slug_retry
 
     db = _make_import_db(fail_flush_count=1)
 
-    # The endpoint fetches from the external catalog; mock that entirely
-    # to return pre-built tables. We drive the slug-allocation path by
-    # mocking _fetch_catalog_tables to return our tables.
-    fake_tables = [{"name": "t1", "description": "", "fields": [
-        {"name": "amount", "data_type": "decimal(18,2)", "description": ""},
-        {"name": "region", "data_type": "varchar", "description": ""},
-    ]}]
+    existing_slugs: set[str] = set()
+    model, candidate = await insert_model_with_slug_retry(
+        db,
+        project_id=uuid.uuid4(),
+        base_slug="test_model",
+        existing_slugs=existing_slugs,
+        display_name="Test Model",
+    )
 
-    # Instead of calling the full endpoint, test the key contract directly:
-    # begin_nested is used (not bare rollback) on IntegrityError.
-    #
-    # Simulate the retry loop in isolation.
-    from shared.db.models import Model
-
-    candidate = "test_model"
-    n = 2
-    _MAX_SLUG_RETRIES = 5
-
-    succeeded = False
-    for _retry in range(_MAX_SLUG_RETRIES):
-        new_model = Model.__new__(Model)
-        db.add(new_model)
-        try:
-            async with db.begin_nested():
-                await db.flush()
-        except IntegrityError:
-            candidate = f"{_slug_with_headroom('test_model', n)}_{n}"
-            n += 1
-            continue
-        succeeded = True
-        break
-
-    assert succeeded, "Retry loop should have succeeded on the second attempt"
     # begin_nested was called twice: once for the failed attempt, once for
     # the successful one.
     assert db.begin_nested.call_count == 2
     # The critical assertion: db.rollback() must NOT have been called.
     # The savepoint handles the IntegrityError rollback internally.
     db.rollback.assert_not_awaited()
+    # The model was created with some slug
+    assert candidate is not None
+
+
+# ---------------------------------------------------------------------------
+# Bug-5724: SSRF defence-in-depth — _is_ssrf_blocked
+# ---------------------------------------------------------------------------
+
+
+class TestIsSSRFBlocked:
+    """Bug-5724: validate the defence-in-depth IP classification function."""
+
+    def test_global_ipv4_allowed(self):
+        assert _is_ssrf_blocked(ipaddress.ip_address("8.8.8.8")) is None
+
+    def test_loopback_blocked(self):
+        result = _is_ssrf_blocked(ipaddress.ip_address("127.0.0.1"))
+        assert result is not None
+        assert "loopback" in result
+
+    def test_private_rfc1918_blocked(self):
+        for addr in ("10.0.0.1", "172.16.0.1", "192.168.1.1"):
+            result = _is_ssrf_blocked(ipaddress.ip_address(addr))
+            assert result is not None, f"{addr} should be blocked"
+            assert "private" in result
+
+    def test_link_local_blocked(self):
+        # 169.254.169.254 (cloud metadata endpoint) is both private and
+        # link-local; the function blocks it regardless of which check fires.
+        result = _is_ssrf_blocked(ipaddress.ip_address("169.254.169.254"))
+        assert result is not None
+
+    def test_multicast_blocked(self):
+        result = _is_ssrf_blocked(ipaddress.ip_address("224.0.0.1"))
+        assert result is not None
+
+    def test_ipv6_mapped_loopback_blocked(self):
+        """DNS rebinding via IPv6-mapped IPv4 loopback must be caught."""
+        result = _is_ssrf_blocked(ipaddress.ip_address("::ffff:127.0.0.1"))
+        assert result is not None
+        assert "loopback" in result
+
+    def test_ipv6_mapped_private_blocked(self):
+        """DNS rebinding via IPv6-mapped RFC1918 must be caught."""
+        result = _is_ssrf_blocked(ipaddress.ip_address("::ffff:192.168.1.1"))
+        assert result is not None
+        assert "private" in result
+
+    def test_ipv6_mapped_link_local_blocked(self):
+        """Cloud metadata endpoint via IPv6-mapped link-local must be caught."""
+        result = _is_ssrf_blocked(ipaddress.ip_address("::ffff:169.254.169.254"))
+        assert result is not None
+
+    def test_global_ipv6_allowed(self):
+        # Google's public DNS IPv6 address
+        assert _is_ssrf_blocked(ipaddress.ip_address("2001:4860:4860::8888")) is None
+
+    def test_ipv6_loopback_blocked(self):
+        result = _is_ssrf_blocked(ipaddress.ip_address("::1"))
+        assert result is not None
+        assert "loopback" in result
+
+    def test_ipv6_link_local_blocked(self):
+        result = _is_ssrf_blocked(ipaddress.ip_address("fe80::1"))
+        assert result is not None
+
+
+def test_ssrf_safe_client_disables_redirects():
+    """Bug-5724: the SSRF-safe client must not follow HTTP redirects."""
+    from src.api.catalog_import import _ssrf_safe_client
+
+    client = _ssrf_safe_client()
+    assert client.follow_redirects is False

@@ -7,17 +7,58 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from sqlalchemy import select
 
-from shared.auth.middleware import CurrentEmbedUser, CurrentUser
+from shared.auth.identity import user_identity_matches
+from shared.auth.middleware import (
+    CurrentEmbedUser,
+    CurrentServiceUser,
+    CurrentUser,
+    is_human_tenant_admin_or_system_admin,
+)
 from shared.auth.roles import project_role_level
 from shared.db.models import Model, UserAccessBinding
 
 
 def _as_uuid(value: UUID | str) -> UUID:
-    return value if isinstance(value, UUID) else UUID(str(value))
+    """Coerce ``value`` to a UUID, raising HTTP 400 on malformed input.
+
+    Bug-6601: bare ``UUID(str(value))`` raised an uncaught ``ValueError``
+    on non-UUID strings, surfacing as an unguarded 500. The query-router
+    JSON surfaces are now individually guarded (Bug-6381), but any other
+    caller reaching this shared helper with a bad id would still 500.
+    """
+    if isinstance(value, UUID):
+        return value
+    try:
+        return UUID(str(value))
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid UUID: {value!r}",
+        )
 
 
 def _has_admin_bypass(current_user: CurrentUser) -> bool:
-    return current_user.role in ("tenant_admin", "system_admin")
+    return is_human_tenant_admin_or_system_admin(current_user)
+
+
+def _is_service_user(current_user: CurrentUser) -> bool:
+    """Return True when *current_user* is a service principal.
+
+    Bug-8613: A service principal must never enter human binding lookup or
+    bootstrap-admin logic (AUTH-RR-01).  The previous behaviour was to
+    unconditionally ADMIT every service principal on the assumption that
+    ``require_capability_or_service_scope`` already validated its scope at
+    the route level.  That assumption holds ONLY for routes that actually
+    use ``require_capability_or_service_scope`` (or an equivalent typed-
+    scope dependency).  Routes gated by bare ``require_capability(...)``
+    never perform a scope check on service tokens — ``require_capability``
+    narrows only ``CurrentEmbedUser`` — so the pair was wide open to any
+    service token regardless of its scopes.
+
+    The callers of this helper now decide what to do with the result by
+    passing ``service_scope_verified``.
+    """
+    return isinstance(current_user, CurrentServiceUser)
 
 
 async def ensure_project_model_access(
@@ -27,6 +68,7 @@ async def ensure_project_model_access(
     project_id: UUID | str,
     model_id: UUID | str | None = None,
     min_role: str = "viewer",
+    service_scope_verified: bool = False,
 ) -> None:
     """Enforce model-service-compatible project/model access bindings.
 
@@ -34,12 +76,30 @@ async def ensure_project_model_access(
     query-router also expose model data. This helper keeps those service
     boundaries on the same persisted ``UserAccessBinding`` contract without
     importing model-service-local modules.
+
+    Bug-8613: ``service_scope_verified`` defaults to ``False``. When False
+    and the caller is a ``CurrentServiceUser``, the request is refused
+    (HTTP 403). Callers on routes that have already verified the service
+    token's scope via ``require_capability_or_service_scope`` (or an
+    equivalent typed-scope dependency) must pass ``True`` to re-enable the
+    previous pass-through behaviour. This closes the composition defect
+    where ``require_capability(...)`` (which narrows only embed users) was
+    paired with the old unconditional service-user bypass — any service
+    token, regardless of its scopes, could access project resources.
     """
     project_uuid = _as_uuid(project_id)
     model_uuid = _as_uuid(model_id) if model_id is not None else None
 
     if _has_admin_bypass(current_user):
         return
+
+    if _is_service_user(current_user):
+        if service_scope_verified:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Service token scope not verified for project access",
+        )
 
     if isinstance(current_user, CurrentEmbedUser):
         if project_role_level(min_role) < project_role_level("viewer"):
@@ -69,7 +129,7 @@ async def ensure_project_model_access(
         model_binding = (
             await db.execute(
                 select(UserAccessBinding).where(
-                    UserAccessBinding.user_identity == current_user.user_id,
+                    user_identity_matches(UserAccessBinding.user_identity, current_user.user_id),
                     UserAccessBinding.project_id == project_uuid,
                     UserAccessBinding.model_id == model_uuid,
                 )
@@ -82,7 +142,7 @@ async def ensure_project_model_access(
         project_binding = (
             await db.execute(
                 select(UserAccessBinding).where(
-                    UserAccessBinding.user_identity == current_user.user_id,
+                    user_identity_matches(UserAccessBinding.user_identity, current_user.user_id),
                     UserAccessBinding.project_id == project_uuid,
                     UserAccessBinding.model_id.is_(None),
                 )
@@ -92,15 +152,10 @@ async def ensure_project_model_access(
             effective_role = project_binding.role
 
     if effective_role is None:
-        any_binding = (
-            await db.execute(
-                select(UserAccessBinding.id)
-                .where(UserAccessBinding.project_id == project_uuid)
-                .limit(1)
-            )
-        ).first()
-        if any_binding is None:
-            return
+        # No binding => deny. There is NO zero-binding bootstrap-admin grant
+        # (F-021-04 hard cutover, Wave C decision #9, 2026-08-19). A project
+        # with no binding for this caller denies, whether or not the project
+        # has any bindings at all.
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: no binding for this project",
@@ -123,7 +178,16 @@ async def load_authorized_model(
     model_id: UUID | str,
     project_id: UUID | str | None = None,
     min_role: str = "viewer",
+    service_scope_verified: bool = False,
 ) -> Model:
+    """Load a model and verify the caller's access.
+
+    Bug-8613: ``service_scope_verified`` is forwarded to
+    ``ensure_project_model_access``. Routes that have already verified
+    the service token's scope (via ``require_capability_or_service_scope``
+    or equivalent) should pass ``True``; all others rely on the default
+    ``False`` which refuses unverified service principals.
+    """
     model_uuid = _as_uuid(model_id)
     model = await db.get(Model, model_uuid)
     if model is None or (
@@ -139,5 +203,6 @@ async def load_authorized_model(
         project_id=model.project_id,
         model_id=model.id,
         min_role=min_role,
+        service_scope_verified=service_scope_verified,
     )
     return model

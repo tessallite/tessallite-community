@@ -1,3 +1,4 @@
 # Dev certificates
 *.pfx
 *.p12
+sideload-catalog/

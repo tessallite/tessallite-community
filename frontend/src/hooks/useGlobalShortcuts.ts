@@ -16,7 +16,14 @@ type ShortcutContext = {
   onFitView?: () => void;
 };
 
-function isEditableTarget(t: EventTarget | null): boolean {
+/**
+ * True when the event target is an element that already swallows typing, so a
+ * global keyboard shortcut must not hijack the keystroke. Exported so every
+ * window-level shortcut handler (including the canvas undo/redo handler in
+ * useCanvasHistory) shares one authoritative guard rather than a weaker copy
+ * that omits SELECT / contenteditable (Bug-7408).
+ */
+export function isEditableTarget(t: EventTarget | null): boolean {
   if (!t || !(t instanceof HTMLElement)) return false;
   const tag = t.tagName;
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
@@ -60,10 +67,9 @@ export function useGlobalShortcuts(ctx: ShortcutContext): void {
         return;
       }
 
-      // Plain-digit miniTab switch. Maps to the actual tab strip
-      // (MiniTabs: canvas / query / health / analytics) — the old "3 -> pivot"
-      // pointed at a tab value that does not exist, leaving the strip with no
-      // selection and logging a MUI value-mismatch (F-026-08).
+      // Plain-digit miniTab switch. Keep this sequence in the same order as
+      // MiniTabs renders it so the visible tab position is also the shortcut
+      // number (L13-9395 / F-026-11).
       if (!mod && !ev.shiftKey && !ev.altKey) {
         if (ev.key === "1") {
           setMiniTab("canvas");
@@ -74,7 +80,15 @@ export function useGlobalShortcuts(ctx: ShortcutContext): void {
           return;
         }
         if (ev.key === "3") {
+          setMiniTab("kpi-scorecard");
+          return;
+        }
+        if (ev.key === "4") {
           setMiniTab("matrix");
+          return;
+        }
+        if (ev.key === "5") {
+          setMiniTab("analytics");
           return;
         }
       }
@@ -107,14 +121,21 @@ export function useGlobalShortcuts(ctx: ShortcutContext): void {
  */
 // Only WIRED shortcuts appear here — the help dialog renders this table
 // verbatim, so an entry with no handler would advertise a no-op (F-026-08).
-// The digit labels match the actual tab strip (1 canvas / 2 query / 3 health),
-// and the unwired "pivot export" entry was removed.
+// The digit labels match the actual tab strip (1 canvas / 2 query /
+// 3 KPI scorecard / 4 Model Health / 5 analytics), and the unwired
+// "pivot export" entry was removed.
 export const SHORTCUTS: Array<{ keys: string; action: string }> = [
   { keys: "Cmd/Ctrl + ?", action: "shortcuts.showHelp" },
   { keys: "Cmd/Ctrl + K", action: "shortcuts.focusMiniTabs" },
+  // F-026-11: undo/redo are wired in useCanvasHistory (canvas keydown); they
+  // belong in this help table so modellers can discover them.
+  { keys: "Cmd/Ctrl + Z", action: "shortcuts.undo" },
+  { keys: "Cmd/Ctrl + Shift + Z / Cmd/Ctrl + Y", action: "shortcuts.redo" },
   { keys: "1", action: "shortcuts.switchToCanvas" },
   { keys: "2", action: "shortcuts.switchToQuery" },
-  { keys: "3", action: "shortcuts.switchToHealth" },
+  { keys: "3", action: "shortcuts.switchToKpiScorecard" },
+  { keys: "4", action: "shortcuts.switchToMatrix" },
+  { keys: "5", action: "shortcuts.switchToAnalytics" },
   { keys: "+ / -", action: "shortcuts.zoomInOut" },
   { keys: "0", action: "shortcuts.fitCanvas" },
   { keys: "Esc", action: "shortcuts.closeDrawer" },

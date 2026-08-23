@@ -1,6 +1,7 @@
 import { Box, Typography, Select, MenuItem, Chip } from '@mui/material';
 import { tokens } from '../../theme';
 import type { Persona } from '../../types/tessallite';
+import { strings } from '../../i18n/strings';
 
 interface PersonaDropdownProps {
   personas: Persona[];
@@ -22,7 +23,7 @@ export default function PersonaDropdown({ personas, activePersonaId, onSelect }:
   return (
     <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
       <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>
-        Persona:
+        {strings.persona.label}
       </Typography>
       <Select
         size="small"
@@ -39,7 +40,7 @@ export default function PersonaDropdown({ personas, activePersonaId, onSelect }:
         displayEmpty
       >
         <MenuItem value="">
-          <Typography sx={{ fontSize: 11 }}>Default</Typography>
+          <Typography sx={{ fontSize: 11 }}>{strings.persona.default}</Typography>
         </MenuItem>
         {personas.map(p => {
           const aud = audienceStyle[p.audience || ''] || audienceStyle.business;

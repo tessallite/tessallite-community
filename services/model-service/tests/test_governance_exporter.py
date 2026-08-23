@@ -332,7 +332,7 @@ class TestBuildGovernanceGraph:
         )
         db = _make_db_for_exporter(model, project, version)
 
-        with patch("src.governance_exporter.snapshot_model", AsyncMock()) as draft_snapshot:
+        with patch("src.governance_exporter.consistent_snapshot", AsyncMock()) as draft_snapshot:
             graph = await build_governance_graph(
                 db,
                 project_id=TEST_PROJECT_ID,
@@ -353,7 +353,7 @@ class TestBuildGovernanceGraph:
         snap, ids = _make_exporter_snapshot()
         db = _make_db_for_exporter(model, project)
 
-        with patch("src.governance_exporter.snapshot_model", AsyncMock(return_value=snap)):
+        with patch("src.governance_exporter.consistent_snapshot", AsyncMock(return_value=snap)):
             graph = await build_governance_graph(
                 db,
                 project_id=TEST_PROJECT_ID,
@@ -401,13 +401,49 @@ class TestBuildGovernanceGraph:
         )
 
     @pytest.mark.anyio
+    async def test_duplicate_lineage_edges_are_deduped(self):
+        # Bug-6493: two lineage mappings that resolve to the same
+        # (source column -> semantic field) pair — differing only on a
+        # non-key property like aggregate_col_id — must collapse to a single
+        # edge so counts are not inflated and a live push does not violate the
+        # object-mapping unique constraint on the edge stable key.
+        model = make_model()
+        project = make_project()
+        snap, ids = _make_exporter_snapshot()
+        dup = dict(snap["lineage_mappings"][0])
+        dup["id"] = str(uuid.uuid4())
+        dup["aggregate_col_id"] = str(uuid.uuid4())
+        snap["lineage_mappings"].append(dup)
+
+        with patch("src.governance_exporter.consistent_snapshot", AsyncMock(return_value=snap)):
+            graph = await build_governance_graph(
+                db=_make_db_for_exporter(model, project),
+                project_id=TEST_PROJECT_ID,
+                model_id=TEST_MODEL_ID,
+                project_slug=project.slug,
+                model_slug=model.slug,
+                include_hidden_objects=True,
+                export_draft=True,
+            )
+
+        edge_keys = [edge.stable_key for edge in graph.edges]
+        assert len(edge_keys) == len(set(edge_keys)), "edge stable keys must be unique"
+        feeds = [
+            e for e in graph.edges
+            if e.source_key == f"column.{ids['visible_col']}"
+            and e.target_key == f"measure.{ids['visible_measure']}"
+            and e.relationship_type == "feeds_semantic_field"
+        ]
+        assert len(feeds) == 1
+
+    @pytest.mark.anyio
     async def test_can_exclude_business_assets(self):
         model = make_model()
         project = make_project()
         snap, _ = _make_exporter_snapshot()
         db = _make_db_for_exporter(model, project)
 
-        with patch("src.governance_exporter.snapshot_model", AsyncMock(return_value=snap)):
+        with patch("src.governance_exporter.consistent_snapshot", AsyncMock(return_value=snap)):
             graph = await build_governance_graph(
                 db,
                 project_id=TEST_PROJECT_ID,
@@ -440,7 +476,7 @@ class TestBuildGovernanceGraph:
         snap, ids = _make_exporter_snapshot()
         db = _make_db_for_exporter(model, project)
 
-        with patch("src.governance_exporter.snapshot_model", AsyncMock(return_value=snap)):
+        with patch("src.governance_exporter.consistent_snapshot", AsyncMock(return_value=snap)):
             graph = await build_governance_graph(
                 db,
                 project_id=TEST_PROJECT_ID,
@@ -463,6 +499,110 @@ class TestBuildGovernanceGraph:
         # Only KPI (and downstream assets, excluded here) yields owner.
         owner_types = {n.object_type for n in graph.nodes if n.owner}
         assert owner_types == {"kpi"}
+
+
+class TestEdgeConsumedBySplit:
+    """Bug-6557: EDGE_CONSUMED_BY must be split into two distinct edge types
+    so downstream lineage consumers can distinguish model-level from
+    column-level consumption."""
+
+    @pytest.mark.anyio
+    async def test_consumed_by_model_and_column_edges(self):
+        """Verify model->asset uses consumed_by_model and asset->column uses
+        consumed_by_column."""
+        model = make_model()
+        project = make_project()
+        snap, ids = _make_exporter_snapshot()
+        db = _make_db_for_exporter(model, project)
+
+        da_id = uuid.uuid4()
+        da = types.SimpleNamespace(
+            id=da_id,
+            model_id=TEST_MODEL_ID,
+            asset_name="Power BI Report",
+            asset_type="report",
+            asset_url="https://example.com/report",
+            owner="analyst@example.com",
+            notes="Main dashboard",
+            created_at=NOW,
+        )
+
+        # Mock downstream asset queries. The exporter calls db.execute twice
+        # in the downstream-asset section: once for the assets, once for the
+        # column links. We need to intercept both.
+        da_execute_calls = []
+
+        async def _execute_side_effect(stmt, *a, **kw):
+            da_execute_calls.append(stmt)
+            call_idx = len(da_execute_calls)
+            if call_idx == 1:
+                # First call in downstream block: DownstreamAsset query
+                result = MagicMock()
+                result.scalars.return_value.all.return_value = [da]
+                return result
+            elif call_idx == 2:
+                # Second call: column link query
+                result = MagicMock()
+                result.all.return_value = [
+                    (da_id, uuid.UUID(ids["visible_col"])),
+                ]
+                return result
+            # Default (should not reach here)
+            result = MagicMock()
+            result.scalars.return_value.all.return_value = []
+            result.all.return_value = []
+            return result
+
+        db.execute = AsyncMock(side_effect=_execute_side_effect)
+
+        with patch("src.governance_exporter.consistent_snapshot", AsyncMock(return_value=snap)):
+            graph = await build_governance_graph(
+                db,
+                project_id=TEST_PROJECT_ID,
+                model_id=TEST_MODEL_ID,
+                project_slug=project.slug,
+                model_slug=model.slug,
+                include_downstream_assets=True,
+                include_business_assets=True,
+                export_draft=True,
+            )
+
+        edge_types = {
+            (e.source_key, e.target_key, e.relationship_type)
+            for e in graph.edges
+        }
+
+        # model -> downstream asset: consumed_by_model
+        da_key = f"downstream.{da_id}"
+        model_key = f"{project.slug}.{model.slug}"
+        model_to_da = [
+            e for e in graph.edges
+            if e.target_key == da_key and e.relationship_type == "consumed_by_model"
+        ]
+        assert len(model_to_da) == 1, (
+            f"Expected one consumed_by_model edge to {da_key}, got {model_to_da}"
+        )
+
+        # downstream asset -> column: consumed_by_column
+        col_key = f"column.{ids['visible_col']}"
+        da_to_col = [
+            e for e in graph.edges
+            if e.source_key == da_key
+            and e.target_key == col_key
+            and e.relationship_type == "consumed_by_column"
+        ]
+        assert len(da_to_col) == 1, (
+            f"Expected one consumed_by_column edge from {da_key}, got {da_to_col}"
+        )
+
+        # The old ambiguous "consumed_by" must not appear.
+        old_consumed_by = [
+            e for e in graph.edges
+            if e.relationship_type == "consumed_by"
+        ]
+        assert old_consumed_by == [], (
+            f"Old ambiguous consumed_by edges still present: {old_consumed_by}"
+        )
 
 
 # ------------------------------------------------------------------ #
@@ -739,6 +879,27 @@ class TestSolidatusSync:
         assert inconsistent_resp.status_code == 422
         assert inconsistent_resp.json()["detail"]["code"] == "inconsistent_solidatus_sync_mode"
 
+    @pytest.mark.anyio
+    async def test_push_mode_rejected_at_api_boundary(self, client):
+        """Bug-5987 (F-030-03): live push always fails (the real Solidatus
+        API contract is unavailable). A direct API caller requesting
+        mode='push' must be rejected up front with a clear 501, not run
+        the full sync cycle only to fail at the final upsert step and
+        return a response with a fabricated run_id."""
+        conn = _make_solidatus_conn()
+        model = make_model()
+        model.deployed_version_id = uuid.uuid4()
+        project = make_project()
+        db = _make_db_for_sync(model, project, conn)
+
+        with patch("src.api.solidatus.get_tenant_db", async_gen_from(db)):
+            resp = await client.post(
+                f"{SOLIDATUS_PREFIX}/sync",
+                json={"connection_id": str(conn.id), "mode": "push"},
+            )
+        assert resp.status_code == 501, resp.text
+        assert resp.json()["detail"]["code"] == "solidatus_push_not_implemented"
+
 
 # ------------------------------------------------------------------ #
 # POST /collibra/sync
@@ -815,3 +976,23 @@ class TestCollibraSync:
         # /export-preview), not rejected with a 422.
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "succeeded"
+
+    @pytest.mark.anyio
+    async def test_push_mode_rejected_at_api_boundary(self, client):
+        """Bug-6027 (sibling of Bug-5987): dry_run defaults to False, so a
+        caller who omits it — or explicitly sets dry_run=False — must be
+        rejected up front with a clear 501 rather than attempt a doomed
+        live push."""
+        conn = _make_collibra_conn()
+        model = make_model()
+        model.deployed_version_id = uuid.uuid4()
+        project = make_project()
+        db = _make_db_for_sync(model, project, conn)
+
+        with patch("src.api.collibra.get_tenant_db", async_gen_from(db)):
+            resp = await client.post(
+                f"{COLLIBRA_PREFIX}/sync",
+                json={"connection_id": str(conn.id)},  # dry_run omitted -> defaults False
+            )
+        assert resp.status_code == 501, resp.text
+        assert resp.json()["detail"]["code"] == "collibra_push_not_implemented"

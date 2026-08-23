@@ -12,6 +12,7 @@ Role requirements:
 """
 from __future__ import annotations
 
+import logging
 import secrets
 from datetime import datetime, timezone
 from uuid import UUID
@@ -32,6 +33,7 @@ from shared.db.models import (
     AggregateDefinition,
     AggregateLifecycleEvent,
     AggregateRefreshPolicy,
+    DataTarget,
     Dimension,
     Join,
     Measure,
@@ -41,6 +43,7 @@ from shared.db.models import (
     UserDefinedAttribute,
 )
 from shared.db.session import get_tenant_db
+from shared.schemas.domains.aggregates_security import USER_SETTABLE_AGGREGATE_STATUSES
 from shared.schemas.pydantic_models import (  # noqa: F401
     AggregateDefinitionCreate,
     AggregateDefinitionResponse,
@@ -52,8 +55,11 @@ from shared.semantic.grain_resolver import (
     resolve_aggregate_layout,
 )
 from shared.semantic.redundant_partner import compute_redundant_partners
+from src.api._scope import ensure_ref_in_model
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}/aggregates",
@@ -61,13 +67,19 @@ router = APIRouter(
 )
 
 
-async def _enforce_max_aggregates(db, model_id: UUID) -> None:
-    """
-    If the model is at its max_aggregates cap, retire the lowest-scored active aggregate.
+async def _enforce_max_aggregates(
+    db, model_id: UUID
+) -> list[AggregateDefinition]:
+    """Stage cap victims as non-routable and return them for post-commit purge.
+
+    This function deliberately performs no physical I/O.  Its caller commits
+    the victims' ``retired`` state together with the replacement definition,
+    then drops the returned tables.  A rollback can therefore never restore an
+    ``active`` victim whose external table has already been removed (Bug-8939).
     """
     model = await db.get(Model, model_id)
     if model is None:
-        return
+        return []
     count_result = await db.execute(
         select(func.count()).where(
             AggregateDefinition.model_id == model_id,
@@ -76,13 +88,13 @@ async def _enforce_max_aggregates(db, model_id: UUID) -> None:
     )
     count = count_result.scalar_one()
     if count < model.max_aggregates:
-        return
+        return []
 
     policy = getattr(model, "predictive_eviction_policy", DEFAULT_EVICTION_POLICY)
     if policy not in EVICTION_POLICIES:
         policy = DEFAULT_EVICTION_POLICY
     if policy == "never_evict":
-        return
+        return []
 
     result = await db.execute(
         select(AggregateDefinition).where(
@@ -94,7 +106,8 @@ async def _enforce_max_aggregates(db, model_id: UUID) -> None:
     actives.sort(key=eviction_sort_key(policy))
     to_retire = max(count - model.max_aggregates + 1, 1)
     now = datetime.now(timezone.utc)
-    for agg in actives[:to_retire]:
+    victims = actives[:to_retire]
+    for agg in victims:
         agg.status = "retired"
         agg.retired_at = now
         db.add(
@@ -106,10 +119,42 @@ async def _enforce_max_aggregates(db, model_id: UUID) -> None:
                 payload={"creation_reason": agg.creation_reason},
             )
         )
-        # Retired means the table is actually dropped — reclaim it now.
-        await drop_aggregate_physical_table(agg, db, reason=f"cap_enforcement:{policy}")
-    if actives[:to_retire]:
+    if victims:
         await db.flush()
+    return victims
+
+
+async def _purge_committed_cap_victims(
+    db, victims: list[AggregateDefinition]
+) -> None:
+    """Drop cap victims only after their non-routable state is durable.
+
+    The shared drop helper records the purge stamp and terminal lifecycle event.
+    Those writes are committed separately.  Failure cannot resurrect a victim:
+    its retirement is already durable, and an unstamped physical table remains
+    a storage leak rather than a routable missing-table/data-loss condition.
+    """
+    if not victims:
+        return
+    for agg in victims:
+        try:
+            await drop_aggregate_physical_table(
+                agg, db, reason="cap_enforcement"
+            )
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            logger.warning(
+                "Bug-8939: post-commit purge of cap victim %s failed: %s",
+                agg.id,
+                exc,
+            )
+    try:
+        await db.commit()
+    except Exception as exc:  # pragma: no cover - terminal evidence retry path
+        await db.rollback()
+        logger.warning(
+            "Bug-8939: purge evidence commit failed after cap retirement: %s",
+            exc,
+        )
 
 
 @router.post(
@@ -128,7 +173,36 @@ async def create_aggregate(
         model = await db.get(Model, model_id)
         if model is None or model.project_id != project_id:
             raise HTTPException(status_code=404, detail="Model not found")
-        await _enforce_max_aggregates(db, model_id)
+
+        # Bug-8026 (API half): ``target_id`` is a NOT NULL body foreign key to
+        # ``data_targets`` and was written straight into the definition. RBAC
+        # only proves the CALLER may act in the PATH project; nothing proved
+        # the submitted target belonged to it. A foreign target_id therefore
+        # pointed this aggregate's materialisation — a CREATE TABLE AS plus
+        # every scheduled refresh — at ANOTHER PROJECT'S warehouse connection,
+        # writing this model's data through credentials the caller has no
+        # rights to (DataTarget.project_connection_id).
+        #
+        # The optimizer's twin lifecycle boundary
+        # (services/optimizer/src/lifecycle/creator.py:create_aggregate) has
+        # validated this since Bug-8026; only the model-service API path was
+        # left open. This closes it with the canonical primitive, which proves
+        # project -> model -> target in one query rather than the optimizer's
+        # two-step get-then-compare.
+        #
+        # It runs with the rest of request validation BEFORE cap retirement.
+        # Even though Bug-8939 now defers the physical DROP until after the
+        # retirement commit, a refused request must not mutate a victim at all.
+        await ensure_ref_in_model(
+            db,
+            DataTarget,
+            ref_id=body.target_id,
+            model_id=model_id,
+            project_id=project_id,
+            field_name="target_id",
+            required=True,
+            noun="a data target",
+        )
 
         # Resolve the grain + measures before touching the DB so we can
         # reject inconsistent definitions with a clean 400 and persist the
@@ -191,9 +265,30 @@ async def create_aggregate(
                 else:
                     st = "calculated"
                 measure_specs.append((m.name, st, st))
-            elif not m.is_additive:
-                measure_specs.append((m.name, "count_distinct", "count_distinct"))
             else:
+                # Bug-8257: the stored stat type is the measure's OWN
+                # aggregation, never a stand-in derived from ``is_additive``.
+                #
+                # This branch used to read ``elif not m.is_additive: ->
+                # count_distinct``, which conflated two unrelated things: WHICH
+                # statistic to materialise, and WHETHER the stored statistic may
+                # be rolled up to a coarser grain. Only the first belongs here.
+                # A measure declared non-additive with ``default_agg='max'``
+                # stored a COUNT(DISTINCT) column that nothing ever asks for, so
+                # the aggregate could never serve the measure at all; and once
+                # ``is_additive`` is correctly coerced for avg/min/max/quantile
+                # measures, EVERY such aggregate would have silently become a
+                # count-distinct aggregate.
+                #
+                # Roll-up safety is a SEPARATE question, decided at serve time
+                # by ``aggregate_matcher.compute_has_non_additive`` — which
+                # forces an EXACT-grain match for a non-additive measure — never
+                # by which columns exist. (That function short-circuits on the
+                # flag before consulting the routing registry; the consequences
+                # of that are an open decision, see
+                # docs/questions/questions_measure-additivity-vs-rollup.md.)
+                # Either way, dropping the conflation here cannot let a stored
+                # statistic be re-aggregated where it must not be.
                 agg_fn = (m.default_agg or "sum").lower()
                 measure_specs.append((m.name, agg_fn, agg_fn))
 
@@ -292,6 +387,13 @@ async def create_aggregate(
                     },
                 )
 
+        # Bug-8939: every rejectable property above is validated before the cap
+        # transition is even selected.  The helper stages the victim as retired
+        # but performs no external DROP.  The metadata commit below makes that
+        # non-routable transition durable together with the replacement; only
+        # then may the physical table be removed and terminal evidence written.
+        cap_victims = await _enforce_max_aggregates(db, model_id)
+
         # Auto-generate physical_table_name from model seed
         seed = model.seed or secrets.token_hex(6)
         suffix = secrets.token_hex(4)
@@ -332,11 +434,30 @@ async def create_aggregate(
         # reads to know an exact-grain MEDIAN/STDDEV query can be served here.
         # Added once per numeric (sum/avg) measure, deduped by measure.
         if body.include_quantiles or body.include_stats:
-            from shared.aggregate_quantiles import QUANTILE_STAT_TYPES
+            # Bug-5891: only the routable percentile subset (p50 today) gets a
+            # coverage row. Non-median percentiles are NOT registered because SQL
+            # routing cannot reach them yet — registering them would create
+            # coverage rows the refresh materialises into dead columns. See
+            # shared.aggregate_quantiles.ROUTABLE_QUANTILE_STAT_TYPES.
+            from shared.aggregate_quantiles import (
+                ROUTABLE_QUANTILE_STAT_TYPES,
+                QUANTILE_STAT_TYPES,
+            )
             from shared.aggregate_stats import STAT_TYPES
             _extra: list[str] = []
             if body.include_quantiles:
-                _extra += QUANTILE_STAT_TYPES
+                _extra += ROUTABLE_QUANTILE_STAT_TYPES
+                _deferred = [
+                    s for s in QUANTILE_STAT_TYPES
+                    if s not in ROUTABLE_QUANTILE_STAT_TYPES
+                ]
+                if _deferred:
+                    logger.info(
+                        "Aggregate %s: include_quantiles requested; materialising "
+                        "only routable percentiles %s. Non-median percentiles %s "
+                        "are deferred pending Bug-5891 (sql_parser/binder routing).",
+                        agg.id, ROUTABLE_QUANTILE_STAT_TYPES, _deferred,
+                    )
             if body.include_stats:
                 _extra += STAT_TYPES
             _seen: set = set()
@@ -369,6 +490,7 @@ async def create_aggregate(
         ))
 
         await db.commit()
+        await _purge_committed_cap_victims(db, cap_victims)
         await db.refresh(agg)
         resp = AggregateDefinitionResponse.model_validate(agg)
         if _variant_measure_names:
@@ -398,11 +520,54 @@ async def list_aggregates(
             )
         )
         aggs = result.scalars().all()
+        if not aggs:
+            return []
+
+        agg_ids = [a.id for a in aggs]
+
+        # Bug-6554: batch measure-name and AI-rationale queries instead of
+        # issuing ~2 per aggregate on a thrice-polled endpoint.
+        # 1) Batch load all AggregateColumns + their measures in one query.
+        from sqlalchemy.orm import selectinload
+        cols_result = await db.execute(
+            select(AggregateColumn)
+            .options(selectinload(AggregateColumn.measure))
+            .where(AggregateColumn.aggregate_definition_id.in_(agg_ids))
+        )
+        all_cols = cols_result.scalars().all()
+        measure_names_by_agg: dict[UUID, list[str]] = {aid: [] for aid in agg_ids}
+        seen_by_agg: dict[UUID, set[str]] = {aid: set() for aid in agg_ids}
+        for col in all_cols:
+            if col.measure is not None and col.measure.name not in seen_by_agg[col.aggregate_definition_id]:
+                measure_names_by_agg[col.aggregate_definition_id].append(col.measure.name)
+                seen_by_agg[col.aggregate_definition_id].add(col.measure.name)
+
+        # 2) Batch load AI rationales for ai-created aggregates in one query.
+        ai_agg_ids = [a.id for a in aggs if a.creation_reason == "ai"]
+        rationale_by_agg: dict[UUID, str | None] = {}
+        if ai_agg_ids:
+            # Get the latest rationale per aggregate_definition_id.
+            rationale_rows = await db.execute(
+                select(
+                    AIAggregateRecommendation.aggregate_definition_id,
+                    AIAggregateRecommendation.rationale,
+                )
+                .where(AIAggregateRecommendation.aggregate_definition_id.in_(ai_agg_ids))
+                .order_by(
+                    AIAggregateRecommendation.aggregate_definition_id,
+                    AIAggregateRecommendation.created_at.desc(),
+                )
+            )
+            for agg_def_id, rationale in rationale_rows.all():
+                # First row per agg_def_id wins (ordered desc by created_at).
+                if agg_def_id not in rationale_by_agg:
+                    rationale_by_agg[agg_def_id] = rationale
+
         responses = []
         for a in aggs:
             resp = AggregateDefinitionResponse.model_validate(a)
-            resp.measure_names = await _get_measure_names(db, a.id)
-            resp.rationale = await _get_ai_rationale(db, a)
+            resp.measure_names = measure_names_by_agg.get(a.id, [])
+            resp.rationale = rationale_by_agg.get(a.id) if a.creation_reason == "ai" else None
             responses.append(resp)
         return responses
 
@@ -448,10 +613,103 @@ async def update_aggregate(
         if a is None or a.model_id != model_id:
             raise HTTPException(status_code=404, detail="Aggregate not found")
 
+        update_values = body.model_dump(exclude_unset=True)
+        # Bug-6549: defence in depth — the AggregateDefinitionUpdate schema
+        # rejects unknown status values at parse time, but guard here too (fail
+        # fast, before touching the row) so a bad status can never reach the
+        # persisted setattr and silently pull the aggregate out of the
+        # routing/refresh paths. An explicit ``null`` is also rejected: status
+        # is a NOT NULL lifecycle column, so a PATCH {"status": null} must fail
+        # closed with 422, never hit a NOT NULL 500.
+        # Bug-6817: only user-settable statuses accepted via API. System-managed
+        # states (invalid, pending) are set directly by internal callers.
+        if (
+            "status" in update_values
+            and update_values["status"] not in USER_SETTABLE_AGGREGATE_STATUSES
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "status must be one of: "
+                    + ", ".join(USER_SETTABLE_AGGREGATE_STATUSES)
+                ),
+            )
+
+        # Bug-7903 (Fable HIGH #1): a status PATCH must NOT lift an aggregate OUT
+        # of a system-managed lifecycle state (``pending``/``invalid``). Those
+        # states mean a refresh is in flight or the physical table is in doubt: the
+        # uniform refresh pending-guard commits ``pending`` before it durably
+        # replaces the target rows, so a user PATCH to ``active`` in that window
+        # would re-open the DG99-CRITICAL-01 window — serving the new physical rows
+        # under the PRIOR run's VERIFIED proof (wrong numbers). Only the refresh
+        # engine may transition out of ``pending``/``invalid`` (restoring the
+        # aggregate to its durable prior status once the new build + manifest +
+        # evidence commit atomically). A user who wants to disable/retire such an
+        # aggregate must wait for the in-flight refresh to settle. Reject with 409.
+        if (
+            "status" in update_values
+            and a.status in ("pending", "invalid")
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Aggregate is in the system-managed '{a.status}' state (a "
+                    "refresh is in progress or the physical table is being rebuilt). "
+                    "Its status cannot be changed until the refresh engine settles "
+                    "it; retry once it returns to 'active' or 'disabled'."
+                ),
+            )
+
+        prev_status = a.status
         prev_stats = a.include_stats
         prev_quantiles = a.include_quantiles
-        for k, v in body.model_dump(exclude_unset=True).items():
+        prev_target_schema = a.target_schema
+        for k, v in update_values.items():
             setattr(a, k, v)
+
+        # The physical location is part of the materialisation's build
+        # identity. Redirecting an active definition to another schema cannot
+        # make the already-built table exist there, so withhold routing until a
+        # refresh rebuilds and verifies the aggregate at the new location.
+        if (
+            "target_schema" in update_values
+            and a.target_schema != prev_target_schema
+        ):
+            a.last_refreshed_at = None
+            a.is_stale = True
+
+        # Bug-6170 enable-path: when an aggregate transitions from disabled
+        # to active, its AggregateRefreshPolicy must be re-enabled and the
+        # aggregate marked stale so the scheduler picks it up for its first
+        # build.  Without this, an AI aggregate enabled via the UI stays
+        # permanently unscheduled because the optimizer created the policy
+        # row with is_enabled=False for disabled aggregates.
+        if prev_status == "disabled" and a.status == "active":
+            policy_result = await db.execute(
+                select(AggregateRefreshPolicy).where(
+                    AggregateRefreshPolicy.aggregate_definition_id == a.id
+                )
+            )
+            policy = policy_result.scalar_one_or_none()
+            if policy is not None:
+                policy.is_enabled = True
+            else:
+                # No policy row exists — create one following the same
+                # pattern as the create endpoint so the scheduler sweep
+                # can schedule this aggregate.
+                default_cron = await get_setting(
+                    "aggregate.default_cron",
+                    tenant_session=db,
+                    project_id=project_id,
+                    model_id=model_id,
+                )
+                db.add(AggregateRefreshPolicy(
+                    aggregate_definition_id=a.id,
+                    refresh_mode="scheduled",
+                    cron_expression=default_cron,
+                    is_enabled=True,
+                ))
+            a.is_stale = True
 
         # The query-router matches against AggregateColumn coverage rows, not
         # the physical table. Flipping include_stats / include_quantiles on the
@@ -460,12 +718,30 @@ async def update_aggregate(
         # the coverage rows in lock-step with the flags, then force a full
         # rebuild so the physical columns match before the router serves any
         # exact-grain stat/quantile query.
-        from shared.aggregate_quantiles import QUANTILE_STAT_TYPES
+        # Bug-5891: ADD only the routable percentile subset (p50 today) so a
+        # newly-enabled include_quantiles never registers a dead non-median
+        # column. REMOVE still uses the full set so turning include_quantiles
+        # off cleans any legacy p90/p95/... coverage rows a prior build left.
+        from shared.aggregate_quantiles import (
+            ROUTABLE_QUANTILE_STAT_TYPES,
+            QUANTILE_STAT_TYPES,
+        )
         from shared.aggregate_stats import STAT_TYPES
 
         add_types: list[str] = []
         if bool(a.include_quantiles) and not prev_quantiles:
-            add_types += QUANTILE_STAT_TYPES
+            add_types += ROUTABLE_QUANTILE_STAT_TYPES
+            _deferred = [
+                s for s in QUANTILE_STAT_TYPES
+                if s not in ROUTABLE_QUANTILE_STAT_TYPES
+            ]
+            if _deferred:
+                logger.info(
+                    "Aggregate %s: include_quantiles enabled; materialising only "
+                    "routable percentiles %s. Non-median percentiles %s deferred "
+                    "pending Bug-5891 (sql_parser/binder routing).",
+                    a.id, ROUTABLE_QUANTILE_STAT_TYPES, _deferred,
+                )
         if bool(a.include_stats) and not prev_stats:
             add_types += STAT_TYPES
         remove_types: set[str] = set()
@@ -566,8 +842,54 @@ async def delete_aggregate(
         a = await db.get(AggregateDefinition, agg_id)
         if a is None or a.model_id != model_id:
             raise HTTPException(status_code=404, detail="Aggregate not found")
+
+        # Bug-9051: deleting the DEFINITION used to leave the materialised table
+        # on the target with nothing left to find it — the definition row was the
+        # only record of its name, target and schema, and the retirement sweep
+        # only enumerates RETIRED definitions, so the storage leaked forever.
+        #
+        # Uses the SAME durable outbox the model/project cascade delete uses
+        # (Bug-8140): the drop identity is captured and persisted INSIDE this
+        # transaction, so it is durable before the owning row disappears, and the
+        # physical DROP happens only after the metadata delete has committed —
+        # the Bug-8126/Bug-9148 stop-routing-before-removal order. A failed drop
+        # leaves a retryable task row, never a routable definition over a missing
+        # table.
+        from shared.physical_cleanup import (
+            PhysicalCleanupIdentityError,
+            attempt_scheduled_physical_cleanup,
+            schedule_model_physical_cleanup,
+        )
+
+        try:
+            await schedule_model_physical_cleanup(
+                db,
+                model_id=model_id,
+                aggregate_definitions=[a],
+                pocket_definitions=[],
+                requested_by="aggregate_delete",
+            )
+        except PhysicalCleanupIdentityError as exc:
+            await db.rollback()
+            logger.error(
+                "Bug-9051: refusing to delete aggregate %s — its physical table "
+                "cannot be safely resolved for cleanup: %s",
+                agg_id, exc,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This aggregate's materialised table cannot be resolved for "
+                    "removal (its target connection is missing or belongs to "
+                    "another project). Deleting the definition now would leave "
+                    "the table behind with nothing left to find it. Repair the "
+                    "target connection and retry."
+                ),
+            ) from exc
+
         await db.delete(a)
         await db.commit()
+        await attempt_scheduled_physical_cleanup(db)
 
 
 async def _get_ai_rationale(db, agg: AggregateDefinition) -> str | None:

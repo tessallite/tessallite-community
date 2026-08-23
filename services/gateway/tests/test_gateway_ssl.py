@@ -54,6 +54,9 @@ def test_generated_lookml_relation_is_conservative_cloud_signature():
 @pytest.mark.asyncio
 async def test_plaintext_looker_startup_is_rejected(monkeypatch):
     monkeypatch.setattr("src.jdbc.server.settings.LOOKER_GATEWAY_ENABLED", True)
+    # This test exercises the LOOKER-specific TLS gate; disable the generic
+    # require-TLS gate (Wave C #2 default) so it does not preempt with 28000.
+    monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_SSL_REQUIRED", False)
     server = PGWireServer()
 
     class Writer:
@@ -96,6 +99,8 @@ async def test_disabled_looker_support_rejects_declared_client_before_auth(monke
 
     monkeypatch.setattr(proto, "read_startup", startup)
     monkeypatch.setattr("src.jdbc.server.settings.LOOKER_GATEWAY_ENABLED", False)
+    # Exercises the Looker-disabled gate, not the generic require-TLS gate.
+    monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_SSL_REQUIRED", False)
     writer = Writer()
     await server._run(object(), writer)
 
@@ -129,6 +134,9 @@ async def test_disabled_lookml_adapter_does_not_block_direct_data_studio_startup
 
     monkeypatch.setattr(proto, "read_startup", startup)
     monkeypatch.setattr("src.jdbc.server.settings.LOOKER_GATEWAY_ENABLED", False)
+    # Not-required scenario: TLS is available/optional here, so a plaintext
+    # Data Studio startup must reach auth (client-kind gating only).
+    monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_SSL_REQUIRED", False)
     monkeypatch.setattr(server, "_authenticate", authenticate)
     writer = Writer()
     await server._run(object(), writer)
@@ -165,6 +173,10 @@ async def test_tls_enabled_allows_plaintext_generic_client_auth(monkeypatch):
 
     monkeypatch.setattr(proto, "read_startup", startup)
     monkeypatch.setattr(server_mod, "_ssl_context", object())
+    # TLS is available but NOT required in this scenario, so a plaintext generic
+    # client must still reach auth (Wave C #2: required is the default; here it is
+    # explicitly relaxed).
+    monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_SSL_REQUIRED", False)
     monkeypatch.setattr(server, "_authenticate", authenticate)
     writer = Writer()
     await server._run(object(), writer)

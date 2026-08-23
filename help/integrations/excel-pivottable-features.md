@@ -47,6 +47,8 @@ Use **Value Filters** on a row or column field to keep only the members whose me
 
 **Label Filters** (begins with, contains, ends with, and their negations) filter members by their caption. Tessallite maps these to SQL `LIKE` / `NOT LIKE` patterns with the wildcards escaped, so a search for a literal percent sign matches that character rather than everything.
 
+One condition per field is supported — which is what Excel's Label Filter dialog offers. To narrow further, apply a label filter to a second field, or combine a label filter with a value filter. If a workbook or a hand-written query ever sends two label conditions joined by *and* / *or* inside a single filter, Tessallite refuses the query with a clear message rather than guessing which rows you meant; a query that would return the wrong number of rows is never run silently.
+
 ---
 
 ## Timeline slicers
@@ -78,6 +80,20 @@ Reference a single PivotTable value from elsewhere in the workbook with `GETPIVO
 Date, geography, and entity hierarchies appear in the field list with working expand/collapse. When you place more than one hierarchy on an axis, Tessallite computes the cross-product of subtotal levels so each subtotal and grand total is correct for additive measures. Non-additive measures (such as a ratio) show a dash in the total row instead of a misleading sum.
 
 ---
+
+## KPIs in a PivotTable
+
+The field list groups each published KPI under a KPI folder with up to four members you can tick: **Value**, **Goal**, **Status**, and **Trend**. Value is the headline number, Goal is the target, and Status and Trend are the governed verdicts.
+
+The important idea is that **Status and Trend are governed**. When you tick Status, the cell does not show the raw business number and it is not a colour Excel guessed. It shows the single traffic-light verdict the model owner defined — a green result is `1`, on-watch is `0`, and off-target is `-1` — the exact same verdict you see on the Tessallite scorecard and in the Excel formula functions. Because a real verdict lives behind the checkbox, Excel can draw the traffic-light icon over it correctly. If a KPI has no target or bands to judge against, Status stays blank rather than inventing a verdict.
+
+A worked example: drop the "Net Revenue" KPI's Value and Status onto a pivot. Value shows the revenue figure; Status shows a single `1`, `0`, or `-1` and a red/amber/green light, matching the scorecard.
+
+A few rules keep the number honest:
+
+- **Status is evaluated for the whole model, not per slice.** You cannot break Status down by a dimension (for example, Status by Region) or put a dimension on the report filter next to it. If you try, Tessallite returns a clear message asking you to remove the breakdown, rather than repeating one model-wide verdict against every region as if it were sliced. To compare regions, use the underlying measure and the model owner's regional KPIs instead.
+- **Value and Goal can sit on a pivot with dimensions** in the normal way — they are ordinary numbers.
+- Each KPI must have a unique name. If two KPIs share the same caption, Tessallite asks the model owner to rename them rather than guess which verdict you meant.
 
 ## Notes and limitations
 

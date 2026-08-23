@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Box, Typography, Chip, Skeleton, TextField, InputAdornment, IconButton,
 } from '@mui/material';
@@ -10,19 +10,25 @@ import {
   RefreshOutlined,
 } from '@mui/icons-material';
 import { tokens } from '../../theme';
-import { getKpis, evaluateKpiBatch, getMeasures } from '../../api/modelService';
-import { buildScorecardKpi } from '../../utils/kpiScorecard';
+import { getKpis, evaluateKpiBatch, getMeasures, reportKpiUsage } from '../../api/modelService';
+import { ApiError } from '../../api/client';
+import { buildScorecardPayload, type EvaluatedScorecardKpi } from '../../utils/kpiScorecard';
 import type { Kpi, KpiBatchResult, Measure } from '../../types/tessallite';
+import { strings, templates } from '../../i18n/strings';
+import { useToast } from '../Toast/ToastProvider';
 
 interface KpiPanelProps {
   projectId: string;
   modelId: string;
   personaId?: string | null;
-  onInsertTable: (headers: string[], rows: (string | number)[][]) => Promise<string | null>;
+  /** Bug-6903: model slug for TESSALLITE.KPI formula scorecard (live refresh). */
+  modelSlug?: string | null;
+  onInsertTable: (headers: string[], rows: (string | number)[][]) => Promise<{ address: string | null; postStepWarning: boolean }>;
   onInsertChart: (headers: string[], rows: (string | number)[][]) => Promise<string | null>;
   onInsertScorecard: (
-    kpis: { id: string; name: string; display_name: string | null; valueMeasureName: string | null; goalMeasureName: string | null; goalLiteral?: number | null; updated_at?: string }[],
+    kpis: EvaluatedScorecardKpi[],
     connectionName: string,
+    modelSlug?: string,
   ) => Promise<string | null>;
   connectionName: string;
 }
@@ -41,13 +47,22 @@ const TREND_ARROWS: Record<string, string> = {
   declining: '\u2193',
 };
 
+const TREND_COLORS: Record<string, string> = {
+  improving: '#2e7d32',
+  // Bug-6368: a stable trend is neutral, not a warning. Rendering it in warning
+  // orange wrongly signalled a problem; use the neutral secondary text colour.
+  stable: tokens.colorTextSecondary,
+  declining: '#d32f2f',
+};
+
 export default function KpiPanel({
-  projectId, modelId, personaId, onInsertTable, onInsertChart, onInsertScorecard, connectionName,
+  projectId, modelId, personaId, modelSlug, onInsertTable, onInsertChart, onInsertScorecard, connectionName,
 }: KpiPanelProps) {
+  const { showToast } = useToast();
   const [kpis, setKpis] = useState<Kpi[]>([]);
-  // F-025-10: the scorecard's Value/Goal columns are CUBEVALUE formulas over
-  // the KPI's value/goal MEASURES — so we must resolve measure id -> technical
-  // name. Without this the scorecard wrote blank Value/Goal cells.
+  // F-025-10 / Bug-6730: scorecard insertions use evaluated literal values by
+  // default, but the payload still resolves technical measure names for the
+  // explicit advanced CUBE-formula paths and for legacy scorecard metadata.
   const [measuresById, setMeasuresById] = useState<Map<string, Measure>>(new Map());
   const [results, setResults] = useState<Map<string, KpiBatchResult>>(new Map());
   const [loading, setLoading] = useState(true);
@@ -58,6 +73,19 @@ export default function KpiPanel({
   const [evalError, setEvalError] = useState<string | null>(null);
   const [filter, setFilter] = useState<FilterMode>('all');
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Bug-7387: 300ms debounce on search input to avoid per-keystroke filter jank.
+  const handleSearchChange = useCallback((value: string) => {
+    setSearch(value);
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    debounceTimerRef.current = setTimeout(() => setDebouncedSearch(value), 300);
+  }, []);
+
+  useEffect(() => () => {
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+  }, []);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -69,7 +97,7 @@ export default function KpiPanel({
       // alongside so the scorecard can resolve value/goal measure names
       // (F-025-10); a measure-load failure must not block KPI display.
       const [kpiList, measureList] = await Promise.all([
-        getKpis(projectId, modelId),
+        getKpis(projectId, modelId, personaId || undefined),
         getMeasures(projectId, modelId, personaId || undefined).catch(() => [] as Measure[]),
       ]);
       setKpis(kpiList);
@@ -86,12 +114,21 @@ export default function KpiPanel({
           }
         } catch {
           // KPIs still render; values are unavailable and the user is told why.
-          setEvalError('KPI values could not be evaluated right now. The list below is current; try refreshing.');
+          setEvalError(strings.kpiPanel.evalError);
         }
       }
       setResults(map);
     } catch (e) {
-      setError('Could not load KPIs. Check your connection.');
+      // Bug-8712: 409 is DEPLOYED_SNAPSHOT_INVALID — the pane asked for the
+      // PUBLISHED definitions and the published version could not be read. Say
+      // so and say what to do; "check your connection" sends the user after the
+      // wrong problem, and falling back to the live draft is the leak this
+      // contract closes.
+      setError(
+        e instanceof ApiError && e.status === 409
+          ? strings.kpiPanel.deployedSnapshotInvalid
+          : strings.kpiPanel.loadError,
+      );
     } finally {
       setLoading(false);
     }
@@ -104,15 +141,15 @@ export default function KpiPanel({
     if (filter === 'certified') {
       list = list.filter(k => k.certification_status === 'certified');
     }
-    if (search.trim()) {
-      const q = search.toLowerCase();
+    if (debouncedSearch.trim()) {
+      const q = debouncedSearch.toLowerCase();
       list = list.filter(k =>
         (k.display_name || k.name).toLowerCase().includes(q) ||
         (k.description || '').toLowerCase().includes(q),
       );
     }
     return list;
-  }, [kpis, filter, search]);
+  }, [kpis, filter, debouncedSearch]);
 
   const grouped = useMemo(() => {
     const groups = new Map<string, Kpi[]>();
@@ -144,7 +181,7 @@ export default function KpiPanel({
 
   const handleInsertTable = useCallback(async (kpi: Kpi) => {
     const r = results.get(kpi.id);
-    const headers = ['KPI', 'Value', 'Goal', 'Status', 'Trend'];
+    const headers = [strings.kpiPanel.headers.kpi, strings.kpiPanel.headers.value, strings.kpiPanel.headers.goal, strings.kpiPanel.headers.status, strings.kpiPanel.headers.trend];
     const row: (string | number)[] = [
       kpi.display_name || kpi.name,
       r?.formatted_value ?? '',
@@ -157,23 +194,86 @@ export default function KpiPanel({
 
   const handleInsertChart = useCallback(async (kpi: Kpi) => {
     const r = results.get(kpi.id);
-    const value = r?.value ?? 0;
-    const goal = r?.goal ?? 0;
-    const headers = ['Metric', kpi.display_name || kpi.name];
+    if (!r || r.value == null || r.goal == null) return;
+    const headers = [strings.kpiPanel.metric, kpi.display_name || kpi.name];
     const rows: (string | number)[][] = [
-      ['Current', value],
-      ['Target', goal],
+      [strings.kpiPanel.currentLabel, r.value],
+      [strings.kpiPanel.targetLabel, r.goal],
     ];
     await onInsertChart(headers, rows);
   }, [results, onInsertChart]);
 
   const handleInsertAllScorecard = useCallback(async () => {
     // F-025-10: resolve each KPI's value/goal measure id to its technical name
-    // (the scorecard CUBEVALUE binds by technical measure name) and carry the
-    // static target literal when a KPI has no goal measure.
-    const payload = kpis.map(k => buildScorecardKpi(k, measuresById));
-    await onInsertScorecard(payload, connectionName);
-  }, [kpis, measuresById, onInsertScorecard, connectionName]);
+    // and carry the static target literal when a KPI has no goal measure.
+    // Bug-6367: route through buildScorecardPayload so this "insert all" path
+    // applies the SAME deprecated-KPI filter as the Report Builder scorecard
+    // path — deprecated KPIs must not be silently written into the scorecard.
+    const payload = buildScorecardPayload(kpis, Array.from(measuresById.values()));
+
+    if (payload.length === 0) {
+      showToast(strings.toasts.noKpisAvailable, 'info');
+      return;
+    }
+
+    // R1 Finding 2: when the panel-load evaluation failed (evalError set),
+    // the results map is empty and the scorecard would contain all-null
+    // values with a misleading success toast. Mirror ReportBuilder's
+    // insert-time evaluation: re-evaluate and abort on failure.
+    let effectiveResults = results;
+    if (evalError) {
+      try {
+        const batchResults = await evaluateKpiBatch(
+          projectId, modelId, payload.map(k => k.id), personaId || undefined,
+        );
+        effectiveResults = new Map<string, KpiBatchResult>();
+        for (const r of batchResults) {
+          effectiveResults.set(r.kpi_id, r);
+        }
+      } catch {
+        showToast(strings.toasts.scorecardInsertionFailed, 'error');
+        return;
+      }
+    }
+
+    // Bug-6730: enrich every KPI with evaluated values from the already-loaded
+    // batch results. The scorecard writes literal values, not workbook
+    // connection-dependent CUBE formulas.
+    const enrichedPayload = payload.map(k => {
+      const ev = effectiveResults.get(k.id);
+      return {
+        ...k,
+        evaluatedValue: ev?.value ?? null,
+        evaluatedGoal: ev?.goal ?? null,
+        evaluatedStatus: ev?.status ?? null,
+      };
+    });
+
+    // Bug-6747: mirror ReportBuilder's error handling, toasts, composite-KPI
+    // notice, undeployed-KPI warning, and usage telemetry (previously absent).
+    try {
+      // Bug-6903: pass model slug for TESSALLITE.KPI formula scorecard.
+      const result = await onInsertScorecard(enrichedPayload, connectionName, modelSlug || undefined);
+      if (result) {
+        showToast(templates.toasts.scorecardInserted(payload.length), 'success');
+
+        // Telemetry: report usage for each KPI in the scorecard.
+        for (const k of payload) {
+          reportKpiUsage(projectId, modelId, k.id, {
+            cell_reference: result, usage_type: 'excel_insert',
+          }).catch(() => {});
+        }
+
+        // R1 Finding 1: the KpiPanel scorecard is always literal (no CUBE
+        // formulas) since Bug-6730, so composite/undeployed CUBE-formula
+        // warnings are not surfaced here — they describe a behavior the
+        // literal scorecard does not have. The ReportBuilder's current
+        // scorecard path (also literal-only) intentionally omits them.
+      }
+    } catch {
+      showToast(strings.toasts.scorecardInsertionFailed, 'error');
+    }
+  }, [kpis, measuresById, results, evalError, onInsertScorecard, connectionName, modelSlug, showToast, projectId, modelId, personaId]);
 
   if (loading) {
     return (
@@ -195,7 +295,7 @@ export default function KpiPanel({
           onClick={fetchData}
           sx={{ fontSize: 12, px: 2, py: 0.75, borderRadius: 1, cursor: 'pointer', border: `1px solid ${tokens.colorPrimary}`, color: tokens.colorPrimary, bgcolor: 'transparent' }}
         >
-          Try again
+          {strings.kpiPanel.tryAgain}
         </Box>
       </Box>
     );
@@ -205,10 +305,10 @@ export default function KpiPanel({
     return (
       <Box sx={{ p: 3, textAlign: 'center' }}>
         <Typography sx={{ fontSize: 14, fontWeight: 600, color: tokens.colorCharcoal, mb: 0.5 }}>
-          No KPIs yet
+          {strings.kpiPanel.noKpisTitle}
         </Typography>
         <Typography sx={{ fontSize: 12, color: tokens.colorTextSecondary }}>
-          Create KPIs in the Tessallite web app, then come back here to view and insert them.
+          {strings.kpiPanel.noKpisDescription}
         </Typography>
       </Box>
     );
@@ -220,16 +320,16 @@ export default function KpiPanel({
       <Box sx={{ px: 1.5, py: 1, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.75 }}>
           <Typography sx={{ fontSize: 13, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-            KPIs ({kpis.length})
+            {templates.kpiPanel.kpiCount(kpis.length)}
           </Typography>
-          <IconButton size="small" onClick={fetchData} title="Refresh KPIs" sx={{ width: 26, height: 26 }}>
+          <IconButton size="small" onClick={fetchData} title={strings.kpiPanel.refreshKpis} sx={{ width: 26, height: 26 }}>
             <RefreshOutlined sx={{ fontSize: 15 }} />
           </IconButton>
           {kpis.length > 0 && (
             <IconButton
               size="small"
               onClick={handleInsertAllScorecard}
-              title="Insert all KPIs as a scorecard table"
+              title={strings.kpiPanel.insertAllScorecard}
               sx={{ width: 26, height: 26, color: tokens.colorGoldDark }}
             >
               <DashboardOutlined sx={{ fontSize: 15 }} />
@@ -238,13 +338,13 @@ export default function KpiPanel({
         </Box>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
           {statusCounts.good > 0 && (
-            <Chip label={`${statusCounts.good} Good`} size="small" sx={{ fontSize: 10, height: 18, bgcolor: 'rgba(46,125,50,0.08)', color: '#2e7d32', fontWeight: 600 }} />
+            <Chip label={templates.kpiPanel.statusCount(statusCounts.good, strings.kpiPanel.good)} size="small" sx={{ fontSize: 10, height: 18, bgcolor: 'rgba(46,125,50,0.08)', color: '#2e7d32', fontWeight: 600 }} />
           )}
           {statusCounts.warning > 0 && (
-            <Chip label={`${statusCounts.warning} Warning`} size="small" sx={{ fontSize: 10, height: 18, bgcolor: 'rgba(237,108,2,0.08)', color: '#ed6c02', fontWeight: 600 }} />
+            <Chip label={templates.kpiPanel.statusCount(statusCounts.warning, strings.kpiPanel.warning)} size="small" sx={{ fontSize: 10, height: 18, bgcolor: 'rgba(237,108,2,0.08)', color: '#ed6c02', fontWeight: 600 }} />
           )}
           {statusCounts.poor > 0 && (
-            <Chip label={`${statusCounts.poor} Poor`} size="small" sx={{ fontSize: 10, height: 18, bgcolor: 'rgba(211,47,47,0.08)', color: '#d32f2f', fontWeight: 600 }} />
+            <Chip label={templates.kpiPanel.statusCount(statusCounts.poor, strings.kpiPanel.poor)} size="small" sx={{ fontSize: 10, height: 18, bgcolor: 'rgba(211,47,47,0.08)', color: '#d32f2f', fontWeight: 600 }} />
           )}
         </Box>
       </Box>
@@ -263,7 +363,7 @@ export default function KpiPanel({
         {(['all', 'certified'] as const).map(f => (
           <Chip
             key={f}
-            label={f === 'all' ? 'All' : 'Certified'}
+            label={f === 'all' ? strings.kpiPanel.filterAll : strings.kpiPanel.filterCertified}
             size="small"
             variant={filter === f ? 'filled' : 'outlined'}
             onClick={() => setFilter(f)}
@@ -275,9 +375,9 @@ export default function KpiPanel({
         ))}
         <TextField
           size="small"
-          placeholder="Search..."
+          placeholder={strings.kpiPanel.searchPlaceholder}
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          onChange={(e) => handleSearchChange(e.target.value)}
           InputProps={{
             startAdornment: (
               <InputAdornment position="start">
@@ -294,7 +394,7 @@ export default function KpiPanel({
       <Box sx={{ flex: 1, overflow: 'auto', px: 1, py: 0.5 }}>
         {filteredKpis.length === 0 ? (
           <Typography sx={{ fontSize: 12, color: tokens.colorTextSecondary, textAlign: 'center', py: 3 }}>
-            No KPIs match your search
+            {strings.kpiPanel.noSearchMatch}
           </Typography>
         ) : (
           grouped.map((group, gi) => (
@@ -333,6 +433,8 @@ interface KpiRowProps {
 function KpiRow({ kpi, result, onInsertTable, onInsertChart }: KpiRowProps) {
   const statusColor = result?.status != null ? STATUS_COLORS[result.status] ?? tokens.colorTextSecondary : tokens.colorTextSecondary;
   const trendArrow = result?.trend_label ? TREND_ARROWS[result.trend_label.toLowerCase()] ?? '' : '';
+  const trendColor = result?.trend_label ? TREND_COLORS[result.trend_label.toLowerCase()] ?? tokens.colorTextSecondary : tokens.colorTextSecondary;
+  const chartAvailable = result != null && result.value != null && result.goal != null;
 
   return (
     <Box sx={{
@@ -352,7 +454,7 @@ function KpiRow({ kpi, result, onInsertTable, onInsertChart }: KpiRowProps) {
           </Typography>
         )}
         {trendArrow && (
-          <Typography sx={{ fontSize: 14, fontWeight: 700, color: statusColor, flexShrink: 0, lineHeight: 1 }}>
+          <Typography sx={{ fontSize: 14, fontWeight: 700, color: trendColor, flexShrink: 0, lineHeight: 1 }}>
             {trendArrow}
           </Typography>
         )}
@@ -361,7 +463,7 @@ function KpiRow({ kpi, result, onInsertTable, onInsertChart }: KpiRowProps) {
       {/* Target line */}
       {result?.formatted_goal && (
         <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, pl: 1.75, mb: 0.5 }}>
-          Target: {result.formatted_goal}
+          {strings.kpiPanel.targetPrefix} {result.formatted_goal}
         </Typography>
       )}
 
@@ -370,7 +472,7 @@ function KpiRow({ kpi, result, onInsertTable, onInsertChart }: KpiRowProps) {
         <Box
           component="button"
           onClick={onInsertTable}
-          title="Insert this KPI as a mini-table in the worksheet"
+          title={strings.kpiPanel.insertTableTitle}
           sx={{
             display: 'flex', alignItems: 'center', gap: 0.4,
             fontSize: 10, fontWeight: 600, px: 0.75, py: 0.35,
@@ -381,23 +483,26 @@ function KpiRow({ kpi, result, onInsertTable, onInsertChart }: KpiRowProps) {
           }}
         >
           <TableChartOutlined sx={{ fontSize: 12 }} />
-          Insert Table
+          {strings.kpiPanel.insertTable}
         </Box>
         <Box
           component="button"
-          onClick={onInsertChart}
-          title="Insert this KPI as a chart comparing value vs target"
+          onClick={chartAvailable ? onInsertChart : undefined}
+          disabled={!chartAvailable}
+          title={chartAvailable ? strings.kpiPanel.insertChartTitle : strings.kpiPanel.evalError}
           sx={{
             display: 'flex', alignItems: 'center', gap: 0.4,
             fontSize: 10, fontWeight: 600, px: 0.75, py: 0.35,
-            borderRadius: 0.75, cursor: 'pointer',
+            borderRadius: 0.75,
+            cursor: chartAvailable ? 'pointer' : 'not-allowed',
             border: `1px solid ${tokens.colorBorderLight}`, bgcolor: 'transparent',
             color: tokens.colorTextSecondary,
-            '&:hover': { bgcolor: tokens.colorPrimaryBg, color: tokens.colorPrimary, borderColor: tokens.colorPrimary },
+            opacity: chartAvailable ? 1 : 0.4,
+            '&:hover': chartAvailable ? { bgcolor: tokens.colorPrimaryBg, color: tokens.colorPrimary, borderColor: tokens.colorPrimary } : {},
           }}
         >
           <BarChartOutlined sx={{ fontSize: 12 }} />
-          Insert Chart
+          {strings.kpiPanel.insertChart}
         </Box>
       </Box>
     </Box>

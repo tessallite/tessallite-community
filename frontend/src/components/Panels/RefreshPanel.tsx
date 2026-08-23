@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useT } from "../../i18n";
@@ -35,6 +35,7 @@ import { aggregatesApi, schedulerApiClient } from "../../api/client";
 import { useAggregates } from "../../api/hooks";
 import { statusColor } from "../../theme/tokens";
 import type { RefreshPolicyCreate, TriggerRefreshResponse } from "../../api/types";
+import { buildAggregateRefreshPolicy } from "../Refresh/policyPayload";
 
 // User-friendly schedule presets — translated to cron behind the scenes.
 const SCHEDULE_PRESETS = [
@@ -67,20 +68,53 @@ export default function RefreshPanel() {
   const [strategy, setStrategy] = useState<"full" | "incremental">("full");
   const [incrCol, setIncrCol] = useState("");
   const [lookback, setLookback] = useState(1);
+  const [fullRebuildInterval, setFullRebuildInterval] = useState<number | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
 
   const aggregates = useAggregates(projectId!, modelId!);
+
+  // Bug-8785 (sibling surface): this dialog opened with component defaults and
+  // never read the persisted policy, so saving any change here wrote
+  // incremental_append_only back from an unhydrated constant and silently
+  // cleared the append-only authority the aggregate already had. The reset in
+  // the open handler stays -- it stops a previously-opened aggregate's values
+  // leaking across -- and the persisted policy overwrites it once loaded.
+  const persistedPolicy = useQuery({
+    queryKey: ["aggregate-refresh-policy", projectId, modelId, policyAggId],
+    enabled: Boolean(policyAggId),
+    // A 404 means no policy is configured yet; the defaults already seeded by
+    // the open handler are then correct, so do not retry or surface an error.
+    retry: false,
+    gcTime: 0,
+    queryFn: () => aggregatesApi.getPolicy(projectId!, modelId!, policyAggId!),
+  });
+
+  useEffect(() => {
+    const p = persistedPolicy.data;
+    if (!policyAggId || !p) return;
+    const incremental = p.refresh_mode === "incremental";
+    // "manual" carries no cron, hence the `in` narrowing.
+    const preset = SCHEDULE_PRESETS.find(
+      (x) => "cron" in x && x.cron === p.cron_expression,
+    );
+    setSchedule((preset?.value ?? "manual") as SchedulePresetValue);
+    setStrategy(incremental ? "incremental" : "full");
+    setIncrCol(p.incremental_column ?? "");
+    setLookback(p.incremental_lookback ?? 1);
+    setFullRebuildInterval(p.full_rebuild_interval_days);
+  }, [policyAggId, persistedPolicy.data]);
 
   const setPolicy = useMutation({
     mutationFn: () => {
       const preset = SCHEDULE_PRESETS.find((p) => p.value === schedule);
       const isManual = !preset || preset.value === "manual";
-      const data: RefreshPolicyCreate = {
-        refresh_mode: isManual ? "manual" : "scheduled",
-        cron_expression: isManual ? undefined : (preset as { cron: string }).cron,
-        incremental_column: strategy === "incremental" && incrCol ? incrCol : undefined,
-        incremental_lookback: strategy === "incremental" ? lookback : undefined,
-      };
+      const data: RefreshPolicyCreate = buildAggregateRefreshPolicy({
+        method: strategy,
+        cron: isManual ? null : (preset as { cron: string }).cron,
+        incrementalColumn: incrCol,
+        lookbackDays: lookback,
+        fullRebuildIntervalDays: fullRebuildInterval,
+      });
       return aggregatesApi.setPolicy(
         projectId!,
         modelId!,
@@ -169,6 +203,7 @@ export default function RefreshPanel() {
                 setStrategy("full");
                 setIncrCol("");
                 setLookback(1);
+                setFullRebuildInterval(null);
               }}
               onTrigger={(m) =>
                 triggerRefresh.mutate({ aggId: agg.id, refreshMode: m })
@@ -220,6 +255,9 @@ export default function RefreshPanel() {
           </FormControl>
           {strategy === "incremental" && (
             <>
+              <Alert severity="info" sx={{ mt: 1 }}>
+                {t("rebuildMethod.appendOnlyNotice")}
+              </Alert>
               <TextField
                 label={t("refresh.columnLabel")}
                 fullWidth
@@ -236,6 +274,19 @@ export default function RefreshPanel() {
                 value={lookback}
                 onChange={(e) => setLookback(Number(e.target.value))}
                 helperText={t("refresh.lookbackHelp")}
+              />
+              <TextField
+                label={t("rebuildMethod.fullRebuildIntervalLabel")}
+                type="number"
+                fullWidth
+                margin="normal"
+                value={fullRebuildInterval ?? ""}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  setFullRebuildInterval(raw === "" ? null : Number(raw));
+                }}
+                inputProps={{ min: 1 }}
+                helperText={t("rebuildMethod.fullRebuildIntervalHelp")}
               />
             </>
           )}

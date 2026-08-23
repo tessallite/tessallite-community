@@ -39,9 +39,9 @@ import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
-import { canEditModelConfig } from "../../auth/currentUser";
-import { useBuilderStore } from "../../store/builderStore";
+import { useCanAuthorModel } from "../../auth/useCanAuthorModel";
 import { measuresApi } from "../../api/client";
+import { recordCreate, recordUpdate, recordDelete } from "../Builder/emitDrawerHistory";
 import DrillThroughSetEditor from "./DrillThroughSetEditor";
 import { useAllModelTables, useDimensions, useFieldCompatibility, useHierarchies, useMeasures, useModelSourceStatistics, useModels, useSources, useTableAttributes } from "../../api/hooks";
 import type {
@@ -73,6 +73,7 @@ import {
   summarizeMeasureCompatibility,
   type MeasureCompatibilitySummary,
 } from "./measureCompatibility";
+import MeasureRenameImpactDialog from "./MeasureRenameImpactDialog";
 
 const AGG_OPTIONS = [
   "sum",
@@ -88,21 +89,16 @@ const MEASURE_TYPES = [
   { value: "calculated", label: "measureType.calculated" },
 ] as const;
 
+// #10: "by_account" is not a supported behaviour and is no longer offered.
 const SEMI_ADDITIVE_OPTIONS: {
   value: SemiAdditiveBehavior;
   label: string;
-  disabled?: boolean;
 }[] = [
   { value: "last_non_empty", label: "semiAdditive.lastNonEmpty" },
   { value: "first_non_empty", label: "semiAdditive.firstNonEmpty" },
   { value: "avg_of_children", label: "semiAdditive.avgOfChildren" },
   { value: "min", label: "semiAdditive.min" },
   { value: "max", label: "semiAdditive.max" },
-  // F-015-06: by_account is not yet supported at query time (per-account
-  // aggregation dispatch is unimplemented and the query rewriter fails loud
-  // on it). Keep the option visible but disabled so modellers are not lured
-  // into a non-functional mode.
-  { value: "by_account", label: "semiAdditive.byAccount", disabled: true },
 ];
 
 const CALC_AGG_MODES = [
@@ -171,10 +167,16 @@ function MeasureCompatibilityTooltip({
 function variantPayload(
   base: Measure,
   plan: VariantCreatePlan,
+  kindLabel?: string,
 ): MeasureCreate {
+  // F-015-15: default the display name from the translated variant label
+  // (e.g. "Revenue (YTD Prior Year)") rather than the raw kind token
+  // ("Revenue (ytd_prior_year)").  The dialog seeds tvDisplay with the same
+  // translated label on kind selection; this keeps the fallback correct even
+  // when tvDisplay is empty at submit or the payload is built via an API path.
   return {
     name: `${base.name}_${plan.kind}`,
-    display_name: `${base.display_name || base.name} (${plan.kind})`,
+    display_name: `${base.display_name || base.name} (${kindLabel ?? plan.kind})`,
     description: base.description ?? null,
     display_folder: base.display_folder ?? null,
     source_table_id: base.source_table_id ?? undefined,
@@ -193,6 +195,43 @@ function variantPayload(
     calendar_model_table_id: base.calendar_model_table_id ?? null,
     hierarchy_id: base.hierarchy_id ?? null,
     date_dimension_column_id: base.date_dimension_column_id ?? null,
+  };
+}
+
+/**
+ * Map a persisted measure to a create-shaped payload so undo/redo can restore
+ * it (Bug-8227). Used to build the inverse op for a delete (re-create) and the
+ * prior-values op for an update.
+ */
+function measureToPayload(m: Measure): Record<string, unknown> {
+  // Use ?? null (not ?? undefined) so undo actively resets a newly-set field
+  // (null->value) back to null via the PATCH, instead of omitting the key and
+  // silently leaving the new value (Fable review finding 3).
+  return {
+    name: m.name,
+    display_name: m.display_name || m.name,
+    description: m.description ?? null,
+    display_folder: m.display_folder ?? null,
+    source_table_id: m.source_table_id ?? null,
+    source_column_name: m.source_column_name ?? null,
+    user_defined_attribute_id: m.user_defined_attribute_id ?? null,
+    measure_type: m.measure_type,
+    expression: m.expression ?? null,
+    calc_agg_mode: m.calc_agg_mode ?? null,
+    default_agg: (m.default_agg as MeasureCreate["default_agg"]) || "sum",
+    data_type: m.data_type,
+    format: m.format,
+    is_additive: m.is_additive,
+    semi_additive_behavior: m.semi_additive_behavior ?? null,
+    semi_additive_account_column_id: m.semi_additive_account_column_id ?? null,
+    variant_kind: m.variant_kind ?? null,
+    variant_of_measure_id: m.variant_of_measure_id ?? null,
+    variant_n: m.variant_n ?? null,
+    calendar_model_table_id: m.calendar_model_table_id ?? null,
+    hierarchy_id: m.hierarchy_id ?? null,
+    date_dimension_column_id: m.date_dimension_column_id ?? null,
+    cross_model_source_model_id: m.cross_model_source_model_id ?? null,
+    cross_model_source_measure_id: m.cross_model_source_measure_id ?? null,
   };
 }
 
@@ -228,10 +267,13 @@ export default function MeasuresPanel() {
   const [measFormat, setMeasFormat] = useState<MeasureFormatToken | "">("");
   const [measAdditive, setMeasAdditive] = useState(true);
   const [measSemiAdditive, setMeasSemiAdditive] = useState<SemiAdditiveBehavior | "">("");
-  const [measSemiAdditiveAccountColId, setMeasSemiAdditiveAccountColId] = useState("");
   const [measCalendarModelTableId, setMeasCalendarModelTableId] = useState("");
   const [measHierarchyId, setMeasHierarchyId] = useState("");
   const [measDateDimColId, setMeasDateDimColId] = useState("");
+  // Bug-6227 (DEC-DATEDIM): the date-dimension column setting stays hidden
+  // until it is actually used (the edited measure already carries a value).
+  // A modeller may manually reveal it, in which case we warn but allow it.
+  const [showDateDimSetting, setShowDateDimSetting] = useState(false);
   const [crossModelSourceModelId, setCrossModelSourceModelId] = useState("");
   const [crossModelSourceMeasureId, setCrossModelSourceMeasureId] = useState("");
   const [expandedDrillId, setExpandedDrillId] = useState<string | null>(null);
@@ -247,9 +289,11 @@ export default function MeasuresPanel() {
   const [tvFormat, setTvFormat] = useState<MeasureFormatToken | "">("");
   const [tvHierarchyId, setTvHierarchyId] = useState("");
   const [tvCalendarModelTableId, setTvCalendarModelTableId] = useState("");
+  const [renameImpact, setRenameImpact] = useState<import("../../api/types").MeasureRenameImpactResponse | null>(null);
+  const [renameImpactLoading, setRenameImpactLoading] = useState(false);
+  const [renameImpactError, setRenameImpactError] = useState<string | null>(null);
 
-  const storeReadOnly = useBuilderStore((s) => s.readOnly);
-  const canEdit = canEditModelConfig() && !storeReadOnly;
+  const canEdit = useCanAuthorModel();
   const measures = useMeasures(projectId!, modelId!);
   const dimensions = useDimensions(projectId!, modelId!);
   const sources = useSources(projectId!, modelId!);
@@ -351,8 +395,7 @@ export default function MeasuresPanel() {
 
   // F-015-23: surface per-kind eligibility inside the time-variant dialog so
   // ineligible kinds are disabled (with their reason) before the modeler fills
-  // the form, rather than failing with a 422 on submit. Reuses the same
-  // /available-variants endpoint the Query-panel VariantPopover consumes.
+  // the form, rather than failing with a 422 on submit.
   const tvAvailableVariants = useQuery({
     queryKey: ["available-variants", projectId, modelId, tvBaseMeasureId],
     queryFn: () =>
@@ -453,10 +496,9 @@ export default function MeasuresPanel() {
       format: measFormat || null,
       is_additive: measAdditive,
       semi_additive_behavior: measSemiAdditive || null,
-      semi_additive_account_column_id:
-        measSemiAdditive === "by_account" && measSemiAdditiveAccountColId
-          ? measSemiAdditiveAccountColId
-          : null,
+      // #10: by_account (the only consumer of the account column) is no longer
+      // authorable, so this is never set from the editor.
+      semi_additive_account_column_id: null,
       calendar_model_table_id: measCalendarModelTableId || null,
       hierarchy_id: measHierarchyId || null,
       date_dimension_column_id: measDateDimColId || null,
@@ -466,9 +508,14 @@ export default function MeasuresPanel() {
   }
 
   const createMeas = useMutation({
-    mutationFn: async () =>
-      measuresApi.create(projectId!, modelId!, buildMeasurePayload()),
-    onSuccess: () => {
+    mutationFn: async () => {
+      const payload = buildMeasurePayload();
+      const created = await measuresApi.create(projectId!, modelId!, payload);
+      return { created, payload };
+    },
+    onSuccess: ({ created, payload }) => {
+      // Bug-8227: record the create so undo removes it / redo re-creates it.
+      recordCreate("measure", created.id, payload as unknown as Record<string, unknown>);
       qc.invalidateQueries({ queryKey: ["measures", projectId, modelId] });
       setDialogOpen(false);
     },
@@ -482,7 +529,7 @@ export default function MeasuresPanel() {
         isParametricVariant(tvKind) && typeof tvN === "number" && tvN > 0
           ? tvN
           : TIME_VARIANT_DEFAULT_N[tvKind] ?? null;
-      const payload = variantPayload(base, { kind: tvKind, n });
+      const payload = variantPayload(base, { kind: tvKind, n }, t(TIME_VARIANT_LABELS[tvKind] ?? tvKind));
       if (tvName) payload.name = tvName;
       if (tvDisplay) payload.display_name = tvDisplay;
       if (tvDescription.trim()) payload.description = tvDescription.trim();
@@ -490,9 +537,13 @@ export default function MeasuresPanel() {
       if (tvFormat) payload.format = tvFormat;
       if (tvHierarchyId) payload.hierarchy_id = tvHierarchyId;
       if (tvCalendarModelTableId) payload.calendar_model_table_id = tvCalendarModelTableId;
-      return measuresApi.create(projectId!, modelId!, payload);
+      const created = await measuresApi.create(projectId!, modelId!, payload);
+      return { created, payload };
     },
-    onSuccess: () => {
+    onSuccess: ({ created, payload }) => {
+      // Bug-8227: time-variant create is a drawer-authored measure create that
+      // must be undoable (Fable review finding 2 — missing history entry).
+      recordCreate("measure", created.id, payload as unknown as Record<string, unknown>);
       qc.invalidateQueries({ queryKey: ["measures", projectId, modelId] });
       setTvDialogOpen(false);
     },
@@ -509,25 +560,75 @@ export default function MeasuresPanel() {
             format: measFormat || null,
           }
         : buildMeasurePayload();
-      return measuresApi.update(
+      // Bug-8227: capture the prior definition BEFORE the write so undo can
+      // PATCH the measure back to its previous field values (S5: undoing a
+      // calculated-measure formula change is the most consequential edit).
+      const prior = (measures.data ?? []).find((m) => m.id === editingMeasureId);
+      const priorPayload = prior ? measureToPayload(prior) : null;
+      await measuresApi.update(
         projectId!,
         modelId!,
         editingMeasureId!,
         payload,
       );
+      return { id: editingMeasureId!, payload, priorPayload };
     },
-    onSuccess: () => {
+    onSuccess: ({ id, payload, priorPayload }) => {
+      if (priorPayload) {
+        recordUpdate(
+          "measure",
+          id,
+          priorPayload,
+          payload as unknown as Record<string, unknown>,
+        );
+      }
       qc.invalidateQueries({ queryKey: ["measures", projectId, modelId] });
       setDialogOpen(false);
       setEditingMeasureId(null);
     },
   });
 
+  async function handleMeasureSave() {
+    const originalName = editingMeasure?.name;
+    const candidate = measName.trim();
+    if (!editingMeasureId || !originalName || candidate === originalName) {
+      updateMeas.mutate();
+      return;
+    }
+    setRenameImpactError(null);
+    setRenameImpactLoading(true);
+    try {
+      const impact = await measuresApi.renameImpact(
+        projectId!,
+        modelId!,
+        editingMeasureId,
+        candidate,
+      );
+      setRenameImpact(impact);
+    } catch (err) {
+      setRenameImpactError(
+        err instanceof Error ? err.message : t("measures.renameImpact.loadFailed"),
+      );
+    } finally {
+      setRenameImpactLoading(false);
+    }
+  }
+
   const deleteMeas = useMutation({
-    mutationFn: (id: string) =>
-      measuresApi.delete(projectId!, modelId!, id),
-    onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ["measures", projectId, modelId] }),
+    // Carry the full measure through so the undo entry can re-create it from
+    // its prior definition after the delete confirms (Bug-8227).
+    mutationFn: async (measure: Measure) => {
+      await measuresApi.delete(projectId!, modelId!, measure.id);
+      return measure;
+    },
+    onSuccess: (measure) => {
+      recordDelete(
+        "measure",
+        measure.id,
+        measureToPayload(measure),
+      );
+      qc.invalidateQueries({ queryKey: ["measures", projectId, modelId] });
+    },
   });
 
   const confirm = useConfirm();
@@ -557,7 +658,7 @@ export default function MeasuresPanel() {
         ),
       confirmLabel: t("measures.deleteMeasureConfirmLabel"),
     });
-    if (ok) deleteMeas.mutate(measure.id);
+    if (ok) deleteMeas.mutate(measure);
   }
 
   function tableLabel(tableId: string | null) {
@@ -584,10 +685,10 @@ export default function MeasuresPanel() {
     setMeasFormat("");
     setMeasAdditive(true);
     setMeasSemiAdditive("");
-    setMeasSemiAdditiveAccountColId("");
     setMeasCalendarModelTableId("");
     setMeasHierarchyId("");
     setMeasDateDimColId("");
+    setShowDateDimSetting(false);
     setCrossModelSourceModelId("");
     setCrossModelSourceMeasureId("");
     setTvBaseMeasureId("");
@@ -640,10 +741,10 @@ export default function MeasuresPanel() {
     setMeasFormat((measure.format as MeasureFormatToken) || "");
     setMeasAdditive(measure.is_additive);
     setMeasSemiAdditive((measure.semi_additive_behavior as SemiAdditiveBehavior) || "");
-    setMeasSemiAdditiveAccountColId(measure.semi_additive_account_column_id ?? "");
     setMeasCalendarModelTableId(measure.calendar_model_table_id ?? "");
     setMeasHierarchyId(measure.hierarchy_id ?? "");
     setMeasDateDimColId(measure.date_dimension_column_id ?? "");
+    setShowDateDimSetting(false);
     setCrossModelSourceModelId(measure.cross_model_source_model_id ?? "");
     setCrossModelSourceMeasureId(measure.cross_model_source_measure_id ?? "");
     createMeas.reset();
@@ -1217,14 +1318,8 @@ export default function MeasuresPanel() {
             >
               <MenuItem value="">{t("semiAdditive.none")}</MenuItem>
               {SEMI_ADDITIVE_OPTIONS.map((opt) => (
-                <MenuItem
-                  key={opt.value}
-                  value={opt.value}
-                  disabled={opt.disabled}
-                >
-                  {opt.disabled
-                    ? `${t(opt.label)} ${t("semiAdditive.notSupportedSuffix")}`
-                    : t(opt.label)}
+                <MenuItem key={opt.value} value={opt.value}>
+                  {t(opt.label)}
                 </MenuItem>
               ))}
             </Select>
@@ -1232,25 +1327,6 @@ export default function MeasuresPanel() {
               {t("measures.semiAdditiveHelp")}
             </FormHelperText>
           </FormControl>
-          {measSemiAdditive === "by_account" && (
-            <FormControl fullWidth margin="dense">
-              <InputLabel>{t("measures.accountColumn")}</InputLabel>
-              <Select
-                value={measSemiAdditiveAccountColId}
-                label={t("measures.accountColumn")}
-                onChange={(e) =>
-                  setMeasSemiAdditiveAccountColId(e.target.value)
-                }
-              >
-                <MenuItem value="">{t("measures.selectColumn")}</MenuItem>
-                {tableAttributes.data?.map((attr) => (
-                  <MenuItem key={attr.id} value={attr.id}>
-                    {attr.is_user_defined ? `fx ${attr.name}` : attr.name}
-                  </MenuItem>
-                ))}
-              </Select>
-            </FormControl>
-          )}
 
           {!isEditingVariant && (
             <>
@@ -1307,6 +1383,119 @@ export default function MeasuresPanel() {
                         </Typography>
                       </FormControl>
                     )}
+                    {/* Bug-6227 (DEC-DATEDIM): the date-dimension column is an
+                        advanced ORDER-BY hint for window variants. It stays
+                        hidden until a measure already uses it; a modeller can
+                        reveal it manually, but we warn first. */}
+                    {(() => {
+                      const dateDimInUse =
+                        !!editingMeasure?.date_dimension_column_id;
+                      if (!dateDimInUse && !showDateDimSetting) {
+                        return (
+                          <Button
+                            size="small"
+                            variant="text"
+                            onClick={() => setShowDateDimSetting(true)}
+                            sx={{ mt: 0.5, pl: 0, textTransform: "none" }}
+                          >
+                            {t("measures.dateDimShowLink")}
+                          </Button>
+                        );
+                      }
+                      // Candidate date columns span BOTH the measure's own
+                      // (fact) table and every date-typed dimension column in
+                      // the model. The stored value can point at either shape:
+                      // a fact-embedded date, or a calendar-alias / date-
+                      // dimension column (which is what the orphan-cascade
+                      // guard matches against). Sourcing from the already-
+                      // loaded dimensions list keeps the picker and the label
+                      // map correct across tables without extra fetches.
+                      const isDateType = (dt?: string | null) =>
+                        /date|timestamp/i.test(dt || "");
+                      const dateColumns: {
+                        id: string;
+                        label: string;
+                      }[] = [];
+                      const seenColIds = new Set<string>();
+                      const pushCol = (id?: string | null, label?: string) => {
+                        if (!id || seenColIds.has(id)) return;
+                        seenColIds.add(id);
+                        dateColumns.push({ id, label: label || id });
+                      };
+                      // Only PHYSICAL columns are valid: date_dimension_column_id
+                      // is FK'd to model_columns.id. User-defined attribute ids
+                      // live in a different namespace and would fail the FK on
+                      // save, so they are excluded here. Hidden physical columns
+                      // are intentionally kept — a deliberately hidden technical
+                      // ordering column is still a valid pick for this setting.
+                      for (const a of tableAttributes.data ?? []) {
+                        if (a.is_user_defined) continue;
+                        if (isDateType(a.data_type)) pushCol(a.id, a.name);
+                      }
+                      for (const d of dimensions.data ?? []) {
+                        if (!d.source_column_id || d.is_hidden) continue;
+                        if (!isDateType(d.data_type) && !d.is_time_dim) continue;
+                        const col = d.source_column_name ?? d.name;
+                        pushCol(
+                          d.source_column_id,
+                          d.source_table_display_name
+                            ? `${d.source_table_display_name}.${col}`
+                            : col,
+                        );
+                      }
+                      const currentEntry = dateColumns.find(
+                        (c) => c.id === measDateDimColId,
+                      );
+                      const currentInList = !measDateDimColId || !!currentEntry;
+                      // Fallback label for a stored value that is neither a
+                      // fact-table date column nor a modelled date dimension
+                      // (rare); the raw id is the last resort.
+                      const currentLabel = currentEntry
+                        ? currentEntry.label
+                        : measDateDimColId;
+                      return (
+                        <>
+                          {showDateDimSetting && !dateDimInUse && (
+                            <Alert severity="warning" sx={{ mt: 1 }}>
+                              {t("measures.dateDimManualWarning")}
+                            </Alert>
+                          )}
+                          <FormControl fullWidth margin="dense">
+                            <InputLabel>
+                              {t("measures.dateDimColumnLabel")}
+                            </InputLabel>
+                            <Select
+                              value={measDateDimColId}
+                              label={t("measures.dateDimColumnLabel")}
+                              onChange={(e) =>
+                                setMeasDateDimColId(e.target.value)
+                              }
+                            >
+                              <MenuItem value="">
+                                {t("common.none")}
+                              </MenuItem>
+                              {measDateDimColId && !currentInList && (
+                                <MenuItem value={measDateDimColId}>
+                                  {currentLabel}
+                                </MenuItem>
+                              )}
+                              {dateColumns.map((c) => (
+                                <MenuItem key={c.id} value={c.id}>
+                                  {c.label}
+                                </MenuItem>
+                              ))}
+                            </Select>
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              sx={{ mt: 0.5 }}
+                            >
+                              {t("measures.dateDimColumnHelp")}
+                            </Typography>
+                          </FormControl>
+                        </>
+                      );
+                    })()}
                   </>
                 );
               })()}
@@ -1398,11 +1587,12 @@ export default function MeasuresPanel() {
             <Button onClick={() => setDialogOpen(false)}>{t("common.cancel")}</Button>
             <Button
               variant="contained"
-              onClick={() => (editingMeasureId ? updateMeas.mutate() : createMeas.mutate())}
+              onClick={() => (editingMeasureId ? void handleMeasureSave() : createMeas.mutate())}
               disabled={
                 !measName ||
                 createMeas.isPending ||
                 updateMeas.isPending ||
+                renameImpactLoading ||
                 (measType === "calculated" &&
                   (!measExpression.trim() ||
                     validationLoading ||
@@ -1413,9 +1603,24 @@ export default function MeasuresPanel() {
                 <CircularProgress size={18} />
               ) : editingMeasureId ? t("common.save") : t("common.add")}
             </Button>
+            {renameImpactError && (
+              <Typography variant="caption" color="error">
+                {renameImpactError}
+              </Typography>
+            )}
           </Box>
         </DialogActions>
       </Dialog>
+
+      <MeasureRenameImpactDialog
+        impact={renameImpact}
+        open={Boolean(renameImpact)}
+        onCancel={() => setRenameImpact(null)}
+        onConfirm={() => {
+          setRenameImpact(null);
+          updateMeas.mutate();
+        }}
+      />
 
       <Dialog open={tvDialogOpen} onClose={() => setTvDialogOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>{t("measures.timeVariant.addTitle")}</DialogTitle>

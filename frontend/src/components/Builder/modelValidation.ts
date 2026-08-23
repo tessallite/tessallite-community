@@ -111,9 +111,10 @@ export function computeStructuralIssues(
   const issues: ValidationIssue[] = [];
   if (tables.length === 0) return issues;
 
-  // Rule 1 — a queryable model needs at least one fact table.
+  // Rule 1 — a multi-table model needs one declared fact anchor. A
+  // single-table model is implicitly fact at deploy (Bug-8614).
   const hasFact = tables.some((tb) => tb.table_type === "fact");
-  if (!hasFact) {
+  if (tables.length > 1 && !hasFact) {
     issues.push({
       id: "struct-no-fact-table",
       severity: "warning",

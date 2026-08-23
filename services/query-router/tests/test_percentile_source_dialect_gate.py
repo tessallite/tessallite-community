@@ -52,8 +52,9 @@ async def test_spark_cross_engine_gate_is_not_exact():
 
 
 async def test_unresolvable_source_returns_none():
-    # resolve_source_connection raising (e.g. multi-source) → None so the caller
-    # falls back to the target dialect rather than crashing the route.
+    # resolve_source_connection raising (e.g. multi-source) → None. The router
+    # gate then fails CLOSED (Bug-6095) and routes the percentile query to
+    # source rather than assuming the target dialect's exactness.
     from src.routing.router import _resolve_aggregate_source_dialect
 
     agg = types.SimpleNamespace(model_id="model-1")
@@ -62,6 +63,16 @@ async def test_unresolvable_source_returns_none():
         new=AsyncMock(side_effect=ValueError("multiple sources")),
     ):
         assert await _resolve_aggregate_source_dialect(agg, AsyncMock()) is None
+
+
+def test_unresolved_source_gate_fails_closed():
+    # Bug-6095: when the SOURCE dialect is unresolved (None), the exactness gate
+    # must NOT fall open to the target dialect. quantile_materialization_is_exact
+    # must return False for a None source even against an exact target, so the
+    # router routes the exact-semantics percentile query to source.
+    assert not quantile_materialization_is_exact(None, "postgresql")
+    assert not quantile_materialization_is_exact(None, "bigquery")
+    assert not quantile_materialization_is_exact(None, None)
 
 
 async def test_missing_model_id_returns_none():

@@ -16,6 +16,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 
 const getPredictivePreviewMock = vi.fn();
 const runPredictiveBuildMock = vi.fn();
+const getPredictiveBuildStatusMock = vi.fn();
 const grainSuggestionsMock = vi.fn();
 
 vi.mock("../../api/client", () => ({
@@ -24,6 +25,8 @@ vi.mock("../../api/client", () => ({
       getPredictivePreviewMock(...args),
     runPredictiveBuild: (...args: unknown[]) =>
       runPredictiveBuildMock(...args),
+    getPredictiveBuildStatus: (...args: unknown[]) =>
+      getPredictiveBuildStatusMock(...args),
   },
   hierarchiesApi: {
     grainSuggestions: (...args: unknown[]) => grainSuggestionsMock(...args),
@@ -48,7 +51,7 @@ const CANDIDATE = {
   fact_table: "public.sales",
   score: 0.87,
   score_pct: 100,
-  expected_hit_rate: 0.62,
+  heuristic_reuse_score: 0.62,
   row_reduction: 50000,
   estimated_rows: 1200,
   rationale: "Low-cardinality grain (50000× reduction)",
@@ -74,11 +77,17 @@ function renderPanel(props: { requiresApproval?: boolean } = {}) {
 
 describe("PredictiveAggregatesPanel", () => {
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     getPredictivePreviewMock.mockReset();
     runPredictiveBuildMock.mockReset();
+    getPredictiveBuildStatusMock.mockReset();
     grainSuggestionsMock.mockReset();
     grainSuggestionsMock.mockResolvedValue([]);
     mockIsTenantAdmin = true;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("renders the candidate table with rationale", async () => {
@@ -153,21 +162,30 @@ describe("PredictiveAggregatesPanel", () => {
     ).toBeInTheDocument();
   });
 
-  it("approves a selected candidate: Build selected sends its grain and measures", async () => {
+  it("approves a selected candidate: Build selected sends its grain and measures (async 202 contract)", async () => {
     getPredictivePreviewMock.mockResolvedValue({
       model_id: "model-1",
       candidates: [CANDIDATE],
     });
+    // Backend returns 202 Accepted with build_id
     runPredictiveBuildMock.mockResolvedValue({
       model_id: "model-1",
+      build_id: "build-abc",
+      status: "running",
+    });
+    // Status poll returns completed result
+    getPredictiveBuildStatusMock.mockResolvedValue({
+      model_id: "model-1",
+      build_id: "build-abc",
       requested: 1,
       created_aggregate_ids: ["agg-1"],
       skipped_count: 0,
       errors: [],
+      status: "completed",
     });
 
     renderPanel({ requiresApproval: true });
-    const user = userEvent.setup();
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
 
     await screen.findByText("public.sales");
     const checkboxes = screen.getAllByRole("checkbox");
@@ -182,7 +200,14 @@ describe("PredictiveAggregatesPanel", () => {
         { grain: ["region", "month"], measure_names: ["total_sales"] },
       ]);
     });
-    // the result summary surfaces to the user
+
+    // Advance time to trigger the polling callback
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // the result summary surfaces to the user after polling
+    await waitFor(() => {
+      expect(getPredictiveBuildStatusMock).toHaveBeenCalledWith("model-1", "build-abc");
+    });
     expect(
       await screen.findByText(/requested 1, created 1, skipped 0/i),
     ).toBeInTheDocument();
@@ -196,22 +221,120 @@ describe("PredictiveAggregatesPanel", () => {
     });
     runPredictiveBuildMock.mockResolvedValue({
       model_id: "model-1",
+      build_id: "build-xyz",
+      status: "running",
+    });
+    getPredictiveBuildStatusMock.mockResolvedValue({
+      model_id: "model-1",
+      build_id: "build-xyz",
       requested: 0,
       created_aggregate_ids: [],
       skipped_count: 0,
       errors: [],
       had_stats: false,
+      status: "completed",
     });
 
     renderPanel();
-    const user = userEvent.setup();
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
 
     await screen.findByText("public.sales");
     await user.click(screen.getByRole("button", { name: /build all/i }));
 
+    // Advance time to trigger polling
+    await vi.advanceTimersByTimeAsync(2000);
+
     expect(
       await screen.findByText(/No source statistics have been collected/i),
     ).toBeInTheDocument();
+  });
+
+  // Bug-7091 consumer: a ceiling-trimmed build succeeds (status "completed")
+  // with created_aggregate_ids=[] and no errors. Without surfacing
+  // governance_notes the operator sees a bare success with zero aggregates and
+  // no reason. The notice must render as informational (not an error), and it
+  // must NOT be swallowed just because errors is empty.
+  it("surfaces governance_notes on a ceiling-trimmed build (0 created, no error)", async () => {
+    getPredictivePreviewMock.mockResolvedValue({
+      model_id: "model-1",
+      candidates: [CANDIDATE],
+      had_stats: true,
+    });
+    runPredictiveBuildMock.mockResolvedValue({
+      model_id: "model-1",
+      build_id: "build-gov",
+      status: "running",
+    });
+    getPredictiveBuildStatusMock.mockResolvedValue({
+      model_id: "model-1",
+      build_id: "build-gov",
+      requested: 2,
+      created_aggregate_ids: [],
+      skipped_count: 0,
+      errors: [],
+      had_stats: true,
+      status: "completed",
+      governance_notes: [
+        "Aggregate agg_region_month trimmed: projected 2.1 GB exceeds the 1 GB byte ceiling.",
+      ],
+    });
+
+    renderPanel();
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+
+    await screen.findByText("public.sales");
+    await user.click(screen.getByRole("button", { name: /build all/i }));
+    await vi.advanceTimersByTimeAsync(2000);
+
+    await waitFor(() => {
+      expect(getPredictiveBuildStatusMock).toHaveBeenCalledWith("model-1", "build-gov");
+    });
+
+    // The governance notice renders as an informational alert with the reason.
+    const notice = await screen.findByTestId("predictive-governance-notes");
+    expect(notice).toBeInTheDocument();
+    expect(
+      screen.getByText(/exceeds the 1 GB byte ceiling/i),
+    ).toBeInTheDocument();
+    // The success summary still shows (this is not an error path).
+    expect(
+      screen.getByText(/requested 2, created 0, skipped 0/i),
+    ).toBeInTheDocument();
+  });
+
+  it("does not render the governance notice when there are no governance_notes", async () => {
+    getPredictivePreviewMock.mockResolvedValue({
+      model_id: "model-1",
+      candidates: [CANDIDATE],
+      had_stats: true,
+    });
+    runPredictiveBuildMock.mockResolvedValue({
+      model_id: "model-1",
+      build_id: "build-clean",
+      status: "running",
+    });
+    getPredictiveBuildStatusMock.mockResolvedValue({
+      model_id: "model-1",
+      build_id: "build-clean",
+      requested: 1,
+      created_aggregate_ids: ["agg-1"],
+      skipped_count: 0,
+      errors: [],
+      had_stats: true,
+      status: "completed",
+    });
+
+    renderPanel();
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+
+    await screen.findByText("public.sales");
+    await user.click(screen.getByRole("button", { name: /build all/i }));
+    await vi.advanceTimersByTimeAsync(2000);
+
+    await screen.findByText(/requested 1, created 1, skipped 0/i);
+    expect(
+      screen.queryByTestId("predictive-governance-notes"),
+    ).not.toBeInTheDocument();
   });
 
   it("non-admin (modeler) sees the candidates read-only — no build controls, no 403 (review F-1)", async () => {

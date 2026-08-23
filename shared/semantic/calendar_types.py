@@ -58,8 +58,58 @@ def is_valid_calendar_type(value: str | None) -> bool:
     return normalize_calendar_type(value) in CALENDAR_TYPES
 
 
+# Bug-5920: calendar types whose DDL emitter needs an optional runtime
+# dependency. ``hijri`` requires the ``hijri-converter`` package (see
+# ``shared/semantic/calendar_dialects.py:_emit_hijri``) — Gregorian calendar
+# arithmetic alone cannot produce Hijri dates. ``hijri-converter`` is now a
+# shipped dependency (pinned in ``shared/pyproject.toml`` and installed by
+# each service Dockerfile), so the type is available in a standard deployment;
+# availability is still re-checked at call time via ``find_spec`` so a stripped
+# build that drops the package degrades gracefully instead of failing inside
+# the DDL emitter. Keep this list in sync with any type whose emitter has an
+# optional import.
+_OPTIONAL_DEPENDENCY_TYPES: dict[str, str] = {
+    "hijri": "hijri_converter",
+}
+
+
+def _dependency_available(module_name: str) -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec(module_name) is not None
+
+
+def available_calendar_types() -> frozenset[str]:
+    """Canonical calendar types that can actually be materialised in this
+    deployment right now.
+
+    Bug-5920: the API previously validated ``calendar_type`` against the
+    full ``CALENDAR_TYPES`` vocabulary and only failed at DDL-emission time
+    with a developer-oriented "pip install hijri-converter" message — the
+    frontend compensated with a separate hardcoded ``HIJRI_AVAILABLE``
+    flag that could drift from backend reality. This function is the
+    single source of truth both sides should consult: it re-checks the
+    optional dependency at call time, so installing the package makes the
+    type available everywhere without a code change.
+    """
+    return frozenset(
+        t for t in CALENDAR_TYPES
+        if t not in _OPTIONAL_DEPENDENCY_TYPES
+        or _dependency_available(_OPTIONAL_DEPENDENCY_TYPES[t])
+    )
+
+
+def is_available_calendar_type(value: str | None) -> bool:
+    """True when *value* is both canonical and available in this deployment."""
+    if value is None:
+        return False
+    return normalize_calendar_type(value) in available_calendar_types()
+
+
 __all__ = [
     "CALENDAR_TYPES",
     "normalize_calendar_type",
     "is_valid_calendar_type",
+    "available_calendar_types",
+    "is_available_calendar_type",
 ]

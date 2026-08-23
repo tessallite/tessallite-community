@@ -1,4 +1,5 @@
 import asyncio
+import time
 import pytest
 from shared.cache.result_cache import ResultCache
 
@@ -128,3 +129,91 @@ def test_evict_nonexistent_model_is_safe():
     cache = ResultCache(ttl_seconds=60)
     cache.evict_model("nonexistent-model")  # must not raise
     assert len(cache) == 0
+
+
+# ---------------------------------------------------------------------------
+# Bug-8507 — bounded retention: expired sweep + hard max-entry bound
+# ---------------------------------------------------------------------------
+
+
+def test_result_cache_enforces_a_hard_size_bound():
+    """Bug-8507: unbounded dict grew the process heap without limit.  Inserting
+    more entries than max_entries must trigger eviction so the store stays
+    bounded."""
+    limit = 5
+    cache = ResultCache(ttl_seconds=60, max_entries=limit)
+    for i in range(limit + 20):
+        cache.set((f"model-{i}", "t", "p", f"q-{i}"), {"rows": [i]})
+    assert len(cache) <= limit
+
+
+def test_result_cache_sweeps_expired_entries_on_set():
+    """Bug-8507: an expired entry whose key is never looked up again must be
+    reclaimed by the next insert, not left resident until process restart."""
+    cache = ResultCache(ttl_seconds=60, max_entries=10_000)
+    dead_key = ("model-dead", "t", "p", "q-dead")
+    cache.set(dead_key, {"rows": ["stale"]})
+
+    # Manually expire the entry by backdating its expiry.
+    cache._store[dead_key] = (time.monotonic() - 1, {"rows": ["stale"]})
+
+    # The next insert triggers the sweep.
+    cache.set(("model-live", "t", "p", "q-live"), {"rows": ["fresh"]})
+    assert dead_key not in cache._store, (
+        "expired entry must be swept on the next set(), not left resident"
+    )
+
+
+def test_size_bound_evicts_nearest_to_expiry_first():
+    """The eviction policy removes the entry closest to its TTL deadline
+    (oldest insert under uniform TTL), preserving the freshest entries."""
+    cache = ResultCache(ttl_seconds=300, max_entries=3)
+    k1 = ("m1", "t", "p", "q1")
+    k2 = ("m2", "t", "p", "q2")
+    k3 = ("m3", "t", "p", "q3")
+    k4 = ("m4", "t", "p", "q4")
+
+    cache.set(k1, "first")
+    cache.set(k2, "second")
+    cache.set(k3, "third")
+    # At this point the cache is full (3 entries).
+    cache.set(k4, "fourth")
+    # k1 was the oldest (nearest to expiry) and should have been evicted.
+    assert cache.get(k1) is None, "oldest entry should have been evicted"
+    assert cache.get(k4) is not None, "newest entry must be retained"
+    assert len(cache) <= 3
+
+
+def test_sweep_does_not_remove_live_entries():
+    """The expired-entry sweep must leave entries that are still within their
+    TTL untouched."""
+    cache = ResultCache(ttl_seconds=300, max_entries=10_000)
+    live_key = ("model-live", "t", "p", "q-live")
+    cache.set(live_key, {"rows": ["ok"]})
+
+    # Insert another entry to trigger the sweep.
+    cache.set(("model-other", "t", "p", "q-other"), {"rows": ["also ok"]})
+    assert live_key in cache._store, (
+        "live (non-expired) entry must survive the sweep"
+    )
+
+
+def test_max_entries_constructor_parameter():
+    """The max_entries parameter controls the bound — a smaller bound means
+    fewer entries retained."""
+    cache_small = ResultCache(ttl_seconds=60, max_entries=2)
+    cache_large = ResultCache(ttl_seconds=60, max_entries=100)
+
+    for i in range(10):
+        key = (f"m{i}", "t", "p", f"q{i}")
+        cache_small.set(key, i)
+        cache_large.set(key, i)
+
+    assert len(cache_small) <= 2
+    assert len(cache_large) == 10
+
+
+@pytest.mark.parametrize("max_entries", [0, -1, True, 1.5])
+def test_max_entries_must_be_a_positive_integer(max_entries):
+    with pytest.raises(ValueError, match="positive integer"):
+        ResultCache(max_entries=max_entries)

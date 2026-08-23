@@ -14,6 +14,8 @@ seeded (admin@acme-demo.com / acme-demo). Skipped otherwise — the suite
 is an integration smoke-test, not a unit test.
 """
 import base64
+import os
+import ssl
 import urllib.error
 import urllib.request
 import pytest
@@ -23,6 +25,14 @@ from httpx import AsyncClient
 
 
 _BASIC_CREDS = base64.b64encode(b"admin@acme-demo.com:acme-demo").decode()
+_XMLA_TLS_ENABLED = os.environ.get(
+    "GATEWAY_XMLA_TLS_ENABLED", "true"
+).strip().lower() in {"true", "1", "yes"}
+_XMLA_SCHEME = "https" if _XMLA_TLS_ENABLED else "http"
+_XMLA_BASE_URL = os.environ.get("GATEWAY_XMLA_URL", f"{_XMLA_SCHEME}://localhost:8080")
+_VERIFY_TLS = os.environ.get("GATEWAY_TLS_VERIFY", "false").strip().lower() in {
+    "true", "1", "yes",
+}
 
 
 def _gateway_accepts_seeded_creds() -> bool:
@@ -41,8 +51,11 @@ def _gateway_accepts_seeded_creds() -> bool:
         b'<Properties><PropertyList/></Properties></Discover>'
         b'</soap:Body></soap:Envelope>'
     )
+    context = None
+    if _XMLA_BASE_URL.startswith("https://") and not _VERIFY_TLS:
+        context = ssl._create_unverified_context()
     req = urllib.request.Request(
-        "http://localhost:8080/api/v1/xmla/",
+        f"{_XMLA_BASE_URL.rstrip('/')}/api/v1/xmla/",
         data=body,
         headers={
             "Content-Type": "text/xml; charset=utf-8",
@@ -50,7 +63,7 @@ def _gateway_accepts_seeded_creds() -> bool:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=3, context=context) as resp:
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as exc:
         return exc.code != 401
@@ -125,7 +138,7 @@ async def test_excel_step1_discover_properties(xmla_headers: dict):
     Excel checks for ProviderName, ServerName, ProviderVersion, etc.
     Missing properties cause Excel to abort the wizard.
     """
-    async with AsyncClient(base_url="http://localhost:8080", timeout=30.0) as client:
+    async with AsyncClient(base_url=_XMLA_BASE_URL, timeout=30.0, verify=_VERIFY_TLS) as client:
         body = '''<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
@@ -167,7 +180,7 @@ async def test_excel_step2_discover_datasources(xmla_headers: dict):
     Excel expects ONE datasource representing the server.
     Catalogs (databases) are listed separately via MDSCHEMA_CATALOGS.
     """
-    async with AsyncClient(base_url="http://localhost:8080", timeout=30.0) as client:
+    async with AsyncClient(base_url=_XMLA_BASE_URL, timeout=30.0, verify=_VERIFY_TLS) as client:
         body = '''<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Header>
@@ -211,7 +224,7 @@ async def test_excel_step3_mdschema_catalogs(xmla_headers: dict):
     Excel expects a list of all catalogs/databases the user can access.
     Each catalog corresponds to a tenant in Tessallite.
     """
-    async with AsyncClient(base_url="http://localhost:8080", timeout=30.0) as client:
+    async with AsyncClient(base_url=_XMLA_BASE_URL, timeout=30.0, verify=_VERIFY_TLS) as client:
         body = '''<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Header>
@@ -257,7 +270,7 @@ async def test_excel_step4_begin_session(xmla_headers: dict):
     Excel establishes a session at the start and echoes the SessionId
     in all subsequent requests.
     """
-    async with AsyncClient(base_url="http://localhost:8080", timeout=30.0) as client:
+    async with AsyncClient(base_url=_XMLA_BASE_URL, timeout=30.0, verify=_VERIFY_TLS) as client:
         body = '''<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Header>
@@ -314,7 +327,7 @@ async def test_excel_catalog_routing(xmla_headers: dict):
     Properties. The gateway should route to the corresponding model.
     Uses the seeded ``modely`` catalog for the acme-demo tenant.
     """
-    async with AsyncClient(base_url="http://localhost:8080", timeout=30.0) as client:
+    async with AsyncClient(base_url=_XMLA_BASE_URL, timeout=30.0, verify=_VERIFY_TLS) as client:
         body = '''<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
@@ -346,7 +359,7 @@ async def test_excel_bogus_catalog_returns_fault(xmla_headers: dict):
     "catalog not found" message instead of silently accepting the
     connection and deferring the failure until the first MDX query.
     """
-    async with AsyncClient(base_url="http://localhost:8080", timeout=30.0) as client:
+    async with AsyncClient(base_url=_XMLA_BASE_URL, timeout=30.0, verify=_VERIFY_TLS) as client:
         body = '''<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>

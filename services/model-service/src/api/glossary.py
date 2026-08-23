@@ -1,7 +1,7 @@
 """
 Glossary v1 — modeller-curated business term catalog.
 
-Phase 3 + Phase 4 of the semantic-layer plan (docs/architecture/architecture_semantic-layer.md).
+Phase 3 + Phase 4 of the semantic-layer plan (docs/architecture/architecture_solution-detailed-technical-design.md).
 
 Authenticated endpoints (Phase 3):
   GET    /projects/{p}/models/{m}/glossary                 — list entries
@@ -43,6 +43,12 @@ from fastapi.responses import Response, StreamingResponse
 from jose import JWTError, jwt
 from sqlalchemy import delete, select
 
+from shared.audit.logger import audit_required
+from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
+from shared.auth.service_principal import (
+    SCOPE_GLOSSARY_STATS_REFRESH,
+    create_service_access_token,
+)
 from shared.config.settings import get_settings
 from shared.db.models import (
     Dimension,
@@ -65,6 +71,7 @@ from shared.schemas.pydantic_models import (
     GlossaryBulkApproveResponse,
     GlossaryBulkDeleteRequest,
     GlossaryBulkDeleteResponse,
+    GlossaryCsvImportRequest,
     GlossaryEntryCreate,
     GlossaryEntryResponse,
     GlossaryEntryUpdate,
@@ -72,6 +79,7 @@ from shared.schemas.pydantic_models import (
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
 from src.api._scope import ensure_model_in_project
+from src.api._model_lock import acquire_model_definition_lock
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +96,24 @@ _GLOSSARY_BOOTSTRAP_TASKS: set[asyncio.Task] = set()
 # Bounds on the durable job table so it cannot grow without limit.
 _JOB_TTL = timedelta(hours=24)        # completed/failed rows expire after this
 _JOB_RETENTION_PER_MODEL = 20         # keep at most this many recent rows/model
+
+# Bug-6265: terminal states a bootstrap job can rest in. Anything else is
+# in-flight and expected to keep advancing (its ``updated_at`` bumps on each
+# phase transition).
+_JOB_TERMINAL_STATES = frozenset({"completed", "failed"})
+
+# Bug-6265: stale-job watchdog. The bootstrap runs as a fire-and-forget asyncio
+# task; a process restart or a Cloud Run CPU throttle can kill it mid-run,
+# leaving the durable row wedged in a non-terminal state forever while the panel
+# polls indefinitely. A job whose ``updated_at`` has not advanced within this
+# window is considered dead and is failed at read time.
+#
+# Bug-6812: raised from 15 to 30 minutes. The "generating_glossary" phase makes
+# serial LLM calls (one per dimension/measure without a glossary entry) and can
+# exceed 15 min on large models with slow providers. Each phase transition
+# bumps ``updated_at``, so a truly stuck job will still be caught — only a job
+# that makes zero progress for 30 continuous minutes is failed.
+_JOB_STALE_TIMEOUT = timedelta(minutes=30)
 
 router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}/glossary",
@@ -108,15 +134,16 @@ def _coerce_user_uuid(user_id: Any) -> Optional[UUID]:
 
 
 def _mint_glossary_service_token(tenant_id: str) -> str:
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": "glossary-bootstrap-service",
-        "tenant_id": tenant_id,
-        "role": "tenant_admin",
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=30)).timestamp()),
-    }
-    return jwt.encode(payload, _settings.JWT_SECRET_KEY, algorithm=_settings.JWT_ALGORITHM)
+    # Bug-7758: use the minimum-privilege role for glossary operations.
+    # The previous "tenant_admin" role could grant broader access than
+    # intended if any route guard checks only role and not scope.
+    return create_service_access_token(
+        principal="glossary-bootstrap-service",
+        tenant_id=tenant_id,
+        role="modeler",
+        ttl_minutes=30,
+        scopes=[SCOPE_GLOSSARY_STATS_REFRESH],
+    )
 
 
 def _job_response(
@@ -206,20 +233,36 @@ async def _update_bootstrap_job(
     status_value: str,
     message: str | None = None,
     result: GlossaryBootstrapResponse | None = None,
-) -> None:
+) -> bool:
     """Update a job row in its own session (the background task has no request
-    session). No-op if the row was swept away."""
+    session). No-op if the row was swept away.
+
+    Bug-6812: returns False (and skips the write) when the row has already been
+    marked "failed" by the stale-job watchdog. This prevents a still-alive
+    worker from resurrecting a watchdog-failed job to "completed", which would
+    confuse operators and diverge the durable state from the watchdog's
+    decision. The worker should bail out on a False return.
+    """
     async for db in get_tenant_db(tenant_id):
         job = await db.get(GlossaryBootstrapJob, job_id)
         if job is None:
-            return
+            return False
+        # Bug-6812: if the watchdog already failed this job, the worker must
+        # not override that decision. Bail out so the caller can stop work.
+        if job.status == "failed" and status_value != "failed":
+            logger.info(
+                "Bug-6812: glossary job %s already failed by watchdog; "
+                "worker update to %r suppressed", job_id, status_value,
+            )
+            return False
         job.status = status_value
         if message is not None:
             job.message = message
         if result is not None:
             job.result = _serialize_job_result(result)
         await db.commit()
-        return
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +294,15 @@ _FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 
 def _formula_guard(value: Any) -> str:
     text = "" if value is None else str(value)
-    if text and text[0] in _FORMULA_TRIGGERS:
+    # F-018-16: Excel/Sheets evaluate a cell as a formula even when the trigger
+    # character sits behind leading whitespace (" =HYPERLINK(...)"). A
+    # first-character-only test let that through. Probe the value with leading
+    # blanks stripped as well, and still prefix the ORIGINAL text so the quote
+    # neutralises it verbatim.
+    probe = text.lstrip(" \t\r\n\v\f")
+    if (text and text[0] in _FORMULA_TRIGGERS) or (
+        probe and probe[0] in _FORMULA_TRIGGERS
+    ):
         return "'" + text
     return text
 
@@ -400,27 +451,34 @@ async def _run_glossary_bootstrap_job(
 ) -> None:
     service_token = _mint_glossary_service_token(tenant_id)
     try:
-        await _update_bootstrap_job(
+        ok = await _update_bootstrap_job(
             tenant_id, job_id,
             status_value="refreshing_statistics",
             message="Refreshing source statistics before glossary generation.",
         )
+        # Bug-6812: bail out if the watchdog already failed this job
+        if not ok:
+            logger.info("Glossary job %s pre-empted by watchdog; aborting", job_id)
+            return
         await _refresh_source_statistics_background(
             source_ids=source_ids,
             bearer=service_token,
             low_cardinality_threshold=max_distinct,
         )
 
-        await _update_bootstrap_job(
+        ok = await _update_bootstrap_job(
             tenant_id, job_id,
             status_value="generating_glossary",
             message="Generating glossary definitions from refreshed statistics.",
         )
+        if not ok:
+            logger.info("Glossary job %s pre-empted by watchdog; aborting", job_id)
+            return
         job_user = CurrentUser(
             user_id=user_id,
             tenant_id=tenant_id,
             email=email,
-            role="tenant_admin",
+            role="modeler",
             raw_token=service_token,
         )
         setattr(job_user, "_glossary_run_now", True)
@@ -450,8 +508,62 @@ async def _run_glossary_bootstrap_job(
         )
 
 
+async def _validate_attachment_target(
+    db: Any, model_id: UUID, target_type: str, target_id: UUID | None,
+) -> None:
+    """Reject an attachment whose target does not belong to the path model.
+
+    Bug-7253 (CF-018-Fable-F01802): without this guard a modeler authorized
+    for project A could attach an entry to a dimension/measure UUID from
+    project B and use ``proposed_is_hidden`` to hide or unhide a column in a
+    model they have no rights to. ``concept``-type attachments carry no
+    ``target_id`` and are always valid.
+    """
+    if target_type == "concept" or target_id is None:
+        return
+    if target_type == "dimension":
+        dim = await db.get(Dimension, target_id)
+        if dim is None or dim.model_id != model_id:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Attachment target_id does not reference a dimension "
+                    "in this model."
+                ),
+            )
+    elif target_type == "measure":
+        meas = await db.get(Measure, target_id)
+        if meas is None or meas.model_id != model_id:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Attachment target_id does not reference a measure "
+                    "in this model."
+                ),
+            )
+    elif target_type == "column":
+        col = await db.get(ModelColumn, target_id)
+        # Bug-7253 codex-F1: use the same error for nonexistent and foreign
+        # columns to prevent a UUID-existence oracle across projects.
+        reject = col is None
+        if not reject:
+            tbl = await db.get(ModelTable, col.model_table_id)
+            reject = tbl is None or tbl.model_id != model_id
+        if reject:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Attachment target_id does not reference a column "
+                    "in this model."
+                ),
+            )
+
+
 async def _cascade_hidden_to_columns(
-    db: Any, attachments: list[GlossaryAttachment], hidden: bool
+    db: Any,
+    attachments: list[GlossaryAttachment],
+    hidden: bool,
+    model_id: UUID | None = None,
 ) -> int:
     """Flip ``ModelColumn.is_hidden`` for every column an entry attaches to.
 
@@ -468,6 +580,10 @@ async def _cascade_hidden_to_columns(
     still honours a direct ``column`` attachment from the manual-create path),
     then flips the column so hiding propagates everywhere the column surfaces.
 
+    Bug-7253: when ``model_id`` is supplied, only act on targets that belong
+    to the specified model. Targets from other models are silently skipped so
+    the cascade can never reach across project boundaries.
+
     Returns the number of columns whose visibility was changed.
     """
     column_ids: set[UUID] = set()
@@ -475,14 +591,26 @@ async def _cascade_hidden_to_columns(
         if att.target_id is None:
             continue
         if att.target_type == "column":
+            # Bug-7253 R1-F1: guard column targets against cross-model
+            # cascade for any pre-existing attachment from before this fix.
+            if model_id is not None:
+                col = await db.get(ModelColumn, att.target_id)
+                if col is not None:
+                    tbl = await db.get(ModelTable, col.model_table_id)
+                    if tbl is None or tbl.model_id != model_id:
+                        continue
             column_ids.add(att.target_id)
         elif att.target_type == "dimension":
             dim = await db.get(Dimension, att.target_id)
             if dim is not None and dim.source_column_id is not None:
+                if model_id is not None and dim.model_id != model_id:
+                    continue
                 column_ids.add(dim.source_column_id)
         elif att.target_type == "measure":
             meas = await db.get(Measure, att.target_id)
             if meas is not None and meas.source_column_id is not None:
+                if model_id is not None and meas.model_id != model_id:
+                    continue
                 column_ids.add(meas.source_column_id)
 
     changed = 0
@@ -517,6 +645,9 @@ def _entry_to_response(
         proposed_is_hidden=entry.proposed_is_hidden,
         visibility=entry.visibility,
         confidence=entry.confidence,
+        # Bug-7251: surface the heuristic fallback status so consumers can
+        # tell at a glance which entries were generated without LLM input.
+        is_heuristic_fallback=(entry.source == "heuristic"),
         sample_values=entry.sample_values,
         created_at=entry.created_at,
         updated_at=entry.updated_at,
@@ -535,10 +666,15 @@ def _entry_to_response(
 
 
 async def _resolve_attachment_target_names(
-    db, entries: list[GlossaryEntry]
+    db, entries: list[GlossaryEntry], model_id: UUID | None = None,
 ) -> dict[UUID, str]:
     """Map each attached dimension/measure target_id to its display name so the
-    curation panel can show names instead of truncated UUIDs (F-018-21)."""
+    curation panel can show names instead of truncated UUIDs (F-018-21).
+
+    Bug-7253: when ``model_id`` is supplied, only resolve names for targets
+    that belong to this model.  This prevents cross-project name disclosure
+    when a stale or malicious attachment references a foreign object.
+    """
     dim_ids: set[UUID] = set()
     meas_ids: set[UUID] = set()
     for e in entries:
@@ -551,17 +687,21 @@ async def _resolve_attachment_target_names(
                 meas_ids.add(a.target_id)
     names: dict[UUID, str] = {}
     if dim_ids:
-        rows = (await db.execute(
-            select(Dimension.id, Dimension.display_name, Dimension.name)
-            .where(Dimension.id.in_(dim_ids))
-        )).all()
+        dim_q = select(Dimension.id, Dimension.display_name, Dimension.name).where(
+            Dimension.id.in_(dim_ids)
+        )
+        if model_id is not None:
+            dim_q = dim_q.where(Dimension.model_id == model_id)
+        rows = (await db.execute(dim_q)).all()
         for did, disp, nm in rows:
             names[did] = disp or nm
     if meas_ids:
-        rows = (await db.execute(
-            select(Measure.id, Measure.display_name, Measure.name)
-            .where(Measure.id.in_(meas_ids))
-        )).all()
+        meas_q = select(Measure.id, Measure.display_name, Measure.name).where(
+            Measure.id.in_(meas_ids)
+        )
+        if model_id is not None:
+            meas_q = meas_q.where(Measure.model_id == model_id)
+        rows = (await db.execute(meas_q)).all()
         for mid, disp, nm in rows:
             names[mid] = disp or nm
     return names
@@ -603,7 +743,9 @@ async def list_entries(
             stmt = stmt.where(GlossaryEntry.status == status_filter)
         result = await db.execute(stmt)
         entries = result.scalars().all()
-        target_names = await _resolve_attachment_target_names(db, entries)
+        target_names = await _resolve_attachment_target_names(
+            db, entries, model_id=model_id,
+        )
         return [_entry_to_response(e, target_names) for e in entries]
 
 
@@ -621,6 +763,12 @@ async def create_entry(
 ) -> GlossaryEntryResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (finding 7: after auth)
+        # Bug-7253: reject attachment targets that do not belong to this
+        # model, preventing cross-project hide-cascade and name disclosure.
+        await _validate_attachment_target(
+            db, model_id, body.target_type, body.target_id,
+        )
         entry = GlossaryEntry(
             model_id=model_id,
             term=body.term,
@@ -630,7 +778,12 @@ async def create_entry(
             status="approved",
             version=1,
             proposed_is_hidden=body.proposed_is_hidden,
-            visibility=body.visibility or "show",
+            # Bug-6261 (Codex R2): manual create produces status="approved"
+            # so the visibility must follow the same publication rule as
+            # approve/edit — "show" unless the modeller explicitly chose
+            # "hide".  The old `or "show"` let callers pass "review" and
+            # produce an approved-but-invisible entry.
+            visibility="hide" if body.visibility == "hide" else "show",
             confidence=body.confidence or "high",
             created_by=_coerce_user_uuid(current_user.user_id),
         )
@@ -638,13 +791,21 @@ async def create_entry(
         await db.flush()
         for syn in body.synonyms or []:
             db.add(GlossarySynonym(entry_id=entry.id, synonym=syn))
-        db.add(
-            GlossaryAttachment(
-                entry_id=entry.id,
-                target_type=body.target_type,
-                target_id=body.target_id,
-            )
+        attachment = GlossaryAttachment(
+            entry_id=entry.id,
+            target_type=body.target_type,
+            target_id=body.target_id,
         )
+        db.add(attachment)
+        # Bug-7962: manual create sets status="approved" directly — there is
+        # no later approval transition that would trigger the hidden cascade.
+        # Invoke the cascade here, mirroring the approve/edit paths, so
+        # "Hide column" actually flips ModelColumn.is_hidden before commit.
+        if entry.proposed_is_hidden is not None:
+            await _cascade_hidden_to_columns(
+                db, [attachment], bool(entry.proposed_is_hidden),
+                model_id=model_id,
+            )
         await db.commit()
         await db.refresh(entry)
         return await _reload(db, entry.id)
@@ -660,8 +821,14 @@ async def bootstrap(
     model_id: UUID,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> GlossaryBootstrapResponse:
-    """Generate proposed glossary entries for every dimension, measure, and
-    physical column that does not yet have one.
+    """Generate proposed glossary entries for every dimension and measure that
+    does not yet have one.
+
+    F-018-05: bootstrap walks the semantic catalogue only — dimensions then
+    measures. It does NOT walk physical columns and does NOT set
+    ``proposed_is_hidden`` (the hide-column cascade fires only on a human
+    approve/edit that sets the flag, never on draft generate). Column-scoped
+    glossary terms are authored manually, not by this endpoint.
 
     Calls the project's configured LLM to generate context-aware business
     definitions. Falls back to heuristic templates if the LLM is not
@@ -684,6 +851,51 @@ async def bootstrap(
             and current_user.raw_token
             and not getattr(current_user, "_glossary_run_now", False)
         ):
+            # Bug-6812: guard against concurrent bootstrap for the same model.
+            # If a non-terminal job already exists, return it rather than
+            # launching a duplicate that would compete for LLM quota and
+            # produce interleaved glossary entries. Best-effort: a query
+            # failure (e.g. table not yet migrated) falls through to the
+            # normal create path so the bootstrap is never blocked by the
+            # guard itself.
+            try:
+                existing_active = (
+                    await db.execute(
+                        select(GlossaryBootstrapJob).where(
+                            GlossaryBootstrapJob.model_id == model_id,
+                            GlossaryBootstrapJob.status.notin_(
+                                list(_JOB_TERMINAL_STATES)
+                            ),
+                        ).order_by(GlossaryBootstrapJob.created_at.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if existing_active is not None:
+                    # Check if the existing job is genuinely alive (not stale).
+                    last_progress = (
+                        existing_active.updated_at or existing_active.created_at
+                    )
+                    if isinstance(last_progress, datetime):
+                        if last_progress.tzinfo is None:
+                            last_progress = last_progress.replace(
+                                tzinfo=timezone.utc
+                            )
+                        if (
+                            datetime.now(timezone.utc) - last_progress
+                            <= _JOB_STALE_TIMEOUT
+                        ):
+                            return _job_response(
+                                existing_active.id,
+                                existing_active.status or "queued",
+                                "A glossary bootstrap is already running for "
+                                "this model. Returning the existing job.",
+                            )
+            except Exception:  # noqa: BLE001 — guard must not block bootstrap
+                logger.debug(
+                    "Bug-6812 concurrent-bootstrap guard query failed for "
+                    "model=%s; proceeding with new job", model_id,
+                )
+
             job_id = _uuid.uuid4()
             max_distinct = model.glossary_max_distinct or 50
             queued_msg = "Queued source statistics refresh before glossary generation."
@@ -709,20 +921,14 @@ async def bootstrap(
             task.add_done_callback(_GLOSSARY_BOOTSTRAP_TASKS.discard)
             return _job_response(job_id, "queued", queued_msg)
 
-        existing = await db.execute(
-            select(
-                GlossaryAttachment.target_type,
-                GlossaryAttachment.target_id,
-                GlossaryAttachment.entry_id,
-            )
-            .join(GlossaryEntry, GlossaryEntry.id == GlossaryAttachment.entry_id)
-            .where(GlossaryEntry.model_id == model_id)
-            .where(GlossaryEntry.superseded_by.is_(None))
-        )
-        existing_entry_map: dict[tuple[str, UUID], UUID] = {
-            (t, tid): eid for t, tid, eid in existing.all()
-        }
-
+        # Bug-7982 R6 (reviewer round 2, BLOCKER): the create-vs-update decision
+        # map (existing_entry_map) is the read side of this read-modify-write, so
+        # it must be read UNDER the lock — NOT here, 200 lines and one up-to-600s
+        # LLM call before the lock is acquired. Reading it pre-lock let a
+        # concurrent delete/revert invalidate an entry id that is then
+        # dereferenced under the lock (500), or create a duplicate entry for a
+        # target the map wrongly reported as absent. It is (re-)built just after
+        # ``acquire_model_definition_lock`` below.
         items: list[dict] = []
         dims = []
         measures = []
@@ -897,6 +1103,33 @@ async def bootstrap(
         llm_total_failure = bool(llm_error and not llm_defs)
 
         author_uuid = _coerce_user_uuid(current_user.user_id)
+        # Bug-7982 R6 (reviewer BLOCKER 2): the glossary bootstrap writes
+        # GlossaryEntry / GlossarySynonym / GlossaryAttachment rows directly here
+        # (both the endpoint and the _run_glossary_bootstrap_job background path
+        # re-enter this function and fall through to these writes) — all three are
+        # snapshot-owned (truncate-reinserted on revert). The write loop below must
+        # therefore serialise with deploy/revert. The lock is acquired HERE, AFTER
+        # the up-to-600s optimizer LLM call above, never across it (the calendar-
+        # DDL-under-lock mistake), and before the first entry write. Auth
+        # (ensure_model_in_project) already ran at the top of the handler.
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
+        # Bug-7982 R6 (round 2, BLOCKER): read the create-vs-update decision map
+        # NOW, under the lock, so a concurrent delete/revert cannot invalidate it
+        # between the read and the writes below (mirrors named_sets.refresh_named_list,
+        # which re-reads its target under the lock after its slow source query).
+        _existing = await db.execute(
+            select(
+                GlossaryAttachment.target_type,
+                GlossaryAttachment.target_id,
+                GlossaryAttachment.entry_id,
+            )
+            .join(GlossaryEntry, GlossaryEntry.id == GlossaryAttachment.entry_id)
+            .where(GlossaryEntry.model_id == model_id)
+            .where(GlossaryEntry.superseded_by.is_(None))
+        )
+        existing_entry_map: dict[tuple[str, UUID], UUID] = {
+            (t, tid): eid for t, tid, eid in _existing.all()
+        }
         proposed = 0
         updated = 0
         fallback_count = 0
@@ -932,8 +1165,8 @@ async def bootstrap(
                 item_source = "heuristic"
 
             existing_eid = existing_entry_map.get(("dimension", dim.id))
-            if existing_eid:
-                entry = await db.get(GlossaryEntry, existing_eid)
+            entry = await db.get(GlossaryEntry, existing_eid) if existing_eid else None
+            if entry is not None:
                 if sample is not None:
                     entry.sample_values = sample
                 if entry.status in ("approved", "rejected") or entry.source == "user":
@@ -1000,8 +1233,8 @@ async def bootstrap(
                 item_source = "heuristic"
 
             existing_eid = existing_entry_map.get(("measure", meas.id))
-            if existing_eid:
-                entry = await db.get(GlossaryEntry, existing_eid)
+            entry = await db.get(GlossaryEntry, existing_eid) if existing_eid else None
+            if entry is not None:
                 if entry.status in ("approved", "rejected") or entry.source == "user":
                     skipped += 1
                     continue
@@ -1078,6 +1311,32 @@ async def bootstrap_job_status(
             raise HTTPException(
                 status_code=404, detail="Glossary bootstrap job not found"
             )
+
+        # Bug-6265: stale-job watchdog. If the row is still non-terminal but has
+        # not advanced within the stale window, the background worker died
+        # (restart / Cloud Run throttle). Fail it now so the panel stops polling
+        # forever and the modeller can retry, rather than leaving a permanently
+        # "running" job.
+        current_status = job.status or "queued"
+        if current_status not in _JOB_TERMINAL_STATES:
+            last_progress = job.updated_at or job.created_at
+            if last_progress is not None:
+                if last_progress.tzinfo is None:
+                    last_progress = last_progress.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - last_progress > _JOB_STALE_TIMEOUT:
+                    job.status = "failed"
+                    job.message = (
+                        "Glossary bootstrap did not complete — the worker stopped "
+                        "responding (a restart or resource throttle). Please retry."
+                    )
+                    await db.commit()
+                    logger.warning(
+                        "Glossary bootstrap job %s wedged in %r; marked failed by "
+                        "stale-job watchdog (model=%s)",
+                        job_id, current_status, model_id,
+                    )
+                    return _job_response(job_id, "failed", job.message)
+
         result = _deserialize_job_result(job.result)
         if result is not None:
             return result
@@ -1098,6 +1357,7 @@ async def approve_entry(
 ) -> GlossaryEntryResponse:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (finding 7: after auth)
         entry = await db.get(GlossaryEntry, entry_id)
         if entry is None or entry.model_id != model_id:
             raise HTTPException(status_code=404, detail="Glossary entry not found")
@@ -1138,13 +1398,24 @@ async def _approve_loaded_entry(
     entry.status = "approved"
     if entry.source == "llm":
         entry.source = "llm_approved"
+    # Bug-6261 (F-018-01): approval is the human publication decision.
+    # Bootstrap sets visibility="review" as an LLM/heuristic recommendation,
+    # but Bug-5926 consumers (_build_public_payload, glossary_text_for_target)
+    # gate on visibility=="show".  Approval must promote visibility to "show"
+    # unless the modeller explicitly chose "hide" (a deliberate decision to
+    # suppress the column from the public glossary and gateway descriptions).
+    if entry.visibility != "hide":
+        entry.visibility = "show"
     # Capture the approver as the first human owner of record when the
     # original LLM proposal had no author.
     if entry.created_by is None:
         entry.created_by = _coerce_user_uuid(current_user.user_id)
     if entry.proposed_is_hidden is not None:
+        # Bug-7253: scope cascade to this entry's model so a cross-project
+        # attachment (if one somehow exists) cannot flip a foreign column.
         await _cascade_hidden_to_columns(
-            db, attachments or [], bool(entry.proposed_is_hidden)
+            db, attachments or [], bool(entry.proposed_is_hidden),
+            model_id=entry.model_id,
         )
 
 
@@ -1166,6 +1437,7 @@ async def approve_bulk(
     """
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (finding 7: after auth)
         from sqlalchemy.orm import selectinload
 
         result = await db.execute(
@@ -1201,8 +1473,12 @@ async def update_entry(
     one as `superseded_by` so the audit trail stays intact."""
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (finding 7: after auth)
         from sqlalchemy.orm import selectinload
 
+        # Bug-7262: lock the row with FOR UPDATE to prevent concurrent edits
+        # from forking the version chain (two version-2 rows both current).
+        # The lock is held until the transaction commits.
         existing_q = await db.execute(
             select(GlossaryEntry)
             .where(GlossaryEntry.id == entry_id)
@@ -1210,6 +1486,7 @@ async def update_entry(
                 selectinload(GlossaryEntry.synonyms),
                 selectinload(GlossaryEntry.attachments),
             )
+            .with_for_update()
         )
         existing = existing_q.scalar_one_or_none()
         if existing is None or existing.model_id != model_id:
@@ -1219,6 +1496,19 @@ async def update_entry(
                 status_code=409,
                 detail="Entry has already been superseded; edit the latest version.",
             )
+
+        # Bug-6261 (Codex R1): editing auto-approves the entry
+        # (status="approved"), so the resulting visibility must follow the
+        # same publication rule as _approve_loaded_entry — promote to
+        # "show" unless the modeller explicitly chose "hide".  Without
+        # this, editing a heuristic entry (visibility="review") produces
+        # an approved-but-invisible entry that _build_public_payload and
+        # glossary_text_for_target exclude from all consumer surfaces.
+        resolved_visibility = (
+            body.visibility if body.visibility is not None else existing.visibility
+        )
+        if resolved_visibility != "hide":
+            resolved_visibility = "show"
 
         new_entry = GlossaryEntry(
             model_id=model_id,
@@ -1235,9 +1525,7 @@ async def update_entry(
                 if body.proposed_is_hidden is not None
                 else existing.proposed_is_hidden
             ),
-            visibility=(
-                body.visibility if body.visibility is not None else existing.visibility
-            ),
+            visibility=resolved_visibility,
             confidence=(
                 body.confidence if body.confidence is not None else existing.confidence
             ),
@@ -1268,9 +1556,12 @@ async def update_entry(
         # Cascade is_hidden if the modeller set it. The attachments were
         # copied from the superseded entry above; resolve each to its source
         # column so dimension/measure attachments hide too (F-018-01).
+        # Bug-7253: scope cascade to this model so foreign targets are
+        # silently skipped.
         if new_entry.proposed_is_hidden is not None:
             await _cascade_hidden_to_columns(
-                db, list(existing.attachments), bool(new_entry.proposed_is_hidden)
+                db, list(existing.attachments), bool(new_entry.proposed_is_hidden),
+                model_id=model_id,
             )
 
         await db.commit()
@@ -1297,6 +1588,7 @@ async def reject_entry(
     """
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (finding 7: after auth)
         entry = await db.get(GlossaryEntry, entry_id)
         if entry is None or entry.model_id != model_id:
             raise HTTPException(status_code=404, detail="Glossary entry not found")
@@ -1325,6 +1617,7 @@ async def delete_entry(
     """
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (finding 7: after auth)
         entry = await db.get(GlossaryEntry, entry_id)
         if entry is None or entry.model_id != model_id:
             raise HTTPException(status_code=404, detail="Glossary entry not found")
@@ -1387,6 +1680,7 @@ async def delete_bulk(
     """
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (finding 7: after auth)
 
         q = (
             select(GlossaryEntry)
@@ -1441,7 +1735,7 @@ async def delete_bulk(
 async def import_glossary_csv(
     project_id: UUID,
     model_id: UUID,
-    payload: dict[str, Any],
+    payload: GlossaryCsvImportRequest,
     current_user: CurrentUser = Depends(forbid_embed_user),
 ) -> dict[str, Any]:
     """Bulk-import glossary entries from a CSV blob.
@@ -1451,8 +1745,8 @@ async def import_glossary_csv(
     are not touched. Reports per-line errors so the modeller can fix and
     retry.
     """
-    raw = (payload or {}).get("csv")
-    if not isinstance(raw, str) or not raw.strip():
+    raw = payload.csv
+    if not raw.strip():
         raise HTTPException(
             status_code=400,
             detail="Body must be {csv: '<csv-text>'} with a non-empty value.",
@@ -1474,6 +1768,7 @@ async def import_glossary_csv(
     errors: list[dict[str, Any]] = []
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock (finding 7: after auth)
         author_uuid = _coerce_user_uuid(current_user.user_id)
         for line_no, row in enumerate(rows[1:], start=2):
             if not row or all(not c.strip() for c in row):
@@ -1606,8 +1901,22 @@ async def issue_share_token(
                 created_by=_coerce_user_uuid(current_user.user_id),
             )
         )
+        # F-022-01/F-022-02: minting a public share token creates a standalone
+        # access credential for the glossary. Record it fail-closed so a leaked
+        # or unexplained share link can always be traced to its issuer.
+        await audit_required(
+            db, action="glossary.share_token.issue", severity="critical",
+            actor_email=current_user.email,
+            target_type="model", target_id=model_id,
+            detail={"token_id": str(jti), "project_id": str(project_id)},
+        )
         await db.commit()
         token = _issue_public_token(current_user.tenant_id, model_id, jti)
+        await emit_webhook(current_user.tenant_id, "glossary.share_token.issue", {
+            "model_id": str(model_id),
+            "token_id": str(jti),
+            "actor": current_user.email,
+        })
         return {"token": token, "frontend_path": f"/g/{token}"}
 
 
@@ -1635,7 +1944,24 @@ async def revoke_share_tokens(
         now = datetime.now(timezone.utc)
         for row in rows:
             row.revoked_at = now
+        # F-022-01/F-022-02: revoking share tokens changes who can reach the
+        # public glossary. Record it fail-closed with the count revoked.
+        await audit_required(
+            db, action="glossary.share_token.revoke", severity="warn",
+            actor_email=current_user.email,
+            target_type="model", target_id=model_id,
+            detail={
+                "revoked_count": len(rows),
+                "token_ids": [str(r.id) for r in rows],
+                "project_id": str(project_id),
+            },
+        )
         await db.commit()
+        await emit_webhook(current_user.tenant_id, "glossary.share_token.revoke", {
+            "model_id": str(model_id),
+            "revoked_count": len(rows),
+            "actor": current_user.email,
+        })
         return {"revoked_count": len(rows)}
 
 
@@ -1668,24 +1994,39 @@ async def _build_public_payload(tenant_id: str, model_id: UUID) -> dict[str, Any
 
         from sqlalchemy.orm import selectinload
 
+        # Bug-5926: filter out non-published entries from public-facing payloads.
+        # Only entries with visibility == "show" (or legacy NULL, defaulting to
+        # show) are safe for public glossary, downloads, and gateway metadata.
+        from sqlalchemy import or_
         result = await db.execute(
             select(GlossaryEntry)
             .where(GlossaryEntry.model_id == model_id)
             .where(GlossaryEntry.status == "approved")
             .where(GlossaryEntry.superseded_by.is_(None))
+            .where(or_(
+                GlossaryEntry.visibility == "show",
+                GlossaryEntry.visibility.is_(None),
+            ))
             .options(
                 selectinload(GlossaryEntry.synonyms),
-                selectinload(GlossaryEntry.attachments),
+                # Bug-7957: attachments are no longer projected into the
+                # public payload, so skip the eager load.
             )
             .order_by(GlossaryEntry.term)
         )
         entries = result.scalars().all()
 
+        # Bug-7957: the public payload is served to unauthenticated
+        # share-link holders. Return ONLY what the public page renders:
+        # model display context (display_name, slug, description) and
+        # approved glossary text (term, definition, context, synonyms,
+        # version, timestamp). No internal object IDs (model.id,
+        # attachment target_id) — those are tenant-internal identifiers
+        # with no business meaning on this surface.
         return {
             "model": {
-                "id": str(model.id),
-                "slug": model.slug,
                 "display_name": model.display_name,
+                "slug": model.slug,
                 "description": getattr(model, "description", None),
             },
             "entries": [
@@ -1694,10 +2035,6 @@ async def _build_public_payload(tenant_id: str, model_id: UUID) -> dict[str, Any
                     "definition": e.definition,
                     "context_notes": e.context_notes,
                     "synonyms": [s.synonym for s in e.synonyms],
-                    "attachments": [
-                        {"target_type": a.target_type, "target_id": str(a.target_id) if a.target_id else None}
-                        for a in e.attachments
-                    ],
                     "version": e.version,
                     "updated_at": e.updated_at.isoformat(),
                 }
@@ -1748,9 +2085,13 @@ async def public_glossary_xlsx(token: str) -> StreamingResponse:
     try:
         from openpyxl import Workbook
     except ImportError as exc:
+        # Bug-7246 (CF-018-DS-F018H2): openpyxl is an optional dependency.
+        # Return 503 (service unavailable) instead of 500 so the caller
+        # gets a clear feature-unavailable signal, not a crash.
+        logger.warning("XLSX export unavailable: openpyxl not installed")
         raise HTTPException(
-            status_code=500,
-            detail="XLSX export requires openpyxl. Install it on the model-service image.",
+            status_code=503,
+            detail="XLSX export is not available in this deployment (openpyxl not installed).",
         ) from exc
 
     wb = Workbook()
@@ -1804,9 +2145,12 @@ async def public_glossary_pdf(token: str) -> StreamingResponse:
             Spacer,
         )
     except ImportError as exc:
+        # Bug-7246 (CF-018-DS-F018H2): reportlab is an optional dependency.
+        # Return 503 (service unavailable) instead of 500.
+        logger.warning("PDF export unavailable: reportlab not installed")
         raise HTTPException(
-            status_code=500,
-            detail="PDF export requires reportlab. Install it on the model-service image.",
+            status_code=503,
+            detail="PDF export is not available in this deployment (reportlab not installed).",
         ) from exc
 
     buf = io.BytesIO()

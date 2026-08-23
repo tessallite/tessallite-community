@@ -123,6 +123,101 @@ class TestBug5185KpiUnsupportedPredicate:
 
 
 # ---------------------------------------------------------------------------
+# Bug-6055 (F-001-18): $KPIs queries on the EXTENDED protocol raw route must be
+# shaped exactly like the simple path — projection / WHERE / ORDER BY / LIMIT
+# honoured, unsupported predicate fails closed. The raw branch previously
+# returned the router's full unfiltered rowset, regressing Bug-5185.
+# ---------------------------------------------------------------------------
+
+
+class TestBug6055ExtendedRawKpiShaping:
+    """The extended-protocol raw branch must apply $KPIs shaping."""
+
+    FULL = {
+        "columns": ["kpi_name", "value", "target", "status"],
+        "rows": [
+            {"kpi_name": "Revenue", "value": 100.0, "target": 90.0, "status": 1},
+            {"kpi_name": "Margin", "value": 0.42, "target": 0.40, "status": 1},
+            {"kpi_name": "Churn", "value": 0.05, "target": 0.03, "status": 2},
+        ],
+    }
+
+    def _make_server(self, monkeypatch):
+        from src.jdbc import server as srv
+
+        s = srv.PGWireServer()
+        s._jwt_token = "tok"
+        s._tenant_slug = "acme"
+        s._catalogue = None
+        s._pid = 1
+        # kpi_name is a dimension column → SELECT of it classifies "raw".
+        s._table_columns = {
+            "modelx$kpis": [
+                {"name": "kpi_name", "kind": "dimension", "data_type": "text"},
+                {"name": "value", "kind": "measure", "data_type": "numeric"},
+                {"name": "target", "kind": "measure", "data_type": "numeric"},
+                {"name": "status", "kind": "measure", "data_type": "integer"},
+            ]
+        }
+        monkeypatch.setattr(
+            s, "_resolve_model_id_and_variant", lambda sql: ("modelx", False, None)
+        )
+        monkeypatch.setattr(s, "_rewrite_exposed_relations", lambda sql: sql)
+
+        async def _run(coro):
+            return await coro
+
+        monkeypatch.setattr(s, "_run_cancellable", _run)
+
+        async def _fake_execute(**kwargs):
+            return dict(self.FULL)
+
+        monkeypatch.setattr(srv, "execute_query", _fake_execute)
+
+        # G2 / grok F-001-01: the extended query path now re-validates the
+        # session upstream before dispatching. These tests exercise $KPIs
+        # shaping, not auth, and run without a live model-service, so stub the
+        # revalidation to a pass-through (a valid, still-live session).
+        async def _session_ok(token):
+            return None
+
+        monkeypatch.setattr(srv, "validate_session_upstream", _session_ok)
+        return s
+
+    @pytest.mark.asyncio
+    async def test_extended_raw_kpi_projection_and_where_applied(self, monkeypatch):
+        s = self._make_server(monkeypatch)
+        col_desc, rows, err = await s._execute_for_extended(
+            'SELECT kpi_name, value FROM "modelx$KPIs" WHERE status = 1'
+        )
+        assert err is None
+        names = [c[0] for c in col_desc]
+        assert names == ["kpi_name", "value"]          # projection honoured
+        assert len(rows) == 2                           # WHERE status=1 applied
+        assert all(len(r) == 2 for r in rows)           # only 2 columns emitted
+        assert {r[0] for r in rows} == {"Revenue", "Margin"}
+
+    @pytest.mark.asyncio
+    async def test_extended_raw_kpi_limit_applied(self, monkeypatch):
+        s = self._make_server(monkeypatch)
+        _, rows, err = await s._execute_for_extended(
+            'SELECT * FROM "modelx$KPIs" LIMIT 1'
+        )
+        assert err is None
+        assert len(rows) == 1                           # LIMIT honoured, not full dump
+
+    @pytest.mark.asyncio
+    async def test_extended_raw_kpi_unsupported_predicate_fails_closed(self, monkeypatch):
+        s = self._make_server(monkeypatch)
+        col_desc, rows, err = await s._execute_for_extended(
+            'SELECT * FROM "modelx$KPIs" WHERE upper(kpi_name) = \'X\''
+        )
+        # Bug-5185 fail-closed guarantee must hold on the extended raw path.
+        assert err is not None
+        assert "Unsupported WHERE predicate" in err[0]
+
+
+# ---------------------------------------------------------------------------
 # Bug-5186: computed column must not inherit catalogue type on name collision
 # ---------------------------------------------------------------------------
 
@@ -274,16 +369,20 @@ class TestBug5187BinaryParamDecoding:
         result = proto._decode_binary_param(b"\x00", oid=proto.OID_BOOL)
         assert result == "false"
 
-    def test_date_oid_decodes_text_representation(self):
-        """Date strings sent as binary text must decode correctly."""
-        data = b"2024-01-15"
-        result = proto._decode_binary_param(data, oid=proto.OID_DATE)
-        assert result == "2024-01-15"
+    def test_date_binary_wrong_width_is_rejected(self):
+        """Wave C #6: a binary DATE must be exactly 4 bytes (int32 days). A
+        non-standard-width payload (e.g. an ASCII date string sent in binary
+        format) is a malformed encoding and is REFUSED, never guessed. The
+        correct 4-byte form is covered by test_date_oid_pg_binary_epoch_offset."""
+        with pytest.raises(proto.ParamDecodeError):
+            proto._decode_binary_param(b"2024-01-15", oid=proto.OID_DATE)
 
-    def test_timestamp_oid_decodes_text_representation(self):
-        data = b"2024-01-15 10:30:00"
-        result = proto._decode_binary_param(data, oid=proto.OID_TIMESTAMP)
-        assert result == "2024-01-15 10:30:00"
+    def test_timestamp_binary_wrong_width_is_rejected(self):
+        """Wave C #6: a binary TIMESTAMP must be exactly 8 bytes; a text payload in
+        binary format is malformed and refused (correct form in
+        test_timestamp_oid_pg_binary_epoch_offset)."""
+        with pytest.raises(proto.ParamDecodeError):
+            proto._decode_binary_param(b"2024-01-15 10:30:00", oid=proto.OID_TIMESTAMP)
 
     def test_date_oid_pg_binary_epoch_offset(self):
         """Review finding [2]: PG binary date is int32 days since 2000-01-01."""
@@ -315,22 +414,24 @@ class TestBug5187BinaryParamDecoding:
         assert "2024-06-15" in result
         assert "UTC" in result or "+00:00" in result
 
-    def test_unknown_oid_zero_falls_back_to_heuristic(self):
-        """OID 0 (unspecified) preserves the legacy byte-length heuristic."""
-        data = struct.pack("!i", 42)
-        result = proto._decode_binary_param(data, oid=0)
-        assert result == "42"
+    def test_unknown_oid_zero_binary_is_rejected(self):
+        """Wave C #6: a BINARY param with an undeclared type (OID 0) is genuinely
+        ambiguous — the gateway refuses it with a stable error instead of guessing
+        by byte length (the old heuristic that could silently corrupt a value)."""
+        with pytest.raises(proto.ParamDecodeError):
+            proto._decode_binary_param(struct.pack("!i", 42), oid=0)
 
     def test_oid_passed_through_parse_bind_parameters(self):
-        """parse_bind_parameters with param_oids uses OID-driven decoding."""
-        # Build a Bind payload with a single binary param (4-byte text "ABCD")
+        """Wave C #6: parse_bind_parameters decodes a binary param by its DECLARED
+        OID. Without a declared OID a binary param is refused (never guessed);
+        with the TEXT OID the 4 bytes decode as text."""
         payload = _build_bind_payload_with_binary(
             format_codes=[1],
             params=[b"ABCD"],
         )
-        # Without OIDs, 4 bytes would be decoded as int32 (heuristic).
-        _, _, params_no_oid, _ = proto.parse_bind_parameters(payload)
-        assert params_no_oid[0] != "ABCD"  # misinterpreted as int
+        # Without OIDs, a binary param is refused rather than guessed.
+        with pytest.raises(proto.ParamDecodeError):
+            proto.parse_bind_parameters(payload)
 
         # With TEXT OID, 4 bytes are correctly decoded as text.
         _, _, params_with_oid, _ = proto.parse_bind_parameters(

@@ -21,6 +21,8 @@ from .domains.hierarchies import *  # noqa: F401,F403
 from .domains.dimensions_measures import *  # noqa: F401,F403
 from .domains.aggregates_security import *  # noqa: F401,F403
 from .domains.governance_advanced import *  # noqa: F401,F403
+from .domains.model_impact import *  # noqa: F401,F403  # Bug-7787 Impact Analysis
+from .domains.pivot_config import *  # noqa: F401,F403  # Bug-8161/8182/7442 typed pivot-view config contract
 
 # Rebuild models that have cross-module forward references.
 # After all star-imports, every class name is in this module's namespace.

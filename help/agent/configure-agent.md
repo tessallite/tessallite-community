@@ -2,7 +2,7 @@
 title: "Configure your project agent"
 audience: tenant-admin
 area: agent
-updated: 2026-06-21
+updated: 2026-08-11
 ---
 
 ## What this covers
@@ -72,7 +72,7 @@ Configuration lives in the **project drawer**, opened from *Tenant Administratio
 - **Allow-list checkboxes.** Tick each model the agent may query. The list is bound to the project's published models. The first ticked model becomes the default primary; you can change the primary with the radio button.
 - **Answer LLM.** Picker bound to the project's LLM Configurations tab. Pick the bundle that powers the answer model.
 - **Judge LLM.** Picker bound to the same list. Use a smaller / faster bundle for the judge if you run sync mode.
-- **Judge mode.** *Async* runs the judge after the answer is returned (faster perceived latency, the verdict lands later in the trace drawer). *Sync* blocks the answer until the verdict is available — required if you intend to gate on the verdict.
+- **Judge mode.** *Validated-first* (the default) holds the answer back until the judge has checked it, so a reader never sees a number the judge later flags — this is the governed default. *Async* is the lower-assurance option: it shows the answer first and runs the judge afterward (faster perceived latency; the verdict lands later in the trace drawer). Choose Async only when speed matters more than showing a pre-checked answer.
 - **Judge rubric.** A reference to a rubric defined in this project. The *Manage rubrics* button opens the rubric editor in a dialog. See [Write a judge rubric](write-a-judge-rubric.md).
 - **Judge block visibility.** *Transparent* shows the verdict and reasoning to the user when the judge blocks an answer; *opaque* shows a generic "withheld for review" message. Pick transparent for internal users where the rubric is well-tuned; opaque for external users.
 - **Visibility toggles.** Four switches — *show thought process*, *show semantic query*, *show physical query*, *enable feedback* — control how much of the trace the user can see in the answer card and the trace drawer. The judge verdict and the citations are always shown.
@@ -87,7 +87,30 @@ Configuration lives in the **project drawer**, opened from *Tenant Administratio
 
 ### Webhook
 
-- **Webhook URL.** Optional outbound URL fired on each agent turn. Leave blank to disable. The signing secret is rotated separately from the project agent record — use the *Rotate webhook secret* action on the agent service if you need to change it.
+A webhook lets another system react the moment something happens in the agent — for example, posting every answer into a support ticket, or raising an alert whenever the judge blocks a reply. Tessallite sends a small JSON message to a web address you choose.
+
+- **Webhook URL.** The HTTPS address that receives the messages. Leave it blank to turn the webhook off entirely. Only `https://` addresses are accepted, and addresses on your internal network are refused — a webhook that could reach an internal machine is a common way for attackers to get inside a network.
+- **Signing secret.** Created automatically the first time you save a webhook URL. Every message Tessallite sends carries a signature made with this secret, so the receiving system can prove the message really came from you and was not faked by someone else who guessed your address.
+  - Press **Rotate signing secret** to replace it — for example if the old one may have been seen by the wrong person, or when someone with access leaves.
+  - The new secret is shown **once**, immediately after you rotate. Copy it straight into the receiving system. Tessallite never shows it again, because storing a readable copy of a secret is exactly what makes secrets leak.
+  - Rotation takes effect at once. The very next message is signed with the new secret, so update the receiver promptly or it will start rejecting messages.
+  - **Changing the webhook URL also replaces the secret, automatically.** Think of the secret as a key you cut for one particular door. If you point the webhook at a different address, the people at the old address would still be holding a key that opens the new door — so Tessallite cuts a new key and shows an inline notice after you save. Press **Rotate signing secret** to read the new value and give it to the new receiver. Until you do, messages are signed with a key the new receiver does not have, so it will turn them away and they will appear in the **Undelivered events** list with its own error message. Changing anything else on this page — the display name, the tone, which events you want — never touches the secret.
+- **Events sent.** Tick which events you want. **All events** is the default and also covers any new event type added in a future release, so you never miss something new. Untick it to choose individually:
+  - *Conversation started* — someone opened a new chat.
+  - *Answer delivered* — the agent answered a question.
+  - *Question refused* — the agent declined to answer (for example, the question broke a guardrail).
+  - *Answer blocked by the judge* — an answer failed its quality check and was withheld.
+  - *Feedback submitted* — a user gave an answer a thumbs up or down.
+
+  You cannot clear every box. An empty selection is ambiguous — it reads as either "send nothing" or "send everything" depending on who is looking — so if you want delivery to stop, clear the webhook URL instead. That is unambiguous.
+- **Undelivered events.** If the receiving system is down or rejects a message, Tessallite retries a few times, then parks the event in this list rather than throwing it away.
+  - **Retry** sends that one event again, using the address and secret you have configured *now*. Use it once you have fixed the receiver.
+  - **Discard** deletes the event permanently. Use it for events you no longer care about.
+  - The **Destination** column shows only the address's host (for example `https://hooks.example.com`), never the full address. Web addresses often carry a token in the path or after the `?`, and this list is something people screenshot and paste into tickets.
+
+> **Tip.** Before you rely on a webhook, point it at a free request-inspection service and send yourself a test question. You will see the exact message shape, and you can confirm the signature header arrives.
+
+> **Common mistake.** Rotating the secret and then forgetting to update the receiver. The receiver keeps checking signatures against the old secret, rejects everything, and each rejected message lands in *Undelivered events*. If that list suddenly fills up right after a rotation, that is almost always why.
 
 ### Retention
 
@@ -108,7 +131,7 @@ This walkthrough assumes the bundled `acme-demo` tenant. The exact menu wording 
 1. Sign in as an admin and open *Tenant Administration → Projects*.
 2. On the `project1` row, click the gear icon to open the project drawer.
 3. *LLM Configurations* tab: confirm there is at least one bundle (e.g. "OpenAI · gpt-4o"). Add one if the list is empty.
-4. *LLM & Judge* tab: tick the checkboxes for `modelx` and `modely` in the allow-list. Pick the OpenAI bundle as the Answer LLM and the Judge LLM. Pick the bundled "Acme finance rubric"; leave mode on Async; visibility on Transparent.
+4. *LLM & Judge* tab: tick the checkboxes for `modelx` and `modely` in the allow-list. Pick the OpenAI bundle as the Answer LLM and the Judge LLM. Pick the bundled "Acme finance rubric"; leave mode on Validated-first (the default); visibility on Transparent.
 5. *Identity & Tone* tab: set the display name to "Acme Insights"; paste a one-paragraph project brief describing the e-commerce domain. In *Brand guidelines*, add `banned: just kidding` (so the agent does not slip into casual asides) and `voice: Acme Insights — figures live as of last refresh.`
 6. *Safety* tab: add at least one line to the safety policy (e.g. "individual employee salaries"). The API requires a non-empty safety policy to enable.
 7. *General* tab: switch *Enable conversational agent* on.

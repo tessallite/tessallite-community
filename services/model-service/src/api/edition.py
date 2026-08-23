@@ -10,17 +10,18 @@ from sqlalchemy import func, select
 
 from shared.db.models import LocalUser, Model, Project, SystemTenant
 from shared.db.session import get_system_db, get_tenant_db
-from src.auth.middleware import CurrentUser, get_current_user
-from src.licensing_guard import get_license_manager
+from src.auth.middleware import CurrentUser, require_human_user
+from src.licensing_guard import _ensure_fresh_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["edition"])
 
 
 @router.get("/edition")
-async def get_edition(_: CurrentUser = Depends(get_current_user)) -> dict:
+async def get_edition(_: CurrentUser = Depends(require_human_user)) -> dict:
     """Edition + activation summary (no secrets)."""
-    return get_license_manager().status()
+    manager = await _ensure_fresh_manager()
+    return manager.status()
 
 
 async def _own_tenant_count() -> int | None:
@@ -29,7 +30,7 @@ async def _own_tenant_count() -> int | None:
     ``classify_tenant``). Lives in the system DB, not the tenant DB. Returns ``None``
     on failure so the caller can omit it (degrade) rather than report a wrong 0."""
     try:
-        manager = get_license_manager()
+        manager = await _ensure_fresh_manager()
         async for sys_db in get_system_db():
             slugs = (await sys_db.execute(select(SystemTenant.slug))).scalars().all()
             return sum(
@@ -56,7 +57,13 @@ async def _tenant_usage(tenant_id) -> dict:
                 (await db.execute(select(func.count()).select_from(Model))).scalar() or 0
             )
             usage["users"] = int(
-                (await db.execute(select(func.count()).select_from(LocalUser))).scalar() or 0
+                (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(LocalUser)
+                        .where(LocalUser.is_active.is_(True))
+                    )
+                ).scalar() or 0
             )
             usage["projects"] = int(
                 (await db.execute(select(func.count()).select_from(Project))).scalar() or 0
@@ -72,11 +79,16 @@ async def _tenant_usage(tenant_id) -> dict:
 
 
 @router.get("/limits")
-async def get_limits(current_user: CurrentUser = Depends(get_current_user)) -> dict:
-    """Entitlement limits + current usage for current/max display in the UI."""
-    manager = get_license_manager()
+async def get_limits(current_user: CurrentUser = Depends(require_human_user)) -> dict:
+    """Entitlement limits + current usage for current/max display in the UI.
+
+    F-031-20: ``entitlements.features`` is display-only. Create-cap enforcement
+    uses numeric caps (models/users/projects/tenants), never the features string.
+    """
+    manager = await _ensure_fresh_manager()
     return {
         "edition": manager.status().get("edition"),
         "entitlements": manager.entitlements(),
+        "features_display_only": True,
         "usage": await _tenant_usage(current_user.tenant_id),
     }

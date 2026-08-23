@@ -17,6 +17,7 @@ import {
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   type ProjectBundle,
+  type ImportWarning,
   type ProjectImportPlan,
   type ProjectImportRequest,
   projectImportExportApi,
@@ -25,6 +26,7 @@ import { useConnections, useProjects } from "../../../api/hooks";
 import { useConfirm } from "../../Confirm";
 import { useT } from "../../../i18n";
 import { readFileAsText } from "../helpers";
+import ImportWarningAlerts from "../ImportWarningAlerts";
 
 type Props = {
   onImported?: () => void;
@@ -41,12 +43,17 @@ export default function ProjectImportPanel({ onImported }: Props) {
   const [projectSlug, setProjectSlug] = useState("");
   const [projectName, setProjectName] = useState("");
   const [modelSlugs, setModelSlugs] = useState<Record<string, string>>({});
+  // G-020-02 / F-020-05: persona slug overrides. The rehydrator + API already
+  // apply persona_slugs; the SPA never exposed the fields, so JDBC/XMLA
+  // catalogues kept the old persona slugs on a clone (collision/leak).
+  const [personaSlugs, setPersonaSlugs] = useState<Record<string, string>>({});
   const [connMapping, setConnMapping] = useState<Record<string, string>>({});
   const [overrideConns, setOverrideConns] = useState(false);
   const [showModelSlugs, setShowModelSlugs] = useState(false);
+  const [showPersonaSlugs, setShowPersonaSlugs] = useState(false);
   const [plan, setPlan] = useState<ProjectImportPlan | null>(null);
   const [importResult, setImportResult] = useState<{
-    warnings: string[];
+    warnings: ImportWarning[];
     models_requiring_deploy: string[];
     post_import_actions: string[];
   } | null>(null);
@@ -78,11 +85,20 @@ export default function ProjectImportPanel({ onImported }: Props) {
       setProjectSlug(parsed.project.slug);
       setProjectName(parsed.project.display_name);
       const slugMap: Record<string, string> = {};
+      const personaMap: Record<string, string> = {};
       for (const m of parsed.models || []) {
         const slug = (m as Record<string, Record<string, string>>).model?.slug;
         if (slug) slugMap[slug] = slug;
+        // Enumerate persona slugs across all models (persona_slugs is a flat
+        // old->new map applied per-model by slug on the backend).
+        const personas =
+          (m as Record<string, Array<{ slug?: string }>>).personas || [];
+        for (const p of personas) {
+          if (p?.slug) personaMap[p.slug] = p.slug;
+        }
       }
       setModelSlugs(slugMap);
+      setPersonaSlugs(personaMap);
     } catch (err) {
       setBundle(null);
       setParseError(err instanceof Error ? err.message : String(err));
@@ -100,6 +116,8 @@ export default function ProjectImportPanel({ onImported }: Props) {
       project_slug: projectSlug || null,
       project_display_name: projectName || null,
       model_slugs: Object.keys(modelSlugs).length > 0 ? modelSlugs : null,
+      persona_slugs:
+        Object.keys(personaSlugs).length > 0 ? personaSlugs : null,
       connection_mapping:
         Object.keys(connMapping).length > 0 ? connMapping : null,
       override_connections: overrideConns,
@@ -175,11 +193,7 @@ export default function ProjectImportPanel({ onImported }: Props) {
             {t("importDialog.aggregatesNeedRefresh")}
           </Alert>
         )}
-        {importResult.warnings.map((w, i) => (
-          <Alert key={i} severity="warning" sx={{ mb: 1 }}>
-            {w}
-          </Alert>
-        ))}
+        <ImportWarningAlerts warnings={importResult.warnings} t={t} />
       </Box>
     );
   }
@@ -293,6 +307,38 @@ export default function ProjectImportPanel({ onImported }: Props) {
               ))}
             </Stack>
           </Collapse>
+
+          {Object.keys(personaSlugs).length > 0 && (
+            <>
+              <Button
+                size="small"
+                onClick={() => setShowPersonaSlugs(!showPersonaSlugs)}
+              >
+                {showPersonaSlugs
+                  ? t("importDialog.hidePersonaSlugs")
+                  : t("importDialog.showPersonaSlugs")}
+              </Button>
+              <Collapse in={showPersonaSlugs}>
+                <Stack spacing={1}>
+                  {Object.keys(personaSlugs).map((origSlug) => (
+                    <TextField
+                      key={origSlug}
+                      label={t("importDialog.personaLabel", { slug: origSlug })}
+                      size="small"
+                      value={personaSlugs[origSlug]}
+                      onChange={(e) => {
+                        setPersonaSlugs((prev) => ({
+                          ...prev,
+                          [origSlug]: e.target.value,
+                        }));
+                        invalidatePlan();
+                      }}
+                    />
+                  ))}
+                </Stack>
+              </Collapse>
+            </>
+          )}
 
           {bundleConns.length > 0 && (
             <>
@@ -587,12 +633,7 @@ function ImportPlanPreview({ plan, t }: PlanPreviewProps) {
         </>
       )}
 
-      {plan.warnings.length > 0 &&
-        plan.warnings.map((w, i) => (
-          <Alert key={i} severity="warning" sx={{ mt: 1 }}>
-            {w}
-          </Alert>
-        ))}
+      <ImportWarningAlerts warnings={plan.warnings} t={t} />
     </Box>
   );
 }

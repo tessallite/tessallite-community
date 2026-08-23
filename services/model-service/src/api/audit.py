@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 
+from shared.auth.identity import canonical_email
 from shared.db.models import AuditEvent
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import (
@@ -31,6 +32,25 @@ router = APIRouter(prefix="/admin/audit-events", tags=["audit"])
 # CSV notice row, so a compliance admin is never silently handed a partial set.
 _EXPORT_ROW_CAP = 10000
 
+# Bug-6314: audit fields (actor_email, action, target_name, detail) contain
+# attacker-influenced text. A spreadsheet app treats a cell that begins with a
+# formula trigger as a live formula (CSV/formula injection), so a crafted
+# target name like ``=cmd|...`` executes when a compliance admin opens the
+# export. Neutralise any cell that starts with a trigger or a control byte by
+# prefixing a single quote — the OWASP-recommended mitigation that keeps the
+# value readable as text.
+_CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r", "\n")
+
+
+def _csv_safe(value) -> str:
+    """Return a CSV-injection-safe string for ``value``."""
+    if value is None:
+        return ""
+    s = value if isinstance(value, str) else str(value)
+    if s and s[0] in _CSV_FORMULA_TRIGGERS:
+        return "'" + s
+    return s
+
 
 def _build_query(
     *,
@@ -43,7 +63,9 @@ def _build_query(
 ):
     stmt = select(AuditEvent)
     if actor_email:
-        stmt = stmt.where(AuditEvent.actor_email == actor_email)
+        stmt = stmt.where(
+            func.lower(AuditEvent.actor_email) == canonical_email(actor_email)
+        )
     if action:
         stmt = stmt.where(AuditEvent.action == action)
     if target_type:
@@ -96,6 +118,19 @@ async def list_audit_events(
         )
 
 
+@router.get("/actions")
+async def list_audit_actions(
+    current_user: CurrentUser = Depends(require_tenant_admin),
+) -> list[str]:
+    """Distinct action names for the audit filter picker (F-022-15)."""
+    async for db in get_tenant_db(current_user.tenant_id):
+        rows = await db.execute(
+            select(AuditEvent.action).distinct().order_by(AuditEvent.action)
+        )
+        return [a for a in rows.scalars().all() if a]
+    return []
+
+
 @router.get("/export")
 async def export_audit_events(
     current_user: CurrentUser = Depends(require_tenant_admin),
@@ -136,13 +171,13 @@ async def export_audit_events(
         for e in events:
             writer.writerow([
                 e.timestamp.isoformat() if e.timestamp else "",
-                e.actor_email or "",
-                e.action,
-                e.target_type or "",
-                e.target_name or "",
-                e.severity,
-                e.ip_address or "",
-                str(e.detail) if e.detail else "",
+                _csv_safe(e.actor_email),
+                _csv_safe(e.action),
+                _csv_safe(e.target_type),
+                _csv_safe(e.target_name),
+                _csv_safe(e.severity),
+                _csv_safe(e.ip_address),
+                _csv_safe(e.detail) if e.detail else "",
             ])
         if truncated:
             # A trailing notice row makes the truncation visible even to a

@@ -29,8 +29,16 @@ from shared.db.models import (
     UserAccessBinding,
 )
 from shared.model_snapshot.serialiser import _j, _row_to_dict, snapshot_model
+from shared.model_snapshot.project_rehydrator import sanitise_imported_config
 
-PROJECT_BUNDLE_VERSION = 1
+# Bundle FORMAT version. Bumped 1 -> 2 (Bug-7623): a v2 bundle carries each
+# model version's OWN portable ``snapshot_json`` (see snapshot_model's
+# ``include_versions`` branch), so a restore can reproduce version N's real
+# shape. v1 bundles carry no per-version snapshots — the importer degrades
+# every version for them (honest, non-restorable). The importer accepts both
+# versions and routes on this number; the ``export_format`` family string is
+# unchanged so the two are one continuous format line, not a hard break.
+PROJECT_BUNDLE_VERSION = 2
 PROJECT_EXPORT_FORMAT = "tessallite-project/v1"
 
 _AGENT_CONFIG_FIELDS = (
@@ -40,11 +48,29 @@ _AGENT_CONFIG_FIELDS = (
     "judge_mode", "judge_block_visibility",
     "show_thought_process", "show_semantic_query", "show_physical_query",
     "feedback_enabled", "conversation_retention_days",
-    "webhook_url",
+    # Bug-8411 — the webhook event subscription travels with the project;
+    # restoring webhook_url without it would silently re-subscribe the
+    # receiver to every agent event.
+    "webhook_url", "webhook_event_filters",
     "primary_model_id", "answer_llm_config_id",
     "judge_llm_config_id", "judge_rubric_id",
     "aggregate_llm_config_id", "glossary_llm_config_id",
 )
+
+
+def _serialise_agent_model_context(context: ProjectAgentModelContext) -> dict[str, Any]:
+    """Serialise agent context while preserving derived-state semantics.
+
+    ``derived_at`` is a local operational timestamp and is intentionally not
+    portable, but its presence is meaningful even when every derived list is
+    legitimately empty. Carry a small state marker so import can distinguish
+    that case from a context row that was never derived.
+    """
+    payload = _row_to_dict(
+        context, exclude=("derived_at", "published_at", "updated_at")
+    )
+    payload["context_derived"] = context.derived_at is not None
+    return payload
 
 
 async def export_project(
@@ -96,9 +122,28 @@ async def export_project(
                 "id": _j(c.id),
                 "display_name": c.display_name,
                 "connection_type": c.connection_type,
-                "config": c.config,
+                # F-020-10 (Bug-9080): the plaintext JSONB config bag is echoed
+                # to lower-privileged readers of the bundle; secrets belong in
+                # the Fernet-encrypted column, never here. Import already strips
+                # secret-like keys (sanitise_imported_config) — apply the SAME
+                # strip on export so a bundle exported WITHOUT credentials cannot
+                # still carry a plaintext "password"/"token" in config.
+                "config": sanitise_imported_config(
+                    c.config, label="connection", name=c.display_name,
+                ),
             }
-            if include_credentials and system_fernet and passphrase_fernet:
+            if (
+                include_credentials
+                and system_fernet
+                and passphrase_fernet
+                and c.encrypted_credentials
+            ):
+                # Bug-6293: deferred-credential connections persist empty
+                # ciphertext (b""). Fernet.decrypt(b"") raises InvalidToken,
+                # 500-ing a credential-including export. Mirror the llm_configs
+                # guard just below: skip the credentials field entirely so the
+                # connection round-trips as a placeholder (re-enter creds on
+                # import) instead of crashing the export.
                 plaintext = system_fernet.decrypt(c.encrypted_credentials)
                 entry["credentials"] = base64.b64encode(
                     passphrase_fernet.encrypt(plaintext)
@@ -123,7 +168,10 @@ async def export_project(
                 "max_tokens": lc.max_tokens,
                 "temperature": lc.temperature,
                 "timeout_seconds": lc.timeout_seconds,
-                "config": lc.config,
+                # F-020-10 (Bug-9080): same strip on the LLM provider config bag.
+                "config": sanitise_imported_config(
+                    lc.config, label="llm_config", name=lc.display_name,
+                ),
             }
             if (
                 include_credentials
@@ -172,9 +220,7 @@ async def export_project(
                 .where(ProjectAgentModelContext.project_id == project_id)
             )
             agent_contexts = [
-                _row_to_dict(
-                    amc, exclude=("derived_at", "published_at", "updated_at")
-                )
+                _serialise_agent_model_context(amc)
                 for amc in amc_q.scalars().all()
             ]
 
@@ -195,7 +241,16 @@ async def export_project(
                 "judge_rubrics": rubrics,
             }
         else:
-            bundle["agent_config"] = None
+            # Bug-6290: emit a valid empty shape so the importer does not
+            # reject the bundle.  Most projects never configure the agent,
+            # so the export must produce a round-trippable section even
+            # when no ProjectAgentConfig row exists.
+            bundle["agent_config"] = {
+                "config": {},
+                "models": [],
+                "model_contexts": [],
+                "judge_rubrics": [],
+            }
 
     if "cross_model_recipes" in sections:
         rec_q = await tenant_db.execute(
@@ -245,6 +300,10 @@ async def export_project(
                 "model_slug": (
                     model_slug_by_id.get(ab.model_id) if ab.model_id else None
                 ),
+                # Bug-6599: carry provenance so an exported sso_group binding
+                # does not silently re-import as "manual" (which would make an
+                # SSO-managed grant permanent and unrevocable post-import).
+                "source": ab.source,
             })
         bundle["access_bindings"] = bindings
 
@@ -256,6 +315,9 @@ async def export_project(
     )
     model_rows = list(models_q.scalars().all())
     model_snapshots: list[dict[str, Any]] = []
+    # Bug-8380: the endpoint supplies one REPEATABLE READ session for the
+    # complete project bundle. Keep model snapshots on that same session so
+    # project sections and every model share one committed observation point.
     for m in model_rows:
         snap = await snapshot_model(m.id, tenant_db, include_versions=True)
         model_snapshots.append(snap)

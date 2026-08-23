@@ -194,6 +194,11 @@ class TestTenantCrossCheck:
     @pytest.mark.asyncio
     async def test_authenticate_accepts_matching_jwt(self, monkeypatch):
         throttle._reset_for_tests()
+        # Bug-7322: mock the upstream session-revocation check so this unit
+        # test does not require a running model-service.
+        async def _noop_validate(token):
+            return None
+        monkeypatch.setattr("src.jdbc.server.validate_session_upstream", _noop_validate)
         server = PGWireServer()
         server._peer_ip = "203.0.113.7"
         writer = _CaptureWriter()
@@ -312,6 +317,10 @@ class TestRequireTls:
     async def test_plaintext_startup_rejected_when_required(self, monkeypatch):
         monkeypatch.setattr(
             "src.jdbc.server.settings.GATEWAY_SSL_REQUIRED", True, raising=False
+        )
+        monkeypatch.setattr(
+            "src.jdbc.server.settings.GATEWAY_ALLOW_INSECURE_TRANSPORT", False,
+            raising=False,
         )
         server = PGWireServer()
         server._peer_ip = "203.0.113.7"

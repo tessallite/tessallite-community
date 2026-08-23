@@ -273,7 +273,7 @@ async def test_remediation_column_removed_marks_drift_removed():
         id=col_id, column_name="amount", drift_removed=False
     )
     mock_dim = types.SimpleNamespace(
-        id=uuid.uuid4(), model_id=TEST_MODEL_ID,
+        id=uuid.uuid4(), model_id=TEST_MODEL_ID, name="amount_dim",
         is_invalid=False, invalid_reason=None,
         source_column_id=col_id,
     )
@@ -287,7 +287,19 @@ async def test_remediation_column_removed_marks_drift_removed():
     dims_result.scalars.return_value.all.return_value = [mock_dim]
     meas_result = MagicMock()
     meas_result.scalars.return_value.all.return_value = []
-    db.execute = AsyncMock(side_effect=[table_result, col_result, dims_result, meas_result])
+    # F-012-01 / Fable R1: apply_remediation now also resolves hierarchy-level
+    # grain names, dependent aggregates (SELECT, empty here), and — on a
+    # breaking event — marks the model's fresh pockets stale (UPDATE).
+    hlevel_result = MagicMock()
+    hlevel_result.fetchall.return_value = []
+    agg_result = MagicMock()
+    agg_result.scalars.return_value.all.return_value = []
+    pocket_update_result = MagicMock()
+    pocket_update_result.rowcount = 0
+    db.execute = AsyncMock(side_effect=[
+        table_result, col_result, dims_result, meas_result,
+        hlevel_result, agg_result, pocket_update_result,
+    ])
     db.add = MagicMock()
 
     await apply_remediation(TEST_MODEL_ID, [event], db)
@@ -337,7 +349,17 @@ async def test_remediation_type_changed_updates_data_type():
     col_result.scalar_one_or_none.return_value = mock_col
     meas_result = MagicMock()
     meas_result.scalars.return_value.all.return_value = [mock_meas]
-    db.execute = AsyncMock(side_effect=[table_result, col_result, meas_result])
+    # F-012-01: an incompatibly-retyped measure column is a breaking event, so
+    # apply_remediation now resolves dependent aggregates (SELECT, empty here)
+    # and marks the model's fresh pockets stale (UPDATE). Script those calls.
+    agg_result = MagicMock()
+    agg_result.scalars.return_value.all.return_value = []
+    pocket_update_result = MagicMock()
+    pocket_update_result.rowcount = 0
+    db.execute = AsyncMock(side_effect=[
+        table_result, col_result, meas_result,
+        agg_result, pocket_update_result,
+    ])
     db.add = MagicMock()
 
     await apply_remediation(TEST_MODEL_ID, [event], db)

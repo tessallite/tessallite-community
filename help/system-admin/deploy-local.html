@@ -20,20 +20,18 @@
 <h2>Requirements</h2>
 <ul><li>Docker Desktop 24 or later with Compose v2.</li><li>Minimum 2 CPUs and 4 GB RAM for a development deployment. 4 CPUs and 8 GB RAM recommended for sustained use.</li><li>Ports 3000, 8001, 8080, and 5433 free on the host. If you use the developer Excel add-in path, port 3443 must also be free for HTTPS.</li><li>A signed Community licence at <code>./license.json</code> when licence enforcement is enabled.</li></ul>
 <h2>Starting and stopping</h2>
-<pre><code># In the signed Community bundle directory
+<pre><code># Community bundle — first install and later upgrades
 ./install.sh
 
-# Start all services in the background
-docker compose up -d
+# Developer source checkout (this repo) — never a bare compose up
+cd deploy/local && bash deploy.sh     # Linux / macOS
+cd deploy\local && deploy.bat         # Windows
 
-# Check service status
-docker compose ps
-
-# Stream logs for a specific service
-docker compose logs -f query-router
-
-# Stop all services (data volumes preserved)
-docker compose down</code></pre>
+# After the stack exists, day-2 commands from the bundle / compose project:
+docker compose --env-file .env ps
+docker compose --env-file .env logs -f query-router
+docker compose --env-file .env down    # volumes preserved</code></pre>
+<p>Do not run <code>docker compose up -d</code> from <code>tessallite/infra/</code> as a substitute for <code>deploy/local/deploy.sh</code> or Community <code>install.sh</code>. Those scripts generate <code>.env</code>, run migrations, and start services in the migrate-then-serve order.</p>
 <h2>Accessing the web UI (HTTP and HTTPS)</h2>
 <p>A Community bundle deployment serves the web UI at:</p>
 <ul><li><strong><code>http://localhost:3000</code></strong> — the main local UI.</li></ul>
@@ -41,7 +39,7 @@ docker compose down</code></pre>
 <ul><li><strong><code>https://localhost:3443</code></strong> — HTTPS, using a locally-generated certificate. This is the address you use for the <strong>Excel add-in</strong>: Microsoft Office only loads add-ins served over HTTPS, so the add-in's manifest points at <code>https://localhost:3443</code>, not the HTTP port.</li></ul>
 <p>The HTTPS certificate for <code>localhost:3443</code> is created during deployment (the certificate step, <code>03b_certs</code>). It is a self-signed development certificate, so a browser may warn you the first time — that warning is expected for local development and does not apply to a real deployment, which serves over a trusted certificate. If the Excel add-in cannot connect, confirm port 3443 is free and that the certificate step ran successfully.</p>
 <h2>Persistent data</h2>
-<p>Tessallite uses one named volume: <code>tessallite_pgdata</code> — stores workspace metadata, model definitions, aggregate build history, and the query miss log.</p>
+<p>Tessallite uses one named volume: <code>postgres_data</code> (Community Compose and the local developer stack) — stores workspace metadata, model definitions, aggregate build history, and the query miss log. Some older help pages said <code>tessallite_pgdata</code>; that name is not the Compose volume.</p>
 <p>This volume persists across <code>docker compose down</code> and <code>docker compose up</code> cycles. To delete it and all Tessallite data, use <code>docker compose down -v</code>. See the Teardown article for details.</p>
 <h2>Environment variable configuration</h2>
 <p>For Community, <code>install.sh</code> creates <code>.env</code> from <code>.env.example</code> if needed, generates missing secrets, and preserves values already present. Review <code>.env</code> before first use if you need to change ports, public URLs, or licence paths. The minimum important values are:</p>
@@ -59,7 +57,7 @@ LICENSE_PUBLIC_KEYS=tessallite-prod-2026:&lt;public-key&gt;</code></pre>
 <tr><td><code>CREDENTIAL_ENCRYPTION_KEY</code></td><td>Yes</td><td>—</td><td>Fernet key for encrypting source database credentials. Generate with <code>python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"</code></td></tr>
 <tr><td><code>JWT_SECRET_KEY</code></td><td>Yes</td><td>—</td><td>Signs user session tokens. Minimum 32 characters.</td></tr>
 <tr><td><code>SYSTEM_ADMIN_EMAIL</code></td><td>No</td><td><code>admin@tessallite.local</code></td><td>System admin login email.</td></tr>
-<tr><td><code>SYSTEM_ADMIN_PASSWORD</code></td><td>Yes</td><td>—</td><td>System admin password.</td></tr>
+<tr><td><code>SYSTEM_ADMIN_PASSWORD</code></td><td>Yes</td><td>—</td><td>System admin password. Minimum 12 characters, with at least one uppercase letter, one lowercase letter, and one digit.</td></tr>
 <tr><td><code>LICENSE_FILE_HOST</code></td><td>No</td><td><code>./license.json</code></td><td>Legacy/bootstrap host path to a signed local licence file. The License Manager upload stores the active licence in the platform database.</td></tr>
 <tr><td><code>LICENSE_PUBLIC_KEYS</code></td><td>No</td><td>built-in key</td><td>Optional public verification key override. Normal installs use the built-in Tessallite public key.</td></tr>
 <tr><td><code>JDBC_PORT</code></td><td>No</td><td><code>5433</code></td><td>Host port for the JDBC listener.</td></tr>

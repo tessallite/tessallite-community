@@ -3,6 +3,7 @@ Unified table attribute listing (physical + user-defined).
 """
 from __future__ import annotations
 
+from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -11,6 +12,9 @@ from sqlalchemy import select
 
 from shared.db.models import (
     Dimension,
+    HierarchyDefinition,
+    HierarchyLevel,
+    HierarchyLevelAttribute,
     Join,
     Measure,
     ModelColumn,
@@ -22,8 +26,10 @@ from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import ModelColumnUpdate, TableAttributeResponse
 from src.auth.middleware import CurrentUser, forbid_embed_user
 from src.auth.rbac import require_role
+from src.api._model_lock import acquire_model_definition_lock
 from src.api._scope import ensure_model_in_project
 from src.api._uda_refs import assert_uda_deletable
+from shared.semantic.join_population_auto_flag import auto_flag_safe_population_joins
 
 router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}/tables/{table_id}",
@@ -35,6 +41,12 @@ class ColumnSyncItem(BaseModel):
     column_name: str
     data_type: str
     is_nullable: bool = True
+    # Bug-8618: the source catalogue's PRIMARY KEY membership, as discovered by
+    # ``shared.source_introspection``. ``None`` means the payload does not
+    # describe keys at all — either an older client, or a catalogue read that
+    # failed — and the stored value is left untouched. It is NOT the same as
+    # ``False``, which is a positive statement that the source has no such key.
+    is_primary_key: Optional[bool] = None
 
 
 @router.get("/attributes", response_model=list[TableAttributeResponse])
@@ -118,9 +130,23 @@ async def sync_columns(
 
     Creates new columns and upgrades existing ``data_type="unknown"`` entries
     with the real type.  Called by the frontend after table classification.
+
+    Bug-8618: also reconciles ``is_primary_key`` against the source. This is a
+    RECONCILIATION, not a merge — when the payload states key membership
+    (``True`` or ``False``) the source wins, including clearing a stored flag
+    the source no longer backs. A stale ``True`` is what the pocket
+    row-population proof reads as evidence that joining a table cannot
+    duplicate rows, so keeping one the source has dropped would turn a
+    forgone acceleration into a wrong number. A modeller declaring a key on a
+    constraint-less view still does so through the column editor
+    (``PATCH .../columns/{id}``); ``is_primary_key`` is simply re-asserted from
+    the source whenever the schema is explicitly re-synced. When the payload
+    omits the field (``None``) — an older client, or a catalogue read that
+    failed — the stored value is left exactly as it was.
     """
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         table = await db.get(ModelTable, table_id)
         if table is None or table.model_id != model_id:
             raise HTTPException(status_code=404, detail="Model table not found")
@@ -137,13 +163,45 @@ async def sync_columns(
                 if col.data_type == "unknown" and item.data_type != "unknown":
                     col.data_type = item.data_type
                     col.is_nullable = item.is_nullable
+                if item.is_primary_key is not None:
+                    col.is_primary_key = item.is_primary_key
             else:
                 db.add(ModelColumn(
                     model_table_id=table_id,
                     column_name=item.column_name,
                     data_type=item.data_type,
                     is_nullable=item.is_nullable,
+                    is_primary_key=bool(item.is_primary_key),
                 ))
+
+        # G4: source introspection is the one boundary that can refresh the
+        # key proof used by the conservative population default. Scope the
+        # pass to this table and only fill a genuinely absent participation
+        # value; explicit modeller states (including ``undeclared``) remain
+        # untouched. Unknown/ambiguous key metadata fails closed in the
+        # helper, so a naming convention can never create a declaration.
+        table_result = await db.execute(
+            select(ModelTable).where(ModelTable.model_id == model_id)
+        )
+        model_tables = list(table_result.scalars().all())
+        table_ids = {table.id for table in model_tables}
+        column_result = (
+            await db.execute(
+                select(ModelColumn).where(ModelColumn.model_table_id.in_(table_ids))
+            )
+            if table_ids
+            else None
+        )
+        model_columns = list(column_result.scalars().all()) if column_result is not None else []
+        join_result = await db.execute(
+            select(Join).where(Join.model_id == model_id)
+        )
+        auto_flag_safe_population_joins(
+            join_result.scalars().all(),
+            model_tables,
+            model_columns,
+            introspected_table_ids={table_id},
+        )
 
         await db.commit()
 
@@ -170,6 +228,7 @@ async def update_physical_column(
     """
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         table = await db.get(ModelTable, table_id)
         if table is None or table.model_id != model_id:
             raise HTTPException(status_code=404, detail="Model table not found")
@@ -223,6 +282,7 @@ async def delete_table_attribute(
 ) -> None:
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-7982 cross-family lock
         table = await db.get(ModelTable, table_id)
         if table is None or table.model_id != model_id:
             raise HTTPException(status_code=404, detail="Model table not found")
@@ -268,12 +328,45 @@ async def delete_table_attribute(
                 UserDefinedAttributeColumnRef.column_id == attribute_id
             )
         )
+        # Bug-7792: Bug-1505 added the hierarchy-level guard to the UDA delete
+        # path (via ``assert_uda_deletable``) but NOT here, on the physical
+        # column path. HierarchyLevel.key_attribute_id / HierarchyLevelAttribute
+        # are polymorphic UUIDs with no FK, so deleting a physical column that
+        # keys a level succeeds and leaves a dangling key_attribute_id (silent
+        # model corruption). Detect both the key reference and the
+        # display/filter-attribute reference, scoped to ``physical_column``.
+        level_key_result = await db.execute(
+            select(HierarchyDefinition.name, HierarchyLevel.name)
+            .join(HierarchyLevel, HierarchyLevel.hierarchy_id == HierarchyDefinition.id)
+            .where(
+                HierarchyDefinition.model_id == model_id,
+                HierarchyLevel.key_attribute_source == "physical_column",
+                HierarchyLevel.key_attribute_id == attribute_id,
+            )
+        )
+        level_attr_result = await db.execute(
+            select(HierarchyDefinition.name, HierarchyLevel.name)
+            .join(HierarchyLevel, HierarchyLevel.hierarchy_id == HierarchyDefinition.id)
+            .join(
+                HierarchyLevelAttribute,
+                HierarchyLevelAttribute.level_id == HierarchyLevel.id,
+            )
+            .where(
+                HierarchyDefinition.model_id == model_id,
+                HierarchyLevelAttribute.attribute_source == "physical_column",
+                HierarchyLevelAttribute.attribute_id == attribute_id,
+            )
+        )
 
         dim_refs = [r[0] for r in dim_result.fetchall()]
         meas_refs = [r[0] for r in meas_result.fetchall()]
         join_refs = [str(r[0]) for r in join_result.fetchall()]
         uda_refs = [str(r[0]) for r in uda_ref_result.fetchall()]
-        if dim_refs or meas_refs or join_refs or uda_refs:
+        level_refs = sorted({f"{h}.{lvl}" for h, lvl in level_key_result.fetchall()})
+        level_attr_refs = sorted(
+            {f"{h}.{lvl}" for h, lvl in level_attr_result.fetchall()}
+        )
+        if dim_refs or meas_refs or join_refs or uda_refs or level_refs or level_attr_refs:
             refs = []
             if dim_refs:
                 refs.append(f"dimensions: {', '.join(dim_refs)}")
@@ -283,6 +376,12 @@ async def delete_table_attribute(
                 refs.append(f"joins: {', '.join(join_refs)}")
             if uda_refs:
                 refs.append("user-defined-attribute dependencies exist")
+            if level_refs:
+                refs.append(f"hierarchy levels (key): {', '.join(level_refs)}")
+            if level_attr_refs:
+                refs.append(
+                    f"hierarchy levels (attribute): {', '.join(level_attr_refs)}"
+                )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Cannot delete physical attribute; it is referenced by {'; '.join(refs)}",

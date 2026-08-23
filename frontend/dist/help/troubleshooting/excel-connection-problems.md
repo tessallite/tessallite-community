@@ -2,7 +2,7 @@
 title: "Excel Connection Problems"
 audience: analyst
 area: Troubleshooting
-updated: 2026-04-17
+updated: 2026-07-02
 ---
 
 ![Excel error dialog when XMLA endpoint is unreachable.](../assets/screencaps/excel-xmla-error-dialog.png)
@@ -17,7 +17,7 @@ Diagnosing and resolving connection failures when connecting Microsoft Excel to 
 
 Before troubleshooting, verify:
 
-- Port 8080 is reachable from this machine. Test with: `curl -v http://HOST:8080/xmla`
+- Port 8080 is reachable from this machine. Test with: `curl -v http://HOST:8080/api/v1/xmla/`
 - You have the workspace slug (obtain from your Tenant Admin — it is case-sensitive).
 - You have valid Tessallite credentials (email address and password).
 - You know the project name and model name you intend to query.
@@ -28,8 +28,8 @@ Before troubleshooting, verify:
 
 | Symptom | Likely cause | Resolution |
 |---------|-------------|------------|
-| "We couldn't connect to the Analysis Services server" | Wrong URL format | URL must be exactly `http://HOST:8080/xmla`. Do not omit `/xmla`. Do not use HTTPS unless SSL is configured. |
-| Same error with correct URL | Port 8080 blocked or Gateway not running | Test with `curl -v http://HOST:8080/xmla`. If refused, escalate to System Admin to check Gateway service and firewall. |
+| "We couldn't connect to the Analysis Services server" | Wrong URL format | URL must be exactly `http://HOST:8080/api/v1/xmla/`. Do not omit `/api/v1/xmla/` or the trailing slash. Do not use HTTPS unless SSL is configured. |
+| Same error with correct URL | Port 8080 blocked or Gateway not running | Test with `curl -v http://HOST:8080/api/v1/xmla/`. If refused, escalate to System Admin to check Gateway service and firewall. |
 | "The catalog name is invalid" | Wrong workspace slug or wrong case | Verify slug with Tenant Admin. Slug is case-sensitive. |
 | "The user name or password is incorrect" | Wrong Tessallite credentials | Confirm you are using Tessallite email and password, not database credentials. Reset via Admin panel if needed. |
 | "No cubes were found" | No published model in the project | Ask Modeller to publish the model in Model Builder. |
@@ -43,7 +43,7 @@ Before troubleshooting, verify:
 From a terminal on the same machine as Excel:
 
 ```
-curl -v http://HOST:8080/xmla
+curl -v http://HOST:8080/api/v1/xmla/
 ```
 
 Any HTTP response (even a server-side error) confirms the port is reachable. A timeout or "connection refused" is a network or service issue, not an Excel configuration issue.

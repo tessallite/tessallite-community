@@ -16,6 +16,17 @@ from shared.config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
+class SmtpNotConfiguredError(Exception):
+    """Raised when SMTP_HOST is empty/unset and email delivery is attempted.
+
+    Bug-7340: callers must distinguish "SMTP is not configured" from a
+    transient delivery failure. When SMTP is unconfigured the send must
+    surface a clear failure so that (a) test-send reports the truth,
+    (b) runtime dispatch does not count the send as successful, and
+    (c) the dedup window is not consumed by a no-op.
+    """
+
+
 def _build_message(
     *,
     to: list[str],
@@ -49,8 +60,10 @@ def _send_sync(
     settings = get_settings()
     host = getattr(settings, "SMTP_HOST", "")
     if not host:
-        logger.warning("SMTP_HOST not configured; skipping email send")
-        return
+        raise SmtpNotConfiguredError(
+            "SMTP_HOST is not configured. Email delivery is unavailable. "
+            "Set SMTP_HOST in .env to enable email alerts."
+        )
 
     port = int(getattr(settings, "SMTP_PORT", 587))
     use_tls = str(getattr(settings, "SMTP_TLS", "true")).lower() in ("true", "1", "yes")
@@ -85,6 +98,13 @@ async def send_email(
     body_text: str | None = None,
     from_addr: str | None = None,
 ) -> None:
+    """Send an alert email via SMTP.
+
+    Raises ``SmtpNotConfiguredError`` when SMTP_HOST is unset so callers
+    can distinguish a configuration gap from a transient delivery failure.
+    Bug-7340: the "sent" log line and success path are only reached when
+    the SMTP server accepted the message.
+    """
     try:
         await asyncio.to_thread(
             _send_sync,
@@ -92,6 +112,13 @@ async def send_email(
             body_text=body_text, from_addr=from_addr,
         )
         logger.info("Alert email sent to %s: %s", to, subject)
+    except SmtpNotConfiguredError:
+        # Bug-7340: propagate without the generic "Failed to send" log line
+        # so callers (dispatcher, test-send) can handle it distinctly.
+        logger.warning(
+            "SMTP not configured; email to %s not sent: %s", to, subject,
+        )
+        raise
     except Exception as exc:
         logger.error("Failed to send alert email to %s: %s", to, exc)
         raise

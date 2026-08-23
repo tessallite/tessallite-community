@@ -14,7 +14,9 @@ import logging
 from datetime import date, timedelta
 from typing import Any
 
-from shared.connector_qualify import quote_table_ref
+from sqlglot import exp
+
+from shared.connector_qualify import CONNECTOR_TO_SQLGLOT
 from shared.schemas.connection_type import normalize_connection_type
 from shared.semantic.calendar_dialects import CALENDAR_DIALECTS, emit_calendar_ddl
 from shared.source_executor import execute_source_ddl, execute_source_sql
@@ -27,6 +29,44 @@ _DEFAULT_END_OFFSET_YEARS = 5
 
 def target_calendar_table_name(calendar_type: str, fiscal_year_start_month: int) -> str:
     return f"tess_cal_{calendar_type}_{fiscal_year_start_month}"
+
+
+def _build_existence_probe(dialect: str, qualified: str) -> str:
+    """Build a ``SELECT 1 ... LIMIT 1`` existence probe for the target dialect.
+
+    Bug-7768: uses sqlglot's AST builder so the SQL is valid on every dialect
+    (T-SQL emits ``TOP 1`` instead of ``LIMIT 1``; BigQuery/Spark get backtick
+    quoting; etc.). The AST approach avoids string-interpolating pre-quoted
+    identifiers into a postgres-read parse, which would fail for bracket-quoted
+    (T-SQL) and backtick-quoted (BigQuery/Spark) names.
+    """
+    target = CONNECTOR_TO_SQLGLOT.get(dialect, "postgres")
+    parts = qualified.split(".")
+    if len(parts) > 3:
+        raise ValueError(
+            f"Qualified name has {len(parts)} segments (max 3): {qualified!r}"
+        )
+    if len(parts) == 3:
+        table_node = exp.Table(
+            this=exp.Identifier(this=parts[2], quoted=True),
+            db=exp.Identifier(this=parts[1], quoted=True),
+            catalog=exp.Identifier(this=parts[0], quoted=True),
+        )
+    elif len(parts) == 2:
+        table_node = exp.Table(
+            this=exp.Identifier(this=parts[1], quoted=True),
+            db=exp.Identifier(this=parts[0], quoted=True),
+        )
+    else:
+        table_node = exp.Table(
+            this=exp.Identifier(this=parts[0], quoted=True),
+        )
+    query = (
+        exp.select(exp.alias_(exp.Literal.number(1), "chk"))
+        .from_(table_node)
+        .limit(1)
+    )
+    return query.sql(dialect=target)
 
 
 def _normalise_target_dialect(conn_type: str) -> str:
@@ -61,18 +101,23 @@ async def ensure_target_calendar_table(
     else:
         qualified = f"{target_schema}.{base_name}"
 
-    quoted = quote_table_ref(dialect, qualified)
+    # Bug-7768: build the existence probe via sqlglot AST so it emits valid SQL
+    # for every dialect (T-SQL ``TOP 1`` instead of ``LIMIT 1``; proper quoting
+    # for brackets/backticks). Probe construction is outside the try so code
+    # bugs fail loud; only the DB execution is caught (table-not-found is
+    # expected on first run).
+    probe_sql = _build_existence_probe(dialect, qualified)
     try:
         rows, _ = await execute_source_sql(
             target_conn,
-            f"SELECT 1 AS chk FROM {quoted} LIMIT 1",
+            probe_sql,
             tenant_session=tenant_session,
         )
         if rows:
             logger.debug("Target calendar table %s already exists", qualified)
             return qualified
     except Exception:
-        pass
+        logger.debug("Existence probe failed for %s; will create", qualified)
 
     end_date = date.today() + timedelta(days=365 * _DEFAULT_END_OFFSET_YEARS)
     ddl = emit_calendar_ddl(

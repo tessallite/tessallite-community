@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
+from shared.aggregate_quantiles import is_quantile_agg_token
+from shared.semantic.join_keyword import edge_cardinality
 from shared.semantic.calculated_expression import (
     ExpressionValidationError,
     parse_expression,
@@ -461,7 +463,13 @@ def _compatibility_code(
     dim_table_id = _field_table_id(dimension, column_by_id, uda_by_id)
     if dim_table_id is None or dim_table_id not in table_by_id:
         return UNKNOWN_FIELD
-    if _aggregate_grain_mismatch(measure, dimension, aggregate_grain_by_measure):
+    if _aggregate_grain_mismatch(
+        measure,
+        dimension,
+        aggregate_grain_by_measure,
+        column_by_id=column_by_id,
+        uda_by_id=uda_by_id,
+    ):
         return AGGREGATE_GRAIN_MISMATCH
 
     saw_many_to_many = False
@@ -472,10 +480,21 @@ def _compatibility_code(
         paths = _enumerate_paths(measure_table_id, dim_table_id, adjacency)
         if not paths:
             return NO_JOIN_PATH
+        # Many-to-many is a CARDINALITY, and cardinality lives in its own
+        # field (join-orientation contract, invariant 3). This used to read
+        # ``join_type``, which only ever held the token while the two
+        # properties shared one column: a many-to-many declared the way the
+        # Joins panel, ``JoinCreate`` and the YAML importer now write it
+        # (``join_type="left"`` + ``cardinality="many_to_many"``) sailed past
+        # the guard and the pair was offered as compatible, so querying it
+        # fanned out and double-counted with no warning.
+        # ``edge_cardinality`` reads the declared field and falls back to a
+        # legacy token still parked in ``join_type``, so pre-split rows keep
+        # being caught exactly as before.
         safe_paths = [
             path
             for path in paths
-            if not any(_join_type(edge) == "many_to_many" for edge in path)
+            if not any(edge_cardinality(edge) == "many_to_many" for edge in path)
         ]
         if not safe_paths:
             saw_many_to_many = True
@@ -604,14 +623,76 @@ def _aggregate_grain_mismatch(
     measure: Any,
     dimension: Any,
     aggregate_grain_by_measure: dict[UUID, list[set[str]]],
+    *,
+    column_by_id: dict[UUID, Any],
+    uda_by_id: dict[UUID, Any],
 ) -> bool:
     if not _measure_requires_exact_aggregate_grain(measure):
         return False
     grains = aggregate_grain_by_measure.get(_uuid(measure.id), [])
     if not grains:
         return False
+    # Q13.10 / Bug-9458: semantic compatibility is not bounded by the current
+    # acceleration inventory. A standard source-bound measure and dimension on
+    # the same model table are valid at source grain even when every active
+    # aggregate omits that dimension. Keep this exception deliberately narrow:
+    # calculated, UDA, variant, semi-additive, and COUNT DISTINCT measures
+    # still require their governed aggregate contracts.
+    if _same_table_standard_source_pair(
+        measure, dimension, column_by_id=column_by_id, uda_by_id=uda_by_id
+    ):
+        return False
     names = {str(getattr(dimension, "name", "")), str(_uuid(dimension.id))}
     return not any(names & grain for grain in grains)
+
+
+def _same_table_standard_source_pair(
+    measure: Any,
+    dimension: Any,
+    *,
+    column_by_id: dict[UUID, Any],
+    uda_by_id: dict[UUID, Any],
+) -> bool:
+    """Whether source semantics can evaluate this pair without an aggregate.
+
+    This is intentionally not a general compatibility bypass. It only covers
+    ordinary fields whose source columns resolve to the same model table and
+    leaves exact-grain measure families governed by their existing rules.
+    """
+    if getattr(measure, "measure_type", "standard") != "standard":
+        return False
+    if getattr(measure, "user_defined_attribute_id", None) is not None:
+        return False
+    if getattr(dimension, "user_defined_attribute_id", None) is not None:
+        return False
+    if getattr(measure, "semi_additive_behavior", None) is not None:
+        return False
+    if getattr(measure, "variant_kind", None) is not None:
+        return False
+    # Q13.10 is a source-semantic exception only for ordinary, canonical
+    # aggregations. Keep every other family fail-closed rather than allowing
+    # a same-table shape to bypass its exact-grain contract.
+    aggregation = str(getattr(measure, "default_agg", "") or "").strip().lower()
+    aggregation = {"average": "avg", "median": "p50"}.get(aggregation, aggregation)
+    if aggregation not in {"sum", "avg", "min", "max", "count"}:
+        return False
+    if is_quantile_agg_token(aggregation):
+        return False
+    measure_column_id = _field_column_id(measure)
+    dimension_column_id = _field_column_id(dimension)
+    if measure_column_id is None or dimension_column_id is None:
+        return False
+    measure_column = column_by_id.get(measure_column_id)
+    dimension_column = column_by_id.get(dimension_column_id)
+    if measure_column is None or dimension_column is None:
+        return False
+    return (
+        getattr(measure_column, "model_table_id", None) is not None
+        and getattr(measure_column, "model_table_id", None)
+        == getattr(dimension_column, "model_table_id", None)
+        and str(getattr(measure, "default_agg", "") or "").lower()
+        not in {"count_distinct", "distinct_count"}
+    )
 
 
 def _measure_requires_exact_aggregate_grain(measure: Any) -> bool:
@@ -804,10 +885,6 @@ def _suggestion_text(
 
 def _display_name(obj: Any) -> str:
     return str(getattr(obj, "display_name", None) or getattr(obj, "name", None) or obj.id)
-
-
-def _join_type(join: Any) -> str:
-    return str(getattr(join, "join_type", "") or "").strip().lower()
 
 
 def _severity_for_code(code: str) -> str:

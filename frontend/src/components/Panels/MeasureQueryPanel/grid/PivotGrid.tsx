@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo } from "react";
 import {
   Box,
   Paper,
@@ -16,10 +16,12 @@ import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
 import UnfoldMoreIcon from "@mui/icons-material/UnfoldMore";
 import { ui } from "../../../../theme/tokens";
 import type { Measure, MeasureFormatToken } from "../../../../api/types";
+import type { PivotSort } from "../../../../api/client";
 import { formatMeasureValue } from "../../../../api/measureFormat";
 import { cellLookupKey } from "../pivot";
 import type { CellCoord, PivotModel } from "../types";
 import { NOT_ADDITIVE, type TotalValue, type TotalsModel } from "../totals";
+import { pivotSortMeasureIdentity, resolvePivotSort } from "./sortState";
 
 export type EmptyCellMode = "blank" | "zero" | "dash";
 export type ConditionalFormat =
@@ -29,9 +31,6 @@ export type ConditionalFormat =
   | { kind: "threshold"; below: string; above: string; threshold: number };
 
 type SortDir = "asc" | "desc";
-// Sort is now per-measure: clicking any measure column sorts by that measure's values.
-type SortState = { measureName: string; ckIndex: number | "grand"; dir: SortDir } | null;
-
 function interpolateColor(low: string, high: string, t: number): string {
   const parseHex = (h: string) => {
     const c = h.replace("#", "");
@@ -77,6 +76,9 @@ type Props = {
   showGrandTotals: boolean;
   emptyCellMode: EmptyCellMode;
   conditionalFormat: ConditionalFormat;
+  sort: PivotSort | null;
+  onSortChange: (sort: PivotSort | null) => void;
+  onSortInvalid?: () => void;
   // measure is the one whose column was clicked.
   onCellClick?: (coord: CellCoord, measure: Measure) => void;
   drillableRowDims?: Set<string>;
@@ -144,6 +146,9 @@ export default function PivotGrid({
   showGrandTotals,
   emptyCellMode,
   conditionalFormat,
+  sort,
+  onSortChange,
+  onSortInvalid,
   onCellClick,
   drillableRowDims,
   drillHierarchyNames,
@@ -152,14 +157,22 @@ export default function PivotGrid({
 }: Props) {
   const t = useT();
   const clickable = Boolean(onCellClick);
-  const [sort, setSort] = useState<SortState>(null);
 
   const allMeasures = [measure, ...extraMeasures];
   const measureCount = allMeasures.length;
   const multiMeasure = measureCount > 1;
 
-  const { rowCols, colCols, colKeys, byKey } = model;
+  const { rowCols, colCols, rowLabels, colKeys, byKey } = model;
   const hasCols = colCols.length > 0;
+
+  const resolvedSort = useMemo(
+    () => resolvePivotSort(sort, allMeasures, colKeys),
+    [sort, measure, extraMeasures, colKeys],
+  );
+
+  useEffect(() => {
+    if (sort && !resolvedSort) onSortInvalid?.();
+  }, [sort, resolvedSort, onSortInvalid]);
 
   // Get the value for a specific measure from a cell.
   function cellValue(cell: CellCoord | undefined, m: Measure): unknown {
@@ -185,17 +198,122 @@ export default function PivotGrid({
     return map;
   }, [model.byKey]);
 
+  const rawColValuesByKey = useMemo(() => {
+    const map = new Map<string, unknown[]>();
+    for (const cell of model.byKey.values()) {
+      const key = tupleKey(cell.colKey);
+      if (!map.has(key)) map.set(key, cell.colValues);
+    }
+    return map;
+  }, [model.byKey]);
+
+  function valuesForRow(row: DisplayRow): { keys: string[]; values: unknown[] } {
+    if (row.kind === "grandRow") return { keys: [], values: [] };
+    if (row.kind === "data") {
+      return {
+        keys: row.rk,
+        values: rawRowValuesByKey.get(tupleKey(row.rk)) ?? row.rk,
+      };
+    }
+    const representative = model.rowKeys.find((key) => (key[0] ?? "") === row.head);
+    return {
+      keys: [row.head],
+      values: (representative
+        ? rawRowValuesByKey.get(tupleKey(representative))
+        : undefined)?.slice(0, 1) ?? [row.head],
+    };
+  }
+
+  function valuesForColumn(column: DisplayCol): { keys: string[]; values: unknown[] } {
+    if (column.kind === "grandCol") return { keys: [], values: [] };
+    if (column.kind === "data") {
+      return {
+        keys: column.ck,
+        values: rawColValuesByKey.get(tupleKey(column.ck)) ?? column.ck,
+      };
+    }
+    const representative = model.colKeys.find((key) => (key[0] ?? "") === column.head);
+    return {
+      keys: [column.head],
+      values: (representative
+        ? rawColValuesByKey.get(tupleKey(representative))
+        : undefined)?.slice(0, 1) ?? [column.head],
+    };
+  }
+
+  function totalCoordinate(row: DisplayRow, column: DisplayCol, total: TotalValue): CellCoord {
+    const rowCoordinate = valuesForRow(row);
+    const columnCoordinate = valuesForColumn(column);
+    const measureValue = total === NOT_ADDITIVE ? null : total;
+    return {
+      rowKey: rowCoordinate.keys,
+      colKey: columnCoordinate.keys,
+      rowValues: rowCoordinate.values,
+      colValues: columnCoordinate.values,
+      measureValue,
+    };
+  }
+
+  /**
+   * Bug-8505: a drillable total cell previously carried
+   * `aria-label="Drill-through: <measure>"`. An aria-label REPLACES the cell's
+   * text content for assistive technology, so screen-reader users lost the
+   * value AND every total cell in the grid announced identically — there was
+   * no way to tell a row subtotal from the grand total, or which row/column it
+   * belonged to. The label below restates the rendered value, the measure, and
+   * the row/column grain of the specific total, then the drill affordance.
+   */
+  function rowScopeLabel(row: DisplayRow): string {
+    if (row.kind === "grandRow") return t("pivotGrid.total");
+    if (row.kind === "subtotalRow") return t("pivotGrid.subtotalPrefix", { head: row.head });
+    return row.rk.join(" / ");
+  }
+
+  function columnScopeLabel(column: DisplayCol): string {
+    if (column.kind === "grandCol") return t("pivotGrid.total");
+    if (column.kind === "subtotalCol") return t("pivotGrid.subtotalPrefix", { head: column.head });
+    return column.ck.join(" / ");
+  }
+
+  function totalCellAriaLabel(
+    row: DisplayRow,
+    column: DisplayCol,
+    valueText: string,
+    measureLabel: string,
+  ): string {
+    const value = valueText.trim() === "" ? t("pivotGrid.emptyValue") : valueText;
+    const params = {
+      value,
+      measure: measureLabel,
+      row: rowScopeLabel(row),
+      column: columnScopeLabel(column),
+    };
+    return hasCols
+      ? t("pivotGrid.totalCellAria", params)
+      : t("pivotGrid.totalCellAriaNoColumns", params);
+  }
+
+  function totalCellKind(row: DisplayRow, column: DisplayCol): string {
+    if (row.kind === "grandRow" && column.kind === "grandCol") return "grand-grand";
+    if (row.kind === "grandRow") return column.kind === "subtotalCol" ? "column-subtotal" : "column-grand";
+    if (column.kind === "grandCol") return row.kind === "subtotalRow" ? "row-subtotal" : "row-grand";
+    if (row.kind === "subtotalRow" && column.kind === "subtotalCol") return "cross-subtotal";
+    if (row.kind === "subtotalRow") return "row-subtotal";
+    return "column-subtotal";
+  }
+
   // Sort rows by whichever measure column was selected. Grand-total sorting uses
   // the original row index so totals stay aligned after the visible rows move.
   const rowKeys = useMemo(() => {
     const src = model.rowKeys;
-    if (!sort || src.length === 0) return src;
-    const sortM = allMeasures.find((m) => m.name === sort.measureName) ?? measure;
-    const sortCk = sort.ckIndex === "grand" ? null : model.colKeys[sort.ckIndex];
-    if (sort.ckIndex !== "grand" && !sortCk) return src;
+    if (!resolvedSort || src.length === 0) return src;
+    const activeSort = resolvedSort;
+    const sortM = allMeasures[activeSort.measureIndex] ?? measure;
+    const sortCk = activeSort.ckIndex === "grand" ? null : model.colKeys[activeSort.ckIndex];
+    if (activeSort.ckIndex !== "grand" && !sortCk) return src;
 
     function sortValue(rk: string[]): unknown {
-      if (sort?.ckIndex === "grand") {
+      if (activeSort.ckIndex === "grand") {
         const originalIndex = rowIndexByKey.get(tupleKey(rk));
         if (originalIndex === undefined) return undefined;
         const total = getMeasureTotals(sortM)?.grandCol[originalIndex];
@@ -217,7 +335,7 @@ export default function PivotGrid({
         groupOrder.push(head);
       }
     }
-    const sign = sort.dir === "asc" ? 1 : -1;
+    const sign = activeSort.dir === "asc" ? 1 : -1;
     const sorted: string[][] = [];
     for (const head of groupOrder) {
       const bucket = groups.get(head)!;
@@ -225,7 +343,7 @@ export default function PivotGrid({
       sorted.push(...bucket);
     }
     return sorted;
-  }, [model.rowKeys, model.colKeys, byKey, sort, rowIndexByKey, allTotals]);
+  }, [model.rowKeys, model.colKeys, byKey, resolvedSort, rowIndexByKey, allTotals]);
 
   // F-019-08: surface the currently-rendered row order so the export reflects
   // the user's sort. Reported on every sort/data change.
@@ -233,13 +351,27 @@ export default function PivotGrid({
     onRowOrderChange?.(rowKeys);
   }, [rowKeys, onRowOrderChange]);
 
-  function cycleSort(ckIndex: number | "grand", measureName: string) {
-    setSort((prev) => {
-      if (!prev || prev.ckIndex !== ckIndex || prev.measureName !== measureName)
-        return { measureName, ckIndex, dir: "asc" };
-      if (prev.dir === "asc") return { measureName, ckIndex, dir: "desc" };
-      return null;
-    });
+  function cycleSort(ckIndex: number | "grand", measureIndex: number) {
+    const nextTarget: PivotSort["target"] = ckIndex === "grand"
+      ? { kind: "grand" }
+      : { kind: "column", columnKey: [...(model.colKeys[ckIndex] ?? [])] };
+    const isSameTarget = resolvedSort?.measureIndex === measureIndex &&
+      resolvedSort.ckIndex === ckIndex;
+    if (!isSameTarget) {
+      onSortChange({
+        measure: pivotSortMeasureIdentity(allMeasures, measureIndex),
+        target: nextTarget,
+        direction: "asc",
+      });
+    } else if (resolvedSort.dir === "asc") {
+      onSortChange({
+        measure: pivotSortMeasureIdentity(allMeasures, measureIndex),
+        target: nextTarget,
+        direction: "desc",
+      });
+    } else {
+      onSortChange(null);
+    }
   }
 
   // Conditional formatting uses the first measure's values for the color scale.
@@ -338,7 +470,7 @@ export default function PivotGrid({
           {lvl === 0
             ? rowCols.map((rc, i) => (
                 <TableCell key={`rh-${i}`} rowSpan={rowDimHeaderSpan} sx={{ fontWeight: 600 }}>
-                  {rc}
+                  {rowLabels[i] ?? rc}
                 </TableCell>
               ))
             : null}
@@ -348,10 +480,10 @@ export default function PivotGrid({
               // Clicking is handled in the measure sub-row instead.
               const colSpanVal = multiMeasure ? measureCount : 1;
               const isLeaf = lvl === colCols.length - 1;
-              const sorted = !multiMeasure && isLeaf && sort?.ckIndex === dc.ckIndex;
+              const sorted = !multiMeasure && isLeaf && resolvedSort?.ckIndex === dc.ckIndex;
               const ariaSort: "ascending" | "descending" | "none" | undefined =
                 isLeaf && !multiMeasure
-                  ? sorted ? (sort?.dir === "asc" ? "ascending" : "descending") : "none"
+                  ? sorted ? (resolvedSort?.dir === "asc" ? "ascending" : "descending") : "none"
                   : undefined;
               return (
                 <TableCell
@@ -362,9 +494,9 @@ export default function PivotGrid({
                   colSpan={colSpanVal}
                   aria-sort={ariaSort}
                   tabIndex={isLeaf && !multiMeasure ? 0 : -1}
-                  onClick={isLeaf && !multiMeasure ? () => cycleSort(dc.ckIndex, measure.name) : undefined}
+                  onClick={isLeaf && !multiMeasure ? () => cycleSort(dc.ckIndex, 0) : undefined}
                   onKeyDown={isLeaf && !multiMeasure
-                    ? (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort(dc.ckIndex, measure.name); } }
+                    ? (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort(dc.ckIndex, 0); } }
                     : undefined}
                   title={isLeaf && !multiMeasure ? t("pivotGrid.sortColumn") : undefined}
                   sx={{
@@ -376,7 +508,7 @@ export default function PivotGrid({
                 >
                   <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}>
                     {dc.ck[lvl] ?? ""}
-                    {isLeaf && !multiMeasure && <SortGlyph active={Boolean(sorted)} dir={sort?.dir} />}
+                    {isLeaf && !multiMeasure && <SortGlyph active={Boolean(sorted)} dir={resolvedSort?.dir} />}
                   </Box>
                 </TableCell>
               );
@@ -389,7 +521,7 @@ export default function PivotGrid({
             // Single-measure grand column is sortable; multi-measure grand
             // sorting is delegated to the per-measure sub-row below.
             const grandSortable = isGrandCol && !multiMeasure;
-            const grandSorted = grandSortable && sort?.ckIndex === "grand" && sort?.measureName === measure.name;
+            const grandSorted = grandSortable && resolvedSort?.ckIndex === "grand" && resolvedSort?.measureIndex === 0;
             return (
               <TableCell
                 key={`${lvl}-${j}`}
@@ -397,11 +529,11 @@ export default function PivotGrid({
                 rowSpan={rowDimHeaderSpan}
                 colSpan={multiMeasure ? measureCount : 1}
                 role={grandSortable ? "columnheader" : undefined}
-                aria-sort={grandSortable ? (grandSorted ? (sort?.dir === "asc" ? "ascending" : "descending") : "none") : undefined}
+                aria-sort={grandSortable ? (grandSorted ? (resolvedSort?.dir === "asc" ? "ascending" : "descending") : "none") : undefined}
                 tabIndex={grandSortable ? 0 : -1}
-                onClick={grandSortable ? () => cycleSort("grand", measure.name) : undefined}
+                onClick={grandSortable ? () => cycleSort("grand", 0) : undefined}
                 onKeyDown={grandSortable
-                  ? (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort("grand", measure.name); } }
+                  ? (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort("grand", 0); } }
                   : undefined}
                 title={grandSortable ? t("pivotGrid.sortColumn") : undefined}
                 sx={{
@@ -413,7 +545,7 @@ export default function PivotGrid({
               >
                 <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.5, justifyContent: "flex-end" }}>
                   {label}
-                  {grandSortable && <SortGlyph active={Boolean(grandSorted)} dir={sort?.dir} />}
+                  {grandSortable && <SortGlyph active={Boolean(grandSorted)} dir={resolvedSort?.dir} />}
                 </Box>
               </TableCell>
             );
@@ -429,17 +561,17 @@ export default function PivotGrid({
           {displayCols.flatMap((dc, j) => {
             if (dc.kind === "data") {
               return allMeasures.map((m, mi) => {
-                const sorted = sort?.ckIndex === dc.ckIndex && sort?.measureName === m.name;
+                const sorted = resolvedSort?.ckIndex === dc.ckIndex && resolvedSort?.measureIndex === mi;
                 return (
                   <TableCell
                     key={`ms-${j}-${mi}`}
                     align="right"
                     scope="col"
                     role="columnheader"
-                    aria-sort={sorted ? (sort?.dir === "asc" ? "ascending" : "descending") : "none"}
+                    aria-sort={sorted ? (resolvedSort?.dir === "asc" ? "ascending" : "descending") : "none"}
                     tabIndex={0}
-                    onClick={() => cycleSort(dc.ckIndex, m.name)}
-                    onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort(dc.ckIndex, m.name); } }}
+                    onClick={() => cycleSort(dc.ckIndex, mi)}
+                    onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort(dc.ckIndex, mi); } }}
                     title={t("pivotGrid.sortColumn")}
                     sx={{
                       fontWeight: 600,
@@ -452,7 +584,7 @@ export default function PivotGrid({
                   >
                     <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.5, justifyContent: "flex-end" }}>
                       {m.display_name || m.name}
-                      <SortGlyph active={Boolean(sorted)} dir={sort?.dir} />
+                      <SortGlyph active={Boolean(sorted)} dir={resolvedSort?.dir} />
                     </Box>
                   </TableCell>
                 );
@@ -462,17 +594,17 @@ export default function PivotGrid({
             // stay non-sortable placeholders.
             if (dc.kind === "grandCol") {
               return allMeasures.map((m, mi) => {
-                const sorted = sort?.ckIndex === "grand" && sort?.measureName === m.name;
+                const sorted = resolvedSort?.ckIndex === "grand" && resolvedSort?.measureIndex === mi;
                 return (
                   <TableCell
                     key={`ms-${j}-grand-${mi}`}
                     align="right"
                     scope="col"
                     role="columnheader"
-                    aria-sort={sorted ? (sort?.dir === "asc" ? "ascending" : "descending") : "none"}
+                    aria-sort={sorted ? (resolvedSort?.dir === "asc" ? "ascending" : "descending") : "none"}
                     tabIndex={0}
-                    onClick={() => cycleSort("grand", m.name)}
-                    onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort("grand", m.name); } }}
+                    onClick={() => cycleSort("grand", mi)}
+                    onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort("grand", mi); } }}
                     title={t("pivotGrid.sortColumn")}
                     sx={{
                       fontWeight: 700,
@@ -485,7 +617,7 @@ export default function PivotGrid({
                   >
                     <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.5, justifyContent: "flex-end" }}>
                       {m.display_name || m.name}
-                      <SortGlyph active={Boolean(sorted)} dir={sort?.dir} />
+                      <SortGlyph active={Boolean(sorted)} dir={resolvedSort?.dir} />
                     </Box>
                   </TableCell>
                 );
@@ -508,48 +640,48 @@ export default function PivotGrid({
     headerRows.push(
       <TableRow key="h-0">
         {rowCols.map((rc, i) => (
-          <TableCell key={`rh-${i}`} sx={{ fontWeight: 600 }}>{rc}</TableCell>
+          <TableCell key={`rh-${i}`} sx={{ fontWeight: 600 }}>{rowLabels[i] ?? rc}</TableCell>
         ))}
         {allMeasures.map((m, mi) => {
-          const sorted = sort?.measureName === m.name && sort?.ckIndex === 0;
+          const sorted = resolvedSort?.measureIndex === mi && resolvedSort?.ckIndex === 0;
           return (
             <TableCell
               key={`mh-${mi}`}
               align="right"
               scope="col"
               role="columnheader"
-              aria-sort={sorted ? (sort?.dir === "asc" ? "ascending" : "descending") : "none"}
+              aria-sort={sorted ? (resolvedSort?.dir === "asc" ? "ascending" : "descending") : "none"}
               tabIndex={0}
-              onClick={() => cycleSort(0, m.name)}
-              onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort(0, m.name); } }}
+              onClick={() => cycleSort(0, mi)}
+              onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort(0, mi); } }}
               title={t("pivotGrid.sortColumn")}
               sx={{ fontWeight: 600, cursor: "pointer", userSelect: "none", "&:hover": { bgcolor: "action.hover" } }}
             >
               <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.5, justifyContent: "flex-end" }}>
                 {m.display_name || m.name}
-                <SortGlyph active={Boolean(sorted)} dir={sort?.dir} />
+                <SortGlyph active={Boolean(sorted)} dir={resolvedSort?.dir} />
               </Box>
             </TableCell>
           );
         })}
         {grandActive && rowCols.length > 0 && allMeasures.map((m, mi) => {
-          const sorted = sort?.ckIndex === "grand" && sort?.measureName === m.name;
+          const sorted = resolvedSort?.ckIndex === "grand" && resolvedSort?.measureIndex === mi;
           return (
             <TableCell
               key={`gh-${mi}`}
               align="right"
               scope="col"
               role="columnheader"
-              aria-sort={sorted ? (sort?.dir === "asc" ? "ascending" : "descending") : "none"}
+              aria-sort={sorted ? (resolvedSort?.dir === "asc" ? "ascending" : "descending") : "none"}
               tabIndex={0}
-              onClick={() => cycleSort("grand", m.name)}
-              onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort("grand", m.name); } }}
+              onClick={() => cycleSort("grand", mi)}
+              onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); cycleSort("grand", mi); } }}
               title={t("pivotGrid.sortColumn")}
               sx={{ fontWeight: 700, cursor: "pointer", userSelect: "none", bgcolor: ui.grandTotalBg, "&:hover": { bgcolor: ui.grandTotalBg } }}
             >
               <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.5, justifyContent: "flex-end" }}>
                 {multiMeasure ? (m.display_name || m.name) : t("pivotGrid.total")}
-                <SortGlyph active={Boolean(sorted)} dir={sort?.dir} />
+                <SortGlyph active={Boolean(sorted)} dir={resolvedSort?.dir} />
               </Box>
             </TableCell>
           );
@@ -693,8 +825,38 @@ export default function PivotGrid({
           }
         }
         const rendered = renderTotalCell(total, fmt, emptyCellMode, t("pivotGrid.notAdditive"));
+        const isScratchpad = (m as { _scratchpad?: boolean })._scratchpad === true;
+        const isRecordCount = (m as { _recordCount?: boolean })._recordCount === true;
+        const totalClickable = clickable && !isScratchpad && !isRecordCount;
+        const coord = totalCoordinate(dr, dc, total);
         const node = (
-          <TableCell key={`${keyBase}-${mi}`} align="right" sx={cellSx}>
+          <TableCell
+            key={`${keyBase}-${mi}`}
+            data-total-kind={totalCellKind(dr, dc)}
+            align="right"
+            tabIndex={totalClickable ? 0 : undefined}
+            aria-label={
+              totalClickable
+                ? totalCellAriaLabel(dr, dc, rendered.text, m.display_name || m.name)
+                : undefined
+            }
+            title={totalClickable ? t("drill.drawerTitle", { name: m.display_name || m.name }) : undefined}
+            onClick={totalClickable ? () => onCellClick?.(coord, m) : undefined}
+            onKeyDown={totalClickable ? (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onCellClick?.(coord, m);
+              }
+            } : undefined}
+            sx={{
+              ...cellSx,
+              cursor: totalClickable ? "pointer" : "default",
+              "&:hover": totalClickable ? { textDecoration: "underline" } : undefined,
+              "&:focus-visible": totalClickable
+                ? { outline: "2px solid", outlineColor: "primary.main", outlineOffset: -2 }
+                : undefined,
+            }}
+          >
             {rendered.text}
           </TableCell>
         );

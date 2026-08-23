@@ -56,7 +56,9 @@ describe("SchemaChangesPanel", () => {
         table_name: "orders",
         change_type: "column_removed",
         is_breaking: true,
-        detail: { column: "old_col" },
+        // The scheduler producer's live contract uses ``column_name``;
+        // ``column`` remains accepted for older persisted events.
+        detail: { column_name: "old_col" },
         detected_at: "2026-05-01T00:00:00Z",
         acknowledged_at: null,
       },

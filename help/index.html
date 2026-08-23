@@ -29,6 +29,10 @@
         <p>Connects BI tools to Tessallite and queries deployed models. Start with <a href="getting-started/what-is-tessallite.html">What is Tessallite</a>, <a href="getting-started/workspace-explorer.html">Workspace Explorer</a>, and <a href="getting-started/connect-a-bi-tool.html">Connect a BI tool</a>.</p>
       </div>
       <div class="audience-card">
+        <h3>End User</h3>
+        <p>Builds dashboards and reports from governed models — in Excel, Power BI, Tableau, or a Jupyter notebook — without touching SQL or the model itself. Start with <a href="analyst-guides/choosing-your-connection.html">Choose Your Connection</a>, then the walkthrough for your tool: <a href="analyst-guides/build-your-first-excel-dashboard.html">Excel</a>, <a href="analyst-guides/build-a-power-bi-report.html">Power BI</a>, <a href="analyst-guides/build-a-tableau-dashboard.html">Tableau</a>, or <a href="analyst-guides/query-tessallite-from-jupyter.html">Jupyter</a>.</p>
+      </div>
+      <div class="audience-card">
         <h3>Modeller</h3>
         <p>Builds and maintains semantic models: sources, joins, measures, dimensions, calendars, aggregates, security, lineage, and diagnostics. Start with <a href="concepts/projects-and-models.html">Projects and models</a>.</p>
       </div>
@@ -89,6 +93,42 @@
         <p>Complete reference of every feature with descriptions and where to find it.</p>
       </a>
     </div>
+    <h2>Analyst Guides</h2>
+    <p>End-to-end walkthroughs for the people who consume the models: building dashboards, reports, and analyses in the tools they already use.</p>
+    <div class="section-nav">
+      <a href="analyst-guides/choosing-your-connection.html" class="nav-card">
+        <h3>Choose Your Connection</h3>
+        <p>Excel add-in or PivotTable, Power BI, Tableau, Jupyter, or the headless API — pick the right path for the job.</p>
+      </a>
+      <a href="analyst-guides/build-your-first-excel-dashboard.html" class="nav-card">
+        <h3>Build Your First Excel Dashboard</h3>
+        <p>From a blank workbook to a live, refreshable dashboard: PivotTable, timeline, slicer, KPI strip, and chart.</p>
+      </a>
+      <a href="analyst-guides/build-a-report-with-the-excel-add-in.html" class="nav-card">
+        <h3>Build a Report with the Excel Add-in</h3>
+        <p>Drag-and-drop report building, the in-Excel agent, KPI cards, drill-through, and one-click refresh.</p>
+      </a>
+      <a href="analyst-guides/excel-formulas-that-stay-live.html" class="nav-card">
+        <h3>Excel Formulas That Stay Live</h3>
+        <p>TESSALLITE.VALUE, TESSALLITE.KPI, GETPIVOTDATA, and CUBE formulas — governed numbers inside any cell.</p>
+      </a>
+      <a href="analyst-guides/build-a-power-bi-report.html" class="nav-card">
+        <h3>Build a Power BI Report</h3>
+        <p>A DirectQuery report on the demo model: bar chart, trend line, slicer, and KPI cards.</p>
+      </a>
+      <a href="analyst-guides/build-a-tableau-dashboard.html" class="nav-card">
+        <h3>Build a Tableau Dashboard</h3>
+        <p>A live-connected dashboard: country view, product leaderboard, monthly trend, and wired-up filters.</p>
+      </a>
+      <a href="analyst-guides/query-tessallite-from-jupyter.html" class="nav-card">
+        <h3>Query Tessallite from a Jupyter Notebook</h3>
+        <p>psycopg2, pandas, a plot, and a small machine-learning example — all on governed numbers.</p>
+      </a>
+      <a href="analyst-guides/why-your-numbers-match.html" class="nav-card">
+        <h3>Why Your Numbers Match</h3>
+        <p>Five ideas — one definition, grain, summaries, security, and trust — that explain every tool agreeing.</p>
+      </a>
+    </div>
     <h2>Core Concepts</h2>
     <p>Core ideas behind Tessallite. Read this section before building or governing models.</p>
     <ul>
@@ -118,12 +158,16 @@
       <li><a href="modelling/define-hierarchies.html">Define Hierarchies</a></li>
       <li><a href="modelling/define-dimensions.html">Define Dimensions</a></li>
       <li><a href="modelling/dimension-aliases.html">Dimension Aliases</a></li>
+      <li><a href="modelling/dimension-attribute-relationships.html">Dimension Attribute Relationships</a></li>
       <li><a href="modelling/business-glossary.html">Business Glossary</a></li>
       <li><a href="modelling/define-measures.html">Define Measures</a></li>
       <li><a href="modelling/semi-additive-measures.html">Semi-Additive Measures</a></li>
       <li><a href="modelling/calculated-measures.html">Calculated Measures</a></li>
+      <li><a href="modelling/define-user-defined-attributes.html">User-Defined Attributes</a></li>
       <li><a href="modelling/configure-time-variants.html">Configure Time Variants</a></li>
+      <li><a href="modelling/window-functions.html">Understanding Window Functions</a></li>
       <li><a href="modelling/configure-calendar-table.html">Configure Calendar Table</a></li>
+      <li><a href="modelling/configure-calendar-table.html#fiscal-and-retail-year-captions">Fiscal and Retail Year Captions</a></li>
       <li><a href="modelling/associate-calendar-with-dimensions.html">Associate Calendar with Dimensions</a></li>
       <li><a href="modelling/multi-calendar-best-practices.html">Multi-Calendar Best Practices</a></li>
       <li><a href="modelling/measure-query-panel.html">Measure Query Panel</a></li>
@@ -149,8 +193,8 @@
       <li><a href="modelling/configure-personas.html">Configure Personas</a></li>
       <li><a href="modelling/parameterized-filters.html">Parameterized Filters</a></li>
       <li><a href="modelling/data-quality-rules.html">Data Quality Rules</a></li>
-      <li><a href="modelling/impact-analysis.html">Impact Analysis</a></li>
-      <li><a href="modelling/named-sets.html">Named Lists (Named Sets)</a></li>
+      <li><a href="modelling/usage-downstream-assets.html">Usage &amp; Downstream Assets</a></li>
+      <li><a href="modelling/named-queries.html">Named Queries</a> &mdash; MDX Named Sets, Tessallite Named Lists &amp; Named Queries</li>
       <li><a href="modelling/kpis.html">KPIs</a></li>
       <li><a href="modelling/data-preview.html">Data Preview</a></li>
       <li><a href="modelling/schema-changes.html">Schema Changes</a></li>
@@ -206,6 +250,7 @@
       <li><a href="system-admin/deploy-local.html">Deploy Locally</a></li>
       <li><a href="system-admin/deploy-gcp.html">Deploy on GCP</a></li>
       <li><a href="system-admin/deploy-kubernetes.html">Deploy on Kubernetes</a></li>
+      <li><a href="system-admin/create-a-tenant.html">Create a Tenant</a></li>
       <li><a href="system-admin/configure-environment-variables.html">Configure Environment Variables</a></li>
       <li><a href="system-admin/system-configuration.html">System Configuration</a></li>
       <li><a href="system-admin/credentials-and-env.html">Credentials and the .env File</a></li>

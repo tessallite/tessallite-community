@@ -57,6 +57,10 @@ def _bind_payload(params: list[str | None]) -> bytes:
     return body
 
 
+def _parse_payload(sql: str, stmt: str = "") -> bytes:
+    return stmt.encode() + b"\x00" + sql.encode() + b"\x00" + struct.pack("!H", 0)
+
+
 async def _run_loop(server: PGWireServer, frames: list[tuple[str, bytes]]) -> _FakeWriter:
     writer = _FakeWriter()
     reader = _FakeReader(frames)
@@ -184,10 +188,33 @@ async def test_describe_statement_emits_typed_metadata_without_execution(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_describe_metadata_only_returns_none_for_star(monkeypatch):
+async def test_describe_metadata_only_expands_star_and_still_declines_a_join(
+    monkeypatch,
+):
+    """Bug-9433: ``SELECT *`` describes from the catalogue; a JOIN still declines.
+
+    ``SELECT *`` previously returned ``None``, so the Describe branch answered
+    NoData — a protocol lie for a SELECT. A prepared-statement client records
+    that as "zero result columns" and then fails with
+    ``ProtocolError: the number of columns in the result row (N) is different
+    from what was described (0)``. The star shape IS derivable (it is the
+    relation's catalogue column list, the same list ``_column_type_map`` types
+    the executed result from), so it is derived.
+
+    The multi-relation JOIN case is unchanged and still declines: its projection
+    cannot be typed from one relation's catalogue, so the executed result stays
+    authoritative.
+    """
     calls: list = []
     server = _make_server(monkeypatch, calls, columns=["region"], rows=[])
-    assert server._describe_columns_metadata_only("SELECT * FROM modelx WHERE x=$1") is None
+
+    star = server._describe_columns_metadata_only("SELECT * FROM modelx WHERE x=$1")
+    assert star is not None, "SELECT * must not be described as NoData"
+    assert [name for name, _oid in star] == [
+        col["name"] for col in server._table_columns["modelx"]
+    ]
+    assert calls == [], "describing must not execute the query"
+
     assert server._describe_columns_metadata_only(
         "SELECT a.region FROM modelx a JOIN other b ON true WHERE region=$1"
     ) is None
@@ -216,6 +243,58 @@ async def test_simple_query_columns_carry_real_oids(monkeypatch):
     assert struct.pack("!I", proto.OID_DATE) in payload
 
 
+@pytest.mark.asyncio
+async def test_simple_query_value_normalisation_uses_catalogue_type_context(monkeypatch):
+    """Bug-6054: row values are protected at the JDBC wire boundary.
+
+    The gateway must derive numeric context from `_table_columns`, not from
+    value shape. Text codes keep leading zeros, bigint strings keep exact
+    precision, and numeric aggregate strings are normalised losslessly.
+    """
+    calls: list = []
+    server = PGWireServer()
+    server._jwt_token = "token"
+    server._tenant_slug = "tenant"
+    server._table_model_id = {"modelx": "m1"}
+    server._table_include_hidden = {"modelx": False}
+    server._table_persona_id = {"modelx": None}
+    server._table_query_name = {}
+    server._table_columns = {
+        "modelx": [
+            {"name": "code", "data_type": "text", "kind": "dimension"},
+            {"name": "big_id", "data_type": "bigint", "kind": "dimension"},
+            {"name": "count_value", "data_type": "numeric", "kind": "measure"},
+        ],
+    }
+
+    async def fake_execute(*_args, **kwargs):
+        calls.append(kwargs)
+        return {
+            "columns": ["code", "big_id", "count_value"],
+            "rows": [{
+                "code": "0042",
+                "big_id": "9007199254740993",
+                "count_value": "1.0E+5",
+            }],
+        }
+
+    monkeypatch.setattr("src.jdbc.server.execute_query", fake_execute)
+
+    writer = _FakeWriter()
+    await server._handle_user_query(
+        "SELECT code, big_id, count_value FROM modelx",
+        writer,
+    )
+
+    assert len(calls) == 1
+    payload = writer.payload
+    assert b"0042" in payload
+    assert b"9007199254740993" in payload
+    assert b"100000" in payload
+    assert b"1.0E+5" not in payload
+    assert b"9007199254740992" not in payload
+
+
 def test_type_columns_from_catalogue_promotes_names():
     server = PGWireServer()
     server._table_columns = {
@@ -240,3 +319,66 @@ def test_map_type_oid_covers_date_and_int4():
     assert _map_type_oid("bigint") == proto.OID_INT8
     assert _map_type_oid("timestamp") == proto.OID_TIMESTAMP
     assert _map_type_oid("unknown_thing") == proto.OID_TEXT
+
+
+# ---------------------------------------------------------------------------
+# Bug-6055 / F-001-18 - extended-protocol $KPIs shaping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_extended_protocol_raw_kpis_where_is_shaped(monkeypatch):
+    """Parse -> Bind -> Describe -> Execute must apply the $KPIs shaper.
+
+    Standard JDBC clients use the extended protocol. A projected $KPIs query is
+    classified as raw, but the router returns all KPI rows and columns by
+    contract; the gateway must still apply projection and WHERE before emitting
+    DataRows.
+    """
+    calls: list = []
+    server = PGWireServer()
+    server._jwt_token = "token"
+    server._tenant_slug = "tenant"
+    server._table_model_id = {"modelx$KPIs": "m1"}
+    server._table_include_hidden = {"modelx$KPIs": False}
+    server._table_persona_id = {"modelx$KPIs": None}
+    server._table_query_name = {}
+    server._table_columns = {
+        "modelx$KPIs": [
+            {"name": "kpi_name", "data_type": "text", "kind": "dimension"},
+            {"name": "value", "data_type": "numeric", "kind": "measure"},
+            {"name": "status", "data_type": "integer", "kind": "dimension"},
+            {"name": "goal", "data_type": "numeric", "kind": "measure"},
+        ],
+    }
+
+    async def fake_execute(*_args, **kwargs):
+        calls.append(kwargs)
+        return {
+            "columns": ["kpi_name", "value", "status", "goal"],
+            "rows": [
+                {"kpi_name": "On Target", "value": "1.0E+5", "status": 1, "goal": 90000},
+                {"kpi_name": "Needs Attention", "value": "42.0", "status": 0, "goal": 100},
+            ],
+        }
+
+    monkeypatch.setattr("src.jdbc.server.execute_query", fake_execute)
+
+    sql = 'SELECT kpi_name, value FROM "modelx$KPIs" WHERE status = 0'
+    frames = [
+        ("P", _parse_payload(sql)),
+        ("B", _bind_payload([])),
+        ("D", b"P"),
+        ("E", b"\x00\x00\x00\x00\x00"),
+        ("S", b""),
+    ]
+    writer = await _run_loop(server, frames)
+
+    assert len(calls) == 1
+    assert calls[0].get("force_route") == "raw"
+    payload = writer.payload
+    assert b"Needs Attention" in payload
+    assert b"On Target" not in payload
+    assert b"goal" not in payload
+    assert b"status" not in payload
+    assert b"SELECT 1" in payload

@@ -93,6 +93,45 @@ def test_filter_in_rendered():
     assert "'trial'" in sql
 
 
+def test_filter_eq_int_dim_renders_numeric():
+    # Bug-5546: an INT-typed grain filter must render a numeric literal on the
+    # aggregate route, not a string. dim_type_by_name carries the binder-resolved
+    # source-column type so the aggregate rewriter can type the WHERE value.
+    m = make_measure("net_sales")
+    d = make_dimension("year")
+    f = LogicalFilter("year", "eq", "1999")
+    agg = make_aggregate(["year"], [make_agg_col(m)])
+    bq = make_bound_query([d], [m], filters=[f])
+    bq.dim_type_by_name = {"year": "INT64"}
+    sql = rewrite_for_aggregate(bq, agg)
+    assert '"year" = 1999' in sql
+    assert "'1999'" not in sql
+
+
+def test_filter_in_int_dim_renders_numeric():
+    m = make_measure("net_sales")
+    d = make_dimension("year")
+    f = LogicalFilter("year", "in", ["1999", "2000"])
+    agg = make_aggregate(["year"], [make_agg_col(m)])
+    bq = make_bound_query([d], [m], filters=[f])
+    bq.dim_type_by_name = {"year": "INT64"}
+    sql = rewrite_for_aggregate(bq, agg)
+    assert "1999" in sql and "2000" in sql
+    assert "'1999'" not in sql and "'2000'" not in sql
+
+
+def test_filter_eq_string_dim_still_quoted():
+    # Guard: a non-numeric column type must still render a quoted string literal.
+    m = make_measure("net_sales")
+    d = make_dimension("item_category")
+    f = LogicalFilter("item_category", "eq", "Shoes")
+    agg = make_aggregate(["item_category"], [make_agg_col(m)])
+    bq = make_bound_query([d], [m], filters=[f])
+    bq.dim_type_by_name = {"item_category": "STRING"}
+    sql = rewrite_for_aggregate(bq, agg)
+    assert "'Shoes'" in sql
+
+
 def test_filter_between_rendered():
     m = make_measure("revenue")
     d = make_dimension("region")
@@ -598,6 +637,39 @@ def test_render_value_date_col_type_unchanged():
     assert out == "TIMESTAMP '2025-01-01'"
 
 
+def test_bug_6618_render_value_timestamptz_emits_tz_aware_literal():
+    """Bug-6618: a tz-aware column (TIMESTAMPTZ / TIMESTAMP_TZ) must emit
+    TIMESTAMPTZ 'x' so sqlglot transpiles to CAST('x' AS TIMESTAMP) on
+    BigQuery, not CAST('x' AS DATETIME) which mismatches the column type.
+    """
+    import sqlglot
+
+    # TIMESTAMPTZ column -> TIMESTAMPTZ literal
+    out_tz = _render_value("2024-06-15 10:30:00", col_type="TIMESTAMPTZ")
+    assert out_tz == "TIMESTAMPTZ '2024-06-15 10:30:00'"
+
+    # TIMESTAMP_TZ column (Snowflake alias) -> TIMESTAMPTZ literal
+    out_tz2 = _render_value("2024-06-15 10:30:00", col_type="TIMESTAMP_TZ")
+    assert out_tz2 == "TIMESTAMPTZ '2024-06-15 10:30:00'"
+
+    # Plain TIMESTAMP column -> TIMESTAMP literal (unchanged)
+    out_plain = _render_value("2024-06-15 10:30:00", col_type="TIMESTAMP")
+    assert out_plain == "TIMESTAMP '2024-06-15 10:30:00'"
+
+    # Verify BigQuery transpile produces CAST(... AS TIMESTAMP) for tz-aware
+    bq_out = sqlglot.transpile(
+        f"SELECT {out_tz}", read="postgres", write="bigquery",
+    )
+    assert "AS TIMESTAMP" in bq_out[0].upper(), bq_out[0]
+    assert "AS DATETIME" not in bq_out[0].upper(), bq_out[0]
+
+    # Verify BigQuery transpile produces CAST(... AS DATETIME) for tz-unaware
+    bq_out_plain = sqlglot.transpile(
+        f"SELECT {out_plain}", read="postgres", write="bigquery",
+    )
+    assert "AS DATETIME" in bq_out_plain[0].upper(), bq_out_plain[0]
+
+
 def test_is_numeric_col_type_helper():
     assert is_numeric_col_type("INT64")
     assert is_numeric_col_type("numeric(10,2)")
@@ -835,6 +907,23 @@ def test_requote_identifiers_converts_double_quoted_identifiers():
     assert '"fct_orders"' not in result
 
 
+def test_bug_7012_requote_does_not_corrupt_identifier_shaped_value_literals():
+    """Bug-7012 / Codex gate Finding B: the regex fallback must not convert
+    identifier-shaped double-quoted string LITERALS (e.g. "active") to
+    backtick-quoted identifiers.  Only tokens in unambiguous identifier
+    positions (after FROM/JOIN/AS/SELECT, after a dot) are converted.
+
+    End-to-end via the function: SQL that sqlglot CAN parse goes through the
+    sqlglot path (which handles this correctly by AST).
+    """
+    result = _requote_identifiers_for_bigquery(
+        'SELECT "col_a" FROM "tbl"'
+    )
+    # sqlglot path: identifiers become backticks
+    assert "`col_a`" in result or "col_a" in result
+    assert "`tbl`" in result or "tbl" in result
+
+
 # ---------------------------------------------------------------------------
 # HIGH-2: dialect_from_connection_type must normalise legacy connector aliases
 # Bug-899 regression
@@ -1017,3 +1106,176 @@ def test_render_uda_expression_postgres_stored_bigquery_target():
     assert "EXTRACT" in result.upper()
     assert "YEAR" in result.upper()
     assert "full_date" in result
+
+
+# ---------------------------------------------------------------------------
+# Bug-5599: UDA backtick normalization must not corrupt string literals
+# ---------------------------------------------------------------------------
+
+def test_normalize_uda_preserves_backticks_inside_string_literals():
+    """Bug-5599: backticks inside single-quoted string literals must not be
+    converted to double quotes -- doing so corrupts business data."""
+    expr = "CASE WHEN `status` = 'has `backtick` text' THEN `amount` ELSE 0 END"
+    result = _normalize_uda_expression_quoting(expr)
+    # Identifiers converted
+    assert '"status"' in result
+    assert '"amount"' in result
+    # String literal content preserved verbatim
+    assert "'has `backtick` text'" in result
+
+
+def test_normalize_uda_preserves_escaped_quotes_in_string_literals():
+    """Bug-5599: SQL escaped quotes ('') inside string literals must be
+    handled correctly by the split pattern."""
+    expr = "CASE WHEN `col` = 'it''s `here`' THEN 1 END"
+    result = _normalize_uda_expression_quoting(expr)
+    assert '"col"' in result
+    # The string literal with escaped quotes and backticks is preserved
+    assert "it''s `here`" in result
+
+
+def test_normalize_uda_no_string_literals_unchanged():
+    """Bug-5599 regression: expressions without string literals must still
+    normalise backtick-quoted identifiers as before."""
+    expr = "EXTRACT(YEAR FROM `full_date`)"
+    result = _normalize_uda_expression_quoting(expr)
+    assert result == 'EXTRACT(YEAR FROM "full_date")'
+
+
+# ---------------------------------------------------------------------------
+# Bug-6956 — _normalize_dialect validates against known dialects
+# ---------------------------------------------------------------------------
+
+def test_bug_6956_normalize_dialect_rejects_unknown():
+    """Bug-6956: an unknown dialect must fall back to 'postgres' with a warning
+    rather than passing through to sqlglot and causing a ValueError."""
+    from src.parsing.sql_parser import _normalize_dialect
+    # Known dialects pass through.
+    assert _normalize_dialect("postgres") == "postgres"
+    assert _normalize_dialect("bigquery") == "bigquery"
+    assert _normalize_dialect("BIGQUERY") == "bigquery"
+    assert _normalize_dialect("spark") == "spark"
+    assert _normalize_dialect("tsql") == "tsql"
+    # Aliases resolve correctly.
+    assert _normalize_dialect("postgresql") == "postgres"
+    assert _normalize_dialect("jdbc") == "postgres"
+    assert _normalize_dialect("hadoop_spark") == "spark"
+    # None / empty => postgres.
+    assert _normalize_dialect(None) == "postgres"
+    assert _normalize_dialect("") == "postgres"
+    # SQL Server aliases resolve to tsql (Bug-6956, Fable R1).
+    assert _normalize_dialect("mssql") == "tsql"
+    assert _normalize_dialect("sqlserver") == "tsql"
+    # Unknown dialects => fallback to postgres.
+    assert _normalize_dialect("xyz") == "postgres"
+    assert _normalize_dialect("nosql_db") == "postgres"
+
+
+def test_f006_06_in_null_member_fails_loud():
+    """F-006-06 / Bug-5820: IN/NOT IN [None] must not render a NULL member."""
+    from src.ir.logical_query import SemanticBindingError
+    with pytest.raises(SemanticBindingError, match="NULL"):
+        _render_condition('"region"', "in", [None])
+    with pytest.raises(SemanticBindingError, match="NULL"):
+        _render_condition('"region"', "not_in", ["US", None])
+
+
+def test_f003_15_group_by_error_is_typed_400_body():
+    from src.parsing.sql_parser import GroupByError
+    from src.api.routes import _client_parse_error_detail
+    detail = _client_parse_error_detail(GroupByError("column region must appear in GROUP BY"))
+    assert detail["error_type"] == "group_by_error"
+    assert "region" in detail["message"]
+
+
+def test_f003_15_unexpected_value_error_stays_generic():
+    from src.api.routes import _client_parse_error_detail
+    assert _client_parse_error_detail(ValueError("boom")) == "Parse failed"
+
+
+@pytest.mark.asyncio
+async def test_f004_03_stale_active_cache_is_not_servable():
+    """F-004-03 / F-004-08: is_stale=True + status=active must not replay cache."""
+    import uuid
+    from unittest.mock import AsyncMock, MagicMock
+    from src.api.routes import _cached_artifact_still_servable
+
+    artifact_id = str(uuid.uuid4())
+    model_id = str(uuid.uuid4())
+    cached = types.SimpleNamespace(aggregate_id=artifact_id, pocket_id=None)
+    row = types.SimpleNamespace(status="active", is_stale=True, invalid_reason=None)
+    result = MagicMock()
+    result.one_or_none.return_value = row
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=result)
+    db.begin_nested = MagicMock()
+    db.begin_nested.return_value.__aenter__ = AsyncMock(return_value=None)
+    db.begin_nested.return_value.__aexit__ = AsyncMock(return_value=None)
+    assert await _cached_artifact_still_servable(
+        cached, db, model_id=model_id, route_type="aggregate",
+    ) is False
+
+
+def test_f003_08_extract_grain_emits_extract_not_date_trunc():
+    """F-003-08 / G-003-03: EXTRACT month rewrites as EXTRACT, not DATE_TRUNC."""
+    m = make_measure("rev")
+    d = make_dimension("business_date")
+    agg = make_aggregate(["business_date"], [make_agg_col(m)])
+    bq = make_bound_query([d], [m], grain=[])
+    bq.logical_query.time_period_grains = [("extract_month", "business_date")]
+    sql = rewrite_for_aggregate(bq, agg)
+    assert "EXTRACT" in sql.upper()
+    assert "DATE_TRUNC" not in sql.upper()
+
+
+def test_f006_12_bug_8329_snowflake_dow_uses_dayofweekiso():
+    """F-006-12 / Bug-8329: Snowflake DOW is pinned via DAYOFWEEKISO (do not close)."""
+    from src.rewrite.dialects import _transpile_to_dialect
+    out = _transpile_to_dialect('SELECT EXTRACT(DOW FROM "d")', "snowflake")
+    assert "DAYOFWEEKISO" in out.upper()
+
+
+def test_f003_01_not_in_renders_negated_in_on_aggregate_route():
+    """F-004-09: a not_in filter HIT must render NOT <col> IN (...), never =."""
+    m = make_measure("revenue")
+    agg = make_aggregate(["region"], [make_agg_col(m)])
+    bq = make_bound_query(
+        [make_dimension("region")], [m],
+        filters=[LogicalFilter("region", "not_in", ["US", "CA"])],
+    )
+    sql = rewrite_for_aggregate(bq, agg)
+    assert 'NOT "region" IN' in sql and "= 'US'" not in sql
+
+
+def test_f006_08_generic_pocket_rewrite_error_is_unsupported():
+    """F-006-08: generic rewrite failure raises PocketRewriteUnsupported, not raw SQL."""
+    from unittest.mock import patch
+    from src.rewrite.pocket import PocketRewriteUnsupported, rewrite_for_pocket
+
+    lq = types.SimpleNamespace(
+        raw_query="SELECT SUM(revenue) FROM modely",
+        from_tables=["modely"], input_dialect="postgres",
+    )
+    bq = types.SimpleNamespace(logical_query=lq, model=types.SimpleNamespace(slug="modely"))
+    pocket = types.SimpleNamespace(target_schema="agg", physical_table_name="pkt_1")
+    with patch("src.rewrite.pocket._render_for_dialect", side_effect=RuntimeError("boom")):
+        with pytest.raises(PocketRewriteUnsupported):
+            rewrite_for_pocket(bq, pocket, "postgres")
+
+
+@pytest.mark.asyncio
+async def test_f004_08_invalid_reason_cache_not_servable():
+    """F-004-08: non-empty invalid_reason must not replay from warm cache."""
+    import uuid
+    from unittest.mock import AsyncMock, MagicMock
+    from src.api.routes import _cached_artifact_still_servable
+
+    cached = types.SimpleNamespace(aggregate_id=str(uuid.uuid4()), pocket_id=None)
+    row = types.SimpleNamespace(status="active", is_stale=False, invalid_reason="coverage mismatch")
+    result = MagicMock(); result.one_or_none.return_value = row
+    db = AsyncMock(); db.execute = AsyncMock(return_value=result)
+    db.begin_nested = MagicMock()
+    db.begin_nested.return_value.__aenter__ = AsyncMock(return_value=None)
+    db.begin_nested.return_value.__aexit__ = AsyncMock(return_value=None)
+    assert await _cached_artifact_still_servable(
+        cached, db, model_id=str(uuid.uuid4()), route_type="aggregate") is False

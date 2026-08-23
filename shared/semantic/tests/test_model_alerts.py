@@ -55,6 +55,7 @@ async def _session_factory():
                 "category VARCHAR(32) NOT NULL, "
                 "title VARCHAR(255) NOT NULL, "
                 "detail TEXT, "
+                "detail_hash VARCHAR(64), "
                 "related_object_type VARCHAR(32), "
                 "related_object_id CHAR(32), "
                 "first_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
@@ -69,7 +70,7 @@ async def _session_factory():
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 async def _session():
