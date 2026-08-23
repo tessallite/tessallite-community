@@ -50,6 +50,7 @@ from shared.schemas.pydantic_models import (
 )
 from shared.middleware.internal_bypass import (
     INTERNAL_BYPASS_HEADER,
+    internal_request_headers,
     is_internal_request_header,
 )
 from shared.semantic.kpi_dependency import (
@@ -68,20 +69,24 @@ from src.api._scope import (
     purge_entity_soft_references,
 )
 from src.auth.middleware import CurrentUser, CurrentServiceUser, get_current_user, require_capability_or_service_scope
-from shared.auth.service_principal import SCOPE_KPI_EVALUATE
+from shared.auth.service_principal import (
+    SCOPE_KPI_EVALUATE,
+    SCOPE_KPI_QUERY_EXECUTE,
+)
 # Bug-8453: the single definition of the /execute row-security contract.
 from shared.security.execute_contract import (
     ROW_SECURITY_DENY_ALL_RULE_ID as _SHARED_DENY_ALL_RULE_ID,
     row_security_denied_all as _shared_denied_all,
     security_rules_from_execute_response,
 )
-from src.kpi_threshold import validate_bands
+from src.kpi_threshold import get_preset_bands, list_presets, validate_bands
 from src.auth.rbac import caller_has_role, require_role
 from src.kpi_cache import get_kpi_cache
 from src.kpi_deploy_resolver import (
     KpiSnapshotInvalidError,
     ResolvedKpi,
     Withheld,
+    resolve_served_filter_metadata,
     resolve_served_kpi,
     resolve_served_kpis,
 )
@@ -1665,6 +1670,11 @@ async def _execute_via_router(
     import httpx as _httpx
     url = f"{_settings.QUERY_ROUTER_URL}/api/v1/execute"
     headers = {"Authorization": f"Bearer {bearer}"}
+    # The query-router accepts the KPI-specific service scope only with this
+    # rotating platform marker and client_kind="kpi". Forward it on the
+    # model-service -> query-router hop; user-facing scorecard requests never
+    # enter this helper.
+    headers.update(internal_request_headers())
     body: dict = {
         "model_id": str(model_id),
         "raw_query": query,
@@ -1776,6 +1786,9 @@ async def _evaluate_ti_decomposed(
     persona_id: str | None = None,
     calc_agg_mode: str = "automatic",
     fiscal_year_start_month: int | None = None,
+    at_grain: str | None = None,
+    non_additive_agg: str | None = None,
+    carry_forward: bool = False,
     sql_sink: list[str] | None = None,
     timeout_s: float = 30.0,
     security_sink: set[str] | None = None,
@@ -1784,6 +1797,21 @@ async def _evaluate_ti_decomposed(
 
     Returns the scalar float result or None if insufficient data.
     Raises ValueError on query execution failure.
+
+    Bug-8570: *at_grain* / *non_additive_agg* carry the KPI's semi-additive
+    reduction into EVERY per-period query. Each period is reduced to its
+    closing/average value BEFORE the time-intelligence arithmetic runs, which is
+    what a "trailing 3 months of the closing balance" KPI actually means. The
+    prior behaviour summed every row in the period (daily balances 100/120/90
+    contributed 310 instead of the 90 closing balance) and was therefore
+    fail-closed by the wrong-numbers wave; threading the reduction is the
+    product-correct answer that replaces the refusal.
+
+    L7B-01: *carry_forward* is the THIRD field of that same reduction and must
+    be threaded with the other two. Bug-8570 threaded only the first two, so a
+    KPI authoring all three evaluated under a configuration the modeller did
+    not author — and the refusal it replaced had at least been honest. See
+    ``_period_sql`` for the boundary the per-period window imposes on the fill.
     """
     from src.kpi_compiler import CompilerContext, compile_expression, interval_literal
 
@@ -1799,7 +1827,8 @@ async def _evaluate_ti_decomposed(
         )
     time_col = _safe_ident(time_column)
     start_sql = time_window_start_sql or f"DATE_TRUNC('{grain}', CURRENT_DATE)"
-    end_sql = time_window_end_sql or "CURRENT_DATE"
+    # Bug-9478: exclusive end includes the anchor day (parity with period_to_date).
+    end_sql = time_window_end_sql or "CURRENT_DATE + INTERVAL '1 day'"
 
     measure_aggs = {
         name: (m.default_agg or "sum")
@@ -1810,6 +1839,16 @@ async def _evaluate_ti_decomposed(
         """Compile a base expression to a simple SELECT (no TI wrapping).
 
         Returns (select_expr, referenced_measure_names).
+
+        L7B-01, enumeration note: this context deliberately carries NO
+        semi-additive field, ``carry_forward`` included. It exists to obtain the
+        bare ``select_expr`` (for the un-reduced per-period query and for the
+        Bug-6831 COUNT(DISTINCT) check); ``select_expr`` is the aggregate
+        expression alone and no reduction field can change it — every one of
+        them shapes the SQL *around* it. Passing ``carry_forward`` here would
+        also raise ``KPITimeContextError``, since this context binds no time
+        column. The reduction is applied in ``_period_sql``, which builds its
+        own context.
         """
         ctx = CompilerContext(
             model_slug=model_slug,
@@ -1873,15 +1912,57 @@ async def _evaluate_ti_decomposed(
         results = await asyncio.gather(*[_query_one(i) for i in range(n_periods)])
         return [v for v in results if v is not None]
 
-    async def _exec_period_scalar(start: str, end: str) -> float | None:
-        """Execute a simple aggregation over a specific time window."""
-        model = _safe_ident(model_slug)
+    def _period_sql(start: str, end: str) -> str:
+        """Build the per-period query for one time window.
+
+        Bug-8570: when the KPI carries a semi-additive reduction, the period
+        query must REDUCE (closing/average/min/max value per ``at_grain``
+        bucket) instead of summing every row in the window. The compiler's
+        semi-additive builder emits exactly that shape — a plain subquery, no
+        CTE and no window function, so the query-router can still bind the
+        semantic measure names — and ``CompilerContext.where_clause`` injects
+        the period window into its innermost FROM scope.
+
+        L7B-01: the dispatch mirrors ``compile_expression``'s own — the
+        semi-additive branch on ``non_additive_agg or at_grain``, then the
+        ``elif ctx.carry_forward`` branch that routes a carry-forward-only KPI
+        through the same bucketed builder. Testing only the first two here made
+        the per-period query answer a different question from the scalar the
+        same compiler serves for the same KPI without time intelligence.
+
+        Boundary of the fill on THIS path: the period window is injected as
+        ``where_clause``, i.e. INSIDE the fill's own FROM scope, so the fill
+        orders over the rows of one period only. It can carry forward from that
+        window's first non-NULL bucket onwards and can never reach into the
+        preceding period; a leading NULL bucket therefore stays NULL. That is
+        the correct reading for a decomposed KPI — each period is an
+        independently evaluated scalar — but it does mean the fill cannot
+        rescue a period that is empty end to end (there is no row to carry
+        into; see Bug-9481's sibling limitation for absent periods).
+        """
         where_parts = [f"{time_col} >= {start}", f"{time_col} < {end}"]
         if filter_where_clause:
             where_parts.append(filter_where_clause)
         where = " AND ".join(where_parts)
-        sql = f"SELECT {select_expr} AS value FROM {model} WHERE {where}"
-        return await _exec_scalar(sql)
+        if non_additive_agg or at_grain or carry_forward:
+            reduced_ctx = CompilerContext(
+                model_slug=model_slug,
+                calc_agg_mode=calc_agg_mode,
+                default_agg="sum",
+                measure_aggs=measure_aggs,
+                time_column=time_column,
+                at_grain=at_grain,
+                non_additive_agg=non_additive_agg,
+                carry_forward=carry_forward,
+                where_clause=where,
+            )
+            return compile_expression(base_expression, reduced_ctx).sql
+        model = _safe_ident(model_slug)
+        return f"SELECT {select_expr} AS value FROM {model} WHERE {where}"
+
+    async def _exec_period_scalar(start: str, end: str) -> float | None:
+        """Execute the per-period aggregation over a specific time window."""
+        return await _exec_scalar(_period_sql(start, end))
 
     if ti_type == "moving_avg":
         values = await _exec_period_values(n)
@@ -1930,7 +2011,7 @@ async def _evaluate_ti_decomposed(
             if fiscal_start is not None:
                 ptd_start = f"DATE '{fiscal_start.isoformat()}'"
         return await _exec_period_scalar(
-            ptd_start, "CURRENT_DATE + INTERVAL '1 day'",
+            ptd_start, end_sql,
         )
 
     if ti_type in ("lag", "lead"):
@@ -2144,6 +2225,47 @@ _TI_NO_TIME_DIMENSION_LABEL = (
     "Evaluation failed — this time-intelligence KPI needs a time dimension"
 )
 
+# Bug-8569 [wrong numbers]. The VALUE leg passed ~25 arguments to
+# ``_evaluate_expression_via_sql``; the TARGET leg at the same three endpoints
+# passed six. Value and target were therefore computed under DIFFERENT rules and
+# the verdict beside a correct headline number was wrong — a semi-additive
+# closing balance of 90 compared against a target SUM of 600 reads 15%
+# attainment instead of 50%, an April fiscal year compared its
+# fiscal-period-to-date target against a January window, and a "last 90 days"
+# value was compared against a target over the last calendar period.
+#
+# The fix is structural: each site builds ONE kwargs block for the value leg and
+# derives the target leg from it by removing only the keys that describe the
+# VALUE EXPRESSION'S OWN shape. Those must never be reused, because the target
+# is a DIFFERENT expression: ``ti_type`` + ``base_expression`` would make the
+# decomposed branch evaluate the value's base expression and return it as the
+# target, and ``share_*`` would rank the target as if it were the share KPI.
+# The target's own time intelligence is derived from the target expression
+# itself by ``derive_ti_decomposition``.
+_VALUE_ONLY_LEG_KEYS = frozenset({
+    "ti_type",
+    "ti_grain",
+    "ti_n_periods",
+    "base_expression",
+    "share_type",
+    "share_dimension",
+    "share_n",
+    "enable_ti_subquery",
+})
+
+
+def _target_leg_kwargs(value_leg_kwargs: dict) -> dict:
+    """Derive the TARGET leg's evaluation context from the VALUE leg's (Bug-8569).
+
+    Everything that describes the SLICE and the REDUCTION rules is shared, so
+    both legs answer the same question; only the value expression's own
+    decomposition/share metadata is dropped.
+    """
+    return {
+        k: v for k, v in value_leg_kwargs.items()
+        if k not in _VALUE_ONLY_LEG_KEYS
+    }
+
 
 class _TIDecompositionFailed:
     """Sentinel-with-detail: a derived (wizard/formula) time-intelligence
@@ -2350,17 +2472,20 @@ async def _evaluate_expression_via_sql(
     # Reducing correctly on those paths is the right product answer and is
     # filed separately; it is a real change to TI/kpi-ref evaluation
     # semantics and must not be improvised inside a correctness fix.
-    _semi_additive_requested = bool(non_additive_agg or at_grain)
+    # Bug-9486: carry_forward is the third reduction field (with at_grain /
+    # non_additive_agg). Omitting it let carry_forward-only nested TI / kpi-ref
+    # fall through to a bare model-wide SUM.
+    _semi_additive_requested = bool(non_additive_agg or at_grain or carry_forward)
 
     def _python_fallback(reason: str):
         """Hand off to the Python evaluator, or refuse if it cannot be correct."""
         if _semi_additive_requested:
             log.error(
                 "KPI needs the Python evaluator (%s) but carries a semi-additive "
-                "grain (at_grain=%s, non_additive_agg=%s), which that evaluator "
-                "cannot apply; failing the KPI closed rather than serving an "
-                "un-reduced model-wide SUM",
-                reason, at_grain, non_additive_agg,
+                "reduction (at_grain=%s, non_additive_agg=%s, carry_forward=%s), "
+                "which that evaluator cannot apply; failing the KPI closed rather "
+                "than serving an un-reduced model-wide SUM",
+                reason, at_grain, non_additive_agg, carry_forward,
             )
             return _GUARD_REFUSED
         return _COMPILER_UNSUPPORTED
@@ -2389,34 +2514,31 @@ async def _evaluate_expression_via_sql(
     # measure names inside CTEs/window-functions.  For TI types that would
     # generate complex SQL, decompose into simple router-friendly queries.
     if ti_type and ti_type in _TI_CTE_TYPES and base_expression:
-        # Bug-6252 (deep-review R3 finding 2): this DECOMPOSED-TI branch is
-        # taken BEFORE the semi-additive CompilerContext is built below, and
-        # ``_evaluate_ti_decomposed`` never receives ``at_grain`` /
-        # ``non_additive_agg``. Each per-period query is therefore a plain
-        # SUM over every row in the period, with no semi-additive reduction
-        # applied at all: for daily balances 100/120/90 a month contributes
-        # 310 instead of the 90 closing balance -- roughly a 30x
-        # overstatement on a stable balance, silently, in a cell that looks
-        # like a legitimate number. That is the literal headline of Bug-6252
-        # on a sibling path.
+        # Bug-6252 (deep-review R3 finding 2) / Bug-8570 [wrong numbers].
         #
-        # Refuse rather than serve it. Threading the reduction through the
-        # decomposition (so each period reduces to its closing/average value
-        # BEFORE the TI arithmetic) is the right product answer and is filed
-        # separately; it is a real change to TI evaluation semantics and must
-        # not be improvised inside a correctness fix. Failing closed is the
-        # safe half and matches the disposition this function already uses
-        # for ``has_ungrouped_window`` and for an unsupported reducer.
-        if non_additive_agg or at_grain:
-            log.error(
-                "KPI combines time intelligence (%s) with a semi-additive "
-                "grain (at_grain=%s, non_additive_agg=%s); the decomposed "
-                "time-intelligence path cannot apply the reduction, so the "
-                "KPI is failed closed rather than served as an un-reduced "
-                "per-period SUM",
-                ti_type, at_grain, non_additive_agg,
-            )
-            return _GUARD_REFUSED
+        # This DECOMPOSED-TI branch is taken BEFORE the semi-additive
+        # CompilerContext is built below. ``_evaluate_ti_decomposed`` used to
+        # receive neither ``at_grain`` nor ``non_additive_agg``, so each
+        # per-period query was a plain SUM over every row in the period with no
+        # reduction at all: for daily balances 100/120/90 a month contributed
+        # 310 instead of the 90 closing balance. Bug-6252 fail-closed that
+        # combination, which stopped the wrong number but denied an ordinary
+        # finance shape (a trailing-3-month view of a closing balance).
+        #
+        # Bug-8570 supplies the product-correct answer instead of the refusal:
+        # the reduction is threaded INTO each per-period query, so every period
+        # reduces to its closing/average value BEFORE the time-intelligence
+        # arithmetic. The emitted per-period SQL is the compiler's own
+        # semi-additive subquery — the same shape already served for a
+        # non-TI semi-additive KPI, and router-bindable for the same reason.
+        #
+        # L7B-01: the reduction is THREE fields, not two. Bug-8570 threaded
+        # at_grain and non_additive_agg and left carry_forward behind, so the
+        # shape it un-refused evaluated under a configuration the modeller did
+        # not author. All three travel together from here; anything added to
+        # the semi-additive vocabulary must be added at this call site, in
+        # ``_period_sql``'s dispatch, and in ``reduced_ctx`` together.
+        #
         # Bug-7228: guard against missing time column on the business-builder
         # path, matching the derived-TI guard above.  Without this, the
         # evaluator falls through to a hardcoded "date" column default which
@@ -2436,11 +2558,26 @@ async def _evaluate_expression_via_sql(
                 persona_id=persona_id,
                 calc_agg_mode=ctx.calc_agg_mode,
                 fiscal_year_start_month=fiscal_year_start_month,
+                at_grain=at_grain,
+                non_additive_agg=non_additive_agg,
+                carry_forward=carry_forward,
                 sql_sink=sql_sink,
                 timeout_s=timeout_s,
                 security_sink=security_sink,
             )
             return result
+        except KPIUnsupportedAggregationError:
+            # Bug-8570: the reduction itself is unusable (an unrecognised
+            # reducer, a non-keyword at_grain, or no bound time column). Fail
+            # the KPI closed — never fall through to the un-reduced per-period
+            # SUM this threading exists to replace.
+            log.error(
+                "KPI time intelligence (%s) carries an unusable semi-additive "
+                "reduction (at_grain=%s, non_additive_agg=%s); refusing to "
+                "serve rather than returning an un-reduced per-period sum",
+                ti_type, at_grain, non_additive_agg,
+            )
+            return _GUARD_REFUSED
         except Exception as exc:
             if _is_model_not_deployed_error(exc):
                 return _MODEL_NOT_DEPLOYED
@@ -2498,6 +2635,15 @@ async def _evaluate_expression_via_sql(
             at_grain, non_additive_agg,
         )
         return _GUARD_REFUSED
+    # Bug-9481: carry_forward × share/rank has no defined fill vocabulary.
+    # (carry_forward × agg-of-agg remains supported via _build_agg_of_agg_sql.)
+    if carry_forward and share_type:
+        log.error(
+            "KPI combines carry_forward with share/rank (share_type=%s "
+            "dimension=%s); refuse rather than silently drop the fill",
+            share_type, share_dimension,
+        )
+        return _GUARD_REFUSED
 
     try:
         measure_aggs = {
@@ -2543,9 +2689,14 @@ async def _evaluate_expression_via_sql(
         # balance), silently, with a legitimate-looking number in the cell.
         # Fail the KPI closed instead, exactly as the sibling
         # ``has_ungrouped_window`` check below does for the same reason.
+        # Bug-8573/Bug-9233: ``KPITimeContextError`` subclasses this type, so an
+        # unresolvable time column or a non-keyword ``at_grain`` lands here too
+        # and gets the same fail-closed disposition — never the Python evaluator,
+        # which would serve the un-reduced model-wide SUM.
         log.error(
-            "KPI expression carries an unsupported semi-additive aggregation; "
-            "refusing to serve rather than falling back to an un-reduced sum",
+            "KPI expression carries an unsupported semi-additive aggregation, "
+            "an unusable at_grain, or no bound time dimension; refusing to "
+            "serve rather than falling back to an un-reduced sum",
             exc_info=True,
         )
         return _GUARD_REFUSED
@@ -2718,7 +2869,17 @@ def _build_ti_evaluator(
     security_sink: set[str] | None = None,
 ):
     """Build the provider hook that resolves a time-intelligence AST subtree
-    via decomposed query-router queries (Python pipeline path for nested TI)."""
+    via decomposed query-router queries (Python pipeline path for nested TI).
+
+    Bug-8570 caller audit: ``_evaluate_ti_decomposed`` now also applies the KPI's
+    semi-additive reduction (``at_grain`` / ``non_additive_agg``). This caller
+    deliberately passes neither, because it is ONLY reachable through
+    ``_python_fallback``, which returns ``_GUARD_REFUSED`` — never
+    ``_COMPILER_UNSUPPORTED`` — whenever a reduction was requested. The Python
+    pipeline cannot apply a reduction OUTSIDE the TI subtree either, so a
+    reduction-carrying KPI must not reach this hook at all; passing the fields
+    here would be unreachable code that suggested otherwise.
+    """
 
     async def evaluate_time_intelligence(node) -> float | None:
         decomp = derive_ti_decomposition_from_node(node)
@@ -2784,7 +2945,15 @@ def _build_measure_provider(
     pipeline via decomposed router queries. Bug-8575: *where_clause* is
     threaded through to on-miss individual ``_get_measure_value`` calls so the
     fallback answers the same filtered question as the SQL path.
+
+    Bug-8682: the slice is read from ``provider.measure_where_clause`` at CALL
+    time rather than captured at construction, because all five
+    ``_evaluate_single_kpi`` call sites build the provider BEFORE the per-KPI
+    business-definition WHERE has been resolved. ``_evaluate_single_kpi`` sets
+    the attribute as soon as it knows the scope; callers that already know it
+    keep passing *where_clause* and get exactly the same behaviour.
     """
+    provider = MeasureValueProvider(measure_where_clause=where_clause)
 
     async def get_measure_value(name: str) -> float | None:
         if measure_value_cache is not None and name in measure_value_cache:
@@ -2796,7 +2965,7 @@ def _build_measure_provider(
         try:
             return await _get_measure_value(
                 model_id, name, bearer, model_slug, agg, persona_id=persona_id,
-                where_clause=where_clause,
+                where_clause=provider.measure_where_clause,
                 security_sink=security_sink,
             )
         except Exception as exc:
@@ -2816,11 +2985,10 @@ def _build_measure_provider(
             security_sink.update(kpi_value_security_rules.get(name, set()))
         return kpi_value_cache.get(name)
 
-    return MeasureValueProvider(
-        get_measure_value=get_measure_value,
-        get_kpi_value=get_kpi_value if kpi_value_cache is not None else None,
-        evaluate_time_intelligence=ti_evaluator,
-    )
+    provider.get_measure_value = get_measure_value
+    provider.get_kpi_value = get_kpi_value if kpi_value_cache is not None else None
+    provider.evaluate_time_intelligence = ti_evaluator
+    return provider
 
 
 _PYTHON_FALLBACK_REASON = (
@@ -2982,6 +3150,9 @@ async def _build_adhoc_trend_series(
     filter_where_clause: str | None,
     n_periods: int,
     persona_id: str | None = None,
+    at_grain: str | None = None,
+    non_additive_agg: str | None = None,
+    carry_forward: bool = False,
     sql_sink: list[str] | None = None,
     timeout_s: float = 30.0,
     security_sink: set[str] | None = None,
@@ -3005,9 +3176,35 @@ async def _build_adhoc_trend_series(
     Returns ``None`` (honest No-Data, never a wrong number) when there is no
     time dimension, the grain is unrecognised, the expression cannot be
     compiled to a single grouped SELECT (time-intelligence / KPI cross-refs),
-    or the query fails. All execution flows through the gateway.
+    a semi-additive reduction is requested (Bug-8570 — see below), or the query
+    fails. All execution flows through the gateway.
     """
     if not time_column:
+        return None
+
+    # Bug-8570 [wrong numbers]: this builder emits ONE grouped SELECT per
+    # period. A semi-additive KPI needs a per-period REDUCTION (the closing /
+    # average value inside each bucket) before the per-period value exists, and
+    # for first/last that needs a window function the query-router cannot bind.
+    # Rendering the un-reduced per-period SUM would draw a sparkline that
+    # contradicts the scalar the same KPI serves — the sum of every day's
+    # balance next to the closing balance. No sparkline is honest; a wrong one
+    # is not.
+    #
+    # L7B-01: ``carry_forward`` belongs in this gate for the same reason and was
+    # missing from it. Since the compiler routes a carry-forward-only KPI
+    # through the bucketed builder (Bug-9482), the preview SCALAR for that shape
+    # is a per-bucket reduction while this builder would draw un-reduced
+    # per-period sums beside it — the same contradiction, arrived at from the
+    # third field of the same reduction instead of the first two.
+    if non_additive_agg or at_grain or carry_forward:
+        log.info(
+            "Ad-hoc sparkline skipped: a semi-additive reduction (at_grain=%s, "
+            "non_additive_agg=%s, carry_forward=%s) cannot be applied per "
+            "period in one grouped SELECT; returning no series rather than "
+            "un-reduced per-period sums",
+            at_grain, non_additive_agg, carry_forward,
+        )
         return None
     grain = (trend_period or "month").lower()
     if grain not in _ADHOC_TREND_GRAINS:
@@ -3716,6 +3913,7 @@ async def _resolve_referenced_kpi_values(
     name_to_id: dict[str, UUID] | None,
     dim_scope: dict | None = None,
     _path: frozenset[str] = frozenset(),
+    request_filter_predicates: list[str] | None = None,
     security_sink: set[str] | None = None,
 ) -> dict[str, float | None]:
     """Resolve the values of KPIs referenced via ``kpi("Name")`` (F-017-08).
@@ -3778,6 +3976,7 @@ async def _resolve_referenced_kpi_values(
                             allowed_measure_ids=allowed_measure_ids,
                             name_to_id=name_to_id, dim_scope=dim_scope,
                             _path=_path | {ref_name},
+                            request_filter_predicates=request_filter_predicates,
                             security_sink=reference_security_rules,
                         )
                     )
@@ -3801,6 +4000,7 @@ async def _resolve_referenced_kpi_values(
                     allowed_measure_ids=allowed_measure_ids,
                     name_to_id=name_to_id,
                     dim_scope=dim_scope,
+                    request_filter_predicates=request_filter_predicates,
                 )
                 composite_security_rules: set[str] = set()
                 composite_result = await _evaluate_composite_score(
@@ -3842,6 +4042,7 @@ async def _resolve_referenced_kpi_values(
                     persona_id=persona_id, allowed_measure_ids=allowed_measure_ids,
                     name_to_id=name_to_id, dim_scope=dim_scope,
                     _path=_path | {ref_name},
+                    request_filter_predicates=request_filter_predicates,
                     security_sink=security_sink,
                 )
             )
@@ -3860,10 +4061,11 @@ async def _resolve_referenced_kpi_values(
             security_sink=security_sink,
             model=model,
             is_privileged=is_privileged,
-            allowed_measure_ids=allowed_measure_ids,
-            name_to_id=name_to_id,
-            dim_scope=dim_scope,
-        )
+                    allowed_measure_ids=allowed_measure_ids,
+                    name_to_id=name_to_id,
+                    dim_scope=dim_scope,
+                    request_filter_predicates=request_filter_predicates,
+                )
         # Bug-8449 (round-2 deep review, finding 2): a KPI whose expression is
         # ONLY ``kpi("...")`` references makes no direct router call of its own —
         # ``extract_measure_names`` finds nothing and ``_batch_get_measure_values``
@@ -3900,6 +4102,24 @@ async def _kpi_outer_cache_allowed(db, model_id: UUID) -> bool:
         ).limit(1)
     )
     return not bool(result.scalars().all())
+
+
+def _batch_outer_cache_allowed_for_request(
+    request_filters: list[dict] | None,
+    effective_persona_id: str | None,
+    model_cache_allowed: bool,
+) -> bool:
+    """Return whether an evaluate-batch request may use the outer cache."""
+    return (
+        not request_filters
+        and effective_persona_id is None
+        and model_cache_allowed
+    )
+
+
+def _batch_prefetch_allowed_for_request(request_filters: list[dict] | None) -> bool:
+    """Model-wide measure prefetch is safe only for an unfiltered request."""
+    return not request_filters
 
 
 async def _evaluate_python_expression(
@@ -4190,6 +4410,42 @@ async def evaluate_kpi(
         # Bug-8449: row-security rule ids the router applied to this evaluation.
         eval_security_rules: set[str] = set()
 
+        # Bug-8569: ONE evaluation context, shared by the value and target legs
+        # so both answer the same question. Built before the composite branch
+        # because a composite's target leg needs it too.
+        #
+        # ``security_sink`` is deliberately NOT in this block: it stays an
+        # explicit keyword at every governed call site so the Bug-8449 AST
+        # coverage guard can still see it (that guard fails closed on a
+        # ``**kwargs`` splat, which is the right behaviour — a governance sink
+        # must not be provable only by reading another function).
+        value_leg_kwargs = dict(
+            time_column=time_column,
+            calendar_type=_derive_calendar_type(model),
+            fiscal_year_start_month=getattr(model, "fiscal_year_start_month", None),
+            at_grain=kpi.at_grain,
+            non_additive_agg=kpi.non_additive_agg,
+            carry_forward=kpi.carry_forward,
+            inner_agg=kpi.inner_agg,
+            inner_grain=kpi.inner_grain,
+            outer_agg=kpi.outer_agg,
+            persona_id=effective_persona_id,
+            where_clause=bd_where,
+            filter_where_clause=bd_filter_where,
+            time_where_clause=bd_time_where,
+            enable_ti_subquery=has_bd,
+            ti_type=bd_ti_type,
+            ti_grain=bd_ti_grain,
+            ti_n_periods=bd_ti_n_periods,
+            base_expression=bd_base_expression,
+            time_window_start_sql=bd_tw_start_sql,
+            time_window_end_sql=bd_tw_end_sql,
+            share_type=bd_share_type,
+            share_dimension=bd_share_dimension,
+            share_n=bd_share_n,
+            filter_predicate_list=bd_filter_predicate_list,
+        )
+
         if kpi.expression:
             if kpi.kpi_type == "composite":
                 # Composite KPIs score their children; the stored expression
@@ -4214,34 +4470,11 @@ async def evaluate_kpi(
                     )
                 value = composite_result.composite_score
             else:
-                # v2 path: try SQL compiler first, fall back to Python evaluator
+                # v2 path: try SQL compiler first, fall back to Python evaluator.
                 value = await _evaluate_expression_via_sql(
                     kpi.expression, model_id, model.slug, bearer, measure_map, ctx,
-                    time_column=time_column,
-                    calendar_type=_derive_calendar_type(model),
-                    fiscal_year_start_month=getattr(model, "fiscal_year_start_month", None),
-                    at_grain=kpi.at_grain,
-                    non_additive_agg=kpi.non_additive_agg,
-                    carry_forward=kpi.carry_forward,
-                    inner_agg=kpi.inner_agg,
-                    inner_grain=kpi.inner_grain,
-                    outer_agg=kpi.outer_agg,
-                    persona_id=effective_persona_id,
-                    where_clause=bd_where,
-                    filter_where_clause=bd_filter_where,
-                    time_where_clause=bd_time_where,
-                    enable_ti_subquery=has_bd,
-                    ti_type=bd_ti_type,
-                    ti_grain=bd_ti_grain,
-                    ti_n_periods=bd_ti_n_periods,
-                    base_expression=bd_base_expression,
-                    time_window_start_sql=bd_tw_start_sql,
-                    time_window_end_sql=bd_tw_end_sql,
-                    share_type=bd_share_type,
-                    share_dimension=bd_share_dimension,
-                    share_n=bd_share_n,
-                    filter_predicate_list=bd_filter_predicate_list,
                     security_sink=eval_security_rules,
+                    **value_leg_kwargs,
                 )
                 if value is _TI_NO_TIME_DIMENSION:
                     return KPIEvaluateResponse(
@@ -4395,14 +4628,14 @@ async def evaluate_kpi(
             # the SQL target path resolves it via the TI machinery too.
             target_expr = kpi.target_expression or _prior_period_target_expression(kpi)
             if target_expr:
+                # Bug-8569: the SAME context as the value leg (slice, calendar,
+                # fiscal start, semi-additive reduction, business-definition
+                # window), minus the value expression's own decomposition.
                 target = await _evaluate_expression_via_sql(
                     target_expr, model_id, model.slug, bearer,
-                    measure_map, ctx, time_column=time_column,
-                    persona_id=effective_persona_id,
-                    where_clause=bd_where,
-                    filter_where_clause=bd_filter_where,
-                    time_where_clause=bd_time_where,
+                    measure_map, ctx,
                     security_sink=eval_security_rules,
+                    **_target_leg_kwargs(value_leg_kwargs),
                 )
                 if target is _MODEL_NOT_DEPLOYED:
                     return KPIEvaluateResponse(
@@ -4826,12 +5059,18 @@ async def evaluate_adhoc(
         # Bug-8449: collect the row-security rule ids the router applied so a
         # null value caused by a DENIAL is not reported as "no data".
         adhoc_security_rules: set[str] = set()
-        value = await _evaluate_expression_via_sql(
-            adhoc_expression, model_id, model.slug, bearer,
-            measure_map, ctx,
-            security_sink=adhoc_security_rules,
+        # Bug-8569/Bug-8570: ONE evaluation context. It carries the semi-additive
+        # reduction and the calendar/fiscal settings the SAVED KPI will use, so
+        # the preview number is the number the product will serve, and the
+        # target leg below is computed under the same rules as the value.
+        value_leg_kwargs = dict(
             persona_id=effective_persona_id,
             time_column=adhoc_time_column,
+            calendar_type=_derive_calendar_type(model),
+            fiscal_year_start_month=getattr(model, "fiscal_year_start_month", None),
+            at_grain=body.at_grain,
+            non_additive_agg=body.non_additive_agg,
+            carry_forward=body.carry_forward,
             where_clause=adhoc_where,
             filter_where_clause=adhoc_filter_where,
             time_where_clause=adhoc_time_where,
@@ -4848,6 +5087,12 @@ async def evaluate_adhoc(
             filter_predicate_list=adhoc_filter_predicate_list,
             sql_sink=adhoc_sql_parts,
             timeout_s=_ADHOC_TIMEOUT_S,
+        )
+        value = await _evaluate_expression_via_sql(
+            adhoc_expression, model_id, model.slug, bearer,
+            measure_map, ctx,
+            security_sink=adhoc_security_rules,
+            **value_leg_kwargs,
         )
         # De-duplicate while preserving order (repeated period queries collapse).
         adhoc_compiled_sql = (
@@ -5005,19 +5250,17 @@ async def evaluate_adhoc(
                     status_code=400,
                     detail=_MODEL_NOT_DEPLOYED_LABEL,
                 ) from exc
-            if result.value is None and _is_evaluation_failure(value):
-                # Bug-8449: a row-security deny-all is NOT an evaluation
-                # failure. Reporting it as one ("check expression and model
-                # scope") sends the modeller to debug an expression that is
-                # perfectly correct. Return the honest restricted response.
-                if row_security_denied_all(adhoc_security_rules):
-                    return _stamp_row_security_restriction(
-                        _result_to_response(result), adhoc_security_rules,
-                    )
-                raise HTTPException(
-                    status_code=400,
-                    detail="KPI evaluation failed — check expression and model scope",
-                )
+            # Bug-8568 (L7 clean-up): the branch that used to sit here read
+            # ``if result.value is None and _is_evaluation_failure(value)``.
+            # Inside this block ``value IS _COMPILER_UNSUPPORTED``, which is not
+            # a failure sentinel, so the condition was ALWAYS False — a 400 that
+            # could never fire. Firing it would also have been wrong: a Python
+            # fallback that legitimately finds no data must report No Data, not
+            # "check expression and model scope". Every failure sentinel is
+            # already dispositioned above (_GUARD_REFUSED -> 400,
+            # _EVALUATION_ERROR -> 503, _MODEL_NOT_DEPLOYED -> 400), and the
+            # Bug-8449 row-security stamp below applies unconditionally, so the
+            # deny-all case the dead branch guarded is still reported honestly.
             return _stamp_row_security_restriction(
                 _result_to_response(result), adhoc_security_rules,
             )
@@ -5029,17 +5272,13 @@ async def evaluate_adhoc(
         # will have one. Static builder targets fall back to adhoc_target_value.
         target: float | None = None
         if adhoc_target_expression:
+            # Bug-8569: same context as the value leg, minus the value
+            # expression's own decomposition/share metadata.
             target = await _evaluate_expression_via_sql(
                 adhoc_target_expression, model_id, model.slug, bearer,
                 measure_map, ctx,
-                persona_id=effective_persona_id,
-                time_column=adhoc_time_column,
-                where_clause=adhoc_where,
-                filter_where_clause=adhoc_filter_where,
-                time_where_clause=adhoc_time_where,
-                filter_predicate_list=adhoc_filter_predicate_list,
-                timeout_s=_ADHOC_TIMEOUT_S,
                 security_sink=adhoc_security_rules,
+                **_target_leg_kwargs(value_leg_kwargs),
             )
             if target is _MODEL_NOT_DEPLOYED:
                 raise HTTPException(
@@ -5132,6 +5371,28 @@ async def evaluate_adhoc(
         meta = body.presentation_meta or {}
         adhoc_eval_type = meta.get("evaluation_type", "percentage_of_target")
         _adhoc_colorblind = bool(meta.get("colorblind", False))  # Bug-7240
+        # Bug-8488: ``threshold_preset`` was an ACCEPTED-BUT-UNWIRED field. A
+        # request with value 1, target 2 and ``threshold_preset=standard_4_band``
+        # came back "Off Target" — the DEFAULT preset's verdict — instead of the
+        # requested preset's "Critical", so the builder preview showed a band the
+        # saved KPI would not use. Explicit ``presentation_meta.bands`` still win
+        # (they are the more specific instruction).
+        _preset_bands = None
+        if body.threshold_preset:
+            if body.threshold_preset not in list_presets():
+                # ``get_preset_bands`` silently substitutes standard_3_band for
+                # an unknown name, which would score the preview against bands
+                # the caller never asked for. Reject instead.
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Unknown threshold_preset '{body.threshold_preset}'. "
+                        f"Must be one of: {sorted(list_presets())}."
+                    ),
+                )
+            _preset_bands = _serialize_bands(
+                get_preset_bands(body.threshold_preset, colorblind=_adhoc_colorblind)
+            )
         th = None
         if meta.get("bands") and value is not None:
             th = evaluate_threshold(
@@ -5146,6 +5407,7 @@ async def evaluate_adhoc(
             th = evaluate_threshold(
                 value=value, target=target, direction=ctx.direction,
                 evaluation_type=adhoc_eval_type,
+                bands=_preset_bands,  # Bug-8488
                 colorblind=_adhoc_colorblind,  # Bug-7240
             )
         if th is not None:
@@ -5197,14 +5459,19 @@ async def evaluate_adhoc(
             filter_where_clause=adhoc_filter_where,
             n_periods=(body.presentation_meta or {}).get("trend_sparkline_periods", 12),
             persona_id=effective_persona_id,
+            at_grain=body.at_grain,
+            non_additive_agg=body.non_additive_agg,
+            carry_forward=body.carry_forward,
             sql_sink=adhoc_sql_parts,
             timeout_s=_ADHOC_TIMEOUT_S,
             security_sink=adhoc_security_rules,
         )
         # Refresh the compiled-SQL surface so the preview's "Show SQL" panel
-        # also exposes the sparkline query (kept in execution order, de-duped).
-        if adhoc_trend_series is not None:
-            adhoc_compiled_sql = "\n\n".join(dict.fromkeys(adhoc_sql_parts)) or None
+        # exposes every statement this request actually ran, in execution order
+        # and de-duped. Bug-8569 put the TARGET leg on the same sql_sink as the
+        # value, so this must refresh unconditionally: gating it on the
+        # sparkline hid the target query whenever no series was produced.
+        adhoc_compiled_sql = "\n\n".join(dict.fromkeys(adhoc_sql_parts)) or None
 
         elapsed = int((_time.monotonic_ns() - start_ms) / 1_000_000)
 
@@ -5324,14 +5591,35 @@ async def evaluate_batch(
         # Only an internal-service publish call (the sweep / post-deploy trigger)
         # ever writes kpi_latest, so only it needs the ordering marker. A regular
         # user render never publishes — leave its marker None (no extra DB query).
-        _svc_ctx = is_internal_request_header(
-            request.headers.get(INTERNAL_BYPASS_HEADER)
+        # Bug-9524: the rotating internal marker is a transport/rate-limit
+        # signal, not publication authority.  A model-wide ``kpi_latest``
+        # write is allowed only for the real typed KPI service principal, on
+        # the two-hop scopes that authorize model-service evaluation and its
+        # query-router execution, with a valid marker and no request slice.
+        # Keep this one decision for both ordering-marker allocation and the
+        # final write gate: a filtered or human request must still return its
+        # correctly scoped response, but must never allocate/publish a global
+        # ordering marker or durable model-wide value.
+        _service_scopes = set(
+            getattr(current_user, "service_scopes", None) or []
+        )
+        _publish_authority = (
+            isinstance(current_user, CurrentServiceUser)
+            and bool(getattr(current_user, "service_principal", None))
+            and {
+                SCOPE_KPI_EVALUATE,
+                SCOPE_KPI_QUERY_EXECUTE,
+            }.issubset(_service_scopes)
+            and is_internal_request_header(
+                request.headers.get(INTERNAL_BYPASS_HEADER)
+            )
+            and not body.filters
         )
         # R7 finding 2: the ordering token is now a strictly-increasing DB
         # sequence value (``eval_generation``), not the non-unique
         # ``clock_timestamp()``. Both are allocated in ONE round-trip at
         # evaluation start; the timestamp stays as metadata / fallback order.
-        if _svc_ctx:
+        if _publish_authority:
             # The clamp rules (and why a caller-supplied token must be bounded at
             # all) live in ``shared/db/kpi_eval_generation.clamp_supplied_marker``
             # so they are testable without the full request stack — R7 review
@@ -5641,9 +5929,10 @@ async def evaluate_batch(
         # SQL.  The same authorization-scoped key components as the single
         # /evaluate endpoint are used (tenant, model, kpi_id, user, persona).
         _batch_cache = get_kpi_cache()
-        _batch_outer_cache_allowed = (
-            effective_persona_id is None
-            and await _kpi_outer_cache_allowed(db, model_id)
+        _batch_outer_cache_allowed = _batch_outer_cache_allowed_for_request(
+            body.filters,
+            effective_persona_id,
+            await _kpi_outer_cache_allowed(db, model_id),
         )
         _batch_cache_definition_versions: dict[UUID, str] = {}
         if _batch_outer_cache_allowed:
@@ -5695,7 +5984,10 @@ async def evaluate_batch(
                 )
         batch_measure_cache: dict[str, float | None] = {}
         batch_measure_security_rules: set[str] = set()
-        if all_referenced_measures:
+        # Bug-9511: the shared prefetch is intentionally model-wide.  A
+        # filtered request must reach the provider's bound WHERE path instead
+        # of reusing those unfiltered values.
+        if all_referenced_measures and _batch_prefetch_allowed_for_request(body.filters):
             try:
                 batch_measure_cache = await _batch_get_measure_values(
                     model_id, list(all_referenced_measures), bearer, model.slug, measure_map,
@@ -5723,16 +6015,26 @@ async def evaluate_batch(
         # evaluate path which compiles at save time with real defaults).
         compiled_request_filters: list[str] | None = None
         if body.filters:
-            # Dimension and ModelParameter are imported at module scope; a local
-            # re-import here shadowed them as function locals, making the earlier
-            # ``select(Dimension)`` in this function a reference-before-assignment
-            # (F823). Use the module-level names.
-            dim_rows = await db.execute(
-                select(Dimension).where(Dimension.model_id == model_id)
-            )
-            dim_objs = list(dim_rows.scalars().all())
-            dim_name_map = {str(d.id): d.name for d in dim_objs}
-            dim_type_map = await _dimension_data_types(db, dim_objs)
+            # Bug-9512: deployed models resolve filter ids from their snapshot;
+            # draft dimensions must never silently widen a deployed request.
+            try:
+                deployed_filter_metadata = await resolve_served_filter_metadata(
+                    db, model
+                )
+            except KpiSnapshotInvalidError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{KpiSnapshotInvalidError.error_code}: {exc}",
+                )
+            if deployed_filter_metadata is not None:
+                dim_name_map, dim_type_map = deployed_filter_metadata
+            else:
+                dim_rows = await db.execute(
+                    select(Dimension).where(Dimension.model_id == model_id)
+                )
+                dim_objs = list(dim_rows.scalars().all())
+                dim_name_map = {str(d.id): d.name for d in dim_objs}
+                dim_type_map = await _dimension_data_types(db, dim_objs)
             if dim_name_map:
                 param_rows = await db.execute(
                     select(ModelParameter).where(
@@ -5748,11 +6050,22 @@ async def evaluate_batch(
                         if p.default_value is not None
                     }
                 from src.kpi_business_builder import _compile_filters
-                preds = _compile_filters(
-                    body.filters, dim_name_map, param_defaults, dim_type_map
+                try:
+                    preds = _compile_filters(
+                        body.filters, dim_name_map, param_defaults, dim_type_map,
+                        strict=True,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid request filters: {exc}",
+                    ) from exc
+                compiled_request_filters = preds
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid request filters: no deployed dimensions match the request.",
                 )
-                if preds:
-                    compiled_request_filters = preds
 
         # Build all_kpis list for composite children lookup
         all_kpis_for_composite = [
@@ -6192,7 +6505,8 @@ async def evaluate_batch(
         # endpoint and the sweep on one shared publish helper. Fail-closed:
         # any caller without the verified marker is excluded.
         #
-        # R6 (round-3 #3): reuse the SAME ``_svc_ctx`` computed at evaluation start
+        # R6 (round-3 #3): reuse the SAME ``_publish_authority`` computed at
+        # evaluation start
         # for the eval_started_at marker decision — do NOT recompute the header
         # predicate here. The internal-service marker is a rotating-HMAC that
         # accepts the current+previous window; two independent evaluations of it,
@@ -6200,7 +6514,7 @@ async def evaluate_batch(
         # boundary and decouple the marker decision from the publish decision (a
         # publish with eval_started_at=None silently reverts to epoch-only
         # ordering, reintroducing the finding-1 clobber). One evaluation, one gate.
-        is_service_context = _svc_ctx
+        is_service_context = _publish_authority
         # F-017-01 (Opus R1): the upsert must ALSO gate on the model being
         # deployed, mirroring the sweep's guard (sweep.py:1446). Otherwise an
         # internal-service caller evaluating a KPI on an undeployed model
@@ -6286,49 +6600,6 @@ async def _evaluate_single_kpi(
     ctx = await _build_evaluation_context(kpi, db, model_id)
     batch_security_rules = security_sink if security_sink is not None else set()
 
-    # F-017-14: resolve the business-definition scope WHERE up-front so a
-    # measure-based target is sliced the same way as the value (EMEA target vs
-    # EMEA revenue), not against the unfiltered grand total.
-    _bd_obj = getattr(kpi, "business_definition", None)
-    _bd_where_for_target: str | None = None
-    if _bd_obj and isinstance(_bd_obj, dict):
-        _compiled = _bd_obj.get("_compiled")
-        if _compiled and isinstance(_compiled, dict):
-            _bd_where_for_target = _compiled.get("where_clause")
-
-    # Resolve measure-based target live via query-router
-    if kpi.target_type == "measure" and kpi.target_measure_id and ctx.target_value is None:
-        target_m = await db.get(Measure, kpi.target_measure_id)
-        if target_m and target_m.model_id == model_id:
-            # Bug-6663: catch query failures so a broken target query
-            # surfaces as target_value=None (Evaluation failed label)
-            # rather than an unhandled 500.
-            try:
-                ctx.target_value = await _get_measure_value(
-                    model_id, target_m.name, bearer,
-                    model_slug, target_m.default_agg or "sum",
-                    persona_id=persona_id,
-                    where_clause=_bd_where_for_target,
-                    security_sink=batch_security_rules,
-                )
-            except Exception as exc:  # noqa: BLE001
-                if _is_model_not_deployed_error(exc):
-                    return KPIEvaluateResponse(
-                        kpi_id=kpi.id,
-                        value=None,
-                        status_label=_MODEL_NOT_DEPLOYED_LABEL,
-                    )
-                log.warning("Bug-6663: target measure query failed for KPI %s", kpi.id)
-                ctx.target_value = None
-                ctx.target_query_failed = True
-
-    if not kpi.expression:
-        return KPIEvaluateResponse(
-            kpi_id=kpi.id,
-            value=None,
-            status_label="No expression configured",
-        )
-
     # Extract business-definition WHERE clauses
     batch_bd_where: str | None = None
     batch_bd_filter_where: str | None = None
@@ -6376,9 +6647,83 @@ async def _evaluate_single_kpi(
         parts = [p for p in (batch_bd_filter_where, batch_bd_time_where) if p]
         batch_bd_where = " AND ".join(parts) if parts else batch_bd_where
 
+    # Bug-8682: the provider was built by the CALLER, before the per-KPI scope
+    # above existed, so its on-miss ``_get_measure_value`` fallback issued an
+    # UNFILTERED ``SELECT SUM("X") FROM "<model>"`` — an EMEA KPI answered with
+    # the all-regions number, at HTTP 200, in a cell that looks legitimate. All
+    # five ``_evaluate_single_kpi`` call sites share this defect, so the slice is
+    # bound HERE (the one place that knows it) rather than at each call site.
+    provider.measure_where_clause = batch_bd_where
+
+    # F-017-14: a measure-based target must be sliced the same way as the value
+    # (EMEA target vs EMEA revenue), not against the unfiltered grand total.
+    # Resolved AFTER the scope above so the slice includes the request-level
+    # filters merged in by Bug-5252 — reading only ``_compiled.where_clause``
+    # here compared an unfiltered target against a request-filtered value.
+    if kpi.target_type == "measure" and kpi.target_measure_id and ctx.target_value is None:
+        target_m = await db.get(Measure, kpi.target_measure_id)
+        if target_m and target_m.model_id == model_id:
+            # Bug-6663: catch query failures so a broken target query
+            # surfaces as target_value=None (Evaluation failed label)
+            # rather than an unhandled 500.
+            try:
+                ctx.target_value = await _get_measure_value(
+                    model_id, target_m.name, bearer,
+                    model_slug, target_m.default_agg or "sum",
+                    persona_id=persona_id,
+                    where_clause=batch_bd_where,
+                    security_sink=batch_security_rules,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if _is_model_not_deployed_error(exc):
+                    return KPIEvaluateResponse(
+                        kpi_id=kpi.id,
+                        value=None,
+                        status_label=_MODEL_NOT_DEPLOYED_LABEL,
+                    )
+                log.warning("Bug-6663: target measure query failed for KPI %s", kpi.id)
+                ctx.target_value = None
+                ctx.target_query_failed = True
+
+    if not kpi.expression:
+        return KPIEvaluateResponse(
+            kpi_id=kpi.id,
+            value=None,
+            status_label="No expression configured",
+        )
+
     # Try SQL compiler path first (matches single-evaluate endpoint pattern)
     if measure_map is not None:
         time_column = await _resolve_time_column(db, kpi, model_id)
+        # Bug-8569: ONE evaluation context, shared by the value and target legs.
+        # ``security_sink`` stays explicit at each call site (see the identical
+        # note on the single-evaluate endpoint).
+        value_leg_kwargs = dict(
+            time_column=time_column,
+            calendar_type=calendar_type,
+            fiscal_year_start_month=fiscal_year_start_month,
+            at_grain=kpi.at_grain,
+            non_additive_agg=kpi.non_additive_agg,
+            carry_forward=kpi.carry_forward,
+            inner_agg=kpi.inner_agg,
+            inner_grain=kpi.inner_grain,
+            outer_agg=kpi.outer_agg,
+            persona_id=persona_id,
+            where_clause=batch_bd_where,
+            filter_where_clause=batch_bd_filter_where,
+            time_where_clause=batch_bd_time_where,
+            enable_ti_subquery=batch_has_bd,
+            ti_type=batch_ti_type,
+            ti_grain=batch_ti_grain,
+            ti_n_periods=batch_ti_n_periods,
+            base_expression=batch_base_expression,
+            time_window_start_sql=batch_tw_start_sql,
+            time_window_end_sql=batch_tw_end_sql,
+            share_type=batch_share_type,
+            share_dimension=batch_share_dimension,
+            share_n=batch_share_n,
+            filter_predicate_list=batch_filter_predicate_list,
+        )
         if kpi.kpi_type == "composite":
             # A composite's stored expression is a placeholder. Its value is
             # discarded and replaced by the weighted child score, so executing
@@ -6389,30 +6734,7 @@ async def _evaluate_single_kpi(
             value = await _evaluate_expression_via_sql(
                 kpi.expression, model_id, model_slug, bearer, measure_map, ctx,
                 security_sink=batch_security_rules,
-                time_column=time_column,
-                calendar_type=calendar_type,
-                fiscal_year_start_month=fiscal_year_start_month,
-                at_grain=kpi.at_grain,
-                non_additive_agg=kpi.non_additive_agg,
-                carry_forward=kpi.carry_forward,
-                inner_agg=kpi.inner_agg,
-                inner_grain=kpi.inner_grain,
-                outer_agg=kpi.outer_agg,
-                persona_id=persona_id,
-                where_clause=batch_bd_where,
-                filter_where_clause=batch_bd_filter_where,
-                time_where_clause=batch_bd_time_where,
-                enable_ti_subquery=batch_has_bd,
-                ti_type=batch_ti_type,
-                ti_grain=batch_ti_grain,
-                ti_n_periods=batch_ti_n_periods,
-                base_expression=batch_base_expression,
-                time_window_start_sql=batch_tw_start_sql,
-                time_window_end_sql=batch_tw_end_sql,
-                share_type=batch_share_type,
-                share_dimension=batch_share_dimension,
-                share_n=batch_share_n,
-                filter_predicate_list=batch_filter_predicate_list,
+                **value_leg_kwargs,
             )
         if value is _TI_NO_TIME_DIMENSION:
             return KPIEvaluateResponse(
@@ -6473,14 +6795,13 @@ async def _evaluate_single_kpi(
             # stored, matching the single-evaluate path.
             target_expr = kpi.target_expression or _prior_period_target_expression(kpi)
             if target_expr:
+                # Bug-8569: same context as the value leg, minus the value
+                # expression's own decomposition/share metadata.
                 t_val = await _evaluate_expression_via_sql(
                     target_expr, model_id, model_slug, bearer,
-                    measure_map, ctx, time_column=time_column,
-                    persona_id=persona_id,
-                    where_clause=batch_bd_where,
-                    filter_where_clause=batch_bd_filter_where,
-                    time_where_clause=batch_bd_time_where,
+                    measure_map, ctx,
                     security_sink=batch_security_rules,
+                    **_target_leg_kwargs(value_leg_kwargs),
                 )
                 if t_val is _COMPILER_UNSUPPORTED:
                     # Bug-8486: resolve kpi() references in the target
@@ -6501,6 +6822,7 @@ async def _evaluate_single_kpi(
                             allowed_measure_ids=allowed_measure_ids,
                             name_to_id=name_to_id,
                             dim_scope=dim_scope,
+                            request_filter_predicates=request_filter_predicates,
                             security_sink=batch_security_rules,
                         )
                     if target_kpi_cache:

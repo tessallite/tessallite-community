@@ -342,5 +342,6 @@ async def test_two_model_bundle_remaps_recipe_and_imported_recipe_executes():
                     ),
                     "jwt",
                     allowed_model_ids={imported_sales_id, imported_units_id},
+                    persona_scopes=None,
                 )
             assert execution.combine_value == 25

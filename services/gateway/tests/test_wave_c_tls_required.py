@@ -40,6 +40,8 @@ async def test_plaintext_startup_rejected_when_required(monkeypatch):
     # SQLSTATE 28000 before any auth challenge, so the password never crosses the
     # wire. TLS is required by default; assert against that default explicitly.
     monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_SSL_REQUIRED", True)
+    monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_ALLOW_INSECURE_TRANSPORT", False)
+    monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_SSL_ENABLED", False)
 
     async def startup(_reader):
         return {"type": "startup", "params": {"application_name": "generic"}}
@@ -54,10 +56,38 @@ async def test_plaintext_startup_rejected_when_required(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_local_insecure_opt_out_reaches_auth_when_tls_is_required(monkeypatch):
+    """The explicit local-dev opt-out applies to the connection gate too."""
+    monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_SSL_REQUIRED", True)
+    monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_SSL_ENABLED", False)
+    monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_ALLOW_INSECURE_TRANSPORT", True)
+
+    async def startup(_reader):
+        return {"type": "startup", "params": {"application_name": "generic"}}
+
+    reached = False
+
+    async def authenticate(_params, _reader, _writer):
+        nonlocal reached
+        reached = True
+        return False
+
+    monkeypatch.setattr(proto, "read_startup", startup)
+    server = PGWireServer()
+    monkeypatch.setattr(server, "_authenticate", authenticate)
+    writer = _Writer()
+    await server._run(object(), writer)
+
+    assert reached is True
+    assert b"C28000\x00" not in writer.payload
+
+
+@pytest.mark.asyncio
 async def test_tls_active_startup_reaches_auth(monkeypatch):
     # sslmode=require path: once TLS is active the require-TLS gate passes and the
     # connection reaches authentication.
     monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_SSL_REQUIRED", True)
+    monkeypatch.setattr("src.jdbc.server.settings.GATEWAY_ALLOW_INSECURE_TRANSPORT", False)
 
     async def startup(_reader):
         return {"type": "startup", "params": {"application_name": "generic"}}

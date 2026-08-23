@@ -426,12 +426,16 @@ async def execute_query(
     jwt_token: str,
     *,
     allowed_model_ids: Collection[UUID],
-    persona_scopes: Mapping[UUID, PersonaFieldScope] | None = None,
+    persona_scopes: Mapping[UUID, PersonaFieldScope] | None,
     allow_row_security_denial: bool = False,
 ) -> QueryExecution:
     # F-023-07 / F-023-08 — every execution path (direct query, compound
     # step, recipe step) flows through this one enforcement point. The
-    # caller cannot opt out: allowed_model_ids is mandatory.
+    # caller cannot opt out: allowed_model_ids is mandatory. ``persona_scopes``
+    # is the agent-service ProjectPersona field/model scope; it is deliberately
+    # local to this chokepoint and is not serialized as query-router's model
+    # Persona ``persona_id``. Query-router derives its independent model persona
+    # and RLS scope from the authenticated JWT on the request.
     model_uuid = enforce_execution_scope(
         call,
         allowed_model_ids=allowed_model_ids,

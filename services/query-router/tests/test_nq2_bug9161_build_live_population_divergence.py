@@ -181,10 +181,10 @@ def test_population_fingerprint_is_definition_and_pointer_scoped() -> None:
     # A contract bump must invalidate every existing artifact.
     with patch(
         "shared.named_query.population_contract.NQ_POPULATION_CONTRACT_VERSION",
-        2,
+        3,
     ):
         assert named_query_population_fingerprint(**kw) != fp
-    assert NQ_POPULATION_CONTRACT_VERSION == 1
+    assert NQ_POPULATION_CONTRACT_VERSION == 2
     # The refresh module re-exports the canonical names for consumers/tests.
-    assert _REEXPORTED_VERSION == NQ_POPULATION_CONTRACT_VERSION == 1
+    assert _REEXPORTED_VERSION == NQ_POPULATION_CONTRACT_VERSION == 2
     assert _reexported_fingerprint is named_query_population_fingerprint

@@ -30,6 +30,7 @@ from conftest import (
 
 _PATCH = "src.routing.aggregate_matcher.load_active_aggregates"
 _PATCH_INACTIVE = "src.routing.aggregate_matcher.load_inactive_aggregates"
+_PATCH_POPULATION_MODE = "src.routing.aggregate_matcher._resolve_population_reason_split"
 
 
 # ---------------------------------------------------------------------------
@@ -1303,3 +1304,140 @@ class TestBug7359KnownAnswerTwoYearProof:
         assert "DATE_TRUNC" in sql_upper, (
             f"GROUP BY must use DATE_TRUNC: {sql}"
         )
+
+    async def test_bug_9458_q13_known_values_and_optional_state_route(self):
+        """Q13.10: values are source-correct before optional routing.
+
+        The groups deliberately have unequal cardinalities and NULL values,
+        including a NULL decision group.  AVG uses non-null score counts and
+        the optional candidate must carry SUM+COUNT+MAX state; an average of
+        group averages is never used.
+        """
+        from decimal import Decimal
+        from src.ir.logical_query import SelectExpression
+
+        rows = {
+            "approve": [Decimal("10"), None, Decimal("30")],
+            "decline": [Decimal("100"), None],
+            None: [Decimal("50"), None, Decimal("150"), Decimal("250")],
+        }
+        expected = {
+            key: {
+                "count": sum(value is not None for value in values),
+                "avg": sum(value for value in values if value is not None)
+                / sum(value is not None for value in values),
+                "max": max(value for value in values if value is not None),
+            }
+            for key, values in rows.items()
+        }
+        assert expected["approve"] == {
+            "count": 2, "avg": Decimal("20"), "max": Decimal("30")
+        }
+        assert expected["decline"] == {
+            "count": 1, "avg": Decimal("100"), "max": Decimal("100")
+        }
+        assert expected[None] == {
+            "count": 3, "avg": Decimal("150"), "max": Decimal("250")
+        }
+
+        # A governed materialisation stores re-aggregatable state, never a
+        # value that would require averaging already-averaged groups.
+        aggregate_state = {
+            key: {
+                "sum": sum(value for value in values if value is not None),
+                "count": sum(value is not None for value in values),
+                "max": max(value for value in values if value is not None),
+            }
+            for key, values in rows.items()
+        }
+        aggregate_values = {
+            key: {
+                "count": state["count"],
+                "avg": state["sum"] / state["count"],
+                "max": state["max"],
+            }
+            for key, state in aggregate_state.items()
+        }
+        assert aggregate_values == expected
+
+        measure = make_measure("risk_score", default_agg="avg", is_additive=False)
+        decision = make_dimension("risk_decision")
+        bound = make_bound_query([decision], [measure])
+        bound.logical_query.select_expressions = [
+            SelectExpression(
+                raw_text="AVG(risk_score)", alias=None,
+                classification="analytical", agg_function="avg",
+                inner_column="risk_score", inner_literal=None,
+            ),
+            SelectExpression(
+                raw_text="MAX(risk_score)", alias=None,
+                classification="analytical", agg_function="max",
+                inner_column="risk_score", inner_literal=None,
+            ),
+        ]
+        candidate = make_aggregate(
+            ["risk_decision"],
+            [
+                make_agg_col(measure, "sum"),
+                make_agg_col(measure, "count"),
+                make_agg_col(measure, "max"),
+            ],
+        )
+        with (
+            patch(_PATCH, new_callable=AsyncMock) as mock_load,
+            patch(_PATCH_INACTIVE, new_callable=AsyncMock) as mock_inactive,
+            patch(_PATCH_POPULATION_MODE, new_callable=AsyncMock) as mock_mode,
+        ):
+            mock_load.return_value = [candidate]
+            mock_inactive.return_value = []
+            mock_mode.return_value = False
+            routed = await find_best_aggregate(bound, AsyncMock())
+        assert routed.aggregate is candidate
+
+        # The same semantic query falls back to source when the optional
+        # acceleration is unrelated, retired, or stale.
+        for optional in (
+            make_aggregate(
+                ["other_dimension"],
+                [make_agg_col(measure, "sum"), make_agg_col(measure, "count")],
+            ),
+            make_aggregate(
+                ["risk_decision"],
+                [
+                    make_agg_col(measure, "sum"),
+                    make_agg_col(measure, "count"),
+                    make_agg_col(measure, "max"),
+                ],
+                status="retired",
+            ),
+        ):
+            with (
+                patch(_PATCH, new_callable=AsyncMock) as mock_load,
+                patch(_PATCH_INACTIVE, new_callable=AsyncMock) as mock_inactive,
+                patch(_PATCH_POPULATION_MODE, new_callable=AsyncMock) as mock_mode,
+            ):
+                mock_load.return_value = [optional]
+                mock_inactive.return_value = []
+                mock_mode.return_value = False
+                source = await find_best_aggregate(bound, AsyncMock())
+            assert source.aggregate is None
+
+        stale = make_aggregate(
+            ["risk_decision"],
+            [
+                make_agg_col(measure, "sum"),
+                make_agg_col(measure, "count"),
+                make_agg_col(measure, "max"),
+            ],
+        )
+        stale.is_stale = True
+        with (
+            patch(_PATCH, new_callable=AsyncMock) as mock_load,
+            patch(_PATCH_INACTIVE, new_callable=AsyncMock) as mock_inactive,
+            patch(_PATCH_POPULATION_MODE, new_callable=AsyncMock) as mock_mode,
+        ):
+            mock_load.return_value = [stale]
+            mock_inactive.return_value = []
+            mock_mode.return_value = False
+            source = await find_best_aggregate(bound, AsyncMock())
+        assert source.aggregate is None

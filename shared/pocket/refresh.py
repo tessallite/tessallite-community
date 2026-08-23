@@ -20,6 +20,8 @@ from shared.artifact_incremental_gate import full_rebuild_required
 from shared.artifact_target_binding import (
     capture_source_build_binding,
     capture_target_build_binding,
+    freeze_source_execution_connection,
+    freeze_target_execution_connection,
 )
 from shared.connection_scope import (
     CrossProjectConnectionError,
@@ -50,12 +52,15 @@ from shared.pocket.incremental import (
     build_orphan_delete_sql,
     build_unreconciled_key_probe_sql,
     build_window_expression,
+    resolve_incremental_watermark_coverage,
     resolve_incremental_window_start,
     resolve_row_identity_candidates,
     usable_identity_columns,
     window_elapsed_seconds,
 )
 from shared.pocket.refresh_guard import (
+    POCKET_INELIGIBLE_POPULATION_REASON,
+    POCKET_POPULATION_ELIGIBILITY_INELIGIBLE,
     POCKET_STATUS_FRESH,
     POCKET_STATUS_INVALIDATING,
     POCKET_STATUS_STALE,
@@ -134,6 +139,7 @@ def should_refresh_incrementally(
     table_exists: bool,
     build_state: PocketBuildState,
     window_start: datetime | None,
+    watermark_coverage_proven: bool = False,
 ) -> bool:
     """The CONTROL-PLANE decision point for pocket incremental vs full rebuild.
 
@@ -147,6 +153,10 @@ def should_refresh_incrementally(
     * the runtime matcher does not currently refuse the artifact, and
     * the delta window can be anchored to this pocket's own last COMPLETED
       refresh run (Bug-8700).
+    * the configured watermark covers every model table in the captured
+      deployed snapshot that contributes to the pocket (Bug-8745). The current
+      single-column metadata proves this only for a one-table snapshot; all
+      joined snapshots fail closed to FULL.
 
     Everything decidable from control-plane state lives here. Two further
     preconditions are decidable only against the TARGET DATABASE and are
@@ -194,6 +204,8 @@ def should_refresh_incrementally(
     if not table_exists:
         return False
     if window_start is None:
+        return False
+    if not watermark_coverage_proven:
         return False
     if build_state.entry_status != POCKET_STATUS_FRESH:
         return False
@@ -862,6 +874,30 @@ async def refresh_pocket_definition(
                     f"refresh was starting"
                 ) from exc
 
+            # G4: rebuilding an ineligible pocket cannot repair the query-plan
+            # population mismatch. The physical lifecycle remains untouched;
+            # finish any queued run without validating SQL or touching data.
+            if getattr(pocket, "population_eligibility", None) == POCKET_POPULATION_ELIGIBILITY_INELIGIBLE:
+                now = datetime.now(timezone.utc)
+                if existing_run is not None:
+                    refused_run = existing_run
+                    refused_run.status = "failed"
+                    refused_run.error_message = POCKET_INELIGIBLE_POPULATION_REASON
+                    refused_run.completed_at = now
+                else:
+                    refused_run = PocketRefreshRun(
+                        pocket_definition_id=pocket.id,
+                        refresh_mode=refresh_mode,
+                        status="failed",
+                        triggered_by=triggered_by,
+                        error_message=POCKET_INELIGIBLE_POPULATION_REASON,
+                        completed_at=now,
+                    )
+                    db.add(refused_run)
+                await db.commit()
+                await db.refresh(refused_run)
+                return refused_run
+
             # Bug-8431: freeze the pocket's ENTRY status before anything in this
             # function mutates it. ``failed`` is rewritten to ``stale`` below and
             # the whole row is flipped to ``invalidating`` before materialisation
@@ -1108,6 +1144,14 @@ async def refresh_pocket_definition(
                 _source_build_binding = await capture_source_build_binding(
                     pocket.model_id, source_conn, tenant_session=db,
                 )
+                # Bug-9427: all physical work below uses detached copies of the
+                # endpoints resolved at build start. A same-ID repoint can
+                # otherwise mutate the ORM object/identity map and redirect a
+                # DROP, CTAS, stream, count or manifest read to the replacement
+                # database. Finalisation re-proves the captured bindings and
+                # keeps the artifact non-serving when the live route changed.
+                _build_target_conn = freeze_target_execution_connection(target_conn)
+                _build_source_conn = freeze_source_execution_connection(source_conn)
             except Exception as _capture_err:
                 now = datetime.now(timezone.utc)
                 run.status = "failed"
@@ -1126,7 +1170,7 @@ async def refresh_pocket_definition(
                 await _notify_pocket_refresh_failure(_alert_tenant_id, pocket, str(_capture_err))
                 return run
 
-            # Bug-8700 / Bug-8699: the two remaining incremental preconditions
+            # Bug-8700 / Bug-8699 / Bug-8745: the incremental preconditions
             # that need control-plane state, resolved as plain values so the
             # materialisation driver makes no policy decision of its own.
             #
@@ -1138,6 +1182,7 @@ async def refresh_pocket_definition(
             # itself — the same invariant the previous ordering provided.
             _window_start: datetime | None = None
             _key_candidates: tuple[str, ...] = ()
+            _watermark_coverage_proven = False
             if pocket.incremental_column and refresh_mode in _INCREMENTAL_REFRESH_MODES:
                 _window_start = await resolve_incremental_window_start(
                     db,
@@ -1146,6 +1191,12 @@ async def refresh_pocket_definition(
                 )
                 _key_candidates = await resolve_row_identity_candidates(
                     db, model_id=pocket.model_id
+                )
+                _watermark_coverage_proven = await resolve_incremental_watermark_coverage(
+                    db,
+                    model_id=pocket.model_id,
+                    version_id=_build_binding.version_id,
+                    incremental_column=pocket.incremental_column,
                 )
 
             # Bug-8827: RE-READ the committed status under a row lock, here, and
@@ -1229,6 +1280,11 @@ async def refresh_pocket_definition(
             # committed (never from inside the except, which runs before the
             # commit). ``None`` means the materialisation did not raise.
             _materialisation_error: str | None = None
+            # Bug-8740: ``refresh_mode`` is an outcome, not merely the trigger
+            # requested by the scheduler. Cross-DB and BigQuery builds are
+            # always full; the same-DB branch overrides this only when the
+            # incremental patch actually completes.
+            _applied_refresh_mode = "full"
 
             try:
                 # F-005-06: always the service token here — never the caller's token —
@@ -1239,8 +1295,8 @@ async def refresh_pocket_definition(
 
                 if cross_db:
                     row_count, storage_bytes = await _refresh_cross_db(
-                        pocket, target_conn, target_schema, target_table, table_ref,
-                        token, db,
+                        pocket, _build_target_conn, target_schema, target_table,
+                        table_ref, token, db, source_conn=_build_source_conn,
                     )
                 elif target_connector == "bigquery" and source_connector == "bigquery":
                     # Bug-5475: take the same-DB BigQuery CREATE OR REPLACE path only when
@@ -1258,18 +1314,20 @@ async def refresh_pocket_definition(
                     # therefore the pocket matcher's table reference) points at the
                     # right dataset.
                     target_schema, row_count, storage_bytes = await _refresh_same_db_bigquery(
-                        pocket, target_conn, target, target_schema, target_table,
+                        pocket, _build_target_conn, target, target_schema, target_table,
                         token, db,
                     )
                 else:
-                    row_count, storage_bytes = await _refresh_same_db(
-                        pocket, target_conn, target_schema, target_table, table_ref,
+                    row_count, storage_bytes, _applied_refresh_mode = await _refresh_same_db(
+                        pocket, _build_target_conn, target_schema, target_table, table_ref,
                         token, refresh_mode, db,
                         target_connector=target_connector,
                         build_state=_build_state,
                         window_start=_window_start,
                         key_candidates=_key_candidates,
+                        watermark_coverage_proven=_watermark_coverage_proven,
                     )
+                run.refresh_mode = _applied_refresh_mode
 
                 # Bug-6110: enforce the pocket.max_rows ceiling against the
                 # ACTUAL materialised cardinality, not the pre-build estimate.
@@ -1305,7 +1363,9 @@ async def refresh_pocket_definition(
                     pocket.target_schema = target_schema
                     pocket.physical_table_name = target_table
                     try:
-                        await drop_pocket_storage(pocket, db)
+                        await drop_pocket_storage(
+                            pocket, db, target_conn_override=_build_target_conn,
+                        )
                     except Exception:  # noqa: BLE001 - best-effort eviction
                         logger.exception(
                             "Bug-6110: failed to evict oversized pocket %s storage; "
@@ -1366,7 +1426,7 @@ async def refresh_pocket_definition(
                     pocket_id=pocket.id,
                     target_binding=_target_build_binding,
                     source_binding=_source_build_binding,
-                    connection_ids=(target_conn.id, source_conn.id),
+                    connection_ids=(_build_target_conn.id, _build_source_conn.id),
                     target_id=pocket.target_id,
                     model_id=pocket.model_id,
                 )
@@ -1521,7 +1581,7 @@ async def refresh_pocket_definition(
                     await advance_artifact_manifest(
                         db=db, model_id=pocket.model_id, artifact=pocket,
                         artifact_kind="POCKET", artifact_refresh_run_id=run.id,
-                        target_conn=target_conn, target_schema=target_schema,
+                        target_conn=_build_target_conn, target_schema=target_schema,
                         physical_table_name=target_table,
                     )
                 except Exception as verify_exc:  # pragma: no cover - defensive
@@ -1541,7 +1601,7 @@ async def refresh_pocket_definition(
                 await write_pocket_row_manifest(
                     pocket=pocket,
                     run_id=run.id,
-                    target_conn=target_conn,
+                    target_conn=_build_target_conn,
                     target_schema=target_schema,
                     target_table=target_table,
                     # Bug-8473: pin WHICH database these columns describe. A
@@ -1718,6 +1778,39 @@ async def _run_incremental_leg(
     window_start: datetime,
     key_candidates: tuple[str, ...],
 ) -> bool:
+    """Run the complete incremental decision and patch on one stable snapshot.
+
+    Bug-8741: the key scan and delta scan previously ran as separate
+    READ COMMITTED statements. A concurrent delete could then make the older
+    key set preserve a row absent from the newer delta until another refresh.
+    Keep every source read and write in one REPEATABLE READ transaction.
+    """
+    async with sc.transaction(isolation="repeatable_read"):
+        return await _run_incremental_leg_in_snapshot(
+            sc,
+            pocket=pocket,
+            select_sql=select_sql,
+            table_ref=table_ref,
+            target_schema=target_schema,
+            target_table=target_table,
+            target_connector=target_connector,
+            window_start=window_start,
+            key_candidates=key_candidates,
+        )
+
+
+async def _run_incremental_leg_in_snapshot(
+    sc,
+    *,
+    pocket: PocketDefinition,
+    select_sql: str,
+    table_ref: str,
+    target_schema: str,
+    target_table: str,
+    target_connector: str,
+    window_start: datetime,
+    key_candidates: tuple[str, ...],
+) -> bool:
     """Patch the cached table over the delta window; return False to force FULL.
 
     Returns False — leaving the cached table BYTE-FOR-BYTE untouched — for every
@@ -1792,20 +1885,9 @@ async def _run_incremental_leg(
     created_temps: list[str] = []
 
     try:
-        # ORDER IS LOAD-BEARING: the KEY SET is snapshotted BEFORE the delta.
-        #
-        # The two scans are separate statement snapshots, so a row inserted at
-        # the source between them appears in one and not the other. Key-set
-        # first puts such a row in the DELTA only, which the leg handles
-        # correctly and silently (the orphan delete cannot touch a row that is
-        # not cached, and the INSERT writes it). Delta first would put it in the
-        # KEY SET only — in the key set, not in the delta, not in the cache,
-        # which is bit-for-bit an invariant violation (no cached copy, no
-        # delta row) — so the reconciliation probe below would fire on every
-        # ordinary concurrent write and permanently
-        # disable the incremental leg for any source with live insert traffic,
-        # while making it cost THREE source scans instead of one. Reviewer round
-        # 2 reproduced both orders live. Do not reorder these two statements.
+        # Bug-8741: the outer REPEATABLE READ transaction gives the key set and
+        # delta one snapshot. Keep key-set first as the stable documented shape,
+        # but concurrent inserts/deletes can no longer appear in only one scan.
         await sc.execute(
             f"CREATE TEMP TABLE {keys_ref} AS "
             f"{build_key_scan_sql(select_sql, quoted_keys, quoted_inc)}"
@@ -1840,12 +1922,12 @@ async def _run_incremental_leg(
             return False
 
         # Computed HERE, immediately before the delta statement, and NOT at the
-        # top of the leg. ``NOW()`` inside the expression is evaluated by the
-        # source when this statement runs, so any work between the measurement
-        # and the statement slides the window's START forward by that much — the
-        # unsafe direction, and silent, because an updated row's key is already
-        # cached and no probe fires on it. The key scan above is a full source
-        # scan, so that gap is not small.
+        # top of the leg. The source clock expression is evaluated when this
+        # statement runs, so any work between the measurement and statement
+        # slides the window's START forward by that much — the unsafe direction,
+        # and silent, because an updated row's key is already cached and no
+        # probe fires on it. The key scan above is a full source scan, so that
+        # gap is not small.
         elapsed = window_elapsed_seconds(window_start)
         if elapsed is None:
             logger.warning(
@@ -1955,25 +2037,26 @@ async def _run_incremental_leg(
             )
             return False
 
-        # All-or-nothing: the cache must never be observable with the old copies
-        # removed and the new ones not yet inserted.
-        async with sc.transaction():
-            await sc.execute(
-                build_orphan_delete_sql(table_ref, keys_ref, quoted_keys)
+        # All-or-nothing: the outer Bug-8741 REPEATABLE READ transaction keeps
+        # the stable source snapshot and also prevents observation between the
+        # delete and insert.
+        await sc.execute(
+            build_orphan_delete_sql(table_ref, keys_ref, quoted_keys)
+        )
+        await sc.execute(
+            build_identity_delete_sql(table_ref, delta_ref, quoted_keys)
+        )
+        await sc.execute(
+            build_insert_from_delta_sql(
+                table_ref, delta_ref, quoted_destination_columns
             )
-            await sc.execute(
-                build_identity_delete_sql(table_ref, delta_ref, quoted_keys)
-            )
-            await sc.execute(
-                build_insert_from_delta_sql(
-                    table_ref, delta_ref, quoted_destination_columns
-                )
-            )
+        )
         # The refusals above all log; the success path must say so too, or an
         # operator has no way to tell a pocket that is quietly full-rebuilding
         # every run (the normal outcome — see Bug-8719) from one that is really
-        # being patched. ``PocketRefreshRun.refresh_mode`` records the REQUESTED
-        # mode and cannot answer this.
+        # being patched. ``PocketRefreshRun.refresh_mode`` now records the
+        # applied outcome, so the same fact is also visible in run history
+        # (Bug-8740).
         logger.info(
             "Pocket %s was patched incrementally on key %s over the window "
             "starting %s (no full rebuild)",
@@ -2006,8 +2089,9 @@ async def _refresh_same_db(
     build_state: PocketBuildState,
     window_start: datetime | None = None,
     key_candidates: tuple[str, ...] = (),
+    watermark_coverage_proven: bool = False,
     target_connector: str = "postgresql",
-) -> tuple[int | None, int | None]:
+) -> tuple[int | None, int | None, str]:
     select_sql = await _get_rewritten_sql(pocket.model_id, pocket.defining_sql, token)
 
     # Bug-8416: discovery is one independent statement and must not retain a
@@ -2024,20 +2108,23 @@ async def _refresh_same_db(
         table_exists=table_exists,
         build_state=build_state,
         window_start=window_start,
+        watermark_coverage_proven=watermark_coverage_proven,
     )
     if not use_incremental and pocket.incremental_column and table_exists:
         logger.info(
             "Pocket %s has an incremental column but is being rebuilt in "
             "FULL (mode=%s entry_status=%s built_for=%s/%s deployed=%s/%s "
-            "window_start=%s): a partial rebuild of a matcher-refused pocket "
+            "window_start=%s watermark_coverage_proven=%s): a partial rebuild "
+            "of a matcher-refused or joined pocket "
             "would leave superseded rows in place and then stamp the table "
             "as current (Bug-8431); an unanchored window would silently drop "
             "every row that changed since the last successful run "
-            "(Bug-8700)",
+            "(Bug-8700); Bug-8745 refuses an unproven joined-table watermark "
+            "coverage set",
             pocket.id, refresh_mode, build_state.entry_status,
             build_state.built_for_version_id, build_state.built_for_epoch,
             build_state.deployed_version_id, build_state.deploy_epoch,
-            window_start,
+            window_start, watermark_coverage_proven,
         )
 
     patched = False
@@ -2072,7 +2159,7 @@ async def _refresh_same_db(
 
         storage_bytes = await _fetch_storage_bytes(sc, target_schema, target_table, target_connector)
 
-    return row_count, storage_bytes
+    return row_count, storage_bytes, ("incremental" if patched else "full")
 
 
 async def _refresh_cross_db(
@@ -2083,6 +2170,8 @@ async def _refresh_cross_db(
     table_ref: str,
     token: str,
     db: AsyncSession,
+    *,
+    source_conn: ProjectConnection | None = None,
 ) -> tuple[int | None, int | None]:
     """Materialise a pocket across databases by streaming into staging.
 
@@ -2095,7 +2184,7 @@ async def _refresh_cross_db(
     that let Bug-8431's pocket leg ship unguarded (round-2 review finding 5).
     """
     rewritten_sql = await _get_rewritten_sql(pocket.model_id, pocket.defining_sql, token)
-    source_conn = await resolve_source_connection(pocket.model_id, db)
+    source_conn = source_conn or await resolve_source_connection(pocket.model_id, db)
 
     await ensure_target_schema(target_conn, target_schema, tenant_session=db)
 
@@ -2188,11 +2277,40 @@ async def resolve_pocket_physical_table(
 async def drop_pocket_storage(
     pocket: PocketDefinition,
     db: AsyncSession,
+    *,
+    target_conn_override: Any = None,
 ) -> None:
-    resolved = await resolve_pocket_physical_table(pocket, db)
-    if resolved is None:
-        return
-    conn, connector, _schema, dotted = resolved
+    if target_conn_override is None:
+        resolved = await resolve_pocket_physical_table(pocket, db)
+        if resolved is None:
+            return
+        conn, connector, _schema, dotted = resolved
+    else:
+        # Refresh admission/eviction passes the detached build-start endpoint
+        # (Bug-9427). A same-ID repoint must not redirect the destructive drop
+        # to the replacement connection. Administrative/delete callers omit
+        # this override and retain the scoped resolver's fail-closed checks.
+        target = await db.get(DataTarget, pocket.target_id)
+        if target is None:
+            return
+        conn = target_conn_override
+        connector = normalize_connection_type(conn.connection_type)
+        if connector not in _POCKET_TARGET_CONNECTORS:
+            return
+        _schema, dotted = _resolve_target_location(pocket, target)
+        if connector == "bigquery":
+            defaults = await resolve_aggregate_target_defaults(
+                tenant_session=db, project_id=conn.project_id,
+            )
+            from shared.config.source_db import resolve_connection_bq_project
+
+            tgt_ref = resolve_target_schema(
+                "bigquery", target.config or {}, defaults,
+                schema_override=pocket.target_schema,
+                connection_bq_project=resolve_connection_bq_project(conn),
+            )
+            _schema = tgt_ref.schema
+            dotted = tgt_ref.qualified_table(_resolve_target_location(pocket, target)[1])
     table_ref = quote_table_ref(connector, dotted)
 
     await execute_source_ddl(conn, f"DROP TABLE IF EXISTS {table_ref}", tenant_session=db)

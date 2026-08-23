@@ -123,6 +123,7 @@ PocketGeneration = ArtifactGeneration
 
 _GENERATION_COLUMNS = (
     PocketDefinition.status,
+    PocketDefinition.population_eligibility,
     PocketDefinition.active_refresh_run_id,
     PocketDefinition.physical_table_name,
     PocketDefinition.target_schema,
@@ -269,6 +270,12 @@ async def assert_pocket_route_admissible(
         raise PocketGenerationChangedError(
             f"Pocket {pocket_id} is no longer {_SERVABLE_STATUS} "
             f"(status={row.status!r}) at execution time; re-routing to source"
+        )
+
+    if as_str(getattr(row, "population_eligibility", None)) == "ineligible":
+        raise PocketGenerationChangedError(
+            f"Pocket {pocket_id} has an unproven join population at execution "
+            "time; re-routing to source"
         )
 
     if not targets_live_location(

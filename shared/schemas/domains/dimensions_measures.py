@@ -896,3 +896,56 @@ class CalculatedExpressionValidateResponse(BaseModel):
         default=None,
         description="Populated when valid=false with a human-readable reason.",
     )
+
+
+class MeasureRenameImpactItem(BaseModel):
+    """One consumer a measure rename would touch (Bug-9394)."""
+    consumer_type: str = Field(
+        description=(
+            "One of: measure | kpi | saved_query | scratchpad_measure | "
+            "cross_model_recipe | model_alias_map | named_set | "
+            "quantile_coverage. This is the CLOSED vocabulary the rename plan "
+            "emits on either list; the producer draws every value from "
+            "measure_rename.RENAME_CONSUMER_TYPES. Two are one-sided by design: "
+            "'named_set' appears only in 'blockers' (a named set is matched by "
+            "containment, never parsed, so a hit is refused rather than "
+            "rewritten), and 'quantile_coverage' only in 'rewrites' (the "
+            "coverage row is invalidated, with field '$invalidated')."
+        ),
+    )
+    consumer_id: str
+    consumer_name: Optional[str] = None
+    field: str = Field(
+        description=(
+            "The field that would be rewritten (e.g. 'expression', "
+            "'target_expression', 'business_definition'), or '$invalidated' "
+            "for a consumer that is dropped rather than rewritten."
+        ),
+    )
+
+
+class MeasureRenameImpactResponse(BaseModel):
+    """What renaming a measure would do, computed without changing anything.
+
+    Bug-9394: the KPI DSL binds measures by NAME. The rename cascade rewrites
+    every KPI expression that binds the old name, but the modeller had no way to
+    see WHICH KPIs would change before committing. This is the preview behind
+    the confirmation dialog: ``rewrites`` is what the rename fixes up
+    automatically, ``blockers`` is what it cannot safely rewrite — each blocker
+    makes the PATCH fail with 409 and the same reference list.
+    """
+    measure_id: uuid.UUID
+    current_name: str
+    new_name: str
+    safe: bool = Field(
+        description=(
+            "True when the rename has NO UNREWRITABLE REFERENCES — i.e. "
+            "'blockers' is empty, so the cascade would not 409 on this check. "
+            "It is NOT a prediction that the PATCH will succeed: this preview "
+            "runs no name-uniqueness and no name-format validation, and a "
+            "concurrent edit can add a blocker between the preview and the "
+            "PATCH. A safe=true rename can still be rejected for those reasons."
+        ),
+    )
+    rewrites: list[MeasureRenameImpactItem] = Field(default_factory=list)
+    blockers: list[MeasureRenameImpactItem] = Field(default_factory=list)

@@ -27,7 +27,10 @@ A model is the core object in Tessallite. It defines a single business fact — 
 
 A model contains:
 
-- **Tables** — the source data tables drawn from a connected data source. One table must be of type `fact`. Additional tables of type `dim_aggregate` or `dim_detail` may be added.
+- **Tables** — the source data tables drawn from a connected data source. A
+  single-table model is implicitly fact; additional tables require one
+  explicitly declared `fact` anchor at deploy. Additional tables may be of
+  type `dim_aggregate` or `dim_detail`.
 - **Joins** — the relationships between tables. A join connects the fact table to a dimension table, or connects dimension tables to each other.
 - **Dimensions** — the attributes by which the fact can be sliced and filtered. Each dimension maps to a column in one of the model's tables.
 - **Measures** — the numeric values computed from the fact. Each measure defines an aggregation function (SUM, COUNT, AVG, and others) applied to a column.
@@ -36,9 +39,11 @@ A model contains:
 
 ---
 
-## The one-fact rule
+## The fact-anchor rule
 
-Each model must have exactly one fact table. Multi-fact analysis is handled by creating one model per fact within the same project.
+At deploy, every multi-table model must declare exactly one fact table; a
+single-table model is implicitly its fact table. Multi-fact analysis is handled
+by creating one model per fact within the same project.
 
 ---
 

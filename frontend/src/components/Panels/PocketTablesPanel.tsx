@@ -26,6 +26,7 @@ import type { PocketDefinition } from "../../api/types";
 import { isTenantAdmin } from "../../auth/currentUser";
 import { useBuilderStore } from "../../store/builderStore";
 import { useConfirm } from "../Confirm";
+import { recordDelete } from "../Builder/emitDrawerHistory";
 import { RefreshTriggerButton } from "../Refresh";
 import PocketDrawer from "./PocketDrawer";
 import PocketSuggestionsPanel from "./PocketSuggestionsPanel";
@@ -38,6 +39,24 @@ const STATUS_COLOR: Record<string, "success" | "default" | "error" | "warning" |
 };
 
 type TFn = (key: string, params?: Record<string, string>) => string;
+
+function pocketToCreatePayload(pocket: PocketDefinition): Record<string, unknown> {
+  const refreshPolicy = pocket.refresh_policy === "event"
+    ? "event"
+    : pocket.refresh_policy === "manual"
+      ? "manual"
+      : "schedule";
+  return {
+    target_id: pocket.target_id,
+    defining_sql: pocket.defining_sql,
+    refresh_policy: refreshPolicy,
+    refresh_cron: pocket.refresh_policy_row?.cron_expression ?? pocket.refresh_cron,
+    refresh_policy_enabled: pocket.refresh_policy_row?.is_enabled ?? false,
+    incremental_column: pocket.incremental_column,
+    incremental_lookback_hours: pocket.incremental_lookback_hours,
+    ttl_days: pocket.ttl_days,
+  };
+}
 
 export default function PocketTablesPanel() {
   const { projectId, modelId } = useParams<{ projectId: string; modelId: string }>();
@@ -85,8 +104,12 @@ export default function PocketTablesPanel() {
   );
 
   const deletePocket = useMutation({
-    mutationFn: (pocketId: string) => pocketsApi.delete(projectId!, modelId!, pocketId),
-    onSuccess: () => {
+    mutationFn: ({ pocketId }: { pocketId: string; prior: Record<string, unknown> }) =>
+      pocketsApi.delete(projectId!, modelId!, pocketId),
+    onSuccess: (_deleted, variables) => {
+      // Bug-9395/F-026-10: deleting a pocket records its create payload so
+      // Builder undo can restore the definition through the normal API.
+      recordDelete("pocket", variables.pocketId, variables.prior);
       setDeleteError(null);
       qc.invalidateQueries({ queryKey: ["pockets", projectId, modelId] });
       qc.invalidateQueries({ queryKey: ["metrics", projectId, modelId] });
@@ -132,7 +155,7 @@ export default function PocketTablesPanel() {
       ),
       confirmLabel: t("pocketTables.deleteConfirm"),
     });
-    if (ok) deletePocket.mutate(pocket.id);
+    if (ok) deletePocket.mutate({ pocketId: pocket.id, prior: pocketToCreatePayload(pocket) });
   }
 
   return (

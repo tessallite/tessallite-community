@@ -73,6 +73,7 @@ import {
   summarizeMeasureCompatibility,
   type MeasureCompatibilitySummary,
 } from "./measureCompatibility";
+import MeasureRenameImpactDialog from "./MeasureRenameImpactDialog";
 
 const AGG_OPTIONS = [
   "sum",
@@ -288,6 +289,9 @@ export default function MeasuresPanel() {
   const [tvFormat, setTvFormat] = useState<MeasureFormatToken | "">("");
   const [tvHierarchyId, setTvHierarchyId] = useState("");
   const [tvCalendarModelTableId, setTvCalendarModelTableId] = useState("");
+  const [renameImpact, setRenameImpact] = useState<import("../../api/types").MeasureRenameImpactResponse | null>(null);
+  const [renameImpactLoading, setRenameImpactLoading] = useState(false);
+  const [renameImpactError, setRenameImpactError] = useState<string | null>(null);
 
   const canEdit = useCanAuthorModel();
   const measures = useMeasures(projectId!, modelId!);
@@ -583,6 +587,32 @@ export default function MeasuresPanel() {
       setEditingMeasureId(null);
     },
   });
+
+  async function handleMeasureSave() {
+    const originalName = editingMeasure?.name;
+    const candidate = measName.trim();
+    if (!editingMeasureId || !originalName || candidate === originalName) {
+      updateMeas.mutate();
+      return;
+    }
+    setRenameImpactError(null);
+    setRenameImpactLoading(true);
+    try {
+      const impact = await measuresApi.renameImpact(
+        projectId!,
+        modelId!,
+        editingMeasureId,
+        candidate,
+      );
+      setRenameImpact(impact);
+    } catch (err) {
+      setRenameImpactError(
+        err instanceof Error ? err.message : t("measures.renameImpact.loadFailed"),
+      );
+    } finally {
+      setRenameImpactLoading(false);
+    }
+  }
 
   const deleteMeas = useMutation({
     // Carry the full measure through so the undo entry can re-create it from
@@ -1557,11 +1587,12 @@ export default function MeasuresPanel() {
             <Button onClick={() => setDialogOpen(false)}>{t("common.cancel")}</Button>
             <Button
               variant="contained"
-              onClick={() => (editingMeasureId ? updateMeas.mutate() : createMeas.mutate())}
+              onClick={() => (editingMeasureId ? void handleMeasureSave() : createMeas.mutate())}
               disabled={
                 !measName ||
                 createMeas.isPending ||
                 updateMeas.isPending ||
+                renameImpactLoading ||
                 (measType === "calculated" &&
                   (!measExpression.trim() ||
                     validationLoading ||
@@ -1572,9 +1603,24 @@ export default function MeasuresPanel() {
                 <CircularProgress size={18} />
               ) : editingMeasureId ? t("common.save") : t("common.add")}
             </Button>
+            {renameImpactError && (
+              <Typography variant="caption" color="error">
+                {renameImpactError}
+              </Typography>
+            )}
           </Box>
         </DialogActions>
       </Dialog>
+
+      <MeasureRenameImpactDialog
+        impact={renameImpact}
+        open={Boolean(renameImpact)}
+        onCancel={() => setRenameImpact(null)}
+        onConfirm={() => {
+          setRenameImpact(null);
+          updateMeas.mutate();
+        }}
+      />
 
       <Dialog open={tvDialogOpen} onClose={() => setTvDialogOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>{t("measures.timeVariant.addTitle")}</DialogTitle>

@@ -29,6 +29,7 @@ from src.auth.rbac import require_role
 from src.api._model_lock import acquire_model_definition_lock
 from src.api._scope import ensure_model_in_project
 from src.api._uda_refs import assert_uda_deletable
+from shared.semantic.join_population_auto_flag import auto_flag_safe_population_joins
 
 router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}/tables/{table_id}",
@@ -172,6 +173,35 @@ async def sync_columns(
                     is_nullable=item.is_nullable,
                     is_primary_key=bool(item.is_primary_key),
                 ))
+
+        # G4: source introspection is the one boundary that can refresh the
+        # key proof used by the conservative population default. Scope the
+        # pass to this table and only fill a genuinely absent participation
+        # value; explicit modeller states (including ``undeclared``) remain
+        # untouched. Unknown/ambiguous key metadata fails closed in the
+        # helper, so a naming convention can never create a declaration.
+        table_result = await db.execute(
+            select(ModelTable).where(ModelTable.model_id == model_id)
+        )
+        model_tables = list(table_result.scalars().all())
+        table_ids = {table.id for table in model_tables}
+        column_result = (
+            await db.execute(
+                select(ModelColumn).where(ModelColumn.model_table_id.in_(table_ids))
+            )
+            if table_ids
+            else None
+        )
+        model_columns = list(column_result.scalars().all()) if column_result is not None else []
+        join_result = await db.execute(
+            select(Join).where(Join.model_id == model_id)
+        )
+        auto_flag_safe_population_joins(
+            join_result.scalars().all(),
+            model_tables,
+            model_columns,
+            introspected_table_ids={table_id},
+        )
 
         await db.commit()
 

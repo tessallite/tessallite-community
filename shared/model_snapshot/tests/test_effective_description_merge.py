@@ -289,6 +289,151 @@ class TestMergeEffectiveDescriptions:
         _merge_effective_descriptions(snap)
         assert snap["dimensions"][0]["effective_description"] == "raw desc"
 
+    def test_column_attachment_maps_to_dimension_via_source_column_id(self):
+        """Bug-9392: a column-type glossary attachment must surface as the
+        effective_description of the dimension whose source_column_id is that
+        column, so column-only terms reach the JDBC/XMLA catalogue instead of
+        being silently dropped. FAILS pre-fix (merge only read dim/measure
+        attachments; column attachments were computed and then ignored)."""
+        col_id = _u()
+        dim_id = _u()
+        snap = _snap(
+            dimensions=[
+                {
+                    "id": dim_id,
+                    "name": "Region",
+                    "description": "raw desc",
+                    "source_column_id": col_id,
+                },
+            ],
+            glossary_entries=[
+                {
+                    "id": _u(),
+                    "status": "approved",
+                    "superseded_by": None,
+                    "visibility": "show",
+                    "version": 1,
+                    "definition": "Column-level business definition",
+                    "attachments": [
+                        {"target_type": "column", "target_id": col_id},
+                    ],
+                },
+            ],
+        )
+        _merge_effective_descriptions(snap)
+        assert (
+            snap["dimensions"][0]["effective_description"]
+            == "Column-level business definition"
+        )
+
+    def test_column_attachment_maps_to_measure_via_source_column_id(self):
+        """Bug-9392: same column-to-source_column_id fallback for measures."""
+        col_id = _u()
+        meas_id = _u()
+        snap = _snap(
+            measures=[
+                {
+                    "id": meas_id,
+                    "name": "Revenue",
+                    "description": "raw measure",
+                    "source_column_id": col_id,
+                },
+            ],
+            glossary_entries=[
+                {
+                    "id": _u(),
+                    "status": "approved",
+                    "superseded_by": None,
+                    "visibility": "show",
+                    "version": 1,
+                    "definition": "Amount billed net of returns",
+                    "attachments": [
+                        {"target_type": "column", "target_id": col_id},
+                    ],
+                },
+            ],
+        )
+        _merge_effective_descriptions(snap)
+        assert (
+            snap["measures"][0]["effective_description"]
+            == "Amount billed net of returns"
+        )
+
+    def test_direct_dimension_attachment_precedes_column_attachment(self):
+        """Bug-9392: a term attached DIRECTLY to the dimension wins over a term
+        attached to its source column, even when the column term has a higher
+        version. The column attachment is only a fallback."""
+        col_id = _u()
+        dim_id = _u()
+        snap = _snap(
+            dimensions=[
+                {
+                    "id": dim_id,
+                    "name": "Region",
+                    "description": "raw desc",
+                    "source_column_id": col_id,
+                },
+            ],
+            glossary_entries=[
+                {
+                    "id": _u(),
+                    "status": "approved",
+                    "superseded_by": None,
+                    "visibility": "show",
+                    "version": 1,
+                    "definition": "Direct dimension term",
+                    "attachments": [
+                        {"target_type": "dimension", "target_id": dim_id},
+                    ],
+                },
+                {
+                    "id": _u(),
+                    "status": "approved",
+                    "superseded_by": None,
+                    "visibility": "show",
+                    "version": 9,
+                    "definition": "Column term (should be shadowed)",
+                    "attachments": [
+                        {"target_type": "column", "target_id": col_id},
+                    ],
+                },
+            ],
+        )
+        _merge_effective_descriptions(snap)
+        assert (
+            snap["dimensions"][0]["effective_description"]
+            == "Direct dimension term"
+        )
+
+    def test_column_attachment_for_other_column_does_not_leak(self):
+        """Bug-9392: the column fallback must match on source_column_id, so a
+        term on an UNRELATED column must not surface on this dimension."""
+        snap = _snap(
+            dimensions=[
+                {
+                    "id": _u(),
+                    "name": "Region",
+                    "description": "raw desc",
+                    "source_column_id": _u(),
+                },
+            ],
+            glossary_entries=[
+                {
+                    "id": _u(),
+                    "status": "approved",
+                    "superseded_by": None,
+                    "visibility": "show",
+                    "version": 1,
+                    "definition": "Unrelated column term",
+                    "attachments": [
+                        {"target_type": "column", "target_id": _u()},
+                    ],
+                },
+            ],
+        )
+        _merge_effective_descriptions(snap)
+        assert snap["dimensions"][0]["effective_description"] == "raw desc"
+
     def test_empty_snap_no_crash(self):
         snap: dict = {"dimensions": [], "measures": [], "glossary_entries": []}
         _merge_effective_descriptions(snap)

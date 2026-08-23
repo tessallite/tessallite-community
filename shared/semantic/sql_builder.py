@@ -44,6 +44,7 @@ from shared.semantic.graph_order import (
     select_model_tables,
 )
 from shared.semantic.join_keyword import join_keyword
+from shared.semantic.join_population_serving import augment_required_table_ids
 
 logger = logging.getLogger(__name__)
 
@@ -123,10 +124,26 @@ async def build_from_clause(
             adjacency.setdefault(lid, []).append(rid)
             adjacency.setdefault(rid, []).append(lid)
 
+    # Bug-8615 / G3: population-defining edges are mandatory even when no
+    # selected aggregate/pocket column comes from their far table.  Validate
+    # the graph for both the pruned and full-component paths; only augment the
+    # requested set when pruning is active so ``None`` retains full-graph
+    # behaviour.
+    _required_with_population = augment_required_table_ids(
+        needed_table_ids or (), joins, table_ids=tables,
+    )
+    if _required_with_population is None:
+        raise ValueError(
+            "Cannot build SQL FROM clause: malformed population-defining "
+            "join graph."
+        )
+
     # Compute the minimal join closure when pruning.
     allowed_table_ids: set | None = None
     if needed_table_ids is not None:
-        allowed_table_ids = _join_closure(anchor.id, needed_table_ids, adjacency)
+        allowed_table_ids = _join_closure(
+            anchor.id, _required_with_population, adjacency,
+        )
 
     _overrides = physical_name_overrides or {}
 
@@ -201,7 +218,7 @@ async def build_from_clause(
                 changed = True
 
     if needed_table_ids is not None:
-        missing = needed_table_ids - visited
+        missing = _required_with_population - visited
         if missing:
             raise ValueError(
                 f"Cannot reach tables {sorted(str(t) for t in missing)} "
@@ -353,9 +370,16 @@ async def build_pocket_select_sql(
             f"Model {pocket.model_id} has no ModelColumn records to project"
         )
 
+    # Bug-8691: pass the set through verbatim. ``all_columns`` is proven
+    # non-empty above, so ``needed_table_ids`` cannot be empty here and the old
+    # ``or None`` was unreachable — but it is the exact shape that caused
+    # Bug-8691 on the aggregate refresh path (an empty set is falsy, so the
+    # builder was asked for NO pruning and joined the whole component instead of
+    # the anchor alone, silently changing a COUNT). Keeping a dead copy of it in
+    # the builder's own module is how the pattern gets copied to a live caller.
     needed_table_ids = {col.model_table_id for col in all_columns}
     from_clause, alias_by_table_id = await build_from_clause(
-        db, pocket.model_id, needed_table_ids=needed_table_ids or None,
+        db, pocket.model_id, needed_table_ids=needed_table_ids,
         connector=connector,
     )
     field_index = await _load_field_index(db, pocket.model_id)

@@ -314,6 +314,43 @@ async def test_kpi_service_principal_remains_fail_closed_when_unmatched():
 
 
 @pytest.mark.asyncio
+async def test_internal_kpi_snapshot_coverage_exemption_preserves_rls_rules():
+    """Bug-9257: the signed KPI snapshot hop may compute the global value,
+    while a normal kpi_evaluator principal remains deny-all and wildcard rules
+    still apply to the explicitly opted-in operation."""
+    unmatched_rule = _make_rule_row_predicate(
+        "members", "region.region_code",
+        "dimension_equals('region.region_code', 'NORTH')", ["member"],
+    )
+    out = await compile_row_security(
+        uuid.uuid4(),
+        Principal(
+            user_identity="service:kpi-snapshot-sweep",
+            roles=frozenset({"kpi_evaluator"}),
+            unmatched_role_coverage_exempt=True,
+        ),
+        _fake_db_with_rules([unmatched_rule]),
+    )
+    assert out is None
+
+    wildcard = _make_rule_row_predicate(
+        "everyone", "region.region_code",
+        "dimension_equals('region.region_code', 'NORTH')", ["*"],
+    )
+    out = await compile_row_security(
+        uuid.uuid4(),
+        Principal(
+            user_identity="service:kpi-snapshot-sweep",
+            roles=frozenset({"kpi_evaluator"}),
+            unmatched_role_coverage_exempt=True,
+        ),
+        _fake_db_with_rules([wildcard]),
+    )
+    assert out is not None
+    assert "NORTH" in out.sql_expression
+
+
+@pytest.mark.asyncio
 async def test_privileged_service_principal_is_exempt_for_full_data_operations():
     """Privileged internal operations need the same role-based exemption.
 

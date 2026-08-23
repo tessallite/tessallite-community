@@ -28,6 +28,8 @@ All other messages: 1-byte type tag + 4-byte length (including length field).
 """
 from __future__ import annotations
 
+import datetime as _dt
+import decimal as _decimal
 import os
 import struct
 from typing import Any
@@ -102,27 +104,48 @@ OID_TIMESTAMP = 1114
 OID_TIMESTAMPTZ = 1184
 OID_TIMETZ = 1266
 
-# Bug-3655 (option b): OIDs the gateway emits as TEXT even when a client
-# requests binary result format. The gateway has no true PG binary wire
-# encoder for these types (NUMERIC is a base-10000 digit array; DATE /
-# TIMESTAMP are epoch-offset integers), so it text-encodes the value in
-# data_row. The advertised per-column format code in row_description MUST
-# match that, otherwise the client mis-parses a text payload as binary.
-# Forcing format code 0 for these columns keeps row_description and data_row
-# in lockstep regardless of the requested format.
-_TEXT_ONLY_BINARY_OIDS = frozenset({
-    OID_NUMERIC, OID_DATE, OID_TIME, OID_TIMESTAMP, OID_TIMESTAMPTZ, OID_TIMETZ,
+# OIDs the gateway can encode in the PostgreSQL BINARY wire format. This is an
+# ALLOW-list, not a deny-list, so a type OID added to ``server._map_type_oid``
+# without an encoder here downgrades to text automatically instead of emitting a
+# payload no client can parse.
+#
+# Bug-3655 originally listed the INVERSE — the six types with no encoder — and
+# forced their format code to 0 so ``row_description`` and ``data_row`` stayed in
+# lockstep. That reasoning holds only for a client that reads the RowDescription
+# the gateway sends alongside the rows. A prepared-statement client does not: it
+# fixes the result formats from the STATEMENT description at Bind time and never
+# re-reads them, so it requested binary NUMERIC, received text, and decoded
+# garbage (asyncpg: ``insufficient data in buffer``). A server may not downgrade
+# a format the client asked for, so the encoders below implement the six types
+# rather than declining them.
+_BINARY_ENCODABLE_OIDS = frozenset({
+    OID_TEXT, OID_BOOL, OID_INT2, OID_INT4, OID_INT8, 26,  # 26 = oid
+    OID_FLOAT4, OID_FLOAT8,
+    OID_NUMERIC, OID_DATE, OID_TIME, OID_TIMETZ, OID_TIMESTAMP, OID_TIMESTAMPTZ,
 })
 
 
-def _effective_result_format(requested_fmt: int, oid: int) -> int:
-    """Return the format code actually used for a column (Bug-3655).
+class BinaryEncodeError(Exception):
+    """A value cannot be encoded in the binary format its column advertises.
 
-    Downgrades a requested binary (1) format to text (0) for OIDs the gateway
-    cannot binary-encode, so the advertised format and the emitted payload
-    always agree.
+    Raised instead of silently falling back to text bytes: under a binary format
+    code the client parses the payload as binary, so a text fallback is not a
+    degradation, it is a corrupted value. The extended-protocol Execute handler
+    converts this into an ErrorResponse.
     """
-    if requested_fmt == 1 and oid in _TEXT_ONLY_BINARY_OIDS:
+
+    def __init__(self, message: str, sqlstate: str = "22P03"):
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+def _effective_result_format(requested_fmt: int, oid: int) -> int:
+    """Return the format code actually used for a column.
+
+    Downgrades a requested binary (1) format to text (0) only for OIDs with no
+    binary encoder, so the advertised format and the emitted payload agree.
+    """
+    if requested_fmt == 1 and oid not in _BINARY_ENCODABLE_OIDS:
         return 0
     return requested_fmt
 
@@ -324,39 +347,234 @@ def _result_format_for_col(result_formats: list[int] | None, idx: int) -> int:
     return 0
 
 
+# PostgreSQL's binary date/time epoch: 2000-01-01T00:00:00.
+_PG_EPOCH_DATE = _dt.date(2000, 1, 1)
+_PG_EPOCH_NAIVE = _dt.datetime(2000, 1, 1)
+_PG_EPOCH_AWARE = _dt.datetime(2000, 1, 1, tzinfo=_dt.timezone.utc)
+
+# NUMERIC sign words (see PostgreSQL ``src/backend/utils/adt/numeric.c``).
+_NUMERIC_POS = 0x0000
+_NUMERIC_NEG = 0x4000
+_NUMERIC_NAN = 0xC000
+
+
+def _encode_numeric_binary(text: str) -> bytes:
+    """PG binary NUMERIC: ndigits, weight, sign, dscale + base-10000 digits.
+
+    ``Decimal`` arithmetic is context-bound: ``abs()``, unary ``-`` and other
+    operators round at the ambient decimal precision. Parse and split the
+    exact coefficient as text so wide NUMERIC values cannot be silently
+    changed before their wire representation is built.
+    """
+    raw = text.strip()
+    try:
+        value = _decimal.Decimal(raw)
+    except (_decimal.InvalidOperation, ValueError) as exc:
+        raise BinaryEncodeError(
+            f"value {text!r} is not a valid NUMERIC for binary encoding"
+        ) from exc
+    if value.is_nan():
+        return struct.pack("!hhHh", 0, 0, _NUMERIC_NAN, 0)
+    if value.is_infinite():
+        # PostgreSQL 14+ has ±Infinity numerics, but the gateway never produces
+        # one; refuse rather than emit a representation the client may not know.
+        raise BinaryEncodeError(
+            f"value {text!r} is an infinite NUMERIC, which the gateway does "
+            "not serve in binary format"
+        )
+    with _decimal.localcontext() as ctx:
+        ctx.prec = _decimal.MAX_PREC
+        sign = _NUMERIC_NEG if value < 0 else _NUMERIC_POS
+        _sign, digits, exponent = value.copy_abs().as_tuple()
+    exponent = int(exponent)
+    digit_text = "".join(str(d) for d in digits) or "0"
+    if exponent > 0:
+        digit_text += "0" * exponent
+        exponent = 0
+    # dscale is the number of digits kept AFTER the decimal point, never negative.
+    dscale = -exponent
+    if len(digit_text) <= dscale:
+        int_text = ""
+        frac_text = digit_text.rjust(dscale, "0")
+    else:
+        split = len(digit_text) - dscale
+        int_text = digit_text[:split]
+        frac_text = digit_text[split:]
+
+    # Integer side: base-10000 groups, most significant first.
+    int_text = int_text.lstrip("0")
+    lead = len(int_text) % 4
+    int_groups: list[int] = []
+    if lead:
+        int_groups.append(int(int_text[:lead]))
+    int_groups.extend(
+        int(int_text[i:i + 4]) for i in range(lead, len(int_text), 4)
+    )
+
+    # Fraction side: pad the scale to a multiple of 4 so it splits into whole
+    # base-10000 groups, most significant first.
+    frac_groups: list[int] = []
+    if dscale:
+        padded_scale = ((dscale + 3) // 4) * 4
+        frac_text = frac_text.ljust(padded_scale, "0")
+        frac_groups = [
+            int(frac_text[i:i + 4]) for i in range(0, padded_scale, 4)
+        ]
+
+    weight = len(int_groups) - 1
+    all_groups = int_groups + frac_groups
+    # Trim leading zero groups (adjusting weight) and trailing zero groups; PG
+    # stores no leading/trailing all-zero digit words.
+    while all_groups and all_groups[0] == 0:
+        all_groups.pop(0)
+        weight -= 1
+    while all_groups and all_groups[-1] == 0:
+        all_groups.pop()
+    if not all_groups:
+        # Exact zero: no digit words, weight 0, dscale preserved.
+        return _pack_numeric_header(text, 0, 0, sign, dscale)
+    payload = _pack_numeric_header(text, len(all_groups), weight, sign, dscale)
+    for group in all_groups:
+        payload += struct.pack("!h", group)
+    return payload
+
+
+def _pack_numeric_header(
+    text: str, ndigits: int, weight: int, sign: int, dscale: int
+) -> bytes:
+    """Pack NUMERIC int16 header fields as a typed binary-encoding failure."""
+    try:
+        return struct.pack("!hhHh", ndigits, weight, sign, dscale)
+    except struct.error as exc:
+        raise BinaryEncodeError(
+            f"value {text!r} does not fit the PostgreSQL NUMERIC wire format "
+            f"(ndigits={ndigits}, weight={weight}, dscale={dscale})"
+        ) from exc
+
+
+def _parse_iso_datetime(text: str) -> _dt.datetime:
+    raw = text.strip().replace(" ", "T", 1) if " " in text.strip() else text.strip()
+    if raw.endswith("Z") or raw.endswith("z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return _dt.datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise BinaryEncodeError(
+            f"value {text!r} is not an ISO-8601 timestamp for binary encoding"
+        ) from exc
+
+
+def _encode_date_binary(text: str) -> bytes:
+    """PG binary DATE: int32 days since 2000-01-01."""
+    raw = text.strip()
+    try:
+        value = _dt.date.fromisoformat(raw)
+    except ValueError:
+        value = _parse_iso_datetime(raw).date()
+    return struct.pack("!i", (value - _PG_EPOCH_DATE).days)
+
+
+def _encode_timestamp_binary(text: str, *, aware: bool) -> bytes:
+    """PG binary TIMESTAMP/TIMESTAMPTZ: int64 microseconds since 2000-01-01."""
+    value = _parse_iso_datetime(text)
+    if aware:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=_dt.timezone.utc)
+        delta = value - _PG_EPOCH_AWARE
+    else:
+        if value.tzinfo is not None:
+            value = value.replace(tzinfo=None)
+        delta = value - _PG_EPOCH_NAIVE
+    micros = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+    return struct.pack("!q", micros)
+
+
+def _parse_iso_time(text: str) -> _dt.time:
+    raw = text.strip()
+    try:
+        return _dt.time.fromisoformat(raw)
+    except ValueError as exc:
+        raise BinaryEncodeError(
+            f"value {text!r} is not an ISO-8601 time for binary encoding"
+        ) from exc
+
+
+def _encode_time_binary(text: str) -> bytes:
+    """PG binary TIME: int64 microseconds since midnight."""
+    value = _parse_iso_time(text)
+    micros = (
+        (value.hour * 3600 + value.minute * 60 + value.second) * 1_000_000
+        + value.microsecond
+    )
+    return struct.pack("!q", micros)
+
+
+def _encode_timetz_binary(text: str) -> bytes:
+    """PG binary TIMETZ: int64 microseconds since midnight + int32 zone offset.
+
+    The zone field is seconds WEST of UTC — the negation of Python's
+    ``utcoffset()``, which counts seconds east.
+    """
+    value = _parse_iso_time(text)
+    micros = (
+        (value.hour * 3600 + value.minute * 60 + value.second) * 1_000_000
+        + value.microsecond
+    )
+    offset = value.utcoffset()
+    zone = -int(offset.total_seconds()) if offset is not None else 0
+    return struct.pack("!qi", micros, zone)
+
+
 def _encode_binary_value(text: str, oid: int) -> bytes:
-    """Encode a text string as PG binary wire format for the given OID."""
+    """Encode a text string as PG binary wire format for the given OID.
+
+    Raises :class:`BinaryEncodeError` when the value does not fit the type the
+    column advertises. Falling back to text bytes (the pre-fix behaviour) is not
+    safe here: the client parses the payload according to the BINARY format code
+    it requested, so a text fallback silently corrupts the value rather than
+    degrading it.
+    """
     if oid == OID_BOOL:
-        return b"\x01" if text.lower() in ("true", "t", "1") else b"\x00"
-    if oid == OID_INT8:
+        lowered = text.strip().lower()
+        if lowered in ("true", "t", "1", "yes", "y", "on"):
+            return b"\x01"
+        if lowered in ("false", "f", "0", "no", "n", "off"):
+            return b"\x00"
+        raise BinaryEncodeError(
+            f"value {text!r} is not a valid BOOLEAN for binary encoding"
+        )
+    if oid in (OID_INT2, OID_INT4, OID_INT8, 26):
+        fmt = {OID_INT2: "!h", OID_INT4: "!i", 26: "!I", OID_INT8: "!q"}[oid]
         try:
-            return struct.pack("!q", int(text))
-        except (ValueError, struct.error):
-            return text.encode("utf-8")
-    if oid in (23, 26):  # INT4, OID
+            return struct.pack(fmt, int(text.strip()))
+        except (ValueError, struct.error) as exc:
+            raise BinaryEncodeError(
+                f"value {text!r} does not fit the integer type (OID {oid}) "
+                "its column advertises"
+            ) from exc
+    if oid in (OID_FLOAT4, OID_FLOAT8):
+        fmt = "!f" if oid == OID_FLOAT4 else "!d"
         try:
-            return struct.pack("!i", int(text))
-        except (ValueError, struct.error):
-            return text.encode("utf-8")
-    if oid in (21,):  # INT2
-        try:
-            return struct.pack("!h", int(text))
-        except (ValueError, struct.error):
-            return text.encode("utf-8")
-    if oid == OID_FLOAT8:
-        try:
-            return struct.pack("!d", float(text))
-        except (ValueError, struct.error):
-            return text.encode("utf-8")
-    if oid in (700,):  # FLOAT4
-        try:
-            return struct.pack("!f", float(text))
-        except (ValueError, struct.error):
-            return text.encode("utf-8")
-    # NUMERIC / DATE / TIMESTAMP / TIMESTAMPTZ and any other OID fall through to
-    # text. data_row never reaches here for those OIDs (Bug-3655 downgrades them
-    # to text before calling this), so the advertised format and payload agree;
-    # this is the defensive fallback for any unexpected OID requesting binary.
+            return struct.pack(fmt, float(text.strip()))
+        except (ValueError, struct.error) as exc:
+            raise BinaryEncodeError(
+                f"value {text!r} is not a valid floating-point number for "
+                f"binary encoding (OID {oid})"
+            ) from exc
+    if oid == OID_NUMERIC:
+        return _encode_numeric_binary(text)
+    if oid == OID_DATE:
+        return _encode_date_binary(text)
+    if oid == OID_TIME:
+        return _encode_time_binary(text)
+    if oid == OID_TIMETZ:
+        return _encode_timetz_binary(text)
+    if oid in (OID_TIMESTAMP, OID_TIMESTAMPTZ):
+        return _encode_timestamp_binary(text, aware=(oid == OID_TIMESTAMPTZ))
+    # TEXT and anything else with no distinct binary representation: the binary
+    # form IS the UTF-8 bytes. ``_effective_result_format`` has already forced
+    # format 0 for any OID absent from ``_BINARY_ENCODABLE_OIDS``, so an
+    # unrecognised OID never reaches here under a binary format code.
     return text.encode("utf-8")
 
 

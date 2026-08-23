@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from src.kpi_compiler import (
+    _CARRY_FORWARD_ISLAND_COL,
     CompilerContext,
     CompiledQuery,
     compile_expression,
@@ -328,11 +329,33 @@ class TestTimeIntelligence:
         assert "NULL" in result.select_expr
         assert result.kpi_names == ["Child KPI"]
 
-    def test_no_time_column_defaults(self):
-        """Without time_column, compiler uses 'date' as default."""
-        result = compile_expression('lag(measure("Revenue"), literal(1), "month")')
+    def test_no_time_column_fails_closed(self):
+        """Bug-8573/Bug-9233: without a time_column, time intelligence REFUSES.
+
+        Superseded ``test_no_time_column_defaults``, which pinned the old
+        ``ctx.time_column or "date"`` fallback as intended behaviour. That
+        default anchored a LAG/YTD period boundary on a column named ``date``
+        that is not the KPI's time dimension — on a model whose fact date is
+        ``business_date`` the period offset was computed from the wrong column
+        and the KPI reported a plausible, wrong number.
+
+        Test escape: coverage ENSHRINED the defect. Guard: this assertion.
+        Tier: T2.
+        """
+        from src.kpi_compiler import KPITimeContextError
+
+        with pytest.raises(KPITimeContextError):
+            compile_expression('lag(measure("Revenue"), literal(1), "month")')
+
+    def test_time_column_is_used_verbatim_not_a_default(self):
+        """The variant binds the KPI's OWN time column, never a literal 'date'."""
+        ctx = CompilerContext(time_column="business_date")
+        result = compile_expression(
+            'lag(measure("Revenue"), literal(1), "month")', ctx
+        )
         assert result.has_time_intelligence is True
-        assert "LAG" in result.select_expr
+        assert '"business_date"' in result.select_expr
+        assert '"date"' not in result.select_expr
 
     def test_prior_period_default_grain(self):
         ctx = CompilerContext(time_column="order_date")
@@ -533,15 +556,40 @@ class TestSemiAdditive:
         assert "DATE_TRUNC('MONTH'" in sql
         assert '"MONTH"' not in sql
 
-    def test_at_grain_real_column_not_truncated(self):
+    def test_at_grain_raw_column_fails_closed(self):
+        """Bug-8573: a non-keyword at_grain must REFUSE, not group by that column.
+
+        Superseded ``test_at_grain_real_column_not_truncated``, which pinned the
+        raw-column form as intended. Grouping the inner query by
+        ``(reporting_bucket, business_date)`` makes the first/last outer
+        ``ORDER BY business_date LIMIT 1`` pick ONE ARBITRARY row out of the
+        whole table instead of reducing per period, and for avg/min/max it
+        reduces over the wrong buckets entirely.
+
+        Test escape: coverage ENSHRINED the defect. Guard: this assertion +
+        ``_validate_kpi_at_grain`` at the API boundary. Tier: T2.
+        """
+        from src.kpi_compiler import KPITimeContextError
+
         ctx = CompilerContext(
             non_additive_agg="avg",
             at_grain="reporting_bucket",
             time_column="business_date",
         )
+        with pytest.raises(KPITimeContextError):
+            compile_expression('measure("Balance")', ctx)
+
+    def test_at_grain_keyword_is_case_and_space_insensitive(self):
+        """Bug-8573: a persisted " Month " still buckets, it does not fall through."""
+        ctx = CompilerContext(
+            non_additive_agg="avg",
+            at_grain=" Month ",
+            time_column="business_date",
+        )
         sql = compile_expression('measure("Balance")', ctx).sql
-        assert '"reporting_bucket"' in sql
-        assert "DATE_TRUNC" not in sql.upper()
+        # sqlglot normalises the unit literal's case on transpile.
+        assert "DATE_TRUNC('MONTH', \"business_date\")" in sql
+        assert '"reporting' not in sql
 
     def test_semi_additive_has_subquery(self):
         ctx = CompilerContext(
@@ -553,14 +601,36 @@ class TestSemiAdditive:
         assert "sub" in result.sql
         assert "inner_val" in result.sql
 
-    def test_semi_additive_default_time_column(self):
-        """Without time_column, defaults to 'date'."""
+    def test_semi_additive_without_time_column_fails_closed(self):
+        """Bug-8573/Bug-9233: no time column => refuse, never a literal 'date'.
+
+        Superseded ``test_semi_additive_default_time_column``. A closing-balance
+        KPI reduced over a column named ``date`` that is not the KPI's time
+        dimension returns a plausible, wrong number (or a cryptic source error
+        when no such column exists).
+
+        Test escape: coverage ENSHRINED the defect. Guard: this assertion.
+        Tier: T2.
+        """
+        from src.kpi_compiler import KPITimeContextError
+
         ctx = CompilerContext(
             non_additive_agg="last",
             at_grain="month",
         )
-        result = compile_expression('measure("Balance")', ctx)
-        assert '"date"' in result.sql
+        with pytest.raises(KPITimeContextError):
+            compile_expression('measure("Balance")', ctx)
+
+    def test_semi_additive_without_at_grain_buckets_by_the_time_column(self):
+        """Half-configured KPI (agg only): "last value by date" uses the KPI's
+        own time column, not a column literally named ``date`` (Bug-8573)."""
+        ctx = CompilerContext(
+            non_additive_agg="last",
+            time_column="business_date",
+        )
+        sql = compile_expression('measure("Balance")', ctx).sql
+        assert '"business_date"' in sql
+        assert '"date"' not in sql.replace('"business_date"', "")
 
     def test_semi_additive_unknown_agg_fails_loud(self):
         """Bug-6252: an unknown non_additive_agg must FAIL, not fall back to SUM.
@@ -596,28 +666,157 @@ class TestSemiAdditive:
         result = compile_expression('measure("Balance")', ctx)
         assert "SUM(" in result.sql
 
-    def test_carry_forward_wraps_coalesce(self):
-        ctx = CompilerContext(
-            carry_forward=True,
-            time_column="order_date",
-        )
-        result = compile_expression('measure("Balance")', ctx)
-        assert "COALESCE" in result.sql
-        assert "ARRAY_AGG" in result.sql
-        # sqlglot may normalize "IS NOT NULL" to "NOT x IS NULL"
-        assert "IS NOT NULL" in result.sql or ("NOT" in result.sql and "IS NULL" in result.sql)
+    # -- carry-forward (Bug-9482) ------------------------------------------
+    #
+    # The two tests that used to live here asserted ``"COALESCE" in sql`` and
+    # ``"ARRAY_AGG" in sql`` and never executed anything. Both passed against an
+    # emission PostgreSQL rejects on EVERY version, so they ENSHRINED the defect
+    # rather than missing it. They are replaced by:
+    #   * the structural invariant below, which is what the defect actually
+    #     violated (a carry-forward window whose argument is an AGGREGATE), and
+    #   * KNOWN-VALUE tests that RUN the SQL on real Postgres, in
+    #     tests/integration/test_kpi_period_and_semi_additive_values_db.py.
+    # A shape assertion is not admissible evidence for this bug: only executing
+    # it is.
 
-    def test_carry_forward_with_semi_additive(self):
-        """carry_forward + semi-additive should apply both."""
-        ctx = CompilerContext(
-            non_additive_agg="last",
-            at_grain="month",
-            carry_forward=True,
-            time_column="order_date",
+    def _aggregates_inside_windows(self, sql: str):
+        """Aggregates nested INSIDE a window construct.
+
+        An aggregate used AS a window function (``MAX(x) OVER (...)``) is legal
+        and expected. What PostgreSQL refuses is an aggregate anywhere INSIDE
+        one: as the windowed function's argument, in its PARTITION BY, or in its
+        ORDER BY. That is exactly the old emission, so it is exactly what this
+        looks for.
+        """
+        import sqlglot
+        from sqlglot import exp
+
+        tree = sqlglot.parse_one(sql, read="postgres")
+        found = []
+        for window in tree.find_all(exp.Window):
+            found.extend(
+                node for node in window.find_all(exp.AggFunc)
+                if node is not window.this
+            )
+        return found
+
+    def test_carry_forward_never_puts_an_aggregate_inside_a_window(self):
+        """Bug-9482: the exact construct PostgreSQL refuses, AND the fill is
+        actually emitted.
+
+        The old emission was
+        ``COALESCE(SUM(x), LAST_VALUE(SUM(x) IGNORE NULLS) OVER (...))`` — an
+        aggregate as the argument of a window function, which the PostgreSQL
+        pre-pass then copied into ``FILTER (WHERE SUM(x) IS NOT NULL)``.
+        PostgreSQL answers "aggregate functions are not allowed in FILTER" and
+        "aggregate ORDER BY is not implemented for window functions". The fill
+        must therefore operate one scope OUT, on the per-period column, so no
+        window argument may contain an aggregate.
+
+        L7R-01: those two assertions are both NEGATIVE, and a negative
+        invariant is vacuously satisfied by emitting no fill at all. Replacing
+        ``_carry_forward_scope`` with the identity function left 288 unit tests
+        green, including every test in this class. The positive assertion below
+        — the island column the fill scope introduces is present — is what
+        makes this class notice a fill that silently stopped being applied.
+
+        (The deleted ``test_carry_forward_with_semi_additive`` asserted only
+        ``COALESCE`` and ``GROUP BY``, never ``ARRAY_AGG``, so it did NOT
+        enshrine the broken shape and would still pass verbatim. It is not
+        restored because the ``at_grain='month', non_additive_agg='last'``
+        context below now asserts strictly more than it did.)
+        """
+        for ctx in (
+            CompilerContext(carry_forward=True, time_column="order_date"),
+            CompilerContext(
+                carry_forward=True, time_column="order_date", at_grain="day",
+            ),
+            CompilerContext(
+                carry_forward=True, time_column="order_date",
+                at_grain="month", non_additive_agg="avg",
+            ),
+            CompilerContext(
+                carry_forward=True, time_column="order_date",
+                at_grain="month", non_additive_agg="last",
+            ),
+            CompilerContext(
+                calc_agg_mode="row_first", carry_forward=True,
+                time_column="order_date", inner_agg="sum",
+                inner_grain="month", outer_agg="avg",
+            ),
+        ):
+            sql = compile_expression('measure("Balance")', ctx).sql
+            nested = self._aggregates_inside_windows(sql)
+            assert not nested, (
+                "a carry-forward window contains an AGGREGATE again "
+                f"({[n.sql() for n in nested]}) — PostgreSQL rejects this "
+                f"SQL: {sql}"
+            )
+            assert "IGNORE NULLS" not in sql.upper(), (
+                "the emission depends on the PostgreSQL IGNORE NULLS pre-pass "
+                f"again, which produces unexecutable SQL: {sql}"
+            )
+            assert _CARRY_FORWARD_ISLAND_COL in sql, (
+                "carry_forward was authored but NO fill scope was emitted: the "
+                f"island column {_CARRY_FORWARD_ISLAND_COL!r} is absent, so "
+                "this KPI silently serves the un-filled number while the two "
+                f"assertions above pass vacuously (L7R-01). SQL: {sql}"
+            )
+
+    def test_carry_forward_requires_a_time_column(self):
+        """Bug-8573 / Bug-9233, the fourth ``_require_time_column`` caller.
+
+        A gap-fill is ORDERED BY the KPI's time dimension. With none bound there
+        is no correct default: the old hard-coded ``"date"`` either referenced a
+        column that does not exist or filled in the order of a column that is
+        not this KPI's time dimension. Fail closed.
+        """
+        from src.kpi_compiler import KPITimeContextError
+
+        with pytest.raises(KPITimeContextError, match="carry-forward"):
+            compile_expression(
+                'measure("Balance")', CompilerContext(carry_forward=True),
+            )
+
+    def test_the_grain_vocabulary_has_one_owner(self):
+        """L7-R5 — the compiler must IMPORT the gated ``at_grain`` vocabulary.
+
+        ``_validate_kpi_at_grain`` gates the API against
+        ``_KPI_AT_GRAIN_KEYWORDS``; the compiler decides, from the same word,
+        whether to emit ``DATE_TRUNC('<grain>', <time col>)`` or to treat the
+        value as a COLUMN NAME. A private duplicate lets the two disagree about
+        which values are grains, and the compiler's answer is what the SQL
+        actually GROUPS BY. Object identity, not equality — the Bug-6574 pattern
+        — because two equal-today sets are exactly what drifts.
+
+        Import direction is service -> shared. ``shared/`` importing from a
+        service would invert the dependency and break every other consumer.
+        """
+        from shared.schemas.domains.governance_advanced import (
+            _KPI_AT_GRAIN_KEYWORDS,
         )
-        result = compile_expression('measure("Balance")', ctx)
-        assert "COALESCE" in result.sql
-        assert "GROUP BY" in result.sql
+        from src import kpi_compiler as compiler_mod
+
+        assert compiler_mod._GRAIN_KEYWORDS is _KPI_AT_GRAIN_KEYWORDS, (
+            "kpi_compiler holds its own copy of the grain vocabulary again; the "
+            "API validator and the compiler then disagree about which at_grain "
+            "values are grain keywords and which are column names (L7-R5)"
+        )
+
+    def test_carry_forward_transpiles_to_every_supported_dialect(self):
+        """Bug-9482: the fill is ordinary ANSI SQL, so ONE emission serves every
+        dialect and no per-connector branch is needed (SQL rule 1)."""
+        for dialect in (
+            "postgresql", "bigquery", "snowflake", "sqlserver",
+            "hadoop_spark", "redshift",
+        ):
+            ctx = CompilerContext(
+                dialect=dialect, carry_forward=True, time_column="order_date",
+                at_grain="month", non_additive_agg="avg",
+            )
+            sql = compile_expression('measure("Balance")', ctx).sql
+            assert sql, f"empty transpilation for {dialect}"
+            assert "IGNORE NULLS" not in sql.upper(), dialect
 
     def test_no_semi_additive_when_fields_absent(self):
         """Without at_grain/non_additive_agg, no subquery wrapping."""
@@ -685,14 +884,35 @@ class TestAggregateOfAggregate:
         result = compile_expression('measure("Revenue")', ctx)
         assert '"order_date"' in result.sql
 
-    def test_default_inner_grain_uses_date(self):
-        """When both inner_grain and time_column are None, falls back to 'date'."""
+    def test_default_inner_grain_without_time_column_fails_closed(self):
+        """Bug-8573/Bug-9233: no inner_grain AND no time column => refuse.
+
+        Superseded ``test_default_inner_grain_uses_date``, which pinned the
+        ``or "date"`` fallback. An aggregate-of-aggregate bucketed on a column
+        that is not the KPI's time dimension changes the inner grouping and
+        therefore the outer average — a plausible, wrong number.
+
+        Test escape: coverage ENSHRINED the defect. Guard: this assertion.
+        Tier: T2.
+        """
+        from src.kpi_compiler import KPITimeContextError
+
         ctx = CompilerContext(
             inner_agg="sum",
             outer_agg="avg",
         )
-        result = compile_expression('measure("Revenue")', ctx)
-        assert '"date"' in result.sql
+        with pytest.raises(KPITimeContextError):
+            compile_expression('measure("Revenue")', ctx)
+
+    def test_default_inner_grain_uses_the_kpi_time_column(self):
+        ctx = CompilerContext(
+            inner_agg="sum",
+            outer_agg="avg",
+            time_column="business_date",
+        )
+        sql = compile_expression('measure("Revenue")', ctx).sql
+        assert '"business_date"' in sql
+        assert "DATE_TRUNC" not in sql.upper()
 
     def test_agg_of_agg_takes_priority_over_semi_additive(self):
         """aggregate_of_aggregate should take priority when both are set."""
@@ -700,6 +920,7 @@ class TestAggregateOfAggregate:
             inner_agg="sum",
             inner_grain="month",
             outer_agg="avg",
+            time_column="business_date",
             non_additive_agg="last",
             at_grain="day",
         )
@@ -762,6 +983,7 @@ class TestDialectTranspilation:
             inner_agg="sum",
             inner_grain="month",
             outer_agg="avg",
+            time_column="business_date",
             dialect="hadoop_spark",
         )
         result = compile_expression('measure("Revenue")', ctx)

@@ -2,7 +2,7 @@
 title: "Add a Data Source"
 audience: modeller
 area: modelling
-updated: 2026-05-18
+updated: 2026-08-17
 ---
 
 ![Model Builder — data source settings panel.](../assets/screencaps/data-source-settings.png)
@@ -110,6 +110,16 @@ The test asks the gateway to authenticate against the source using the parameter
 - For BigQuery: the service account JSON is valid and has sufficient permissions.
 
 A successful test does not validate that specific schemas or tables exist.
+
+Test Connection runs through the same query path as table discovery and profiling. Tessallite does not open your source database from the settings page itself.
+
+---
+
+## Large catalogues and BigQuery profiling
+
+The Sources panel lists up to about 500 tables (and about 50 BigQuery datasets). If your catalogue is larger, a banner explains that the list is incomplete — filter by schema to see the rest. The incomplete listing is a warning, not a table you can add to the model.
+
+When you classify or profile a BigQuery table, Tessallite uses approximate distinct counts and the dataset `__TABLES__` metadata for row counts. It does not run a billed `COUNT(*)` full table scan for that profile step.
 
 ---
 

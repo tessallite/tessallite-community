@@ -11,6 +11,27 @@ import type {
 import { agentApi, type AgentConversation, type AgentTurn } from "./agentApi";
 import { agentServiceBaseUrl } from "./apiBase";
 
+// A ProjectPersona PATCH must settle before a send/create reaches the agent
+// service. The shared composer has no project-specific disabled prop, so the
+// adapter supplies a small write barrier for this cross-request contract.
+let projectPersonaWriteBarrier: Promise<void> = Promise.resolve();
+
+export function setProjectPersonaWriteBarrier(write: Promise<unknown>): void {
+  const barrier = Promise.resolve(write).then(() => undefined);
+  // The barrier must remain rejected for every queued operation to fail closed.
+  // Attach an observer only to prevent an unhandled-rejection report when no
+  // operation is queued; callers still await the original rejected promise.
+  barrier.catch(() => undefined);
+  projectPersonaWriteBarrier = barrier;
+  barrier.finally(() => {
+    if (projectPersonaWriteBarrier === barrier) projectPersonaWriteBarrier = Promise.resolve();
+  }).catch(() => undefined);
+}
+
+export function resetProjectPersonaWriteBarrier(): void {
+  projectPersonaWriteBarrier = Promise.resolve();
+}
+
 function getCsrfToken(): string | undefined {
   return document.cookie
     .split("; ")
@@ -67,7 +88,10 @@ function toTurnResponse(t: AgentTurn): TurnResponse {
       : null,
     chart_type: t.chart_type ?? null,
     provider: t.provider ?? null,
-    judge_pending: t.judge_pending,
+    // Bug-8364: persisted rows may carry only the durable status.  Normalize
+    // that backend authority so shared-ui renders its translated verifying
+    // state instead of an empty answer bubble.
+    judge_pending: t.judge_pending ?? t.status === "judge_pending",
   };
 }
 
@@ -81,9 +105,14 @@ export const mainAppAdapter: AgentChatAdapter = {
     projectId,
     options?: CreateConversationOptions,
   ) => {
+    await projectPersonaWriteBarrier;
     const payload: { persona_id?: string | null; pinned_model_id?: string | null } = {};
-    if (options?.personaId) payload.persona_id = options.personaId;
-    if (options?.pinnedModelId) payload.pinned_model_id = options.pinnedModelId;
+    if (options && "personaId" in options) {
+      payload.persona_id = options.personaId ?? null;
+    }
+    if (options && "pinnedModelId" in options && options.pinnedModelId) {
+      payload.pinned_model_id = options.pinnedModelId;
+    }
     const conv = await agentApi.createConversation(
       projectId,
       Object.keys(payload).length > 0 ? payload : undefined,
@@ -123,6 +152,7 @@ export const mainAppAdapter: AgentChatAdapter = {
   },
 
   streamMessageRaw: async (projectId, conversationId, text, signal, idempotencyKey) => {
+    await projectPersonaWriteBarrier;
     const csrf = getCsrfToken();
     const url =
       `${agentServiceBaseUrl()}/api/v1/projects/${projectId}` +

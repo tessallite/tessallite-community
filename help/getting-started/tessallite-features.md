@@ -81,7 +81,7 @@ A complete reference of every Tessallite feature, what it does, and where to fin
 | Aggregate lifecycle | Automatic events: created, validated, refreshed, retired (idle), evicted (over cap) | Model Health > Lifecycle panel |
 | Idle retirement | Aggregates with zero hits over a configurable window are automatically retired | Scheduler > Idle retirement sweep |
 | Pocket tables | Materialised model slices (`SELECT * FROM model WHERE predicate`) for filtered workloads | Model Builder > Pocket Tables panel |
-| Pocket incremental refresh | Refresh only rows changed since the last successful run, when the pocket exposes a row key; otherwise a full rebuild | Pocket Tables drawer > Schedule tab |
+| Pocket incremental refresh | Refresh only when the existing row key and safety checks pass and the captured deployed snapshot has complete watermark coverage for every table; under the current single-column contract, multi-table pockets always use a full CTAS rebuild (Bug-8745) | Pocket Tables drawer > Schedule tab |
 | Pocket auto-suggestion | Optimizer analyses repeated WHERE predicates and suggests candidates within a size budget | Pocket Tables panel > Suggestions tab |
 
 ## Security and Access Control

@@ -384,6 +384,7 @@
   "modelHealth.aggHealthRetired": "Retiré",
   "modelHealth.aggHealthUnhealthy": "Total non sains",
   "modelHealth.aggHealthNone": "Ce modèle ne contient encore aucun agrégat.",
+  "modelHealth.aggHealthWaitingForStats": "En attente des statistiques sources avant de recommander des agrégats prédictifs.",
   "modelHealth.aggHealthPendingNote": "Les agrégats en attente ont été mis de côté après une importation ou une réinitialisation et sont en attente de reconstruction. Le cycle d'actualisation planifié les reconstruit automatiquement, mais vous pouvez également déclencher une actualisation depuis le panneau Agrégats.",
   "modelHealth.sectionAggRefresh": "Actualisations récentes d'agrégats",
   "modelHealth.sectionAlerts": "Alertes",

@@ -80,6 +80,8 @@ function appendStep(
 }
 
 export interface ChatCanvasProps {
+  /** Parent-owned authority transition gate. */
+  disabled?: boolean;
   visibility?: TraceVisibility;
   onFeedback?: (turnId: string, vote: "up" | "down") => void;
   feedbackEnabled?: boolean;
@@ -94,6 +96,7 @@ export interface ChatCanvasProps {
 }
 
 export function ChatCanvas({
+  disabled = false,
   visibility,
   onFeedback,
   feedbackEnabled,
@@ -155,7 +158,7 @@ export function ChatCanvas({
 
   const handleSend = useCallback(
     async (text: string) => {
-      if (!projectId || isStreaming) return;
+      if (!projectId || isStreaming || disabled) return;
 
       // Bug-6521 — one idempotency key per logical send, generated ABOVE the
       // retry loop and captured in the fetchStream closure so every automatic
@@ -421,6 +424,7 @@ export function ChatCanvas({
     },
     [
       projectId,
+      disabled,
       isEmbed,
       activeConversationId,
       isStreaming,
@@ -488,6 +492,7 @@ export function ChatCanvas({
           onSend={handleSend}
           onAbort={handleAbort}
           isStreaming={isStreaming}
+          disabled={disabled}
           maxChars={maxChars}
           placeholder={composerPlaceholder}
         />
@@ -710,6 +715,7 @@ export function ChatCanvas({
         onSend={handleSend}
         onAbort={handleAbort}
         isStreaming={isStreaming}
+        disabled={disabled}
         maxChars={maxChars}
         placeholder={composerPlaceholder}
       />

@@ -37,10 +37,13 @@ import type {
   ModelTable,
   TableAttribute,
   UserDefinedAttribute,
+  UserDefinedAttributeCreate,
+  UserDefinedAttributeUpdate,
   UserDefinedAttributeFunctionOption,
 } from "../../../api/types";
 import SyncColumnsButton from "./SyncColumnsButton";
 import { useT } from "../../../i18n";
+import { recordCreate, recordDelete, recordUpdate } from "../../Builder/emitDrawerHistory";
 
 type OutputType = "varchar" | "integer" | "numeric" | "date";
 
@@ -128,14 +131,13 @@ export default function AttributesTab({ projectId, modelId, table, connectionId 
   });
 
   const createUda = useMutation({
-    mutationFn: () =>
-      userDefinedAttributesApi.create(projectId, modelId, table.id, {
-        name,
-        expression,
-        output_data_type: outputType,
-        description: description || undefined,
-      }),
-    onSuccess: () => {
+    mutationFn: (data: UserDefinedAttributeCreate) =>
+      userDefinedAttributesApi.create(projectId, modelId, table.id, data),
+    onSuccess: (created, data) => {
+      recordCreate("userDefinedAttribute", created.id, {
+        ...data,
+        __table_id: table.id,
+      });
       invalidateAttrs();
       clearForm();
     },
@@ -145,14 +147,15 @@ export default function AttributesTab({ projectId, modelId, table, connectionId 
   });
 
   const updateUda = useMutation({
-    mutationFn: () =>
-      userDefinedAttributesApi.update(projectId, modelId, table.id, editingAttrId!, {
-        name,
-        expression,
-        output_data_type: outputType,
-        description: description || undefined,
-      }),
-    onSuccess: () => {
+    mutationFn: ({ id, data, prior }: { id: string; data: UserDefinedAttributeUpdate; prior: Record<string, unknown> }) =>
+      userDefinedAttributesApi.update(projectId, modelId, table.id, id, data),
+    onSuccess: (_updated, variables) => {
+      recordUpdate(
+        "userDefinedAttribute",
+        variables.id,
+        variables.prior,
+        { ...variables.data, __table_id: table.id },
+      );
       invalidateAttrs();
       clearForm();
     },
@@ -170,7 +173,21 @@ export default function AttributesTab({ projectId, modelId, table, connectionId 
         attr.id,
         attr.is_user_defined ? "user_defined" : "physical",
       ),
-    onSuccess: () => invalidateAttrs(),
+    onSuccess: (_deleted, variables) => {
+      if (variables.attr.is_user_defined) {
+        const prior = udaList.data?.find((uda) => uda.id === variables.attr.id);
+        if (prior) {
+          recordDelete("userDefinedAttribute", prior.id, {
+            name: prior.name,
+            expression: prior.expression,
+            output_data_type: prior.output_data_type,
+            description: prior.description ?? undefined,
+            __table_id: table.id,
+          });
+        }
+      }
+      invalidateAttrs();
+    },
     onError: (err: { response?: { data?: { detail?: string } } }) => {
       setLocalError(err?.response?.data?.detail ?? t("tableEditAttrs.removeAttrFailed"));
     },
@@ -218,8 +235,30 @@ export default function AttributesTab({ projectId, modelId, table, connectionId 
       setLocalError(t("tableEditAttrs.nameExpressionRequired"));
       return;
     }
-    if (editingAttrId) updateUda.mutate();
-    else createUda.mutate();
+    const data = {
+      name,
+      expression,
+      output_data_type: outputType,
+      description: description || undefined,
+    } satisfies UserDefinedAttributeCreate;
+    if (editingAttrId) {
+      const prior = udaList.data?.find((uda) => uda.id === editingAttrId);
+      updateUda.mutate({
+        id: editingAttrId,
+        data,
+        prior: prior
+          ? {
+              name: prior.name,
+              expression: prior.expression,
+              output_data_type: prior.output_data_type,
+              description: prior.description ?? undefined,
+              __table_id: table.id,
+            }
+          : { __table_id: table.id },
+      });
+    } else {
+      createUda.mutate(data);
+    }
   }
 
   const physicalCount = (attributes.data ?? []).filter((a) => !a.is_user_defined).length;

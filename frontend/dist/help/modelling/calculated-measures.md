@@ -162,4 +162,4 @@ A minimal, copyable recipe for the single most-requested calculated measure.
 
 ---
 
-← [Define Measures](define-measures.md) | [Home](../index.md) | [Configure Time Variants →](configure-time-variants.md)
+← [Define Measures](define-measures.md) | [Home](../index.md) | [User-Defined Attributes →](define-user-defined-attributes.md)

@@ -2,7 +2,7 @@
 title: "Define Joins"
 audience: modeller
 area: modelling
-updated: 2026-08-09
+updated: 2026-08-21
 ---
 
 ![Model Builder — Join configuration drawer.](../assets/screencaps/model-builder-join-drawer.png)
@@ -92,11 +92,27 @@ The population role tells Tessallite whether this join is meant to change which 
 | Population role | Choose it when |
 |---|---|
 | Keep base rows (default) | The join supplies optional labels or details and should not decide which base rows belong in the model. |
-| Defines the population | The join deliberately decides which rows belong, such as keeping only completed orders. Tessallite always includes it. |
-| Adds detail only | The join may add matching detail rows, and that extra detail is expected. It must not silently remove base rows. |
+| Defines the population (`population_defining`) | The join deliberately decides which rows belong, such as keeping only completed orders. Tessallite includes both endpoints and any connector path in source SQL and materialisation plans, even when the query projects only fact fields. |
+| Adds detail only (`enrichment_only`) | The join may add matching detail rows, and that extra detail is expected. It remains eligible for elision; this declaration excuses multiplication during validation, not filtering. |
 | Not decided yet | You are not ready to make the decision. Tessallite keeps the join visible for review in Population governance. |
 
 After a model is published, the **Population governance** banner reports whether each join behaved as declared. A warning means the source data changed row counts in a way that needs review. Open the join to compare the declaration that was checked with its current value, then publish again after correcting it.
+
+### Serving and upgrades
+
+The population role is part of the deployed model snapshot. Source queries,
+aggregate creation and refresh, and pocket population checks use the same
+declared role, so a `population_defining` join cannot disappear simply because
+no selected column comes from its dimension. `preserve_base_rows`,
+`enrichment_only`, and `undeclared` remain eligible for normal projection-based
+elision. If an imported bundle contains an unknown role, Tessallite treats it as
+`undeclared` rather than assuming that it is safe or mandatory.
+
+When the serving contract is upgraded, Tessallite advances the deployed model
+epoch and marks older aggregates, pockets, and Named Query artifacts stale.
+Those artifacts cannot serve until rebuilt under the current snapshot; an
+operator does not need to trigger a manual refresh to make the safety fence
+effective.
 
 ---
 

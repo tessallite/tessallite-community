@@ -148,7 +148,7 @@ The embed token controls what the chat can do. The `capabilities` field in the t
 | `query` | Allows the agent to execute queries. If excluded, the agent can still respond using cached context but cannot run new queries. |
 | `explore` | Allows the agent to browse model metadata for context. |
 
-The `persona_id` field locks the session to a specific persona's row-level security filters and column restrictions. The `model_ids` field restricts which models the agent can query. The `project_ids` field restricts which projects the embedded session can access; the chat loads only projects in this list.
+The `persona_id` field locks Query Router access to a model Persona's row-level security filters and column restrictions. The optional `project_persona_id` field independently locks the agent to a ProjectPersona's field scope. These are separate UUID namespaces: an older token with only `persona_id` has no ProjectPersona lock. The `model_ids` field restricts which models the agent can query. The `project_ids` field restricts which projects the embedded session can access; the chat loads only projects in this list.
 
 ---
 
@@ -160,7 +160,7 @@ A project agent can be configured with several semantic models. By default a con
 - Picking **Project default** clears the restriction and returns the conversation to the project's normal set of models.
 - The choice is saved on the conversation, so it persists across reloads and applies to every later turn.
 
-The picker only ever lists models the session is already entitled to: the project allow-list, further narrowed by the embed token's `persona_id` and `model_ids` scope. It can only narrow access, never widen it. If a chosen model later leaves that scope, the conversation silently reverts to the project default. This makes the picker a convenience for focusing an answer on one subject area, not a way to reach data the token does not already permit.
+The picker only ever lists models the session is already entitled to: the project allow-list, further narrowed by the embed token's `project_persona_id` and `model_ids` scope. It can only narrow access, never widen it. If a chosen model later leaves that scope, the conversation silently reverts to the project default. This makes the picker a convenience for focusing an answer on one subject area, not a way to reach data the token does not already permit.
 
 ---
 

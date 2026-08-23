@@ -78,6 +78,16 @@ _GATEWAY_CLIENT_ROUTES: dict[str, RouteClass] = {
     "GET /api/v1/headless/models": RouteClass("HEADLESS", _META),
     "GET /api/v1/headless/models/{model_id}/dimensions": RouteClass("HEADLESS", _META),
     "GET /api/v1/headless/models/{model_id}/measures": RouteClass("HEADLESS", _META),
+    # Bug-9219/9224 SPA contract: the DEPLOYED @-object catalogue (parameters,
+    # named sets, Named Queries) a SQL client needs to offer an @-token picker.
+    # _META, and deliberately so: it publishes governed model DEFINITIONS —
+    # names, types, defaults, allowed values, member COUNTS — and never a member
+    # VALUE or a source row, so there is nothing here for a row-security
+    # predicate to filter. Membership itself is reached only by running a query
+    # through /execute, which is _DATA and already probed. Model access is gated
+    # by ``enforce_model_scope`` + ``load_authorized_model(min_role="viewer")``,
+    # the same gate the other metadata routes use.
+    "GET /api/v1/models/{model_id}/named-objects": RouteClass("REST/SPA", _META),
     "POST /api/v1/measures/{measure_id}/drill-options": RouteClass("REST/XMLA", _META),
     # -- Plan / validation only: no rows returned --
     "POST /api/v1/explain": RouteClass("REST", _META),

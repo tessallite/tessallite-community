@@ -150,3 +150,25 @@ describe("F-029-05: default value validation blocks silent corruption", () => {
     ).toBeNull();
   });
 });
+
+describe("L13-PERSONA-AT: typed parameter editor codec", () => {
+  it("preserves structured arrays, including values containing commas", () => {
+    const original = ["North, America", "EMEA", 7, true];
+    const encoded = formatDefaultValue(original, "multi_value");
+    expect(parseDefaultValue(encoded, "multi_value")).toEqual(original);
+  });
+
+  it("preserves only the date_range from/to contract", () => {
+    const original = { from: "2026-01-01", to: "2026-12-31" };
+    const encoded = formatDefaultValue(original, "date_range");
+    expect(parseDefaultValue(encoded, "date_range")).toEqual(original);
+    expect(defaultValueError('{"from":"2026-01-01","to":"2026-12-31","x":1}', "date_range"))
+      .toBe("parameters.defaultValueDateRangeError");
+  });
+
+  it("keeps typed scalar parsing separate from structured values", () => {
+    expect(parseDefaultValue("42.50", "number")).toBe(42.5);
+    expect(parseDefaultValue("yes", "boolean")).toBe(true);
+    expect(parseDefaultValue("001", "string")).toBe("001");
+  });
+});

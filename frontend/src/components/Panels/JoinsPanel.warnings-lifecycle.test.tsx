@@ -121,7 +121,7 @@ describe("JoinsPanel authoritative warning lifecycle (Bug-8094)", () => {
       evaluated_count: 0,
       warning_count: 0,
       blocked_count: 0,
-      warn_only: true,
+      warn_only: false,
       items: [],
     });
     api.listAttributes.mockImplementation(async (_projectId, _modelId, tableId) => (

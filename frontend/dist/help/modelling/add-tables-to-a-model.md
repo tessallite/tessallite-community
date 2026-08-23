@@ -2,7 +2,7 @@
 title: "Add Tables to a Model"
 audience: modeller
 area: modelling
-updated: 2026-04-26
+updated: 2026-08-17
 ---
 
 ![Model Builder — Add table from source schema browser.](../assets/screencaps/model-builder-add-table.png)
@@ -52,6 +52,10 @@ Choosing the right type determines how Tessallite constructs the aggregate grain
 Each table appears as a card showing the table name and type badge. Tables with no join are shown with a dashed border and flagged as a warning in the Health tab until all tables are joined.
 
 Click a table-node header to focus the matching row in the **Sources** panel — the source expands and the row is briefly highlighted. From there, the **Edit** pencil opens the unified table editor (General · Columns · Attributes) where you can change the type, rename the alias, edit columns, and manage user-defined attributes. See [Dimension Aliases](dimension-aliases.md) for the full editor walkthrough.
+
+If the source catalogue is larger than the listing limit, the Sources panel shows a banner that the list is incomplete. That banner is not a table. Filter by schema. BigQuery classify uses approximate distinct counts, not a full `COUNT(*)` scan.
+
+Tessallite carries the "list is incomplete" signal in a reserved schema named `__tessallite__`. That schema and any table in it are never real source objects and are never shown as addable tables — they are stripped from the browser and only raise the incomplete-list banner. A genuine table of your own named `__truncated__` in an ordinary schema (for example `public`) stays fully selectable.
 
 ---
 

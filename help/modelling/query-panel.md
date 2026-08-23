@@ -2,7 +2,7 @@
 title: "Query Panel"
 audience: modeller
 area: modelling
-updated: 2026-08-11
+updated: 2026-08-22
 ---
 
 ## What this covers
@@ -39,15 +39,18 @@ The route trace explains whether Tessallite used an aggregate, a pocket table, o
 
 ## Saving and reusing a query
 
-A query you run often can be saved to the model's **Saved Queries** so you — and your teammates — can re-run it without retyping it. Give the query a name and an optional description and save it. Saved queries belong to the **model**, not to one person, so anyone with access to the model sees the same list and can run any of them.
+A query you run often can be saved to the model's **Saved Queries** without retyping it. Give the query a name and an optional description. New saved queries are **personal by default**: only you can see them. Select **Share with everyone who can access this model** when you want teammates to see and run one; shared entries carry a **Shared** badge.
 
-Because the list is shared, *changing* or *deleting* a saved query is governed:
+Select **Play** to open Query Panel and run the saved SQL immediately through the current governed model context.
+
+Changing or deleting a saved query is governed:
 
 - You may always edit or delete a query **you** created.
-- A **Modeller** (or higher) may edit or delete **any** saved query on the model.
+- Only the owner can publish a personal query or make a shared query personal again.
+- A **Modeller** (or higher) may edit or delete another user's **shared** query.
 - A Viewer who did not create a query cannot change or delete it — the panel shows the server's message ("Only the query owner or a modeler can modify this saved query") rather than failing silently.
 
-Deleting always asks you to **confirm first**, because a delete cannot be undone and the query is shared with everyone on the model.
+Deleting always asks you to **confirm first**, because a delete cannot be undone.
 
 ---
 

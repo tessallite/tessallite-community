@@ -327,6 +327,17 @@ def test_population_participation_roundtrips_when_declared():
     assert parsed["joins"][0]["population_participation"] == "population_defining"
 
 
+def test_g4_sol_r1_b01_manual_default_participation_provenance_roundtrips():
+    snap = _make_lossy_snapshot()
+    snap["joins"][0]["population_participation"] = "preserve_base_rows"
+    snap["joins"][0]["population_participation_source"] = "manual"
+    yaml_str = snapshot_to_yaml(snap, connection_name="wh")
+    doc = yaml.safe_load(yaml_str)
+    assert doc["joins"][0]["population_participation_source"] == "manual"
+    parsed = parse_model_yaml(yaml_str)
+    assert parsed["joins"][0]["population_participation_source"] == "manual"
+
+
 def test_the_default_population_participation_is_not_written_to_yaml():
     """An untouched model's YAML must be byte-identical to what it was before
     this field existed, so a diff of an unrelated edit does not show a spurious

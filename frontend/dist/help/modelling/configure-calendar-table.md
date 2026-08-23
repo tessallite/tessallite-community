@@ -2,7 +2,7 @@
 title: "Configure Calendar Table"
 audience: modeller
 area: modelling
-updated: 2026-07-04
+updated: 2026-08-21
 ---
 
 ## What this covers
@@ -42,6 +42,7 @@ When you bind an existing table, map the real source columns. Do not keep defaul
 |---|---|
 | Date | `date_key` |
 | Year | `year_no` |
+| Year caption | `year_label` (generated calendar tables; caption-only) |
 | Half | `half_no` |
 | Quarter | `quarter_no` |
 | Month | `month_no` |
@@ -49,6 +50,31 @@ When you bind an existing table, map the real source columns. Do not keep defaul
 | Day of year | `day_no` |
 
 `date_key` is the only required column. Period columns are optional but a variant that needs a missing period column will be silently dropped from the catalog.
+
+Standard generated calendars also include `year_label`, with the same plain
+integer value as `year_no`; the tenant format only changes captions for fiscal
+and NRF retail years that span two calendar years.
+
+## Fiscal and retail year captions
+
+Fiscal and NRF retail calendars emit a caption-only `year_label` beside the
+numeric `year_no`/`retail_year` key. Choose the tenant-wide convention with
+`calendar.fiscal_year_label_format` through
+`GET`/`PUT /api/v1/tenants/{tenant_id}/calendar-settings`:
+
+| Token | Example for a year starting in February |
+|---|---|
+| `start_year` (default) | `2025` |
+| `span_short` | `2025-26` |
+| `span_long` | `2025-2026` |
+| `span_fy` | `FY25-26` |
+| `end_year` | `FY2026` |
+
+The numeric year remains the key, sort, and join field. January-start fiscal
+calendars and ISO week calendars always use the plain integer. Existing source
+tables need a normal calendar rebuild before `year_label` is available; until
+then Excel, Power BI, and XMLA metadata deliberately fall back to the numeric
+key. Unknown tokens are rejected with HTTP 422.
 
 ---
 

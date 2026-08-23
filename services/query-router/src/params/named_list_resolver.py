@@ -384,10 +384,25 @@ def expand_named_lists(
             )
 
         # MDX-type set referenced on the SQL path — specific 400.
+        #
+        # Bug-9219: every non-``sql_fixed`` list type (``advanced_mdx``,
+        # ``dynamic_top_n``, ``filtered``) stores an MDX EXPRESSION
+        # (``TopCount(...)`` / ``Filter(...)``) and no member list, so there is
+        # literally nothing for the SQL path to expand — evaluating one needs an
+        # MDX engine the SQL path does not have. The refusal is correct; what
+        # was wrong is that it named only the XMLA escape hatch and never the
+        # in-product fix, so an analyst hitting it in the SPA Query Panel had no
+        # next step. Both routes forward are now stated. The machine-readable
+        # form of this same verdict is ``sql_usable=false`` /
+        # ``unusable_reason="mdx_only"`` on the deployed named-object catalogue,
+        # which lets a client avoid the error entirely.
         if nlist.list_type != "sql_fixed":
             raise ParameterError(
-                f"'{nlist.name}' is an MDX named set, not available in SQL queries. "
-                f"Use a BI tool with an XMLA connection."
+                f"'{nlist.name}' is an MDX named set ({nlist.list_type}), so a "
+                f"SQL query cannot expand it: it stores an MDX expression, not "
+                f"a list of members. Either query it from a BI tool over XMLA, "
+                f"or open the model builder and republish it as a SQL list "
+                f"(fixed members or top-N), then redeploy the model."
             )
 
         # Empty list — dynamic types may be empty if never refreshed.

@@ -58,6 +58,21 @@ _AGENT_CONFIG_FIELDS = (
 )
 
 
+def _serialise_agent_model_context(context: ProjectAgentModelContext) -> dict[str, Any]:
+    """Serialise agent context while preserving derived-state semantics.
+
+    ``derived_at`` is a local operational timestamp and is intentionally not
+    portable, but its presence is meaningful even when every derived list is
+    legitimately empty. Carry a small state marker so import can distinguish
+    that case from a context row that was never derived.
+    """
+    payload = _row_to_dict(
+        context, exclude=("derived_at", "published_at", "updated_at")
+    )
+    payload["context_derived"] = context.derived_at is not None
+    return payload
+
+
 async def export_project(
     project_id: UUID,
     tenant_db: AsyncSession,
@@ -205,9 +220,7 @@ async def export_project(
                 .where(ProjectAgentModelContext.project_id == project_id)
             )
             agent_contexts = [
-                _row_to_dict(
-                    amc, exclude=("derived_at", "published_at", "updated_at")
-                )
+                _serialise_agent_model_context(amc)
                 for amc in amc_q.scalars().all()
             ]
 

@@ -3,9 +3,13 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const listMock = vi.fn();
+const getPredictivePreviewMock = vi.fn();
 
 vi.mock("../../api/client", () => ({
   aggregatesApi: { list: (...a: unknown[]) => listMock(...a) },
+  optimizerApiClient: {
+    getPredictivePreview: (...a: unknown[]) => getPredictivePreviewMock(...a),
+  },
 }));
 
 import { AggregateHealthSection } from "./ModelHealthPanel";
@@ -46,7 +50,14 @@ function renderSection() {
 }
 
 describe("AggregateHealthSection", () => {
-  beforeEach(() => listMock.mockReset());
+  beforeEach(() => {
+    listMock.mockReset();
+    getPredictivePreviewMock.mockReset();
+    getPredictivePreviewMock.mockResolvedValue({
+      candidates: [],
+      had_stats: true,
+    });
+  });
 
   // Each SummaryChip renders its label and value as sibling Typography nodes
   // inside one Box, so scope the value lookup to the label's parent — the
@@ -81,6 +92,7 @@ describe("AggregateHealthSection", () => {
     expect(chipValue("Invalid")).toBe("1");
     expect(chipValue("Retired")).toBe("1");
     expect(chipValue("Unhealthy total")).toBe("3");
+    expect(getPredictivePreviewMock).not.toHaveBeenCalled();
   });
 
   it("derives health from status when the backend health field is absent", async () => {
@@ -110,11 +122,31 @@ describe("AggregateHealthSection", () => {
     expect(chipValue("Unhealthy total")).toBe("2");
   });
 
-  it("shows the empty message when there are no aggregates", async () => {
+  it("shows the empty message when there are no aggregates and stats exist", async () => {
     listMock.mockResolvedValue([]);
+    getPredictivePreviewMock.mockResolvedValue({
+      candidates: [],
+      had_stats: true,
+    });
     renderSection();
     await waitFor(() =>
       expect(screen.getByText(/no aggregates yet/i)).toBeInTheDocument(),
     );
+    expect(getPredictivePreviewMock).toHaveBeenCalledWith("m1");
+  });
+
+  it("shows waiting-for-stats when the empty list has had_stats=false (Bug-9408)", async () => {
+    listMock.mockResolvedValue([]);
+    getPredictivePreviewMock.mockResolvedValue({
+      candidates: [],
+      had_stats: false,
+    });
+    renderSection();
+    await waitFor(() =>
+      expect(
+        screen.getByText(/waiting for source statistics/i),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/no aggregates yet/i)).not.toBeInTheDocument();
   });
 });

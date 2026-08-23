@@ -15,6 +15,7 @@ from shared.schemas.pydantic_models import (
     JoinResponse,
     JoinUpdate,
     coerce_population_participation,
+    coerce_population_participation_source,
 )
 from shared.semantic.graph_order import is_fact_table
 from src.api._model_lock import acquire_model_definition_lock
@@ -67,6 +68,9 @@ async def _build_join_response(
         # make the joins list 500.
         population_participation=coerce_population_participation(
             join.population_participation
+        ),
+        population_participation_source=coerce_population_participation_source(
+            getattr(join, "population_participation_source", None)
         ),
         left_column_id=join.left_column_id,
         right_column_id=join.right_column_id,
@@ -188,6 +192,14 @@ async def create_join(
             field_name="right_table_id",
         )
 
+        # Pydantic applies the compatibility default to the request model, so
+        # inspect the original field set to distinguish an omitted value from
+        # an explicit modeller choice of the same token.
+        participation_source = (
+            "manual"
+            if "population_participation" in body.model_fields_set
+            else "default"
+        )
         j = Join(
             model_id=model_id,
             left_table_id=body.left_table_id,
@@ -198,6 +210,7 @@ async def create_join(
             # caller that does not send this field creates exactly the join it
             # created before the field existed.
             population_participation=body.population_participation,
+            population_participation_source=participation_source,
             left_column_id=left_col.id,
             right_column_id=right_col.id,
         )
@@ -293,6 +306,7 @@ async def update_join(
             # ``population_participation`` is NOT NULL and its four states are
             # all meaningful, so there is nothing to clear TO.
             j.population_participation = data["population_participation"]
+            j.population_participation_source = "manual"
         if "left_column_name" in data:
             # ``j.left_table_id`` is persisted state on a join already proven to
             # belong to this model, not a body value — but the model context is

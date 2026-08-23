@@ -18,21 +18,27 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.auth.middleware import (
+    CurrentServiceUser,
     CurrentUser,
     enforce_model_scope,
     require_capability,
     require_capability_or_service_scope,
+    require_capability_or_service_scopes,
     require_service_scope_or_tenant_admin,
     require_tenant_admin,
 )
-from shared.auth.service_principal import SCOPE_CACHE_EVICT, SCOPE_POCKET_REFRESH
+from shared.auth.service_principal import (
+    SCOPE_CACHE_EVICT,
+    SCOPE_KPI_QUERY_EXECUTE,
+    SCOPE_POCKET_REFRESH,
+)
 from shared.auth.project_access import load_authorized_model
 from shared.connection_scope import (
     CrossProjectConnectionError,
@@ -61,6 +67,10 @@ from shared.db.models import (
     data_tag_columns,
 )
 from shared.db.session import get_tenant_db
+from shared.middleware.internal_bypass import (
+    INTERNAL_BYPASS_HEADER,
+    is_internal_request_header,
+)
 from shared.query_log_client_kinds import RequestClientKindLiteral
 from shared.semantic.field_compatibility import (
     HIDDEN_FIELD_UNAVAILABLE,
@@ -93,8 +103,18 @@ from src.ir.logical_query import (
     UnsupportedSQL,
 )
 from src.logging.query_logger import log_query, log_query_failure, log_query_miss
-from src.params.named_list_resolver import load_named_lists, expand_named_lists
-from src.params.resolver import ParameterError, apply_parameters, placeholder_spans
+from src.params.named_list_resolver import (
+    expand_named_lists,
+    invalidate_named_list_cache,
+    load_named_lists,
+)
+from src.params.resolver import (
+    ParameterError,
+    apply_parameters,
+    colliding_sigil_bare_names,
+    parameter_session_var_key,
+    placeholder_spans,
+)
 from src.parsing.dax_normalizer import parse_dax_to_ir
 from src.parsing.sql_parser import GroupByError, SyntaxErrorInSQL, parse_sql_to_ir
 from src.rewrite.query_rewriter import (
@@ -122,8 +142,9 @@ from src.routing.named_query_resolver import (
     NamedQueryUnknownReference,
     NamedQueryUnsupportedShape,
     NamedQueryWrongType,
+    invalidate_named_query_cache,
     load_named_queries,
-    named_query_reference_name,
+    named_query_reference,
     projection_security_proof_holds,
     sql_references_named_query_position,
 )
@@ -156,6 +177,10 @@ from src.security.query_audit import (
     resolve_filter_anchors,
 )
 from src.semantic.binder import bind_query_to_model
+from src.semantic.snapshot_resolver import (
+    SnapshotAuthority,
+    resolve_serving_authority,
+)
 
 from shared.audit.logger import audit
 from shared.cache.result_cache import ResultCache
@@ -222,6 +247,8 @@ async def _log_query_failure(
     error_detail: str,
     persona_id: uuid.UUID | None = None,
     client_kind: str | None = None,
+    named_query_id: uuid.UUID | None = None,
+    named_query_fallback_reason: str | None = None,
 ) -> None:
     elapsed_ms = int((time.monotonic() - start_ms) * 1000)
     if bound and bound.model:
@@ -258,6 +285,8 @@ async def _log_query_failure(
             client_kind=client_kind,
             error_type=error_type,
             error_detail=error_detail,
+            named_query_id=named_query_id,
+            named_query_fallback_reason=named_query_fallback_reason,
         )
     except Exception:
         logger.warning("Failed to persist query failure log", exc_info=True)
@@ -322,6 +351,8 @@ async def _log_preexec_failure(
     start_ms: float,
     persona_id: uuid.UUID | None = None,
     client_kind: str | None = None,
+    named_query_id: uuid.UUID | None = None,
+    named_query_fallback_reason: str | None = None,
 ) -> None:
     """Persist a QueryLog error row for a pre-execution failure (Bug-7674).
 
@@ -369,6 +400,8 @@ async def _log_preexec_failure(
             error_detail=error_detail,
             raw_query_override=raw_query,
             protocol_override=protocol,
+            named_query_id=named_query_id,
+            named_query_fallback_reason=named_query_fallback_reason,
         )
     except Exception:
         logger.warning("Failed to persist pre-execution query failure log", exc_info=True)
@@ -390,6 +423,8 @@ async def _security_audit_block(
     audit_layer: str,
     persona_id: uuid.UUID | None = None,
     client_kind: str | None = None,
+    named_query_id: uuid.UUID | None = None,
+    named_query_fallback_reason: str | None = None,
 ) -> HTTPException:
     """Record one security-audit block and build the client error.
 
@@ -411,6 +446,8 @@ async def _security_audit_block(
         db, user_identity, tenant_id, bound, decision, start_ms,
         "security_audit", str(exc),
         persona_id=persona_id, client_kind=client_kind,
+        named_query_id=named_query_id,
+        named_query_fallback_reason=named_query_fallback_reason,
     )
     try:
         await audit(
@@ -950,10 +987,19 @@ async def _cached_artifact_still_servable(
     Runs inside a SAVEPOINT for the same reason ``_result_freshness`` does: on
     the cache-hit path this is the request's FIRST statement, so a DB-level
     fault would abort the whole transaction and turn a query whose rows were
-    already cached into a 500. On an unprovable lookup we FAIL OPEN (serve the
-    cached entry) rather than turning a transient database blip into a cache
-    stampede against the source — the artifact gates on the re-routed path would
-    catch a genuinely dead artifact on the next miss anyway.
+    already cached into a 500.
+
+    Bug-9227 [FAIL CLOSED]: an unprovable lookup returns ``False`` — the entry
+    is treated as a cache MISS and the query re-routes through the matcher
+    gates. It used to return ``True`` (serve the cached rows), traded for
+    avoiding "a cache stampede against the source" on a transient database
+    blip. That trade spends CORRECTNESS on LATENCY: the whole purpose of this
+    check is that the cache key cannot see an artifact being retired, deleted,
+    marked stale or marked invalid, so the ONLY thing standing between a dead
+    or stale artifact and a served result is this lookup. Failing it open
+    re-opens exactly the window it was built to close, and the "next miss would
+    catch it" argument is circular — a hit never becomes a miss while the entry
+    keeps being served. A re-route is never wrong; it is only slower.
     """
     artifact_ref = (
         cached.aggregate_id if route_type == "aggregate" else cached.pocket_id
@@ -988,7 +1034,11 @@ async def _cached_artifact_still_servable(
             return True
         async with db.begin_nested():
             result = await db.execute(
-                select(PocketDefinition.status, PocketDefinition.retired_at).where(
+                select(
+                    PocketDefinition.status,
+                    PocketDefinition.population_eligibility,
+                    PocketDefinition.retired_at,
+                ).where(
                     PocketDefinition.id == artifact_id,
                     PocketDefinition.model_id == scoped_model_id,
                 )
@@ -996,18 +1046,25 @@ async def _cached_artifact_still_servable(
         row = result.one_or_none()
         if row is None:
             return False
+        # Bug-9239: admit exactly what ``pocket_matcher`` admits. The matcher
+        # selects ``PocketDefinition.status == "fresh"`` only, so accepting
+        # ``"stale"`` here meant a pocket the scheduler had flipped to stale on
+        # a failed refresh or a schema drift kept replaying its cached rows for
+        # the rest of the cache TTL, while the very same pocket was refused on
+        # a miss. The cache must never be a wider door than the matcher.
         return (
             getattr(row, "retired_at", None) is None
-            and str(getattr(row, "status", "")) in {"fresh", "stale"}
+            and str(getattr(row, "status", "")) == "fresh"
+            and str(getattr(row, "population_eligibility", "unknown")) != "ineligible"
         )
     except Exception as exc:
         logger.warning(
-            "Bug-8581: could not prove the cached %s artifact %s is still "
-            "servable for model %s (%s) — serving the cached result; the next "
-            "cache miss re-routes through the matcher gates",
+            "Bug-9227: could not prove the cached %s artifact %s is still "
+            "servable for model %s (%s) — refusing the cached result and "
+            "re-routing through the matcher gates (fail closed)",
             route_type, artifact_ref, model_id, exc,
         )
-        return True
+        return False
 
 
 async def _cached_response_with_current_freshness(
@@ -1022,8 +1079,12 @@ async def _cached_response_with_current_freshness(
 
     Cached rows retain the materialization timestamp captured when they were
     produced. Aggregate/pocket status, policy and overdue state are read again
-    at serve time. The shared cached object is never mutated, and an unprovable
-    artifact lookup removes diagnostic freshness from only this response.
+    at serve time, and the shared cached object is never mutated.
+
+    L2-F7: an artifact lookup that cannot be PROVEN returns ``None`` — the
+    caller re-routes. It does not (as this docstring used to say) merely strip
+    the diagnostic freshness block and serve the rows anyway; that fail-open is
+    the Bug-8581 defect and it was removed.
     """
     route_type = str(cached.route_type or "").lower()
     if route_type not in {"aggregate", "pocket"}:
@@ -1099,6 +1160,111 @@ class ExplainResponse(BaseModel):
     filter_columns_missing: list[str] = []
 
 
+# ---------------------------------------------------------------------------
+# Deployed @-object catalogue (Bug-9219 / Bug-9224 backend contract)
+# ---------------------------------------------------------------------------
+#
+# A SQL client — the SPA Query Panel, the MCP server, an agent — can write three
+# kinds of ``@name`` token, and until now had NO way to discover which ones this
+# model actually offers:
+#
+#   * ``@Param``      a model parameter, substituted as a typed literal;
+#   * ``IN (@List)``  a named list, expanded to typed literals;
+#   * ``FROM @NQ``    a Named Query reference.
+#
+# The SPA's only source was model-service's LIVE draft CRUD endpoints, which
+# describe the DRAFT model — so the picker would offer objects that queries
+# cannot resolve (undeployed) and hide ones they can. That is the same authority
+# split this lane closes everywhere else, so the catalogue is served from the
+# DEPLOYED SNAPSHOT and fails closed exactly like the serving path.
+#
+# ``sql_usable`` is the field the picker gates on, and ``unusable_reason`` is a
+# STABLE CODE (never prose) so the client can translate it. An MDX-expression
+# named set is genuinely not SQL-expandable — it has no member list, only a
+# ``TopCount(...)`` / ``Filter(...)`` expression that needs an MDX evaluator —
+# so the honest contract is to SAY SO in a machine-readable way rather than let
+# every client rediscover it from a 400 body.
+
+# Named-set reasons.
+NAMED_OBJECT_MDX_ONLY = "mdx_only"
+NAMED_OBJECT_NO_MEMBERS = "no_members"
+# Named-query reason.
+NAMED_OBJECT_DEFINITION_MISSING = "definition_missing"
+# Parameter reason (R2-PCR-002 / Bug-9541): a deployed sigil+bare collision
+# cannot be addressed by supported ``@Name`` placeholders, so both catalogue
+# rows must fail closed rather than advertise a dead ``app.legacy.*`` override.
+PARAMETER_SIGIL_BARE_COLLISION = "sigil_bare_name_collision"
+
+
+class DeployedParameterInfo(BaseModel):
+    """A parameter a SQL query may reference as ``@name``."""
+
+    name: str                       # display form WITHOUT the leading '@'
+    # Bug-9493: exact persisted/deployed name (may retain a leading '@').
+    # Distinct from ``name`` so ``@Region`` and legacy ``Region`` do not collapse.
+    canonical_name: str
+    param_type: str                 # string | number | date | date_range | multi_value
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    default_value: Any = None
+    allowed_values: Any = None
+    # False when the parameter has no default: the caller MUST supply a value
+    # (session var or persona filter) or the query is refused.
+    has_default: bool = False
+    # The exact JDBC session-variable key that overrides it. Published rather
+    # than left for the client to assemble, because the gateway lower-cases the
+    # key and a client that built ``app.<AuthoredCase>`` would never match.
+    session_var_key: str
+    # R2-PCR-002: picker gate — colliding sigil/bare rows are not SQL-addressable
+    # as distinct overrides, so they must not render as usable inputs.
+    sql_usable: bool = True
+    unusable_reason: Optional[str] = None
+
+
+class DeployedNamedSetInfo(BaseModel):
+    """A named set/list, with whether a SQL query can expand it."""
+
+    name: str
+    list_type: str
+    sql_usable: bool
+    member_count: int = 0
+    data_type: Optional[str] = None
+    unusable_reason: Optional[str] = None
+
+
+class DeployedNamedQueryOutputColumn(BaseModel):
+    """One derived output column of a deployed Named Query.
+
+    Mirrors ``shared.schemas.domains.governance_advanced.NamedQueryOutputColumn``
+    field-for-field — the producer stores ``{"name", "type"}`` dicts, so a
+    consumer that flattened them to strings would publish
+    ``"{'name': 'branch_id', 'type': 'string'}"`` as a column name.
+    """
+
+    name: str
+    type: Optional[str] = None
+
+
+class DeployedNamedQueryInfo(BaseModel):
+    """A Named Query a SQL query may reference as ``SELECT * FROM @name``."""
+
+    name: str
+    shape: str
+    sql_usable: bool
+    output_columns: list[DeployedNamedQueryOutputColumn] = []
+    unusable_reason: Optional[str] = None
+
+
+class DeployedNamedObjectsResponse(BaseModel):
+    """Everything a SQL client needs to offer and validate ``@name`` tokens."""
+
+    model_id: str
+    deployed_version_id: Optional[str] = None
+    parameters: list[DeployedParameterInfo] = []
+    named_sets: list[DeployedNamedSetInfo] = []
+    named_queries: list[DeployedNamedQueryInfo] = []
+
+
 class ValidateResponse(BaseModel):
     """Validate-only response. `ok=False` means a friendly error message
     was captured and the caller should display it; HTTP status stays 200."""
@@ -1163,27 +1329,61 @@ class QueryRewritesResponse(BaseModel):
 @router.post("/execute", response_model=ExecuteResponse)
 async def execute_query(
     body: ExecuteRequest,
+    request: Request,
     current_user: CurrentUser = Depends(
-        require_capability_or_service_scope("query", SCOPE_POCKET_REFRESH)
+        # KPI snapshot evaluation is an internal model-service hop. It has
+        # its own scope so the low-privilege KPI principal does not receive
+        # the broader pocket-refresh capability. Other query-router routes
+        # remain pocket-refresh-only below.
+        require_capability_or_service_scopes(
+            "query", (SCOPE_KPI_QUERY_EXECUTE, SCOPE_POCKET_REFRESH),
+        )
     ),
     x_simulate_principal: str | None = Header(default=None, alias="X-Tessallite-Simulate-Principal"),
     x_simulate_roles: str | None = Header(default=None, alias="X-Tessallite-Simulate-Roles"),
     x_simulate_groups: str | None = Header(default=None, alias="X-Tessallite-Simulate-Groups"),
     x_simulate_claims: str | None = Header(default=None, alias="X-Tessallite-Simulate-Claims"),
 ) -> ExecuteResponse:
+    # KPI snapshot evaluation is the only caller of the dedicated KPI query
+    # scope. Require both the declared client origin and the rotating platform
+    # HMAC marker so a leaked scoped token cannot turn this generic endpoint
+    # into an arbitrary data-read primitive. The marker is added by
+    # model-service's internal KPI evaluator and is not user-controlled.
+    _kpi_snapshot_call = (
+        isinstance(current_user, CurrentServiceUser)
+        and SCOPE_KPI_QUERY_EXECUTE in current_user.service_scopes
+    )
+    if _kpi_snapshot_call:
+        if (
+            body.client_kind != "kpi"
+            or not is_internal_request_header(
+                request.headers.get(INTERNAL_BYPASS_HEADER)
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="KPI query execution requires internal service context",
+            )
     enforce_model_scope(current_user, body.model_id)
     _validate_force_route(body.force_route)
     principal = resolve_principal(
         current_user, x_simulate_principal, x_simulate_roles,
         x_simulate_groups, x_simulate_claims,
     )
+    if _kpi_snapshot_call:
+        # This flag exempts only the unmatched-role coverage denial. It does
+        # not skip wildcard/explicit RLS rules, and it is reachable only after
+        # the typed scope + rotating internal marker checks above.
+        principal = dataclasses.replace(
+            principal, unmatched_role_coverage_exempt=True,
+        )
     _simulated = simulate_headers_present(
         x_simulate_principal, x_simulate_roles, x_simulate_groups, x_simulate_claims,
     )
     async for db in get_tenant_db(current_user.tenant_id):
         await load_authorized_model(
             db, current_user, model_id=body.model_id, min_role="viewer",
-            service_scope_verified=True,  # Bug-8613: scope verified by require_capability_or_service_scope
+            service_scope_verified=True,  # Bug-8613: scope verified by the route dependency
         )
         # Bug-8301: resolve the effective persona against the SIMULATED identity
         # (when simulate-as is active) so persona default-filters / persona-CLS
@@ -1344,6 +1544,219 @@ async def discover_members(
         )
 
 
+@router.get(
+    "/models/{model_id}/named-objects",
+    response_model=DeployedNamedObjectsResponse,
+)
+async def list_deployed_named_objects(
+    model_id: str,
+    current_user: CurrentUser = Depends(
+        require_capability_or_service_scope("query", SCOPE_POCKET_REFRESH)
+    ),
+) -> DeployedNamedObjectsResponse:
+    """The deployed ``@``-object catalogue for a SQL client (Bug-9219/9224).
+
+    Answers the question every SQL surface has to answer before it can offer an
+    ``@`` picker or explain a rejection: *which parameters, named sets and Named
+    Queries can a query on THIS model actually resolve right now?*
+
+    Resolved from the DEPLOYED SNAPSHOT, never from live draft rows, so the
+    catalogue and the serving path give the same answer. An undeployed model
+    returns empty lists (nothing is resolvable, which is the truth); a deployed
+    model whose snapshot cannot be read returns 503 rather than an empty
+    catalogue that reads like "this model has no parameters".
+    """
+    enforce_model_scope(current_user, model_id)
+    async for db in get_tenant_db(current_user.tenant_id):
+        await load_authorized_model(
+            db, current_user, model_id=model_id, min_role="viewer",
+            service_scope_verified=True,
+        )
+        return await _build_deployed_named_objects(model_id, db)
+
+
+def _named_query_output_columns(raw: Any) -> list[DeployedNamedQueryOutputColumn]:
+    """Normalise a snapshot's ``output_columns`` to the published shape.
+
+    The producer stores ``{"name", "type"}`` dicts, but a legacy snapshot may
+    hold bare strings. Both are accepted; anything unnamed is dropped rather
+    than published as an empty column.
+    """
+    out: list[DeployedNamedQueryOutputColumn] = []
+    for col in raw or ():
+        if isinstance(col, dict):
+            name = col.get("name")
+            if name:
+                out.append(
+                    DeployedNamedQueryOutputColumn(
+                        name=str(name),
+                        type=(str(col["type"]) if col.get("type") else None),
+                    )
+                )
+        elif col:
+            out.append(DeployedNamedQueryOutputColumn(name=str(col)))
+    return out
+
+
+async def _build_deployed_named_objects(
+    model_id: str, db: AsyncSession,
+) -> DeployedNamedObjectsResponse:
+    """Assemble the deployed ``@``-object catalogue. See the route above."""
+    try:
+        authority, shape = await _resolve_parameter_authority(model_id, db)
+    except HTTPException as exc:
+        # L2-F11: the shared refusal names "this query's model parameters".
+        # This route carries no query, so re-flavour the 503 for the catalogue
+        # caller rather than describing something that does not exist. Every
+        # other status passes through untouched.
+        if exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_DEPLOY_AUTHORITY_CATALOGUE_UNAVAILABLE_DETAIL,
+        )
+    if authority is not SnapshotAuthority.DEPLOYED or shape is None:
+        return DeployedNamedObjectsResponse(model_id=str(model_id))
+
+    canonical_names = [
+        str(p.get("name") or "")
+        for p in shape.model_parameters
+        if p.get("name")
+    ]
+    colliding_bare = colliding_sigil_bare_names(canonical_names)
+    parameters = [
+        DeployedParameterInfo(
+            name=canonical.lstrip("@"),
+            canonical_name=canonical,
+            param_type=str(p.get("param_type") or "string"),
+            display_name=p.get("display_name"),
+            description=p.get("description"),
+            default_value=p.get("default_value"),
+            allowed_values=p.get("allowed_values"),
+            has_default=p.get("default_value") is not None,
+            session_var_key=parameter_session_var_key(
+                canonical, colliding_bare=colliding_bare,
+            ),
+            # R2-PCR-002: both the ``@Bare`` and bare rows fail closed when they
+            # collide — supported SQL can only address ``@Name``, so advertising
+            # a usable ``app.legacy.*`` override would be a silent no-op.
+            sql_usable=(canonical.lstrip("@").lower() not in colliding_bare),
+            unusable_reason=(
+                PARAMETER_SIGIL_BARE_COLLISION
+                if canonical.lstrip("@").lower() in colliding_bare
+                else None
+            ),
+        )
+        for p in shape.model_parameters
+        for canonical in (str(p.get("name") or ""),)
+        if p.get("name")
+    ]
+
+    # Named sets and Named Queries come from the SAME deployed snapshot the
+    # serving path reads (both loaders are snapshot-backed and cached), so the
+    # catalogue cannot advertise an object a query would then fail to resolve.
+    named_sets: list[DeployedNamedSetInfo] = []
+    try:
+        _lists = await load_named_lists(model_id, db)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # A snapshot the named-list loader refuses (duplicate lowercase key) is
+        # a deployment fault, not an empty catalogue. Fail closed the same way
+        # the Named Query loader does two blocks below, and the same way a
+        # query against this model would.
+        #
+        # L2-F12: the handler is ``Exception``, not ``ParameterError``. Both
+        # loaders read the database, so a transient DB fault raised an UNTYPED
+        # 500 out of a route whose parameter authority one function above was
+        # rewritten (Bug-9397) precisely to stop doing exactly that. One typed
+        # 503 for every reason the deployed snapshot cannot be read.
+        logger.warning(
+            "L2-F12: the deployed named-set catalogue for model %s could not "
+            "be read (%s) — refusing with a typed 503 (fail closed)",
+            model_id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_DEPLOY_AUTHORITY_CATALOGUE_UNAVAILABLE_DETAIL,
+        )
+    for nlist in _lists.values():
+        members = list(nlist.members or [])
+        if nlist.list_type != "sql_fixed":
+            # An MDX-expression set (``TopCount(...)`` / ``Filter(...)``) has no
+            # member list to expand — it needs an MDX evaluator, which the SQL
+            # path deliberately does not have. Not a defect, a boundary; the
+            # client's job is to say so up front instead of letting the user
+            # discover it from a 400.
+            usable, reason = False, NAMED_OBJECT_MDX_ONLY
+        elif not members:
+            # A dynamic sql_fixed list (topN / filter / sql_query) that has
+            # never been refreshed-and-redeployed.
+            usable, reason = False, NAMED_OBJECT_NO_MEMBERS
+        else:
+            usable, reason = True, None
+        named_sets.append(
+            DeployedNamedSetInfo(
+                name=nlist.name,
+                list_type=str(nlist.list_type or ""),
+                sql_usable=usable,
+                member_count=len(members),
+                data_type=nlist.data_type,
+                unusable_reason=reason,
+            )
+        )
+
+    named_queries: list[DeployedNamedQueryInfo] = []
+    try:
+        _nq_defs = await load_named_queries(model_id, db)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # A snapshot the NQ loader refuses (duplicate lowercase key) is a
+        # deployment fault, not an empty catalogue. Fail closed like the
+        # serving path does for the same snapshot. L2-F12: same widening as the
+        # named-set loader above — a transient DB fault is a typed 503, not an
+        # untyped 500.
+        logger.warning(
+            "L2-F12: the deployed Named Query catalogue for model %s could not "
+            "be read (%s) — refusing with a typed 503 (fail closed)",
+            model_id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_DEPLOY_AUTHORITY_CATALOGUE_UNAVAILABLE_DETAIL,
+        )
+    for nq in _nq_defs.values():
+        has_definition = bool((nq.definition_sql or "").strip())
+        named_queries.append(
+            DeployedNamedQueryInfo(
+                name=nq.name,
+                shape=nq.shape,
+                sql_usable=has_definition,
+                output_columns=_named_query_output_columns(nq.output_columns),
+                unusable_reason=(
+                    None if has_definition else NAMED_OBJECT_DEFINITION_MISSING
+                ),
+            )
+        )
+
+    # The deploy pointer the catalogue was built from. A client caches on it and
+    # refetches when it moves, which is the same key every deploy-scoped cache
+    # in this service uses. ``db.get`` is the session-identity-map read that
+    # ``resolve_serving_authority`` already performed above, so it costs nothing.
+    from shared.db.models import Model as _CatalogueModel
+    _model = await db.get(_CatalogueModel, model_id)
+    _dvid = getattr(_model, "deployed_version_id", None) if _model else None
+
+    return DeployedNamedObjectsResponse(
+        model_id=str(model_id),
+        deployed_version_id=str(_dvid) if _dvid is not None else None,
+        parameters=sorted(parameters, key=lambda p: p.name.lower()),
+        named_sets=sorted(named_sets, key=lambda n: n.name.lower()),
+        named_queries=sorted(named_queries, key=lambda n: n.name.lower()),
+    )
+
+
 @router.get("/diagnostics/query-rewrites", response_model=QueryRewritesResponse)
 async def list_query_rewrites(
     current_user: CurrentUser = Depends(require_tenant_admin),
@@ -1420,11 +1833,90 @@ async def evict_model_cache(model_id: str) -> None:
     # keep an under-estimated plan bound, and therefore an unearned population
     # proof, cached for the full TTL. Same exposure, same eviction.
     invalidate_aggregate_population_cache(model_id)
+    # Bug-9393: the two SNAPSHOT-BACKED @-namespace caches. Both key on the
+    # deploy pointer and self-heal on the next post-deploy query, so this is
+    # residual-window hygiene rather than the correctness mechanism — the same
+    # contract as the join-graph cache above. They were the only deploy-scoped
+    # query-router caches missing from this list, which is exactly how a
+    # cache goes unevicted: the list is hand-maintained and nothing enumerates
+    # it. L2-F3: the enumeration this comment claimed did not exist until it was
+    # written — it is
+    # ``tests/test_snapshot_authority_serving.py::
+    # test_evict_model_cache_covers_every_deploy_scoped_cache``, which AST-scans
+    # this service's ``src`` tree for every module-level ``invalidate*(model_id)``
+    # and asserts each one is called from here. A new invalidator whose shape it
+    # does not recognise fails the suite rather than being skipped.
+    invalidate_named_list_cache(model_id)
+    invalidate_named_query_cache(model_id)
 
 
 # ---------------------------------------------------------------------------
 # Implementation
 # ---------------------------------------------------------------------------
+
+# The typed refusal every deployed-snapshot authority failure on the pre-parse
+# serving path raises. 503 (not 500) tells the gateway / BI tool the deployment
+# is temporarily unusable — the same signal the binder's
+# DeployedSnapshotUnavailableError already produces one step later.
+_DEPLOY_AUTHORITY_UNAVAILABLE_DETAIL = (
+    "The deployed model snapshot could not be read, so this query's model "
+    "parameters cannot be resolved against the deployed contract. The query "
+    "was refused (fail closed); retry shortly."
+)
+
+# L2-F11: the same failure on the ``/named-objects`` catalogue route, which has
+# no query and no parameters to resolve. Reusing the message above told a UI
+# caller its "query's model parameters" could not be resolved on a request that
+# never carried one.
+_DEPLOY_AUTHORITY_CATALOGUE_UNAVAILABLE_DETAIL = (
+    "The deployed model snapshot could not be read, so the model's deployed "
+    "named objects cannot be listed. The request was refused (fail closed); "
+    "retry shortly."
+)
+
+
+async def _resolve_parameter_authority(
+    model_id: str, db: AsyncSession,
+) -> tuple[SnapshotAuthority, Any]:
+    """Classify the parameter-serving authority for *model_id*, fail-closed.
+
+    Returns ``(SnapshotAuthority.DEPLOYED, shape)`` or
+    ``(SnapshotAuthority.UNDEPLOYED, None)``. It NEVER returns
+    ``DEPLOYED_SNAPSHOT_INVALID`` to the caller: that case, and any DB failure
+    while classifying, raises a typed 503.
+
+    Bug-9397 (F-029-03): the old inline block wrapped the whole lookup in
+    ``except Exception: pass``. An exception raised by ``db.get(Model, ...)``
+    fired BEFORE the deploy pointer was known, so ``_deployed_params`` was still
+    ``None`` — and ``None`` is the sentinel that means "undeployed, read the
+    LIVE ORM". A transient database error on a DEPLOYED model therefore made the
+    query resolve its parameters from DRAFT defaults and serve numbers under
+    values that were never deployed. The fail-closed default it documented
+    (``[]``) was only ever reached when the failure happened AFTER the pointer
+    read, which is the harmless half of the window.
+
+    "We could not read the model" is not "the model is undeployed". Refuse.
+    """
+    try:
+        authority, shape = await resolve_serving_authority(model_id, db)
+    except Exception as exc:
+        logger.warning(
+            "Bug-9397: could not classify the deployed parameter authority for "
+            "model %s (%s) — refusing the query rather than resolving "
+            "parameters from live draft values (fail closed)",
+            model_id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_DEPLOY_AUTHORITY_UNAVAILABLE_DETAIL,
+        )
+    if authority is SnapshotAuthority.DEPLOYED_SNAPSHOT_INVALID:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_DEPLOY_AUTHORITY_UNAVAILABLE_DETAIL,
+        )
+    return authority, shape
+
 
 _ALLOWED_FORCE_ROUTES = frozenset({"source", "aggregate", "pocket", "raw"})
 
@@ -1491,6 +1983,42 @@ async def _bind_query_parameters(
     if "@" not in body.raw_query:
         return
 
+    # --- ONE authority for this request, classified FIRST (Bug-9397) ---------
+    # Every ``@``-namespace lookup below — named lists, Named Query definitions,
+    # the declared-parameter NAME SET, the parameter DEFINITIONS — is a read of
+    # governed model content, so the authority that governs them all is settled
+    # BEFORE any of them runs. Classifying first is what makes the refusal
+    # coherent: a model whose deployment cannot be read gets ONE typed 503 here,
+    # instead of whichever lookup happened to touch the database first raising
+    # an untyped 500.
+    #
+    # The name set and the definitions in particular used to disagree: the
+    # definitions were read from the deployed snapshot while the name set ran a
+    # LIVE ``select(ModelParameter)``. A draft parameter that collided with a
+    # DEPLOYED named list therefore 400'd production queries that should have
+    # expanded the deployed list — an UNDEPLOYED edit breaking DEPLOYED serving,
+    # which is exactly what deploy pinning exists to prevent, inverted. Both now
+    # come from one request-pinned ``DeployedShape``, so the disagreement is
+    # unrepresentable rather than merely fixed at two call sites.
+    _param_authority, _param_shape = await _resolve_parameter_authority(
+        body.model_id, db
+    )
+    if _param_authority is SnapshotAuthority.DEPLOYED:
+        declared_param_names = set(_param_shape.model_parameter_names)
+        _deployed_params: list[dict[str, Any]] | None = list(
+            _param_shape.model_parameters
+        )
+    else:
+        # UNDEPLOYED: the live tables ARE the authority (authoring / editor
+        # preview), mirroring the binder's undeployed fallback. ``None`` tells
+        # ``apply_parameters`` to read the live ORM.
+        _deployed_params = None
+        from shared.db.models import ModelParameter as _MP
+        _pr = await db.execute(
+            select(_MP).where(_MP.model_id == body.model_id)
+        )
+        declared_param_names = {p.name for p in _pr.scalars().all()}
+
     # Load named lists from the deployed snapshot (cached). Their names
     # are passed to apply_parameters as extra_declared_names so that
     # named list placeholders are not rejected as unknown parameters.
@@ -1530,12 +2058,7 @@ async def _bind_query_parameters(
     # parameter AND a named list, scoped to the placeholders actually present
     # in THIS query. A model-wide check would break all parameterized queries
     # when a single misconfigured list name collides with a parameter.
-    if named_list_declared:
-        from shared.db.models import ModelParameter as _MP
-        _pr = await db.execute(
-            select(_MP).where(_MP.model_id == body.model_id)
-        )
-        declared_param_names = {p.name for p in _pr.scalars().all()}
+    if named_list_declared and declared_param_names:
         param_lower = {n.lower() for n in declared_param_names}
 
         # Only check placeholders actually used in this query.
@@ -1553,16 +2076,31 @@ async def _bind_query_parameters(
                         f"Rename one to avoid ambiguity."
                     ),
                 )
-    else:
-        declared_param_names = set()
 
     # Law 6 (namespace collision, named queries): a FROM-position @name that
     # matches BOTH a declared parameter and a deployed Named Query is
     # ambiguous — fail loud at query time (legacy cross-table data; create-
     # time checks prevent new collisions).
-    if _nq_declared and declared_param_names:
-        param_lower = {n.lower() for n in declared_param_names}
-        if _nq_from_ref is not None and _nq_from_ref.lower() in param_lower:
+    #
+    # L2-F2: compare on the BARE name, on both sides. ``_nq_from_ref`` comes
+    # from ``sql_references_named_query_position``, which returns the token text
+    # WITHOUT the ``@`` (``leads``), while a ``ModelParameter.name`` is required
+    # by model-service to CARRY it (``_PARAM_NAME_RE = ^@[A-Za-z_]\w*$``), so a
+    # raw ``lower()`` comparison of the two could never match and this refusal
+    # never fired. The parameter then silently won the substitution and the user
+    # got a downstream parse error naming a table nobody created. Stripping the
+    # sigil on both sides mirrors model-service's own create-time comparison.
+    #
+    # Scoped to a Named Query that actually EXISTS in the deployed snapshot:
+    # ``_nq_declared`` is populated for ANY FROM-position ``@name`` (it is the
+    # substitution whitelist), so testing it alone would raise a
+    # "matches both ... and a Named Query" refusal for ``SELECT * FROM @Region``
+    # on a model that has a ``@Region`` parameter and no Named Query at all —
+    # an error message that is simply untrue.
+    if _nq_from_ref is not None and _nq_definitions and declared_param_names:
+        _nq_bare = _nq_from_ref.lstrip("@").lower()
+        param_bare = {n.lstrip("@").lower() for n in declared_param_names}
+        if _nq_bare in param_bare and f"@{_nq_bare}" in _nq_definitions:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
@@ -1571,25 +2109,21 @@ async def _bind_query_parameters(
                 ),
             )
 
-    # Persona default filters take top precedence. Load the persona once
-    # here to read its ``default_filters`` (keyed by dimension name without
-    # the ``@`` prefix). The resolver matches parameters by their declared
-    # ``@name``, so we re-key the dict to add the ``@`` prefix before
-    # passing it in (Bug-7660: without this, persona parameter overrides
-    # never resolve because the bare-name key never matches the ``@name``
-    # the resolver looks up). The later persona gate reuses the same
-    # session-cached row, so this is not a redundant round trip.
+    # Persona default filters take top precedence. Under the explicit targeting
+    # contract (L13-PERSONA-AT / Q2 Option B), bare keys remain dimension
+    # filters and ONLY authored ``@Name`` keys are parameter overrides. Do not
+    # reconstruct an ``@`` key from a bare dimension: when a dimension and a
+    # parameter intentionally share a name, that would silently change the
+    # meaning of the persisted persona. The later persona gate consumes the
+    # same loaded row and already skips explicit ``@`` keys.
     persona_filters: dict[str, Any] = {}
     if persona_id:
         persona = await load_persona(
             db, model_id=body.model_id, persona_id=persona_id
         )
         raw_filters = persona.default_filters or {}
-        # Bug-7660: default_filters are keyed by dimension name (e.g.
-        # "Region"); the resolver expects ``@``-prefixed parameter names
-        # (e.g. "@Region"). Re-key so persona overrides actually match.
-        # Keys that already carry ``@`` (future-proof) are left as-is.
-        #
+        # Only explicit ``@`` keys are parameter overrides. Bare keys are left
+        # for persona_gate.merge_default_filters to apply as dimensions.
         # Only scalar/list values are valid as parameter overrides.
         # Operator-shaped dicts (e.g. {"gte": 100}) are dimension-level
         # WHERE filters handled by merge_default_filters, not parameter
@@ -1601,43 +2135,11 @@ async def _bind_query_parameters(
             if isinstance(v, dict) and not ("from" in v and "to" in v):
                 # Operator dict (e.g. {"gte": 100}) -- skip, not a param.
                 continue
-            key = k if k.startswith("@") else f"@{k}"
-            persona_filters[key] = v
+            if k.startswith("@"):
+                persona_filters[k] = v
 
-    # F-029-01 / Bug-6422: load parameter definitions from the deployed
-    # snapshot when the model is deployed, so draft default changes cannot
-    # alter production results before redeployment. Mirrors the fail-closed
-    # discipline of load_named_lists: deployed -> snapshot, undeployed -> live.
-    # F-029-01 / Bug-6422 (fail-closed): for a deployed model, load parameter
-    # definitions from the deployed snapshot so draft default changes cannot
-    # alter production results before redeployment. On transient DB failure,
-    # fail closed (empty list = no deployed params) so queries with @param
-    # tokens get a clear "unknown/unresolved" error rather than silently
-    # resolving from live draft defaults (Fable FINDING-2).
-    _deployed_params: list[dict[str, Any]] | None = None
-    try:
-        from shared.db.models import Model as _Model, ModelVersion as _MV
-        _param_model = await db.get(_Model, body.model_id)
-        if _param_model is not None:
-            _dvid = getattr(_param_model, "deployed_version_id", None)
-            if _dvid is not None:
-                _deployed_params = []  # fail-closed default: no deployed params
-                _version = await db.get(_MV, _dvid)
-                if (
-                    _version is not None
-                    and isinstance(_version.snapshot_json, dict)
-                ):
-                    _snap_params = _version.snapshot_json.get("model_parameters")
-                    if _snap_params is not None:
-                        _deployed_params = _snap_params
-    except Exception:
-        # DB failure during deployed snapshot lookup — fail closed. Leave
-        # _deployed_params as [] (set above when dvid is not None) so a query
-        # with @param tokens fails with "unresolved parameter" rather than
-        # silently using live draft defaults. If dvid was None (undeployed),
-        # _deployed_params is None -> live ORM is the legitimate authority.
-        pass
-
+    # ``_deployed_params`` / ``declared_param_names`` were resolved above from
+    # the ONE request-pinned authority (F-029-01 / Bug-6422 / Bug-9397).
     try:
         _extra_declared: set[str] | None = None
         if named_list_declared or _nq_declared:
@@ -2124,6 +2626,8 @@ async def _handle_execute(
     persona: Any | None = None,
     tenant_id: str = "",
     drill_join_path_ids: Optional[list[str]] = None,
+    named_query_id: uuid.UUID | None = None,
+    named_query_fallback_reason: str | None = None,
 ) -> ExecuteResponse:
     # 0. Bind model parameters into the SQL before parse (F-029-01).
     await _bind_query_parameters(body, db, persona_id)
@@ -2224,14 +2728,17 @@ async def _handle_execute(
     # 1.6 Intercept Named Query references (`SELECT * FROM @name`).
     # Recognition is a pre-parse STRUCTURAL check on the raw SQL (token-level,
     # mirroring the Named List lexer-span technique — not how sqlglot parses
-    # ``@x`` in FROM position). The exact v1 shape is the whole-statement
-    # reference; a decorated shape (projection subset, join, WHERE against it,
-    # nested) dispatches here too so the resolver can raise the specific
-    # NQ_UNSUPPORTED_SHAPE 400 instead of a generic parse/bind failure.
+    # ``@x`` in FROM position). The accepted v1 shape is the whole-statement
+    # reference, optionally with a trailing LIMIT/OFFSET and a quoted name
+    # (Bug-9398); a decorated shape (projection subset, join, WHERE against it,
+    # ORDER BY, nested) dispatches here too so the resolver can raise the
+    # specific NQ_UNSUPPORTED_SHAPE 400 instead of a generic parse/bind failure.
     if body.protocol != "dax" and "@" in body.raw_query:
-        _nq_ref_name = named_query_reference_name(body.raw_query)
-        if _nq_ref_name is None:
-            _nq_ref_name = sql_references_named_query_position(body.raw_query)
+        _nq_reference = named_query_reference(body.raw_query)
+        _nq_ref_name = (
+            _nq_reference.name if _nq_reference is not None
+            else sql_references_named_query_position(body.raw_query)
+        )
         if _nq_ref_name is not None:
             # Bug-6610 parity: resolve the persona exactly as the $KPIs path
             # does, so the Named Query CLS/RLS gates are never inert for a
@@ -2245,6 +2752,7 @@ async def _handle_execute(
                 db,
                 body,
                 logical_query,
+                reference=_nq_reference,
                 ref_name=_nq_ref_name,
                 persona=nq_persona,
                 principal=principal,
@@ -2393,11 +2901,17 @@ async def _handle_execute(
                 str(e),
                 persona_id=persona.id if persona is not None else None,
                 client_kind=body.client_kind,
+                named_query_id=named_query_id,
+                named_query_fallback_reason=named_query_fallback_reason,
             )
-            raise HTTPException(
+            _mapped = HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=row_security_misconfigured_detail(e, surface="/execute"),
             )
+            # The execution boundary already persisted this attributed failure;
+            # the /execute wrapper must not add a second un-attributed row.
+            _mapped._tessallite_failure_logged = True  # type: ignore[attr-defined]
+            raise _mapped
         if _compiled_rls is not None and has_active_rules(_compiled_rls):
             _rls_policy_hash = _compiled_rls.policy_hash
             # Bug-7039: validate that user_mapping rules reference mapping
@@ -2593,6 +3107,8 @@ async def _handle_execute(
                 tenant_id=tenant_id,
                 persona=persona,
                 client_kind=body.client_kind,
+                named_query_id=named_query_id,
+                named_query_fallback_reason=named_query_fallback_reason,
             )
             return served_cached
 
@@ -2663,6 +3179,8 @@ async def _handle_execute(
             "routing_error", str(e),
             persona_id=persona.id if persona is not None else None,
             client_kind=body.client_kind,
+            named_query_id=named_query_id,
+            named_query_fallback_reason=named_query_fallback_reason,
         )
         _mapped = HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -2692,6 +3210,8 @@ async def _handle_execute(
                 tenant_id=tenant_id,
                 persona=persona,
                 client_kind=body.client_kind,
+                named_query_id=named_query_id,
+                named_query_fallback_reason=named_query_fallback_reason,
             )
         )
     except HTTPException as _exec_exc:
@@ -2789,6 +3309,8 @@ async def record_query_success(
     client_kind: Optional[str] = None,
     log_miss: bool = True,
     cache_status: Optional[str] = None,
+    named_query_id: uuid.UUID | None = None,
+    named_query_fallback_reason: str | None = None,
 ) -> None:
     """Persist QueryLog + miss log, emit Prometheus counters, the query
     audit log line, and the platform audit record for one successful
@@ -2822,6 +3344,8 @@ async def record_query_success(
         persona_id=persona_uuid,
         client_kind=client_kind,
         cache_status=cache_status,
+        named_query_id=named_query_id,
+        named_query_fallback_reason=named_query_fallback_reason,
     )
     QUERY_ROUTED_COUNT.labels(routed_to=decision.route_type).inc()
     _model = bound.model.display_name
@@ -2875,8 +3399,17 @@ async def record_query_success(
     # the cache-hit path (F-030-03) without re-classifying the route.
     if log_miss and decision.route_type == "source":
         miss_reason = decision.reason
+        # G4: this is a population-proof refusal, not generic build evidence.
+        # The matcher parks the candidate as ineligible; retain the exact
+        # machine reason for the optimizer's pocket-build gate.
+        pocket_population_mismatch = (
+            getattr(decision, "pocket_skipped_reason", None)
+            == "join_population_mismatch"
+        )
+        if pocket_population_mismatch:
+            miss_reason = "pocket_skip:join_population_mismatch"
         agg_skipped = getattr(decision, "aggregate_skipped_reasons", None)
-        if agg_skipped:
+        if agg_skipped and not pocket_population_mismatch:
             miss_reason = "aggregate_skip:" + ",".join(sorted(set(agg_skipped)))
         # Bug-6726 (b): miss-log telemetry must never fail the user query.
         # The upsert itself is now race-safe (ON CONFLICT), but ANY
@@ -2915,6 +3448,8 @@ async def record_query_cache_hit(
     tenant_id: str,
     persona=None,
     client_kind: Optional[str] = None,
+    named_query_id: uuid.UUID | None = None,
+    named_query_fallback_reason: str | None = None,
 ) -> None:
     """Persist observability for a result-cache HIT (F-030-03).
 
@@ -2968,6 +3503,8 @@ async def record_query_cache_hit(
         client_kind=client_kind,
         log_miss=False,
         cache_status="cache_hit",
+        named_query_id=named_query_id,
+        named_query_fallback_reason=named_query_fallback_reason,
     )
 
 
@@ -2980,6 +3517,8 @@ async def execute_with_observation(
     tenant_id: str,
     persona=None,
     client_kind: Optional[str] = None,
+    named_query_id: uuid.UUID | None = None,
+    named_query_fallback_reason: str | None = None,
 ) -> tuple[list[dict], int, list[str], DataSource | DataTarget, int, RouteDecision]:
     """Run a routed query through the full observed execution pipeline.
 
@@ -3019,15 +3558,27 @@ async def execute_with_observation(
             db, user_identity, tenant_id, bound, decision, start_ms, e,
             audit_layer="filter_presence",
             persona_id=persona_uuid, client_kind=client_kind,
+            named_query_id=named_query_id,
+            named_query_fallback_reason=named_query_fallback_reason,
         )
 
     try:
         rows, bytes_processed, columns, chosen_source = await execute_routed_query(bound, decision, db)
     except ResultTooLargeError as e:
-        await _log_query_failure(db, user_identity, tenant_id, bound, decision, start_ms, "result_too_large", str(e), persona_id=persona_uuid, client_kind=client_kind)
+        await _log_query_failure(
+            db, user_identity, tenant_id, bound, decision, start_ms,
+            "result_too_large", str(e), persona_id=persona_uuid,
+            client_kind=client_kind, named_query_id=named_query_id,
+            named_query_fallback_reason=named_query_fallback_reason,
+        )
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(e))
     except QueryTimeoutError as e:
-        await _log_query_failure(db, user_identity, tenant_id, bound, decision, start_ms, "timeout", str(e), persona_id=persona_uuid, client_kind=client_kind)
+        await _log_query_failure(
+            db, user_identity, tenant_id, bound, decision, start_ms,
+            "timeout", str(e), persona_id=persona_uuid,
+            client_kind=client_kind, named_query_id=named_query_id,
+            named_query_fallback_reason=named_query_fallback_reason,
+        )
         raise HTTPException(status_code=status.HTTP_408_REQUEST_TIMEOUT, detail=str(e))
     except CrossProjectConnectionError as e:
         # Bug-5325: the routed source/target connection belongs to a different
@@ -3039,6 +3590,8 @@ async def execute_with_observation(
             db, user_identity, tenant_id, bound, decision, start_ms,
             "cross_project_connection", str(e),
             persona_id=persona_uuid, client_kind=client_kind,
+            named_query_id=named_query_id,
+            named_query_fallback_reason=named_query_fallback_reason,
         )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -3132,6 +3685,13 @@ async def execute_with_observation(
                                     "Physical pocket table missing at query time; "
                                     "fell back to source (Bug-6986)"
                                 ),
+                                population_eligibility="unknown",
+                                population_eligibility_reason=None,
+                                population_proof_fingerprint=None,
+                                row_manifest=None,
+                                active_refresh_run_id=None,
+                                built_for_version_id=None,
+                                built_for_epoch=None,
                             )
                         )
                 except Exception:
@@ -3187,6 +3747,8 @@ async def execute_with_observation(
                     db, user_identity, tenant_id, bound, decision,
                     start_ms, "snapshot_unavailable", str(_snapshot_err),
                     persona_id=persona_uuid, client_kind=client_kind,
+                    named_query_id=named_query_id,
+                    named_query_fallback_reason=named_query_fallback_reason,
                 )
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -3201,6 +3763,8 @@ async def execute_with_observation(
                     db, user_identity, tenant_id, bound, decision,
                     start_ms, "routing_error", str(_rewrite_err),
                     persona_id=persona_uuid, client_kind=client_kind,
+                    named_query_id=named_query_id,
+                    named_query_fallback_reason=named_query_fallback_reason,
                 )
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
@@ -3251,17 +3815,29 @@ async def execute_with_observation(
                     db, user_identity, tenant_id, bound, decision, start_ms, sa_err,
                     audit_layer="filter_presence",
                     persona_id=persona_uuid, client_kind=client_kind,
+                    named_query_id=named_query_id,
+                    named_query_fallback_reason=named_query_fallback_reason,
                 )
             try:
                 rows, bytes_processed, columns, chosen_source = await execute_routed_query(bound, decision, db)
             except ResultTooLargeError as inner:
-                await _log_query_failure(db, user_identity, tenant_id, bound, decision, start_ms, "result_too_large", str(inner), persona_id=persona_uuid, client_kind=client_kind)
+                await _log_query_failure(
+                    db, user_identity, tenant_id, bound, decision, start_ms,
+                    "result_too_large", str(inner), persona_id=persona_uuid,
+                    client_kind=client_kind, named_query_id=named_query_id,
+                    named_query_fallback_reason=named_query_fallback_reason,
+                )
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     detail=str(inner),
                 )
             except QueryTimeoutError as inner:
-                await _log_query_failure(db, user_identity, tenant_id, bound, decision, start_ms, "timeout", str(inner), persona_id=persona_uuid, client_kind=client_kind)
+                await _log_query_failure(
+                    db, user_identity, tenant_id, bound, decision, start_ms,
+                    "timeout", str(inner), persona_id=persona_uuid,
+                    client_kind=client_kind, named_query_id=named_query_id,
+                    named_query_fallback_reason=named_query_fallback_reason,
+                )
                 raise HTTPException(
                     status_code=status.HTTP_408_REQUEST_TIMEOUT,
                     detail=str(inner),
@@ -3277,13 +3853,20 @@ async def execute_with_observation(
                         db, user_identity, tenant_id, bound, decision,
                         start_ms, "missing_source_table", _mn,
                         persona_id=persona_uuid, client_kind=client_kind,
+                        named_query_id=named_query_id,
+                        named_query_fallback_reason=named_query_fallback_reason,
                     )
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         detail=_missing_source_table_detail(_mn),
                     )
                 logger.error("Source query failed (fallback): %s", inner, exc_info=True)
-                await _log_query_failure(db, user_identity, tenant_id, bound, decision, start_ms, "execution_error", str(inner), persona_id=persona_uuid, client_kind=client_kind)
+                await _log_query_failure(
+                    db, user_identity, tenant_id, bound, decision, start_ms,
+                    "execution_error", str(inner), persona_id=persona_uuid,
+                    client_kind=client_kind, named_query_id=named_query_id,
+                    named_query_fallback_reason=named_query_fallback_reason,
+                )
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail=sanitize_error_for_client(inner),
@@ -3298,6 +3881,8 @@ async def execute_with_observation(
                 db, user_identity, tenant_id, bound, decision, start_ms,
                 "missing_source_table", _missing_name,
                 persona_id=persona_uuid, client_kind=client_kind,
+                named_query_id=named_query_id,
+                named_query_fallback_reason=named_query_fallback_reason,
             )
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -3305,7 +3890,12 @@ async def execute_with_observation(
             )
         else:
             logger.error("Source query failed: %s", e, exc_info=True)
-            await _log_query_failure(db, user_identity, tenant_id, bound, decision, start_ms, "execution_error", str(e), persona_id=persona_uuid, client_kind=client_kind)
+            await _log_query_failure(
+                db, user_identity, tenant_id, bound, decision, start_ms,
+                "execution_error", str(e), persona_id=persona_uuid,
+                client_kind=client_kind, named_query_id=named_query_id,
+                named_query_fallback_reason=named_query_fallback_reason,
+            )
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=sanitize_error_for_client(e))
     elapsed_ms = int((time.monotonic() - start_ms) * 1000)
 
@@ -3320,6 +3910,8 @@ async def execute_with_observation(
             db, user_identity, tenant_id, bound, decision, start_ms, e,
             audit_layer="result_columns",
             persona_id=persona_uuid, client_kind=client_kind,
+            named_query_id=named_query_id,
+            named_query_fallback_reason=named_query_fallback_reason,
         )
 
     # Bug-5195: credit the aggregate hit ONLY after the routed query
@@ -3343,6 +3935,14 @@ async def execute_with_observation(
         tenant_id=tenant_id,
         persona=persona,
         client_kind=client_kind,
+        # The router marks an explicit source route ``log_miss=False`` because
+        # aggregate/pocket matching was deliberately bypassed.  Preserve that
+        # consumer-side contract here, including the NQ live fallback, so the
+        # attribution fix observes the existing QueryLog without creating an
+        # actionable QueryMissLog row for a Named Query.
+        log_miss=getattr(decision, "log_miss", True),
+        named_query_id=named_query_id,
+        named_query_fallback_reason=named_query_fallback_reason,
     )
 
     return rows, bytes_processed, columns, chosen_source, elapsed_ms, decision
@@ -3466,6 +4066,10 @@ async def _handle_explain(
             principal=principal,
             force_route=body.force_route,
             persona=persona,
+            # Explain is a read-only route-plan surface. The matcher may still
+            # evaluate the same proof, but it must not persist lifecycle
+            # observations through a request session that is rolled back.
+            persist_population_observation=False,
         )
     except NoAggregateMatchError as e:
         raise HTTPException(
@@ -4445,12 +5049,54 @@ async def _named_query_persona_restricted_column_ids(
     return {str(c) for c in restricted_col_rows}
 
 
+def _named_query_row_window(reference: Any) -> tuple[int, Optional[int], bool]:
+    """The reference's ``(offset, limit, has_window)``.
+
+    ONE predicate for "does this reference carry a row window", shared by the
+    two places that must agree about it: the function that APPLIES the window
+    and the live helper that must recompose ``truncated`` when it does. When
+    those were two separate expressions they could drift into applying a window
+    without recomputing the truncation marker, which is L2-F1 in a new costume.
+    """
+    if reference is None:
+        return 0, None, False
+    offset = getattr(reference, "offset", None) or 0
+    limit = getattr(reference, "limit", None)
+    return offset, limit, bool(offset) or limit is not None
+
+
+def _apply_named_query_row_window(rows: list, reference: Any) -> list:
+    """Apply a Named Query reference's trailing OFFSET/LIMIT to ``rows``.
+
+    Bug-9398. Both are the CALLER's explicit intent, so neither sets the
+    ``truncated`` marker — that marker means "the SERVER capped you", which is
+    a different fact and one a BI client renders differently.
+
+    OFFSET is applied before LIMIT, matching SQL. Accepting an OFFSET without
+    applying it would silently return the WRONG ROWS, which is why the
+    recogniser refuses any tail shape this cannot honour rather than parsing
+    optimistically.
+
+    Returns ``rows`` UNCHANGED (the same object) when there is no window, so
+    the caller can tell "no window applied" from "window produced the same
+    rows" without recomputing.
+    """
+    offset, limit, has_window = _named_query_row_window(reference)
+    if not has_window:
+        return rows
+    out = rows[offset:] if offset else list(rows)
+    if limit is not None:
+        out = out[:limit]
+    return out
+
+
 async def _handle_named_query_reference(
     db: AsyncSession,
     body: ExecuteRequest,
     logical_query: LogicalQuery,
     *,
     ref_name: str,
+    reference: Any | None = None,
     persona: Any | None = None,
     principal: Any | None = None,
     user_identity: str = "",
@@ -4504,7 +5150,13 @@ async def _handle_named_query_reference(
 
     start_ms = time.monotonic()
 
-    exact_reference = named_query_reference_name(body.raw_query) is not None
+    # Bug-9398: the recogniser's verdict is computed ONCE at the step-1.6 seam
+    # and threaded here, so the shape that dispatched and the shape that is
+    # served can never be two different answers to the same question. The
+    # fallback re-derivation keeps the direct-call test surface working.
+    if reference is None:
+        reference = named_query_reference(body.raw_query)
+    exact_reference = reference is not None
 
     # --- An undeployed model has no deployed snapshot: no Named Queries are
     # defined, and any query against it fails with the same 409 the binder
@@ -4530,7 +5182,6 @@ async def _handle_named_query_reference(
         # Wrong object type: the name matches a named set/list (any kind).
         named_lists = await load_named_lists(body.model_id, db)
         if _key in named_lists:
-            _nl = named_lists[_key]
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=NamedQueryWrongType(
@@ -4572,6 +5223,27 @@ async def _handle_named_query_reference(
             )
         ).scalar_one_or_none()
 
+    # The Named Query handler can fail before the ordinary bound-query
+    # observation exists (for example while compiling the consumer's RLS
+    # predicate). Keep a small, eager observation model for those failures so
+    # the QueryLog row still carries the model and Named Query identities.
+    # ``model.project`` is deliberately not touched here: the model was loaded
+    # without relationship eager-loading and an async lazy load would turn a
+    # clean 4xx into a MissingGreenlet error while recording telemetry.
+    _nq_log_model = SimpleNamespace(
+        id=model.id,
+        display_name=getattr(model, "display_name", ""),
+        project_id=getattr(model, "project_id", None),
+        project=SimpleNamespace(display_name=""),
+    )
+    _nq_failure_bound = BoundQuery(
+        logical_query=logical_query,
+        model=_nq_log_model,
+        resolved_measures=[],
+        resolved_dimensions=[],
+        resolved_filters=[],
+    )
+
     # --- Security context (compiled RLS + CLS + persona default filters) ---
     _compiled_rls = None
     _rls_active = False
@@ -4580,10 +5252,10 @@ async def _handle_named_query_reference(
         try:
             _source_conn = await resolve_source_connection(body.model_id, db)
             _source_connector = await resolve_connector_type(_source_conn)
-        except Exception:
+        except Exception as exc:
             # F-007-22: never guess postgresql. A connector we cannot
             # prove would quote the security predicate in the wrong dialect.
-            raise HTTPException(
+            _mapped = HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={
                     "message": (
@@ -4593,6 +5265,21 @@ async def _handle_named_query_reference(
                     "error_type": "row_security_misconfigured",
                 },
             )
+            await _log_query_failure(
+                db,
+                user_identity,
+                tenant_id,
+                _nq_failure_bound,
+                None,
+                start_ms,
+                "row_security_misconfigured",
+                str(exc),
+                persona_id=persona.id if persona is not None else None,
+                client_kind=client_kind,
+                named_query_id=_nq_id,
+            )
+            _mapped._tessallite_failure_logged = True  # type: ignore[attr-defined]
+            raise _mapped
         try:
             _compiled_rls = await compile_row_security(
                 body.model_id, principal, db, connector=_source_connector,
@@ -4602,10 +5289,25 @@ async def _handle_named_query_reference(
             # with the same typed 422 every other surface raises (/execute,
             # /explain, /discover/members) — NEVER fall through to serving the
             # unfiltered materialised table.
-            raise HTTPException(
+            _mapped = HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=row_security_misconfigured_detail(e, surface="/named-query"),
             )
+            await _log_query_failure(
+                db,
+                user_identity,
+                tenant_id,
+                _nq_failure_bound,
+                None,
+                start_ms,
+                "row_security_misconfigured",
+                str(e),
+                persona_id=persona.id if persona is not None else None,
+                client_kind=client_kind,
+                named_query_id=_nq_id,
+            )
+            _mapped._tessallite_failure_logged = True  # type: ignore[attr-defined]
+            raise _mapped
         _rls_active = bool(
             _compiled_rls is not None
             and has_active_rules(_compiled_rls)
@@ -4760,7 +5462,19 @@ async def _handle_named_query_reference(
     # from a superseded contract fall back to live until rebuilt — no unsafe
     # grandfathering.
     serve_materialised = False
-    _skip_reason = "no_artifact"
+    # Bug-9166: distinguish "no artifact row at all" from "the artifact exists
+    # but is not fresh yet" (building / failed / refreshing). Both serve live
+    # and neither is a wrong number, but the caller-facing reason string read
+    # ``served live (no_artifact)`` for BOTH — telling an operator watching a
+    # first refresh that nothing was ever built. Only the freshness branch
+    # below re-laboured the label, so a present-but-unfresh artifact kept the
+    # initial value forever.
+    # L2-F8: two arms, not three. The old third arm ("fresh" -> "no_artifact")
+    # was unreachable dressed as a default — the fresh branch below overwrites
+    # ``_skip_reason`` on its first line.
+    _skip_reason = (
+        "no_artifact" if artifact is None else "artifact_not_fresh"
+    )
     _overdue = False
     if artifact is not None and artifact.status == "fresh":
         _skip_reason = "version_gate"
@@ -4853,6 +5567,8 @@ async def _handle_named_query_reference(
             user_identity=user_identity,
             tenant_id=tenant_id,
             skip_reason=_skip_reason,
+            reference=reference,
+            server_row_cap=server_row_cap,
         )
 
     # --- MATERIALISED: rewrite + serve the physical result table ---
@@ -4862,6 +5578,7 @@ async def _handle_named_query_reference(
             db, body, nq, _expanded_definition,
             persona=persona, principal=principal, user_identity=user_identity,
             tenant_id=tenant_id, skip_reason="target_missing",
+            reference=reference, server_row_cap=server_row_cap,
         )
     try:
         conn = await resolve_endpoint_connection(
@@ -4872,6 +5589,7 @@ async def _handle_named_query_reference(
             db, body, nq, _expanded_definition,
             persona=persona, principal=principal, user_identity=user_identity,
             tenant_id=tenant_id, skip_reason="cross_project_connection",
+            reference=reference, server_row_cap=server_row_cap,
         )
 
     connector = normalize_connection_type(conn.connection_type)
@@ -4949,6 +5667,7 @@ async def _handle_named_query_reference(
             db, body, nq, _expanded_definition,
             persona=persona, principal=principal, user_identity=user_identity,
             tenant_id=tenant_id, skip_reason="generation_changed",
+            reference=reference, server_row_cap=server_row_cap,
         )
     except Exception as exc:
         if _is_missing_relation_error(exc):
@@ -4957,8 +5676,74 @@ async def _handle_named_query_reference(
                 persona=persona, principal=principal,
                 user_identity=user_identity,
                 tenant_id=tenant_id, skip_reason="missing_table",
+                reference=reference, server_row_cap=server_row_cap,
             )
-        raise
+        # A materialised target failure is still a Named Query observation.
+        # Preserve the normal error mapping while writing exactly one
+        # attributed QueryLog row; the outer /execute wrapper sees the marker
+        # and therefore does not add a second, un-attributed row.
+        if isinstance(exc, ResultTooLargeError):
+            _error_type = "result_too_large"
+            _status_code = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+        elif isinstance(exc, QueryTimeoutError):
+            _error_type = "timeout"
+            _status_code = status.HTTP_408_REQUEST_TIMEOUT
+        elif isinstance(exc, HTTPException):
+            _error_type = _preexec_error_type(exc)
+            await _log_query_failure(
+                db,
+                user_identity,
+                tenant_id,
+                _nq_failure_bound,
+                decision,
+                start_ms,
+                _error_type,
+                str(exc.detail),
+                persona_id=persona.id if persona is not None else None,
+                client_kind=client_kind,
+                named_query_id=_nq_id,
+                named_query_fallback_reason=None,
+            )
+            exc._tessallite_failure_logged = True  # type: ignore[attr-defined]
+            raise
+        else:
+            _error_type = "execution_error"
+            _status_code = status.HTTP_502_BAD_GATEWAY
+        await _log_query_failure(
+            db,
+            user_identity,
+            tenant_id,
+            _nq_failure_bound,
+            decision,
+            start_ms,
+            _error_type,
+            str(exc),
+            persona_id=persona.id if persona is not None else None,
+            client_kind=client_kind,
+            named_query_id=_nq_id,
+            named_query_fallback_reason=None,
+        )
+        _mapped = HTTPException(
+            status_code=_status_code,
+            detail=(
+                str(exc)
+                if _status_code in (
+                    status.HTTP_408_REQUEST_TIMEOUT,
+                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                )
+                else sanitize_error_for_client(exc)
+            ),
+        )
+        _mapped._tessallite_failure_logged = True  # type: ignore[attr-defined]
+        raise _mapped
+
+    # Bug-9398: the reference's own trailing OFFSET/LIMIT is the caller's
+    # explicit intent, applied BEFORE the server cap (an OFFSET applied after a
+    # cap would skip rows the cap already removed). Applied here rather than
+    # pushed into the scan because the materialised leg is a plain
+    # ``SELECT * FROM <table>`` and the live leg must stay byte-identical to the
+    # deployed population — see _apply_named_query_row_window.
+    rows = _apply_named_query_row_window(rows, reference)
 
     # Honour the caller's row cap with honest truncation (same N+1 contract as
     # $KPIs and the ordinary route).
@@ -4967,8 +5752,6 @@ async def _handle_named_query_reference(
         _truncated = len(rows) > server_row_cap
         if _truncated:
             rows = rows[:server_row_cap]
-    elif logical_query.limit is not None and len(rows) > logical_query.limit:
-        rows = rows[: logical_query.limit]
 
     elapsed_ms = int((time.monotonic() - start_ms) * 1000)
 
@@ -5004,6 +5787,8 @@ async def _handle_named_query_reference(
         persona=persona,
         client_kind=client_kind,
         log_miss=False,
+        named_query_id=_nq_id,
+        named_query_fallback_reason=None,
     )
 
     return ExecuteResponse(
@@ -5023,6 +5808,47 @@ async def _handle_named_query_reference(
     )
 
 
+def _named_query_live_fetch_bound(
+    *,
+    offset: int,
+    limit: Optional[int],
+    server_row_cap: Optional[int],
+) -> Optional[int]:
+    """How many rows the LIVE dispatch must fetch to answer a windowed
+    reference exactly as the materialised leg would.
+
+    L2-F1. The materialised leg composes ``window THEN cap``: it reads the whole
+    physical table, applies the reference's OFFSET/LIMIT, and only then honours
+    the caller's row cap. The live leg's inner dispatch composes ``cap THEN
+    rows``, so handing it the caller's cap directly applied the window to
+    ALREADY-CAPPED rows — an OFFSET past the cap silently returned fewer rows,
+    or none at all.
+
+    The bound is therefore derived from what the WINDOW needs, not from the
+    caller's cap:
+
+    * a bounded window needs ``offset + limit`` rows and never more — the window
+      itself discards everything past that;
+    * an OFFSET-only window needs ``offset + cap + 1``: the cap bounds what the
+      caller may RECEIVE, and the extra row is the same N+1 truncation probe the
+      rest of the pipeline uses to tell "exactly the cap" from "more than it";
+    * with neither a LIMIT nor a cap there is nothing to bound — the same
+      unbounded read the materialised leg already performs.
+
+    This can exceed ``server_row_cap``, and must: the cap governs how many rows
+    the CALLER receives (re-applied after the window, exactly as the
+    materialised leg does), not how many the server may read to compute them.
+    Returns ``None`` for "no bound".
+    """
+    if limit is not None:
+        # ``LIMIT 0`` is a legal window (zero rows); ``row_limit`` is ``ge=1``,
+        # so fetch one row and let the window discard it.
+        return max(offset + limit, 1)
+    if server_row_cap is not None:
+        return offset + server_row_cap + 1
+    return None
+
+
 async def _execute_named_query_live(
     db: AsyncSession,
     body: ExecuteRequest,
@@ -5034,6 +5860,8 @@ async def _execute_named_query_live(
     user_identity: str,
     tenant_id: str,
     skip_reason: str,
+    reference: Any,
+    server_row_cap: Optional[int],
 ) -> ExecuteResponse:
     """The ONE live path: re-dispatch the EXPANDED deployed definition through
     the ordinary pipeline over its canonical SEMANTIC closure.
@@ -5050,7 +5878,31 @@ async def _execute_named_query_live(
     result MUST be the source route (load-bearing invariant): the canonical
     population is the definition-scoped source closure, identical to what the
     build materialised.
+
+    ``reference`` and ``server_row_cap`` (Bug-9398 / L2-F1) are REQUIRED, not
+    defaulted: a call site that forgot either would silently drop the caller's
+    trailing LIMIT/OFFSET or its row cap and return the wrong number of rows,
+    and there are five live-dispatch sites in this handler. The window is
+    applied to the RETURNED ROWS after dispatch — never folded into
+    ``_live_body``'s SQL, whose compiled population must stay a function of the
+    deployed definition alone.
+
+    ``row_limit`` is the ONE field the window touches, and only to widen the
+    inner fetch to what the window needs (see ``_named_query_live_fetch_bound``)
+    — it is already one of the four caller fields the canonical population
+    contract permits to carry over, so it cannot move the compiled population.
+    ``raw_query`` stays byte-identical to the expanded deployed definition.
     """
+    _window_offset, _window_limit, _has_window = _named_query_row_window(
+        reference
+    )
+    _live_row_limit = body.row_limit
+    if _has_window:
+        _live_row_limit = _named_query_live_fetch_bound(
+            offset=_window_offset,
+            limit=_window_limit,
+            server_row_cap=server_row_cap,
+        )
     _live_body = ExecuteRequest(
         model_id=body.model_id,
         raw_query=expanded_definition,
@@ -5060,19 +5912,51 @@ async def _execute_named_query_live(
         force_route=NQ_CANONICAL_FORCE_ROUTE,
         persona_id=body.persona_id,
         client_kind=body.client_kind,
-        row_limit=body.row_limit,
+        row_limit=_live_row_limit,
         session_vars=None,
         caption_dimensions=None,
     )
-    _response = await _handle_execute(
-        _live_body,
-        db,
-        user_identity,
-        principal=principal,
-        persona_id=persona.id if persona is not None else None,
-        persona=persona,
-        tenant_id=tenant_id,
-    )
+    try:
+        _live_named_query_id = uuid.UUID(str(nq.id))
+    except (TypeError, ValueError, AttributeError):
+        # Deployed Named Query definitions are UUID-backed. Keep the existing
+        # query response available if a malformed legacy snapshot reaches this
+        # seam, but never write an invalid value into the UUID QueryLog column.
+        _live_named_query_id = None
+    _live_start_ms = time.monotonic()
+    try:
+        _response = await _handle_execute(
+            _live_body,
+            db,
+            user_identity,
+            principal=principal,
+            persona_id=persona.id if persona is not None else None,
+            persona=persona,
+            tenant_id=tenant_id,
+            named_query_id=_live_named_query_id,
+            named_query_fallback_reason=skip_reason,
+        )
+    except HTTPException as exc:
+        # The outer /execute wrapper cannot see the Named Query context when a
+        # canonical live dispatch fails before its BoundQuery exists. Persist
+        # that pre-execution failure here, while preserving the shared marker
+        # so the outer request does not write a duplicate un-attributed row.
+        if not getattr(exc, "_tessallite_failure_logged", False):
+            await _log_preexec_failure(
+                db,
+                user_identity,
+                tenant_id,
+                _live_body.raw_query,
+                _live_body.protocol,
+                exc,
+                _live_start_ms,
+                persona_id=persona.id if persona is not None else None,
+                client_kind=_live_body.client_kind,
+                named_query_id=_live_named_query_id,
+                named_query_fallback_reason=skip_reason,
+            )
+            exc._tessallite_failure_logged = True  # type: ignore[attr-defined]
+        raise
     if _response.route_type != NQ_CANONICAL_FORCE_ROUTE:
         # Load-bearing: the canonical population IS the source route. Any
         # other route (aggregate/pocket/raw) would mean the live population
@@ -5105,6 +5989,34 @@ async def _execute_named_query_live(
             f": {_response.reason}" if getattr(_response, "reason", "") else ""
         )
     )
+    if not _has_window:
+        # No window: the inner dispatch already applied the caller's cap and
+        # its own honest truncation marker. Nothing to recompose.
+        return _response
+
+    # Bug-9398: apply the reference's trailing OFFSET/LIMIT to the rows the
+    # canonical dispatch returned. Doing it here (not in ``_live_body``'s SQL)
+    # is what keeps the two legs honest: the LIVE population stays byte-identical
+    # to what the refresh build materialises, so a windowed reference and an
+    # unwindowed one still agree about which rows EXIST — they differ only in
+    # how many of them the caller asked to see.
+    #
+    # L2-F1: window THEN cap, the SAME order as the materialised leg. The inner
+    # response's ``truncated``/``row_limit`` describe the WIDENED fetch bound
+    # this helper chose, not the caller's cap, so both are recomputed here
+    # against ``server_row_cap`` — otherwise a fetch bound that happened to bite
+    # would be reported to a BI client as "the server cut your result short"
+    # when the caller's own LIMIT is what bounded it.
+    _windowed = _apply_named_query_row_window(_response.rows, reference)
+    _truncated = False
+    if server_row_cap is not None:
+        _truncated = len(_windowed) > server_row_cap
+        if _truncated:
+            _windowed = _windowed[:server_row_cap]
+    _response.rows = _windowed
+    _response.rows_returned = len(_windowed)
+    _response.truncated = _truncated
+    _response.row_limit = server_row_cap
     return _response
 
 

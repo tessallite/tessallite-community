@@ -161,16 +161,23 @@ async def test_insert_refresh_sla_config_single_row():
 @pytest.mark.asyncio
 async def test_insert_data_quality_rules_round_trips():
     mid = uuid.uuid4()
-    snap = {"data_quality_rules": [
-        {
-            "id": str(uuid.uuid4()),
-            "name": "no_nulls",
-            "target_type": "column",
-            "target_id": str(uuid.uuid4()),
-            "rule_type": "not_null",
-            "severity": "warn",
-        },
-    ]}
+    # Bug-8950: a rehydrated DQ rule's (target_type, target_id) must resolve to
+    # a row present in the SAME snapshot, so the fixture carries the target
+    # column the rule references (a self-consistent same-model snapshot).
+    col_id = str(uuid.uuid4())
+    snap = {
+        "columns": [{"id": col_id, "column_name": "amount"}],
+        "data_quality_rules": [
+            {
+                "id": str(uuid.uuid4()),
+                "name": "no_nulls",
+                "target_type": "column",
+                "target_id": col_id,
+                "rule_type": "not_null",
+                "severity": "warn",
+            },
+        ],
+    }
     db = _capture_db()
     await _insert_data_quality_rules(mid, snap, db)
     assert len(db._captured) == 1

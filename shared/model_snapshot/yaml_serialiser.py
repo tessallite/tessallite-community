@@ -48,6 +48,7 @@ import yaml
 
 from shared.schemas.domains.aggregates_security import (
     DEFAULT_POPULATION_PARTICIPATION,
+    POPULATION_PARTICIPATION_SOURCE_DEFAULT,
 )
 
 
@@ -433,6 +434,12 @@ def _build_joins(
         participation = j.get("population_participation")
         if participation and participation != DEFAULT_POPULATION_PARTICIPATION:
             entry["population_participation"] = participation
+        # Provenance is model content too.  Preserve a non-default source even
+        # when its value is the compatibility participation token; otherwise a
+        # later introspection pass could overwrite an explicit manual choice.
+        source = j.get("population_participation_source")
+        if source and source != POPULATION_PARTICIPATION_SOURCE_DEFAULT:
+            entry["population_participation_source"] = source
         joins.append(entry)
     return sorted(joins, key=lambda x: (x.get("left", ""), x.get("right", "")))
 
@@ -466,6 +473,13 @@ def _build_measures(
             # evaluates at fact grain and then aggregates. Dropping it made the
             # re-imported measure compute something different from the one that
             # was exported.
+            #
+            # Emitted only when the snapshot carries an explicit mode. A measure
+            # with a NULL calc_agg_mode (predates the field) is deliberately
+            # exported WITHOUT calc_mode rather than fabricating a default the
+            # modeller never chose; the deserialiser then applies the documented
+            # historical default with a surfaced warning (Bug-9390), so the
+            # result-affecting assumption is visible instead of silent.
             if m.get("calc_agg_mode"):
                 entry["calc_mode"] = m["calc_agg_mode"]
 

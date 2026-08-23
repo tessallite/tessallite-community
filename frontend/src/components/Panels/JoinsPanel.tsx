@@ -661,11 +661,10 @@ export default function JoinsPanel() {
         )}
       </Box>
 
-      {/* Population governance rollup (Bug-8615 G2, contract invariant 6):
+      {/* Population governance rollup (Bug-8615 G5, contract invariant 6):
           a model's OK/WARNING/BLOCKED status is a first-class surfaced fact.
-          Warn-only in this phase — a BLOCKED status is reported, never
-          enforced. Hidden while loading/absent so an empty model (or one on
-          a build predating this feature) shows no banner at all. */}
+          Hidden while loading/absent so an empty model (or one on a build
+          predating this feature) shows no banner at all. */}
       {joinPopulationHealth.data && joinPopulationHealth.data.join_count > 0 && (
         <Alert
           severity={
@@ -696,10 +695,10 @@ export default function JoinsPanel() {
               {t("joins.populationHealthUnevaluated")}
             </Typography>
           )}
-          {joinPopulationHealth.data.warn_only &&
+          {!joinPopulationHealth.data.warn_only &&
             joinPopulationHealth.data.status === "BLOCKED" && (
               <Typography variant="caption" display="block" color="text.secondary">
-                {t("joins.populationHealthWarnOnly")}
+                {t("joins.populationHealthEnforced")}
               </Typography>
             )}
         </Alert>

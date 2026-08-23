@@ -194,3 +194,46 @@ async def resolve_served_kpis(
             )
         )
     return resolved, withheld
+
+
+async def resolve_served_filter_metadata(
+    db: AsyncSession, model: Model,
+) -> tuple[dict[str, str], dict[str, str]] | None:
+    """Return deployed dimension names and source types for request filters.
+
+    Request slicers are part of the served definition, so a deployed model
+    must resolve their ids from the same immutable snapshot as its KPIs.  The
+    live ``dimensions`` rows are deliberately not consulted in this branch:
+    an edited draft must not silently rename a deployed filter or turn an
+    unknown id into an unsliced query.  ``None`` means the model is
+    undeployed, in which case the builder-owned live draft remains the
+    authority.
+    """
+    snapshot = await _load_deployed_snapshot(db, model)
+    if snapshot is None:
+        return None
+
+    dimensions = snapshot.get("dimensions")
+    if not isinstance(dimensions, list):
+        raise KpiSnapshotInvalidError("The deployed dimension snapshot is malformed.")
+    columns = snapshot.get("columns") or []
+    if not isinstance(columns, list) or any(not isinstance(row, dict) for row in columns):
+        raise KpiSnapshotInvalidError("The deployed column snapshot is malformed.")
+    column_types = {
+        str(row.get("id")): str(row.get("data_type") or "").lower()
+        for row in columns
+        if row.get("id") is not None
+    }
+    names: dict[str, str] = {}
+    types: dict[str, str] = {}
+    for row in dimensions:
+        if not isinstance(row, dict) or not row.get("id") or not row.get("name"):
+            raise KpiSnapshotInvalidError(
+                "The deployed dimension snapshot contains an invalid row."
+            )
+        dimension_id = str(row["id"])
+        names[dimension_id] = str(row["name"])
+        source_column_id = row.get("source_column_id")
+        if source_column_id is not None:
+            types[dimension_id] = column_types.get(str(source_column_id), "")
+    return names, types

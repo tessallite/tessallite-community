@@ -15,6 +15,11 @@ SCOPE_CACHE_EVICT = "query-router.cache-evict"
 SCOPE_DATA_QUALITY = "query-router.data-quality"
 SCOPE_GLOSSARY_STATS_REFRESH = "optimizer.stats-refresh"
 SCOPE_KPI_EVALUATE = "model-service.kpi-evaluate"
+# The KPI evaluator crosses the model-service -> query-router boundary to
+# execute the already-bound KPI expression. Keep that hop as its own typed
+# capability; granting the model-service scope to query-router would make a
+# cross-service name imply permission in the wrong service.
+SCOPE_KPI_QUERY_EXECUTE = "query-router.kpi-execute"
 SCOPE_POCKET_REFRESH = "query-router.pocket-refresh"
 # Bug-8029: deploy/import-time predictive cold-start kickoff. Must match the
 # scope constant the optimizer's cold-start route enforces
@@ -63,7 +68,7 @@ _PRINCIPAL_POLICY = {
     },
     "kpi-snapshot-sweep": {
         "max_role": KPI_EVALUATOR_ROLE,
-        "scopes": frozenset({SCOPE_KPI_EVALUATE}),
+        "scopes": frozenset({SCOPE_KPI_EVALUATE, SCOPE_KPI_QUERY_EXECUTE}),
     },
     "model-service-deploy": {
         "max_role": "tenant_admin",

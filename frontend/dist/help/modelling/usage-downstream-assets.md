@@ -116,4 +116,4 @@ Shows which column each reference belongs to, how many times it was referenced, 
 
 ---
 
-← [Data Quality Rules](data-quality-rules.md) | [Home](../index.md) | [Named Lists →](named-sets.md)
+← [Data Quality Rules](data-quality-rules.md) | [Home](../index.md) | [Named Queries →](named-queries.md)

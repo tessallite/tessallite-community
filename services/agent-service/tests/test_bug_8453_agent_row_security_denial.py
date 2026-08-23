@@ -14,6 +14,10 @@ codebase keeps hitting:
 """
 from __future__ import annotations
 
+import ast
+from dataclasses import dataclass
+from pathlib import Path
+
 import pytest
 
 from shared.security.execute_contract import ROW_SECURITY_DENY_ALL_RULE_ID
@@ -180,7 +184,10 @@ async def _execute_with_payload(payload, **kw):
     )
     with patch("src.exec.query.httpx.AsyncClient", _wire_client(payload)):
         return await execute_query(
-            db, call, "jwt", allowed_model_ids={_MODEL}, **kw
+            db, call, "jwt",
+            allowed_model_ids={_MODEL},
+            persona_scopes=None,
+            **kw,
         )
 
 
@@ -312,27 +319,345 @@ def test_recipe_denial_names_the_permissions_restriction():
     assert "not an absence of data" in denial_msg.lower()
 
 
-def test_every_execute_query_call_site_is_accounted_for():
-    """The enumeration that was wrong three times, made mechanical for this
-    module: any NEW execute_query call site must either opt in explicitly (and
-    therefore have a denial-rendering path) or inherit the chokepoint refusal.
-    A silent third state is what produced the compound/recipe gap."""
-    import inspect
-    import re
+@dataclass(frozen=True)
+class _ExecuteQueryCallSite:
+    path: str
+    line: int
+    enclosing: tuple[str, ...]
+    keywords: frozenset[str]
 
-    import src.pipeline as pipeline
-    import src.exec.recipe as recipe
 
-    sites = 0
-    opted_in = 0
-    for mod in (pipeline, recipe):
-        text = inspect.getsource(mod)
-        for m in re.finditer(r"await execute_query\((.*?)\n        \)", text, re.S):
-            sites += 1
-            if "allow_row_security_denial=True" in m.group(1):
-                opted_in += 1
-    assert sites >= 3, f"expected the 3 known call sites, found {sites}"
-    assert opted_in == 1, (
-        f"exactly ONE call site (the direct-query path, which narrates the "
-        f"denial) may opt out of the chokepoint refusal; found {opted_in}"
+class _ExecuteQueryScanError(RuntimeError):
+    """The caller guard cannot prove the production call graph."""
+
+
+_EXECUTE_QUERY_MODULE = ("src", "exec", "query")
+_EXECUTE_QUERY_SYMBOL = _EXECUTE_QUERY_MODULE + ("execute_query",)
+
+# The inventory is a release guard, not a best-effort static analyser.  The
+# only production imports that are allowed to establish an execute_query
+# binding are the two files whose callers are explicitly listed below.  A
+# module-qualified import, alias, re-export, container, or getattr indirection
+# is rejected even when a human could resolve it: silently accepting a new
+# shape would let an un-inventoried caller bypass the persona-scope contract.
+_SANCTIONED_EXECUTE_QUERY_FILES = frozenset({"pipeline.py", "exec/recipe.py"})
+
+
+def _module_for_path(root: Path, path: Path) -> tuple[str, ...]:
+    relative = path.relative_to(root).with_suffix("")
+    parts = relative.parts
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ("src",) + parts
+
+
+def _resolve_relative_import(
+    current_module: tuple[str, ...], node: ast.ImportFrom,
+) -> tuple[str, ...] | None:
+    if node.level == 0:
+        if not node.module:
+            return None
+        return tuple(node.module.split("."))
+    package = list(current_module[:-1])
+    if node.level - 1 > len(package):
+        return None
+    package = package[: len(package) - (node.level - 1)]
+    if node.module:
+        package.extend(node.module.split("."))
+    return tuple(package)
+
+
+def _raise_scan(path: Path, node: ast.AST, detail: str) -> None:
+    raise _ExecuteQueryScanError(
+        f"{detail} in {path}:{getattr(node, 'lineno', '?')}"
     )
+
+
+def _check_execute_query_imports(
+    tree: ast.Module,
+    current_module: tuple[str, ...],
+    *,
+    path: Path,
+) -> None:
+    """Reject every import shape except the two direct production imports."""
+    relative_path = path.as_posix()
+    direct_allowed = relative_path in _SANCTIONED_EXECUTE_QUERY_FILES
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported = tuple(alias.name.split("."))
+                if imported == _EXECUTE_QUERY_MODULE:
+                    _raise_scan(
+                        path,
+                        node,
+                        "module-qualified execute_query import is not allowed",
+                    )
+                if imported[: len(_EXECUTE_QUERY_MODULE)] == _EXECUTE_QUERY_MODULE:
+                    _raise_scan(
+                        path,
+                        node,
+                        "ambiguous execute_query module import is not allowed",
+                    )
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        imported_module = _resolve_relative_import(current_module, node)
+        if imported_module is None:
+            _raise_scan(path, node, "unresolvable import")
+        for alias in node.names:
+            if alias.name == "*":
+                _raise_scan(path, node, "star import cannot resolve execute_query")
+            if alias.name == "execute_query":
+                if (
+                    imported_module != _EXECUTE_QUERY_MODULE
+                    or not direct_allowed
+                    or alias.asname is not None
+                ):
+                    _raise_scan(
+                        path,
+                        node,
+                        "execute_query aliases/re-exports are not allowed",
+                    )
+                continue
+            if imported_module == ("src", "exec") and alias.name == "query":
+                _raise_scan(
+                    path,
+                    node,
+                    "module-qualified execute_query import is not allowed",
+                )
+
+
+class _ExecuteQueryCallVisitor(ast.NodeVisitor):
+    def __init__(
+        self,
+        *,
+        path: Path,
+        direct_allowed: bool,
+    ) -> None:
+        self.path = path
+        self.direct_allowed = direct_allowed
+        self.enclosing: list[str] = []
+        self.calls: list[_ExecuteQueryCallSite] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.enclosing.append(node.name)
+        self.generic_visit(node)
+        self.enclosing.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.enclosing.append(node.name)
+        self.generic_visit(node)
+        self.enclosing.pop()
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Name) and node.func.id == "execute_query":
+            if not self.direct_allowed:
+                _raise_scan(self.path, node, "unauthorized execute_query caller")
+            self.calls.append(
+                _ExecuteQueryCallSite(
+                    path=self.path.as_posix(),
+                    line=node.lineno,
+                    enclosing=tuple(self.enclosing),
+                    keywords=frozenset(
+                        keyword.arg if keyword.arg is not None else "**"
+                        for keyword in node.keywords
+                    ),
+                )
+            )
+            # Do not visit the direct function name again, but inspect every
+            # argument: passing the callable onward is indirection, not a
+            # caller that the inventory can certify.
+            for argument in node.args:
+                self.visit(argument)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
+            return
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "execute_query":
+            _raise_scan(
+                self.path,
+                node,
+                "qualified execute_query call is not allowed",
+            )
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "execute_query"
+        ):
+            _raise_scan(
+                self.path,
+                node,
+                "getattr execute_query indirection is not allowed",
+            )
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id == "execute_query":
+            _raise_scan(
+                self.path,
+                node,
+                "execute_query callable indirection is not allowed",
+            )
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr == "execute_query":
+            _raise_scan(
+                self.path,
+                node,
+                "qualified execute_query reference is not allowed",
+            )
+        self.generic_visit(node)
+
+
+def _scan_execute_query_callers(root: Path) -> list[_ExecuteQueryCallSite]:
+    """Find every production execute_query call through static AST binding.
+
+    This intentionally scans the complete agent-service ``src`` tree instead
+    of a hand-picked pair of modules. UTF-8-sig accommodates Windows-authored
+    files, and parse/import/binding ambiguity raises rather than certifying a
+    potentially missed caller.
+    """
+    calls: list[_ExecuteQueryCallSite] = []
+    for path in sorted(root.rglob("*.py")):
+        try:
+            source = path.read_text(encoding="utf-8-sig")
+            tree = ast.parse(source, filename=str(path))
+        except (OSError, SyntaxError, UnicodeError) as exc:
+            raise _ExecuteQueryScanError(
+                f"cannot parse production file {path}: {exc}"
+            ) from exc
+        current_module = _module_for_path(root, path)
+        relative_path = path.relative_to(root)
+        _check_execute_query_imports(
+            tree,
+            current_module,
+            path=relative_path,
+        )
+        visitor = _ExecuteQueryCallVisitor(
+            path=relative_path,
+            direct_allowed=relative_path.as_posix()
+            in _SANCTIONED_EXECUTE_QUERY_FILES,
+        )
+        visitor.visit(tree)
+        calls.extend(visitor.calls)
+    return calls
+
+
+_SANCTIONED_EXECUTE_QUERY_CALLERS = {
+    ("pipeline.py", "run_turn"): "direct",
+    ("pipeline.py", "_run_compound_query_branch"): "compound",
+    ("exec/recipe.py", "execute_recipe"): "recipe",
+}
+
+
+def test_every_execute_query_call_site_is_accounted_for():
+    """The repository-wide AST inventory protects the shared chokepoint.
+
+    Every current caller must carry the local ProjectPersona-derived
+    ``persona_scopes`` keyword and must not carry the project-persona UUID as
+    query-router's model ``persona_id``. The direct caller is the only one that
+    may render a row-security denial; compound and recipe remain fail-closed.
+    """
+    root = Path(__file__).resolve().parents[1] / "src"
+    calls = _scan_execute_query_callers(root)
+    actual = {(site.path, site.enclosing[-1]) for site in calls}
+    assert actual == set(_SANCTIONED_EXECUTE_QUERY_CALLERS), (
+        "execute_query caller inventory drifted: "
+        f"expected {sorted(_SANCTIONED_EXECUTE_QUERY_CALLERS)}, found {sorted(actual)}"
+    )
+    assert len(calls) == len(_SANCTIONED_EXECUTE_QUERY_CALLERS)
+    for site in calls:
+        assert "persona_scopes" in site.keywords, (
+            f"{site.path}:{site.line} must pass persona_scopes explicitly"
+        )
+        assert "persona_id" not in site.keywords, (
+            f"{site.path}:{site.line} must not pass a project-persona UUID to "
+            "query-router's model persona_id"
+        )
+    direct = next(
+        site for site in calls
+        if (site.path, site.enclosing[-1]) == ("pipeline.py", "run_turn")
+    )
+    assert "allow_row_security_denial" in direct.keywords
+    for site in calls:
+        if site is not direct:
+            assert "allow_row_security_denial" not in site.keywords
+
+
+def _write_scan_fixture(root: Path, source: str) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "fixture.py").write_text(source, encoding="utf-8-sig")
+
+
+def test_execute_query_ast_scan_fails_closed_on_alias_indirection(tmp_path):
+    """Mutation fixtures must never create an un-inventoried caller.
+
+    The old resolver followed only bindings visible in one file.  These
+    mutations are deliberately shaped like the cross-module re-export,
+    wrapper alias, callable-container, and getattr patterns that can hide a
+    new production caller from a local AST walk.  The guard rejects each
+    shape before it can be certified.
+    """
+    cases = {
+        "cross_file_reexport": {
+            "bridge.py": "from src.exec.query import execute_query as forwarded\n",
+            "caller.py": (
+                "from bridge import forwarded as run_query\n"
+                "async def caller(db, call, token, scopes):\n"
+                "    return await run_query(db, call, token, persona_scopes=scopes)\n"
+            ),
+        },
+        "wrapper_alias": {
+            "fixture.py": (
+                "from src.exec.query import execute_query as run_query\n"
+                "async def wrapper(db, call, token, scopes):\n"
+                "    return await run_query(db, call, token, persona_scopes=scopes)\n"
+            ),
+        },
+        "callable_container": {
+            # ``pipeline.py`` is the only fixture path allowed to import the
+            # callable directly; the visitor must still reject storing it.
+            "pipeline.py": (
+                "from src.exec.query import execute_query\n"
+                "handlers = [execute_query]\n"
+            ),
+        },
+        "getattr": {
+            "fixture.py": (
+                "query_module = object()\n"
+                "handler = getattr(query_module, 'execute_query')\n"
+            ),
+        },
+    }
+    for name, files in cases.items():
+        root = tmp_path / name
+        for relative, source in files.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source, encoding="utf-8-sig")
+        with pytest.raises(_ExecuteQueryScanError, match="execute_query"):
+            _scan_execute_query_callers(root)
+
+
+def test_execute_query_ast_scan_fails_closed_on_parse_or_import_ambiguity(tmp_path):
+    _write_scan_fixture(
+        tmp_path / "bad_parse",
+        "async def broken(:\n    pass\n",
+    )
+    with pytest.raises(_ExecuteQueryScanError, match="cannot parse"):
+        _scan_execute_query_callers(tmp_path / "bad_parse")
+
+    _write_scan_fixture(
+        tmp_path / "bad_import",
+        """
+from src.exec.query import *
+
+async def hidden_call(db, call, token, scopes):
+    return await execute_query(db, call, token, persona_scopes=scopes)
+""",
+    )
+    with pytest.raises(_ExecuteQueryScanError, match="star import"):
+        _scan_execute_query_callers(tmp_path / "bad_import")

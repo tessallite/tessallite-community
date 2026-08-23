@@ -51,13 +51,18 @@ vi.mock("./client", () => ({
   dataTagsApi: {},
   dimensionsApi: {},
   downstreamAssetsApi: {},
-  hierarchiesApi: {},
+  hierarchiesApi: {
+    listWithLevels: vi.fn(() => Promise.resolve([])),
+    listLevels: vi.fn(() => Promise.resolve([])),
+  },
   impactScanApi: {},
   joinsApi: {},
   llmConfigsApi: {},
   logsApi: {},
   measuresApi: {},
-  modelTablesApi: {},
+  modelTablesApi: {
+    listWithAttributes: vi.fn(() => Promise.resolve([])),
+  },
   optimizerApiClient: {},
   personasApi: {},
   namedQueriesApi: {
@@ -108,12 +113,14 @@ import {
   useModels,
   useModel,
   useSources,
+  useAllModelTables,
   useFieldCompatibility,
   useAIOptimizerRuns,
   useNamedQueries,
   useNamedQueryCaps,
+  useHierarchiesWithLevels,
 } from "./hooks";
-import { aiOptimizerApi, fieldCompatibilityApi } from "./client";
+import { aiOptimizerApi, fieldCompatibilityApi, modelTablesApi, hierarchiesApi } from "./client";
 
 function createWrapper() {
   const qc = new QueryClient({
@@ -232,6 +239,76 @@ describe("React Query hooks", () => {
       });
       expect(result.current.fetchStatus).toBe("idle");
     });
+  });
+
+  describe("useAllModelTables", () => {
+    it("uses one model-scoped batch request and hydrates attribute caches (Bug-9158)", async () => {
+      const table = {
+        id: "table-1",
+        model_id: "m-1",
+        source_id: "source-1",
+        table_type: "dim_detail",
+        physical_name: "public.customers",
+        alias: "customers",
+        display_name: "Customers",
+        row_count_estimate: null,
+        last_stats_at: null,
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      };
+      const attributes = [{
+        kind: "physical" as const,
+        id: "column-1",
+        table_id: "table-1",
+        name: "customer_id",
+        data_type: "uuid",
+        is_user_defined: false,
+        validated: null,
+        validation_error: null,
+      }];
+      vi.mocked(modelTablesApi.listWithAttributes).mockResolvedValueOnce([
+        { table, attributes },
+      ]);
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      const wrapper = ({ children }: { children: React.ReactNode }) =>
+        React.createElement(QueryClientProvider, { client: queryClient }, children);
+
+      const { result } = renderHook(
+        () => useAllModelTables("p-1", "m-1", ["source-1"]),
+        { wrapper },
+      );
+
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(modelTablesApi.listWithAttributes).toHaveBeenCalledTimes(1);
+      expect(modelTablesApi.listWithAttributes).toHaveBeenCalledWith("p-1", "m-1");
+      expect(result.current.data).toEqual([table]);
+      expect(queryClient.getQueryData([
+        "allModelTables", "p-1", "m-1", ["source-1"],
+      ])).toEqual([{ table, attributes }]);
+      expect(queryClient.getQueryData([
+        "tableAttributes", "p-1", "m-1", "table-1",
+      ])).toEqual(attributes);
+    });
+  });
+
+  it("Bug-9158 opens a model without per-hierarchy level requests", async () => {
+    const rows = [
+      { id: "h-1", model_id: "m-1", name: "Date", type: "explicit", dimension_kind: "time", description: null, calendar_type: null, fiscal_year_start_month: null, levels: [{ id: "l-1", name: "Year", ordinal: 0, key_attribute: { id: "a-1", name: "year", table_id: "t-1", table_name: "dates", data_type: "int", source: "physical_column" }, attributes: [], description: null, time_unit: "year", allowed_time_calcs: [] }], created_at: "2026-01-01", updated_at: "2026-01-01" },
+      { id: "h-2", model_id: "m-1", name: "Geo", type: "explicit", dimension_kind: "geo", description: null, calendar_type: null, fiscal_year_start_month: null, levels: [], created_at: "2026-01-01", updated_at: "2026-01-01" },
+    ];
+    vi.mocked(hierarchiesApi.listWithLevels).mockResolvedValueOnce(rows as never);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: React.ReactNode }) =>
+      React.createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useHierarchiesWithLevels("p-1", "m-1"), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(hierarchiesApi.listWithLevels).toHaveBeenCalledTimes(1);
+    expect(hierarchiesApi.listLevels).not.toHaveBeenCalled();
+    expect(result.current.data?.[0].levels).toHaveLength(1);
+    expect(queryClient.getQueryData(["hierarchyLevels", "p-1", "m-1", "h-1"]))
+      .toEqual(rows[0].levels);
   });
 
   describe("useFieldCompatibility", () => {

@@ -136,7 +136,7 @@ describe("JoinsPanel population participation (Bug-8615 G2)", () => {
       evaluated_count: 1,
       warning_count: 1,
       blocked_count: 0,
-      warn_only: true,
+      warn_only: false,
       items: [
         {
           join_id: "join-1",

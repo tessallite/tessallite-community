@@ -14,6 +14,8 @@ from ..measure_formats import (
     TIME_VARIANT_NAMES as _TIME_VARIANT_NAMES,
 )
 
+from shared.model_defaults import DEFAULT_INCLUDE_ALL_MEASURES
+
 from ._base import OrmBase
 from .tenants_projects import _validate_non_sensitive_config, redact_config_bag
 
@@ -36,7 +38,9 @@ class ModelCreate(BaseModel):
     description: Optional[str] = None
     refresh_strategy: str = "scheduled"
     aggregations_enabled: bool = True
-    include_all_measures: bool = True
+    # Bug-9409 (F-102-26 = A): all-measure aggregates are an explicit opt-in.
+    # See shared/model_defaults.py.
+    include_all_measures: bool = DEFAULT_INCLUDE_ALL_MEASURES
     max_aggregates: int = 50
     miss_threshold_daily: int = 3
     miss_threshold_weekly: int = 5
@@ -290,6 +294,9 @@ class CalendarTableResponse(OrmBase):
     created_at: datetime
     updated_at: datetime
     auto_created_aliases: list[str] = []
+    # Present only for server-created reversible history. The client may carry
+    # the opaque token to undo/redo, but never supplies authoritative metadata.
+    history_provenance: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +348,9 @@ class DataTargetResponse(OrmBase):
 # Model Table
 # ---------------------------------------------------------------------------
 
+ModelTableClassification = Literal["fact", "dim_aggregate", "dim_detail"]
+
+
 class ModelTableCreate(BaseModel):
     """Body for ``POST .../models/{model_id}/sources/{source_id}/tables``.
 
@@ -365,7 +375,7 @@ class ModelTableCreate(BaseModel):
     # value (e.g. "Fact") persisted as a raw str bypasses the one-fact-per-model
     # cap, which compares exactly to FACT_TABLE_TYPE ("fact") — a direct API
     # client could persist a second fact-like table. Reject with 422 instead.
-    table_type: Literal["fact", "dim_aggregate", "dim_detail"] = Field(
+    table_type: ModelTableClassification = Field(
         description="fact | dim_aggregate | dim_detail"
     )
     physical_name: str = Field(max_length=512)
@@ -376,7 +386,7 @@ class ModelTableCreate(BaseModel):
 
 class ModelTableUpdate(BaseModel):
     # F-013-08 (Bug-9118): same enum guard as create; None leaves it unchanged.
-    table_type: Optional[Literal["fact", "dim_aggregate", "dim_detail"]] = None
+    table_type: Optional[ModelTableClassification] = None
     alias: Optional[str] = None
     display_name: Optional[str] = None
     description: Optional[str] = None
@@ -397,5 +407,4 @@ class ModelTableResponse(OrmBase):
     calendar_table_id: Optional[uuid.UUID] = None
     created_at: datetime
     updated_at: datetime
-
 

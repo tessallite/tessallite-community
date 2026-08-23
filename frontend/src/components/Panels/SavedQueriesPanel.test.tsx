@@ -12,10 +12,11 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 
 const deleteMock = vi.fn();
 const confirmMock = vi.fn();
+const createMock = vi.fn();
 
 vi.mock("../../api/client", () => ({
   savedQueriesApi: {
-    create: vi.fn(),
+    create: (...args: unknown[]) => createMock(...args),
     update: vi.fn(),
     delete: (...args: unknown[]) => deleteMock(...args),
   },
@@ -30,6 +31,9 @@ const queriesData = [
     query_text: "SELECT 1",
     query_type: "sql",
     created_by: "owner@example.com",
+    is_shared: true,
+    is_owner: true,
+    can_edit: true,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
   },
@@ -62,6 +66,7 @@ describe("SavedQueriesPanel", () => {
   beforeEach(() => {
     deleteMock.mockReset();
     confirmMock.mockReset();
+    createMock.mockReset();
   });
 
   it("asks for confirmation before deleting and does nothing on cancel", async () => {
@@ -103,5 +108,30 @@ describe("SavedQueriesPanel", () => {
         "Only the query owner or a modeler can modify this saved query",
       ),
     ).toBeInTheDocument();
+  });
+
+  it("shows shared state and lets a new query default personal or opt in", async () => {
+    createMock.mockResolvedValue(undefined);
+    renderPanel();
+
+    expect(screen.getByText("Shared")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "New" }));
+    const share = screen.getByRole("checkbox", {
+      name: "Share with everyone who can access this model",
+    });
+    expect(share).not.toBeChecked();
+
+    await userEvent.type(screen.getByLabelText("Name"), "My query");
+    await userEvent.type(screen.getByLabelText("SQL"), "SELECT 1");
+    await userEvent.click(share);
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(createMock).toHaveBeenCalledWith(
+        "proj-1",
+        "model-1",
+        expect.objectContaining({ is_shared: true }),
+      ),
+    );
   });
 });

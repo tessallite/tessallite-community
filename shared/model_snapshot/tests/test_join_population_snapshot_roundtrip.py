@@ -71,6 +71,18 @@ def test_the_serialiser_emits_the_field():
     assert row["population_participation"] == "enrichment_only"
 
 
+def test_g4_sol_r1_b01_serialiser_emits_participation_provenance():
+    join = Join(
+        id=uuid.uuid4(), model_id=uuid.uuid4(),
+        left_table_id=uuid.uuid4(), right_table_id=uuid.uuid4(),
+        left_column_id=uuid.uuid4(), right_column_id=uuid.uuid4(),
+        join_type="left", population_participation="preserve_base_rows",
+        population_participation_source="manual",
+    )
+    row = _row_to_dict(join, exclude=("created_at", "updated_at"))
+    assert row["population_participation_source"] == "manual"
+
+
 @pytest.mark.asyncio
 async def test_a_declared_value_is_restored_verbatim():
     db = _capture_db()
@@ -81,6 +93,20 @@ async def test_a_declared_value_is_restored_verbatim():
         db,
     )
     assert db._captured[0]["population_participation"] == "population_defining"
+
+
+@pytest.mark.asyncio
+async def test_g4_sol_r1_b01_manual_provenance_is_restored_verbatim():
+    db = _capture_db()
+    await _insert_joins(
+        uuid.uuid4(),
+        {"joins": [_snapshot_join(
+            population_participation="preserve_base_rows",
+            population_participation_source="manual",
+        )]},
+        db,
+    )
+    assert db._captured[0]["population_participation_source"] == "manual"
 
 
 @pytest.mark.asyncio

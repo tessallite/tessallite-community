@@ -9,7 +9,7 @@ import httpx
 from fastapi import HTTPException
 
 from shared.auth.middleware import CurrentEmbedUser, CurrentUser
-from src.auth.local_backend import decode_access_token
+from src.auth.local_backend import create_embed_token, decode_access_token
 from src.auth.middleware import get_current_user, require_tenant_admin
 from src.main import app
 
@@ -20,6 +20,7 @@ _PERSONA_UUID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 _MODEL_UUID_1 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 _MODEL_UUID_2 = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 _PROJECT_UUID = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+_PROJECT_PERSONA_UUID = "99999999-9999-9999-9999-999999999999"
 
 
 def _admin_user(tenant_id: str = "acme") -> CurrentUser:
@@ -42,7 +43,12 @@ def _system_admin() -> CurrentUser:
 
 async def _fake_tenant_db(tenant_id: str = ""):
     db = AsyncMock()
+    db.add = MagicMock()
     db.commit = AsyncMock()
+    db.flush = AsyncMock()
+    audit_result = MagicMock()
+    audit_result.scalar_one_or_none.return_value = None
+    db.execute = AsyncMock(return_value=audit_result)
     yield db
 
 
@@ -53,10 +59,16 @@ async def _fake_tenant_db_with_scope(tenant_id: str = ""):
     unknowns, so the embed-token scope validation can verify existence.
     """
     db = AsyncMock()
+    db.add = MagicMock()
     db.commit = AsyncMock()
+    db.flush = AsyncMock()
+    audit_result = MagicMock()
+    audit_result.scalar_one_or_none.return_value = None
+    db.execute = AsyncMock(return_value=audit_result)
 
     _known: dict[str, set[str]] = {
         "Persona": {_PERSONA_UUID},
+        "ProjectPersona": {_PROJECT_PERSONA_UUID},
         "Project": {_PROJECT_UUID},
         "Model": {_MODEL_UUID_1, _MODEL_UUID_2},
     }
@@ -71,6 +83,8 @@ async def _fake_tenant_db_with_scope(tenant_id: str = ""):
             if cls_name == "Persona":
                 # Bug-8253: the persona belongs to model M1 (project P).
                 obj.model_id = _uuid.UUID(_MODEL_UUID_1)
+            if cls_name == "ProjectPersona":
+                obj.project_id = _uuid.UUID(_PROJECT_UUID)
             return obj
         return None
 
@@ -86,7 +100,12 @@ _MODEL_UUID_3 = "ffffffff-ffff-ffff-ffff-ffffffffffff"
 async def _fake_tenant_db_persona_scope(tenant_id: str = ""):
     """Fake tenant DB for Bug-8253: persona belongs to M1/P1; M3 is in P2."""
     db = AsyncMock()
+    db.add = MagicMock()
     db.commit = AsyncMock()
+    db.flush = AsyncMock()
+    audit_result = MagicMock()
+    audit_result.scalar_one_or_none.return_value = None
+    db.execute = AsyncMock(return_value=audit_result)
 
     async def _get(model_cls, pk):
         cls_name = model_cls.__name__
@@ -110,6 +129,11 @@ async def _fake_tenant_db_persona_scope(tenant_id: str = ""):
             obj = MagicMock()
             obj.id = pk
             return obj
+        if cls_name == "ProjectPersona" and pk_s == _PROJECT_PERSONA_UUID:
+            obj = MagicMock()
+            obj.id = pk
+            obj.project_id = _uuid.UUID(_PROJECT_UUID)
+            return obj
         return None
 
     db.get = _get
@@ -119,7 +143,7 @@ async def _fake_tenant_db_persona_scope(tenant_id: str = ""):
 async def _fake_system_db():
     db = AsyncMock()
     # Return a fake tenant for the SystemTenant lookup
-    result = AsyncMock()
+    result = MagicMock()
     result.scalar_one_or_none.return_value = AsyncMock(slug="acme", id="fake-id")
     db.execute = AsyncMock(return_value=result)
     yield db
@@ -194,21 +218,39 @@ class TestMintEmbedToken:
     @patch("src.api.embed.get_tenant_db", new=_fake_tenant_db_with_scope)
     async def test_scoped_embed_token(self, admin_client):
         # Bug-5943: scope IDs must be valid UUIDs that exist in the tenant DB.
-        resp = await admin_client.post(URL, json={
-            "tenant_id": "acme",
-            "user_identity": "limited@customer.com",
-            "persona_id": _PERSONA_UUID,
-            "model_ids": [_MODEL_UUID_1, _MODEL_UUID_2],
-            "capabilities": ["chat"],
-            "expiry_minutes": 60,
-        })
+        # Bug-9196/F01: model Personas and agent ProjectPersonas are distinct
+        # namespaces. The signed embed token carries both claims separately so
+        # query-router keeps consuming ``persona_id`` while agent-service uses
+        # only ``project_persona_id``.
+        with patch("src.api.embed.emit_webhook", AsyncMock()):
+            resp = await admin_client.post(URL, json={
+                "tenant_id": "acme",
+                "user_identity": "limited@customer.com",
+                "persona_id": _PERSONA_UUID,
+                "project_persona_id": _PROJECT_PERSONA_UUID,
+                "project_ids": [_PROJECT_UUID],
+                "model_ids": [_MODEL_UUID_1, _MODEL_UUID_2],
+                "capabilities": ["chat"],
+                "expiry_minutes": 60,
+            })
         assert resp.status_code == 200
         data = resp.json()
         payload = decode_access_token(data["token"])
         assert payload["persona_id"] == _PERSONA_UUID
+        assert payload["project_persona_id"] == _PROJECT_PERSONA_UUID
+        assert payload["project_ids"] == [_PROJECT_UUID]
         assert payload["model_ids"] == [_MODEL_UUID_1, _MODEL_UUID_2]
         assert payload["capabilities"] == ["chat"]
+        assert data["scope"]["persona_id"] == _PERSONA_UUID
+        assert data["scope"]["project_persona_id"] == _PROJECT_PERSONA_UUID
         assert data["scope"]["expiry_minutes"] == 60
+
+        from shared.auth.middleware import _build_user_from_payload
+
+        user = _build_user_from_payload(payload)
+        assert isinstance(user, CurrentEmbedUser)
+        assert user.persona_id == _PERSONA_UUID
+        assert user.project_persona_id == _PROJECT_PERSONA_UUID
 
     @patch("src.api.embed.get_tenant_db", new=_fake_tenant_db_with_scope)
     async def test_nonexistent_model_rejected(self, admin_client):
@@ -384,6 +426,62 @@ class TestEmbedRlsSubject:
 
 
 class TestEmbedTokenMiddleware:
+    @pytest.mark.asyncio
+    async def test_signed_embed_token_keeps_model_and_project_personas_distinct(self):
+        """Bug-9196/F01: exercise the real signer, decoder, and QR resolver.
+
+        ``persona_id`` remains the model-service/query-router Persona claim;
+        ``project_persona_id`` is the only claim that can lock an agent
+        ProjectPersona.  A legacy signed token has no project claim and must
+        therefore leave the agent side unbound.
+        """
+        from shared.auth.middleware import _build_user_from_payload
+        from shared.security.persona_resolver import resolve_effective_persona
+
+        model_persona_id = _PERSONA_UUID
+        project_persona_id = _PROJECT_PERSONA_UUID
+        assert model_persona_id != project_persona_id
+        token, _ = create_embed_token(
+            user_identity="signed-viewer@customer.com",
+            tenant_id="acme",
+            persona_id=model_persona_id,
+            project_persona_id=project_persona_id,
+        )
+        payload = decode_access_token(token)
+        user = _build_user_from_payload(payload)
+        assert user.persona_id == model_persona_id
+        assert user.project_persona_id == project_persona_id
+
+        sentinel = object()
+        loader = AsyncMock(return_value=sentinel)
+        db = AsyncMock()
+        with patch(
+            "shared.security.persona_resolver.load_persona_or_fail",
+            new=loader,
+        ):
+            resolved = await resolve_effective_persona(
+                db,
+                current_user=user,
+                model_id=_uuid.UUID(_MODEL_UUID_1),
+                requested_persona_id=None,
+            )
+        assert resolved is sentinel
+        loader.assert_awaited_once_with(
+            db,
+            model_persona_id,
+            _uuid.UUID(_MODEL_UUID_1),
+        )
+
+        legacy_token, _ = create_embed_token(
+            user_identity="legacy-viewer@customer.com",
+            tenant_id="acme",
+            persona_id=model_persona_id,
+        )
+        legacy_payload = decode_access_token(legacy_token)
+        legacy_user = _build_user_from_payload(legacy_payload)
+        assert legacy_user.persona_id == model_persona_id
+        assert legacy_user.project_persona_id is None
+
     def test_embed_payload_produces_embed_user(self):
         from shared.auth.middleware import _build_user_from_payload
         payload = {
@@ -391,6 +489,7 @@ class TestEmbedTokenMiddleware:
             "tenant_id": "acme",
             "aud": "embed",
             "persona_id": "p1",
+            "project_persona_id": "agent-p1",
             "model_ids": ["m1", "m2"],
             "capabilities": ["query", "chat"],
         }
@@ -399,6 +498,7 @@ class TestEmbedTokenMiddleware:
         assert user.is_embed is True
         assert user.tenant_id == "acme"
         assert user.persona_id == "p1"
+        assert user.project_persona_id == "agent-p1"
         assert user.model_ids == ["m1", "m2"]
         assert user.capabilities == ["query", "chat"]
 
@@ -722,6 +822,30 @@ class TestEmbedPersonaScopeAtMint:
             "model_ids": [_MODEL_UUID_1],
         })
         assert resp.status_code == 200
+
+    @patch("src.api.embed.get_tenant_db", new=_fake_tenant_db_persona_scope)
+    async def test_project_persona_in_scope_accepted(self, admin_client):
+        """Bug-9196/F01: the agent ProjectPersona claim is ownership checked."""
+        resp = await admin_client.post(URL, json={
+            "tenant_id": "acme",
+            "user_identity": "u@customer.com",
+            "project_persona_id": _PROJECT_PERSONA_UUID,
+            "project_ids": [_PROJECT_UUID],
+        })
+        assert resp.status_code == 200
+        payload = decode_access_token(resp.json()["token"])
+        assert payload["project_persona_id"] == _PROJECT_PERSONA_UUID
+
+    @patch("src.api.embed.get_tenant_db", new=_fake_tenant_db_persona_scope)
+    async def test_project_persona_out_of_project_scope_rejected(self, admin_client):
+        resp = await admin_client.post(URL, json={
+            "tenant_id": "acme",
+            "user_identity": "u@customer.com",
+            "project_persona_id": _PROJECT_PERSONA_UUID,
+            "project_ids": [_PROJECT_UUID_2],
+        })
+        assert resp.status_code == 422
+        assert "project_ids" in resp.json()["detail"]
 
     @patch("src.api.embed.get_tenant_db", new=_fake_tenant_db_persona_scope)
     async def test_persona_out_of_model_scope_rejected(self, admin_client):

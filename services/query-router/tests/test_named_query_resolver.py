@@ -20,7 +20,7 @@ from src.routing.named_query_resolver import (
     _definition_is_row_preserving_projection,
     _extract_named_queries_from_snapshot,
     manifest_has_security_columns,
-    named_query_reference_name,
+    named_query_reference,
     projection_security_proof_holds,
     sql_references_named_query_position,
 )
@@ -52,7 +52,9 @@ EXACT_SHAPES = [
     ],
 )
 def test_exact_reference_shape_recognised(sql: str, expected: str) -> None:
-    assert named_query_reference_name(sql) == expected
+    ref = named_query_reference(sql)
+    assert ref is not None and ref.name == expected
+    assert ref.limit is None and ref.offset is None
 
 
 @pytest.mark.parametrize(
@@ -70,18 +72,87 @@ def test_exact_reference_shape_recognised(sql: str, expected: str) -> None:
         "SELECT * FROM @a UNION SELECT * FROM @b",
         # Decoration of the projection
         "SELECT DISTINCT * FROM @a",
-        "SELECT * FROM @a LIMIT 10",
+        # ORDER BY stays rejected even though LIMIT/OFFSET are now accepted
+        # (Bug-9398): honouring it would require the materialised and live legs
+        # to sort identically, and ignoring it would silently reorder the user's
+        # result. An explicit refusal is the only non-lying option.
         "SELECT * FROM @a ORDER BY 1",
+        "SELECT * FROM @a ORDER BY 1 LIMIT 2",
         # A real table / literal, not a reference at all
         "SELECT * FROM modely",
         "SELECT * FROM '@not_a_ref'",
         "SELECT * FROM modely WHERE x = '@a'",
         # Multi-statement
         "SELECT * FROM @a; SELECT 1",
+        # Tail shapes this v1 cannot honour, so it refuses rather than
+        # accepting-and-ignoring (which would return the wrong row count).
+        "SELECT * FROM @a LIMIT ALL",
+        "SELECT * FROM @a LIMIT 2, 3",          # MySQL two-argument form
+        "SELECT * FROM @a LIMIT -1",
+        "SELECT * FROM @a LIMIT 1e2",           # not an integer row count
+        "SELECT * FROM @a LIMIT 2 LIMIT 3",     # repeated clause
+        "SELECT * FROM @a FETCH FIRST 2 ROWS ONLY",
+        "SELECT * FROM @a OFFSET 3 ROWS",
+        "SELECT * FROM @a LIMIT",               # no count
     ],
 )
 def test_decorated_shapes_are_not_exact(sql: str) -> None:
-    assert named_query_reference_name(sql) is None
+    assert named_query_reference(sql) is None
+
+
+# ---------------------------------------------------------------------------
+# Bug-9398 — the shapes BI clients actually send
+# ---------------------------------------------------------------------------
+#
+# A JDBC IDE (DBeaver, Excel "view data") appends a LIMIT to every browse and
+# quotes identifiers by default. v1 accepted neither, so the first thing a user
+# did with a working Named Query returned NQ_UNSUPPORTED_SHAPE and the object
+# looked broken. Recognition is widened in exactly those two directions; every
+# other decoration stays rejected (above).
+
+
+@pytest.mark.parametrize(
+    ("sql", "name", "limit", "offset"),
+    [
+        ("SELECT * FROM @nq LIMIT 2", "nq", 2, None),
+        ("select * from @nq limit 2", "nq", 2, None),
+        ("SELECT * FROM @nq LIMIT 2;", "nq", 2, None),
+        ("SELECT * FROM @nq OFFSET 3", "nq", None, 3),
+        ("SELECT * FROM @nq LIMIT 2 OFFSET 3", "nq", 2, 3),
+        # Either order — Postgres accepts both spellings.
+        ("SELECT * FROM @nq OFFSET 3 LIMIT 2", "nq", 2, 3),
+        ("SELECT * FROM @nq LIMIT 0", "nq", 0, None),
+        # Quoted spellings.
+        ('SELECT * FROM @"nq"', "nq", None, None),
+        ('SELECT * FROM "@nq"', "nq", None, None),
+        ('SELECT * FROM @"nq" LIMIT 2', "nq", 2, None),
+        ('SELECT * FROM "@nq" LIMIT 2 OFFSET 1', "nq", 2, 1),
+        # A quoted name keeps its authored case and inner spacing.
+        ('SELECT * FROM "@Top 5 Branches"', "Top 5 Branches", None, None),
+    ],
+)
+def test_bug_9398_bi_client_shapes_are_accepted_with_their_window(
+    sql: str, name: str, limit, offset,
+) -> None:
+    ref = named_query_reference(sql)
+    assert ref is not None, f"BI-client shape rejected: {sql!r}"
+    assert ref.name == name
+    assert ref.limit == limit
+    assert ref.offset == offset
+    # The name is always returned WITHOUT its ``@``, whichever spelling the
+    # client used — the handler keys the deployed definition lookup on
+    # ``f"@{name}".lower()``, so a leaked ``@`` would look the name up as
+    # ``@@nq`` and report NQ_UNKNOWN_REFERENCE for an object that exists.
+    assert not ref.name.startswith("@")
+
+
+def test_bug_9398_a_refused_tail_yields_no_window_rather_than_a_partial_one() -> None:
+    """A tail this v1 cannot honour must produce None, never a reference with
+    the window silently dropped — that would return every row for a query that
+    asked for two."""
+    assert named_query_reference("SELECT * FROM @nq LIMIT ALL") is None
+    assert named_query_reference("SELECT * FROM @nq LIMIT 2, 3") is None
+    assert named_query_reference("SELECT * FROM @nq ORDER BY 1 LIMIT 2") is None
 
 
 def test_from_position_detection_for_unsupported_shapes() -> None:
@@ -94,6 +165,27 @@ def test_from_position_detection_for_unsupported_shapes() -> None:
     )
     assert sql_references_named_query_position("SELECT * FROM modely") is None
     assert sql_references_named_query_position("SELECT * FROM '@not'") is None
+
+
+def test_bug_9398_from_position_detection_covers_the_quoted_spellings() -> None:
+    """A DECORATED reference that also quotes its name must still reach the
+    Named Query error surface. Before Bug-9398 a quoted name produced no
+    PARAMETER token at all, so the scan missed it entirely and the query died
+    later with a generic bind error naming a table nobody created."""
+    assert (
+        sql_references_named_query_position('SELECT branch_id FROM @"nq"') == "nq"
+    )
+    assert (
+        sql_references_named_query_position('SELECT * FROM "@nq" WHERE x = 1')
+        == "nq"
+    )
+    assert (
+        sql_references_named_query_position('SELECT * FROM @"nq" ORDER BY 1') == "nq"
+    )
+    # A quoted identifier that is NOT @-prefixed is an ordinary table.
+    assert sql_references_named_query_position('SELECT * FROM "modely"') is None
+    # A bare "@" with nothing after it names nothing.
+    assert sql_references_named_query_position('SELECT * FROM "@"') is None
 
 
 # ---------------------------------------------------------------------------

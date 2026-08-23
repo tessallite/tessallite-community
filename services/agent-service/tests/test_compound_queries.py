@@ -668,6 +668,13 @@ async def test_compound_branch_happy_path(compound_call):
     assert outcome.semantic_query["combine_value"] == 11.1
     assert outcome.rows_returned == 2
     assert mock_exec.call_count == 2
+    # The project-persona field scope remains local to each chokepoint call;
+    # no model-persona UUID is passed as a query-router argument.
+    assert [call.kwargs["persona_scopes"] for call in mock_exec.await_args_list] == [
+        bundle.persona_scopes,
+        bundle.persona_scopes,
+    ]
+    assert all("persona_id" not in call.kwargs for call in mock_exec.await_args_list)
 
 
 @pytest.mark.asyncio

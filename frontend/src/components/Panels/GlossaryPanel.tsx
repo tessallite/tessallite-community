@@ -52,11 +52,37 @@ import type {
   GlossaryConfidence,
   GlossaryBootstrapResponse,
   GlossaryEntry,
+  GlossaryEntryCreate,
   GlossaryEntryUpdate,
   GlossarySource,
   GlossaryStatus,
   GlossaryVisibility,
 } from "../../api/types";
+import { recordCreate, recordDelete, recordUpdate } from "../Builder/emitDrawerHistory";
+
+function glossaryToCreatePayload(entry: GlossaryEntry): Record<string, unknown> {
+  const attachment = entry.attachments[0];
+  return {
+    term: entry.term,
+    definition: entry.definition,
+    context_notes: entry.context_notes ?? null,
+    synonyms: entry.synonyms,
+    target_type: attachment?.target_type ?? "concept",
+    target_id: attachment?.target_id ?? null,
+  };
+}
+
+function glossaryToUpdatePayload(entry: GlossaryEntry): Record<string, unknown> {
+  return {
+    term: entry.term,
+    definition: entry.definition,
+    context_notes: entry.context_notes ?? null,
+    synonyms: entry.synonyms,
+    proposed_is_hidden: entry.proposed_is_hidden ?? null,
+    visibility: entry.visibility ?? undefined,
+    confidence: entry.confidence ?? undefined,
+  };
+}
 
 function SourceBadge({ source }: { source: GlossarySource }) {
   const t = useT();
@@ -289,9 +315,11 @@ export default function GlossaryPanel() {
   });
 
   const deleteEntry = useMutation({
-    mutationFn: (entryId: string) =>
+    mutationFn: ({ entryId }: { entryId: string; prior: Record<string, unknown> }) =>
       glossaryApi.delete(projectId!, modelId!, entryId),
-    onSuccess: () => {
+    onSuccess: (_deleted, variables) => {
+      const prior = variables.prior;
+      recordDelete("glossary", variables.entryId, prior);
       setConfirmDeleteId(null);
       qc.invalidateQueries({ queryKey: ["glossary", projectId, modelId] });
     },
@@ -302,9 +330,15 @@ export default function GlossaryPanel() {
   });
 
   const updateEntry = useMutation({
-    mutationFn: (params: { entryId: string; data: GlossaryEntryUpdate }) =>
+    mutationFn: (params: { entryId: string; data: GlossaryEntryUpdate; prior: Record<string, unknown> }) =>
       glossaryApi.update(projectId!, modelId!, params.entryId, params.data),
-    onSuccess: () => {
+    onSuccess: (_updated, variables) => {
+      recordUpdate(
+        "glossary",
+        variables.entryId,
+        variables.prior,
+        variables.data as unknown as Record<string, unknown>,
+      );
       qc.invalidateQueries({ queryKey: ["glossary", projectId, modelId] });
       qc.invalidateQueries({ queryKey: ["tableAttributes"] });
       setEditState(null);
@@ -344,18 +378,10 @@ export default function GlossaryPanel() {
   });
 
   const addTerm = useMutation({
-    mutationFn: () =>
-      glossaryApi.create(projectId!, modelId!, {
-        term: addTermState.term.trim(),
-        definition: addTermState.definition.trim(),
-        context_notes: addTermState.context_notes.trim() || null,
-        synonyms: addTermState.synonyms
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean),
-        target_type: "concept",
-      }),
-    onSuccess: () => {
+    mutationFn: (data: GlossaryEntryCreate) =>
+      glossaryApi.create(projectId!, modelId!, data),
+    onSuccess: (created, data) => {
+      recordCreate("glossary", created.id, data as unknown as Record<string, unknown>);
       setAddTermOpen(false);
       setAddTermState({ term: "", definition: "", context_notes: "", synonyms: "" });
       setFeedback({ severity: "success", text: t("glossary.addTermDone") });
@@ -440,6 +466,10 @@ export default function GlossaryPanel() {
         visibility: editState.visibility,
         confidence: editState.confidence,
       },
+      prior: (() => {
+        const entry = (entries.data ?? []).find((candidate) => candidate.id === editState.entryId);
+        return entry ? glossaryToUpdatePayload(entry) : {};
+      })(),
     });
   }
 
@@ -778,7 +808,11 @@ export default function GlossaryPanel() {
           <Button onClick={() => setConfirmDeleteId(null)}>{t("common.cancel")}</Button>
           <Button
             variant="contained"
-            onClick={() => confirmDeleteId && deleteEntry.mutate(confirmDeleteId)}
+            onClick={() => {
+              if (!confirmDeleteId) return;
+              const entry = (entries.data ?? []).find((candidate) => candidate.id === confirmDeleteId);
+              if (entry) deleteEntry.mutate({ entryId: confirmDeleteId, prior: glossaryToCreatePayload(entry) });
+            }}
             disabled={deleteEntry.isPending}
           >
             {deleteEntry.isPending ? <CircularProgress size={16} /> : t("common.delete")}
@@ -970,7 +1004,16 @@ export default function GlossaryPanel() {
           <Button onClick={() => setAddTermOpen(false)}>{t("common.cancel")}</Button>
           <Button
             variant="contained"
-            onClick={() => addTerm.mutate()}
+            onClick={() => addTerm.mutate({
+              term: addTermState.term.trim(),
+              definition: addTermState.definition.trim(),
+              context_notes: addTermState.context_notes.trim() || null,
+              synonyms: addTermState.synonyms
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean),
+              target_type: "concept",
+            })}
             disabled={
               addTerm.isPending ||
               !addTermState.term.trim() ||

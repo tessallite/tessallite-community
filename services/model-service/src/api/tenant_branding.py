@@ -11,6 +11,7 @@ from shared.config.resolver import get_setting, set_setting
 from shared.db.session import get_tenant_db
 from src.auth.middleware import (
     CurrentUser,
+    is_canonical_human_system_admin,
     require_human_user,
     require_tenant_admin,
 )
@@ -74,16 +75,27 @@ class BrandingConfig(BaseModel):
         return _validate_logo_url(v)
 
 
-def _assert_own_tenant(tenant_id: str, current_user: CurrentUser) -> None:
-    """The branding routes are keyed by a ``tenant_id`` path parameter, but the
-    session always resolves to ``current_user.tenant_id``. Reject a mismatch so
-    a request that names another tenant fails loud (403) rather than silently
-    operating on the caller's own tenant (F-029-13)."""
+def _resolve_branding_target_tenant(
+    tenant_id: str, current_user: CurrentUser
+) -> str:
+    """Resolve the branding data tenant without opening ``__system__``.
+
+    Canonical human system admins may manage a real path-target tenant. Other
+    human users remain confined to their authenticated tenant.
+    """
+    if not tenant_id or tenant_id == "__system__":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A real target tenant is required",
+        )
+    if is_canonical_human_system_admin(current_user):
+        return tenant_id
     if tenant_id != current_user.tenant_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="tenant_id does not match the authenticated tenant",
         )
+    return current_user.tenant_id
 
 
 @router.get("", response_model=BrandingConfig)
@@ -96,9 +108,9 @@ async def get_branding(
     # reject embed tokens so an embed session cannot read the tenant's branding
     # config, keeping read/write access on this surface consistent (the same
     # embed-forbidden invariant applied to sibling per-user library reads,
-    # Bug-6423). ``_assert_own_tenant`` still enforces the tenant match.
-    _assert_own_tenant(tenant_id, current_user)
-    async for db in get_tenant_db(current_user.tenant_id):
+    # Bug-6423).
+    target_tenant = _resolve_branding_target_tenant(tenant_id, current_user)
+    async for db in get_tenant_db(target_tenant):
         return BrandingConfig(
             logo_url=await get_setting("branding.logo_url", tenant_session=db),
             primary_color=await get_setting("branding.primary_color", tenant_session=db),
@@ -115,12 +127,12 @@ async def update_branding(
     body: BrandingConfig,
     current_user: CurrentUser = Depends(require_tenant_admin),
 ) -> BrandingConfig:
-    _assert_own_tenant(tenant_id, current_user)
+    target_tenant = _resolve_branding_target_tenant(tenant_id, current_user)
     # Only fields the caller actually supplied are written; an explicit null or
     # empty string clears the stored setting (reverting to the theme default)
     # rather than being silently skipped (F-029-11).
     supplied = body.model_dump(exclude_unset=True)
-    async for db in get_tenant_db(current_user.tenant_id):
+    async for db in get_tenant_db(target_tenant):
         actor = current_user.email or "unknown"
         for field in (
             "logo_url",

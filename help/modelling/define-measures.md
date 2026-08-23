@@ -29,8 +29,11 @@ This page covers plain measures. User-defined attributes (UDAs) are **not** in t
 
 ## Before you start
 
-- You must have a model open in Model Builder with at least one fact table added to the canvas.
-- The source column you want to aggregate must exist in that fact table.
+- You must have a model open in Model Builder with a source table added to the
+  canvas. A single-table model is implicitly fact; a multi-table model must
+  declare its fact table before deploy.
+- The source column you want to aggregate must exist in the model's declared
+  fact table (or its implicit single-table fact).
 - Dimensions should be defined before you configure aggregates, because the aggregation type determines which grains Tessallite can serve from pre-aggregated summaries.
 
 ---

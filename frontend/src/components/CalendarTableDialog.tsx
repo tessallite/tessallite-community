@@ -39,6 +39,8 @@ import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { calendarApi } from "../api/client";
 import { useT } from "../i18n";
+import type { CalendarAutoCreateRequest, CalendarBindRequest, CalendarTable } from "../api/types";
+import { recordCreate, recordDelete } from "./Builder/emitDrawerHistory";
 
 type Flow = "view" | "auto-create" | "script" | "bind";
 type CalendarColumnKey =
@@ -130,6 +132,22 @@ function extractError(err: unknown, t: (key: string) => string): { message: stri
   return { message: anyErr.message || t("calendarTable.operationFailed") };
 }
 
+function calendarToBindPayload(calendar: CalendarTable, sourceId: string): Record<string, unknown> {
+  return {
+    __source_id: sourceId,
+    table_name: calendar.table_name,
+    dialect: calendar.dialect,
+    calendar_type: calendar.calendar_type,
+    date_column: calendar.date_column,
+    year_column: calendar.year_column,
+    half_column: calendar.half_column,
+    quarter_column: calendar.quarter_column,
+    month_column: calendar.month_column,
+    week_column: calendar.week_column,
+    day_column: calendar.day_column,
+  };
+}
+
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -210,16 +228,31 @@ export default function CalendarTableDialog({
   });
 
   const autoMut = useMutation({
-    mutationFn: () =>
+    mutationFn: (body: CalendarAutoCreateRequest) =>
       calendarApi.autoCreate(projectId, modelId, sourceId, {
-        table_name: tableName,
-        start_date: startDate,
-        end_date: endDate,
-        alias: aliasField,
-        fiscal_year_start_month: effectiveFys,
-        calendar_type: calendarType,
+        ...body,
       }),
     onSuccess: (data) => {
+      recordCreate("calendar", data.id, {
+        __source_id: sourceId,
+        // Keep the successful physical mapping for a metadata-only history
+        // redo. Replaying this entry binds the existing table instead of
+        // running auto-create's destructive DROP/recreate DDL.
+        __calendar_flow: "auto-create",
+        __history_provenance: data.history_provenance?.token,
+        table_name: data.table_name,
+        dialect: data.dialect,
+        date_column: data.date_column,
+        year_column: data.year_column,
+        half_column: data.half_column,
+        quarter_column: data.quarter_column,
+        month_column: data.month_column,
+        week_column: data.week_column,
+        day_column: data.day_column,
+        calendar_type: data.calendar_type,
+        fiscal_year_start_month: effectiveFys,
+        alias: aliasField,
+      });
       invalidate();
       setAutoCreatedAliases(data.auto_created_aliases ?? []);
       setFlow("view");
@@ -238,15 +271,14 @@ export default function CalendarTableDialog({
     Boolean(bindColumns.date_column.trim()) || Boolean(bindColumns.year_column.trim());
 
   const bindMut = useMutation({
-    mutationFn: () =>
+    mutationFn: (body: CalendarBindRequest) =>
       calendarApi.bind(projectId, modelId, sourceId, {
-        table_name: tableName,
-        ...bindColumnPayload(bindColumns),
-        alias: aliasField,
-        fiscal_year_start_month: effectiveFys,
-        calendar_type: calendarType,
+        ...body,
       }),
     onSuccess: (data) => {
+      recordCreate("calendar", data.id, {
+        ...calendarToBindPayload(data, sourceId),
+      });
       invalidate();
       setAutoCreatedAliases(data.auto_created_aliases ?? []);
       setFlow("view");
@@ -254,9 +286,12 @@ export default function CalendarTableDialog({
   });
 
   const deleteMut = useMutation({
-    mutationFn: (calendarId: string) =>
+    mutationFn: ({ calendarId }: { calendarId: string; prior: Record<string, unknown> }) =>
       calendarApi.delete(projectId, modelId, sourceId, calendarId),
-    onSuccess: invalidate,
+    onSuccess: (_deleted, variables) => {
+      recordDelete("calendar", variables.calendarId, variables.prior);
+      invalidate();
+    },
   });
 
   function switchTab(next: Flow) {
@@ -335,7 +370,7 @@ export default function CalendarTableDialog({
                         <span>
                           <IconButton
                             size="small"
-                            onClick={() => deleteMut.mutate(c.id)}
+                            onClick={() => deleteMut.mutate({ calendarId: c.id, prior: calendarToBindPayload(c, sourceId) })}
                             disabled={deleteMut.isPending}
                           >
                             <DeleteOutlineIcon fontSize="small" />
@@ -558,7 +593,14 @@ export default function CalendarTableDialog({
         {flow === "auto-create" && (
           <Button
             variant="contained"
-            onClick={() => autoMut.mutate()}
+            onClick={() => autoMut.mutate({
+              table_name: tableName,
+              start_date: startDate,
+              end_date: endDate,
+              alias: aliasField,
+              fiscal_year_start_month: effectiveFys,
+              calendar_type: calendarType,
+            })}
             disabled={autoMut.isPending || !tableName.trim()}
           >
             {autoMut.isPending ? <CircularProgress size={16} /> : t("calendar.generate")}
@@ -585,7 +627,13 @@ export default function CalendarTableDialog({
         {flow === "bind" && (
           <Button
             variant="contained"
-            onClick={() => bindMut.mutate()}
+            onClick={() => bindMut.mutate({
+              table_name: tableName,
+              ...bindColumnPayload(bindColumns),
+              alias: aliasField,
+              fiscal_year_start_month: effectiveFys,
+              calendar_type: calendarType,
+            })}
             disabled={bindMut.isPending || !tableName.trim() || !hasRequiredBindColumn}
           >
             {bindMut.isPending ? <CircularProgress size={16} /> : t("calendar.bind")}

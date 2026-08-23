@@ -45,6 +45,7 @@ async def test_kpi_bridge_declares_client_kind_kpi():
 
         async def post(self, url, json=None, headers=None):
             captured.update(json or {})
+            captured["headers"] = headers or {}
             return _Resp()
 
     with patch("httpx.AsyncClient", return_value=_Client()):
@@ -54,6 +55,9 @@ async def test_kpi_bridge_declares_client_kind_kpi():
     # protocol must stay "jdbc": the SQL still needs strict-parser treatment.
     # client_kind is the attribution axis, not a parser switch.
     assert captured.get("protocol") == "jdbc"
+    # Bug-9257: the dedicated KPI query scope is accepted by query-router only
+    # with the rotating internal service marker.
+    assert captured["headers"].get("X-Tessallite-Internal")
 
 
 def test_query_router_request_model_accepts_kpi_origin():

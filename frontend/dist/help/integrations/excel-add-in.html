@@ -100,7 +100,7 @@
     <p>The persona switcher sets the active persona for everything the add-in does. Selecting a persona applies that audience's allowed measures and dimensions, default filters, and row-level security.</p>
 
     <h2>Custom Excel Functions</h2>
-    <p>The add-in registers connectionless worksheet functions under the <code>TESSALLITE</code> namespace, plus older compatibility functions under the <code>TESS</code> namespace. These functions use the add-in sign-in session, so the task pane must be signed in and a model selected before custom functions will work.</p>
+    <p>The add-in registers connectionless worksheet functions under the single <code>TESSALLITE</code> namespace. These functions use the add-in sign-in session, so the task pane must be signed in and a model selected before custom functions will work. Existing workbooks that use the retired short namespace must be updated to <code>TESSALLITE.*</code>; the add-in does not publish a second namespace.</p>
 
     <h3>TESSALLITE.VALUE</h3>
     <pre><code>=TESSALLITE.VALUE("model_slug", "measure_name")
@@ -117,11 +117,11 @@
     <pre><code>=TESSALLITE.MEMBERVALUE("model_slug", "measure_name", "dimension_name", "member_value")</code></pre>
     <p>Returns one measure for one dimension member.</p>
 
-    <h3>Older TESS Namespace</h3>
-    <ul>
-      <li><code>=TESS.LISTBYID("named_set_id")</code> returns the members of a named set as a spilled array where the Excel version supports dynamic arrays.</li>
-      <li><code>=TESS.KPIVALUE("kpi_id")</code>, <code>=TESS.KPIGOAL("kpi_id")</code>, and <code>=TESS.KPISTATUS("kpi_id")</code> are retained for older workbooks.</li>
-    </ul>
+    <h3>TESSALLITE.LISTBYID and KPI ID functions</h3>
+    <p>The published ID-based functions use the same namespace: <code>TESSALLITE.LISTBYID</code>, <code>TESSALLITE.KPIVALUE</code>, <code>TESSALLITE.KPIGOAL</code>, and <code>TESSALLITE.KPISTATUS</code>. <code>LISTBYID</code> returns a named set's members as a spilled array where the Excel version supports dynamic arrays.</p>
+
+    <h3>Retired namespace</h3>
+    <p>The historical short namespace is not a shipped namespace. Replace those formulas with the equivalent <code>TESSALLITE.*</code> function before opening the workbook in a supported Excel host.</p>
 
     <h3>Caching And Refresh</h3>
     <p>Custom functions cache results for 60 seconds. To force a fresh evaluation, click <strong>Refresh</strong> in the Report Builder footer. This clears all caches and triggers a full workbook recalculation so every <code>TESSALLITE.*</code> formula fetches a fresh value immediately. Switching personas, switching connection profiles, and signing out also clear the caches automatically.</p>

@@ -26,13 +26,14 @@
 <ol><li>Open a browser and navigate to Tessallite (by default <code>http://localhost:3000</code>).</li><li>Enter the System Admin email and password. The application opens directly to the <strong>System Administration</strong> screen, which is only visible to this account.</li></ol>
 <p>If you have forgotten the System Admin password, it is stored in the <code>.env</code> file on the deployment host. See <a href="credentials-and-env.html">Credentials and the .env File</a> for the full reference.</p>
 <h2>Steps to create a tenant</h2>
-<ol><li>In the System Administration screen, click the <strong>Workspaces</strong> tab.</li><li>Click <strong>New Workspace</strong>.</li><li>Fill in the required fields (see the field reference below).</li><li>Enter the email address for the first <strong>Tenant Admin</strong> -- the person who will manage users, roles, and settings inside this workspace.</li><li>Click <strong>Create</strong>.</li></ol>
+<ol><li>In the System Administration screen, click the <strong>Workspaces</strong> tab.</li><li>Click <strong>New Workspace</strong>.</li><li>Fill in the required fields (see the field reference below).</li><li>Click <strong>Create</strong>.</li></ol>
+<p>Creating a workspace provisions the workspace itself -- its record and its two database schemas. It does <strong>not</strong> create any user accounts. You add the first user in a separate step; see <a href="#add-the-first-user">Add the first user</a> below.</p>
 <h2>Required fields</h2>
 <div class="table-wrapper"><table><thead><tr><th>Field</th><th>Description</th><th>Constraints</th></tr></thead><tbody>
 <tr><td><strong>Display name</strong></td><td>The human-readable label shown throughout the UI. Can be changed at any time after creation.</td><td>Free text; maximum 80 characters.</td></tr>
 <tr><td><strong>Slug</strong></td><td>A short, machine-friendly identifier. This becomes the JDBC database name and the XMLA catalog name that analysts use when connecting BI tools.</td><td>Lowercase letters, numbers, and hyphens only. No spaces. Must be unique across the entire installation.</td></tr>
-<tr><td><strong>Tenant Admin email</strong></td><td>The email address of the first administrator for this workspace. Tessallite creates this user automatically and sends an invitation.</td><td>Must be a valid email address.</td></tr>
 </tbody></table></div>
+<p>There is no "administrator email" field. A new workspace starts with no users; you create the first account yourself once the workspace exists.</p>
 <h2>Why the slug matters</h2>
 <p>The slug is permanent. Once the workspace is created, the slug cannot be renamed, because it is wired into two critical connection paths:</p>
 <ul><li><strong>JDBC connections</strong> (port 5433): BI tools set the <em>Database</em> field to the slug.</li><li><strong>XMLA connections</strong> (port 8080): Excel and other XMLA clients set the <em>Catalog</em> field to the slug.</li></ul>
@@ -48,15 +49,21 @@
 </ul>
 <p>These schemas are the isolation boundary. No other tenant can read or write to them. The Fernet-encrypted database connection URL stored in the SystemTenant record ensures that even at the platform level, credentials are not exposed in plaintext.</p>
 </li>
-<li><strong>A Tenant Admin user</strong> with the email address you provided. This user receives an invitation and, once they sign in, can create projects, invite other users, assign roles, and configure workspace-level settings.</li>
 </ol>
-<p>This entire provisioning sequence completes in seconds. Once it finishes, the new workspace appears in the System Admin's workspace list and the Tenant Admin can sign in immediately.</p>
+<p>This provisioning sequence completes in seconds. Once it finishes, the new workspace appears in the System Admin's workspace list. The workspace has no users yet -- add the first one next.</p>
+<h2>Add the first user</h2>
+<p>A new workspace has no accounts, so nobody can sign in to it until you create one. Tessallite does not send invitation emails; an administrator sets each user's password directly and passes the credentials to the person out of band (or the user signs in through single sign-on -- see below).</p>
+<p>To create the first Tenant Admin:</p>
+<ol><li>In the System Administration screen, open the workspace you just created.</li><li>Click <strong>Add User</strong>.</li><li>Enter a username, the person's email address, and an initial password. The password must meet the complexity rule shown under the field (at least 12 characters, with an upper-case letter, a lower-case letter, and a number).</li><li>Choose the <strong>Tenant Admin</strong> role so this first user can manage the workspace.</li><li>Click <strong>Save</strong>, then give the email and password to the new administrator.</li></ol>
+<p>That user can then sign in and, from the workspace <strong>Admin &gt; Users</strong> tab, add the rest of the team the same way. See <a href="../admin/manage-users.html">Manage Users</a>.</p>
+<h3>Single sign-on (optional)</h3>
+<p>If the workspace is configured for single sign-on, you do not have to create accounts by hand. The first time someone signs in through the identity provider, Tessallite provisions their account automatically (just-in-time provisioning) and assigns the role your SSO mapping specifies. A password is never set for these users -- the identity provider owns authentication.</p>
 <h2>Edition limits</h2>
 <p>The Community Edition enforces a cap on the number of tenants you can create. When licence enforcement is enabled, attempting to create a tenant beyond the licensed limit returns an error. The built-in demo tenant (used for evaluation and onboarding) does not count toward this cap.</p>
 <p>If you need more tenants, upgrade your licence. See the System Administration licence panel for details.</p>
 <h2>Verify the new tenant</h2>
-<p>After creating a tenant, confirm that provisioning succeeded:</p>
-<ol><li>Ask the Tenant Admin to sign in at the Tessallite URL using the email address you entered and the password from their invitation.</li><li>After sign-in, the Workspace Explorer should appear with the new workspace name displayed. The workspace will be empty (no projects or models yet) -- this is expected.</li><li>Back in the System Admin screen, the new tenant should appear in the <strong>Workspaces</strong> tab with an active status indicator.</li></ol>
+<p>After creating a tenant and adding its first user, confirm that provisioning succeeded:</p>
+<ol><li>Ask the Tenant Admin to sign in at the Tessallite URL using the email address and password you set when you created their account (or through single sign-on).</li><li>After sign-in, the Workspace Explorer should appear with the new workspace name displayed. The workspace will be empty (no projects or models yet) -- this is expected.</li><li>Back in the System Admin screen, the new tenant should appear in the <strong>Workspaces</strong> tab with an active status indicator.</li></ol>
 <p>If sign-in fails or the workspace does not appear, check the model-service logs (<code>docker compose logs -f model-service</code>) for schema-provisioning errors.</p>
 <h2>Best practices and pitfalls</h2>
 <p><strong>Choose slugs carefully.</strong> The slug is permanent and visible to every analyst who connects a BI tool. Keep it short, lowercase, and descriptive. Avoid abbreviations that could be confused with another workspace.</p>

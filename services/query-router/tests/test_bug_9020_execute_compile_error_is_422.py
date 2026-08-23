@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import types
+import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -33,9 +34,13 @@ def _bound(body: _routes.ExecuteRequest) -> types.SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_bug_9020_execute_compile_error_is_422():
-    """A bad row-security DSL on /execute is ``row_security_misconfigured``
-    422, not an untyped 500. Guard: this test. Tier: T3.
+async def test_bug_9020_bug9172_sol_r1_f1_execute_compile_error_is_attributed_once():
+    """Bug-9020/Bug-9172: a bad RLS DSL is a single attributed 422.
+
+    The cache-key hoist is also the live Named Query failure seam. The
+    execution wrapper must receive the NQ identity and must not append a
+    second un-attributed row after the boundary has persisted the failure.
+    Guard: B9172-SOL-R1-F1-A. Tier: T3.
     """
     body = _routes.ExecuteRequest(
         model_id="model-1",
@@ -47,6 +52,7 @@ async def test_bug_9020_execute_compile_error_is_422():
     compile_error = RowSecurityCompileError(
         "unknown row-security function: 'dimension_in'"
     )
+    named_query_id = uuid.uuid4()
     log_mock = AsyncMock()
     route_mock = AsyncMock()
 
@@ -81,11 +87,17 @@ async def test_bug_9020_execute_compile_error_is_422():
                     roles=frozenset({"region_manager_emea"}),
                 ),
                 tenant_id="acme-demo",
+                named_query_id=named_query_id,
+                named_query_fallback_reason="artifact_not_fresh",
             )
 
     assert exc.value.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
     assert exc.value.detail["error_type"] == "row_security_misconfigured"
-    log_mock.assert_awaited()
+    assert log_mock.await_count == 1
+    failure_kwargs = log_mock.await_args.kwargs
+    assert failure_kwargs["named_query_id"] == named_query_id
+    assert failure_kwargs["named_query_fallback_reason"] == "artifact_not_fresh"
+    assert exc.value._tessallite_failure_logged is True
     route_mock.assert_not_awaited()
 
 

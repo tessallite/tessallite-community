@@ -1130,7 +1130,6 @@ async def _invalidate_artifacts(
         update(PocketDefinition)
         .where(
             pocket_scope,
-            PocketDefinition.status != "stale",
             PocketDefinition.retired_at.is_(None),
         )
         .values(
@@ -1138,6 +1137,11 @@ async def _invalidate_artifacts(
             failure_reason=reason[:1000],
             row_manifest=None,
             active_refresh_run_id=None,
+            built_for_version_id=None,
+            built_for_epoch=None,
+            population_eligibility="unknown",
+            population_eligibility_reason=None,
+            population_proof_fingerprint=None,
         )
     )
     nq_result = None

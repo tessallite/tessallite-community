@@ -64,7 +64,12 @@ import HelpIconButton from "../components/HelpIconButton";
 import { canPerform } from "../auth/explorerPrivileges";
 import { projectsApi, modelsApi, preferencesApi } from "../api/client";
 import { agentApi } from "../api/agentApi";
-import { versionsApi } from "../api/versionsApi";
+import {
+  parseJoinPopulationBlockedError,
+  versionsApi,
+  type JoinPopulationBlockedDetail,
+} from "../api/versionsApi";
+import JoinPopulationBlockedNotice from "../components/Deploy/JoinPopulationBlockedNotice";
 import { useFavouriteModels, useModels, useProjects, useTenantMe } from "../api/hooks";
 import type { FavouriteModelsResponse, Model, Project } from "../api/types";
 
@@ -96,6 +101,10 @@ export default function Explorer() {
   const [modelImportExportOpen, setModelImportExportOpen] = useState(false);
   const [formSlug, setFormSlug] = useState("");
   const [formName, setFormName] = useState("");
+  const [deployRefusal, setDeployRefusal] = useState<{
+    modelId: string;
+    detail: JoinPopulationBlockedDetail;
+  } | null>(null);
 
   const [configProject, setConfigProject] = useState<Project | null>(null);
 
@@ -303,7 +312,12 @@ export default function Explorer() {
     mutationFn: (modelId: string) =>
       versionsApi.deploy(selectedProject!.id, modelId),
     onSuccess: () => {
+      setDeployRefusal(null);
       qc.invalidateQueries({ queryKey: ["models", selectedProject!.id] });
+    },
+    onError: (error: unknown, modelId: string) => {
+      const detail = parseJoinPopulationBlockedError(error);
+      if (detail) setDeployRefusal({ modelId, detail });
     },
   });
 
@@ -388,6 +402,7 @@ export default function Explorer() {
     try {
       await deployModel.mutateAsync(m.id);
     } catch (err) {
+      if (parseJoinPopulationBlockedError(err)) return;
       const msg =
         (err as { response?: { data?: { detail?: string } } })?.response?.data
           ?.detail ?? t("explorer.deployFailed");
@@ -693,6 +708,19 @@ export default function Explorer() {
           </Box>
         ) : (
           <Box maxWidth="lg" mx="auto">
+            {deployRefusal && (
+              <JoinPopulationBlockedNotice
+                detail={deployRefusal.detail}
+                onClose={() => setDeployRefusal(null)}
+                onOpenJoins={() => {
+                  const modelId = deployRefusal.modelId;
+                  setDeployRefusal(null);
+                  navigate(
+                    `/tenants/${tenantSlug}/projects/${selectedProject.id}/models/${modelId}?panel=joins`,
+                  );
+                }}
+              />
+            )}
             {/* ── Project header ───────────────────────────────── */}
             <Box
               sx={{

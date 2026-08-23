@@ -4,13 +4,20 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ConfirmProvider } from "../Confirm";
-import { parseFilterRows, serializeFilterRows } from "./PersonasPanel";
+import {
+  parseFilterRows,
+  parseParameterFilterRows,
+  serializeFilterRows,
+  updateFilterRow,
+} from "./PersonasPanel";
 
 const usePersonasMock = vi.fn();
 const useMeasuresMock = vi.fn();
 const useDimensionsMock = vi.fn();
 const useHierarchiesMock = vi.fn();
 const useDataTagsMock = vi.fn();
+const useParametersMock = vi.fn();
+const usePersonaParameterCollisionPreflightMock = vi.fn();
 const createMock = vi.fn();
 const updateMock = vi.fn();
 const deleteMock = vi.fn();
@@ -23,6 +30,9 @@ vi.mock("../../api/hooks", () => ({
   useDimensions: (...args: unknown[]) => useDimensionsMock(...args),
   useHierarchies: (...args: unknown[]) => useHierarchiesMock(...args),
   useDataTags: (...args: unknown[]) => useDataTagsMock(...args),
+  useParameters: (...args: unknown[]) => useParametersMock(...args),
+  usePersonaParameterCollisionPreflight: (...args: unknown[]) =>
+    usePersonaParameterCollisionPreflightMock(...args),
 }));
 
 vi.mock("../../api/client", () => ({
@@ -30,6 +40,7 @@ vi.mock("../../api/client", () => ({
     create: (...args: unknown[]) => createMock(...args),
     update: (...args: unknown[]) => updateMock(...args),
     delete: (...args: unknown[]) => deleteMock(...args),
+    parameterCollisionPreflight: vi.fn(),
   },
   dataTagsApi: {
     getPersonaRestrictions: (...args: unknown[]) => getRestrictionsMock(...args),
@@ -73,6 +84,8 @@ describe("PersonasPanel", () => {
     useDimensionsMock.mockReset();
     useHierarchiesMock.mockReset();
     useDataTagsMock.mockReset();
+    useParametersMock.mockReset();
+    usePersonaParameterCollisionPreflightMock.mockReset();
     createMock.mockReset();
     updateMock.mockReset();
     deleteMock.mockReset();
@@ -85,6 +98,12 @@ describe("PersonasPanel", () => {
     useDimensionsMock.mockReturnValue({ data: [], isLoading: false });
     useHierarchiesMock.mockReturnValue({ data: [], isLoading: false });
     useDataTagsMock.mockReturnValue({ data: [], isLoading: false });
+    useParametersMock.mockReturnValue({ data: [], isLoading: false });
+    usePersonaParameterCollisionPreflightMock.mockReturnValue({
+      data: { collisions: [] },
+      isLoading: false,
+      isError: false,
+    });
     // F-026-04: authoring controls now require an editor role (and not
     // read-only). These tests exercise the modeller authoring path.
     window.localStorage.setItem("user_role", "modeler");
@@ -266,6 +285,60 @@ describe("PersonasPanel", () => {
   });
 });
 
+describe("L13-PERSONA-AT parameter-aware filter codec", () => {
+  const catalog = [
+    { name: "@code", param_type: "string" as const },
+    { name: "@enabled", param_type: "boolean" as const },
+    { name: "@count", param_type: "number" as const },
+    { name: "@regions", param_type: "multi_value" as const },
+    { name: "@period", param_type: "date_range" as const },
+  ];
+
+  it("preserves string tokens that look like numbers or booleans", () => {
+    const rows = parseParameterFilterRows(
+      JSON.stringify({ "@code": "001", "@enabled": true }),
+      catalog,
+    );
+    expect(JSON.parse(serializeFilterRows(rows, catalog))).toEqual(
+      { "@code": "001", "@enabled": true },
+    );
+  });
+
+  it("round-trips arrays containing commas and complete date ranges", () => {
+    const value = {
+      "@regions": ["North, America", "EMEA"],
+      "@period": { from: "2026-01-01", to: "2026-12-31" },
+    };
+    const rows = parseParameterFilterRows(JSON.stringify(value), catalog);
+    expect(JSON.parse(serializeFilterRows(rows, catalog))).toEqual(value);
+  });
+
+  it("L13-R1-F2 preserves @ date_range from and to when another row changes", () => {
+    const original = JSON.stringify({
+      Region: "EMEA",
+      "@period": { from: "2026-01-01", to: "2026-12-31" },
+    });
+    const updated = updateFilterRow(
+      original,
+      "Region",
+      (row) => ({ ...row, value: "APAC" }),
+      catalog,
+    );
+
+    expect(JSON.parse(updated)).toEqual({
+      Region: "APAC",
+      "@period": { from: "2026-01-01", to: "2026-12-31" },
+    });
+  });
+
+  it("keeps unsupported multi-entry operator objects opaque", () => {
+    const value = { "@code": { eq: "001", neq: "002" } };
+    const rows = parseParameterFilterRows(JSON.stringify(value), catalog);
+    expect(rows[0]).toMatchObject({ dim: "@code", op: "__raw" });
+    expect(JSON.parse(serializeFilterRows(rows, catalog))).toEqual(value);
+  });
+});
+
 describe("PersonasPanel — column restriction persistence (F-008-07)", () => {
   const TAG = {
     id: "tag-1",
@@ -308,6 +381,12 @@ describe("PersonasPanel — column restriction persistence (F-008-07)", () => {
     useDimensionsMock.mockReturnValue({ data: [], isLoading: false });
     useHierarchiesMock.mockReturnValue({ data: [], isLoading: false });
     useDataTagsMock.mockReturnValue({ data: [TAG], isLoading: false });
+    useParametersMock.mockReturnValue({ data: [], isLoading: false });
+    usePersonaParameterCollisionPreflightMock.mockReturnValue({
+      data: { collisions: [] },
+      isLoading: false,
+      isError: false,
+    });
     // F-026-04: authoring controls now require an editor role.
     window.localStorage.setItem("user_role", "modeler");
   });
@@ -396,6 +475,8 @@ describe("PersonasPanel empty-audience warning (F-008-12)", () => {
     useDimensionsMock.mockReset();
     useHierarchiesMock.mockReset();
     useDataTagsMock.mockReset();
+    useParametersMock.mockReset();
+    usePersonaParameterCollisionPreflightMock.mockReset();
     getRestrictionsMock.mockReset();
     getRestrictionsMock.mockResolvedValue([]);
     useMeasuresMock.mockReturnValue({
@@ -405,6 +486,12 @@ describe("PersonasPanel empty-audience warning (F-008-12)", () => {
     useDimensionsMock.mockReturnValue({ data: [], isLoading: false });
     useHierarchiesMock.mockReturnValue({ data: [], isLoading: false });
     useDataTagsMock.mockReturnValue({ data: [], isLoading: false });
+    useParametersMock.mockReturnValue({ data: [], isLoading: false });
+    usePersonaParameterCollisionPreflightMock.mockReturnValue({
+      data: { collisions: [] },
+      isLoading: false,
+      isError: false,
+    });
     window.localStorage.setItem("user_role", "modeler");
   });
 

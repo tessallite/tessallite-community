@@ -1,6 +1,7 @@
 """Tests for embed user conversation ownership and management API denial."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import uuid
@@ -14,7 +15,11 @@ from shared.auth.middleware import (
     CurrentUser,
     forbid_embed_user,
 )
-from src.api.conversations import _enforce_conversation_ownership
+from src.api.conversations import (
+    ConversationCreate,
+    _enforce_conversation_ownership,
+    create_conversation,
+)
 from src.api.personas import (
     _require_project_modeller as _require_persona_modeller,
     _require_project_viewer as _require_persona_viewer,
@@ -93,6 +98,73 @@ class TestConversationOwnership:
         with pytest.raises(HTTPException) as exc_info:
             _enforce_conversation_ownership(conv, user)
         assert exc_info.value.status_code == 404
+
+
+class TestEmbedPersonaOverride:
+    @pytest.mark.asyncio
+    async def test_create_conversation_uses_project_persona_claim_only(self):
+        """Bug-9196/F01: agent ProjectPersona is not query-router Persona.
+
+        A legacy/simultaneous embed ``persona_id`` claim remains available to
+        query-router as the model Persona lock. Agent-service must ignore that
+        namespace and apply only ``project_persona_id`` to conversation field
+        scope.
+        """
+        project_id = uuid.uuid4()
+        model_persona = "11111111-1111-1111-1111-111111111111"
+        project_persona = uuid.uuid4()
+        body_persona = uuid.uuid4()
+        saved = {}
+
+        db = AsyncMock()
+
+        def _add(conv):
+            saved["conversation"] = conv
+
+        async def _refresh(conv):
+            conv.id = uuid.uuid4()
+            conv.created_at = datetime.now(timezone.utc)
+            conv.updated_at = datetime.now(timezone.utc)
+            conv.last_active_at = None
+            conv.title = None
+            conv.state = {}
+            conv.summary = None
+            conv.started_at = datetime.now(timezone.utc)
+
+        db.add = _add
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock(side_effect=_refresh)
+
+        async def _tenant_db(_tenant_id: str):
+            yield db
+
+        current_user = CurrentEmbedUser(
+            user_id="embed@customer.com",
+            tenant_id="t",
+            email="embed@customer.com",
+            persona_id=model_persona,
+            project_persona_id=str(project_persona),
+            project_ids=[str(project_id)],
+            capabilities=["chat"],
+        )
+
+        with patch("src.api.conversations.get_tenant_db", _tenant_db), \
+             patch("src.api.conversations._require_project_access_and_agent", AsyncMock()), \
+             patch("src.api.conversations._validate_persona", AsyncMock()) as validate_persona, \
+             patch("src.api.conversations.dispatch_event", lambda **_kwargs: None), \
+             patch("src.api.conversations._spawn_background", lambda _coro: None):
+            response = await create_conversation(
+                project_id,
+                ConversationCreate(persona_id=body_persona),
+                current_user,
+            )
+
+        conv = saved["conversation"]
+        assert conv.persona_id == str(project_persona)
+        assert conv.persona_id != model_persona
+        assert conv.persona_id != body_persona
+        validate_persona.assert_awaited_once_with(db, project_id, str(project_persona))
+        assert response.persona_id == project_persona
 
 
 class TestForbidEmbedUser:

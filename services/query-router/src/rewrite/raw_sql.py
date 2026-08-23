@@ -7,7 +7,9 @@ wants per-row data, not aggregated summaries.
 Key differences from ``rewrite_for_source`` (source_sql.py):
   * No GROUP BY clause.
   * No aggregation wrappers (SUM/AVG/COUNT) around measure columns.
-  * All JOINs forced to LEFT JOIN (ignore model's inner setting).
+  * Projection-only JOINs retain the historical LEFT JOIN behaviour; declared
+    population-defining JOINs use the shared orientation-aware keyword so raw
+    rows have the same population as the ordinary source route.
   * Disconnected tables (unreachable from fact via join graph) are not joined;
     their columns appear as schema-preserving ``CAST(NULL AS <type>)`` so the
     result column count and order stay stable for BI clients.
@@ -30,6 +32,15 @@ from shared.semantic.calculated_expression import (
     parse_expression,
 )
 from shared.semantic.graph_order import is_fact_table
+from shared.semantic.join_keyword import (
+    is_orientation_declared,
+    join_keyword as _join_keyword,
+)
+from shared.semantic.join_population_serving import (
+    augment_required_table_ids,
+    population_defining_join_rows,
+    population_defining_table_ids,
+)
 
 from shared.connector_qualify import safe_ident
 from src.ir.logical_query import BoundQuery, SemanticBindingError
@@ -92,9 +103,10 @@ async def rewrite_for_raw(
 ) -> str:
     """Build an ungrouped SQL query for the raw route.
 
-    Returns a flat-row query with LEFT JOINs, no aggregation, and typed-NULL
-    placeholders for columns backed by unreachable tables or unsupported
-    measure types.
+    Returns a flat-row query with legacy LEFT JOINs for optional enrichment,
+    declared orientation-aware JOINs for mandatory population edges, no
+    aggregation, and typed-NULL placeholders for columns backed by unreachable
+    tables or unsupported measure types.
     """
     if target_dialect is not None:
         _target_dialect = target_dialect
@@ -326,6 +338,45 @@ async def rewrite_for_raw(
 
     base_table_id = base_table.id
 
+    # Bug-8615 / G3: raw/source row serving must not drop a deployed
+    # population-defining edge merely because no projected column names its
+    # far table.  Use the shared closure and refuse malformed graph data.
+    population_required = augment_required_table_ids(
+        required_table_ids,
+        joins,
+        table_ids=tables_by_id,
+    )
+    if population_required is None:
+        raise RawRouteUnsupported(
+            "raw source route cannot classify a population-defining join"
+        )
+    required_table_ids = population_required
+    population_rows = population_defining_join_rows(joins)
+    population_tables = population_defining_table_ids(joins)
+    if population_rows is None or population_tables is None:
+        raise RawRouteUnsupported(
+            "raw source route cannot classify a population-defining join"
+        )
+    # Raw serving can preserve the mandatory population only when the
+    # modeller's orientation is declared.  A legacy/cardinality/unknown token
+    # has no preserved side to prove; fail closed to the ordinary source route
+    # rather than silently rendering it as the historical LEFT JOIN.
+    mandatory_join_ids = {id(row) for row in population_rows}
+    if any(
+        not is_orientation_declared(getattr(row, "join_type", None))
+        for row in population_rows
+    ):
+        raise RawRouteUnsupported(
+            "raw source route cannot prove the orientation of a "
+            "population-defining join"
+        )
+
+    # Feed the normalized mandatory endpoint set into the rendered join plan
+    # as well as the reachability guard.  This is intentionally redundant with
+    # ``augment_required_table_ids``: the explicit sink keeps the raw consumer
+    # fail-closed if its closure assignment is later overwritten.
+    population_table_ids = {str(table_id) for table_id in population_tables}
+
     adjacency: dict[Any, list[Any]] = defaultdict(list)
     for j in joins:
         adjacency[j.left_table_id].append(j)
@@ -341,7 +392,10 @@ async def rewrite_for_raw(
                 reachable.add(nxt)
                 queue.append(nxt)
 
-    joinable_table_ids = required_table_ids & reachable
+    joinable_table_ids = (required_table_ids & reachable) | {
+        table_id for table_id in reachable
+        if str(table_id) in population_table_ids
+    }
     unreachable_table_ids = required_table_ids - reachable
 
     alias_by_table_id: dict[Any, str] = {}
@@ -389,8 +443,17 @@ async def rewrite_for_raw(
                 )
                 nxt_ref = ".".join(safe_ident(p) for p in nxt_table.physical_name.split("."))
                 nonlocal from_clause
+                if id(j) in mandatory_join_ids:
+                    join_keyword = _join_keyword(
+                        getattr(j, "join_type", None),
+                        flipped=tid == j.right_table_id,
+                    )
+                else:
+                    # Preserve the raw route's historical behaviour for
+                    # projection-only optional enrichment.
+                    join_keyword = "LEFT JOIN"
                 from_clause += (
-                    f' LEFT JOIN {nxt_ref} AS {_qid(alias_by_table_id[nxt])}'
+                    f' {join_keyword} {nxt_ref} AS {_qid(alias_by_table_id[nxt])}'
                     f' ON {lhs} = {rhs}'
                 )
                 joined.add(nxt)
@@ -405,6 +468,14 @@ async def rewrite_for_raw(
         if intermediates and _try_join(intermediates):
             continue
         break
+
+    # A mandatory endpoint that could not be reached/rendered is not safe to
+    # represent as a typed NULL placeholder; fall back to the regular source
+    # route instead of silently changing the row population.
+    if any(str(table_id) not in {str(tid) for tid in joined} for table_id in population_tables):
+        raise RawRouteUnsupported(
+            "raw source route cannot reach every population-defining join"
+        )
 
     select_parts: list[str] = []
 

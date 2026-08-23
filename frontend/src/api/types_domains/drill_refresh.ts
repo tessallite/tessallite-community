@@ -34,6 +34,22 @@ export interface QueryRouterRequest {
   dialect?: string;
   force_route?: "source" | "aggregate" | "pocket";
   persona_id?: string | null;
+  /**
+   * Model-parameter overrides, keyed `app.<lowercased parameter name>` — the
+   * same channel the JDBC gateway fills from `SET app.<name> = <value>`.
+   *
+   * Bug-9224: `ExecuteRequest.session_vars` has existed on the query-router
+   * since F-029-01, but this type omitted it, so the SPA could not send an
+   * override at ALL — a parameterised query always resolved to its deployed
+   * default. Precedence is persona default filter > session var > deployed
+   * default.
+   *
+   * Build the key from `session_var_key` on
+   * `GET /api/v1/models/{model_id}/named-objects` rather than assembling it:
+   * the gateway lower-cases the key (Postgres GUC semantics), so a
+   * hand-built `app.<AuthoredCase>` silently never matches.
+   */
+  session_vars?: Record<string, string> | null;
 }
 export interface TraceStep {
   stage: "parser" | "binder" | "router" | "rewriter" | "executor";

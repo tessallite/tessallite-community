@@ -63,6 +63,7 @@ function renderCanvas(
   tenantSlug?: string,
   readOnly = false,
   canvasLayout: Record<string, unknown> = {},
+  joins: Array<Record<string, unknown>> = [],
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const ui = (slug?: string, ro = readOnly) => (
@@ -72,7 +73,7 @@ function renderCanvas(
           projectId="proj-1"
           modelId="model-1"
           tables={[]}
-          joins={[]}
+          joins={joins as never}
           canvasLayout={canvasLayout as never}
           tenantSlug={slug}
           readOnly={ro}
@@ -104,6 +105,33 @@ describe("Canvas render stability (Bug-6373)", () => {
     // No user edit and a persisted (empty) layout with no unplaced tables means
     // no layout PATCH should ever fire on mount.
     expect(updateSpy).not.toHaveBeenCalled();
+  });
+
+  it("places the hidden-joins warning away from Controls and MiniMap (Bug-9533)", () => {
+    renderCanvas(undefined, false, {}, [
+      { id: "hidden-join", left_table_id: "hidden-a", right_table_id: "hidden-b" },
+    ]);
+
+    const warningPanel = screen.getByRole("alert").closest(".react-flow__panel");
+    expect(warningPanel).not.toBeNull();
+    // RFGPT-001: bottom-center keeps Controls (bottom-left) and MiniMap
+    // (bottom-right) free; do not share either corner's positional classes.
+    expect(warningPanel).toHaveClass("bottom", "center");
+    expect(warningPanel).not.toHaveClass("left");
+    expect(warningPanel).not.toHaveClass("right");
+
+    const controls = document.querySelector('[data-testid="rf__controls"]');
+    expect(controls).not.toBeNull();
+    expect(controls).toHaveClass("bottom", "left");
+    expect(controls).not.toBe(warningPanel);
+
+    fireEvent.click(screen.getByTitle("Model annotations"));
+    const notesPanel = screen.getByRole("textbox").closest(".react-flow__panel");
+    expect(notesPanel).toBe(warningPanel);
+    expect(screen.getByRole("alert").parentElement).toHaveStyle({
+      display: "flex",
+      flexDirection: "column",
+    });
   });
 
   // Reproduces the actual reported scenario: after a layout EDIT the save must

@@ -930,8 +930,8 @@ async def list_selectable_models(
         persona_id = None
         embed_model_ids = None
         if isinstance(current_user, CurrentEmbedUser):
-            if current_user.persona_id:
-                persona_id = UUID(current_user.persona_id)
+            if current_user.project_persona_id:
+                persona_id = UUID(current_user.project_persona_id)
             # Bug-6575 — narrow the picker to the embed token's model_ids
             # allow-list so it never advertises models the caller could not
             # query (matches assemble_prompt / the router's enforce_model_scope).

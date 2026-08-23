@@ -199,6 +199,15 @@ CALENDAR_HIERARCHY_TEMPLATES: dict[str, list[tuple[str, str]]] = {
 # These are used to build hierarchy levels from actual calendar table columns
 # rather than from EXTRACT-based UDA expressions.
 _TABLE_BOUND_COMPONENT_TO_COLUMN: dict[str, dict[str, str]] = {
+    # Fiscal calendars are table-bound for the generated hierarchy path when
+    # a materialised calendar is available.  Their period keys use the same
+    # physical columns as the standard calendar; the separate ``year_label``
+    # column is attached to the year Dimension as its caption below.
+    "year": {"column": "year_no", "time_unit": "year"},
+    "half_year": {"column": "half_no", "time_unit": "half"},
+    "quarter": {"column": "quarter_no", "time_unit": "quarter"},
+    "month": {"column": "month_no", "time_unit": "month"},
+    "day": {"column": "day_no", "time_unit": "day"},
     "retail_year": {"column": "retail_year", "time_unit": "year"},
     "retail_quarter": {"column": "retail_quarter", "time_unit": "quarter"},
     "retail_period": {"column": "retail_period", "time_unit": "month"},
@@ -732,6 +741,7 @@ async def _create_generated_uda(
     referenced_column_ids: list[UUID],
     description: str | None = None,
     reuse_existing: bool = False,
+    history_capture: dict | None = None,
 ) -> UserDefinedAttribute:
     if reuse_existing:
         existing = (
@@ -764,6 +774,8 @@ async def _create_generated_uda(
     )
     db.add(uda)
     await db.flush()
+    if history_capture is not None:
+        history_capture.setdefault("generated_uda_ids", []).append(uda.id)
     for col_id in set(referenced_column_ids):
         db.add(
             UserDefinedAttributeColumnRef(
@@ -1301,6 +1313,173 @@ async def _level_response(db, level: HierarchyLevel, model_id: UUID) -> Hierarch
     )
 
 
+async def _hierarchy_details_batch(
+    db,
+    hierarchies: list[HierarchyDefinition],
+    model_id: UUID,
+    *,
+    excluded_attr_ids: set[UUID] | None = None,
+) -> list[HierarchyDetailResponse]:
+    """Build hierarchy details from one model-scoped metadata batch.
+
+    The model editor opens a whole catalogue, so resolving each hierarchy with
+    ``_hierarchy_detail`` turns one request into a hierarchy/level/attribute
+    fan-out.  Keep the endpoint's response contract, but load each metadata
+    relation once and resolve references from in-memory maps.  The fixed set of
+    statements is intentional: it remains bounded when a model has hundreds
+    of hierarchies and also avoids ``Session.get`` calls hidden inside a loop.
+    """
+    hierarchy_ids = [hierarchy.id for hierarchy in hierarchies]
+    levels_result = await db.execute(
+        select(HierarchyLevel)
+        .where(HierarchyLevel.hierarchy_id.in_(hierarchy_ids))
+        .order_by(HierarchyLevel.hierarchy_id, HierarchyLevel.ordinal)
+    )
+    all_levels = list(levels_result.scalars().all())
+    levels_by_hierarchy: dict[UUID, list[HierarchyLevel]] = defaultdict(list)
+    visible_levels: list[HierarchyLevel] = []
+    for level in all_levels:
+        if excluded_attr_ids is not None and level.key_attribute_id in excluded_attr_ids:
+            continue
+        levels_by_hierarchy[level.hierarchy_id].append(level)
+        visible_levels.append(level)
+
+    level_ids = [level.id for level in visible_levels]
+    attributes_result = await db.execute(
+        select(HierarchyLevelAttribute)
+        .where(HierarchyLevelAttribute.level_id.in_(level_ids))
+        .order_by(HierarchyLevelAttribute.level_id, HierarchyLevelAttribute.id)
+    )
+    attrs_by_level: dict[UUID, list[HierarchyLevelAttribute]] = defaultdict(list)
+    all_attributes = list(attributes_result.scalars().all())
+    for item in all_attributes:
+        attrs_by_level[item.level_id].append(item)
+
+    # Keep all three catalogue reads unconditional.  Besides making the query
+    # budget explicit, this means a model containing only physical columns or
+    # only UDAs has the same bounded request shape as a mixed model.
+    physical_ids = {
+        level.key_attribute_id
+        for level in visible_levels
+        if _normalize_source(level.key_attribute_source, field="key_attribute_source")
+        == "physical_column"
+    }
+    uda_ids = {
+        level.key_attribute_id
+        for level in visible_levels
+        if _normalize_source(level.key_attribute_source, field="key_attribute_source")
+        == "user_defined_attribute"
+    }
+    for item in all_attributes:
+        source = _normalize_source(item.attribute_source, field="attribute_source")
+        if source == "physical_column":
+            physical_ids.add(item.attribute_id)
+        else:
+            uda_ids.add(item.attribute_id)
+
+    columns_result = await db.execute(
+        select(ModelColumn).where(ModelColumn.id.in_(physical_ids))
+    )
+    columns_by_id = {column.id: column for column in columns_result.scalars().all()}
+    udas_result = await db.execute(
+        select(UserDefinedAttribute).where(
+            UserDefinedAttribute.model_id == model_id,
+            UserDefinedAttribute.id.in_(uda_ids),
+        )
+    )
+    udas_by_id = {uda.id: uda for uda in udas_result.scalars().all()}
+    table_ids = {
+        column.model_table_id for column in columns_by_id.values()
+    } | {
+        uda.table_id for uda in udas_by_id.values()
+    }
+    tables_result = await db.execute(
+        select(ModelTable).where(
+            ModelTable.model_id == model_id,
+            ModelTable.id.in_(table_ids),
+        )
+    )
+    tables_by_id = {table.id: table for table in tables_result.scalars().all()}
+
+    def resolve(attribute_id: UUID, source: str) -> _ResolvedAttribute:
+        source = _normalize_source(source, field="attribute_source")
+        if source == "physical_column":
+            column = columns_by_id.get(attribute_id)
+            if column is None:
+                raise _not_found("Attribute not found")
+            table = tables_by_id.get(column.model_table_id)
+            if table is None:
+                raise _not_found("Attribute not found")
+            name = column.column_name
+            data_type = column.data_type
+        else:
+            uda = udas_by_id.get(attribute_id)
+            if uda is None:
+                raise _not_found("Attribute not found")
+            table = tables_by_id.get(uda.table_id)
+            if table is None:
+                raise _not_found("Attribute not found")
+            name = uda.name
+            data_type = uda.output_data_type
+        return _ResolvedAttribute(
+            ref=HierarchyAttributeRef(
+                id=attribute_id,
+                name=name,
+                table_id=table.id,
+                table_name=table.alias or table.display_name or table.physical_name,
+                data_type=data_type,
+                source=source,
+            ),
+            table=table,
+        )
+
+    details: list[HierarchyDetailResponse] = []
+    for hierarchy in hierarchies:
+        level_items: list[HierarchyLevelResponse] = []
+        for level in levels_by_hierarchy.get(hierarchy.id, []):
+            key_attr = resolve(level.key_attribute_id, level.key_attribute_source)
+            attr_items = [
+                HierarchyLevelAttributeResponse(
+                    id=item.id,
+                    attribute=resolve(item.attribute_id, item.attribute_source).ref,
+                    role=item.role,
+                )
+                for item in attrs_by_level.get(level.id, [])
+            ]
+            level_items.append(
+                HierarchyLevelResponse(
+                    id=level.id,
+                    name=level.name,
+                    ordinal=level.ordinal,
+                    key_attribute=key_attr.ref,
+                    attributes=attr_items,
+                    description=level.description,
+                    time_unit=level.time_unit,
+                    allowed_time_calcs=list(level.allowed_time_calcs or []),
+                )
+            )
+        if excluded_attr_ids is not None and not level_items:
+            continue
+        details.append(
+            HierarchyDetailResponse(
+                id=hierarchy.id,
+                model_id=hierarchy.model_id,
+                name=hierarchy.name,
+                type=hierarchy.type,
+                dimension_kind=hierarchy.dimension_kind,
+                description=hierarchy.description,
+                segment_config=hierarchy.segment_config,
+                date_config=hierarchy.date_config,
+                calendar_type=hierarchy.calendar_type,
+                fiscal_year_start_month=hierarchy.fiscal_year_start_month,
+                levels=level_items,
+                created_at=hierarchy.created_at,
+                updated_at=hierarchy.updated_at,
+            )
+        )
+    return details
+
+
 async def _hierarchy_detail(
     db,
     hierarchy: HierarchyDefinition,
@@ -1653,6 +1832,48 @@ async def list_hierarchies(
                 )
             )
         return items
+
+
+@router.get("/hierarchies/with-levels", response_model=list[HierarchyDetailResponse])
+async def list_hierarchies_with_levels(
+    project_id: UUID,
+    model_id: UUID,
+    persona_id: UUID | None = Query(default=None),
+    current_user: CurrentUser = Depends(get_current_user),
+    _: None = require_role("viewer"),
+) -> list[HierarchyDetailResponse]:
+    """Return one model-scoped hierarchy/level catalogue for editor opens.
+
+    The canvas needs level attributes to build persona bindings. Keeping this
+    contract model-scoped avoids turning one model open into one request per
+    hierarchy while retaining the same persona filtering as the summary and
+    detail routes.
+    """
+    enforce_model_scope(current_user, str(model_id), project_id=str(project_id))
+    async for db in get_tenant_db(current_user.tenant_id):
+        await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        persona = await resolve_effective_persona(
+            db, current_user=current_user, model_id=model_id,
+            requested_persona_id=persona_id,
+        )
+        stmt = select(HierarchyDefinition).where(
+            HierarchyDefinition.model_id == model_id,
+        )
+        if persona:
+            allowed = parse_allowed_ids(persona.included_hierarchy_ids)
+            if allowed is not None:
+                stmt = stmt.where(HierarchyDefinition.id.in_(allowed))
+        hierarchies = (await db.execute(stmt.order_by(HierarchyDefinition.name))).scalars().all()
+        excluded_attrs = (
+            await get_excluded_level_attribute_ids(db, model_id=model_id, persona=persona)
+            if persona else None
+        )
+        return await _hierarchy_details_batch(
+            db,
+            list(hierarchies),
+            model_id,
+            excluded_attr_ids=excluded_attrs,
+        )
 
 
 @router.get("/hierarchies/{hierarchy_id}", response_model=HierarchyDetailResponse)
@@ -3079,7 +3300,9 @@ async def _auto_create_date_hierarchies_for_model(
     *,
     model_id: UUID,
     calendar_model_table_id: UUID,
+    calendar_table_id: UUID | None = None,
     grain: str = "y_m_d",
+    history_capture: dict | None = None,
 ) -> tuple[int, list[str], list[str]]:
     """Auto-create date hierarchies for all unassigned fact-table date columns.
 
@@ -3117,8 +3340,15 @@ async def _auto_create_date_hierarchies_for_model(
 
     # Bug-6722: determine whether this calendar type can compute its period
     # boundaries from date arithmetic alone (no physical calendar table join).
+    # Fiscal calendars additionally need the materialised ``year_label`` for
+    # BI captions, so their generated hierarchy uses the table-bound path when
+    # a calendar alias is available.  The query-time expression path remains
+    # available to the variant emitter and explicit expression callers.
     cal_type = normalize_calendar_type(cal_info.calendar_type) or "standard"
-    expr_capable = cal_type in EXPRESSION_CAPABLE_CALENDAR_TYPES
+    expr_capable = (
+        cal_type in EXPRESSION_CAPABLE_CALENDAR_TYPES
+        and cal_type != "fiscal"
+    )
 
     # For table-bound types we still need the calendar date-key column.
     cal_date_key_col = None
@@ -3198,6 +3428,8 @@ async def _auto_create_date_hierarchies_for_model(
                 name=hier_name,
                 calendar_type=cal_type,
                 fiscal_year_start_month=cal_info.fiscal_year_start_month,
+                calendar_table_id=calendar_table_id,
+                history_capture=history_capture,
             )
         else:
             # Bug-7204: Table-bound path (retail_445, hijri) -- calendar alias
@@ -3216,6 +3448,8 @@ async def _auto_create_date_hierarchies_for_model(
             )
             db.add(alias)
             await db.flush()
+            if history_capture is not None:
+                history_capture.setdefault("generated_model_table_ids", []).append(alias.id)
 
             # Create date_key column on the alias
             alias_date_key = ModelColumn(
@@ -3282,9 +3516,12 @@ async def _auto_create_date_hierarchies_for_model(
                 calendar_type=cal_type,
                 fiscal_year_start_month=cal_info.fiscal_year_start_month,
                 column_id_map=column_id_map if column_id_map else None,
+                caption_source_table_id=cal_mt.id,
+                calendar_table_id=calendar_table_id,
+                history_capture=history_capture,
             )
 
-            db.add(Join(
+            join = Join(
                 model_id=model_id,
                 left_table_id=attr.table_id,
                 right_table_id=alias.id,
@@ -3301,7 +3538,11 @@ async def _auto_create_date_hierarchies_for_model(
                 cardinality=_CALENDAR_ALIAS_CARDINALITY,
                 left_column_id=join_col_id,
                 right_column_id=alias_date_key.id,
-            ))
+            )
+            db.add(join)
+            await db.flush()
+            if history_capture is not None:
+                history_capture.setdefault("generated_join_ids", []).append(join.id)
 
         created_names.append(attr.display_name or attr.column_name)
         created += 1
@@ -3321,6 +3562,9 @@ async def _create_date_hierarchy_for_alias(
     calendar_type: str | None = None,
     fiscal_year_start_month: int | None = None,
     column_id_map: dict[str, UUID] | None = None,
+    caption_source_table_id: UUID | None = None,
+    calendar_table_id: UUID | None = None,
+    history_capture: dict | None = None,
 ) -> HierarchyDefinition:
     """Create a date hierarchy with UDA levels on a table.
 
@@ -3368,22 +3612,28 @@ async def _create_date_hierarchy_for_alias(
             "template": grain,
             "source_attribute_id": str(date_key_col_id),
             "source_attribute_source": "physical_column",
+            **({"calendar_table_id": str(calendar_table_id)} if calendar_table_id else {}),
         },
         calendar_type=calendar_type,
         fiscal_year_start_month=fiscal_year_start_month,
     )
     db.add(hierarchy)
     await db.flush()
+    if history_capture is not None:
+        history_capture.setdefault("generated_hierarchy_ids", []).append(hierarchy.id)
 
     # Bug-7204: for table-bound types with column_id_map, build levels directly
     # from physical calendar columns instead of UDA expressions.
     if column_id_map:
+        caption_dimensions: list[Dimension] = []
+
         for ordinal, (component, level_name) in enumerate(components):
-            col_id = column_id_map.get(component)
+            meta = _TABLE_BOUND_COMPONENT_TO_COLUMN.get(component, {})
+            physical_name = meta.get("column", component)
+            col_id = column_id_map.get(component) or column_id_map.get(physical_name)
             if col_id is None:
                 continue  # column not available on alias; skip this level
 
-            meta = _TABLE_BOUND_COMPONENT_TO_COLUMN.get(component, {})
             time_unit = meta.get("time_unit")
 
             db.add(
@@ -3410,19 +3660,75 @@ async def _create_date_hierarchy_for_alias(
                 )
             ).scalar_one_or_none()
             if existing_dim is None:
-                db.add(
-                    Dimension(
-                        model_id=model_id,
-                        name=gen_name,
-                        display_name=_clamp_to_limit(f"{level_name} ({name})"),
-                        source_column_id=col_id,
-                        is_time_dim=True,
-                        time_grain=time_unit,
-                        description=f"Auto-generated for hierarchy '{name}' ({component})",
-                    )
+                generated_dimension = Dimension(
+                    model_id=model_id,
+                    name=gen_name,
+                    display_name=_clamp_to_limit(f"{level_name} ({name})"),
+                    source_column_id=col_id,
+                    is_time_dim=True,
+                    time_grain=time_unit,
+                    description=f"Auto-generated for hierarchy '{name}' ({component})",
                 )
+                db.add(generated_dimension)
+                dimension_for_caption = generated_dimension
+                if history_capture is not None:
+                    history_capture.setdefault("generated_dimension_objects", []).append(
+                        generated_dimension
+                    )
+            else:
+                dimension_for_caption = existing_dim
+            if component in {"year", "retail_year"}:
+                caption_dimensions.append(dimension_for_caption)
+
+        # A caption is optional during the normal pre-rebuild window.  Do not
+        # advertise a display column until the source calendar alias really
+        # exposes it; XMLA/Power BI then naturally falls back to the key.  The
+        # lookup is deliberately after level creation so an older caller's
+        # key-only path remains usable even when no optional metadata row exists.
+        if (
+            caption_source_table_id is not None
+            and calendar_type in {"fiscal", "retail_445"}
+        ):
+            try:
+                label_result = await db.execute(
+                    select(ModelColumn)
+                    .where(
+                        ModelColumn.model_table_id == caption_source_table_id,
+                        ModelColumn.column_name == "year_label",
+                    )
+                    .limit(1)
+                )
+            except StopAsyncIteration:
+                # Test doubles and legacy metadata adapters can have no answer
+                # for this optional probe.  Treat that exactly like an old
+                # calendar: year_no remains the key and caption.
+                label_result = None
+            source_year_label = (
+                label_result.scalar_one_or_none() if label_result is not None else None
+            )
+            if source_year_label is not None:
+                alias_year_label = ModelColumn(
+                    model_table_id=table_id,
+                    column_name=source_year_label.column_name,
+                    display_name=source_year_label.display_name or "Year Label",
+                    description=source_year_label.description,
+                    data_type=source_year_label.data_type,
+                    is_nullable=source_year_label.is_nullable,
+                    is_hidden=False,
+                )
+                db.add(alias_year_label)
+                await db.flush()
+                for dimension in caption_dimensions:
+                    if dimension.display_column_id is None:
+                        dimension.display_column_id = alias_year_label.id
 
         await db.flush()
+        if history_capture is not None:
+            history_capture.setdefault("generated_dimension_ids", []).extend(
+                dimension.id
+                for dimension in history_capture.pop("generated_dimension_objects", [])
+                if dimension.id is not None
+            )
         return hierarchy
 
     # Expression-capable path: create UDA expressions for each level.
@@ -3455,6 +3761,7 @@ async def _create_date_hierarchy_for_alias(
             referenced_column_ids=[date_key_col_id],
             description=f"Auto-generated for hierarchy '{name}' ({component})",
             reuse_existing=bool(reusable),
+            history_capture=history_capture,
         )
         key_attribute_id = uda.id
         key_attribute_source = "user_defined_attribute"
@@ -3482,8 +3789,7 @@ async def _create_date_hierarchy_for_alias(
             )
         ).scalar_one_or_none()
         if existing_dim is None:
-            db.add(
-                Dimension(
+            generated_dimension = Dimension(
                     model_id=model_id,
                     name=gen_name,
                     display_name=_clamp_to_limit(f"{level_name} ({name})"),
@@ -3492,10 +3798,295 @@ async def _create_date_hierarchy_for_alias(
                     time_grain=time_grain,
                     description=f"Auto-generated for hierarchy '{name}' ({component})",
                 )
-            )
+            db.add(generated_dimension)
+            if history_capture is not None:
+                history_capture.setdefault("generated_dimension_objects", []).append(
+                    generated_dimension
+                )
 
     await db.flush()
+    if history_capture is not None:
+        history_capture.setdefault("generated_dimension_ids", []).extend(
+            dimension.id
+            for dimension in history_capture.pop("generated_dimension_objects", [])
+            if dimension.id is not None
+        )
     return hierarchy
+
+
+async def reconcile_generated_calendar_captions(
+    db,
+    *,
+    model_id: UUID,
+    calendar_table_id: UUID,
+    calendar_type: str,
+    history_capture: dict | None = None,
+) -> int:
+    """Reconcile captions on already-generated fiscal/retail hierarchies.
+
+    Auto-generation is intentionally idempotent and therefore skips a hierarchy
+    whose name already exists.  A calendar rebuild must still revisit the
+    generated year dimension after the physical ``year_label`` column appears.
+    This narrow pass follows the persisted ``date_config.calendar_table_id``
+    marker and only changes server-generated time dimensions whose key column
+    and caption column belong to the same generated calendar alias.  It never
+    changes a numeric level key or a modeller-authored dimension.
+    """
+    if calendar_type not in {"fiscal", "retail_445"}:
+        return 0
+    rows = (
+        await db.execute(select(HierarchyDefinition).where(HierarchyDefinition.model_id == model_id))
+    ).scalars().all()
+    reconciled = 0
+    calendar_marker = str(calendar_table_id)
+    calendar = await db.get(CalendarTable, calendar_table_id)
+    if calendar is None:
+        return 0
+    spine = (
+        await db.execute(
+            select(ModelTable).where(
+                ModelTable.model_id == model_id,
+                ModelTable.calendar_table_id == calendar_table_id,
+                ModelTable.table_type == "calendar",
+            ).order_by(ModelTable.id).limit(1)
+        )
+    ).scalar_one_or_none()
+    if spine is None:
+        return 0
+    for hierarchy in rows:
+        config = hierarchy.date_config
+        if not isinstance(config, dict) or config.get("calendar_table_id") != calendar_marker:
+            continue
+        if hierarchy.calendar_type != calendar_type or hierarchy.type != "date_embedded":
+            continue
+        levels = (
+            await db.execute(
+                select(HierarchyLevel).where(HierarchyLevel.hierarchy_id == hierarchy.id)
+            )
+        ).scalars().all()
+        year_level = next((level for level in levels if level.time_unit == "year"), None)
+        if year_level is None:
+            continue
+        key_column = await db.get(ModelColumn, year_level.key_attribute_id)
+        if key_column is None and year_level.key_attribute_source == "user_defined_attribute":
+            # Legacy fiscal hierarchies were expression-backed.  They are
+            # server-generated (date_config marker + time hierarchy), so
+            # upgrade their levels to the existing physical calendar alias
+            # rather than leaving a caption pointer to a non-existent source.
+            source_id = config.get("source_attribute_id")
+            try:
+                source_attribute_id = UUID(str(source_id))
+            except (TypeError, ValueError):
+                source_attribute_id = None
+            source_column = (
+                await db.get(ModelColumn, source_attribute_id)
+                if source_attribute_id is not None else None
+            )
+            if source_column is None and source_attribute_id is not None:
+                # Older expression-backed hierarchies may persist the source
+                # UDA id rather than its single physical date column. Resolve
+                # that supported representation before looking up the
+                # companion join; multi-column UDAs cannot identify one date
+                # role and remain on their existing expression path.
+                source_uda = await db.get(UserDefinedAttribute, source_attribute_id)
+                if source_uda is not None:
+                    ref_ids = (
+                        await db.execute(
+                            select(UserDefinedAttributeColumnRef.column_id).where(
+                                UserDefinedAttributeColumnRef.attribute_id == source_uda.id
+                            )
+                        )
+                    ).scalars().all()
+                    if len(ref_ids) == 1:
+                        source_column = await db.get(ModelColumn, ref_ids[0])
+            if source_column is None:
+                continue
+            aliases = (
+                await db.execute(
+                    select(ModelTable).where(
+                        ModelTable.model_id == model_id,
+                        ModelTable.calendar_table_id == calendar_table_id,
+                        ModelTable.id != spine.id,
+                    )
+                )
+            ).scalars().all()
+            alias_by_id = {item.id: item for item in aliases}
+            alias = None
+            date_alias_column = None
+            if alias_by_id:
+                # The semantic identity of a companion alias is the fact-date
+                # column it joins, not merely its membership in this calendar.
+                # A model can have Order Date and Ship Date hierarchies over
+                # the same calendar, each requiring its own alias and join.
+                joins = (
+                    await db.execute(
+                        select(Join).where(
+                            Join.model_id == model_id,
+                            Join.left_column_id == source_column.id,
+                            Join.right_table_id.in_(tuple(alias_by_id)),
+                        )
+                    )
+                ).scalars().all()
+                for candidate_join in joins:
+                    candidate_alias = alias_by_id.get(candidate_join.right_table_id)
+                    if candidate_alias is None:
+                        continue
+                    candidate_column = await db.get(
+                        ModelColumn, candidate_join.right_column_id
+                    )
+                    if (
+                        candidate_column is not None
+                        and candidate_column.model_table_id == candidate_alias.id
+                        and candidate_column.column_name == calendar.date_column
+                    ):
+                        alias = candidate_alias
+                        date_alias_column = candidate_column
+                        break
+
+            if alias is not None and history_capture is not None:
+                recorded_ids = {
+                    str(item.get("id"))
+                    for item in history_capture.setdefault("reused_model_tables", [])
+                    if isinstance(item, dict) and item.get("id")
+                }
+                if str(alias.id) not in recorded_ids:
+                    history_capture["reused_model_tables"].append({
+                        "id": str(alias.id),
+                        "calendar_table_id": str(alias.calendar_table_id)
+                        if alias.calendar_table_id is not None else None,
+                        "table_type": alias.table_type,
+                    })
+            if alias is None:
+                alias_name = await _next_calendar_alias(
+                    db, model_id, source_column.column_name, set()
+                )
+                alias = ModelTable(
+                    model_id=model_id,
+                    source_id=spine.source_id,
+                    table_type="dim_detail",
+                    physical_name=spine.physical_name,
+                    alias=alias_name,
+                    display_name=f"{hierarchy.name} Calendar",
+                    calendar_table_id=calendar_table_id,
+                )
+                db.add(alias)
+                await db.flush()
+                if history_capture is not None:
+                    history_capture.setdefault("generated_model_table_ids", []).append(alias.id)
+                spine_columns = (
+                    await db.execute(
+                        select(ModelColumn).where(ModelColumn.model_table_id == spine.id)
+                    )
+                ).scalars().all()
+                for source in spine_columns:
+                    db.add(ModelColumn(
+                        model_table_id=alias.id,
+                        column_name=source.column_name,
+                        display_name=source.display_name,
+                        description=source.description,
+                        data_type=source.data_type,
+                        is_nullable=source.is_nullable,
+                        is_hidden=False,
+                    ))
+                await db.flush()
+                date_alias_column = next(
+                    (item for item in (await db.execute(
+                        select(ModelColumn).where(ModelColumn.model_table_id == alias.id)
+                    )).scalars().all() if item.column_name == calendar.date_column),
+                    None,
+                )
+                if date_alias_column is not None:
+                    join = Join(
+                        model_id=model_id,
+                        left_table_id=source_column.model_table_id,
+                        right_table_id=alias.id,
+                        join_type=_CALENDAR_ALIAS_JOIN_TYPE,
+                        cardinality=_CALENDAR_ALIAS_CARDINALITY,
+                        left_column_id=source_column.id,
+                        right_column_id=date_alias_column.id,
+                    )
+                    db.add(join)
+                    await db.flush()
+                    if history_capture is not None:
+                        history_capture.setdefault("generated_join_ids", []).append(join.id)
+            alias_columns = (
+                await db.execute(
+                    select(ModelColumn).where(ModelColumn.model_table_id == alias.id)
+                )
+            ).scalars().all()
+            by_name = {item.column_name: item for item in alias_columns}
+            component_columns = {
+                "year": getattr(calendar, "year_column", None),
+                "half": getattr(calendar, "half_column", None),
+                "quarter": getattr(calendar, "quarter_column", None),
+                "month": getattr(calendar, "month_column", None),
+                "week": getattr(calendar, "week_column", None),
+                "day": getattr(calendar, "day_column", None),
+            }
+            for level in levels:
+                component = level.time_unit
+                physical = by_name.get(component_columns.get(component))
+                if physical is None:
+                    continue
+                if history_capture is not None:
+                    history_capture.setdefault("hierarchy_level_keys", []).append({
+                        "id": str(level.id), "key_attribute_id": str(level.key_attribute_id),
+                        "key_attribute_source": level.key_attribute_source,
+                    })
+                level.key_attribute_id = physical.id
+                level.key_attribute_source = "physical_column"
+            key_column = by_name.get(component_columns.get("year"))
+            if key_column is None:
+                continue
+        if key_column is None or year_level.key_attribute_source != "physical_column":
+            continue
+        label_result = await db.execute(
+            select(ModelColumn).where(
+                ModelColumn.model_table_id == key_column.model_table_id,
+                ModelColumn.column_name == "year_label",
+            ).limit(1)
+        )
+        label_column = label_result.scalar_one_or_none()
+        if label_column is None:
+            continue
+        dimension_name = _clamp_to_limit(
+            f"{_slugify_name(hierarchy.name)}_"
+            f"{'retail_year' if calendar_type == 'retail_445' else 'year'}"
+        )
+        dimension = (
+            await db.execute(
+                select(Dimension).where(
+                    Dimension.model_id == model_id,
+                    Dimension.name == dimension_name,
+                    Dimension.is_time_dim.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if dimension is None:
+            continue
+        if history_capture is not None and dimension.display_column_id != label_column.id:
+            history_capture.setdefault("dimension_display_columns", []).append(
+                {"id": str(dimension.id), "display_column_id": (
+                    str(dimension.display_column_id)
+                    if dimension.display_column_id is not None else None
+                )}
+            )
+        if dimension.source_column_id != key_column.id:
+            if history_capture is not None:
+                history_capture.setdefault("dimension_source_columns", []).append({
+                    "id": str(dimension.id),
+                    "source_column_id": str(dimension.source_column_id)
+                    if dimension.source_column_id is not None else None,
+                    "user_defined_attribute_id": str(dimension.user_defined_attribute_id)
+                    if dimension.user_defined_attribute_id is not None else None,
+                })
+            dimension.source_column_id = key_column.id
+            dimension.user_defined_attribute_id = None
+        if dimension.display_column_id != label_column.id:
+            dimension.display_column_id = label_column.id
+            reconciled += 1
+    await db.flush()
+    return reconciled
 
 
 # ---------------------------------------------------------------------------
@@ -3568,7 +4159,10 @@ async def batch_create_date_hierarchies(
                 batch_cal_type = normalize_calendar_type(
                     getattr(cal_info_batch, "calendar_type", None)
                 ) or "standard"
-                batch_expr_capable = batch_cal_type in EXPRESSION_CAPABLE_CALENDAR_TYPES
+                batch_expr_capable = (
+                    batch_cal_type in EXPRESSION_CAPABLE_CALENDAR_TYPES
+                    and batch_cal_type != "fiscal"
+                )
 
         cal_date_key_col: ModelColumn | None = None
 
@@ -3773,6 +4367,7 @@ async def batch_create_date_hierarchies(
                         if cal_info_batch else None
                     ),
                     column_id_map=batch_column_id_map if batch_column_id_map else None,
+                    caption_source_table_id=cal_mt.id,
                 )
 
                 db.add(Join(

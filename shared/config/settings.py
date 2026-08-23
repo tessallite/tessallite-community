@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     # System DB — global PostgreSQL that stores the tenant registry + per-tenant DB URLs
     SYSTEM_DATABASE_URL: str = "postgresql+asyncpg://tessallite:tessallite@localhost:5432/tessallite_system"
 
+    # Bug-9192 / RFGPT-002: max retained per-tenant request engines in THIS
+    # process. Each engine holds pool_size=2 connections; an unbounded cache
+    # of engines can still exhaust PostgreSQL max_connections under a large
+    # active-tenant sweep. LRU eviction disposes the oldest engines.
+    TENANT_ENGINE_CACHE_MAX: int = Field(default=16, ge=1)
+
     # Credential encryption — Fernet symmetric key (base64-encoded, 32 bytes)
     # Generate with: from cryptography.fernet import Fernet; Fernet.generate_key().decode()
     CREDENTIAL_ENCRYPTION_KEY: str = "CHANGE_ME_generate_with_fernet"

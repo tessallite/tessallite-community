@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Manage Aggregate Schedules</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-08-14</span></div>
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-08-22</span></div>
     <h1>Manage Aggregate Schedules</h1>
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/scheduler-panel.png" alt="Scheduler panel listing aggregate refresh jobs."></figure>
 <h2>What this covers</h2>
@@ -49,6 +49,8 @@
 <p>In the Scheduler panel, click <strong>Run now</strong> in the Actions column. The aggregate&#x27;s status changes to <strong>Building</strong> for the duration of the run. This does not affect the regular schedule.</p>
 <h2>Viewing refresh history</h2>
 <ol><li>In the Scheduler panel, click the aggregate name.</li><li>A history drawer opens showing the last 10 refresh runs.</li><li>Each entry shows start time, duration, and outcome (Success or Failed).</li><li>For failed runs, click <strong>View log</strong> to see the full Scheduler log for that run.</li></ol>
+<h2>Viewing scheduler job history</h2>
+<p>Open the <strong>Scheduler</strong> panel in Model Builder and scroll to <strong>Scheduler Job History</strong>. This read-only table lists every registered scheduler job with its durable last status, completion time, last error, next run, and whether the last run was scheduled or manual. It refreshes every 30 seconds. <strong>Not run yet</strong> means that job has no execution-ledger record yet; it does not mean the job failed.</p>
 <h2>Stale status</h2>
 <p>An aggregate is marked <strong>Stale</strong> when its last successful refresh completed more than twice the schedule interval ago. Stale aggregates continue to serve queries using their existing data, but the data may be older than expected.</p>
 <h2>Related</h2>

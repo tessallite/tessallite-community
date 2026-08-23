@@ -2,12 +2,9 @@ import { Tab, Tabs } from "@mui/material";
 import { useBuilderStore, type MiniTab } from "../../store/builderStore";
 import { useT } from "../../i18n";
 
-// Two-way toggle between the Canvas (star-schema editor) and the
-// Model Health tab. The previously-planned "Data" tab was removed
-// in Phase G2 — the Diagnostics Query Log already surfaces real
-// query results, so a dedicated data preview would duplicate
-// existing UI without clear value. Add it back when there's a
-// concrete use case that the Query Log doesn't cover.
+// Keep this list in the same visible order used by the plain-digit shortcuts
+// in useGlobalShortcuts: canvas, query, KPI scorecard, Model Health, analytics.
+// "matrix" remains the internal store value for the Model Health tab.
 const TAB_KEYS: { value: MiniTab; key: string }[] = [
   { value: "canvas", key: "builder.canvas" },
   { value: "query", key: "builder.query" },

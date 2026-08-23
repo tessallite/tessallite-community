@@ -625,6 +625,7 @@ class TestConversationsReservationThreading:
         run_turn_mock = AsyncMock(return_value=self._outcome())
         persist_mock = AsyncMock(return_value=MagicMock())
         reconcile_mock = AsyncMock()
+        reserved_turn_id = _uuid.uuid4()
 
         with (
             patch.object(conv_mod, "_enforce_project_scope", MagicMock()),
@@ -637,7 +638,7 @@ class TestConversationsReservationThreading:
             patch.object(
                 conv_mod, "_reserve_turn",
                 AsyncMock(return_value=SimpleNamespace(
-                    is_duplicate=False, existing_turn_id=None, turn_index=0,
+                    is_duplicate=False, existing_turn_id=reserved_turn_id, turn_index=0,
                 )),
             ),
             patch.object(conv_mod, "reserve_budget", AsyncMock(return_value=res_id)),
@@ -664,6 +665,7 @@ class TestConversationsReservationThreading:
             )
 
         assert run_turn_mock.await_args.kwargs["budget_reservation_id"] == res_id
+        assert run_turn_mock.await_args.kwargs["turn_id"] == reserved_turn_id
         assert persist_mock.await_args.kwargs["budget_reservation_id"] == res_id
         reconcile_mock.assert_awaited_once_with("t1", res_id)
 
@@ -697,6 +699,7 @@ class TestConversationsReservationThreading:
         run_turn_mock = AsyncMock(return_value=self._outcome())
         persist_mock = AsyncMock(return_value=MagicMock())
         reconcile_mock = AsyncMock()
+        reserved_turn_id = _uuid.uuid4()
 
         redacted = MagicMock()
         with (
@@ -718,9 +721,11 @@ class TestConversationsReservationThreading:
                 jwt_token="tok",
                 started=_time.monotonic(),
                 publisher=publisher,
+                turn_id=reserved_turn_id,
             )
 
         assert run_turn_mock.await_args.kwargs["budget_reservation_id"] == res_id
+        assert run_turn_mock.await_args.kwargs["turn_id"] == reserved_turn_id
         assert persist_mock.await_args.kwargs["budget_reservation_id"] == res_id
         reconcile_mock.assert_awaited_once_with("t1", res_id)
 

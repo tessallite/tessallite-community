@@ -115,6 +115,10 @@ from shared.semantic.join_keyword import (  # noqa: E402
     RIGHT_TOKENS as _RIGHT_TOKENS,
     is_orientation_declared as _token_orientation_is_declared,
 )
+from shared.semantic.join_population_serving import (
+    DEFAULT_POPULATION_PARTICIPATION,
+    population_defining_table_ids,
+)
 
 
 @dataclass(frozen=True)
@@ -126,6 +130,7 @@ class JoinEdge:
     left_column_id: str
     right_column_id: str
     join_type: str
+    population_participation: str = DEFAULT_POPULATION_PARTICIPATION
 
     def other_endpoint(self, table_id: str) -> str | None:
         if table_id == self.left_table_id:
@@ -486,6 +491,18 @@ def population_proven(
         # The query names a relation this model's graph does not contain, so the
         # graph does not describe the query. Unproven.
         return False
+
+    # Bug-8615 / G3: the query and artifact plans both include every endpoint
+    # of a deployed population-defining edge.  Resolve this through the same
+    # mapping/ORM/namespace normalizer used by source and aggregate builders.
+    # Unknown participation is elidable; malformed mandatory endpoints or an
+    # endpoint outside the deployed graph are unproven and therefore refuse.
+    population_tables = population_defining_table_ids(graph.edges)
+    if population_tables is None or not population_tables.issubset(graph.table_ids):
+        return False
+    if not population_tables.issubset(_reachable_from(kept, graph)):
+        return False
+    kept = frozenset(set(kept) | set(population_tables))
     if supplied_plan is None:
         plan = _reachable_from(kept, graph)
     else:

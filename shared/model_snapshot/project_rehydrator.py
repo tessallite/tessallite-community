@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
+from datetime import datetime, timezone
 import logging
 import uuid
 from typing import Any, Optional
@@ -68,7 +69,7 @@ from shared.model_snapshot.slug_utils import (
     insert_model_with_slug_retry,
     validate_bi_safe_slug,
 )
-from shared.semantic.graph_order import is_fact_table
+from shared.semantic.graph_order import fact_anchor_violation
 from shared.recipes.schema import CombineSchemaError, collect_combine_references
 # Bug-8350 R2 MED-3 — reuse the canonical placeholder-secret validator so
 # the import path's strength check cannot drift from the one dispatch time
@@ -99,6 +100,30 @@ PROJECT_EXPORT_FORMAT = "tessallite-project/v1"
 # rejects anything drastically weaker without rejecting a legitimately
 # generated secret.
 _MIN_IMPORTED_WEBHOOK_SECRET_LEN = 32
+
+
+def _imported_agent_context_derived_at(payload: dict[str, Any]) -> datetime | None:
+    """Restore the prompt-visible derived-state marker without old timestamps.
+
+    New bundles carry ``context_derived`` so a derived context with empty lists
+    survives import as available context. Older bundles have no marker; infer
+    the historical intent from non-empty derived fields and otherwise keep the
+    row in the safe never-derived state.
+    """
+    marker = payload.get("context_derived")
+    if marker is None:
+        marker = any(
+            payload.get(field)
+            for field in (
+                "aggregates_summary", "calendar_aliases", "dimension_aliases",
+            )
+        )
+    else:
+        # The exporter emits a JSON boolean. Treat malformed values (for
+        # example the string ``"false"``) as not-derived rather than allowing
+        # truthiness to upgrade a degraded imported context.
+        marker = marker is True
+    return datetime.now(timezone.utc) if marker else None
 
 # Bundle FORMAT versions this importer understands. v1 = no per-version
 # snapshots (every imported version honest-degrades). v2 (Bug-7623) = each
@@ -227,31 +252,31 @@ def _validate_bundle(bundle: dict[str, Any]) -> None:
             )
         seen_model_ids.add(mid_str)
 
-        # Bug-8134: at most one fact table per model (F-013-11, migration
-        # 0136's partial unique index `uq_model_tables_one_fact_per_model`).
+        # Bug-8614 / Bug-8134: enforce the deploy fact-anchor contract before
+        # staging any project row (F-013-11's partial unique index still caps
+        # explicitly declared facts).
         # The API create/update paths guard this with `_assert_at_most_one_
         # fact` (services/model-service/src/api/tables.py), but import
         # bypasses those schemas/endpoints entirely -- same class of gap
         # `sanitise_imported_config` documents for connection/LLM config
         # bags. Left unchecked, a two-fact-table model snapshot reaches
         # `_insert_tables_and_columns` (shared/model_snapshot/rehydrator.py),
-        # whose second per-row Core INSERT trips the partial unique index
+        # whose invalid per-row INSERT trips the partial unique index
         # AFTER the first fact row (and every sibling row already inserted
         # in that loop) has been staged into this transaction: the caller
         # sees a raw IntegrityError instead of a clean, actionable error.
         # Checking here -- in `_validate_bundle`, which both `import_project`
         # and `plan_project_import` call before any row (or even the Project
         # row) is created -- catches it before a single row is staged.
-        fact_tables = [t for t in (ms.get("tables") or []) if is_fact_table(t)]
-        if len(fact_tables) > 1:
+        anchor_error = fact_anchor_violation(ms.get("tables") or [])
+        if anchor_error:
             fact_names = [
                 str(t.get("physical_name") or t.get("alias") or "?")
-                for t in fact_tables
+                for t in (ms.get("tables") or [])
             ]
             raise ProjectImportError(
-                f"Model snapshot at index {idx} (id {mid_str!r}) has "
-                f"{len(fact_tables)} fact tables ({', '.join(fact_names)}); "
-                "a model may contain at most one fact table."
+                f"Model snapshot at index {idx} (id {mid_str!r}) violates "
+                f"the fact-anchor contract: {anchor_error}"
             )
 
 
@@ -2036,6 +2061,7 @@ async def import_project(
                         aggregates_summary=amc.get("aggregates_summary", []),
                         calendar_aliases=amc.get("calendar_aliases", []),
                         dimension_aliases=amc.get("dimension_aliases", []),
+                        derived_at=_imported_agent_context_derived_at(amc),
                     )
                 )
         await tenant_db.flush()

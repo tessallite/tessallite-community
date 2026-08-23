@@ -27,6 +27,7 @@ from shared.importers.import_warnings import (
 )
 from shared.model_snapshot.slug_utils import slugify
 from shared.semantic.join_keyword import split_join_token
+from shared.model_defaults import DEFAULT_INCLUDE_ALL_MEASURES
 
 # An SML relationship is fact -> dimension: many fact rows to one dimension
 # row. Derived once, through the shared classifier, so the orientation and the
@@ -489,7 +490,7 @@ def _map_model(
             "refresh_strategy": "manual",
             "max_aggregates": 20,
             "aggregations_enabled": True,
-            "include_all_measures": True,
+            "include_all_measures": DEFAULT_INCLUDE_ALL_MEASURES,
         },
         "tables": tables_out,
         "columns": columns_out,
@@ -615,7 +616,7 @@ def _map_standalone_metrics(
             "refresh_strategy": "manual",
             "max_aggregates": 20,
             "aggregations_enabled": True,
-            "include_all_measures": True,
+            "include_all_measures": DEFAULT_INCLUDE_ALL_MEASURES,
         },
         "tables": tables_out,
         "columns": columns_out,

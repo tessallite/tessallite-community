@@ -113,7 +113,7 @@
   "connections.deleteConfirmLabel": "Verbindung löschen",
   "connections.deleteConnection": "Löschen",
   "connections.deleteFailed": "Löschen der Verbindung fehlgeschlagen.",
-  "connections.deleteMessage": "Verbindung <strong>{{name}}</strong> löschen? Quellen und Ziele, die an diese Verbindung gebunden sind, werden unbrauchbar, bis sie neu gebunden werden.",
+  "connections.deleteMessage": "Verbindung {{name}} löschen? Quellen und Ziele, die an diese Verbindung gebunden sind, werden unbrauchbar, bis sie neu gebunden werden.",
   "connections.deleteTitle": "Verbindung löschen?",
   "connections.deleteTooltip": "Verbindung löschen",
   "connections.displayName": "Anzeigename *",

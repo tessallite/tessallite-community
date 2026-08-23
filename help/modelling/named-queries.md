@@ -2,7 +2,7 @@
 title: "Named Queries"
 audience: modeller
 area: modelling
-updated: 2026-08-16
+updated: 2026-08-22
 ---
 
 ## What this covers
@@ -140,6 +140,10 @@ You can also drive all of this through the model-service API under `/projects/{p
 
 - A single `SELECT` statement; no DML keywords (defence in depth on top of the router's read-only enforcement).
 - No other `@` placeholders (a Named Query inside a Named Query would never end).
+- Use semantic model names in every clause. In particular, a `SELECT *`
+  definition must order by the semantic name (for example, `ORDER BY "Sale
+  Number"`), not the physical source-column name (`ORDER BY sale_id`). Physical
+  names are not part of Named Query SQL and are not translated as a fallback.
 - Output columns are capped by `named_query.max_columns` (default 200); the cap rejects at authoring time — it never silently truncates.
 
 ### Refreshing (building the answer table)
@@ -152,7 +156,17 @@ A Named Query does not materialise itself. A refresh builds the stored table:
 4. It counts the rows and checks the row cap (`named_query.max_rows`, default 100,000; a per-query override is allowed). Over the cap, the table is dropped and the query is marked `failed` with `ROW_CAP_EXCEEDED` — rejected, never truncated.
 5. It records the output-column manifest and stamps the build with the model version it was built for. Only then is the result marked `fresh`.
 
-A refresh runs **manually** (the editor's Refresh button, or `POST /{id}/refresh`) or on a **schedule**: turn on *Refresh on a schedule* in the Named Query editor and enter a cron expression (equivalently `PUT /{id}/refresh/policy`). The scheduler then sweeps due policies automatically, so a materialised Named Query stays current without anyone clicking Refresh. The refreshed rows are stored and published on the next Deploy.
+A refresh runs **manually** (the editor's Refresh button, or `POST /{id}/refresh`) or on a **schedule**: turn on *Refresh on a schedule* in the Named Query editor and enter a cron expression (equivalently `PUT /{id}/refresh/policy`). The scheduler then sweeps due policies automatically, so a materialised Named Query stays current without anyone clicking Refresh. Once the model is deployed, a successful refresh is immediately eligible to serve against that deployed definition when its freshness, binding, overdue, and security gates all pass.
+
+#### Concurrency, routing, and cleanup
+
+- A refresh holds a **per-query lock** and takes the shared **per-model definition lock** around artifact creation, run status, manifest, and freshness writes. Deploy, revert, import, and delete cannot clobber those snapshot-owned rows while a refresh is finalising.
+- The refresh freezes the resolved **target and source connections at build start**. DDL, streaming, row counts, storage/catalogue reads, and oversized-result cleanup all use those frozen endpoints. Finalisation re-checks both bindings; a same-ID target or source repoint fails closed and leaves the artifact non-serving for a later rebuild.
+- Model and project deletion capture a refreshed Named Query's physical identity before removing its metadata, then delete the Named Query family before its target rows and drain a qualified cleanup task after commit. A failed target drop remains retryable operator evidence.
+
+#### Import, clone, and revert
+
+Import and clone paths mint fresh Named Query, artifact, and refresh-policy identities and rebind the physical table name to the destination model. Source physical names, manifests, active runs, build/version bindings, row counts, and source/target routing evidence are cleared; imported queries start **stale** and must refresh on the destination. A RESTORE/revert of the same model preserves the historical identity and table for a surviving query. If the restored snapshot removes a query, its old physical table is scheduled for cleanup before the metadata rows are replaced.
 
 #### Health states
 
@@ -165,6 +179,18 @@ A refresh runs **manually** (the editor's Refresh button, or `POST /{id}/refresh
 
 A refresh failure never breaks `SELECT * FROM @name` — the query simply runs live against the source until the next successful refresh.
 
+#### Fallback analytics
+
+The editor's health area also shows the existing QueryLog timing and byte-cost
+telemetry attributed to this Named Query: how many requests used the
+materialised result, how many fell back to the source, and the recorded fallback
+reasons. When fallback cost telemetry exists, the panel also shows its average
+execution time and bytes processed; cache-hit sentinel rows are not included in
+those averages. A sustained expensive fallback is labelled with a Named Query-owned
+recommendation to repair, refresh, or adjust this query's materialisation. It
+never recommends creating an aggregate copy; Named Queries and aggregates are
+separate serving boundaries.
+
 ### Using a Named Query
 
 From any SQL channel (JDBC, REST, the query panel, Explorer), the whole statement is the reference:
@@ -174,7 +200,26 @@ SELECT * FROM @branch_3279863;
 SELECT * FROM @top_three_transaction_cities;
 ```
 
-That exact shape — `SELECT * FROM @Name` and nothing else — is the only one v1 accepts. A projection subset, a `WHERE` against it, a join, or a nested reference is rejected with `NQ_UNSUPPORTED_SHAPE`, so no query can silently mean something other than what it says.
+**Just looking at the first few rows?** You can add a `LIMIT` (and an `OFFSET`) on the end, and Tessallite honours it:
+
+```sql
+SELECT * FROM @branch_3279863 LIMIT 20;
+SELECT * FROM @branch_3279863 LIMIT 20 OFFSET 40;
+```
+
+This matters more than it looks. Database tools such as DBeaver, and Excel's "view data" button, quietly add a `LIMIT` to everything you preview — and some of them wrap the name in quotes as well. All of these mean the same thing and all of them work:
+
+```sql
+SELECT * FROM @branch_3279863 LIMIT 20;
+SELECT * FROM @"branch_3279863";
+SELECT * FROM "@branch_3279863" LIMIT 20;
+```
+
+Apart from those, the reference has to be the whole statement on its own. Picking out single columns, adding a `WHERE`, adding an `ORDER BY`, joining it to something else, or nesting it inside another query are all turned down with `NQ_UNSUPPORTED_SHAPE`.
+
+That may feel strict, so here is the reasoning. A Named Query is a saved, governed answer. If Tessallite accepted a decorated reference it could not always apply the decoration faithfully — and a query that *quietly* means something other than what it says is far more dangerous than one that stops and tells you. `ORDER BY` is the clearest example: the answer can come from a stored table or from a live run, and nothing guarantees those two arrive in the same order, so an `ORDER BY` that Tessallite ignored would hand you rows in an order you did not ask for and had no way to notice. A clear refusal is the honest answer.
+
+**Tip:** if you want a filtered or reordered version of a Named Query, make it part of the Named Query's own definition and redeploy. That way everyone who uses the name gets the same governed answer.
 
 Named Queries also appear as first-class tables in the **XMLA/DAX catalogue**, so Excel and Power BI users see each deployed Named Query as an `@name` table they can select (subject to the same persona visibility as the model's other tables).
 
@@ -239,7 +284,7 @@ Every one of these objects is part of the model's deployed snapshot, exactly lik
 - You need a model open in Model Builder with the measures/dimensions your definitions reference, and modeller (or higher) access.
 - Top N and Filtered lists need the ranking measure / queryable attributes to already exist.
 - Named Queries need a query target configured to materialise; without one, refresh fails with a clear reason and serving always falls back to live.
-- Nothing reaches users until the model is deployed; refreshed Named List members and Named Query tables need a (re)deploy too.
+- Nothing reaches users until the model is deployed. Refreshed Named List members still require a redeploy; a successful Named Query refresh is eligible immediately against the already-deployed definition when its serving gates pass.
 
 ---
 

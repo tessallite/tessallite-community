@@ -725,21 +725,21 @@ function tessListById(
         return;
       }
 
-      // Persona is deliberately NOT threaded here, unchanged from before: this
-      // function has always relied on the caller's EFFECTIVE persona resolved
-      // server-side, while the task pane sends its actively-selected one. That
-      // difference is a real cross-surface inconsistency, but it is not this
-      // change's business — logged separately rather than altered in passing.
       const result = await apiRequest<PreviewResult>(
         `/api/v1/projects/${ctx.projectId}/models/${ctx.modelId}/named-sets/${namedSetId}/preview`
-        + consumptionQuery(),
+        + consumptionQuery(ctx.personaId),
         'POST',
       );
 
       if (cancelled) return;
 
       if (result.items.length === 0) {
-        invocation.setResult([['(empty set)']]);
+        // An empty dynamic array is the only faithful representation of an
+        // empty set. A synthetic caption becomes a real member in Excel and
+        // can be selected or persisted as if it came from the model.
+        const emptyGrid: string[][] = [];
+        listCache.set(key, { data: emptyGrid, ts: Date.now() });
+        invocation.setResult(emptyGrid);
         return;
       }
 

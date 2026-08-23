@@ -34,9 +34,9 @@ Both model export and import are accessed from a single **Import / Export** butt
 3. Select a format from the dropdown: **Tessallite Model (.json)**, **Tessallite YAML (.zip)**, or **LookML (.zip)**.
 4. For Tessallite Model format, click the model you want to export from the list.
 5. Tessallite downloads a file named `{model_slug}.tessallite.json` to your browser's download folder.
-6. The file is a single JSON document containing every per-model row — tables, columns, joins, hierarchies, dimensions, measures, aggregates, refresh policies, AI scheduler config, model settings, and the canvas layout.
+6. The Tessallite Model (.json) file is a single JSON document that carries the model's full definition: tables, columns, joins, dimensions, measures (including time variants), hierarchies, calendars, user-defined attributes, personas, row security, column/data tags, KPIs, named sets, named queries, glossary, drill-through sets, parameters, aggregates and pockets (as rebuild-pending), refresh and AI-scheduler config, model settings, and the canvas layout. (The authoritative, machine-checked list is the snapshot coverage matrix, `docs/architecture/architecture_snapshot-coverage-matrix.md`.)
 
-The file does **not** contain credentials, query history, miss logs, alerts, or anything stored at tenant, project, or system scope.
+The file does **not** contain credentials, query history, miss logs, alerts, or anything stored at tenant, project, or system scope. The **YAML** and **LookML** exports are deliberately partial: each declares what it drops (YAML in an in-file `not_exported` block; LookML skips calculated/variant measures with a warning), so use Tessallite Model (.json) when you need a complete, re-importable copy.
 
 ---
 
@@ -44,7 +44,7 @@ The file does **not** contain credentials, query history, miss logs, alerts, or 
 
 1. Click the **Import / Export** button in the project toolbar (Explorer) or Model Builder toolbar.
 2. The dialog opens on the **Import** tab by default.
-3. Select a format from the dropdown: **Tessallite Model (.json)**, **Tessallite YAML (.zip)**, **dbt (.yml / .zip)**, **Cube (.yml / .zip)**, or **AtScale SML (.zip)**.
+3. Select a format from the dropdown: **Tessallite Model (.json)**, **Tessallite YAML (.zip)**, **dbt (.yml / .zip)**, **Cube (.yml / .zip)**, **AtScale SML (.zip)**, or **Catalog** (pull metadata live from DataHub / OpenMetadata / Alation into a starter model).
 4. For Tessallite Model format, click **Choose .tessallite.json file** and pick the export file.
 5. The dialog reads the bundle and shows:
    - The original model's slug and display name (you can override either).

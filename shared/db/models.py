@@ -18,6 +18,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from shared.model_defaults import DEFAULT_INCLUDE_ALL_MEASURES
+
 # TIMESTAMPTZ was removed from SQLAlchemy 2.x; use TIMESTAMP(timezone=True) instance
 TIMESTAMPTZ = TIMESTAMP(timezone=True)
 
@@ -339,8 +341,13 @@ class Model(TenantBase):
     refresh_strategy: Mapped[str] = mapped_column(String(32), nullable=False, default="scheduled")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     aggregations_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Bug-9409 (user decision F-102-26 = A): FALSE for new models. Migration
+    # 0216 alters the column DEFAULT only — every existing row keeps its
+    # persisted value. See shared/model_defaults.py for the rationale.
     include_all_measures: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default=text("true")
+        Boolean, nullable=False,
+        default=DEFAULT_INCLUDE_ALL_MEASURES,
+        server_default=text("false"),
     )
     seed: Mapped[str] = mapped_column(String(64), nullable=False)
     max_aggregates: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
@@ -1505,6 +1512,27 @@ class CalendarTable(TenantBase):
     )
 
 
+class CalendarHistoryProvenance(TenantBase):
+    """Server-issued capability for reversible auto-created calendar history.
+
+    The token is deliberately separate from ``CalendarTable`` so undo can
+    remove the active metadata while redo still has a server-owned record to
+    validate.  Client-supplied flow flags are never authoritative.
+    """
+
+    __tablename__ = "calendar_history_provenance"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    token: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True, index=True)
+    model_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("models.id", ondelete="CASCADE"), nullable=False, index=True)
+    data_source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("data_sources.id", ondelete="CASCADE"), nullable=False, index=True)
+    calendar_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    physical_table: Mapped[str] = mapped_column(String(512), nullable=False)
+    generated_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now(), onupdate=func.now())
+
+
 class Join(TenantBase):
     __tablename__ = "joins"
 
@@ -1571,6 +1599,15 @@ class Join(TenantBase):
         default="preserve_base_rows",
         server_default=text("'preserve_base_rows'"),
     )
+    # Provenance is orthogonal to the participation vocabulary.  ``default``
+    # means the compatibility value was materialised by a producer that did
+    # not make a modeller decision; ``manual`` is never rewritten by source
+    # introspection; ``auto`` records a structural proof made by that pass.
+    population_participation_source: Mapped[str] = mapped_column(
+        String(16), nullable=False,
+        default="default",
+        server_default=text("'default'"),
+    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
 
     model: Mapped[Model] = relationship(back_populates="joins")
@@ -1585,28 +1622,33 @@ class JoinPopulationCheck(TenantBase):
     such in ``model_snapshot/tests/test_snapshot_coverage_guard.py``) and is
     re-established by the next deploy after a revert/import.
 
-    Exactly one CURRENT row per join (``join_id`` unique — the same shape
-    ``source_join_statistics`` uses). The deploy hook replaces the whole
-    model's set inside the deploy transaction, so "no row for a join" honestly
-    means "not evaluated at the last deploy" rather than "evaluated clean".
+    Exactly one CURRENT row per selected join (``join_id`` unique — the same
+    shape ``source_join_statistics`` uses). ``join_id`` is a stable identity
+    copied from the selected immutable snapshot, not a live foreign key: a
+    historical deploy must remain readable after the modeller deletes the
+    corresponding draft join. The deploy hook replaces the whole model's set
+    inside the deploy transaction, so "no row for a join" honestly means "not
+    evaluated at the last deploy" rather than "evaluated clean".
 
-    Rows cascade-delete with their ``Join`` (which the canonical model delete
-    removes explicitly before ``models``) and with their ``Model``, so no extra
-    step is required in ``shared/model_snapshot/cascade_delete.py``.
+    Rows cascade-delete with their ``Model``. They deliberately do not cascade
+    from ``Join`` because this operational evidence belongs to the deployed
+    snapshot, not to the mutable editor graph.
 
-    WARN-ONLY in this phase: a ``BLOCKED`` row is computed and surfaced but
-    never prevents a deploy (governance plan phase G5 owns block mode).
+    G5 policy: a measured, unresolved ``BLOCKED`` row for an ``undeclared`` or
+    filtering ``enrichment_only`` join is consumed by the deploy gate before
+    publish state can commit. Unmeasured rows and ``preserve_base_rows`` rows
+    remain non-blocking.
     """
 
     __tablename__ = "join_population_checks"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Stable selected-snapshot identity. No FK to ``joins``: the selected
+    # historical graph may outlive the mutable draft row.
     join_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("joins.id", ondelete="CASCADE"),
-        nullable=False, unique=True,
+        UUID(as_uuid=True), nullable=False, unique=True,
     )
-    # Denormalised so the health read and the deploy-time replace need no
-    # sub-select through ``joins``. CASCADE from both sides keeps it consistent.
+    # Denormalised so the health/deploy readers need no live-join lookup.
     model_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("models.id", ondelete="CASCADE"),
         nullable=False, index=True,
@@ -1641,6 +1683,13 @@ class JoinPopulationCheck(TenantBase):
     # appeared, so the health surface compares this instead. NULL only for a
     # row written before this column existed.
     inputs_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
+    # Selected snapshot endpoint labels. Nullable for pre-0222 rows only;
+    # every new deploy evidence row writes the selected labels explicitly.
+    join_label: Mapped[Optional[str]] = mapped_column(String(1024))
+    left_table_name: Mapped[Optional[str]] = mapped_column(String(255))
+    right_table_name: Mapped[Optional[str]] = mapped_column(String(255))
+    left_column_name: Mapped[Optional[str]] = mapped_column(String(255))
+    right_column_name: Mapped[Optional[str]] = mapped_column(String(255))
     checked_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
 
 
@@ -2109,7 +2158,9 @@ class PocketDefinition(TenantBase):
     # incremental refresh (the row-key DELETE needs the PK to match rows). Auto-set
     # when incremental_column + incremental_lookback_hours are both configured and
     # the fact PK is hidden. Not user-facing — the Pocket drawer shows an
-    # informational message instead of a checkbox.
+    # informational message instead of a checkbox. Bug-8745 still refuses the
+    # incremental leg for multi-table deployed snapshots unless complete
+    # per-table watermark coverage is proven by the captured snapshot.
     include_fact_key: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
@@ -2121,6 +2172,16 @@ class PocketDefinition(TenantBase):
     # exist. Both current writers set status="stale" explicitly; this aligns the
     # default with that contract.
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="stale")
+    # Population eligibility is a query/model-proof axis, not a physical
+    # generation lifecycle.  A mismatch must not be represented by changing
+    # ``status``: a later proof may clear this axis, but only a successful
+    # rebuild may make a physical generation fresh.
+    population_eligibility: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown",
+        server_default=text("'unknown'"),
+    )
+    population_eligibility_reason: Mapped[Optional[str]] = mapped_column(Text)
+    population_proof_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
     # --- Derived-grain routing row manifest (Bug-7359, spec §5.2/§5.3, Phase 3) ---
     # Row-preserving pockets get a SEPARATE versioned manifest rather than reusing
     # aggregate grain_keys (spec §5.2): deployed model/version, exact row-population
@@ -2238,10 +2299,13 @@ class PocketRefreshRun(TenantBase):
 class PocketRefreshPolicy(TenantBase):
     """Schedule for refreshing a pocket table.
 
-    Mirrors :class:`AggregateRefreshPolicy` but drops the incremental
-    columns — pockets only support full refresh.  ``is_enabled`` lives
-    here, not on :class:`PocketDefinition`, so "pocket active" and
-    "refresh schedule active" stay independent.
+    Mirrors :class:`AggregateRefreshPolicy` but keeps the schedule separate
+    from the pocket's optional ``incremental_column``. The refresh driver only
+    uses that column when complete watermark coverage is provable for the
+    model; a multi-table model therefore takes the full-refresh path under the
+    current single-column contract (Bug-8745). ``is_enabled`` lives here, not
+    on :class:`PocketDefinition`, so "pocket active" and "refresh schedule
+    active" stay independent.
     """
 
     __tablename__ = "pocket_refresh_policies"
@@ -2503,6 +2567,17 @@ class QueryLog(TenantBase):
     route_type: Mapped[str] = mapped_column(String(32), nullable=False)
     aggregate_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
     pocket_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Bug-9172: Named Query execution already records timing and byte cost in
+    # this row. These nullable fields add attribution at the existing
+    # observation seam without turning Named Query fallback into optimizer
+    # miss/candidate telemetry. A null pair is the valid shape for every
+    # ordinary (non-Named-Query) writer and for historical rows.
+    named_query_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )
+    named_query_fallback_reason: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
     security_rules_applied: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     persona_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
@@ -3940,6 +4015,7 @@ class EmbedTokenMint(TenantBase):
     actor_email: Mapped[str] = mapped_column(String(255), nullable=False)
     user_identity: Mapped[str] = mapped_column(String(255), nullable=False)
     persona_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    project_persona_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     project_ids: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
     model_ids: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
     capabilities: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
@@ -4316,6 +4392,11 @@ class SavedQuery(TenantBase):
         String(16), nullable=False, default="sql", server_default=text("'sql'")
     )
     created_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    # New queries are personal until their owner deliberately publishes them.
+    # Migration 0223 preserves legacy rows as shared.
+    is_shared: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMPTZ, server_default=func.now(), onupdate=func.now()

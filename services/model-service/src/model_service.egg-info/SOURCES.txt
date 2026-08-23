@@ -139,6 +139,7 @@ src/auth/pat_backend.py
 src/auth/rbac.py
 src/auth/saml_backend.py
 src/auth/saml_replay.py
+src/auth/sso_overlay.py
 src/auth/sso_state.py
 src/auth/tenant_admin_guard.py
 src/auth/token_version.py
@@ -173,7 +174,14 @@ tests/test_bug6252_kpi_semi_additive_vocabulary.py
 tests/test_bug6597_tenant_admin_reconcile.py
 tests/test_bug7231_adhoc_rate_limit.py
 tests/test_bug7527_8484_8147_audit_events.py
+tests/test_bug8488_adhoc_threshold_preset.py
 tests/test_bug8568_adhoc_error_disposition.py
+tests/test_bug8569_target_leg_context.py
+tests/test_bug9158_hierarchy_batch.py
+tests/test_bug9158_tables_batch.py
+tests/test_bug9172_named_query_analytics.py
+tests/test_bug9394_measure_rename_impact.py
+tests/test_bug9487_fiscal_year_label_metadata.py
 tests/test_bug_5942_6033.py
 tests/test_bug_6831_count_distinct_guard.py
 tests/test_bug_7257_named_set_preview_boundary.py
@@ -206,9 +214,12 @@ tests/test_connections_gateway_invariant.py
 tests/test_connections_ml13.py
 tests/test_data_tags.py
 tests/test_data_tags_ml14.py
+tests/test_datasource_config_secret_gate.py
 tests/test_date_intelligence.py
 tests/test_delete_guards_correctness.py
+tests/test_deploy_gate_invalid_snapshot.py
 tests/test_deploy_join_population_warn_only.py
+tests/test_deploy_stales_named_query_artifacts.py
 tests/test_deploy_staling_uses_shared_gate_8250.py
 tests/test_differ.py
 tests/test_dimension_aliases.py
@@ -216,12 +227,14 @@ tests/test_dimension_attribute_relationship.py
 tests/test_dimension_calc_cls.py
 tests/test_dimension_display_column.py
 tests/test_dimension_rename_aggregate.py
+tests/test_discard_draft.py
 tests/test_downstream_assets.py
 tests/test_drill_join_path_resolver.py
 tests/test_drill_through_sets_autocreate.py
 tests/test_e5_preview_coverage_sql.py
 tests/test_ecosystem_import_endpoints.py
 tests/test_edition_usage.py
+tests/test_effective_description_glossary_live_route_parity.py
 tests/test_eligible_variant_kinds.py
 tests/test_embed.py
 tests/test_embed_revoke_tenant_target.py
@@ -230,6 +243,7 @@ tests/test_explorer_privilege_matrix.py
 tests/test_export_import.py
 tests/test_field_compatibility_api.py
 tests/test_fiscal_calendar.py
+tests/test_fiscal_hierarchy_members.py
 tests/test_gcp_iam_backend.py
 tests/test_glossary_api.py
 tests/test_glossary_effective_description_batch.py
@@ -238,6 +252,7 @@ tests/test_governance_crypto_rotation.py
 tests/test_governance_exporter.py
 tests/test_governance_f035_remediation.py
 tests/test_governance_mapping_regressions.py
+tests/test_health_serving_readiness.py
 tests/test_hierarchies.py
 tests/test_hierarchies_api_validation.py
 tests/test_hierarchy_health.py
@@ -249,6 +264,7 @@ tests/test_impact_guard.py
 tests/test_impact_loader.py
 tests/test_impact_scan.py
 tests/test_import_cert_clamp.py
+tests/test_import_credentials_audit.py
 tests/test_import_export_snapshot.py
 tests/test_importer_rehydration_harness.py
 tests/test_importer_seeds_technical_persona.py
@@ -269,7 +285,9 @@ tests/test_kpi_composite_indicators.py
 tests/test_kpi_correctness_bugs.py
 tests/test_kpi_dependency.py
 tests/test_kpi_deploy_resolver.py
+tests/test_kpi_draft_visibility.py
 tests/test_kpi_evaluate.py
+tests/test_kpi_evaluation_path.py
 tests/test_kpi_expression.py
 tests/test_kpi_formatter.py
 tests/test_kpi_governance.py
@@ -281,13 +299,17 @@ tests/test_kpi_reeval_trigger_wiring.py
 tests/test_kpi_regression.py
 tests/test_kpi_row_security_restricted_8449.py
 tests/test_kpi_snapshots.py
+tests/test_kpi_statistical_input_validation.py
 tests/test_kpi_target_dependency_cache_invalidation.py
 tests/test_kpi_threshold.py
 tests/test_kpi_time_intelligence.py
 tests/test_kpi_trend.py
 tests/test_kpi_wizard_api_contract.py
 tests/test_kpi_wizard_ti_evaluate.py
+tests/test_l1_kpi_slicing_contract.py
 tests/test_l4_data_integrity_guards.py
+tests/test_l7_already_fixed_guards.py
+tests/test_l7_provider_slice.py
 tests/test_ldap_backend.py
 tests/test_licensing_guard.py
 tests/test_lineage.py
@@ -339,6 +361,7 @@ tests/test_one_fact_constraint.py
 tests/test_parameters.py
 tests/test_pat.py
 tests/test_pat_api.py
+tests/test_persona_at.py
 tests/test_persona_scope.py
 tests/test_personas_cls_ml14.py
 tests/test_personas_crud.py
@@ -393,6 +416,7 @@ tests/test_target_rebind_invalidates_caches.py
 tests/test_targets_validation.py
 tests/test_technical_persona_seed.py
 tests/test_tenant_branding_embed.py
+tests/test_tenant_system_audit.py
 tests/test_token_version.py
 tests/test_translations_orphan_validation.py
 tests/test_uda_cls_and_semi_additive_cascade.py
@@ -402,6 +426,7 @@ tests/test_user_defined_attributes.py
 tests/test_user_update_schema.py
 tests/test_validate_expression_endpoint.py
 tests/test_validation_endpoint.py
+tests/test_version_audit_display_name_cached.py
 tests/test_version_retention.py
 tests/test_versioning_remediation.py
 tests/test_versions_audit_retry.py

@@ -264,13 +264,15 @@ class TestBug8134OneFactTablePerModel:
         bundle = _minimal_bundle(models=[model])
         _validate_bundle(bundle)
 
-    def test_zero_fact_tables_passes(self):
+    def test_bug_8614_multi_table_zero_fact_tables_are_rejected(self):
         model = self._two_fact_model()
         model["tables"] = [
             {"id": "d1", "physical_name": "customers", "table_type": "dim_detail"},
+            {"id": "d2", "physical_name": "regions", "table_type": "dim_detail"},
         ]
         bundle = _minimal_bundle(models=[model])
-        _validate_bundle(bundle)
+        with pytest.raises(ProjectImportError, match="exactly one fact table"):
+            _validate_bundle(bundle)
 
     def test_missing_tables_key_passes(self):
         # Mirrors TestBug6631ModelIdValidation's fixtures, which omit

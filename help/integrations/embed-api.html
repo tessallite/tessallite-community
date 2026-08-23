@@ -33,7 +33,8 @@
 <tbody>
 <tr><td><code>tenant_id</code></td><td>string</td><td>yes</td><td>-</td><td>Target tenant slug</td></tr>
 <tr><td><code>user_identity</code></td><td>string</td><td>yes</td><td>-</td><td>Display name for audit trail</td></tr>
-<tr><td><code>persona_id</code></td><td>string</td><td>no</td><td>null</td><td>Lock to this persona's permissions</td></tr>
+<tr><td><code>persona_id</code></td><td>string</td><td>no</td><td>null</td><td>Lock Query Router to this model Persona's permissions</td></tr>
+<tr><td><code>project_persona_id</code></td><td>string</td><td>no</td><td>null</td><td>Independently lock the agent to this ProjectPersona's field scope</td></tr>
 <tr><td><code>project_ids</code></td><td>string[]</td><td>no</td><td>null</td><td>Restrict access to these project IDs only</td></tr>
 <tr><td><code>model_ids</code></td><td>string[]</td><td>no</td><td>null</td><td>Restrict visible models</td></tr>
 <tr><td><code>capabilities</code></td><td>string[]</td><td>no</td><td><code>[]</code> (deny-all)</td><td>Allowed features: query, chat, explore. Omit or pass an empty list for no capabilities.</td></tr>
@@ -48,6 +49,7 @@
     "tenant_id": "acme-demo",
     "user_identity": "viewer@customer.com",
     "persona_id": null,
+    "project_persona_id": null,
     "project_ids": null,
     "model_ids": null,
     "capabilities": ["query", "chat", "explore"],
@@ -55,7 +57,7 @@
   }
 }</code></pre>
 <h2>Scope fields</h2>
-<p><strong>persona_id</strong> locks the session to a specific persona. All row-level security filters and measure/dimension access rules for that persona apply. If omitted, the embedded user sees the default (unfiltered) view.</p>
+<p><strong>persona_id</strong> locks Query Router to a specific model Persona. All row-level security filters and measure/dimension access rules for that persona apply. <strong>project_persona_id</strong> independently locks the conversational agent to a ProjectPersona's field scope. These are separate UUID namespaces; a legacy token with only <code>persona_id</code> has no ProjectPersona lock. If <code>persona_id</code> is omitted, query-router uses the normal authenticated-persona resolution.</p>
 <p><strong>project_ids</strong> restricts which projects the embedded session can access. API calls targeting a project not in the list return 403. The embedded chat only loads and displays projects that appear in this list. If omitted, all projects in the tenant are accessible (subject to normal RBAC).</p>
 <p><strong>model_ids</strong> restricts which models the token can access. Any query or chat request targeting a model not in the list returns 403. If omitted, all models in the tenant are accessible.</p>
 <p><strong>capabilities</strong> controls which features the embed can use:</p>

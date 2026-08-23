@@ -13,3 +13,4 @@ export * from "./types_domains/scratchpad";
 export * from "./types_domains/solidatus";
 export * from "./types_domains/collibra";
 export * from "./types_domains/model_impact";
+export * from "./types_domains/query_catalogue";

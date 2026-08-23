@@ -1956,6 +1956,96 @@ def _setop_branch_selects(expr: Any) -> list[Any]:
     return []
 
 
+def _proven_scope_outputs(
+    scope: Any,
+    cache: dict[int, set[str] | None],
+    active: set[int],
+) -> set[str] | None:
+    """Return names provably published by a derived ``Scope``.
+
+    Bug-9458: an identity ``SELECT *`` wrapper over another derived relation
+    carries that relation's query-defined aliases (for example ``cnt`` or
+    ``rate``).  ``sqlglot`` exposes the wrapper as a STAR scope, so the normal
+    physical-column containment check cannot see those names.  Only a wrapper
+    whose star resolves to one fully-known derived scope is accepted here;
+    stars over a physical table, mixed stars, and ambiguous/set-operation shapes
+    remain opaque and continue through the fail-closed model vocabulary check.
+    """
+    from sqlglot import exp
+
+    key = id(scope)
+    if key in cache:
+        return cache[key]
+    if key in active:
+        # Defensive cycle guard for future sqlglot scope graph changes.
+        return None
+    active.add(key)
+    try:
+        branches = _setop_branch_selects(getattr(scope, "expression", None))
+        if not branches:
+            cache[key] = None
+            return None
+
+        outputs: set[str] = set()
+        for branch in branches:
+            projections = list(getattr(branch, "selects", None) or [])
+            has_star = any(
+                isinstance(proj, exp.Star)
+                or (isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star))
+                for proj in projections
+            )
+            if has_star:
+                # Propagation is deliberately limited to a pure identity star.
+                # Mixed ``SELECT *, expression AS x`` remains covered by the
+                # existing star_named_outputs path below.
+                if len(projections) != 1:
+                    cache[key] = None
+                    return None
+                star = projections[0]
+                qualifier = (
+                    (getattr(star, "table", "") or "").lower()
+                    if isinstance(star, exp.Column)
+                    else ""
+                )
+                sources = getattr(scope, "sources", {}) or {}
+                if qualifier:
+                    child = sources.get(qualifier)
+                    if not isinstance(child, type(scope)):
+                        cache[key] = None
+                        return None
+                else:
+                    if len(sources) != 1:
+                        cache[key] = None
+                        return None
+                    child = next(iter(sources.values()))
+                    if not isinstance(child, type(scope)):
+                        cache[key] = None
+                        return None
+                child_outputs = _proven_scope_outputs(child, cache, active)
+                if child_outputs is None:
+                    cache[key] = None
+                    return None
+                outputs.update(child_outputs)
+                continue
+
+            # A fully named projection is already validated in its own scope;
+            # its output names are safe to publish through a later identity star.
+            branch_outputs = {
+                (getattr(proj, "alias_or_name", "") or "").lower()
+                for proj in projections
+            }
+            branch_outputs.discard("")
+            if len(branch_outputs) != len(projections):
+                cache[key] = None
+                return None
+            outputs.update(branch_outputs)
+
+        cache[key] = outputs
+        return outputs
+    finally:
+        active.discard(key)
+
+
 def _validate_complex_sql_columns(
     query: LogicalQuery,
     model: Model,
@@ -2022,6 +2112,9 @@ def _validate_complex_sql_columns(
     unmodelled: set[str] = set()
     saw_physical_ref = False
     relation_alias_lists = _relation_alias_column_lists(ast)
+    # Bug-9458: cache only the names that can be proven to survive an identity
+    # SELECT * wrapper.  Unknown/physical stars deliberately remain ``None``.
+    proven_scope_outputs: dict[int, set[str] | None] = {}
     for scope in scopes:
         # Classify each CTE / derived-table (sub-scope) source of THIS scope.
         #
@@ -2054,6 +2147,7 @@ def _validate_complex_sql_columns(
         named_subscope_aliases: set[str] = set()
         star_subscope_aliases: set[str] = set()
         star_named_outputs: dict[str, set[str]] = {}
+        star_propagated_outputs: dict[str, set[str]] = {}
         physical_source_count = 0
         any_star_subscope = False
         for src_name, src in scope.sources.items():
@@ -2091,6 +2185,11 @@ def _validate_complex_sql_columns(
                     }
                     if named_from_star:
                         star_named_outputs[alias_lc] = named_from_star
+                    known_outputs = _proven_scope_outputs(
+                        src, proven_scope_outputs, set(),
+                    )
+                    if known_outputs:
+                        star_propagated_outputs[alias_lc] = known_outputs
                 else:
                     named_subscope_aliases.add(alias_lc)
                     for proj in _branch_projs:
@@ -2108,8 +2207,22 @@ def _validate_complex_sql_columns(
         # ``scope.sources`` are the relation aliases visible here.
         scope_source_aliases = {(k or "").lower() for k in scope.sources}
         scope_published_names: set[str] = set()
+        values_published_counts: dict[str, int] = {}
         for _src_alias in scope_source_aliases:
             scope_published_names |= relation_alias_lists.get(_src_alias, set())
+            _src = scope.sources.get(_src_alias)
+            if (
+                isinstance(_src, Scope)
+                and isinstance(_src.expression, exp.Values)
+            ):
+                # The JDBC gateway's BI normalizer may remove ``v.`` from
+                # references while preserving ``AS v(multiplier)``.  Keep this
+                # exemption limited to explicitly published VALUES names; a
+                # malformed/unknown name still falls through to containment.
+                for _published_name in relation_alias_lists.get(_src_alias, set()):
+                    values_published_counts[_published_name] = (
+                        values_published_counts.get(_published_name, 0) + 1
+                    )
 
         for col in _scope_local_columns(scope.expression):
             # A QUALIFIED star ``alias.*`` parses to ``Column(this=Star, name='*')``
@@ -2141,14 +2254,31 @@ def _validate_complex_sql_columns(
                 and name in scope_published_names
             ):
                 continue
+            if (
+                not qualifier
+                and values_published_counts.get(name) == 1
+                and name not in _model_set
+            ):
+                continue
             # Bug-9045 mixed star: ``q.extra`` / bare ``extra`` from
             # ``SELECT *, 1 AS extra`` is a named output, not a physical read.
             if qualifier and name in star_named_outputs.get(qualifier, set()):
+                continue
+            # Bug-9458: a qualified reference into an identity STAR wrapper may
+            # be one of the fully-proven names emitted by its named inner scope.
+            # Physical-table stars never enter this map.
+            if qualifier and name in star_propagated_outputs.get(qualifier, set()):
                 continue
             if (
                 not qualifier
                 and physical_source_count == 0
                 and any(name in named for named in star_named_outputs.values())
+            ):
+                continue
+            if (
+                not qualifier
+                and physical_source_count == 0
+                and any(name in names for names in star_propagated_outputs.values())
             ):
                 continue
             # 1. Qualified by a NAMED sub-scope alias -> intermediate output name,
@@ -2493,4 +2623,3 @@ async def _filter_by_from_tables(
         [d for d in dimensions if _in_scope(d)],
         [m for m in measures if _in_scope(m)],
     )
-

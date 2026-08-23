@@ -9,6 +9,7 @@ Role requirements:
 """
 from __future__ import annotations
 
+import logging
 import secrets
 from typing import Any
 from uuid import UUID
@@ -36,6 +37,8 @@ from src.auth.middleware import CurrentEmbedUser, CurrentUser, enforce_model_sco
 from src.auth.rbac import caller_has_role, require_role, resolve_listable_model_scope
 from src.api.personas import seed_technical_persona
 from src.licensing_guard import enforce_create_cap
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/projects/{project_id}/models", tags=["models"])
 
@@ -437,14 +440,60 @@ async def update_model(
                 updates["display_name"] = new_slug
         if "display_name" in updates and (updates["display_name"] is None or not str(updates["display_name"]).strip()):
             updates["display_name"] = new_slug or m.slug
+
+        # Bug-9409 (F-102-26 = A): a change to ``include_all_measures`` is an
+        # aggregate-shape decision, so record the transition explicitly rather
+        # than leaving it as one entry in a list of field names. The lifecycle it
+        # triggers is the EXISTING one, on the optimizer's next sweep — no new
+        # mechanism and nothing destructive here:
+        #   OFF -> ON : ``creator.backfill_include_all_measures`` retires and
+        #               rebuilds each active aggregate with the wider measure
+        #               set (it runs at the top of every ``_sweep_one_model``).
+        #   ON -> OFF : injection stops, so every subsequent build materialises
+        #               only what the workload asks for. Existing aggregates keep
+        #               their columns — narrowing them here would remove a measure
+        #               a BI client may already be querying. An aggregate the
+        #               row-population gate refuses is NOT retired: the flywheel
+        #               builds the narrow, servable artifact ALONGSIDE it
+        #               (Bug-9209), and the wide one stays active until the
+        #               per-model cap evicts it or an operator retires it. It is
+        #               not dead weight either — a query whose own plan joins all
+        #               of its relations is still served from it, which is why
+        #               superseding it automatically is a product decision
+        #               (docs/questions/questions_unprovable-aggregate-supersession.md),
+        #               not a defect fix.
+        include_all_change: tuple[bool, bool] | None = None
+        if "include_all_measures" in updates:
+            before = bool(m.include_all_measures)
+            after = bool(updates["include_all_measures"])
+            if before != after:
+                include_all_change = (before, after)
+
         for key, val in updates.items():
             setattr(m, key, val)
+        _detail: dict = {"fields": list(updates.keys())}
+        if include_all_change is not None:
+            _detail["include_all_measures"] = {
+                "from": include_all_change[0],
+                "to": include_all_change[1],
+                "aggregate_lifecycle": (
+                    "backfill_widens_active_aggregates_on_next_sweep"
+                    if include_all_change[1]
+                    else "new_builds_narrow_to_the_requested_measures"
+                ),
+            }
+            logger.info(
+                "Model %s include_all_measures %s -> %s; aggregate rebuild is "
+                "handled by the optimizer sweep's existing retire/rebuild path "
+                "(Bug-9409)",
+                model_id, include_all_change[0], include_all_change[1],
+            )
         await audit(
             db, action="model.update", severity="info",
             actor_email=current_user.email,
             target_type="model", target_id=m.id,
             target_name=m.display_name,
-            detail={"fields": list(updates.keys())},
+            detail=_detail,
         )
         await db.commit()
 

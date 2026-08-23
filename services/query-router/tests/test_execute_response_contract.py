@@ -327,17 +327,26 @@ async def test_pocket_cache_hit_preserves_timestamp_and_crosses_stale_deadline()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route_type", ["aggregate", "pocket"])
-async def test_cache_hit_freshness_lookup_failure_omits_only_diagnostic(route_type):
-    """A lookup that FAILS is undiagnosable, so the rows are still served with
-    the freshness block omitted.
+async def test_bug_9227_cache_hit_refuses_when_the_artifact_lookup_fails(route_type):
+    """Bug-9227: an UNPROVABLE artifact lookup refuses the cached entry.
 
-    Bug-8581 split this from the case below. The test used to model "failure" as
-    an artifact row that is ABSENT — but an absent row from a query scoped by
-    (artifact id, model id) is not an unprovable lookup, it is proof the artifact
-    was DELETED, and serving on it is the defect. A genuine failure is an
-    exception (a DB fault), which is what this now models; that path still fails
-    open, because turning a transient blip into a cache stampede against the
-    source would be worse than a missing diagnostic.
+    History of this assertion, because it has been inverted once already:
+    Bug-8581 established that an ABSENT artifact row is proof of deletion and
+    must refuse. It left the EXCEPTION path failing open — serving the cached
+    rows with the freshness block omitted — trading correctness for latency on
+    the argument that a transient blip should not stampede the source.
+
+    That trade does not hold. This lookup is the ONLY gate between a retired,
+    deleted, stale or invalidated artifact and a served result: the cache key
+    carries the deploy pointer, and an artifact is not part of the model
+    snapshot, so nothing in the key moves when one is retired. The fast path
+    returns BEFORE ``route_query``, so no matcher gate runs on a hit. Failing
+    the lookup open therefore re-opens precisely the window Bug-8581 closed,
+    and "the next cache miss would catch it" is circular — a hit never becomes
+    a miss while the entry keeps being served.
+
+    ``None`` makes the caller treat the entry as a MISS and re-route for real.
+    A re-route is never wrong, only slower.
     """
     refreshed = datetime(2026, 8, 3, 7, 0, tzinfo=timezone.utc)
     cached = _cached_accelerated_response(route_type, refreshed)
@@ -349,10 +358,11 @@ async def test_cache_hit_freshness_lookup_failure_omits_only_diagnostic(route_ty
         cached, db, model_id=uuid.uuid4(),
     )
 
-    assert served is not None
-    assert served.rows == cached.rows
-    assert served.rows is not cached.rows
-    assert served.freshness is None
+    assert served is None, (
+        "an unprovable artifact lookup must refuse the cached result "
+        "(fail closed), not serve it with the freshness diagnostic dropped"
+    )
+    # The shared cached object is never mutated by a refusal.
     assert cached.freshness is not None
     assert cached.freshness.last_refreshed_at == refreshed
     assert cached.freshness.is_stale is False
@@ -554,17 +564,26 @@ async def test_handle_execute_cache_hit_revalidates_freshness_before_early_retur
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route_type", ["aggregate", "pocket"])
-async def test_handle_execute_cache_hit_lookup_failure_omits_freshness_only(
+async def test_bug_9227_handle_execute_cache_hit_reroutes_when_lookup_fails(
     route_type,
 ):
+    """Bug-9227, end to end: an unprovable artifact lookup on a cache HIT drops
+    the entry and RE-ROUTES — it does not replay the cached rows.
+
+    This is the whole-pipeline half of
+    ``test_bug_9227_cache_hit_refuses_when_the_artifact_lookup_fails``. It
+    matters separately because the refusal is only worth anything if the caller
+    actually reaches the router afterwards: a ``None`` that ended the request,
+    or one that left the entry in the cache to be replayed on the next hit,
+    would satisfy the unit test and still ship the defect.
+
+    Pre-fix this test fails on ``route_mock.assert_awaited()`` — the old code
+    returned the cached response with the freshness block dropped, and the
+    router was never reached.
+    """
     model_id = uuid.uuid4()
     original_refreshed = datetime(2026, 8, 3, 7, 0, tzinfo=timezone.utc)
     cached = _cached_accelerated_response(route_type, original_refreshed)
-    # Bug-8581: an ABSENT artifact row is now proof of deletion and makes the
-    # entry a cache MISS (asserted in
-    # ``test_bug_8581_cached_response_is_refused_when_its_artifact_is_gone``).
-    # The contract this test owns is the other one: a lookup that FAILS must not
-    # break an otherwise-successful cached query, so model a DB fault.
     db = AsyncMock()
     db.execute = AsyncMock(side_effect=RuntimeError("connection reset"))
     db.begin_nested = MagicMock(side_effect=lambda: _Savepoint())
@@ -579,8 +598,21 @@ async def test_handle_execute_cache_hit_lookup_failure_omits_freshness_only(
         resolved_filters=[],
         has_passthrough_expressions=False,
     )
-    route_mock = AsyncMock(side_effect=AssertionError("router must be skipped"))
-    execute_mock = AsyncMock(side_effect=AssertionError("source must be skipped"))
+    # The re-route the refusal must produce. Anything that reaches these
+    # proves the query was answered for real instead of replayed.
+    _reroute_decision = RouteDecision(
+        route_type="source",
+        rewritten_query='SELECT "amount" FROM "modely"',
+        reason="Re-routed after an unprovable cached artifact",
+    )
+    route_mock = AsyncMock(return_value=_reroute_decision)
+    # (rows, bytes_processed, columns, chosen_source, elapsed_ms, decision)
+    execute_mock = AsyncMock(
+        return_value=(
+            [{"amount": 41}], 0, ["amount"], None, 3, _reroute_decision,
+        )
+    )
+    delete_mock = MagicMock()
 
     with (
         patch.object(_routes, "_bind_query_parameters", new=AsyncMock()),
@@ -599,9 +631,16 @@ async def test_handle_execute_cache_hit_lookup_failure_omits_freshness_only(
         ),
         patch.object(_routes, "audit_result_columns"),
         patch.object(_routes._cache, "get", return_value=cached),
+        patch.object(_routes._cache, "delete", new=delete_mock),
+        patch.object(_routes._cache, "set", new=MagicMock()),
         patch.object(_routes, "record_query_cache_hit", new=AsyncMock()),
         patch.object(_routes, "route_query", new=route_mock),
         patch.object(_routes, "execute_with_observation", new=execute_mock),
+        patch.object(
+            _routes, "_build_trace",
+            new=AsyncMock(return_value=_routes.PipelineTrace()),
+        ),
+        patch.object(_routes, "_result_freshness", new=AsyncMock(return_value=None)),
     ):
         served = await _handle_execute(
             ExecuteRequest(
@@ -614,11 +653,13 @@ async def test_handle_execute_cache_hit_lookup_failure_omits_freshness_only(
             tenant_id="acme-demo",
         )
 
-    route_mock.assert_not_awaited()
-    execute_mock.assert_not_awaited()
+    route_mock.assert_awaited()
+    delete_mock.assert_called()
     assert served is not cached
-    assert served.rows == cached.rows
-    assert served.freshness is None
+    # The stale cached rows must NOT be what came back.
+    assert served.rows == [{"amount": 41}]
+    assert served.route_type == "source"
+    # The shared cached object was never mutated by the refusal.
     assert cached.freshness is not None
     assert cached.freshness.last_refreshed_at == original_refreshed
     assert cached.freshness.is_stale is False
@@ -1048,11 +1089,20 @@ async def test_failing_artifact_read_leaves_the_transaction_usable(route_type):
 
 
 @pytest.mark.asyncio
-async def test_cache_hit_survives_a_failing_freshness_read():
-    """The end-to-end shape of the same property: rows were already in the
-    result cache, the freshness revalidation faults, and the caller still
-    serves the cached rows (with freshness omitted) instead of 500ing on the
-    subsequent QueryLog write."""
+async def test_a_faulting_cache_revalidation_leaves_the_session_usable():
+    """The end-to-end shape of the SAVEPOINT property.
+
+    A fault during cache-hit revalidation must leave the caller's transaction
+    able to write, or the request 500s on the very next statement (in
+    production, the QueryLog write) instead of taking the re-route.
+
+    The refusal itself is Bug-9227's contract and is asserted in
+    ``test_bug_9227_cache_hit_refuses_when_the_artifact_lookup_fails``. This
+    test owns the transaction half: the refusal is only usable if the session
+    survives it. Before Bug-9227 this was asserted THROUGH the fail-open
+    ("the cached rows still came back"), which is why removing the fail-open
+    surfaced it here.
+    """
     cached = _cached_accelerated_response(
         "aggregate", datetime(2026, 8, 3, 7, 0, tzinfo=timezone.utc),
     )
@@ -1062,9 +1112,12 @@ async def test_cache_hit_survives_a_failing_freshness_read():
         cached, db, model_id=uuid.uuid4(),
     )
 
-    assert served.rows == cached.rows
-    assert served.freshness is None, "unprovable freshness must be omitted"
-    assert db.aborted is False
+    assert served is None, "an unprovable revalidation must refuse (Bug-9227)"
+    assert db.executed == 1, "the artifact read must actually have been attempted"
+    assert db.aborted is False, (
+        "the faulting revalidation must not leave the caller's transaction "
+        "aborted — the re-route that follows it needs a usable session"
+    )
     await db.execute("INSERT INTO query_logs ...")
 
 

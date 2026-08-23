@@ -43,6 +43,14 @@ Identical structure to standard, but the year starts on a configurable month (e.
 
 **Who uses it:** Governments, enterprises, universities — any organisation whose financial year does not start in January.
 
+**Year captions:** Fiscal and NRF retail calendars expose `year_no` (the
+numeric key) and a caption-only `year_label`. The tenant setting
+`calendar.fiscal_year_label_format` accepts `start_year` (default),
+`span_short`, `span_long`, `span_fy`, and `end_year`; see [Configure Calendar
+Table](../modelling/configure-calendar-table.md) for the examples and the
+tenant settings endpoint. January-start fiscal calendars always use the plain
+integer, regardless of the selected token.
+
 **Key concept — fiscal offset:** The fiscal start month shifts all period boundaries. "Fiscal year 2026" with an April start covers April 2025 through March 2026. Forgetting this offset is the most common source of wrong YTD numbers in cross-calendar environments.
 
 ### ISO week (ISO 8601)
@@ -60,6 +68,11 @@ Because this week-and-period grid **cannot** be derived by ordinary date arithme
 **Who uses it:** Retail chains, CPG companies, any business that needs like-for-like weekly comparisons across years without the distortion of months having different numbers of days.
 
 **Key concept — period vs month:** In a 4-4-5 calendar, "Period 1" is the first 4-week block of Q1, not January. Retail reports labelled "monthly" are actually period reports. Mixing retail periods with standard months in the same pivot query produces meaningless numbers.
+
+Retail year captions use the same tenant setting as fiscal calendars, while
+`retail_year` remains the numeric grouping and sort key. A normal rebuild is
+required before an existing table gains `year_label`; BI metadata falls back to
+the numeric key until then.
 
 ### Hijri (Islamic)
 

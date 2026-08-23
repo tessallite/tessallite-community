@@ -22,10 +22,12 @@ from shared.db.models import (
 )
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import (
+    ModelTableClassification,
     ModelTableCreate,
     ModelTableResponse,
     ModelTableUpdate,
     TableAnalysisResponse,
+    TableAttributeResponse,
 )
 from shared.semantic.graph_order import FACT_TABLE_TYPE
 from src.api._model_lock import acquire_model_definition_lock
@@ -94,6 +96,62 @@ router = APIRouter(
     prefix="/projects/{project_id}/models/{model_id}/sources/{source_id}/tables",
     tags=["tables"],
 )
+
+# ModelBuilder opens every table node at once.  Keep that consumer off the
+# source-scoped CRUD route so it can hydrate all table attributes in one
+# model-scoped request instead of issuing one attributes request per node
+# (Bug-9158).
+batch_router = APIRouter(
+    prefix="/projects/{project_id}/models/{model_id}/tables",
+    tags=["tables"],
+)
+
+
+class ModelTableWithAttributesResponse(BaseModel):
+    table: ModelTableResponse
+    attributes: list[TableAttributeResponse]
+
+
+def _table_attribute_responses(table: ModelTable) -> list[TableAttributeResponse]:
+    """Serialize physical columns and UDAs for the batch canvas response."""
+    physical = [
+        TableAttributeResponse(
+            kind="physical",
+            id=column.id,
+            table_id=table.id,
+            name=column.column_name,
+            display_name=column.display_name,
+            description=column.description,
+            is_hidden=column.is_hidden,
+            hidden_reason=column.hidden_reason,
+            is_primary_key=column.is_primary_key,
+            data_type=column.data_type,
+            is_user_defined=False,
+            validated=None,
+            validation_error=None,
+        )
+        for column in table.columns
+    ]
+    user_defined = [
+        TableAttributeResponse(
+            kind="user_defined",
+            id=attribute.id,
+            table_id=table.id,
+            name=attribute.name,
+            display_name=None,
+            description=attribute.description,
+            is_hidden=False,
+            is_primary_key=False,
+            data_type=attribute.output_data_type,
+            is_user_defined=True,
+            is_generated=attribute.is_generated,
+            expression=attribute.expression,
+            validated=attribute.validated,
+            validation_error=attribute.validation_error,
+        )
+        for attribute in table.user_defined_attributes
+    ]
+    return sorted(physical + user_defined, key=lambda attribute: attribute.name.lower())
 
 
 async def _get_scoped_source(
@@ -358,6 +416,54 @@ async def list_tables(
             )
         )
         return [ModelTableResponse.model_validate(t) for t in result.scalars().all()]
+
+
+@batch_router.get(
+    "/with-attributes",
+    response_model=list[ModelTableWithAttributesResponse],
+    dependencies=[require_role("viewer")],
+)
+async def list_tables_with_attributes(
+    project_id: UUID,
+    model_id: UUID,
+    current_user: CurrentUser = Depends(forbid_embed_user),
+) -> list[ModelTableWithAttributesResponse]:
+    """Return every visible model table and its attributes in one request.
+
+    The Builder canvas renders an attribute list for every table.  The old
+    client fetched the table catalogue per source and then fetched attributes
+    per table, producing a request fan-out proportional to model size.  This
+    endpoint preserves the same autocreated-calendar filtering as
+    ``list_tables`` while using select-in loading for the two attribute
+    collections, so the client has one stable batch contract (Bug-9158).
+    """
+    async for db in get_tenant_db(current_user.tenant_id):
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        autocreated_ids = (
+            select(CalendarTable.id).where(CalendarTable.autocreated == True)  # noqa: E712
+        ).scalar_subquery()
+        result = await db.execute(
+            select(ModelTable)
+            .options(
+                selectinload(ModelTable.columns),
+                selectinload(ModelTable.user_defined_attributes),
+            )
+            .where(
+                ModelTable.model_id == model_id,
+                or_(
+                    ModelTable.calendar_table_id.is_(None),
+                    ModelTable.calendar_table_id.notin_(autocreated_ids),
+                ),
+            )
+            .order_by(ModelTable.alias, ModelTable.id)
+        )
+        return [
+            ModelTableWithAttributesResponse(
+                table=ModelTableResponse.model_validate(table),
+                attributes=_table_attribute_responses(table),
+            )
+            for table in result.scalars().unique().all()
+        ]
 
 
 @router.get("/{table_id}", response_model=ModelTableResponse, dependencies=[require_role("viewer")])
@@ -681,7 +787,10 @@ class ClassificationOverride(BaseModel):
 
 
 class ApplyClassificationRequest(BaseModel):
-    table_type: str | None = None
+    # Bug-8626: this endpoint is a second public ModelTable.table_type writer,
+    # so it must share the create/update domain rather than accept a free string
+    # such as "Fact" that bypasses the case-sensitive one-fact index.
+    table_type: ModelTableClassification | None = None
     overrides: list[ClassificationOverride] = []
 
 

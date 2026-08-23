@@ -118,7 +118,16 @@ class EmbedTokenRequest(BaseModel):
         description="Display name for audit trail (e.g. end-user email or name)",
     )
     persona_id: str | None = Field(
-        default=None, description="Lock session to this persona's permissions",
+        default=None,
+        description=(
+            "Lock query-router/model access to this model Persona's permissions"
+        ),
+    )
+    project_persona_id: str | None = Field(
+        default=None,
+        description=(
+            "Lock agent-service access to this project's ProjectPersona field scope"
+        ),
     )
     project_ids: list[str] | None = Field(
         default=None, description="Restrict access to these project IDs only",
@@ -173,6 +182,7 @@ class EmbedTokenScope(BaseModel):
     tenant_id: str
     user_identity: str
     persona_id: str | None = None
+    project_persona_id: str | None = None
     project_ids: list[str] | None = None
     model_ids: list[str] | None = None
     capabilities: list[str]

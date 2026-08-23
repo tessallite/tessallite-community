@@ -3,7 +3,8 @@
 Invariants under test:
   * No GROUP BY clause in output.
   * No aggregation wrappers (SUM/AVG/COUNT) around measures.
-  * LEFT JOINs only (model inner joins ignored).
+  * Orientation-aware mandatory population joins; optional projection-only
+    edges remain LEFT JOINs.
   * Disconnected tables produce typed-NULL projections.
   * Time-variant measures and __row_count emit typed NULLs.
   * Calculated measures with resolvable refs render raw arithmetic.
@@ -13,15 +14,18 @@ Invariants under test:
 """
 from __future__ import annotations
 
+import sqlite3
 import types
 from uuid import uuid4
 
 import pytest
 import sqlglot
 
-from src.rewrite.raw_sql import rewrite_for_raw
+from src.rewrite.raw_sql import RawRouteUnsupported, rewrite_for_raw
+from src.rewrite.joins import _build_joined_from_clause
 from src.ir.logical_query import BoundQuery, LogicalQuery
 from shared.db.models import UserDefinedAttribute
+from shared.semantic.graph_order import pick_anchor_table
 
 
 pytestmark = pytest.mark.integration
@@ -196,6 +200,103 @@ def _patch_graph(monkeypatch, tables, joins_list, columns, udas=None):
     monkeypatch.setattr(raw_sql_mod, "_resolve_target_dialect", _mock_dialect)
 
 
+@pytest.mark.parametrize("reverse_declared_orientation", [False, True])
+async def test_population_defining_inner_raw_route_matches_source_population(
+    monkeypatch, reverse_declared_orientation,
+):
+    """B01: raw serving must preserve an INNER population edge.
+
+    The fact has keys ``{1, 2, 3}`` and the dimension has ``{1, 2}``.  A
+    population-defining INNER edge therefore returns ``{1, 2}``, irrespective
+    of whether the modeler declared the edge fact -> dimension or the reversed
+    dimension -> fact orientation.  The old raw route unconditionally emitted
+    LEFT JOIN and returned the extra fact key ``3``.
+    """
+    fact = _table("fact_sales", table_type="fact")
+    dim = _table("dim_region")
+    fact_key = _column("id", fact, "int4")
+    dim_key = _column("id", dim, "int4")
+    amount = _column("amount", fact, "numeric")
+    if reverse_declared_orientation:
+        join = _join(dim, fact, dim_key, fact_key, join_type="inner")
+    else:
+        join = _join(fact, dim, fact_key, dim_key, join_type="inner")
+    join.population_participation = "population_defining"
+
+    bound = _bound(
+        [_measure("amount", amount)],
+        [_dimension("fact_id", fact_key)],
+    )
+    _patch_graph(
+        monkeypatch,
+        [fact, dim],
+        [join],
+        [fact_key, dim_key, amount],
+    )
+
+    raw_sql = await rewrite_for_raw(bound, _MockDB({}, [], {}, {}), target_dialect="postgres")
+    assert "INNER JOIN" in raw_sql.upper()
+    assert "LEFT JOIN" not in raw_sql.upper()
+
+    source_from = _build_joined_from_clause(
+        base_table_id=fact.id,
+        required_table_ids={fact.id, dim.id},
+        joins=[join],
+        tables_by_id={fact.id: fact, dim.id: dim},
+        columns_by_id={fact_key.id: fact_key, dim_key.id: dim_key},
+        alias_by_table_id={fact.id: fact.alias, dim.id: dim.alias},
+        connector="postgresql",
+    )
+    source_sql = (
+        f'SELECT "{fact.alias}"."id" AS "fact_id" FROM {source_from}'
+    )
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute(
+            'CREATE TABLE "fact_sales" ("id" INTEGER, "amount" NUMERIC)'
+        )
+        connection.execute('CREATE TABLE "dim_region" ("id" INTEGER)')
+        connection.executemany(
+            'INSERT INTO "fact_sales" VALUES (?, ?)',
+            [(1, 10), (2, 20), (3, 30)],
+        )
+        connection.executemany(
+            'INSERT INTO "dim_region" VALUES (?)', [(1,), (2,)]
+        )
+        raw_rows = {
+            row[0]
+            for row in connection.execute(raw_sql).fetchall()
+        }
+        source_rows = {
+            row[0] for row in connection.execute(source_sql).fetchall()
+        }
+    finally:
+        connection.close()
+
+    assert raw_rows == {1, 2}
+    assert raw_rows == source_rows
+
+
+async def test_population_defining_unknown_orientation_falls_back(monkeypatch):
+    """B01: a mandatory edge without a provable orientation is fail-closed."""
+    fact = _table("fact_sales", table_type="fact")
+    dim = _table("dim_region")
+    fact_key = _column("id", fact, "int4")
+    dim_key = _column("id", dim, "int4")
+    amount = _column("amount", fact, "numeric")
+    join = _join(fact, dim, fact_key, dim_key, join_type="many_to_one")
+    join.population_participation = "population_defining"
+    bound = _bound(
+        [_measure("amount", amount)],
+        [_dimension("fact_id", fact_key)],
+    )
+    _patch_graph(monkeypatch, [fact, dim], [join], [fact_key, dim_key, amount])
+
+    with pytest.raises(RawRouteUnsupported, match="orientation"):
+        await rewrite_for_raw(bound, _MockDB({}, [], {}, {}), target_dialect="postgres")
+
+
 async def test_simple_model_no_group_by(monkeypatch):
     fact = _table("fact_sales", table_type="fact")
     dim_region = _table("dim_region")
@@ -221,6 +322,45 @@ async def test_simple_model_no_group_by(monkeypatch):
     assert '"region_name"' in sql
     assert '"revenue"' in sql
     assert "LEFT JOIN" in sql.upper()
+
+
+@pytest.mark.parametrize("reverse_input_order", [False, True])
+async def test_bug_8626_raw_base_matches_shared_anchor_for_deployable_model(
+    monkeypatch, reverse_input_order,
+):
+    """Bug-8626: raw and source serving share the L3 fact-anchor contract.
+
+    The dimension deliberately has the lower canonical id and is the only
+    projected table.  For a deployable multi-table model, neither input order
+    nor required-table preference may move the raw FROM away from the one
+    declared fact selected by ``pick_anchor_table``.
+    """
+    fact = _table("fact_sales", table_type="fact", alias="f")
+    dim = _table("dim_region", table_type="dim_detail", alias="d")
+    dim.id = uuid4()
+    fact.id = uuid4()
+    if str(fact.id) < str(dim.id):
+        fact.id, dim.id = dim.id, fact.id
+
+    fact_key = _column("region_id", fact, "int4")
+    dim_key = _column("region_id", dim, "int4")
+    region_name = _column("region_name", dim)
+    join = _join(fact, dim, fact_key, dim_key)
+    bound = _bound([], [_dimension("region_name", region_name)])
+    tables = [dim, fact] if reverse_input_order else [fact, dim]
+    _patch_graph(
+        monkeypatch,
+        tables,
+        [join],
+        [fact_key, dim_key, region_name],
+    )
+
+    assert pick_anchor_table(tables) is fact
+    sql = await rewrite_for_raw(bound, _MockDB({}, [], {}, {}))
+
+    from_clause = sql.upper().split(" FROM ", 1)[1]
+    assert from_clause.startswith('"FACT_SALES" AS "F"')
+    assert 'LEFT JOIN "DIM_REGION" AS "D"' in from_clause
 
 
 async def test_disconnected_table_typed_null(monkeypatch):

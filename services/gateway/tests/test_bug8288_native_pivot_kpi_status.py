@@ -130,12 +130,17 @@ def _make_fakes(governed, rows=None, capture=None):
     }
 
 
-async def _run_execute(statement, governed, monkeypatch, capture=None, rows=None):
+async def _run_execute(
+    statement, governed, monkeypatch, capture=None, rows=None, batch=None,
+):
     fakes = _make_fakes(governed, rows=rows, capture=capture)
     for name, fn in fakes.items():
         monkeypatch.setattr(xmla_server, name, fn)
     mock_eval = AsyncMock(return_value=governed)
     monkeypatch.setattr(xmla_server, "evaluate_kpi_governed", mock_eval)
+    monkeypatch.setattr(xmla_server, "evaluate_kpi_batch", batch or AsyncMock(
+        return_value={_KPI_AA["id"]: governed},
+    ))
 
     execute_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
@@ -296,17 +301,50 @@ async def test_dimension_named_like_status_member_does_not_fault(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_status_member_with_where_slicer_fails_loud(monkeypatch):
-    """A WHERE dimension slicer alongside the status member also fails loud (the
-    governed verdict cannot be sliced)."""
+    """Bug-8383: a WHERE dimension slicer reaches governed batch evaluation."""
+    mock_batch = AsyncMock(return_value={_KPI_AA["id"]: {"status": 1}})
     body, mock_eval = await _run_execute(
         "SELECT {[Measures].[aa Status]} ON COLUMNS FROM [m] "
         "WHERE ([Region].[Region].[EMEA])",
         {"value": 1.0, "status": 1},
         monkeypatch,
+        batch=mock_batch,
     )
-    assert "Fault" in body, body
-    assert "dimension breakdown" in body or "slicer" in body, body
+    assert "Fault" not in body, body
     mock_eval.assert_not_awaited()
+    mock_batch.assert_awaited_once()
+    assert mock_batch.await_args.kwargs["filters"] == [{
+        "dimension_id": "d1",
+        "operator": "eq",
+        "value": "EMEA",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_bug8383_bare_dimension_where_batches_or_faults(monkeypatch):
+    """Bug-8383/L1-R1-004: a bare dimension slicer is never silently dropped."""
+    mock_batch = AsyncMock(return_value={_KPI_AA["id"]: {"status": 1}})
+    body, mock_eval = await _run_execute(
+        "SELECT {[Measures].[aa Status]} ON COLUMNS FROM [m] "
+        "WHERE [Region].[Region].[EMEA]",
+        {"value": 1.0, "status": 1},
+        monkeypatch,
+        batch=mock_batch,
+    )
+    if "Fault" in body:
+        # The structured admission parser may reject this legacy bare syntax;
+        # that is still fail-closed and cannot reach an unsliced evaluation.
+        assert "could not be parsed" in body, body
+        mock_eval.assert_not_awaited()
+        mock_batch.assert_not_awaited()
+    else:
+        mock_eval.assert_not_awaited()
+        mock_batch.assert_awaited_once()
+        assert mock_batch.await_args.kwargs["filters"] == [{
+            "dimension_id": "d1",
+            "operator": "eq",
+            "value": "EMEA",
+        }]
 
 
 @pytest.mark.asyncio

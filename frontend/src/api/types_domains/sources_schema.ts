@@ -42,6 +42,7 @@ export interface CalendarTable {
   day_column?: string | null;
   autocreated: boolean;
   auto_created_aliases?: string[];
+  history_provenance?: { token: string } | null;
 }
 
 export interface CalendarScriptRequest {
@@ -81,6 +82,7 @@ export interface CalendarBindRequest {
   alias?: string;
   display_name?: string;
   fiscal_year_start_month?: number;
+  history_provenance?: string;
 }
 
 export interface CalendarUpdateRequest {
@@ -154,6 +156,12 @@ export interface ModelTable {
   calendar_table_id?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** Model-open batch payload (Bug-9158): table metadata plus its attributes. */
+export interface ModelTableWithAttributes {
+  table: ModelTable;
+  attributes: TableAttribute[];
 }
 export interface ModelColumn {
   id: string;

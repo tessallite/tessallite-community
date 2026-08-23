@@ -44,6 +44,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional
 
+from shared.semantic.fiscal_year_labels import (
+    DEFAULT_FISCAL_YEAR_LABEL_FORMAT,
+    FISCAL_YEAR_LABEL_FORMATS,
+    validate_fiscal_year_label_format,
+)
+
 
 Level = Literal["system", "tenant", "project", "model"]
 SettingType = Literal[
@@ -150,6 +156,18 @@ def _validate_positive_int(value: Any) -> None:
 def _validate_non_negative_int(value: Any) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError(f"value must be a non-negative integer (got {value!r})")
+
+
+def _validate_positive_float(value: Any) -> None:
+    """Strictly positive rate. Zero is rejected, not merely discouraged.
+
+    Bug-9076: these are ROI cost rates. A zero storage or compute rate makes
+    every candidate look free, so the ranker would spend the scarce create slot
+    on whichever aggregate is largest. Refuse it at the settings boundary rather
+    than compensating for it in the estimator.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"value must be a positive number (got {value!r})")
 
 
 def _validate_ratio(value: Any) -> None:
@@ -261,9 +279,10 @@ def _validate_judge_context_mode(value: Any) -> None:
         )
 
 
-#: Bug-8615 (join population governance, phase G1). The row-effect fraction at
-#: or below which a non-neutral, undeclared join is only a WARNING; above it the
-#: model rolls up to BLOCKED. 1% is the governance plan's stated threshold.
+#: Bug-8615 (join population governance, G5). The row-effect fraction at or
+#: below which a non-neutral, undeclared join is WARNING; above it the model
+#: rolls up to BLOCKED and the measured policy row refuses deployment. 1% is
+#: the governance plan's stated threshold.
 #: Declared here — the registry is the single source of truth for every knob —
 #: and re-exported by ``shared.semantic.join_population_validator`` as
 #: ``DEFAULT_ROW_EFFECT_WARNING_THRESHOLD`` so the classifier never carries a
@@ -283,7 +302,7 @@ def _validate_join_population_mode(value: Any) -> None:
     # on | off. Default on. Off does not touch the source: it still clears the
     # previous verdicts and records a conservative unmeasured one per join, so
     # the model's join population status reads UNEVALUATED rather than stale.
-    # Never blocks a deploy either way (phase G1 is warn-only).
+    # Off never measures, so its rows remain unmeasured and cannot block.
     allowed = {"on", "off"}
     if value not in allowed:
         raise ValueError(
@@ -1005,13 +1024,14 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
         default=JOIN_POPULATION_ROW_EFFECT_THRESHOLD_DEFAULT,
         section="Aggregates",
         description=(
-            "Row-effect fraction at or below which a non-neutral, UNDECLARED "
-            "join is reported as WARNING rather than BLOCKED. 0.01 = 1% of rows. "
-            "Warn-only: BLOCKED is surfaced but never prevents a deploy in this "
-            "phase."
+            "System row-effect threshold for deploy-time join governance. A "
+            "measured, unresolved UNDECLARED effect above this value is BLOCKED; "
+            "a filtering ENRICHMENT_ONLY effect is treated the same way. "
+            "0.01 = 1% of rows. preserve_base_rows and unmeasured checks never "
+            "block."
         ),
         validator=_validate_join_population_threshold,
-        label="Join population warning threshold",
+        label="Join population deploy threshold",
         ui_group=_GRP_AGG, ui_control="number", unit="fraction of rows",
         ui_help=(
             "How much row loss or duplication a join may cause before an "
@@ -1520,6 +1540,26 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
         surfaced=True,
     ),
     SettingDef(
+        key="named_query.analytics_sustained_fallback_count",
+        level="system", type="int", default=3,
+        section="Named queries",
+        description=(
+            "Minimum number of attributed live-fallback observations in the "
+            "analytics window before a costly fallback pattern is considered "
+            "sustained. The recommendation remains to repair, refresh, or "
+            "adjust Named Query materialisation; it never builds an aggregate "
+            "copy."
+        ),
+        validator=_validate_positive_int,
+        label="Named Query sustained fallback count",
+        ui_group=_GRP_LIMITS, ui_control="number", unit="fallbacks",
+        ui_help=(
+            "How many attributed live fallbacks are required before health "
+            "analytics recommends repairing or refreshing the Named Query."
+        ),
+        surfaced=True,
+    ),
+    SettingDef(
         key="named_query.max_rows",
         level="system", type="int", default=100_000,
         section="Limits",
@@ -1699,13 +1739,15 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
 
 
 # ---------------------------------------------------------------------------
-# TENANT — empty after the 2026-04 restructure.
+# TENANT — tenant-wide policies and presentation defaults.
 # Connections and LLM configurations live at PROJECT level. Conversation
-# retention is now project-only (no tenant fallback).
+# retention is project-only (no tenant fallback); the policies below apply to
+# all projects/models in a tenant and therefore have no narrower home.
 # ---------------------------------------------------------------------------
 
 _GRP_AUDIT = "Audit logging"
 _GRP_BRANDING = "Branding"
+_GRP_CALENDAR = "Calendars"
 
 
 def _validate_audit_level(value: Any) -> None:
@@ -1738,6 +1780,25 @@ def _validate_version_retention_count(value: Any) -> None:
 
 
 _TENANT_SETTINGS: list[SettingDef] = [
+    SettingDef(
+        key="calendar.fiscal_year_label_format",
+        level="tenant", type="dict", default={"format": DEFAULT_FISCAL_YEAR_LABEL_FORMAT},
+        section="Calendars",
+        description=(
+            "Caption format for fiscal and NRF retail year members. The numeric "
+            "year key remains unchanged; January-start and ISO calendars always "
+            "use the plain integer caption."
+        ),
+        validator=validate_fiscal_year_label_format,
+        label="Fiscal year label format",
+        ui_group=_GRP_CALENDAR, ui_control="dict",
+        ui_choices=[{"format": token} for token in FISCAL_YEAR_LABEL_FORMATS],
+        ui_help=(
+            "Choose start_year (default), span_short (2025-26), span_long "
+            "(2025-2026), span_fy (FY25-26), or end_year (FY2026). Rebuild "
+            "existing calendars before the caption column is available."
+        ),
+    ),
     # Bug-8789: controls the miss-reason VOCABULARY the aggregate row-population
     # proof reports. "legacy" (default) emits the single opaque
     # join_population_mismatch, exactly as every existing deployment, log
@@ -2099,6 +2160,87 @@ _MODEL_SETTINGS: list[SettingDef] = [
             "ignore when recommending aggregates."
         ),
     ),
+    SettingDef(
+        key="ai_scheduler.daily_token_budget",
+        level="model", type="int", default=0,
+        section="AI optimizer",
+        description=(
+            "Ceiling on LLM tokens the AI optimiser may spend on this model per "
+            "UTC day. Admission reserves the prompt plus the provider "
+            "configuration's maximum output; completed runs record actual "
+            "input+output tokens for audit. A run whose reservation would "
+            "exceed it stops BEFORE the provider call. 0 means no limit. "
+            "Separate from the conversational agent's budget: an advisor loop "
+            "must not be able to consume the chat allowance, or vice versa."
+        ),
+        validator=_validate_non_negative_int,
+        label="AI optimiser daily token budget",
+        ui_group=_GRP_AI_SCHED, ui_control="number", unit="tokens",
+        ui_help=(
+            "Stops the AI optimiser before a call whose prompt plus configured "
+            "maximum output would exceed this model's daily reservation. "
+            "Actual provider usage is recorded on completed runs. Leave at 0 "
+            "for no limit."
+        ),
+    ),
+
+    # ROI cost model (Bug-9076). These are COST ASSUMPTIONS about the customer's
+    # own infrastructure, not code constants, and since Bug-8123 they ORDER the
+    # candidates rather than merely gating them — so the rate decides which
+    # single aggregate gets built. The shipped defaults are the generic figures
+    # the estimator used to hard-code. Per-CONNECTOR economics (BigQuery bills
+    # per byte scanned, Snowflake per warehouse-second) is a separate governed
+    # cost-catalogue decision and is NOT expressible with these three knobs.
+    SettingDef(
+        key="optimizer.roi_storage_rate_gb_month",
+        level="model", type="float", default=0.023,
+        section="AI optimizer",
+        description=(
+            "Storage price in $ per GB per month used by the ROI cost model "
+            "when it decides whether an aggregate is worth its disk. Default "
+            "0.023 (generic object-storage list price)."
+        ),
+        validator=_validate_positive_float,
+        label="ROI storage rate",
+        ui_group=_GRP_AI_SCHED, ui_control="number", unit="$/GB/month",
+        ui_help=(
+            "What a gigabyte of aggregate storage costs you per month. Used to "
+            "work out whether an aggregate pays for itself."
+        ),
+    ),
+    SettingDef(
+        key="optimizer.roi_compute_rate_per_million_rows",
+        level="model", type="float", default=0.005,
+        section="AI optimizer",
+        description=(
+            "Compute price in $ per million source rows scanned, used to value "
+            "the scans an aggregate avoids and to price its refresh. Default "
+            "0.005."
+        ),
+        validator=_validate_positive_float,
+        label="ROI compute rate",
+        ui_group=_GRP_AI_SCHED, ui_control="number", unit="$/M rows",
+        ui_help=(
+            "What scanning a million source rows costs you. Used to value the "
+            "scans an aggregate saves and the cost of refreshing it."
+        ),
+    ),
+    SettingDef(
+        key="optimizer.roi_daily_refresh_rate",
+        level="model", type="float", default=1.0,
+        section="AI optimizer",
+        description=(
+            "Refreshes per day assumed by the ROI cost model for an aggregate "
+            "with no explicit schedule. Default 1.0."
+        ),
+        validator=_validate_positive_float,
+        label="ROI assumed refresh frequency",
+        ui_group=_GRP_AI_SCHED, ui_control="number", unit="refreshes/day",
+        ui_help=(
+            "How often the cost model assumes an aggregate is rebuilt when no "
+            "schedule says otherwise."
+        ),
+    ),
 
     # Derived-grain aggregate routing (spec §15.1) — per-model gates.
     SettingDef(
@@ -2157,8 +2299,8 @@ _MODEL_SETTINGS: list[SettingDef] = [
             "'on' = measure and record the per-join verdict and the model's "
             "OK/WARNING/BLOCKED rollup (default); 'off' = do not touch the "
             "source, which clears the previous verdicts and leaves the model's "
-            "join population status UNEVALUATED rather than stale. Warn-only "
-            "either way — this never blocks a deploy."
+            "join population status UNEVALUATED rather than stale. Unmeasured "
+            "rows never block; measured G5 policy blockers do."
         ),
         validator=_validate_join_population_mode,
         label="Join population validation",
@@ -2166,8 +2308,9 @@ _MODEL_SETTINGS: list[SettingDef] = [
         ui_choices=["on", "off"],
         ui_help=(
             "Checks, when you deploy, whether any join in this model drops or "
-            "duplicates rows. It reports what it finds; it never changes results "
-            "and never stops a deployment."
+            "duplicates rows. It reports what it finds; it never changes results. "
+            "Measured policy blockers stop a deployment before publish state "
+            "changes."
         ),
         surfaced=False,
     ),

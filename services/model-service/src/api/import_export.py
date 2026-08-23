@@ -48,7 +48,7 @@ from shared.model_snapshot.slug_utils import (
     resolve_slug_collision,
     slugify,
 )
-from shared.semantic.graph_order import is_fact_table
+from shared.semantic.graph_order import fact_anchor_violation
 from src.api.personas import seed_technical_persona
 from src.auth.middleware import (
     CurrentUser,
@@ -375,31 +375,31 @@ async def import_model(
                 ),
             )
 
-        # Bug-8134: at most one fact table per model (F-013-11, migration
-        # 0136's partial unique index `uq_model_tables_one_fact_per_model`).
+        # Bug-8614 / Bug-8134: enforce the deploy fact-anchor contract before
+        # staging the destination model (F-013-11's partial unique index still
+        # caps explicitly declared facts).
         # The create/update table API guards this with `_assert_at_most_one_
         # fact` (api/tables.py), but a single-model import bundle bypasses
         # that schema/endpoint entirely, same as the project-import bundle
         # this fix was first applied to (project_rehydrator.py::
-        # _validate_bundle). Left unchecked, a two-fact-table bundle would
+        # _validate_bundle). Left unchecked, an invalid multi-table bundle would
         # reach `insert_model_with_slug_retry` (staging the destination
         # Model row) and then `rehydrate_into_live` ->
         # rehydrator.py::_insert_tables_and_columns, whose second per-row
         # Core INSERT trips the partial unique index and raises a raw
         # IntegrityError instead of a clean 4xx. Checked here, before any
         # row (destination Model included) is staged.
-        _fact_tables = [t for t in (rewritten.get("tables") or []) if is_fact_table(t)]
-        if len(_fact_tables) > 1:
+        _anchor_error = fact_anchor_violation(rewritten.get("tables") or [])
+        if _anchor_error:
             _fact_names = [
                 str(t.get("physical_name") or t.get("alias") or "?")
-                for t in _fact_tables
+                for t in (rewritten.get("tables") or [])
             ]
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    f"Bundle has {len(_fact_tables)} fact tables "
-                    f"({', '.join(_fact_names)}); a model may contain at "
-                    "most one fact table."
+                    "Bundle violates the fact-anchor contract: "
+                    f"{_anchor_error} Tables: {', '.join(_fact_names)}."
                 ),
             )
 

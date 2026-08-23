@@ -389,7 +389,12 @@ async def _build_response(
     if glossary_texts is not None:
         glossary_text = glossary_texts.get(dim.id)
     else:
-        glossary_text = await _glossary_text_for_target(db, dim.model_id, "dimension", dim.id)
+        # Bug-9392: no direct attachment falls back to the physical column's
+        # term, matching the deployed snapshot (serialiser) exactly.
+        glossary_text = await _glossary_text_for_target(
+            db, dim.model_id, "dimension", dim.id,
+            fallback_column_id=dim.source_column_id,
+        )
     effective_description = glossary_text or dim.description
 
     partner_info = None
@@ -825,7 +830,8 @@ async def list_dimensions(
                 )
             ]
         glossary_texts = await _glossary_texts_for_targets(
-            db, model_id, "dimension", [d.id for d in dims]
+            db, model_id, "dimension", [d.id for d in dims],
+            fallback_column_ids={d.id: d.source_column_id for d in dims},
         )
         # Prefetch declared attribute relationships once for the whole model so
         # the per-dimension response build does not fire an extra query each.
@@ -1193,7 +1199,10 @@ async def bulk_rename_attributes(
             await propagate_measure_renames(db, model_id, measure_renames)
         except UnsafeMeasureRename as exc:
             await db.rollback()
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=409,
+                detail=exc.detail_for(current_user.email or current_user.user_id),
+            ) from exc
 
         for dim_id in dim_ids:
             d = await db.get(Dimension, dim_id)

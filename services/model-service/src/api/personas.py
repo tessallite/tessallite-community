@@ -15,9 +15,12 @@ former hard-coded ``_technical`` variant.
 """
 from __future__ import annotations
 
+import math
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
@@ -27,6 +30,9 @@ from shared.db.models import (
     Dimension,
     HierarchyDefinition,
     Measure,
+    Model,
+    ModelParameter,
+    ModelVersion,
     ModelColumn,
     ModelTable,
     Persona,
@@ -84,6 +90,30 @@ TECHNICAL_PERSONA_DESCRIPTION = (
     "Auto-seeded technical view — shows every column including those "
     "marked hidden on the business view."
 )
+
+
+class PersonaParameterCollision(BaseModel):
+    """One persisted bare persona key shadowing a deployed parameter.
+
+    The value is deliberately not returned: this is a read-only authoring
+    preflight and filter values may contain sensitive business data. The
+    canonical remediation is explicit ``@parameter`` targeting.
+    """
+
+    persona_id: UUID
+    persona_name: str
+    persona_slug: str
+    default_filter_key: str
+    parameter_name: str
+    suggested_key: str
+
+
+class PersonaParameterCollisionPreflightResponse(BaseModel):
+    """Read-only persisted-persona/deployed-parameter collision report."""
+
+    model_id: UUID
+    deployed_version_id: UUID | None
+    collisions: list[PersonaParameterCollision]
 
 
 async def seed_technical_persona(db, model_id: UUID) -> Persona:
@@ -447,6 +477,64 @@ def _filter_value_is_valid(raw) -> bool:
     return persona_filter_value_is_valid(raw)
 
 
+def _date_range_parameter_is_valid(raw: object) -> bool:
+    """Validate the persisted ``@parameter`` date-range wire shape.
+
+    Persona parameters are execution inputs, not dimension operator objects:
+    the canonical value is exactly ``{"from": ..., "to": ...}``. Keeping
+    this check here in model-service makes the authoring boundary agree with
+    the query-time resolver and prevents a save from silently losing one bound.
+    """
+    if not isinstance(raw, dict) or set(raw) != {"from", "to"}:
+        return False
+    lower = raw.get("from")
+    upper = raw.get("to")
+    if not isinstance(lower, str) or not isinstance(upper, str):
+        return False
+    try:
+        return datetime.fromisoformat(lower.strip()) <= datetime.fromisoformat(upper.strip())
+    except (TypeError, ValueError):
+        return False
+
+
+def _parameter_value_is_valid(raw: object, param_type: str) -> bool:
+    """Match the query-router's declared parameter coercion contract."""
+    def _finite_number(value: object) -> bool:
+        try:
+            return isinstance(value, (int, float)) and math.isfinite(float(value))
+        except (OverflowError, ValueError):
+            return False
+
+    if param_type == "string":
+        return isinstance(raw, str)
+    if param_type == "number":
+        return (
+            _finite_number(raw)
+            and not isinstance(raw, bool)
+        )
+    if param_type == "boolean":
+        return isinstance(raw, bool)
+    if param_type == "multi_value":
+        return (
+            isinstance(raw, list)
+            and bool(raw)
+            and all(
+                item is not None
+                and not isinstance(item, bool)
+                and (
+                        isinstance(item, str)
+                    or (
+                        _finite_number(item)
+                    )
+                )
+                for item in raw
+            )
+        )
+    if param_type == "date_range":
+        return _date_range_parameter_is_valid(raw)
+    return False
+
+
 async def _validate_persona_scope(
     db,
     model_id: UUID,
@@ -486,8 +574,11 @@ async def _validate_persona_scope(
                 },
             )
 
-    # F-008-16: default_filters keys must be real dimension names and values
-    # must use a supported operator (BETWEEN arity 2).
+    # F-008-16 / L13-PERSONA-AT: bare keys are dimension targets and explicit
+    # ``@Name`` keys are parameter targets. Do not turn a bare key into a
+    # parameter name at save time: Q2 Option B intentionally permits both
+    # namespaces to coexist and the read-only preflight below calls out the
+    # persisted collision before deployment.
     if default_filters:
         dim_names = set(
             (
@@ -496,7 +587,39 @@ async def _validate_persona_scope(
                 )
             ).scalars().all()
         )
-        bad_keys = [k for k in default_filters if k not in dim_names]
+        parameter_descriptors: dict[str, tuple[str, str]] = {}
+        for row in (
+            await db.execute(
+                select(ModelParameter).where(ModelParameter.model_id == model_id)
+            )
+        ).scalars().all():
+            # The test seam supplies plain names; production supplies ORM rows.
+            # Treat an untyped legacy row as a string parameter while preserving
+            # the same namespace lookup for both forms.
+            authored = str(getattr(row, "name", row))
+            canonical = authored if authored.startswith("@") else f"@{authored}"
+            param_type = str(getattr(row, "param_type", "string"))
+            parameter_descriptors[authored.lower()] = (canonical, param_type)
+            parameter_descriptors[canonical.lower()] = (canonical, param_type)
+        unknown_parameter_keys = [
+            k for k in default_filters
+            if k.startswith("@") and k.lower() not in parameter_descriptors
+        ]
+        if unknown_parameter_keys:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error_code": "PERSONA_DEFAULT_FILTER_UNKNOWN_PARAMETER",
+                    "message": (
+                        "These explicit parameter targets are not declared on "
+                        f"this model: {', '.join(unknown_parameter_keys)}."
+                    ),
+                },
+            )
+        bad_keys = [
+            k for k in default_filters
+            if not k.startswith("@") and k not in dim_names
+        ]
         if bad_keys:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -508,10 +631,17 @@ async def _validate_persona_scope(
                     ),
                 },
             )
-        bad_vals = [
-            k for k, v in default_filters.items() if not _filter_value_is_valid(v)
+        bad_dimension_values = [
+            k for k, v in default_filters.items()
+            if not k.startswith("@") and not _filter_value_is_valid(v)
         ]
-        if bad_vals:
+        bad_parameter_values = [
+            k for k, v in default_filters.items()
+            if k.startswith("@")
+            and k.lower() in parameter_descriptors
+            and not _parameter_value_is_valid(v, parameter_descriptors[k.lower()][1])
+        ]
+        if bad_dimension_values:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail={
@@ -520,7 +650,20 @@ async def _validate_persona_scope(
                         "These default-filter values use an unsupported "
                         "operator or shape (a dict must be a single "
                         "{operator: value}; BETWEEN needs exactly two bounds): "
-                        f"{', '.join(bad_vals)}."
+                        f"{', '.join(bad_dimension_values)}."
+                    ),
+                },
+            )
+        if bad_parameter_values:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error_code": "PERSONA_PARAMETER_VALUE_INVALID",
+                    "message": (
+                        "These explicit parameter values do not match their "
+                        "declared types (strings, numbers, booleans, non-empty "
+                        "scalar arrays, or exact ordered date ranges): "
+                        f"{', '.join(bad_parameter_values)}."
                     ),
                 },
             )
@@ -770,6 +913,80 @@ async def list_personas(
                 )
             )
         return out
+
+
+@router.get(
+    "/personas/parameter-collision-preflight",
+    response_model=PersonaParameterCollisionPreflightResponse,
+)
+async def persona_parameter_collision_preflight(
+    project_id: UUID,
+    model_id: UUID,
+    current_user: CurrentUser = Depends(forbid_embed_user),
+    _: None = require_role("viewer"),
+) -> PersonaParameterCollisionPreflightResponse:
+    """Report persisted bare keys that collide with deployed parameters.
+
+    This endpoint is intentionally read-only and uses the deployed version's
+    immutable ``model_parameters`` snapshot, not draft ``ModelParameter`` rows.
+    The editor calls it on open so an existing collision is visible before a
+    modeler saves a persona; no persisted key is rewritten implicitly.
+    """
+    async for db in get_tenant_db(current_user.tenant_id):
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        model = await db.get(Model, model_id)
+        deployed_version_id = getattr(model, "deployed_version_id", None)
+        deployed = None
+        if deployed_version_id is not None:
+            deployed = await db.get(ModelVersion, deployed_version_id)
+            if deployed is not None and deployed.model_id != model_id:
+                # A corrupt cross-model pointer must not turn another model's
+                # parameters into an authoring warning for this model.
+                deployed = None
+
+        snapshot = getattr(deployed, "snapshot_json", None)
+        parameter_names: dict[str, str] = {}
+        if isinstance(snapshot, dict):
+            for item in snapshot.get("model_parameters", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                authored = str(item.get("name") or "").strip()
+                if not authored:
+                    continue
+                canonical = authored if authored.startswith("@") else f"@{authored}"
+                parameter_names[canonical.lstrip("@").lower()] = canonical
+
+        result = await db.execute(
+            select(Persona)
+            .where(Persona.model_id == model_id)
+            .order_by(Persona.name, Persona.id)
+        )
+        collisions: list[PersonaParameterCollision] = []
+        for persona in result.scalars().all():
+            for key in (persona.default_filters or {}):
+                if key.startswith("@"):  # already explicit; no collision
+                    continue
+                parameter_name = parameter_names.get(key.lower())
+                if parameter_name is None:
+                    continue
+                collisions.append(
+                    PersonaParameterCollision(
+                        persona_id=persona.id,
+                        persona_name=persona.name,
+                        persona_slug=persona.slug,
+                        default_filter_key=key,
+                        parameter_name=parameter_name,
+                        suggested_key=parameter_name,
+                    )
+                )
+
+        return PersonaParameterCollisionPreflightResponse(
+            model_id=model_id,
+            deployed_version_id=(
+                deployed.id if deployed is not None else None
+            ),
+            collisions=collisions,
+        )
 
 
 @router.get(

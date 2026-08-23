@@ -188,10 +188,33 @@ async def test_describe_statement_emits_typed_metadata_without_execution(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_describe_metadata_only_returns_none_for_star(monkeypatch):
+async def test_describe_metadata_only_expands_star_and_still_declines_a_join(
+    monkeypatch,
+):
+    """Bug-9433: ``SELECT *`` describes from the catalogue; a JOIN still declines.
+
+    ``SELECT *`` previously returned ``None``, so the Describe branch answered
+    NoData — a protocol lie for a SELECT. A prepared-statement client records
+    that as "zero result columns" and then fails with
+    ``ProtocolError: the number of columns in the result row (N) is different
+    from what was described (0)``. The star shape IS derivable (it is the
+    relation's catalogue column list, the same list ``_column_type_map`` types
+    the executed result from), so it is derived.
+
+    The multi-relation JOIN case is unchanged and still declines: its projection
+    cannot be typed from one relation's catalogue, so the executed result stays
+    authoritative.
+    """
     calls: list = []
     server = _make_server(monkeypatch, calls, columns=["region"], rows=[])
-    assert server._describe_columns_metadata_only("SELECT * FROM modelx WHERE x=$1") is None
+
+    star = server._describe_columns_metadata_only("SELECT * FROM modelx WHERE x=$1")
+    assert star is not None, "SELECT * must not be described as NoData"
+    assert [name for name, _oid in star] == [
+        col["name"] for col in server._table_columns["modelx"]
+    ]
+    assert calls == [], "describing must not execute the query"
+
     assert server._describe_columns_metadata_only(
         "SELECT a.region FROM modelx a JOIN other b ON true WHERE region=$1"
     ) is None

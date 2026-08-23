@@ -371,8 +371,20 @@ async def _resolve_hierarchy_calendar_rules(
     authority, shape = await resolve_calendar_serving_shape(model_id, db)
     if authority is SnapshotAuthority.DEPLOYED and shape is not None:
         return _hierarchy_calendar_rules_from_snapshot(shape, time_dim)
-    # UNDEPLOYED / snapshot-invalid: the invalid case cannot reach here (the
-    # binder 503s first), so live rows are the authoring authority.
+    if authority is SnapshotAuthority.DEPLOYED_SNAPSHOT_INVALID:
+        # Bug-9200: this branch used to fall THROUGH to the live
+        # HierarchyDefinition query on the argument that "the binder 503s
+        # first". Relying on an upstream guard is fail-OPEN by construction —
+        # the guarantee lives in another function that a new caller need not
+        # go through, and calendar_type / fiscal_year_start_month decide
+        # period MATH, so leaking a draft edit here moves served YTD/QTD
+        # numbers. Refuse, exactly as the sibling _resolve_calendar_binding
+        # does for the calendar ROW.
+        raise SemanticBindingError(
+            "The deployed model snapshot is unavailable; cannot resolve the "
+            "calendar rules for this query's time dimension."
+        )
+    # UNDEPLOYED: live rows are the authoring authority.
 
     # Path 1: resolve straight off the hierarchy the dimension belongs to.
     hierarchy_id = getattr(time_dim, "hierarchy_id", None)

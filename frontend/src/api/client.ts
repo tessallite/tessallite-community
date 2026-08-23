@@ -68,6 +68,7 @@ import type {
   LineageGraph,
   LoginRequest,
   Measure,
+  MeasureRenameImpactResponse,
   MeasureCreate,
   ValidateMeasureExpressionRequest,
   ValidateMeasureExpressionResponse,
@@ -79,6 +80,7 @@ import type {
   TablePreviewResponse,
   ModelColumnUpdate,
   ModelTable,
+  ModelTableWithAttributes,
   ModelTableCreate,
   ModelTableUpdate,
   OptimizeRunRequest,
@@ -90,6 +92,7 @@ import type {
   ProjectUpdate,
   QueryMissLog,
   PocketCreate,
+  PocketCompoundEdit,
   PocketDefinition,
   PocketDryRunResponse,
   PocketRefreshPolicy,
@@ -129,10 +132,12 @@ import type {
   PersonaCreate,
   PersonaUpdate,
   PersonaResolution,
+  PersonaParameterCollisionPreflightResponse,
   Tenant,
   TenantCreate,
   TenantUpdate,
   LoginResponse,
+  ListSchedulerJobsResponse,
   TriggerRefreshResponse,
   User,
   AccessSupersedePreflightResponse,
@@ -941,6 +946,11 @@ export const calendarApi = {
     api.delete(
       `/api/v1/projects/${projectId}/models/${modelId}/sources/${sourceId}/calendars/${calendarId}`,
     ),
+  undoAutoCreate: (projectId: string, modelId: string, sourceId: string, calendarId: string, historyProvenance: string) =>
+    api.post(
+      `/api/v1/projects/${projectId}/models/${modelId}/sources/${sourceId}/calendars/${calendarId}/undo-auto-create`,
+      { history_provenance: historyProvenance },
+    ),
   // F-016-23: compare the calendar's date range against a fact table's actual
   // data range so the UI can warn before out-of-range fact rows drop to NULL
   // period values.
@@ -966,6 +976,12 @@ export const modelTablesApi = {
       .get<ModelTable[]>(
         `/api/v1/projects/${projectId}/models/${modelId}/sources/${sourceId}/tables`,
         { signal },
+      )
+      .then((r) => r.data),
+  listWithAttributes: (projectId: string, modelId: string) =>
+    api
+      .get<ModelTableWithAttributes[]>(
+        `/api/v1/projects/${projectId}/models/${modelId}/tables/with-attributes`,
       )
       .then((r) => r.data),
   create: (
@@ -1124,6 +1140,12 @@ export const hierarchiesApi = {
     api
       .get<Hierarchy[]>(
         `/api/v1/projects/${projectId}/models/${modelId}/hierarchies`
+      )
+      .then((r) => r.data),
+  listWithLevels: (projectId: string, modelId: string) =>
+    api
+      .get<HierarchyDetail[]>(
+        `/api/v1/projects/${projectId}/models/${modelId}/hierarchies/with-levels`,
       )
       .then((r) => r.data),
   get: (projectId: string, modelId: string, hierarchyId: string) =>
@@ -1499,6 +1521,18 @@ export const measuresApi = {
         data
       )
       .then((r) => r.data),
+  renameImpact: (
+    projectId: string,
+    modelId: string,
+    measureId: string,
+    newName: string,
+  ) =>
+    api
+      .get<MeasureRenameImpactResponse>(
+        `/api/v1/projects/${projectId}/models/${modelId}/measures/${measureId}/rename-impact`,
+        { params: { new_name: newName } },
+      )
+      .then((r) => r.data),
   delete: (projectId: string, modelId: string, measureId: string) =>
     api.delete(
       `/api/v1/projects/${projectId}/models/${modelId}/measures/${measureId}`
@@ -1751,6 +1785,13 @@ export const pocketsApi = {
       .patch<PocketDefinition>(
         `/api/v1/projects/${projectId}/models/${modelId}/pockets/${pocketId}`,
         data
+      )
+      .then((r) => r.data),
+  updateCompound: (projectId: string, modelId: string, pocketId: string, data: PocketCompoundEdit) =>
+    api
+      .post<PocketDefinition>(
+        `/api/v1/projects/${projectId}/models/${modelId}/pockets/${pocketId}/compound-edit`,
+        data,
       )
       .then((r) => r.data),
   refresh: (projectId: string, modelId: string, pocketId: string) =>
@@ -2145,7 +2186,9 @@ export const schedulerApiClient = {
       .post("/api/v1/scheduler/trigger/retirement", data)
       .then((r) => r.data),
   jobs: () =>
-    schedulerApi.get("/api/v1/scheduler/jobs").then((r) => r.data),
+    schedulerApi
+      .get<ListSchedulerJobsResponse>("/api/v1/scheduler/jobs")
+      .then((r) => r.data),
   reseedDemo: () =>
     schedulerApi
       .post("/api/v1/scheduler/trigger/demo-reseed")
@@ -2384,6 +2427,12 @@ function _withPersona(
 }
 
 export const queryRouterApiClient = {
+  namedObjects: (modelId: string) =>
+    queryRouterApi
+      .get<import("./types").DeployedNamedObjectsResponse>(
+        `/api/v1/models/${modelId}/named-objects`,
+      )
+      .then((r) => r.data),
   validate: (data: QueryRouterRequest, personaId?: string | null) =>
     queryRouterApi
       .post<QueryValidateResponse>(
@@ -2540,6 +2589,12 @@ export const personasApi = {
       )
       .then((r) => r.data);
   },
+  parameterCollisionPreflight: (projectId: string, modelId: string) =>
+    api
+      .get<PersonaParameterCollisionPreflightResponse>(
+        `/api/v1/projects/${projectId}/models/${modelId}/personas/parameter-collision-preflight`,
+      )
+      .then((r) => r.data),
   get: (projectId: string, modelId: string, personaId: string) =>
     api
       .get<Persona>(
@@ -2604,6 +2659,7 @@ export interface PocketMetrics {
   stale_pockets: number;
   invalidating_pockets: number;
   failed_pockets: number;
+  ineligible_pockets: number;
   retired_pockets: number;
   pocket_hit_rate: number;
   pocket_time_saved_ms: number;
@@ -3168,6 +3224,12 @@ export const namedQueriesApi = {
     api
       .get<import("./types").NamedQuery>(
         `/api/v1/projects/${projectId}/models/${modelId}/named-queries/${id}`,
+      )
+      .then((r) => r.data),
+  analytics: (projectId: string, modelId: string, id: string, days = 30) =>
+    api
+      .get<import("./types").NamedQueryAnalytics>(
+        `/api/v1/projects/${projectId}/models/${modelId}/named-queries/${id}/analytics?days=${days}`,
       )
       .then((r) => r.data),
   create: (projectId: string, modelId: string, data: import("./types").NamedQueryCreate) =>
@@ -3788,6 +3850,28 @@ export const brandingApi = {
       .put<BrandingConfig>(
         `/api/v1/tenants/${encodeURIComponent(tenantId)}/branding`,
         data,
+      )
+      .then((r) => r.data),
+};
+
+// Tenant-wide fiscal/NRF caption convention (Bug-9487).
+export interface CalendarSettings {
+  format: string;
+  available_formats: string[];
+}
+
+export const calendarSettingsApi = {
+  get: (tenantId: string) =>
+    api
+      .get<CalendarSettings>(
+        `/api/v1/tenants/${encodeURIComponent(tenantId)}/calendar-settings`,
+      )
+      .then((r) => r.data),
+  update: (tenantId: string, format: string) =>
+    api
+      .put<CalendarSettings>(
+        `/api/v1/tenants/${encodeURIComponent(tenantId)}/calendar-settings`,
+        { format },
       )
       .then((r) => r.data),
 };

@@ -562,7 +562,17 @@ def test_dq_rule_target_map_covers_exactly_the_schemas_vocabulary():
     type. That fails CLOSED — but as a 422 the modeller cannot act on, for a
     target type the product says is legal. Pinning the two sets equal turns that
     into a failing test at the moment the vocabulary is widened.
+
+    L9-F3: the WRITE path is not the only enumeration of this vocabulary. The
+    IMPORT path (``shared/model_snapshot/rehydrator.py``) validates the same
+    polymorphic ``(target_type, target_id)`` before inserting a rehydrated rule,
+    and it too fails closed on a type it does not recognise — so a fourth type
+    added to the domain and to the route would be ACCEPTED by the API and then
+    silently dropped on every import/revert. Both maps are pinned here, because
+    the blind spot is in the enumeration mechanism itself and there are two of
+    them.
     """
+    from shared.model_snapshot.rehydrator import _DQ_TARGET_SNAP_TYPE_KEYS
     from shared.schemas.domains.governance_advanced import _DQ_TARGET_TYPES
     from src.api.data_quality import _DQ_RULE_TARGETS
 
@@ -570,6 +580,11 @@ def test_dq_rule_target_map_covers_exactly_the_schemas_vocabulary():
     assert all(entity is not None for entity in _DQ_RULE_TARGETS.values()), (
         "a data-quality rule always names a row; unlike glossary attachments "
         "there is no id-less target type here"
+    )
+    assert set(_DQ_TARGET_SNAP_TYPE_KEYS) == set(_DQ_TARGET_TYPES), (
+        "every declared data-quality target type needs a snapshot collection "
+        "the rehydrator can validate its target_id against; a missing entry "
+        "makes import drop every rule of that type"
     )
 
 

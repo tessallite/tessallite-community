@@ -29,9 +29,9 @@ The only sound matcher is ROW IDENTITY. A pocket caches ``SELECT * FROM
 and their identity is the model FACT table's declared primary key — provided
 that key is actually materialised as an output column of the cached table. When
 it is not, no sound incremental patch exists and the caller must rebuild in
-FULL. That is a fail-closed degradation to the documented pocket behaviour
-("pockets only support full refresh", ``PocketRefreshPolicy``), never a wrong
-number.
+FULL. That is a fail-closed degradation to the documented pocket behaviour,
+never a wrong number. Joined models take the same full-refresh path unless the
+refresh driver can prove complete per-table watermark coverage (Bug-8745).
 
 The window
 ----------
@@ -55,9 +55,10 @@ under an identity-keyed DELETE/INSERT.
 ``started_at`` is stamped by the TENANT METADATA database's clock, while the
 watermark values are written by the SOURCE database's clock, so the anchor is
 inherently a cross-server quantity. That is why the window is handed to the
-source as a DURATION back from its own ``NOW()`` rather than as an absolute
-instant: the SOURCE's offset then cancels out entirely, because a duration is
-offset-invariant.
+source as a DURATION rather than as an absolute instant. Offset-aware values use
+the source's ``NOW()``; naive timestamps use the source's UTC wall clock because
+Tessallite's naive-timestamp contract is UTC. This keeps a session timezone
+ahead of UTC from moving the whole delta window into the future (Bug-8746).
 
 Be precise about which offset cancels, because the first version of this
 paragraph over-claimed. The elapsed seconds are ``datetime.now()`` on the
@@ -103,29 +104,20 @@ Two things sit alongside the invariant because it does not cover them:
   TWICE satisfies it. ``build_key_integrity_probe_sql`` over the key set covers
   that, and over the cache and the delta as well.
 
-The one true residual, which nothing downstream can detect: a source that edits
-a row WITHOUT moving its own watermark. That is the user's contract with their
-source, and the help page says so plainly.
+The one true residual for a permitted single-table incremental pocket, which
+nothing downstream can detect: a source that edits a row WITHOUT moving its own
+watermark. That is the user's contract with their source, and the help page
+says so plainly. A joined model is refused before this leg unless complete
+per-table coverage is proven (Bug-8745).
 
-The two source scans are separate statement snapshots, and their ORDER is
-load-bearing: the KEY SET is scanned FIRST, the delta second. A row inserted
-between them then appears in the delta only, which satisfies the invariant and
-is written correctly. The other order puts it in the key set only, with no
-cached copy and no delta row — a false invariant violation on every ordinary
-concurrent write, which would disable the leg permanently on any source with
-insert traffic. ``shared/pocket/refresh.py`` states this at the two statements.
-
-The order is not free. Against a source mid ``TRUNCATE``-and-reload, or one that
-simply deletes a row between the two scans, the older key set keeps the affected
-rows alive for one extra cycle where the other order would have evicted them.
-That is the deliberate trade: those cases self-heal on the next run (the
-invariant or the anti-join catches them), and the concurrent-insert case did not
-self-heal at all. The empty-key-set guard blocks the catastrophic variant — the
-whole cache evicted, or an empty key set beside a non-empty delta, which is
-direct evidence the two snapshots disagree. Removing the cause needs a shared
-REPEATABLE READ snapshot across both scans, tracked as Bug-8739 and deliberately
-not done here because it changes a shared primitive
-(``SourceConnection.transaction``) with many other callers.
+The key set, delta, integrity probes, and DELETE/INSERT patch now share one
+REPEATABLE READ source transaction (Bug-8741 / source Bug-8739). Concurrent
+inserts and deletes therefore cannot appear in only one scan. Key-set first is
+retained for clarity and stable statement shape, but correctness no longer
+depends on a READ COMMITTED ordering trade-off. The empty-key-set guard remains
+useful for a source snapshot captured mid ``TRUNCATE``-and-reload: one stable
+snapshot can still represent an incomplete non-atomic load even though its own
+statements agree with each other.
 """
 from __future__ import annotations
 
@@ -147,6 +139,7 @@ __all__ = [
     "build_orphan_delete_sql",
     "build_unreconciled_key_probe_sql",
     "build_window_expression",
+    "resolve_incremental_watermark_coverage",
     "resolve_incremental_window_start",
     "resolve_row_identity_candidates",
     "usable_identity_columns",
@@ -165,6 +158,92 @@ DEFAULT_LOOKBACK_HOURS = 24
 # ``ModelTable.table_type`` value identifying the star's centre. A model has at
 # most one (DB-enforced: ``uq_model_tables_one_fact_per_model``).
 FACT_TABLE_TYPE = "fact"
+
+
+async def resolve_incremental_watermark_coverage(
+    db: Any,
+    *,
+    model_id: Any,
+    version_id: Any | None,
+    incremental_column: str | None,
+) -> bool:
+    """Prove whether the configured watermark covers the pocket's model.
+
+    Bug-8745. A pocket materialises the model's joined row population, while
+    the current product stores exactly one ``incremental_column``. That one
+    watermark cannot prove freshness for a joined dimension: changing the
+    dimension can change the materialised number without changing the fact
+    row's watermark. Until per-table watermark metadata exists, the only
+    authoritative proof available is the captured deployed snapshot with
+    exactly one valid fact table. The snapshot is keyed by the build-start
+    ``version_id`` rather than by the live model pointer: draft ``ModelTable``
+    rows must never influence a build that is pinned to an immutable deployed
+    definition.
+
+    The read deliberately fails closed: no column, no captured version, a
+    missing/unavailable/malformed/mismatched snapshot, or more than one
+    snapshot table returns ``False``. The caller then uses the full CTAS path.
+    This is a positive snapshot-structure check, not a static enumeration of
+    join shapes, so a newly introduced draft table cannot accidentally bypass
+    it. A metadata read failure is also treated as unproven coverage.
+    """
+    if not incremental_column or version_id is None:
+        return False
+
+    from sqlalchemy import select
+
+    from shared.db.models import ModelVersion
+
+    try:
+        row = (
+            await db.execute(
+                select(
+                    ModelVersion.model_id,
+                    ModelVersion.snapshot_json,
+                    ModelVersion.snapshot_unavailable,
+                ).where(ModelVersion.id == version_id)
+            )
+        ).first()
+    except Exception:
+        # Coverage is a precondition for the delta leg, not a reason to make
+        # the refresh itself fail before it can take the safe full path.
+        return False
+
+    if row is None:
+        return False
+    try:
+        snapshot_model_id, snapshot_json, snapshot_unavailable = row[0:3]
+    except (IndexError, KeyError, TypeError):
+        return False
+    if snapshot_unavailable:
+        return False
+    if str(snapshot_model_id) != str(model_id):
+        return False
+    if not isinstance(snapshot_json, dict):
+        return False
+
+    tables = snapshot_json.get("tables")
+    if not isinstance(tables, list) or len(tables) != 1:
+        return False
+    table = tables[0]
+    if not isinstance(table, dict):
+        return False
+
+    # These are the identity/shape fields emitted for every ModelTable by the
+    # model snapshot serialiser. Requiring them prevents a partial or foreign
+    # snapshot from being treated as the one-table proof. A model with one
+    # valid table must have the fact anchor; a lone dimension is not a valid
+    # model topology for this decision.
+    required = ("id", "model_id", "table_type", "physical_name")
+    if any(not table.get(field) for field in required):
+        return False
+    if str(table["model_id"]) != str(model_id):
+        return False
+    if table["table_type"] != FACT_TABLE_TYPE:
+        return False
+    if not isinstance(table["physical_name"], str):
+        return False
+    return True
 
 
 async def resolve_incremental_window_start(
@@ -377,12 +456,14 @@ def build_window_expression(elapsed_seconds: int, watermark_data_type: str) -> s
 
     A duration back from the source's ``NOW()`` fixes both halves at once:
 
-    * naive and ``timestamptz`` columns get exactly the semantics the
-      pre-Bug-8700 code had (PostgreSQL converts a ``timestamptz`` to the SESSION
-      zone before comparing it to a naive column), and
-    * the metadata-clock / source-clock OFFSET cancels out entirely, because a
-      duration is offset-invariant. That removes the cross-clock caveat the
-      absolute form needed the lookback to absorb.
+    * ``timestamptz`` columns use the source instant from ``NOW()``;
+    * naive timestamp columns use ``NOW() AT TIME ZONE 'UTC'``. Tessallite
+      interprets naive timestamps as UTC, so using the session wall clock would
+      make an ahead-of-UTC session's delta permanently empty (Bug-8746).
+
+    This removes the source-session TIMEZONE offset. It does not remove physical
+    clock skew between the metadata database, scheduler process, and source;
+    the lookback cushion and fail-closed reconciliation absorb that residual.
 
     The anchor is NOT lost: ``elapsed_seconds`` is measured from the last
     completed run, so after a week-long outage the window reaches back a week.
@@ -393,7 +474,10 @@ def build_window_expression(elapsed_seconds: int, watermark_data_type: str) -> s
     window start to its own date widens it to the whole boundary day — the safe
     direction, and the same correction the aggregate sibling applies.
     """
-    interval = f"(NOW() - INTERVAL '{int(elapsed_seconds)} seconds')"
+    clock = "NOW()"
+    if _is_naive_timestamp_type(watermark_data_type):
+        clock = "(NOW() AT TIME ZONE 'UTC')"
+    interval = f"({clock} - INTERVAL '{int(elapsed_seconds)} seconds')"
     if _is_date_only_type(watermark_data_type):
         return f"({interval}::date)"
     return interval
@@ -403,6 +487,16 @@ def _is_date_only_type(data_type: str) -> bool:
     """True for a watermark column that carries a DATE with no time part."""
     normalised = (data_type or "").strip().lower()
     return normalised == "date"
+
+
+def _is_naive_timestamp_type(data_type: str) -> bool:
+    """True when the watermark stores a UTC wall-clock timestamp."""
+    normalised = (data_type or "").strip().lower()
+    return (
+        normalised.startswith("timestamp")
+        and "with time zone" not in normalised
+        and "timestamptz" not in normalised
+    )
 
 
 def build_delta_sql(

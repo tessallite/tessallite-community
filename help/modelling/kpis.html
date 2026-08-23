@@ -273,6 +273,61 @@
 <p>Hover over the <strong>Restricted</strong> badge for the full explanation.</p>
 <blockquote><strong>Worth knowing if you build models:</strong> the moment a model gets its first row-security rule, everybody whose role is not named in a rule sees nothing &mdash; including you, and including administrators. That is deliberate: it is safer to show nothing than to accidentally show data a rule was meant to hide. If you add a rule and the whole model suddenly goes blank for you, that is why. Add a rule that covers your own role, or set up a persona that is allowed to see everything, and the numbers come back. See <a href="configure-row-security.html">Configure row security</a>.</blockquote>
 
+<h3>When a KPI needs a time dimension</h3>
+<p>Some KPI settings only make sense against a date. If you use any of these, the
+KPI must have a <strong>time dimension</strong> chosen:</p>
+<ul>
+<li>a <strong>time calculation</strong> (year to date, versus last month, 3-month average, and so on);</li>
+<li>a <strong>balance-style reduction</strong> — telling the KPI to take the closing, opening, average, highest or lowest value per day, week, month, quarter or year instead of adding every row up;</li>
+<li><strong>carry forward</strong>, which fills a gap with the last known value;</li>
+<li>an <strong>aggregate of aggregate</strong> whose inner grain is a period (for example "average of the monthly totals").</li>
+</ul>
+<p>If a KPI asks for one of these but no time dimension is set, the card shows an
+error instead of a number. That is deliberate. There is no safe guess: picking
+some other date column would quietly answer a different question, and the number
+would look perfectly ordinary while being wrong. Choose the date that represents
+when the business event happened, and the KPI calculates.</p>
+<h3>Choosing the reduction grain</h3>
+<p>When you tell a KPI to take a closing or average value rather than a total, you
+also choose the period it resets on. The grain must be one of:</p>
+<p><code>day</code>, <code>week</code>, <code>month</code>, <code>quarter</code>, <code>year</code></p>
+<p>These are the only accepted values. A typo such as "monthly", or the name of a
+column, is rejected when you save. Older KPIs that somehow carry a different
+value show an error rather than a number.</p>
+<p>The reason is worth understanding. "Closing balance per month" means: group the
+rows into months, and take the last value in each. If the grouping is by
+something that is not a period — a column such as <code>account_code</code>, say —
+the KPI no longer has a "last value per month" to return, so it hands back one
+row it happened to pick. That number looks like a balance and is not one.</p>
+<h3>Balances combined with time calculations</h3>
+<p>You can combine the two: "the trailing three months of the closing balance",
+"year to date on the closing balance", "last month's closing balance".</p>
+<p>Tessallite reduces each period FIRST and then does the time arithmetic. With
+daily balances of 100, 120 and 90 in March, March contributes 90 — the closing
+balance — not 310, the sum of the three days. A trailing three-month sum adds the
+three monthly closing balances together.</p>
+<p><strong>Carry forward on a time calculation.</strong> If you also switch carry
+forward on, it is applied inside each period as that period is worked out. Say
+March has a balance on the 1st and the 3rd but nothing on the 2nd: the 2nd takes
+the 1st&rsquo;s value, and March&rsquo;s average is worked out over all three days
+instead of two.</p>
+<p>Two things are worth knowing about where the filling stops:</p>
+<ul>
+<li>It fills <strong>inside</strong> a period, never across one. February&rsquo;s
+last balance does not carry into March, because each period is worked out on its
+own. So if a period starts with a gap &mdash; no balance yet on its first day
+&mdash; that first day stays empty; there is nothing earlier in that period to
+copy.</li>
+<li>It fills days that exist but have <strong>no value</strong>. It does not
+invent days, or months, that have no rows at all. A period with nothing in it
+stays empty.</li>
+</ul>
+<p>One preview limitation: while you are still building the KPI, the little trend
+line (the sparkline) is left empty for a balance-style KPI &mdash; including one
+that only uses carry forward. Drawing it would mean adding the days up again,
+which would contradict the single number shown right next to it. The number is
+correct; only the preview sparkline is withheld. Once the KPI is saved, its trend
+chart is built from real saved readings and shows normally.</p>
 <h3>Time calculation (optional)</h3>
 <p>Most formula types offer a &ldquo;+ Add time calculation&rdquo; link below the formula controls. Clicking it adds a secondary time-variant calculation that transforms the base formula&rsquo;s result over time. This is different from the time window &mdash; the time window says &ldquo;look at data from last month&rdquo;, while the time calculation says &ldquo;compare this month to last month&rdquo; or &ldquo;average across the last 3 months&rdquo;.</p>
 <p><strong>When to use it:</strong> You already have a base formula (like Sum of Revenue) and you want the KPI to automatically do something comparative or rolling with it. Without a time calculation, the KPI just shows the raw value for the chosen time window. With a time calculation, it can show change, trend, or smoothed values.</p>

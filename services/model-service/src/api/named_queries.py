@@ -13,14 +13,15 @@ The materialisation runs on the shared artifact substrate
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
-from sqlalchemy import func as sa_func, select
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from sqlalchemy import case, func as sa_func, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from shared.config.resolver import get_setting
@@ -36,8 +37,9 @@ from shared.db.models import (
     NamedQueryRefreshPolicy,
     NamedQueryRefreshRun,
     NamedSet,
+    QueryLog,
 )
-from shared.db.session import get_tenant_db
+from shared.db.session import get_system_db, get_tenant_db
 from shared.schemas.pydantic_models import (
     NamedQueryCreate,
     NamedQueryResponse,
@@ -47,6 +49,8 @@ from shared.schemas.pydantic_models import (
     NamedQueryRefreshPolicyResponse,
     NamedQueryRefreshPolicyUpsert,
     NamedQueryRefreshRunResponse,
+    NamedQueryAnalyticsResponse,
+    NamedQueryFallbackReasonCount,
 )
 from src.api._model_lock import acquire_model_definition_lock
 from src.api._validator_unavailable import validator_unavailable
@@ -109,17 +113,31 @@ async def _run_named_query_refresh_in_background(
                     named_query_id, run_id, exc,
                 )
                 try:
+                    # The refresh may have left this session in PostgreSQL's
+                    # aborted-transaction state. Roll back before any read,
+                    # including the queued run lookup; otherwise the fallback
+                    # can never stamp the failure (Bug-9193).
+                    await db.rollback()
                     run = await db.get(NamedQueryRefreshRun, run_id)
                     if run is not None and run.status in ("queued", "running"):
+                        # Bug-9193: this is the background refresh funnel's
+                        # last shared write site.  A crash can happen outside
+                        # ``refresh_named_query_artifact`` (session setup,
+                        # wrapper code, or a future refresh entry-point
+                        # change), so the fallback failure mutation must use
+                        # the same per-model definition lock as the normal
+                        # refresh path.
+                        nq = await db.get(NamedQuery, named_query_id)
+                        if nq is None:
+                            return
+                        await acquire_model_definition_lock(db, nq.model_id)
                         run.status = "failed"
                         run.error_message = str(exc)[:1000]
                         run.completed_at = datetime.now(timezone.utc)
-                        nq = await db.get(NamedQuery, named_query_id)
-                        if nq is not None:
-                            artifact = await _get_artifact(db, named_query_id)
-                            if artifact is not None:
-                                artifact.status = "failed"
-                                artifact.failure_reason = str(exc)[:1000]
+                        artifact = await _get_artifact(db, named_query_id)
+                        if artifact is not None:
+                            artifact.status = "failed"
+                            artifact.failure_reason = str(exc)[:1000]
                         await db.commit()
                 except Exception:
                     logger.exception(
@@ -411,6 +429,154 @@ async def get_named_query(
         if nq is None:
             raise HTTPException(status_code=404, detail="Named Query not found")
         return _to_response(nq)
+
+
+@router.get(
+    "/{named_query_id}/analytics",
+    response_model=NamedQueryAnalyticsResponse,
+)
+async def named_query_analytics(
+    project_id: UUID,
+    model_id: UUID,
+    named_query_id: UUID,
+    days: int = Query(30, ge=1, le=365),
+    sys_db: AsyncSession = Depends(get_system_db),
+    current_user: CurrentUser = Depends(forbid_embed_user),
+    _: None = require_role("viewer"),
+) -> NamedQueryAnalyticsResponse:
+    """Return existing QueryLog cost telemetry attributed to one Named Query.
+
+    The model and Named Query are resolved inside the current tenant session
+    before any log aggregation. This preserves the same project/model/NQ
+    authority as the authoring and health routes and prevents a guessed UUID
+    from becoming a cross-project or cross-tenant analytics oracle.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    async for db in get_tenant_db(current_user.tenant_id):
+        await _get_scoped_model(db, project_id, model_id)
+        nq_result = await db.execute(
+            select(NamedQuery.id).where(
+                NamedQuery.id == named_query_id,
+                NamedQuery.model_id == model_id,
+            )
+        )
+        if nq_result.scalar_one_or_none() is None:
+            raise HTTPException(status_code=404, detail="Named Query not found")
+
+        base_filters = (
+            QueryLog.model_id == model_id,
+            QueryLog.named_query_id == named_query_id,
+            QueryLog.created_at >= since,
+        )
+        fallback = QueryLog.named_query_fallback_reason.is_not(None)
+        fallback_success = fallback & (QueryLog.status == "success")
+        fallback_cost_sample = fallback_success & (
+            QueryLog.cache_status.is_(None)
+            | (QueryLog.cache_status != "cache_hit")
+        )
+        materialized_success = (~fallback) & (QueryLog.status == "success")
+        summary_result = await db.execute(
+            select(
+                sa_func.count().label("total_queries"),
+                sa_func.sum(case((fallback, 1), else_=0)).label("fallback_queries"),
+                sa_func.sum(
+                    case((materialized_success, 1), else_=0)
+                ).label("materialized_queries"),
+                sa_func.sum(
+                    case((fallback & (QueryLog.status == "error"), 1), else_=0)
+                ).label("fallback_failures"),
+                sa_func.avg(
+                    case((fallback_cost_sample, QueryLog.execution_ms), else_=None)
+                ).label("avg_fallback_execution_ms"),
+                sa_func.avg(
+                    case((fallback_cost_sample, QueryLog.bytes_processed), else_=None)
+                ).label("avg_fallback_bytes_processed"),
+            ).where(*base_filters)
+        )
+        summary = summary_result.one()
+        total_queries = int(summary.total_queries or 0)
+        fallback_queries = int(summary.fallback_queries or 0)
+        materialized_queries = int(summary.materialized_queries or 0)
+        fallback_failures = int(summary.fallback_failures or 0)
+        avg_execution_ms = (
+            float(summary.avg_fallback_execution_ms)
+            if summary.avg_fallback_execution_ms is not None
+            else None
+        )
+        avg_bytes = (
+            float(summary.avg_fallback_bytes_processed)
+            if summary.avg_fallback_bytes_processed is not None
+            else None
+        )
+
+        reason_result = await db.execute(
+            select(
+                QueryLog.named_query_fallback_reason.label("reason"),
+                sa_func.count().label("count"),
+            )
+            .where(*base_filters, fallback)
+            .group_by(QueryLog.named_query_fallback_reason)
+            .order_by(sa_func.count().desc(), QueryLog.named_query_fallback_reason)
+        )
+        reasons = [
+            NamedQueryFallbackReasonCount(reason=row.reason, count=int(row.count))
+            for row in reason_result.all()
+            if row.reason
+        ]
+
+        expensive_fallback = (
+            avg_execution_ms is not None and avg_execution_ms > 0
+        ) or (avg_bytes is not None and avg_bytes > 0)
+        sustained_fallback_count = int(
+            await get_setting(
+                "named_query.analytics_sustained_fallback_count",
+                system_session=sys_db,
+                tenant_session=db,
+                model_id=model_id,
+            )
+        )
+        sustained = fallback_queries >= sustained_fallback_count
+        recommendation = (
+            "repair_named_query_materialisation"
+            if sustained and expensive_fallback
+            else "none"
+        )
+        recommendation_reason = (
+            "sustained_expensive_fallback"
+            if recommendation != "none"
+            else None
+        )
+        return NamedQueryAnalyticsResponse(
+            named_query_id=named_query_id,
+            window_days=days,
+            total_queries=total_queries,
+            materialized_queries=materialized_queries,
+            fallback_queries=fallback_queries,
+            fallback_failures=fallback_failures,
+            fallback_rate=(fallback_queries / total_queries * 100)
+            if total_queries
+            else 0.0,
+            avg_fallback_execution_ms=(
+                round(avg_execution_ms, 1) if avg_execution_ms is not None else None
+            ),
+            avg_fallback_bytes_processed=(
+                round(avg_bytes, 1) if avg_bytes is not None else None
+            ),
+            fallback_reasons=reasons,
+            recommendation=recommendation,
+            recommendation_reason=recommendation_reason,
+        )
+    # ``get_tenant_db`` always yields once for a valid tenant; this keeps the
+    # return contract explicit for type-checkers and unusual test doubles.
+    return NamedQueryAnalyticsResponse(
+        named_query_id=named_query_id,
+        window_days=days,
+        total_queries=0,
+        materialized_queries=0,
+        fallback_queries=0,
+        fallback_failures=0,
+        fallback_rate=0.0,
+    )
 
 
 @router.post(

@@ -40,7 +40,7 @@ When **not** to use row security:
 
 ## The two rule shapes
 
-A rule is one of two shapes. A model can mix shapes freely; every enabled rule that matches the caller is AND'd together at query time.
+A rule is one of two shapes. A model can mix shapes freely. Named-role grants that match the caller **OR** together (a person with two roles sees the union of those grants). Wildcard `*` rules **AND** with that union as a floor every caller must satisfy. Mapping-table rules also **AND**. Do not write two named-role rules expecting them to intersect for a multi-role user.
 
 ### 1. Role predicate
 
@@ -106,7 +106,7 @@ For every read query, the Query Router runs the same four-step procedure:
 3. **Constrain every table scan.** If at least one rule compiled, the Query Router adds the combined predicate to the `WHERE` of *every* SELECT that reads a physical table — not as an outer wrapper around the whole query, but inside each scan. That includes each branch of a `UNION` / `EXCEPT` / `INTERSECT`, scalar subqueries, subquery-first `FROM` clauses, and the bodies of CTEs. Two consequences matter:
 
    - Because the filter lives in the *same* SELECT as each scan, it always applies **before any `LIMIT`**. So `LIMIT 100` returns up to 100 *allowed* rows — never the first 100 physical rows that are then filtered down to far fewer (or none).
-   - The combined predicate is an AND of every compiled rule, so multiple enabled rules for the same principal **intersect** — if one rule says "EMEA or APAC" and another says "2024 only", the caller sees the intersection.
+   - The combined predicate is `AND(each wildcard, OR(named grants), each mapping)`. Two named-role grants for a caller who holds both roles **union**. A wildcard plus a named grant **intersects**. Mapping-table rules always intersect.
 
    A query whose shape the Router cannot prove it has fully constrained — one it cannot parse, or whose scopes it cannot resolve — is **rejected** with a `403` and the error code `row_security_unsupported_shape`, rather than being run unfiltered. Rewriting it as a plain SELECT (or a UNION of plain SELECTs) over the model resolves it. This fail-closed stance is the whole point: an unconstrainable query is refused, never leaked.
 
@@ -123,15 +123,15 @@ When **no rule matches**, ordinary callers receive a deny-all predicate and see 
 
 ## Preview compiled policy
 
-The Row Security panel has a button labeled **Simulate as user**. It opens a dialog where you enter a candidate email address and a list of roles, then click **Preview**. Despite the button's name, nothing runs as a query: Tessallite compiles every enabled rule against that hypothetical person and shows you the resulting filter — the compiled policy — exactly as the Query Router would build it for a real request. No query is executed and no rows, real or simulated, are ever returned by this dialog.
+The Row Security panel has a button labeled **Simulate as user**. It opens a dialog where you enter a candidate email address and a list of roles, then click **Preview**. Tessallite compiles every enabled rule against that hypothetical person and shows the resulting filter — one compiled string, the same predicate the Query Router would inject. There is no per-rule fire / not-fire tree: unmatched named grants simply do not appear in that string.
 
-![The Simulate-as-user drawer showing a pretty-printed predicate tree with each leaf annotated with its source rule, and a footer summary counting which rules fire and do not fire for the previewed principal.](../assets/screencaps/row-security-simulate-drawer.png)
+Optionally fill **Probe query** (the panel suggests `SELECT <security_column>, COUNT(*) FROM <model> GROUP BY <security_column> LIMIT 50`). When a tenant administrator supplies a probe, Simulate runs it through the real `/execute` path and shows the rows that principal would see. A modeller who is not a tenant administrator still gets the compiled predicate; the probe is refused rather than silently ignored. A blank probe is compiled-preview only.
+
+![The Simulate-as-user drawer showing one compiled predicate string and, when a probe query was supplied, the rows that principal would see.](../assets/screencaps/row-security-simulate-drawer.png)
 
 *Figure 3 — Preview compiled policy. Confirming a rule's effect before sending a JWT to a user's tool is the single highest-value habit in row-security authoring. Full description: [row-security-simulate-drawer.txt](../assets/screencaps/row-security-simulate-drawer.txt).*
 
-Think of this preview as a policy check, not a data preview: it proves what predicate a person's queries would carry, not what rows they would actually see. Reviewing the predicate before and after every rule change is the right habit — rule interaction is subtle. Enabling two rules that individually make sense can produce a combined predicate that lets nothing through, or, more dangerously, lets too much through.
-
-A workspace-wide version of this preview — one that checks an entire canvas and pivot at once instead of one query at a time — is a planned enhancement. For now, previewing one rule at a time already covers the check that matters most: what a specific rule filters for a specific person.
+The compiled string is a policy check. The probe table is the row proof. Review both after every rule change — named grants OR, so two rules that look like they tighten can instead widen a multi-role caller.
 
 ---
 
@@ -151,8 +151,8 @@ A workspace-wide version of this preview — one that checks an entire canvas an
    - **Enabled:** on.
 3. Save. Add a second rule mirroring the first for APAC (`dimension_equals('region.region_code', 'APAC')`, role `region_manager_apac`).
 4. Add an explicit central-analytics rule covering every allowed region. An ordinary unmatched `analytics_central` role is denied every row.
-5. Open **Simulate as user**, enter `analyst@acme-demo.com` with role `region_manager_emea`, and click **Preview**. The predicate tree should show only the EMEA rule firing; the APAC rule should show greyed-out with "does not fire".
-6. Preview again with a user who has no roles. The result should show the fail-closed deny-all outcome. Then preview a tenant administrator and confirm the administrative exemption only if no rule explicitly targets that role.
+5. Open **Simulate as user**, enter `analyst@acme-demo.com` with role `region_manager_emea`, and click **Preview**. The compiled string should constrain the region to EMEA. The APAC grant is simply absent from that string (the panel does not grey out unused rules).
+6. Preview again with a user who has no roles. The compiled string should be deny-all (`0 = 1`). Then preview a tenant administrator: the compiled predicate is empty because privileged unmatched roles are exempt, not because the model is unprotected. Do not use `admin@acme-demo.com` as the everyday JDBC/Excel user when you want to see France-manager rows.
 
 ---
 
@@ -163,7 +163,7 @@ A workspace-wide version of this preview — one that checks an entire canvas an
 | **Every scanned table must expose the security dimension column.** The Router ANDs the predicate (referenced by the path's last segment, e.g. `region.region_code` → `region_code`) into the WHERE of every SELECT that reads a physical table. | If a scanned scope does not expose that column, the source database rejects the query with "column does not exist" — it fails **closed**, never returning unfiltered rows. Query shapes the Router cannot safely constrain are rejected with a `row_security_unsupported_shape` error. | Ensure the fact table exposes the security column, or rewrite the query as a plain SELECT (or a UNION of plain SELECTs) over the model. |
 | **Aggregate and pocket fast paths are used under row security only when they can be proved safe.** An aggregate needs every security column in its grouping; a pocket needs to be a straight row-preserving copy whose recorded materialised columns include every security column, matched exactly (including upper/lower case). | A filtered audience gets the fast answer when the proof holds and the source-speed answer when it does not — never a wrong or unfiltered one. A pocket that drops or renames the security column, or whose column record is missing or out of date, quietly routes to source. | If a filtered audience is slower than you expect, check that the security dimension column is actually materialised in the aggregate's grain or the pocket's copy, spelled identically. A per-audience pre-filtered pocket is still a good option when the general artifact cannot carry the column. |
 | **Roles are strings carried on the JWT.** No central role registry today. | Typos in `applies_to_roles` silently match nothing. | Keep a canonical list of role strings in the team's runbook; a planned rule-coverage audit will highlight orphaned roles. |
-| **One security dimension per rule.** A rule filters on exactly one `dimension_path`. | Compound rules require multiple rules. | Author multiple rules — they AND together. |
+| **One security dimension per rule.** A rule filters on exactly one `dimension_path`. | Compound restrictions need more than one rule. | Author a wildcard (AND floor) plus named grants (OR entitlements), or a single `and(...)` DSL expression. Named grants for a multi-role user union; they do not intersect. |
 | **Embed sessions apply row-security rules only when the embed token carries a security subject.** When you mint an embed token you can set an `rls` subject — a role, a set of groups, and/or a set of claims — for the end user the token represents. That subject drives `role_predicate` / `idp_group` / `saml_claim` / `oidc_scope` rules exactly like an ordinary sign-in does. If you leave the subject off, the embedded view carries no role/group/claim. | On a model that has row-security rules, an embed token **without** a matching subject is denied every row (it fails closed) — it never sees the unrestricted set. | Set the `rls` subject on the embed token to the role/groups/claims the end user should be filtered by. Embed persona default filters still apply as an additional layer. |
 | **Visual rule builder (predicate tree, a canvas-wide preview overlay, and a coverage audit) is planned for a future release.** | Current authoring uses model-aware dropdown selectors for dimension and mapping table, but the predicate expression is a free-text DSL editor. | The DSL is small; the form validates as you type; Preview gives the round-trip check. |
 
@@ -171,12 +171,11 @@ A workspace-wide version of this preview — one that checks an entire canvas an
 
 ## Demo and simulation data
 
-The `acme-demo` tenant seeds a working row-security example out of the box. The seed bundle includes two `role_predicate` rules on `modely`:
+The `acme-demo` tenant seeds row-security rules. After a current reseed, regional-manager predicates use the compilable `in(...)` form (not the retired `dimension_in`). Live tenants that were never reseeded can still hold uncompilable text — Simulate and `/execute` then return a typed 422, not unfiltered rows.
 
-- Role `region_manager_emea` — sees only `EMEA` rows via a role-predicate rule on the region dimension.
-- Role `region_manager_apac` — sees only `APAC` rows.
+`admin@acme-demo.com` is a tenant administrator. Privileged unmatched roles are exempt from coverage deny-all, so that JDBC/Excel login sees every region, including ones a France manager must not see. Use Simulate with role `region_manager_emea` (and a probe query) to inspect restricted rows. A dedicated non-privileged demo JDBC user is a seed follow-up.
 
-To try it, open **Simulate as user** in the Row Security panel, enter any email address and one of the roles above, and click **Preview**. Tessallite compiles the rule and shows you the predicate that role would receive — no query runs and no rows come back. To reseed the demo tenant (including its row-security rules), run `bash scripts/reseed_acme_demo.sh` from the `tessallite/` directory.
+To reseed the demo tenant (including its row-security rules), run `bash scripts/reseed_acme_demo.sh` from the `tessallite/` directory.
 
 ---
 
@@ -187,7 +186,7 @@ To try it, open **Simulate as user** in the Row Security panel, enter any email 
 | Rule saves but no filtering happens | Role in `applies_to_roles` does not match the JWT's `role` claim | Check the JWT; keep role strings canonical |
 | Query errors with "column does not exist" for the security column | A scanned scope does not expose the security dimension column the rule references | Ensure the fact table exposes the column (the filter fails closed rather than returning unfiltered rows) |
 | Query rejected with `row_security_unsupported_shape` | The query shape cannot be safely constrained by the active rules | Rewrite it as a plain SELECT, or a UNION of plain SELECTs, over the model |
-| Rule saves but Simulate says "does not fire" for the target user | User's roles do not include any `applies_to_roles` from the rule | Add the role to the user's JWT claim, or the role name to the rule |
+| Simulate compiled string is deny-all (`0 = 1`) for the target user | User's roles do not include any `applies_to_roles` from a named grant, and no wildcard matches | Add the role to the user's JWT claim, or the role name to the rule |
 | Two users in the same role see different rows | The rule is `user_mapping`, not `role_predicate` — and the mapping table's allowed values differ per user | Expected. Use `role_predicate` if per-role scope is needed |
 | User mapping rule returns zero rows for a valid user | Mapping table has no row for that user | Add a row, or fall back to a role-predicate rule for users without mapping rows |
 

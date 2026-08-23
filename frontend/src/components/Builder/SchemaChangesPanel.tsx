@@ -83,9 +83,17 @@ export default function SchemaChangesPanel() {
             size="small"
             sx={{ ml: 0.5 }}
           />
-          {"column" in (e.detail ?? {}) && (
+          {Boolean(
+            (e.detail as Record<string, unknown> | null | undefined)?.column_name
+              ?? (e.detail as Record<string, unknown> | null | undefined)?.column,
+          ) && (
             <Typography variant="caption" display="block">
-              {t("schemaChanges.column", { name: String((e.detail as Record<string, unknown>).column) })}
+              {t("schemaChanges.column", {
+                name: String(
+                  (e.detail as Record<string, unknown>).column_name
+                    ?? (e.detail as Record<string, unknown>).column,
+                ),
+              })}
             </Typography>
           )}
           {e.detected_at && (

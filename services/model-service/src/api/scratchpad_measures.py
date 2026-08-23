@@ -10,6 +10,7 @@ from sqlglot import exp
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from shared.config.settings import get_settings
 from shared.connector_qualify import quote_identifier
@@ -280,6 +281,22 @@ def _to_response(row: ScratchpadMeasure) -> ScratchpadResponse:
     )
 
 
+def _name_conflict(name: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail=f"Scratchpad measure '{name}' already exists on this model",
+    )
+
+
+async def _commit_with_name_conflict(db, name: str) -> None:
+    """Map the uniqueness race after the optimistic pre-check to HTTP 409."""
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise _name_conflict(name)
+
+
 @router.get("", response_model=list[ScratchpadResponse], dependencies=[require_role("viewer")])
 async def list_scratchpad_measures(
     project_id: UUID,
@@ -325,7 +342,7 @@ async def create_scratchpad_measure(
         user_id = current_user.email or current_user.user_id
         # Pre-check the (model_id, created_by, name) uniqueness constraint and
         # return a clean 409 instead of letting the DB IntegrityError escape as
-        # a 500 (F-029-08), mirroring parameters.py.
+        # a 500 (F-029-07), mirroring parameters.py.
         existing = await db.execute(
             select(ScratchpadMeasure).where(
                 ScratchpadMeasure.model_id == model_id,
@@ -334,10 +351,7 @@ async def create_scratchpad_measure(
             )
         )
         if existing.scalar_one_or_none():
-            raise HTTPException(
-                status_code=409,
-                detail=f"Scratchpad measure '{body.name}' already exists on this model",
-            )
+            raise _name_conflict(body.name)
         row = ScratchpadMeasure(
             model_id=model_id,
             name=body.name,
@@ -348,7 +362,7 @@ async def create_scratchpad_measure(
             created_by=user_id,
         )
         db.add(row)
-        await db.commit()
+        await _commit_with_name_conflict(db, body.name)
         await db.refresh(row)
         return _to_response(row)
     raise HTTPException(status_code=500, detail="DB session exhausted")
@@ -378,7 +392,19 @@ async def update_scratchpad_measure(
         if row.created_by != user_id:
             raise HTTPException(status_code=403, detail="Not your scratchpad measure")
         if "name" in supplied and supplied["name"] is not None:
-            row.name = supplied["name"]
+            new_name = supplied["name"]
+            if new_name != row.name:
+                existing = await db.execute(
+                    select(ScratchpadMeasure).where(
+                        ScratchpadMeasure.model_id == model_id,
+                        ScratchpadMeasure.created_by == user_id,
+                        ScratchpadMeasure.name == new_name,
+                        ScratchpadMeasure.id != measure_id,
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    raise _name_conflict(new_name)
+                row.name = new_name
         if "display_name" in supplied:
             row.display_name = supplied["display_name"]
         if "expression" in supplied and supplied["expression"] is not None:
@@ -396,7 +422,7 @@ async def update_scratchpad_measure(
             row.data_type = supplied["data_type"]
         if "format" in supplied:
             row.format = supplied["format"]
-        await db.commit()
+        await _commit_with_name_conflict(db, row.name)
         await db.refresh(row)
         return _to_response(row)
     raise HTTPException(status_code=500, detail="DB session exhausted")

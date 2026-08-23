@@ -50,6 +50,18 @@ WRITER_ENTRY_POINTS = {
     "tessallite/services/optimizer/src/lifecycle/creator.py": "tessallite/services/optimizer",
 }
 
+# DDL implementations are a conservative inventory, not all runtime import
+# edges. The optimizer currently executes the canonical PostgreSQL emitter;
+# the BigQuery and Spark emitters remain supported implementation files even
+# though the current creator reaches them only through the separately tested
+# dialect contract. Keeping this inventory separate prevents the closure walk
+# from claiming a runtime edge that the AST cannot prove.
+DDL_IMPLEMENTATION_INVENTORY = (
+    "tessallite/services/optimizer/src/ddl/bigquery_ddl.py",
+    "tessallite/services/optimizer/src/ddl/postgres_ddl.py",
+    "tessallite/services/optimizer/src/ddl/spark_ddl.py",
+)
+
 #: Modules that assemble an aggregate CTAS or the SQL it embeds. Every ORM
 #: entity these load is, by definition, a build input.
 BUILDER_MODULES = [
@@ -69,6 +81,10 @@ BUILDER_MODULES = [
     # select()/get()-only scanner returned an empty set for it -- which
     # EXEMPTED it from classification altogether.
     "tessallite/shared/semantic/calculated_expression.py",
+    # The optimizer's deployed-snapshot resolver supplies the semantic shape
+    # used by creator._deployed_measure_index. Its ModelVersion read therefore
+    # selects the measures the CTAS is allowed to materialise.
+    "tessallite/shared/deploy_resolver_core.py",
     # Bug-8605: it does not emit SQL, but it decides WHICH table anchors the
     # FROM clause and in what order the joins expand -- and the anchor of a
     # LEFT JOIN chain decides the CTAS's row membership. Its reads shape the
@@ -120,6 +136,11 @@ NON_BUILDER_MODULES = {
     ),
     "tessallite/services/optimizer/src/lifecycle/retirement.py": (
         "retires and purges artifacts; reads no model definition"
+    ),
+    "tessallite/services/optimizer/src/lifecycle/resolve_target.py": (
+        "target ownership/default resolution; reads DataTarget endpoint identity, "
+        "not model definitions or CTAS row shape. Storage routing is covered by "
+        "shared/artifact_target_binding.py"
     ),
 }
 
@@ -176,6 +197,12 @@ EXCLUDED = {
         "connection row byte-identical, which no row-versus-row diff can see"
     ),
     "QueryMissLog": "optimizer bookkeeping, never read into generated SQL",
+    "ModelVersion": (
+        "the deployed snapshot container. Its semantic rows are the authoritative "
+        "input consumed by deploy_resolver_core, while the definition closure "
+        "compares the live semantic entities against that snapshot; the version "
+        "row itself is not a definition group"
+    ),
 }
 
 
@@ -273,13 +300,15 @@ def _resolve_relative(rel: str, node) -> str | None:
 def _import_closure(unresolved=None) -> set[str]:
     """Every first-party module transitively imported by the writer entry points.
 
-    Resolves three shapes, because resolving only the first is how round-3
-    review found this guard failing OPEN:
+    Resolves only explicit AST import edges, because treating a package's
+    sibling files as runtime imports would make the guard claim reachability
+    that production code has not demonstrated:
 
     * ``import shared.x`` / ``from shared.x import name`` -> ``shared/x.py``
     * ``from src.ddl import postgres_ddl`` -> ``src/ddl/postgres_ddl.py``. The
       imported NAME can be a module, and ``src/ddl.py`` does not exist, so the
-      whole dialect-CTAS package was skipped silently.
+      resolver tries the explicit imported child rather than treating every
+      sibling as runtime-reached.
     * ``from .postgres_ddl import ...`` -> relative, previously dropped outright
       by the ``node.level == 0`` condition.
 
@@ -376,26 +405,266 @@ def test_every_entity_a_builder_reads_is_classified(module):
 
 
 def test_import_closure_follows_package_and_relative_imports():
-    """The discovery walk must not fail OPEN on the two commonest import shapes.
+    """SHARED-GATE-R1-F1: explicit package/relative edges resolve correctly.
 
-    ``creator.py`` reaches the dialect CTAS emitters as
-    ``from src.ddl import bigquery_ddl, postgres_ddl, spark_ddl`` -- a PACKAGE
-    import. Resolving only ``src.ddl`` -> ``src/ddl.py`` found nothing and
-    skipped them silently, so the most load-bearing modules in the build path
-    (``postgres_ddl.build_pg_ctas`` IS the CTAS builder) sat outside the guard
-    while every test was green. Round-3 review measured 79 modules reached
-    versus 89 with a correct resolver.
+    ``creator.py`` reaches the dialect CTAS emitter package with
+    ``from src.ddl import postgres_ddl``. The package is also the dispatch
+    surface for the sibling dialect emitters, but only the named PostgreSQL
+    child is a runtime import edge in this path. Resolving only ``src.ddl`` ->
+    ``src/ddl.py`` found nothing and skipped the explicit child silently.
     """
     reached = {r.replace(chr(92), "/") for r in _import_closure()}
     for expected in (
         "tessallite/services/optimizer/src/ddl/postgres_ddl.py",
-        "tessallite/services/optimizer/src/ddl/bigquery_ddl.py",
         "tessallite/services/scheduler/src/ddl/dialect_map.py",
     ):
         assert expected in reached, (
             f"{expected} is imported by a writer but the discovery walk never "
             f"reached it; the guard fails OPEN on that import shape"
         )
+
+
+def test_ddl_inventory_is_conservative_and_distinct_from_runtime_closure():
+    """SHARED-GATE-R1-F1: inventory coverage must not imply runtime reachability.
+
+    The optimizer's three dialect emitters are all release-relevant build
+    implementations, so each must exist in the explicit inventory. Only the
+    PostgreSQL emitter is reached by the current creator AST; BigQuery and
+    Spark are covered by inventory and must not be reported as runtime edges
+    until a real explicit import reaches them.
+    """
+    inventory = set(DDL_IMPLEMENTATION_INVENTORY)
+    ddl_dir = os.path.join(_REPO, "tessallite/services/optimizer/src/ddl")
+    on_disk = {
+        "tessallite/services/optimizer/src/ddl/" + name
+        for name in os.listdir(ddl_dir)
+        if name.endswith("_ddl.py")
+    }
+    assert inventory == on_disk, (
+        "optimizer DDL implementation inventory is stale or incomplete: "
+        f"inventory={sorted(inventory)}, on_disk={sorted(on_disk)}"
+    )
+    assert all(os.path.isfile(os.path.join(_REPO, module)) for module in inventory)
+
+    reached = {r.replace(chr(92), "/") for r in _import_closure()}
+    postgres = "tessallite/services/optimizer/src/ddl/postgres_ddl.py"
+    assert postgres in reached
+    assert {
+        "tessallite/services/optimizer/src/ddl/bigquery_ddl.py",
+        "tessallite/services/optimizer/src/ddl/spark_ddl.py",
+    }.isdisjoint(reached), (
+        "the runtime closure must not claim unproven optimizer dialect edges; "
+        "use DDL_IMPLEMENTATION_INVENTORY for conservative file coverage"
+    )
+
+
+def test_deploy_resolver_builder_classification_tracks_ctas_authority():
+    """SHARED-GATE-R1-F1: snapshot authority is proven from production AST.
+
+    ``creator._deployed_measure_index`` gates which deployed measures may enter
+    a CTAS, so its shared resolver must stay in ``BUILDER_MODULES``. The
+    resolver's ``ModelVersion`` row is the snapshot container, not a semantic
+    definition group, and therefore must remain an explicit exclusion. The
+    assertions below require the actual family argument, version lookup, and
+    snapshot consumption; they do not certify a substring or a list entry
+    without the production call path.
+    """
+    resolver = "tessallite/shared/deploy_resolver_core.py"
+    creator_path = os.path.join(
+        _REPO, "tessallite/services/optimizer/src/lifecycle/creator.py"
+    )
+    resolver_path = os.path.join(_REPO, resolver)
+    creator_tree = ast.parse(
+        io.open(creator_path, encoding="utf-8").read(), filename=creator_path
+    )
+    resolver_tree = ast.parse(
+        io.open(resolver_path, encoding="utf-8").read(), filename=resolver_path
+    )
+
+    assert resolver in BUILDER_MODULES
+    assert "ModelVersion" in _orm_entities(os.path.join(_REPO, resolver))
+    assert "ModelVersion" in EXCLUDED
+    assert "snapshot container" in EXCLUDED["ModelVersion"]
+
+    deployed_measure_fn = next(
+        node for node in ast.walk(creator_tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_deployed_measure_index"
+    )
+    snapshot_assignments = []
+    for node in ast.walk(deployed_measure_fn):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "snapshot"
+            for target in node.targets
+        ):
+            continue
+        value = node.value.value if isinstance(node.value, ast.Await) else node.value
+        if not (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "load_deployed_snapshot"
+            and any(
+                keyword.arg == "family"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == "measures"
+                for keyword in value.keywords
+            )
+        ):
+            continue
+        snapshot_assignments.append(node)
+    assert snapshot_assignments, (
+        "_deployed_measure_index must assign the measures snapshot from "
+        "load_deployed_snapshot(..., family='measures')"
+    )
+    snapshot_line = snapshot_assignments[0].lineno
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "snapshot"
+        and node.func.attr == "get"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "measures"
+        and node.lineno > snapshot_line
+        for node in ast.walk(deployed_measure_fn)
+    ), "_deployed_measure_index must consume snapshot.get('measures')"
+
+    load_fn = next(
+        node for node in ast.walk(resolver_tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "load_deployed_snapshot"
+    )
+    version_assignments = []
+    for node in ast.walk(load_fn):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "version"
+            for target in node.targets
+        ):
+            continue
+        value = node.value.value if isinstance(node.value, ast.Await) else node.value
+        if not (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "db"
+            and value.func.attr == "get"
+            and len(value.args) >= 2
+            and isinstance(value.args[0], ast.Name)
+            and value.args[0].id == "ModelVersion"
+            and isinstance(value.args[1], ast.Name)
+            and value.args[1].id == "deployed_version_id"
+        ):
+            continue
+        version_assignments.append(node)
+    assert version_assignments, (
+        "load_deployed_snapshot must fetch ModelVersion by deployed_version_id"
+    )
+    version_line = version_assignments[0].lineno
+    assert any(
+        isinstance(node, ast.Attribute)
+        and node.attr == "snapshot_json"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "version"
+        and node.lineno > version_line
+        for node in ast.walk(load_fn)
+    ), "the loaded ModelVersion must be consumed through version.snapshot_json"
+
+
+def test_resolve_target_non_builder_classification_tracks_endpoint_path():
+    """SHARED-GATE-R1-F1: target classification is proven from production AST.
+
+    The optimizer creator and AI runner call ``resolve_target`` to validate the
+    endpoint before persistence, while ``artifact_target_binding`` covers the
+    storage identity. The module is therefore a non-builder. The assertions
+    require actual ownership-check calls in both production callers and verify
+    that creator passes the returned target into endpoint resolution.
+    """
+    resolver = "tessallite/services/optimizer/src/lifecycle/resolve_target.py"
+    creator_path = os.path.join(
+        _REPO, "tessallite/services/optimizer/src/lifecycle/creator.py"
+    )
+    runner_path = os.path.join(
+        _REPO, "tessallite/services/optimizer/src/ai/runner.py"
+    )
+    creator_tree = ast.parse(
+        io.open(creator_path, encoding="utf-8").read(), filename=creator_path
+    )
+    runner_tree = ast.parse(
+        io.open(runner_path, encoding="utf-8").read(), filename=runner_path
+    )
+
+    assert resolver in NON_BUILDER_MODULES
+    assert "DataTarget" in _orm_entities(os.path.join(_REPO, resolver))
+    reason = NON_BUILDER_MODULES[resolver]
+    assert "endpoint" in reason
+    assert "shared/artifact_target_binding.py" in reason
+
+    def ownership_calls(tree):
+        return [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ensure_target_belongs_to_model"
+            and {keyword.arg for keyword in node.keywords}
+            >= {"target_id", "model_id"}
+        ]
+
+    assert ownership_calls(creator_tree), (
+        "creator must call the shared ownership check with target_id and model_id"
+    )
+    assert ownership_calls(runner_tree), (
+        "AI runner must call the shared ownership check with target_id and model_id"
+    )
+
+    create_impl_fn = next(
+        node for node in ast.walk(creator_tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_create_aggregate_impl"
+    )
+    target_assignment_lines = []
+    for node in ast.walk(create_impl_fn):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "target"
+            for target in node.targets
+        ):
+            continue
+        value = node.value.value if isinstance(node.value, ast.Await) else node.value
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "ensure_target_belongs_to_model"
+        ):
+            target_assignment_lines.append(node.lineno)
+    assert target_assignment_lines, (
+        "creator must assign the ownership-check result to target before endpoint resolution"
+    )
+
+    endpoint_calls = [
+        node for node in ast.walk(create_impl_fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "resolve_endpoint_connection"
+    ]
+    assert any(
+        call.lineno > target_line
+        and (
+            any(isinstance(arg, ast.Name) and arg.id == "target" for arg in call.args)
+            or any(
+                isinstance(keyword.value, ast.Name)
+                and keyword.value.id == "target"
+                for keyword in call.keywords
+            )
+        )
+        for target_line in target_assignment_lines
+        for call in endpoint_calls
+    ), "creator must pass the owned target into resolve_endpoint_connection"
 
 
 def test_import_closure_places_every_first_party_import():

@@ -52,7 +52,7 @@ vi.mock("../../api/client", () => ({
       evaluated_count: 0,
       warning_count: 0,
       blocked_count: 0,
-      warn_only: true,
+      warn_only: false,
       items: [],
     }),
   },

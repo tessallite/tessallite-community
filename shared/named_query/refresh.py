@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import secrets
 import types
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -39,6 +40,8 @@ from shared.artifact_build_binding import apply_build_binding, capture_build_bin
 from shared.artifact_target_binding import (
     capture_source_build_binding,
     capture_target_build_binding,
+    freeze_source_execution_connection,
+    freeze_target_execution_connection,
 )
 from shared.auth.service_principal import (
     SCOPE_POCKET_REFRESH,
@@ -63,6 +66,7 @@ from shared.db.models import (
     NamedQueryRefreshRun,
     ProjectConnection,
 )
+from shared.db.model_lock import acquire_model_definition_lock
 from shared.db.session import SystemSessionLocal
 from shared.model_refresh_epoch import bump_data_epoch
 from shared.named_query_refresh_lock import (
@@ -305,8 +309,8 @@ async def _load_deployed_named_query_definition(
     same clear error as the model-row path.
 
     Returns ``(deployed_snapshot, definition_row)`` where ``definition_row`` is
-    a namespace carrying ``definition_sql``, ``row_cap`` and ``shape`` from the
-    DEPLOYED row. Target/policy/artifact state stays live.
+    a namespace carrying only the deployed values this refresh consumes:
+    ``definition_sql`` and ``row_cap``. Target/policy/artifact state stays live.
     """
     from shared.db.models import ModelVersion
     from shared.deploy_resolver_core import (
@@ -358,7 +362,6 @@ async def _load_deployed_named_query_definition(
     return snapshot, types.SimpleNamespace(
         definition_sql=str(row.get("definition_sql") or ""),
         row_cap=row.get("row_cap"),
-        shape=str(row.get("shape") or "projection"),
     )
 
 
@@ -600,6 +603,7 @@ async def _refresh_cross_db(
     token: str,
     artifact: NamedQueryArtifact,
     target_conn: ProjectConnection,
+    source_conn: ProjectConnection | None = None,
     target_schema: str,
     target_table: str,
     db: AsyncSession,
@@ -610,7 +614,7 @@ async def _refresh_cross_db(
     source SELECT streams through ``stream_to_staging_table``.
     """
     rewritten_sql = await _get_rewritten_sql(model_id, definition_sql, token)
-    source_conn = await resolve_source_connection(model_id, db)
+    source_conn = source_conn or await resolve_source_connection(model_id, db)
     await ensure_target_schema(target_conn, target_schema, tenant_session=db)
 
     async def _streaming_batches():
@@ -658,7 +662,7 @@ from shared.named_query.star_expansion import (  # noqa: F401
 )
 
 
-async def write_named_query_row_manifest(
+async def _build_named_query_row_manifest(
     *,
     artifact: NamedQueryArtifact,
     run_id: object,
@@ -671,15 +675,16 @@ async def write_named_query_row_manifest(
     tenant_session: Any = None,
     target_binding_dict: Optional[dict] = None,
     source_binding_dict: Optional[dict] = None,
-) -> bool:
-    """Write the artifact's row manifest + liveness pointer for ``run_id``.
+) -> dict | None:
+    """Read and build a row manifest for ``run_id`` without ORM mutation.
 
     Mirrors ``write_pocket_row_manifest`` (Bug-8393/Bug-8473/Bug-8780): the
     columns are read back from the target catalogue, the already-captured
     target + source build bindings are recorded verbatim, and the manifest is
-    written in the same transaction as ``active_refresh_run_id``. Returns True
-    when written, False when cleared fail-closed (never raises — a manifest
-    failure must cost only the RLS-serving proof, not the refresh).
+    The caller assigns the returned dictionary in the same transaction as
+    ``active_refresh_run_id``. Returns a dictionary on success or ``None`` on a
+    fail-closed manifest read (never raises — a manifest failure must cost only
+    the RLS-serving proof, not the refresh).
     """
     from shared.semantic.artifact_manifest import RowManifest, compute_row_manifest_hash
 
@@ -722,9 +727,7 @@ async def write_named_query_row_manifest(
                     source_binding=source_binding_dict,
                 )
                 manifest.manifest_hash = compute_row_manifest_hash(manifest)
-                artifact.row_manifest = manifest.to_dict()
-                artifact.active_refresh_run_id = run_id
-                return True
+                return manifest.to_dict()
             except Exception:
                 logger.warning(
                     "Named Query row manifest not written for artifact %s "
@@ -732,16 +735,71 @@ async def write_named_query_row_manifest(
                     "until a later refresh records its materialised columns",
                     getattr(artifact, "id", None), run_id, exc_info=True,
                 )
-                clear_pocket_row_manifest(artifact, generation_run_id=run_id)
-                return False
+                return None
     except Exception:
         logger.warning(
             "Named Query row manifest not written for artifact %s (run %s); "
             "the system-scoped endpoint could not be resolved",
             getattr(artifact, "id", None), run_id, exc_info=True,
         )
+        return None
+
+
+async def write_named_query_row_manifest(
+    *,
+    artifact: NamedQueryArtifact,
+    run_id: object,
+    target_conn: ProjectConnection,
+    target_schema: Optional[str],
+    target_table: str,
+    target: DataTarget,
+    deployed_version_id: object = None,
+    population_fingerprint: Optional[str] = None,
+    tenant_session: Any = None,
+    target_binding_dict: Optional[dict] = None,
+    source_binding_dict: Optional[dict] = None,
+) -> bool:
+    """Persist a manifest using the caller's current transaction.
+
+    Kept as a compatibility wrapper for non-refresh callers. The refresh path
+    reads with ``_build_named_query_row_manifest`` first and performs the
+    assignment while holding Bug-9193's model lock.
+    """
+    from shared.db.models import NamedQuery
+
+    # This wrapper is a shared write site even though the current production
+    # refresh path uses the non-mutating builder directly. Keep future callers
+    # from bypassing Bug-9193 merely because they do not own the refresh
+    # coroutine's lock context.
+    if tenant_session is None:
+        # There is no transaction on which to take the model lock, so fail
+        # closed without mutating the artifact. Production callers pass the
+        # tenant session; the guard keeps this compatibility helper's old
+        # optional argument from becoming an unlocked write path.
+        return False
+    named_query = await tenant_session.get(NamedQuery, artifact.named_query_id)
+    if named_query is None:
+        return False
+    manifest = await _build_named_query_row_manifest(
+        artifact=artifact,
+        run_id=run_id,
+        target_conn=target_conn,
+        target_schema=target_schema,
+        target_table=target_table,
+        target=target,
+        deployed_version_id=deployed_version_id,
+        population_fingerprint=population_fingerprint,
+        tenant_session=tenant_session,
+        target_binding_dict=target_binding_dict,
+        source_binding_dict=source_binding_dict,
+    )
+    await acquire_model_definition_lock(tenant_session, named_query.model_id)
+    if manifest is None:
         clear_pocket_row_manifest(artifact, generation_run_id=run_id)
         return False
+    artifact.row_manifest = manifest
+    artifact.active_refresh_run_id = run_id
+    return True
 
 
 def _mark_run_failed(
@@ -768,6 +826,60 @@ async def _stamp_failure(
     artifact.status = "failed"
     artifact.failure_reason = reason[:1000]
     clear_pocket_row_manifest(artifact)
+
+
+async def _recover_failed_refresh_state(
+    db: AsyncSession,
+    *,
+    named_query_id: object,
+    model_id: object,
+    run_id: object,
+    artifact_id: object,
+    reason: str,
+) -> NamedQueryRefreshRun | None:
+    """Recover failure metadata on a clean transaction after a DB error.
+
+    A PostgreSQL statement error aborts the current transaction. Reading an ORM
+    object or taking the model lock before rolling back then raises the generic
+    ``InFailedSqlTransaction`` error and leaves the refresh stuck. Recovery is
+    deliberately ID-only: it rolls back first, takes the model definition lock
+    before any snapshot-owned read/write, refetches the rows, and never creates
+    a replacement when a concurrent delete already removed them.
+    """
+    try:
+        await db.rollback()
+        await acquire_model_definition_lock(db, model_id)
+        named_query = await db.get(NamedQuery, named_query_id)
+        if named_query is None or named_query.model_id != model_id:
+            await db.rollback()
+            return None
+        run = await db.get(NamedQueryRefreshRun, run_id)
+        if run is None:
+            await db.rollback()
+            return None
+        artifact = None
+        if artifact_id is not None:
+            artifact = await db.get(NamedQueryArtifact, artifact_id)
+        _mark_run_failed(run, reason, datetime.now(timezone.utc))
+        if artifact is not None:
+            await _stamp_failure(db, artifact, run, reason)
+        await db.commit()
+        await db.refresh(run)
+        return run
+    except Exception as recovery_error:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Named Query refresh recovery rollback failed for run %s",
+                run_id,
+            )
+        logger.exception(
+            "Named Query refresh failure could not be durably stamped for run %s: %s",
+            run_id,
+            recovery_error,
+        )
+        return None
 
 
 async def refresh_named_query_artifact(
@@ -800,6 +912,14 @@ async def refresh_named_query_artifact(
                 f"NamedQueryRefreshRun {existing_run_id} not found for "
                 f"named query {named_query_id}"
             )
+
+    # Cache identity before any build, external call, commit, or rollback. A
+    # DBAPI failure expires/invalidates ORM state, so recovery must never read
+    # ``named_query.model_id`` or another live attribute from the old objects.
+    model_id_for_recovery = named_query.model_id
+    run_id_for_recovery = getattr(existing_run, "id", None)
+    artifact_id_for_recovery = None
+    failure_recovery_attempted = False
 
     try:
         async with named_query_refresh_lock(db, named_query.id):
@@ -861,12 +981,18 @@ async def refresh_named_query_artifact(
             except RuntimeError as exc:
                 invalid_reason = str(exc)
             if invalid_reason is not None:
+                # Bug-9193: the run/artifact failure state is snapshot-owned
+                # model content. Take the model-definition lock before any
+                # ORM mutation (including adding a new run), not merely the
+                # per-NQ refresh lock.
+                await acquire_model_definition_lock(db, named_query.model_id)
                 now = datetime.now(timezone.utc)
                 if existing_run is not None:
                     run = existing_run
                     _mark_run_failed(run, invalid_reason, now)
                 else:
                     run = NamedQueryRefreshRun(
+                        id=uuid.uuid4(),
                         named_query_id=named_query.id,
                         refresh_mode="full",
                         status="failed",
@@ -882,13 +1008,21 @@ async def refresh_named_query_artifact(
                         )
                     )
                 ).scalar_one_or_none()
+                artifact_id_for_recovery = getattr(artifact, "id", None)
+                run_id_for_recovery = getattr(run, "id", run_id_for_recovery)
                 if artifact is not None:
                     await _stamp_failure(db, artifact, run, invalid_reason)
                 await db.commit()
                 await db.refresh(run)
                 return run
 
+            # Bug-9193: _get_or_create_artifact may INSERT and flush an
+            # artifact, so the model lock must precede the helper rather than
+            # follow it. This lock remains held only through the metadata
+            # start transaction; the slow physical build begins after commit.
+            await acquire_model_definition_lock(db, named_query.model_id)
             artifact = await _get_or_create_artifact(db, named_query, model)
+            artifact_id_for_recovery = getattr(artifact, "id", None)
             target = await db.get(DataTarget, artifact.target_id)
             if target is None:
                 raise ValueError(
@@ -914,11 +1048,16 @@ async def refresh_named_query_artifact(
                 source_connector, target_connector, cross_db
             )
             if combo_error is not None:
+                # The model lock above is still held in this transaction, but
+                # keep the acquisition explicit at this failure boundary so a
+                # future refactor cannot move the branch ahead of the guard.
+                await acquire_model_definition_lock(db, named_query.model_id)
                 if existing_run is not None:
                     run = existing_run
                     _mark_run_failed(run, combo_error, datetime.now(timezone.utc))
                 else:
                     run = NamedQueryRefreshRun(
+                        id=uuid.uuid4(),
                         named_query_id=named_query.id,
                         refresh_mode="full",
                         status="failed",
@@ -927,6 +1066,7 @@ async def refresh_named_query_artifact(
                         completed_at=datetime.now(timezone.utc),
                     )
                     db.add(run)
+                run_id_for_recovery = getattr(run, "id", run_id_for_recovery)
                 await _stamp_failure(db, artifact, run, combo_error)
                 await db.commit()
                 await db.refresh(run)
@@ -940,12 +1080,15 @@ async def refresh_named_query_artifact(
                 run.refresh_mode = "full"
             else:
                 run = NamedQueryRefreshRun(
+                    id=uuid.uuid4(),
                     named_query_id=named_query.id,
                     refresh_mode="full",
                     status="running",
                     triggered_by=triggered_by,
                 )
                 db.add(run)
+
+            run_id_for_recovery = getattr(run, "id", None)
 
             try:
                 _target_build_binding = await capture_target_build_binding(
@@ -954,15 +1097,28 @@ async def refresh_named_query_artifact(
                 _source_build_binding = await capture_source_build_binding(
                     named_query.model_id, source_conn, tenant_session=db,
                 )
+                # Bug-9427: copy the exact resolved execution endpoints before
+                # the first physical operation. The ORM identity may be
+                # repointed in place under the same id while a build runs;
+                # every target/source DDL, stream, count, storage probe and
+                # manifest read must continue addressing the build-start
+                # endpoint. Finalisation re-proves the captured bindings and
+                # refuses publication when the live route changed.
+                _build_target_conn = freeze_target_execution_connection(target_conn)
+                _build_source_conn = freeze_source_execution_connection(source_conn)
             except Exception as _capture_err:
-                now = datetime.now(timezone.utc)
-                _mark_run_failed(run, str(_capture_err), now)
-                artifact.status = "failed"
-                artifact.failure_reason = str(_capture_err)[:1000]
-                clear_pocket_row_manifest(artifact)
-                await db.commit()
-                await db.refresh(run)
-                return run
+                failure_recovery_attempted = True
+                recovered = await _recover_failed_refresh_state(
+                    db,
+                    named_query_id=named_query.id,
+                    model_id=model_id_for_recovery,
+                    run_id=run_id_for_recovery,
+                    artifact_id=artifact_id_for_recovery,
+                    reason=str(_capture_err),
+                )
+                if recovered is not None:
+                    return recovered
+                raise
 
             # The invalidating write itself can clobber a staler (Bug-8827).
             # With no incremental leg there is no shortcut to withdraw, so a
@@ -984,6 +1140,7 @@ async def refresh_named_query_artifact(
             artifact.status = NQ_STATUS_INVALIDATING
             await db.commit()
             await db.refresh(run)
+            run_id_for_recovery = getattr(run, "id", run_id_for_recovery)
 
             target_schema, target_table = _resolve_target_location(artifact, target)
             table_ref = _quoted_table_ref(
@@ -991,6 +1148,7 @@ async def refresh_named_query_artifact(
             )
 
             _serving_refusal: Optional[str] = None
+            _manifest_payload: dict | None = None
             try:
                 token = service_token
                 if cross_db:
@@ -999,7 +1157,8 @@ async def refresh_named_query_artifact(
                         definition_sql=definition_sql,
                         token=token,
                         artifact=artifact,
-                        target_conn=target_conn,
+                        target_conn=_build_target_conn,
+                        source_conn=_build_source_conn,
                         target_schema=target_schema,
                         target_table=target_table,
                         db=db,
@@ -1014,7 +1173,7 @@ async def refresh_named_query_artifact(
                             definition_sql=definition_sql,
                             token=token,
                             artifact=artifact,
-                            target_conn=target_conn,
+                            target_conn=_build_target_conn,
                             target=target,
                             target_schema=target_schema,
                             target_table=target_table,
@@ -1027,7 +1186,7 @@ async def refresh_named_query_artifact(
                         definition_sql=definition_sql,
                         token=token,
                         artifact=artifact,
-                        target_conn=target_conn,
+                        target_conn=_build_target_conn,
                         target_schema=target_schema,
                         target_table=target_table,
                         table_ref=table_ref,
@@ -1058,10 +1217,14 @@ async def refresh_named_query_artifact(
                     and effective_row_cap > 0
                     and (row_count is None or row_count > effective_row_cap)
                 ):
-                    artifact.target_schema = target_schema
-                    artifact.physical_table_name = target_table
                     try:
-                        await drop_named_query_storage(artifact, db)
+                        await drop_named_query_storage(
+                            artifact,
+                            db,
+                            target_conn_override=_build_target_conn,
+                            target_schema_override=target_schema,
+                            target_table_override=target_table,
+                        )
                     except Exception:
                         logger.exception(
                             "Failed to evict oversized named query %s storage; "
@@ -1085,15 +1248,47 @@ async def refresh_named_query_artifact(
                         )
                     raise NamedQueryMaxRowsExceededError(reason)
 
+                # The target catalogue read can involve an external endpoint.
+                # Build the manifest before taking the model-definition lock;
+                # only assignment to the snapshot-owned artifact row happens
+                # under that lock (Bug-9193).
+                _manifest_payload = await _build_named_query_row_manifest(
+                    artifact=artifact,
+                    run_id=run.id,
+                    target_conn=_build_target_conn,
+                    target_schema=target_schema,
+                    target_table=target_table,
+                    target=target,
+                    deployed_version_id=_build_binding.version_id,
+                    population_fingerprint=named_query_population_fingerprint(
+                        model_id=named_query.model_id,
+                        named_query_id=named_query.id,
+                        deployed_version_id=_build_binding.version_id,
+                        deploy_epoch=_build_binding.epoch,
+                        definition_sql=definition_sql,
+                    ),
+                    tenant_session=db,
+                    target_binding_dict=_target_build_binding.to_dict(),
+                    source_binding_dict=_source_build_binding.to_dict(),
+                )
+
+                # Bug-9193: every run/artifact/model freshness write begins
+                # only after the per-model definition lock is held. The lock is
+                # deliberately acquired after the physical build and manifest
+                # read, never held across slow source/target operations.
+                await acquire_model_definition_lock(db, named_query.model_id)
+
                 # Finalisation protocol (Bug-8807): MUST run before any
                 # run/artifact mutation below, on committed truth under the
-                # fixed-order control-plane locks.
+                # fixed-order control-plane locks. The model lock is acquired
+                # first so the order is identical to model-definition writers;
+                # no ABBA cycle can form with deploy/revert/delete.
                 _finalization = await read_named_query_finalization_state(
                     db,
                     artifact_id=artifact.id,
                     target_binding=_target_build_binding,
                     source_binding=_source_build_binding,
-                    connection_ids=(target_conn.id, source_conn.id),
+                    connection_ids=(_build_target_conn.id, _build_source_conn.id),
                     target_id=artifact.target_id,
                     model_id=named_query.model_id,
                 )
@@ -1144,11 +1339,21 @@ async def refresh_named_query_artifact(
                     )
                 await bump_data_epoch(db, named_query.model_id)
             except Exception as exc:
-                now = datetime.now(timezone.utc)
-                _mark_run_failed(run, str(exc), now)
-                artifact.status = "failed"
-                artifact.failure_reason = str(exc)[:1000]
-                clear_pocket_row_manifest(artifact)
+                # Bug-9193: failure state is snapshot-owned too. Acquire the
+                # model lock before dirtying the run/artifact rows, including
+                # failures raised by finalisation or manifest preparation.
+                failure_recovery_attempted = True
+                recovered = await _recover_failed_refresh_state(
+                    db,
+                    named_query_id=named_query.id,
+                    model_id=model_id_for_recovery,
+                    run_id=run_id_for_recovery,
+                    artifact_id=artifact_id_for_recovery,
+                    reason=str(exc),
+                )
+                if recovered is not None:
+                    return recovered
+                raise
 
             await db.flush()
 
@@ -1158,25 +1363,11 @@ async def refresh_named_query_artifact(
             if run.status == NQ_RUN_STATUS_COMPLETED and _serving_refusal is not None:
                 clear_pocket_row_manifest(artifact)
             elif run.status == NQ_RUN_STATUS_COMPLETED:
-                await write_named_query_row_manifest(
-                    artifact=artifact,
-                    run_id=run.id,
-                    target_conn=target_conn,
-                    target_schema=target_schema,
-                    target_table=target_table,
-                    target=target,
-                    deployed_version_id=_build_binding.version_id,
-                    population_fingerprint=named_query_population_fingerprint(
-                        model_id=named_query.model_id,
-                        named_query_id=named_query.id,
-                        deployed_version_id=_build_binding.version_id,
-                        deploy_epoch=_build_binding.epoch,
-                        definition_sql=definition_sql,
-                    ),
-                    tenant_session=db,
-                    target_binding_dict=_target_build_binding.to_dict(),
-                    source_binding_dict=_source_build_binding.to_dict(),
-                )
+                if _manifest_payload is None:
+                    clear_pocket_row_manifest(artifact, generation_run_id=run.id)
+                else:
+                    artifact.row_manifest = _manifest_payload
+                    artifact.active_refresh_run_id = run.id
 
             await db.commit()
             await db.refresh(run)
@@ -1184,6 +1375,9 @@ async def refresh_named_query_artifact(
 
     except NamedQueryRefreshInFlightError as exc:
         if existing_run is not None:
+            # The caller-created queued run is model-owned state even when the
+            # refresh lock rejects this attempt (Bug-9193).
+            await acquire_model_definition_lock(db, model_id_for_recovery)
             existing_run.status = "failed"
             existing_run.error_message = str(exc)[:1000]
             existing_run.completed_at = datetime.now(timezone.utc)
@@ -1191,11 +1385,37 @@ async def refresh_named_query_artifact(
             await db.refresh(existing_run)
             return existing_run
         raise
+    except Exception as exc:
+        # Metadata failures outside the physical-build block (definition
+        # capture, the invalidating commit, or finalisation setup) can abort
+        # the transaction before that block's handler runs. Use the same
+        # clean-transaction recovery, but never recreate rows whose concurrent
+        # delete already won.
+        if (
+            not failure_recovery_attempted
+            and run_id_for_recovery is not None
+            and artifact_id_for_recovery is not None
+        ):
+            recovered = await _recover_failed_refresh_state(
+                db,
+                named_query_id=named_query_id,
+                model_id=model_id_for_recovery,
+                run_id=run_id_for_recovery,
+                artifact_id=artifact_id_for_recovery,
+                reason=str(exc),
+            )
+            if recovered is not None:
+                return recovered
+        raise
 
 
 async def drop_named_query_storage(
     artifact: NamedQueryArtifact,
     db: AsyncSession,
+    *,
+    target_conn_override: Any = None,
+    target_schema_override: str | None = None,
+    target_table_override: str | None = None,
 ) -> None:
     """Drop the physical result table (eviction path, delete + row-cap).
 
@@ -1211,25 +1431,36 @@ async def drop_named_query_storage(
     target = await db.get(DataTarget, artifact.target_id)
     if target is None:
         return
-    try:
-        conn = await resolve_endpoint_connection_for_model(
-            db, target, model_id=named_query.model_id
-        )
-    except CrossProjectConnectionError:
-        logger.error(
-            "drop_named_query_storage: refusing to drop named query %s "
-            "storage — its target connection belongs to a different project "
-            "than model %s (cross-project row rejected fail-closed)",
-            named_query.id, named_query.model_id,
-        )
-        return
-    except ValueError:
-        return
+    if target_conn_override is not None:
+        # Refresh callers pass the detached build-start endpoint (Bug-9427),
+        # so a same-ID repoint cannot redirect an eviction to the replacement
+        # connection. Delete/administrative callers omit it and resolve the
+        # current scoped endpoint through the normal guard below.
+        conn = target_conn_override
+    else:
+        try:
+            conn = await resolve_endpoint_connection_for_model(
+                db, target, model_id=named_query.model_id
+            )
+        except CrossProjectConnectionError:
+            logger.error(
+                "drop_named_query_storage: refusing to drop named query %s "
+                "storage — its target connection belongs to a different project "
+                "than model %s (cross-project row rejected fail-closed)",
+                named_query.id, named_query.model_id,
+            )
+            return
+        except ValueError:
+            return
 
     connector = normalize_connection_type(conn.connection_type)
     if connector not in _NQ_TARGET_CONNECTORS:
         return
     target_schema, target_table = _resolve_target_location(artifact, target)
+    if target_schema_override is not None:
+        target_schema = target_schema_override
+    if target_table_override is not None:
+        target_table = target_table_override
     if connector == "bigquery":
         defaults = await resolve_aggregate_target_defaults(
             tenant_session=db, project_id=conn.project_id,

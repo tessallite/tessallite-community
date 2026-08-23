@@ -14,11 +14,13 @@ const refreshNqMock = vi.fn();
 const listRunsMock = vi.fn();
 const putPolicyMock = vi.fn();
 const listSettingsMock = vi.fn();
+const analyticsNqMock = vi.fn();
 
 vi.mock("../../api/client", () => ({
   namedQueriesApi: {
     list: (...args: unknown[]) => listNqMock(...args),
     get: vi.fn(),
+    analytics: (...args: unknown[]) => analyticsNqMock(...args),
     create: (...args: unknown[]) => createNqMock(...args),
     update: (...args: unknown[]) => updateNqMock(...args),
     delete: vi.fn(),
@@ -99,6 +101,21 @@ describe("NamedQueryEditor", () => {
     refreshNqMock.mockReset();
     listRunsMock.mockReset();
     listRunsMock.mockResolvedValue([]);
+    analyticsNqMock.mockReset();
+    analyticsNqMock.mockResolvedValue({
+      named_query_id: "nq1",
+      window_days: 30,
+      total_queries: 0,
+      materialized_queries: 0,
+      fallback_queries: 0,
+      fallback_failures: 0,
+      fallback_rate: 0,
+      avg_fallback_execution_ms: null,
+      avg_fallback_bytes_processed: null,
+      fallback_reasons: [],
+      recommendation: "none",
+      recommendation_reason: null,
+    });
     putPolicyMock.mockReset();
     putPolicyMock.mockResolvedValue({ cron_expression: "0 6 * * *", is_enabled: true });
     listSettingsMock.mockReset();
@@ -326,6 +343,39 @@ describe("NamedQueryEditor", () => {
     expect(screen.getByTestId("nq-health-badge").textContent).toBe("Stale");
     expect(screen.getByTestId("nq-health-reason").textContent).toContain(
       "Never materialised",
+    );
+  });
+
+  it("shows attributed fallback analytics and the Named Query repair recommendation (Bug-9172)", async () => {
+    analyticsNqMock.mockResolvedValue({
+      named_query_id: "nq1",
+      window_days: 30,
+      total_queries: 4,
+      materialized_queries: 1,
+      fallback_queries: 3,
+      fallback_failures: 0,
+      fallback_rate: 75,
+      avg_fallback_execution_ms: 120,
+      avg_fallback_bytes_processed: 4096,
+      fallback_reasons: [{ reason: "artifact_not_fresh", count: 3 }],
+      recommendation: "repair_named_query_materialisation",
+      recommendation_reason: "sustained_expensive_fallback",
+    });
+    renderEditor({ mode: "edit", initial: SAMPLE_NQ });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("nq-analytics")).toBeTruthy();
+    });
+    expect(screen.getByTestId("nq-analytics").textContent).toContain(
+      "3 of 4 queries fell back to the source (75.0%).",
+    );
+    expect(screen.getByTestId("nq-analytics").textContent).toContain("120.0 ms");
+    expect(screen.getByTestId("nq-analytics").textContent).toContain("4,096 bytes");
+    expect(screen.getByTestId("nq-analytics").textContent).toContain(
+      "artifact_not_fresh (3)",
+    );
+    expect(screen.getByTestId("nq-analytics-recommendation").textContent).toContain(
+      "Repair, refresh, or adjust this Named Query's materialisation",
     );
   });
 

@@ -9,22 +9,84 @@ from __future__ import annotations
 
 from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from shared.audit.system import system_audit
+from shared.audit.logger import audit_required
+from shared.config.resolver import get_setting, set_setting
 from shared.config.settings import get_settings
 from shared.db.models import SystemTenant
-from shared.db.session import get_system_db, normalize_tenant_db_url, evict_tenant_engine
+from shared.db.session import (
+    evict_tenant_engine,
+    get_system_db,
+    get_tenant_db,
+    normalize_tenant_db_url,
+)
 from shared.schemas.pydantic_models import TenantCreate, TenantResponse, TenantUpdate
+from shared.semantic.fiscal_year_labels import (
+    FISCAL_YEAR_LABEL_SETTING,
+    extract_fiscal_year_label_format,
+    FISCAL_YEAR_LABEL_FORMATS,
+)
 from shared.security.credential_crypto import decrypt_str, encrypt_str
 from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
-from src.auth.middleware import CurrentUser, require_human_user, require_system_admin
+from src.auth.middleware import (
+    CurrentUser,
+    require_human_user,
+    require_system_admin,
+    require_tenant_admin,
+    is_canonical_human_system_admin,
+)
 from src.licensing_guard import enforce_create_cap, get_license_manager
 
 settings = get_settings()
 router = APIRouter(prefix="/tenants", tags=["tenants"])
+
+
+class FiscalYearLabelFormatRequest(BaseModel):
+    """Tenant setting payload; strict extras keep the JSONB contract closed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    format: str
+
+    @field_validator("format")
+    @classmethod
+    def _validate_format(cls, value: str) -> str:
+        # Let FastAPI turn the registry vocabulary error into a 422 rather than
+        # letting a bad token reach a calendar rebuild.
+        extract_fiscal_year_label_format(value)
+        return value
+
+
+class FiscalYearLabelFormatResponse(FiscalYearLabelFormatRequest):
+    available_formats: list[str] = list(FISCAL_YEAR_LABEL_FORMATS)
+
+
+def _resolve_calendar_target_tenant(tenant_id: str, current_user: CurrentUser) -> str:
+    """Resolve the path target without ever opening the system tenant DB."""
+    if (
+        getattr(current_user, "role", None) == "system_admin"
+        and getattr(current_user, "tenant_id", None) == "__system__"
+        and is_canonical_human_system_admin(current_user)
+    ):
+        if not tenant_id or tenant_id == "__system__":
+            raise HTTPException(status_code=400, detail="A real target tenant is required")
+        return tenant_id
+    if tenant_id != current_user.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="tenant_id does not match the authenticated tenant",
+        )
+    return current_user.tenant_id
+
+
+def _assert_own_tenant(tenant_id: str, current_user: CurrentUser) -> None:
+    """Compatibility guard for callers/tests; system admins resolve targets."""
+    _resolve_calendar_target_tenant(tenant_id, current_user)
 
 
 def _encrypt_db_url(url: str) -> bytes:
@@ -167,6 +229,88 @@ async def get_my_tenant(
     if tenant is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
     return TenantResponse.model_validate(tenant)
+
+
+@router.get(
+    "/{tenant_id}/calendar-settings",
+    response_model=FiscalYearLabelFormatResponse,
+)
+async def get_calendar_settings(
+    tenant_id: str,
+    current_user: CurrentUser = Depends(require_tenant_admin),
+) -> FiscalYearLabelFormatResponse:
+    """Read the tenant-wide fiscal/retail year caption convention."""
+    target_tenant_id = _resolve_calendar_target_tenant(tenant_id, current_user)
+    async for tenant_db in get_tenant_db(target_tenant_id):
+        value = await get_setting(
+            FISCAL_YEAR_LABEL_SETTING,
+            tenant_session=tenant_db,
+            tenant_id=target_tenant_id,
+        )
+        try:
+            token = extract_fiscal_year_label_format(value)
+        except ValueError as exc:
+            # A row written outside the registry is corrupt. Do not silently
+            # serve a different label convention; make the operator repair it.
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Stored fiscal year label format is invalid",
+            ) from exc
+        return FiscalYearLabelFormatResponse(format=token)
+    raise HTTPException(status_code=500, detail="DB session exhausted")
+
+
+@router.put(
+    "/{tenant_id}/calendar-settings",
+    response_model=FiscalYearLabelFormatResponse,
+)
+async def update_calendar_settings(
+    tenant_id: str,
+    body: FiscalYearLabelFormatRequest,
+    current_user: CurrentUser = Depends(require_tenant_admin),
+) -> FiscalYearLabelFormatResponse:
+    """Set the tenant caption convention used on the next calendar rebuild."""
+    target_tenant_id = _resolve_calendar_target_tenant(tenant_id, current_user)
+    async for tenant_db in get_tenant_db(target_tenant_id):
+        previous = await get_setting(
+            FISCAL_YEAR_LABEL_SETTING,
+            tenant_session=tenant_db,
+            tenant_id=target_tenant_id,
+        )
+        previous_token = extract_fiscal_year_label_format(previous)
+        await audit_required(
+            tenant_db,
+            action="settings.update",
+            severity="warn",
+            actor_email=current_user.email or current_user.user_id,
+            target_type="tenant_setting",
+            target_name=target_tenant_id,
+            detail={
+                "setting": FISCAL_YEAR_LABEL_SETTING,
+                "before": previous_token,
+                "after": body.format,
+            },
+        )
+        await set_setting(
+            FISCAL_YEAR_LABEL_SETTING,
+            body.model_dump(),
+            actor=current_user.email or current_user.user_id,
+            tenant_session=tenant_db,
+            tenant_id=target_tenant_id,
+            tenant_scope=True,
+        )
+        # ``set_setting`` commits the existing tenant-settings transaction and
+        # invalidates its resolver cache. Re-read so the response is the
+        # persisted effective value, matching the branding/settings APIs.
+        value = await get_setting(
+            FISCAL_YEAR_LABEL_SETTING,
+            tenant_session=tenant_db,
+            tenant_id=target_tenant_id,
+        )
+        return FiscalYearLabelFormatResponse(
+            format=extract_fiscal_year_label_format(value)
+        )
+    raise HTTPException(status_code=500, detail="DB session exhausted")
 
 
 @router.get("/{tenant_id}", response_model=TenantResponse)

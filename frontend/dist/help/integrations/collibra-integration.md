@@ -4,7 +4,9 @@ Status: active. Updated 2026-06-13.
 
 ## What it is
 
-The Collibra integration lets you push your Tessallite semantic model metadata into **Collibra**, the enterprise data governance and catalog platform. When connected, Collibra becomes the governed catalog for your metrics, dimensions, KPIs, glossary terms, and downstream reports — complete with ownership, classifications, and relationships.
+The Collibra integration builds a Collibra-shaped picture of your Tessallite semantic model — your metrics, dimensions, KPIs, glossary terms, and downstream reports, complete with ownership, classifications, and relationships — so you can preview exactly what would land in **Collibra**, the enterprise data governance and catalog platform.
+
+In this build the integration is a **preview / dry-run** tool. It reads your model and computes the Collibra payload locally; it does not send anything to Collibra. Live push (writing the assets into your Collibra instance) is not yet available — see [Not available yet: live connector](#not-available-yet-live-connector).
 
 ## Who it is for
 
@@ -14,7 +16,7 @@ The Collibra integration lets you push your Tessallite semantic model metadata i
 
 ## What gets exported
 
-When you sync a model to Collibra, Tessallite exports these objects as governed assets with attributes, relations, and responsibilities:
+When you preview or dry-run a model export, Tessallite maps these objects into governed Collibra assets with attributes, relations, and responsibilities (computed locally — nothing is written to Collibra yet):
 
 | Tessallite object | Collibra asset type |
 |---|---|
@@ -112,12 +114,17 @@ payload locally — nothing is sent to Collibra.
 
 1. **Build governance graph** — reads all model objects from the snapshot.
 2. **Map to Collibra format** — converts to assets (with attributes + status), relations, and responsibilities.
-3. **Hash every object** — SHA256 fingerprint for diffing.
-4. **Compare with the previous run's mapping** — identifies new, changed, and unchanged objects so the dry run can show what a future push *would* create or update.
-5. **Record the run** — saves the run in history with the exact model snapshot it was built from, the asset/relation counts, and any governance warnings.
+3. **Hash every object** — SHA256 fingerprint, ready to drive an incremental diff once live push exists.
+4. **Record the run** — saves the run in history with the exact model snapshot it was built from, the asset/relation counts, and any governance warnings.
 
-The dry run computes what a push would do; it does not contact Collibra and
+The dry run computes what a push *would* do; it does not contact Collibra and
 does not create, update, or deprecate anything remotely.
+
+**Incremental diff is not available yet.** Live push is not implemented in this
+build, so no remote mapping is ever saved. With no saved baseline to compare
+against, every dry run reports all objects as *new* — it cannot yet show which
+objects changed or stayed the same since a previous sync. When live push lands,
+the fingerprints above will drive an incremental create/update/deprecate diff.
 
 ## Not available yet: live connector
 

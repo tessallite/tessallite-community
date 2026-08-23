@@ -42,7 +42,7 @@ To install or replace it, use the **Upload license file** button on the Licence 
 | `JWT_SECRET_KEY` | HMAC signing key for issued JWTs. Long, random, and unique per environment. Rotation invalidates every active session. |
 | `POSTGRES_PASSWORD` | System database password. Used in the constructed DSN unless `SYSTEM_DATABASE_URL` is set explicitly. |
 | `SYSTEM_ADMIN_EMAIL` | Login email for the bootstrap system administrator. Default `admin@tessallite.local`. |
-| `SYSTEM_ADMIN_PASSWORD` | Password for the bootstrap system administrator. |
+| `SYSTEM_ADMIN_PASSWORD` | Password for the bootstrap system administrator. Minimum 12 characters, with at least one uppercase letter, one lowercase letter, and one digit. |
 | `LICENSE_FILE_HOST` | Legacy/bootstrap host path to a signed licence file, normally `./license.json` in the bundle directory. The active uploaded licence is stored in the platform database. |
 | `LICENSE_PUBLIC_KEYS` | Optional public verification key override. Normal installs use the built-in Tessallite public key. |
 
@@ -57,7 +57,7 @@ To install or replace it, use the **Upload license file** button on the Licence 
 | `CORS_ORIGINS` | Comma-separated CORS allow-list. Set to override the default loopback list entirely. |
 | `CORS_LAN_IP` | Optional LAN IP that gets prepended to the default CORS list (handy for testing the SPA from another machine on the same network without overriding the whole list). |
 | `CREDENTIAL_ENCRYPTION_KEY_PREVIOUS` | Comma-separated list of *old* encryption keys, set **only during a key-rotation window**. While set, the platform encrypts new values with `CREDENTIAL_ENCRYPTION_KEY` and can still decrypt anything that was written under a listed previous key. Leave it unset in normal running; add the old key here when you start a rotation, and remove it once the rotation is complete. |
-| `LICENSE_ENFORCEMENT_ENABLED` | Leave `true` for normal installs. When `false`, the stack starts unactivated and create operations remain disabled by edition policy. |
+| `LICENSE_ENFORCEMENT_ENABLED` | Leave `true` for normal installs. When `false` (or `TESSALLITE_DEV_UNLIMITED=true`), the stack reports edition `internal-unlimited` — never Enterprise — and create-cap checks are skipped. |
 
 ## LLM provider keys
 

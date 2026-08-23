@@ -130,7 +130,10 @@ On the right-hand end of the status bar sits the **validation chip**. It is the 
 Click the chip and the **validation tray** expands above the status bar, listing every issue with its severity. Issues come from two places:
 
 1. **The model validation engine.** Broken dimensions or measures, failed aggregate builds, refresh failures, schema drift — anything the platform's structural validator has flagged on this model. These are the same alerts you see on the Model Health tab.
-2. **Structural checks on the canvas itself.** A model with no fact table, a table that is joined to nothing, or a missing query target gets flagged immediately, while you are still building.
+2. **Structural checks on the canvas itself.** A multi-table model with no
+   declared fact anchor, a table that is joined to nothing, or a missing query
+   target gets flagged immediately, while you are still building. A
+   single-table model is implicitly fact.
 
 Most issues are clickable: an issue about a dimension or measure opens that object in its panel, and an issue about a table pans the canvas to that table. Fix the problem and the issue disappears from the tray on the next check — no manual refresh needed.
 
@@ -169,16 +172,25 @@ Under one minute. The modeller has the shape, the coverage, and the one open que
 
 ## Keyboard shortcuts
 
+The Model Builder's plain-digit shortcuts follow the visible mini-tab order:
+
 | Key | Action |
 |---|---|
-| `Space + drag` | Force-pan (useful when cursor is over a node) |
-| `Ctrl/Cmd + scroll` | Zoom |
-| `0` | Zoom to fit |
-| `1` | Zoom to 100% |
-| `M` | Toggle minimap |
-| `H` | Toggle hierarchy overlay on all dimension nodes |
-| `/` | Focus the canvas search (jumps to a named table) |
+| `Cmd/Ctrl + ?` | Open the keyboard-shortcut help dialog |
+| `Cmd/Ctrl + K` | Focus the mini-tab switcher |
+| `1` | Canvas |
+| `2` | Query |
+| `3` | KPI Scorecard |
+| `4` | Model Health |
+| `5` | Analytics |
+| `Cmd/Ctrl + Z` | Undo the latest canvas edit |
+| `Cmd/Ctrl + Shift + Z` or `Cmd/Ctrl + Y` | Redo the latest canvas edit |
+| `+` / `-` | Zoom in or out while Canvas is active |
+| `0` | Fit the canvas while Canvas is active |
 | `Esc` | Close the active drawer or popover |
+
+Shortcuts pause while focus is in an input, textarea, select, or contenteditable
+control, so a digit typed into an editor is never treated as navigation.
 
 ---
 

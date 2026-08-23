@@ -234,3 +234,108 @@ async def test_deployed_calendar_missing_from_snapshot_fails_closed():
     with _pin_patch(_deployed_shape(_snapshot(include_calendar=False))):
         with pytest.raises(SemanticBindingError):
             await _resolve_calendar_binding(db, [_period_measure(model.id)])
+
+
+# ---------------------------------------------------------------------------
+# Bug-9200 — the hierarchy-RULES half must fail closed too
+# ---------------------------------------------------------------------------
+#
+# ``_resolve_calendar_binding`` (the calendar ROW) has raised on an unusable
+# deployed snapshot since F-013-01. Its sibling ``_resolve_hierarchy_calendar_rules``
+# (the calendar RULES — calendar_type and fiscal_year_start_month) did NOT: it
+# fell through to the live HierarchyDefinition query on the argument that "the
+# binder 503s first". Two problems with that argument:
+#
+#   * it is fail-OPEN by construction — the guarantee lives in a DIFFERENT
+#     function, so it holds only for callers that happen to route through the
+#     binder, and nothing makes a new caller do that; and
+#   * these two values decide period MATH, so a leaked draft edit does not
+#     produce an error, it produces a DIFFERENT NUMBER for YTD/QTD — the exact
+#     silent-wrong-number class deploy pinning exists to prevent.
+#
+# Both halves of the calendar family now refuse identically.
+
+
+def _invalid_snapshot_patch():
+    """Deploy pointer present, snapshot unusable -> DEPLOYED_SNAPSHOT_INVALID."""
+    return patch(
+        "src.semantic.snapshot_resolver.resolve_deployed_shape",
+        new=AsyncMock(return_value=None),
+    )
+
+
+async def test_bug_9200_hierarchy_rules_refuse_an_unusable_deployed_snapshot():
+    """Pre-fix this returned ("fiscal", 9) — the LIVE draft rules — instead of
+    raising, so a deployed query silently computed its fiscal year from an
+    unpublished edit."""
+    model = _deployed_model()
+    db = _deployed_db(model, _live_calendar(fiscal_start=7))
+    db.execute.return_value = types.SimpleNamespace(first=lambda: ("fiscal", 9))
+    time_dim = types.SimpleNamespace(
+        hierarchy_id=HIER_ID, source_column_id=None, is_time_dim=True
+    )
+
+    with _invalid_snapshot_patch():
+        with pytest.raises(SemanticBindingError):
+            await _resolve_hierarchy_calendar_rules(db, time_dim, model.id)
+
+    db.execute.assert_not_called()
+
+
+async def test_bug_9200_hierarchy_rules_refuse_via_the_physical_column_path_too():
+    """The same refusal on the second resolution path.
+
+    Path 2 (a plain date dimension matched by its physical column) is a separate
+    branch, and a fix applied to path 1 alone would leave it leaking.
+    """
+    model = _deployed_model()
+    db = _deployed_db(model, _live_calendar(fiscal_start=7))
+    db.execute.return_value = types.SimpleNamespace(first=lambda: ("fiscal", 9))
+    time_dim = types.SimpleNamespace(
+        hierarchy_id=None, source_column_id=SRC_COL_ID, is_time_dim=True
+    )
+
+    with _invalid_snapshot_patch():
+        with pytest.raises(SemanticBindingError):
+            await _resolve_hierarchy_calendar_rules(db, time_dim, model.id)
+
+    db.execute.assert_not_called()
+
+
+async def test_bug_9200_both_calendar_halves_refuse_the_same_unusable_snapshot():
+    """The two halves must agree.
+
+    They diverged for months — the ROW raised, the RULES fell through to live —
+    which is how a family-wide invariant becomes a half-invariant. Asserting
+    them together is what stops one being hardened and the other forgotten.
+    """
+    model = _deployed_model()
+    db = _deployed_db(model, _live_calendar(fiscal_start=7))
+    db.execute.return_value = types.SimpleNamespace(first=lambda: ("fiscal", 9))
+    time_dim = types.SimpleNamespace(
+        hierarchy_id=HIER_ID, source_column_id=None, is_time_dim=True
+    )
+
+    with _invalid_snapshot_patch():
+        with pytest.raises(SemanticBindingError):
+            await _resolve_calendar_binding(db, [_period_measure(model.id)])
+        with pytest.raises(SemanticBindingError):
+            await _resolve_hierarchy_calendar_rules(db, time_dim, model.id)
+
+
+async def test_undeployed_hierarchy_rules_still_read_live():
+    """The refusal must not break AUTHORING: with no deploy pointer the live
+    HierarchyDefinition rows ARE the authority, and the model builder's preview
+    depends on it."""
+    model = types.SimpleNamespace(
+        id=uuid.uuid4(), deployed_version_id=None, deploy_epoch=0
+    )
+    db = _undeployed_db(model, _live_calendar(fiscal_start=7))
+    db.execute.return_value = types.SimpleNamespace(first=lambda: ("fiscal", 9))
+    time_dim = types.SimpleNamespace(
+        hierarchy_id=HIER_ID, source_column_id=None, is_time_dim=True
+    )
+
+    cal_type, fy = await _resolve_hierarchy_calendar_rules(db, time_dim, model.id)
+
+    assert (cal_type, fy) == ("fiscal", 9)

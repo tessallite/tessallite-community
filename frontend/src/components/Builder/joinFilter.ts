@@ -30,3 +30,12 @@ export function partitionJoinsByEndpoints(
   }
   return { linked, dropped };
 }
+
+/**
+ * Number of persisted joins that cannot be drawn with the current canvas
+ * catalogue. The canvas uses this to surface the omission to the modeller;
+ * silently logging it to the console made calendar joins look like data loss.
+ */
+export function countDroppedJoins(joins: Join[], nodeIds: Set<string>): number {
+  return partitionJoinsByEndpoints(joins, nodeIds).dropped.length;
+}

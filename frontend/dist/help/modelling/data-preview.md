@@ -62,4 +62,4 @@ Use the pagination controls to navigate through the data. The preview fetches ea
 
 ---
 
-← [Usage & Downstream Assets](usage-downstream-assets.md) | [Home](../index.md) | [Schema Changes →](schema-changes.md)
+← [KPIs](kpis.md) | [Home](../index.md) | [Schema Changes →](schema-changes.md)

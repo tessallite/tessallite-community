@@ -48,6 +48,7 @@ from src.jdbc import protocol as proto
 from src.jdbc.throttle import get_governor
 from src.router_client import (
     GatewayQueryRateLimitExceeded,
+    ModelMetadataUnavailable,
     QueryByteCeilingExceeded,
     QueryRouterError,
     execute_query,
@@ -336,6 +337,58 @@ def _projection_alias_map(sql: str) -> dict[str, str]:
         if source and alias and source != alias:
             aliases[source.lower()] = alias
     return aliases
+
+
+# PostgreSQL's own name for an unaliased projection it cannot name after a
+# column or a function — e.g. ``SELECT a + b FROM t`` describes as ``?column?``.
+_PG_UNNAMED_PROJECTION = "?column?"
+
+
+def _projection_has_star(sql: str) -> bool:
+    """True when *sql*'s SELECT list contains a ``*`` (Bug-9116).
+
+    Marks the describes that ENUMERATE a field list rather than confirming
+    columns the client already named — the ones that must revalidate CLS first.
+    Unparseable SQL answers True: the conservative side is to revalidate.
+    """
+    try:
+        parsed = sqlglot.parse_one(sql, read="postgres")
+    except Exception:
+        return True
+    if not isinstance(parsed, exp.Select):
+        return False
+    return any(
+        isinstance(proj, exp.Star)
+        or (isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star))
+        for proj in parsed.expressions
+    )
+
+
+def _computed_projection_output_name(proj: exp.Expression) -> str:
+    """PostgreSQL's output column name for a computed projection (Bug-9433).
+
+    The gateway presents a PostgreSQL wire interface, so it names an unaliased
+    expression the way PostgreSQL does: an explicit alias wins; otherwise a
+    function call is named after the function (``COUNT(*)`` -> ``count``,
+    ``SUM(x)`` -> ``sum``), a cast/CASE after its keyword, and anything else
+    falls back to ``?column?``.
+
+    This is deliberately NOT an attempt to predict what the SOURCE will call the
+    column — that is dialect-dependent (PostgreSQL says ``count``, BigQuery says
+    ``f0_``) and unknowable before execution. It is the name the GATEWAY commits
+    to, in Describe and in the served RowDescription alike, so the client sees
+    one stable PostgreSQL-shaped answer on either connector.
+    """
+    if isinstance(proj, exp.Alias):
+        return proj.alias or _PG_UNNAMED_PROJECTION
+    if isinstance(proj, exp.Func):
+        name = proj.sql_name() if hasattr(proj, "sql_name") else type(proj).__name__
+        return str(name).lower() or _PG_UNNAMED_PROJECTION
+    if isinstance(proj, exp.Case):
+        return "case"
+    if isinstance(proj, exp.Cast):
+        return _PG_UNNAMED_PROJECTION
+    return _PG_UNNAMED_PROJECTION
 
 
 def _apply_projection_aliases(
@@ -664,7 +717,14 @@ class PGWireServer:
         # attacker who answered the SSLRequest with 'N', would otherwise send
         # the tenant password in cleartext. Fail-closed with SQLSTATE 28000
         # before the auth challenge so no credential ever crosses the wire.
-        if settings.GATEWAY_SSL_REQUIRED and not self._tls_active:
+        # The explicit local-development opt-out is also honoured here, matching
+        # ``validate_transport_security``: it permits the configured plaintext
+        # listener to reach authentication while production remains fail-closed.
+        if (
+            settings.GATEWAY_SSL_REQUIRED
+            and not settings.GATEWAY_ALLOW_INSECURE_TRANSPORT
+            and not self._tls_active
+        ):
             logger.warning(
                 "JDBC plaintext startup refused (pid=%d): TLS is required", self._pid
             )
@@ -708,25 +768,50 @@ class PGWireServer:
         # sent after ReadyForQuery is lost when the connection closes).
         # If no model_id was given, all enabled models for the tenant are loaded
         # so DBeaver can browse tables without specifying a model upfront.
-        (
-            self._model_names,
-            self._table_columns,
-            self._table_model_id,
-            self._table_descriptions,
-            self._table_trust_meta,
-            self._table_persona_id,
-            self._table_include_hidden,
-            self._table_query_name,
-            self._table_foreign_keys,
-            self._table_row_estimates,
-            self._looker_relations,
-            self._table_project_slug,
-        ) = await fetch_model_metadata(
-            self._model_id,
-            self._tenant_slug,
-            self._jwt_token,
-            project_slug=getattr(self, "_project_hint", None),
-        )
+        try:
+            (
+                self._model_names,
+                self._table_columns,
+                self._table_model_id,
+                self._table_descriptions,
+                self._table_trust_meta,
+                self._table_persona_id,
+                self._table_include_hidden,
+                self._table_query_name,
+                self._table_foreign_keys,
+                self._table_row_estimates,
+                self._looker_relations,
+                self._table_project_slug,
+            ) = await fetch_model_metadata(
+                self._model_id,
+                self._tenant_slug,
+                self._jwt_token,
+                project_slug=getattr(self, "_project_hint", None),
+                # Bug-9061: the connection-setup fan-out is burst-cached. The
+                # CLS revalidation path deliberately does NOT pass this.
+                use_cache=True,
+            )
+        except ModelMetadataUnavailable as exc:
+            # Bug-9213 / Bug-9218: a metadata FAILURE is not an absence. Without
+            # this the connection either came up with an EMPTY catalogue (the
+            # client concludes the tenant has no tables) or reported
+            # "Unknown model" for a model that exists and is deployed.
+            logger.error(
+                "JDBC startup refused (pid=%d): model metadata unavailable "
+                "for tenant %s: %s", self._pid, self._tenant_slug, exc,
+            )
+            writer.write(
+                proto.error_response(
+                    "Model metadata is temporarily unavailable, so this "
+                    "connection cannot be given a catalogue. This is a "
+                    "service fault, not an empty or missing model — retry "
+                    "shortly.",
+                    severity="FATAL",
+                    code="08006",
+                )
+            )
+            await writer.drain()
+            return
         logger.info(
             "Metadata loaded (pid=%d): tenant=%s model_id=%s tables=%s",
             self._pid, self._tenant_slug, self._model_id, self._model_names,
@@ -1253,7 +1338,7 @@ class PGWireServer:
                         writer.write(proto.no_data())
                         await writer.drain()
                         continue
-                    derived = self._describe_columns_metadata_only(stmt_sql)
+                    derived = await self._describe_columns_for_client(stmt_sql)
                     if derived is not None:
                         writer.write(proto.row_description(derived, []))
                     else:
@@ -1284,7 +1369,7 @@ class PGWireServer:
 
                 # F-001-01 / Bug-6056 — execute the user query at most once.
                 if not portal["bound"]:
-                    derived = self._describe_columns_metadata_only(portal["sql"])
+                    derived = await self._describe_columns_for_client(portal["sql"])
                     if derived is not None:
                         portal["cols"] = derived
                         writer.write(proto.row_description(derived, portal["formats"]))
@@ -1401,23 +1486,46 @@ class PGWireServer:
                     writer.write(proto.command_complete("SELECT 0"))
                 else:
                     col_oids = [oid for _, oid in portal["cols"]]
-                    if not described:
-                        writer.write(proto.row_description(portal["cols"], portal["formats"]))
                     all_rows = portal["rows"] or []
                     offset = portal.get("row_offset", 0)
                     remaining = all_rows[offset:]
-                    if max_rows > 0 and len(remaining) > max_rows:
+                    paged = max_rows > 0 and len(remaining) > max_rows
+                    page = remaining[:max_rows] if paged else remaining
+                    # Encode every DataRow BEFORE writing any of them: a value
+                    # that cannot be encoded in the binary format its column
+                    # advertises must produce an ErrorResponse, never a half-sent
+                    # result set the client would decode as garbage.
+                    try:
+                        encoded_rows = [
+                            proto.data_row(row, portal["formats"], col_oids)
+                            for row in page
+                        ]
+                    except proto.BinaryEncodeError as exc:
+                        logger.error(
+                            "JDBC binary encode refused (pid=%d): %s",
+                            self._pid, exc,
+                        )
+                        writer.write(proto.error_response(
+                            str(exc), severity="ERROR",
+                            code=getattr(exc, "sqlstate", "22P03"),
+                        ))
+                        _error_skip = True
+                        portal["rows"] = None
+                        portal["cols"] = None
+                        portal["row_offset"] = 0
+                        await writer.drain()
+                        continue
+                    if not described:
+                        writer.write(proto.row_description(portal["cols"], portal["formats"]))
+                    for encoded in encoded_rows:
+                        writer.write(encoded)
+                    if paged:
                         # Bug-6935: emit only the requested number of rows
                         # and signal PortalSuspended so the client can fetch
                         # additional pages.
-                        page = remaining[:max_rows]
-                        for row in page:
-                            writer.write(proto.data_row(row, portal["formats"], col_oids))
                         portal["row_offset"] = offset + max_rows
                         writer.write(proto.portal_suspended())
                     else:
-                        for row in remaining:
-                            writer.write(proto.data_row(row, portal["formats"], col_oids))
                         total = len(all_rows)
                         writer.write(proto.command_complete(f"SELECT {total}"))
                         portal["rows"] = None
@@ -1931,7 +2039,15 @@ class PGWireServer:
                     _normalize_jdbc_row(row, col_names, numeric_cols)
                     for row in rows_data
                 ]
-                return col_desc, rows, None
+                # Bug-9433/6776: rows are positional now; relabel to the shape
+                # Describe advertises so the client decodes with the same
+                # descriptor the gateway encoded with.
+                conformed, shape_err = self._conform_result_shape(
+                    original_sql, col_desc,
+                )
+                if shape_err is not None:
+                    return None, None, shape_err
+                return conformed, rows, None
             except asyncio.CancelledError:
                 logger.info("Extended query cancelled by client (pid=%d)", self._pid)
                 return None, None, ("Query cancelled by client request.", "57014")
@@ -2009,7 +2125,12 @@ class PGWireServer:
         rows = [
             _normalize_jdbc_row(row, col_names, numeric_cols) for row in rows_data
         ]
-        return col_desc, rows, None
+        # Bug-9433/6776: see the raw-route branch above — one conform step per
+        # extended-protocol result producer, applied after rows are positional.
+        conformed, shape_err = self._conform_result_shape(original_sql, col_desc)
+        if shape_err is not None:
+            return None, None, shape_err
+        return conformed, rows, None
 
     async def _log_sql(self, sql: str, source: str = "Q") -> None:
         # F-001-14: the raw statement can carry WHERE-clause literals that are
@@ -2379,11 +2500,123 @@ class PGWireServer:
         OID, so a computed aggregate downgraded to a TEXT wire OID by Bug-5186
         is still recognised as numeric for VALUE reshaping (preserving the
         Bug-5383 aggregate-formatting fix) while genuine TEXT columns are not.
+
+        Bug-6807: the map is keyed on CATALOGUE column names, so a custom alias
+        that matches no catalogue column was not "numeric" and skipped Bug-5383's
+        normalisation entirely — ``SUM(revenue) AS total_rev`` handed the router's
+        ``1.0E+5`` straight to the client as text, while the identically-computed
+        ``SUM(revenue) AS revenue`` (alias colliding with a catalogue column) was
+        normalised to ``100000``. The alias is added when the expression it wraps
+        reads a catalogue-numeric column, so the formatting no longer depends on
+        what the user happened to call the column.
         """
-        return {
+        numeric = {
             name for name, type_str in self._column_type_map(sql).items()
             if _is_numeric_catalogue_type(type_str)
         }
+        numeric |= self._numeric_computed_aliases(sql, numeric)
+        return numeric
+
+    @staticmethod
+    def _numeric_computed_aliases(sql: str, numeric_columns: set[str]) -> set[str]:
+        """Return aliases whose expression is provably numeric.
+
+        Bug-6807: checking only the referenced catalogue columns marked text
+        expressions such as ``CONCAT(CAST(revenue AS TEXT), 'E+5')`` as numeric
+        and rewrote a user-visible label.  The whitelist below admits only
+        numeric aggregates, numeric casts, literals, and arithmetic over those
+        values; unknown functions and text-producing casts remain text.
+        """
+        try:
+            parsed = sqlglot.parse_one(sql, read="postgres")
+        except Exception:
+            return set()
+        if not isinstance(parsed, exp.Select):
+            return set()
+        numeric_ops = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.Neg)
+        numeric_cast_types = {
+            "BIGDECIMAL", "BIGINT", "BIGNUM", "BIGSERIAL", "DECIMAL",
+            "DECIMAL32", "DECIMAL64", "DECIMAL128", "DECIMAL256", "DECFLOAT",
+            "DOUBLE", "FLOAT", "INT", "INT128", "INT256", "INT4MULTIRANGE",
+            "INT8MULTIRANGE", "INT4RANGE", "INT8RANGE", "INTEGER", "MONEY",
+            "NUMERIC", "NUMBER", "SERIAL", "SMALLINT", "SMALLMONEY",
+            "SMALLSERIAL", "TINYINT", "UBIGINT", "UDECIMAL", "UDOUBLE",
+            "UINT", "UINT128", "UINT256", "UMEDIUMINT", "USMALLINT",
+            "UTINYINT",
+        }
+
+        def _is_numeric_expression(node: exp.Expression) -> bool:
+            if isinstance(node, exp.Column):
+                return node.name.lower() in numeric_columns
+            if isinstance(node, exp.Literal):
+                return not node.is_string
+            if isinstance(node, exp.Null):
+                return True
+            if isinstance(node, exp.Paren):
+                return _is_numeric_expression(node.this)
+            if isinstance(node, exp.Cast):
+                target = node.args.get("to")
+                dtype = getattr(getattr(target, "this", None), "value", None)
+                if dtype is None:
+                    dtype = str(getattr(target, "this", "")).upper().split(".")[-1]
+                return str(dtype).upper() in numeric_cast_types and _is_numeric_expression(
+                    node.this
+                )
+            if isinstance(node, exp.Count):
+                # COUNT is numeric regardless of the type it counts.
+                return True
+            if isinstance(node, exp.AggFunc):
+                argument = node.this
+                return argument is not None and _is_numeric_expression(argument)
+            if isinstance(node, exp.Coalesce):
+                # COALESCE preserves the numeric result only when every
+                # fallback is numeric too.  In particular, do not let a
+                # text fallback turn a numeric source into a normalised
+                # label (Bug-6807 / Bug-9508).
+                return (
+                    node.this is not None
+                    and _is_numeric_expression(node.this)
+                    and all(
+                        _is_numeric_expression(value)
+                        for value in node.expressions
+                    )
+                )
+            if isinstance(node, exp.Round):
+                # sqlglot stores ROUND's optional precision in ``decimals``
+                # rather than ``expressions``.  It is numeric-preserving when
+                # both the value and that precision are numeric.
+                decimals = node.args.get("decimals")
+                return (
+                    node.this is not None
+                    and _is_numeric_expression(node.this)
+                    and (
+                        decimals is None or _is_numeric_expression(decimals)
+                    )
+                )
+            if isinstance(node, exp.Abs):
+                return node.this is not None and _is_numeric_expression(node.this)
+            if isinstance(node, numeric_ops):
+                if isinstance(node, exp.Neg):
+                    return _is_numeric_expression(node.this)
+                return (
+                    _is_numeric_expression(node.this)
+                    and _is_numeric_expression(node.expression)
+                )
+            return False
+
+        out: set[str] = set()
+        for proj in parsed.expressions:
+            if not isinstance(proj, exp.Alias):
+                continue
+            inner = proj.this
+            if isinstance(inner, exp.Column):
+                continue  # a plain rename — already typed from the catalogue
+            alias = (proj.alias or "").lower()
+            if not alias:
+                continue
+            if _is_numeric_expression(inner):
+                out.add(alias)
+        return out
 
     def _type_columns_from_catalogue(
         self, sql: str, columns_meta: list
@@ -2495,15 +2728,34 @@ class PGWireServer:
         """
         if not self._is_kpi_table_query(sql):
             return None
-        # Bug-6592: a transaction-local SET LOCAL app.* filter is just as
+        # Bug-9259: the gate used to refuse ANY ``persona_id is not None`` read.
+        # Since F-008-05 the catalogue REGISTERS a ``<slug>_<persona>$KPIs``
+        # relation for every persona, so the gateway advertised a scorecard it
+        # then refused with 42501 on every query — a catalogue that promises
+        # what the serving path denies. Persona scope is not the gateway's to
+        # enforce here and never was after Bug-6930: the router's
+        # ``_handle_kpi_table_query`` resolves the effective persona and gates
+        # on measure lineage, column-level security (Bug-6139) and row-level
+        # security (withholding EVERY row when a rule applies and the persona
+        # carries no authorised bypass). ``persona_id`` is forwarded to
+        # ``/execute`` on both JDBC seams, so that enforcement runs.
+        #
+        # What remains the GATEWAY's own responsibility is the one thing the
+        # router's withhold does not cover: a JDBC ``SET app.<name>=...``
+        # parameterised filter cannot be honoured against pre-aggregated
+        # ``kpi_latest`` rows, so an active session variable still fails closed.
+        #
+        # Bug-6592: a transaction-local ``SET LOCAL app.*`` filter is just as
         # much an active session-variable context as a connection-lifetime
         # SET — check both dicts, not only the connection-lifetime one.
-        if persona_id is None and not self._session_vars and not self._session_vars_local:
+        del persona_id  # enforced by the query-router, not here (Bug-9259)
+        if not self._session_vars and not self._session_vars_local:
             return None
         return (
-            "$KPIs cannot be queried through JDBC for secured persona or "
-            "session-variable contexts because cached KPI rows cannot enforce "
-            "row-level security at read time."
+            "$KPIs cannot be queried through JDBC in a session-variable "
+            "context, because cached KPI rows cannot apply a SET app.* filter "
+            "at read time. RESET the session variable, or query the "
+            "underlying measure instead."
         )
 
     def _shape_kpi_result(
@@ -2686,19 +2938,33 @@ class PGWireServer:
             )
         return result
 
-    def _describe_columns_metadata_only(
+    def _projected_result_shape(
         self, sql: str
-    ) -> list[tuple[str, int]] | None:
-        """Resolve RowDescription columns without executing (F-001-01).
+    ) -> tuple[list[tuple[str, int]], set[int]] | None:
+        """The ``(name, type-OID)`` list the gateway will serve for *sql*.
 
-        Used for a statement-level Describe that arrives before Bind: we must
-        never run a NULL-substituted probe query. We can only answer when the
-        result shape is unambiguous from the SQL alone — an explicit projection
-        (no ``*``, no expressions) over a single catalogue relation where every
-        projected column has a known type. Anything else returns ``None`` so the
-        caller advertises NoData and the single Execute run becomes the
-        authoritative RowDescription. This guarantees the executed shape always
-        matches the advertised shape.
+        THE single derivation of a SELECT's result shape, used by BOTH the
+        pre-execution Describe (``_describe_columns_metadata_only``) and the
+        post-execution conform step (``_conform_result_shape``) so the shape a
+        client is TOLD can never diverge from the shape it is SENT.
+
+        Bug-6776 filed that divergence as a hazard; it is a proven one. A client
+        decodes DataRows with the DESCRIBED type OID while ``proto.data_row``
+        encodes with the EXECUTED one, so a mismatch does not error — it hands
+        back corrupted values (an INT4 described as TEXT arrives as the four
+        raw big-endian bytes). Deriving both sides from this one function is
+        what removes the divergence, rather than documenting it.
+
+        Returns ``(shape, computed_positions)`` where *computed_positions* holds
+        the indexes whose output name the gateway derived for a computed
+        projection (an aggregate, function, arithmetic or CASE) rather than
+        reading it off a catalogue column. Returns ``None`` when the shape
+        cannot be derived from metadata alone — the caller then leaves the
+        executed result authoritative.
+
+        Scope: a single base relation, no joins/subqueries/CTEs, whose columns
+        are known from the connection catalogue. F-001-01 still holds: nothing
+        here executes the query or substitutes a parameter.
         """
         try:
             parsed = sqlglot.parse_one(sql, read="postgres")
@@ -2720,22 +2986,182 @@ class PGWireServer:
         if not projections:
             return None
         resolved: list[tuple[str, int]] = []
+        computed: set[int] = set()
         for proj in projections:
-            # Reject star and any non-trivial expression.
-            if isinstance(proj, exp.Star):
-                return None
+            # Bug-9433: ``SELECT *`` expands to the relation's catalogue columns
+            # in catalogue order — the same list ``_column_type_map`` types the
+            # executed result from. Answering NoData for it (the pre-fix
+            # behaviour) told every prepared-statement client that the most
+            # common BI query shape returns no columns at all.
+            if isinstance(proj, exp.Star) or (
+                isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star)
+            ):
+                star_columns = self._relation_columns_in_order(sql)
+                if not star_columns:
+                    return None
+                resolved.extend(star_columns)
+                continue
             col = proj if isinstance(proj, exp.Column) else None
             if col is None and isinstance(proj, exp.Alias) and isinstance(proj.this, exp.Column):
                 col = proj.this
-            if col is None:
+            if col is not None:
+                name = col.name
+                type_str = type_map.get(name.lower())
+                if type_str is None:
+                    return None
+                out_name = proj.alias_or_name or name
+                resolved.append((out_name, _map_type_oid(type_str)))
+                continue
+            # Bug-9433: a computed projection (COUNT/SUM/CASE/arithmetic). Its
+            # ARITY is unambiguous, and Bug-5186 already fixes its served type
+            # at TEXT on the executed path ("computed projections stay text"),
+            # so TEXT here is that same documented rule applied one step
+            # earlier — not a guess about what the source will return.
+            out_name = _computed_projection_output_name(proj)
+            if not out_name:
                 return None
-            name = col.name
-            type_str = type_map.get(name.lower())
-            if type_str is None:
-                return None
-            out_name = proj.alias_or_name or name
-            resolved.append((out_name, _map_type_oid(type_str)))
-        return resolved
+            computed.add(len(resolved))
+            resolved.append((out_name, proto.OID_TEXT))
+        return resolved, computed
+
+    def _relation_columns_in_order(self, sql: str) -> list[tuple[str, int]]:
+        """Catalogue columns of the single relation in *sql*, in catalogue order.
+
+        Backs the ``SELECT *`` expansion above. Returns ``[]`` when the relation
+        is unknown or carries no columns, so the caller falls back to letting
+        the executed result describe itself.
+        """
+        table_names = self._extract_tables_via_sqlglot(sql)
+        if not table_names:
+            table_names = self._extract_tables_via_regex(sql)
+        for table_name in table_names:
+            for cols in (
+                self._table_columns.get(table_name),
+                self._table_columns.get(table_name.lower()),
+                self._table_columns.get(f"@{table_name}"),
+                self._table_columns.get(f"@{table_name.lower()}"),
+            ):
+                if not cols:
+                    continue
+                out = [
+                    (str(col.get("name")), _map_type_oid(str(col.get("data_type") or "text")))
+                    for col in cols
+                    if col.get("name")
+                ]
+                if out:
+                    return out
+        return []
+
+    async def _describe_columns_for_client(
+        self, sql: str
+    ) -> list[tuple[str, int]] | None:
+        """Describe seam: revalidate CLS before ENUMERATING a field list.
+
+        Bug-9116: ``self._table_columns`` is captured at connection time, and by
+        design the Describe/typing side channel never revalidated it — only the
+        two execute seams did, and SOL-LAT-001 narrowed those to catalogue
+        queries. The registry's own reasoning for accepting that window was that
+        Describe "answers ONLY explicit projections ... so it cannot leak a
+        restricted column NAME the client did not already type".
+
+        Bug-9433's ``SELECT *`` expansion removes that property: a star Describe
+        ENUMERATES the connection-time field list, which after a mid-session CLS
+        tightening could echo a name that is now restricted. So the enumerating
+        case — and only that case — revalidates first, exactly as a catalogue
+        query does. An explicit projection keeps its documented connection-time
+        typing and pays nothing, and ordinary query DISPATCH is untouched, so
+        SOL-LAT-001's hot path is preserved.
+
+        ``_refresh_catalogue_if_stale`` reassigns ``self._table_columns``, so
+        the derivation below reads the revalidated set.
+        """
+        if self._catalogue is not None and _projection_has_star(sql):
+            await self._refresh_catalogue_if_stale()
+        return self._describe_columns_metadata_only(sql)
+
+    def _describe_columns_metadata_only(
+        self, sql: str
+    ) -> list[tuple[str, int]] | None:
+        """Resolve RowDescription columns without executing (F-001-01).
+
+        Used for a Describe that arrives before Bind: we must never run a
+        NULL-substituted probe query. Delegates to ``_projected_result_shape``
+        so the advertised shape is derived by the SAME function that conforms
+        the executed shape, and returns ``None`` (caller answers NoData) only
+        when the shape genuinely cannot be derived.
+
+        Bug-9433: answering NoData for a SELECT is a protocol lie — NoData means
+        "this statement returns no rows", so asyncpg (and any driver that treats
+        the statement description as authoritative) records zero result columns
+        and then fails with ``ProtocolError: the number of columns in the result
+        row (N) is different from what was described (0)``. That is why an
+        aggregate — and ``SELECT *`` — could not be served over the extended
+        protocol at all.
+        """
+        derived = self._projected_result_shape(sql)
+        if derived is None:
+            return None
+        shape, _computed = derived
+        return shape or None
+
+    def _conform_result_shape(
+        self, sql: str, col_desc: list[tuple[str, int]]
+    ) -> tuple[list[tuple[str, int]] | None, tuple[str, str] | None]:
+        """Reconcile an executed result against the shape Describe advertises.
+
+        Returns ``(shape_to_serve, error)``. The advertised shape is a pure
+        function of the SQL plus the connection catalogue, so this runs whether
+        or not the client actually sent a Describe — the two must agree for
+        every client, not only the ones that asked first.
+
+        Fails CLOSED on an arity mismatch: at that point the gateway has
+        advertised a shape it cannot honour, and serving the rows anyway is the
+        Bug-6776 corruption path. It reports the disagreement instead.
+
+        Rows reaching the wire are already positional lists (``_normalize_jdbc_row``
+        resolves dict rows against the EXECUTED names before this relabelling),
+        so replacing the descriptor never moves a value between columns. A name
+        difference at a position the gateway did NOT derive as computed means
+        the executed column ORDER differs from the advertised order — that would
+        move values, so it fails closed too.
+        """
+        derived = self._projected_result_shape(sql)
+        if derived is None:
+            return col_desc, None
+        shape, computed = derived
+        if not shape:
+            return col_desc, None
+        if len(shape) != len(col_desc):
+            logger.error(
+                "Bug-9433: result shape disagreement (pid=%d): described %d "
+                "column(s), executed %d for %s",
+                self._pid, len(shape), len(col_desc), _redact_sql_for_log(sql),
+            )
+            return None, (
+                "The gateway described this statement as returning "
+                f"{len(shape)} column(s) but the result carries "
+                f"{len(col_desc)}. Re-prepare the statement; if it persists, "
+                "alias each projected expression explicitly.",
+                "42601",
+            )
+        for idx, ((want_name, _want_oid), (got_name, _got_oid)) in enumerate(
+            zip(shape, col_desc)
+        ):
+            if idx in computed:
+                continue
+            if str(want_name).lower() != str(got_name).lower():
+                logger.error(
+                    "Bug-9433: result column order disagreement (pid=%d) at "
+                    "position %d: described %r, executed %r",
+                    self._pid, idx, want_name, got_name,
+                )
+                return None, (
+                    f"The gateway described column {idx + 1} of this statement "
+                    f"as {want_name!r} but the result carries {got_name!r}. "
+                    "Re-prepare the statement.",
+                    "42601",
+                )
+        return shape, None
 
     def _unsupported_generated_relation_complex_sql(self, sql: str) -> str | None:
         """Reject complex SQL before generated relations collapse to one model name."""
@@ -3252,13 +3678,30 @@ class PGWireServer:
         columns_meta = self._type_columns_from_catalogue(sql, columns_meta)
         columns_meta, rows_data = _apply_projection_aliases(original_sql, columns_meta, rows_data)
         col_desc = _parse_columns(columns_meta)
-        writer.write(proto.row_description(col_desc))
+        # Rows are resolved against the EXECUTED column names (dict rows are
+        # keyed by them), so they are materialised BEFORE the descriptor is
+        # relabelled — relabelling then only renames, never re-keys.
         col_names = [c[0] for c in col_desc]
         numeric_cols = self._numeric_result_columns(sql)
-        for row in rows_data:
-            writer.write(proto.data_row(
-                _normalize_jdbc_row(row, col_names, numeric_cols)
-            ))
+        wire_rows = [
+            _normalize_jdbc_row(row, col_names, numeric_cols) for row in rows_data
+        ]
+        # Bug-9433: the simple path applies the SAME conform step as the
+        # extended path. It has no Describe/Execute split of its own, so it
+        # needs no reconciliation for correctness — but without it the two
+        # protocols would answer the same query with DIFFERENT column names
+        # (the extended path commits to PostgreSQL's ``count``/``sum`` naming
+        # while the simple path echoed whatever the connector produced, e.g.
+        # BigQuery's ``f0_``). One gateway, one answer.
+        conformed, shape_err = self._conform_result_shape(original_sql, col_desc)
+        if shape_err is not None:
+            writer.write(proto.error_response(shape_err[0], code=shape_err[1]))
+            writer.write(proto.ready_for_query())
+            await writer.drain()
+            return
+        writer.write(proto.row_description(conformed))
+        for row in wire_rows:
+            writer.write(proto.data_row(row))
         writer.write(proto.command_complete(f"SELECT {len(rows_data)}"))
         writer.write(proto.ready_for_query())
         await writer.drain()

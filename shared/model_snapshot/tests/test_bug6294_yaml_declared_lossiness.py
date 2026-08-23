@@ -169,6 +169,138 @@ class TestNumbersAndAccessRoundTrip:
         assert snap["dimensions"][0]["is_time_dim"] is True
 
 
+def _model_yaml_with_measure(measure: dict) -> str:
+    """A minimal, parseable model YAML carrying exactly one measure."""
+    return yaml.safe_dump({
+        "model": {"name": "sales", "display_name": "Sales"},
+        "tables": [{"name": "orders", "source_table": "public.orders"}],
+        "measures": [measure],
+    })
+
+
+class TestBug9390CalcModeNotSilentlyDefaulted:
+    """Bug-9390 — a calculated measure whose YAML omits ``calc_mode`` must NOT
+    silently adopt a result-changing default.
+
+    ``expression_as_written`` (a ratio of sums) and ``per_row_then_aggregate``
+    (a sum of ratios) are DIFFERENT numbers. Before this fix the deserialiser
+    ran ``m.get("calc_mode") or "expression_as_written"``: a measure a modeller
+    authored as ``per_row_then_aggregate`` whose YAML dropped the field flipped
+    to ``expression_as_written`` with no error and no warning — a silent
+    wrong-numbers path. The historical default is preserved so older/hand-written
+    files still import, but its application is now SURFACED, and an unrecognised
+    value is refused rather than guessed.
+
+    Test escape: ``test_calc_mode_round_trips`` only proved an EXPLICIT mode
+    survives a round-trip; nothing exercised the ABSENT or the INVALID path, so
+    the silent default and the pass-through of a bad value were both invisible.
+    Guard: this class. Tier: T2 wrong-numbers regression.
+    """
+
+    _EXPR = "safe_div(measure(\"revenue\"), measure(\"cost\"))"
+
+    def test_absent_calc_mode_emits_a_surfaced_warning(self) -> None:
+        """The core regression: absence must be loud, not silent. FAILS against
+        pre-fix code, which produced no warning at all."""
+        snap = parse_model_yaml(_model_yaml_with_measure(
+            {"name": "margin", "expression": self._EXPR}
+        ))
+        warnings = snap.get("warnings", [])
+        assert any(
+            "calc_mode" in w and "margin" in w for w in warnings
+        ), f"expected a surfaced calc_mode warning naming the measure; got {warnings!r}"
+        # The warning must state that the two modes are different numbers, so the
+        # reader understands the assumption carries a wrong-numbers risk.
+        assert any("DIFFERENT numbers" in w for w in warnings), warnings
+
+    def test_absent_calc_mode_still_imports_with_the_documented_default(
+        self,
+    ) -> None:
+        """Non-breaking: an older/hand-written file must still import, using the
+        documented historical default the compiler assumes for a NULL column."""
+        snap = parse_model_yaml(_model_yaml_with_measure(
+            {"name": "margin", "expression": self._EXPR}
+        ))
+        row = next(m for m in snap["measures"] if m["name"] == "margin")
+        assert row["calc_agg_mode"] == "expression_as_written"
+
+    def test_invalid_calc_mode_is_rejected_not_passed_through(self) -> None:
+        """A present-but-unrecognised mode has no safe coercion (either guess
+        changes the number), so it is refused fail-closed. FAILS against pre-fix
+        code, which passed the value straight through to a raw DB constraint
+        violation at insert time."""
+        with pytest.raises(YamlImportError) as exc:
+            parse_model_yaml(_model_yaml_with_measure(
+                {"name": "margin", "expression": self._EXPR,
+                 "calc_mode": "sum_of_everything"}
+            ))
+        msg = str(exc.value)
+        assert "calc_mode" in msg and "margin" in msg, msg
+
+    @pytest.mark.parametrize("bad_mode", ["", "   ", None])
+    def test_present_empty_null_or_whitespace_calc_mode_is_rejected(
+        self, bad_mode: object,
+    ) -> None:
+        """Bug-9525: an explicitly present empty/null/whitespace calc_mode must
+        NOT be treated as an omitted field. Pre-fix code equated ``""`` with
+        absence and inferred ``expression_as_written`` — a silent wrong-numbers
+        path when a modeller cleared the field instead of choosing a mode."""
+        with pytest.raises(YamlImportError) as exc:
+            parse_model_yaml(_model_yaml_with_measure(
+                {"name": "margin", "expression": self._EXPR,
+                 "calc_mode": bad_mode}
+            ))
+        msg = str(exc.value)
+        assert "calc_mode" in msg and "margin" in msg, msg
+
+    def test_the_rejection_lists_the_valid_modes(self) -> None:
+        with pytest.raises(YamlImportError) as exc:
+            parse_model_yaml(_model_yaml_with_measure(
+                {"name": "margin", "expression": self._EXPR,
+                 "calc_mode": "bogus"}
+            ))
+        msg = str(exc.value)
+        assert "expression_as_written" in msg
+        assert "per_row_then_aggregate" in msg
+
+    def test_non_string_calc_mode_is_rejected_cleanly_not_a_500(self) -> None:
+        """A YAML list/dict in calc_mode is unhashable; membership-testing it
+        against the valid-mode set would raise a raw TypeError (a 500) past the
+        422 import handler. It must be refused as a normal validation error."""
+        with pytest.raises(YamlImportError) as exc:
+            parse_model_yaml(_model_yaml_with_measure(
+                {"name": "margin", "expression": self._EXPR,
+                 "calc_mode": ["per_row_then_aggregate"]}
+            ))
+        assert "calc_mode" in str(exc.value) and "margin" in str(exc.value)
+
+    def test_explicit_valid_mode_imports_without_a_calc_mode_warning(
+        self,
+    ) -> None:
+        """The fix must not over-warn: an explicit, valid mode is honoured with
+        no assumption and therefore no warning."""
+        snap = parse_model_yaml(_model_yaml_with_measure(
+            {"name": "margin", "expression": self._EXPR,
+             "calc_mode": "per_row_then_aggregate"}
+        ))
+        row = next(m for m in snap["measures"] if m["name"] == "margin")
+        assert row["calc_agg_mode"] == "per_row_then_aggregate"
+        assert not any(
+            "calc_mode" in w for w in snap.get("warnings", [])
+        ), snap.get("warnings")
+
+    def test_a_standard_measure_never_triggers_the_calc_mode_path(self) -> None:
+        """Only calculated measures carry calc_agg_mode; a plain measure must
+        neither warn nor gain the field."""
+        snap = parse_model_yaml(_model_yaml_with_measure(
+            {"name": "total_revenue", "table": "orders", "column": "amount",
+             "aggregation": "sum"}
+        ))
+        row = next(m for m in snap["measures"] if m["name"] == "total_revenue")
+        assert "calc_agg_mode" not in row
+        assert not any("calc_mode" in w for w in snap.get("warnings", []))
+
+
 class TestDeclaredLossiness:
     def test_a_plain_model_declares_nothing(self) -> None:
         assert "not_exported" not in _export()

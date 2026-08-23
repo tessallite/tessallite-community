@@ -38,6 +38,7 @@ from shared.db.models import (
     PocketDefinition,
     PocketPredicate,
 )
+from shared.semantic.graph_order import pick_anchor_table
 from src.dependencies.loader import ModelDependencyLoader
 
 PROJECT = uuid.uuid4()
@@ -230,6 +231,60 @@ async def test_loader_resolves_all_references_to_ids():
     # MSR_GROSS in THIS model.
     assert (str(OTHER_MODEL), str(OTHER_MSR), "Other Gross", str(MSR_GROSS)) in \
         snap.cross_model_measures
+
+
+@pytest.mark.asyncio
+async def test_bug_8626_loader_uses_declared_fact_for_structural_paths():
+    """Bug-8626: impact paths use the same fact anchor as serving.
+
+    The dimension has the lower canonical id and arrives first.  An L3-valid
+    multi-table model still pairs the dimension with the declared fact selected
+    by ``pick_anchor_table``; the loader's measure-table fallback is therefore
+    confined to undeployable zero-fact drafts.
+    """
+    rows = _rows()
+    fact = rows[ModelTable][0]
+    fact.id = uuid.UUID(int=(1 << 128) - 1)
+    for column in rows[ModelColumn]:
+        column.model_table_id = fact.id
+
+    dim_table = ModelTable(
+        id=uuid.UUID(int=1),
+        model_id=MODEL,
+        source_id=SRC,
+        table_type="dim_detail",
+        physical_name="regions",
+        alias="regions",
+        display_name="Regions",
+    )
+    dim_column = ModelColumn(
+        id=uuid.uuid4(),
+        model_table_id=dim_table.id,
+        column_name="region_name",
+        display_name="Region",
+        data_type="text",
+    )
+    dim = Dimension(
+        id=uuid.uuid4(),
+        model_id=MODEL,
+        name="Region",
+        display_name="Region",
+        source_column_id=dim_column.id,
+    )
+    rows[ModelTable] = [dim_table, fact]
+    rows[ModelColumn].append(dim_column)
+    rows[Dimension].append(dim)
+
+    db = FakeSession({Model: [_model()], **rows})
+    loader = ModelDependencyLoader(db)
+    await loader.load(PROJECT, MODEL)
+    required = await loader.object_required_tables()
+
+    assert pick_anchor_table(rows[ModelTable]) is fact
+    assert required[str(dim.id)] == (
+        str(dim_table.id),
+        (str(dim_table.id), str(fact.id)),
+    )
 
 
 @pytest.mark.asyncio

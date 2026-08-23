@@ -67,6 +67,7 @@ except ImportError:
 
 JDBC_HOST = os.environ.get("GATEWAY_JDBC_HOST", "localhost")
 JDBC_PORT = int(os.environ.get("GATEWAY_JDBC_PORT", "5433"))
+JDBC_SSLMODE = os.environ.get("GATEWAY_JDBC_SSLMODE", "prefer").strip() or None
 TENANT_SLUG = os.environ.get("BATCH_TENANT_SLUG", "acme-demo")
 TENANT_EMAIL = os.environ.get("BATCH_TENANT_EMAIL", "admin@acme-demo.com")
 TENANT_PASSWORD = os.environ.get("BATCH_TENANT_PASSWORD", "acme-demo")
@@ -159,6 +160,7 @@ def _gateway_readiness():
         user=TENANT_EMAIL,
         password=TENANT_PASSWORD,
         timeout=5.0,
+        sslmode=JDBC_SSLMODE,
     )
 
 
@@ -216,6 +218,7 @@ def jdbc():
             user=TENANT_EMAIL,
             password=TENANT_PASSWORD,
             connect_timeout=TIMEOUT_S,
+            sslmode=JDBC_SSLMODE,
         )
         conn.autocommit = True
     except Exception as exc:

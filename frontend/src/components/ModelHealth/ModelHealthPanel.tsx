@@ -1,6 +1,6 @@
 /**
  * Model Health — the dashboard that replaces the disabled "Matrix"
- * tab in the Model Builder. Five read-only sections:
+ * tab in the Model Builder. It contains read-only health sections:
  *
  *   A. Exposed model info (business + technical facts)
  *   B. Alerts stream (dedup-aware, paginated, dismissable)
@@ -56,13 +56,16 @@ import {
   measuresApi,
   schemaDriftApi,
   relationshipHealthApi,
+  joinPopulationHealthApi,
   dataQualityApi,
+  optimizerApiClient,
 } from "../../api/client";
 import type {
   DataQualityRule,
   MeasureWarning,
   ModelAlert,
   RelationshipHealthItem,
+  JoinPopulationHealthItem,
   SchemaChangeEvent,
 } from "../../api/types";
 import {
@@ -277,6 +280,7 @@ export default function ModelHealthPanel({ projectId, modelId }: Props) {
       />
       <SchemaDriftSection projectId={projectId} modelId={modelId} />
       <RelationshipHealthSection projectId={projectId} modelId={modelId} />
+      <JoinPopulationHealthSection projectId={projectId} modelId={modelId} />
       <DataQualitySection projectId={projectId} modelId={modelId} />
     </Box>
   );
@@ -582,7 +586,9 @@ function ModelInfoSection({ model }: { model: any }) {
     [t("modelHealth.description"), model.description],
     [t("modelHealth.status"), model.status],
     [t("modelHealth.aggregationsEnabled"), model.aggregations_enabled ? t("modelHealth.yes") : t("modelHealth.no")],
-    [t("modelHealth.includeAllMeasures"), (model.include_all_measures ?? true) ? t("modelHealth.yes") : t("modelHealth.no")],
+    // Bug-9409: all-measure aggregates are opt-in; an un-loaded value reads as
+    // OFF, matching the backend default in shared/model_defaults.py.
+    [t("modelHealth.includeAllMeasures"), (model.include_all_measures ?? false) ? t("modelHealth.yes") : t("modelHealth.no")],
   ];
   const technical: [string, string | null | undefined][] = [
     [t("modelHealth.modelId"), model.id],
@@ -840,14 +846,27 @@ export function AggregateHealthSection({
     };
   }, [aggs.data]);
 
+  // Bug-9408 / F-102-12: empty aggregate list is ambiguous — distinguish
+  // "waiting for source statistics" (had_stats=false) from a genuine empty set.
+  const predictivePreview = useQuery({
+    queryKey: ["predictive-preview", modelId, "model-health"],
+    queryFn: () => optimizerApiClient.getPredictivePreview(modelId),
+    enabled: Boolean(modelId) && !aggs.isLoading && counts.total === 0,
+  });
+
+  const emptyMessage =
+    predictivePreview.data?.had_stats === false
+      ? t("modelHealth.aggHealthWaitingForStats")
+      : t("modelHealth.aggHealthNone");
+
   return (
     <>
       <SectionHeader title={t("modelHealth.sectionAggHealth")} />
-      {aggs.isLoading ? (
+      {aggs.isLoading || (counts.total === 0 && predictivePreview.isLoading) ? (
         <CircularProgress size={20} />
       ) : counts.total === 0 ? (
         <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-          {t("modelHealth.aggHealthNone")}
+          {emptyMessage}
         </Typography>
       ) : (
         <Paper variant="outlined" sx={{ p: 1.5, mb: 2 }}>
@@ -1575,6 +1594,147 @@ export function RelationshipHealthSection({
                   </TableCell>
                 </TableRow>
               ))}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
+    </>
+  );
+}
+
+const JOIN_POPULATION_STATUS_COLOR: Record<
+  string,
+  "default" | "success" | "warning" | "error"
+> = {
+  OK: "success",
+  WARNING: "warning",
+  BLOCKED: "error",
+};
+
+/**
+ * Deploy-time join-population evidence. This is deliberately read-only: the
+ * join declaration remains editable in Joins, while this section explains the
+ * last measured status and whether it is stale after a declaration change.
+ */
+export function JoinPopulationHealthSection({
+  projectId,
+  modelId,
+}: {
+  projectId: string;
+  modelId: string;
+}) {
+  const t = useT();
+  const health = useQuery({
+    queryKey: ["join-population-health", projectId, modelId],
+    queryFn: () => joinPopulationHealthApi.get(projectId, modelId),
+    refetchInterval: 60000,
+  });
+  const rows = health.data?.items ?? [];
+
+  return (
+    <>
+      <SectionHeader title={t("modelHealth.joinPopulationHealth")} />
+      <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+        <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap">
+          <Chip
+            label={
+              health.data
+                ? t(`modelHealth.joinPopulationStatus.${health.data.status}`)
+                : t("modelHealth.joinPopulationStatus.PENDING")
+            }
+            size="small"
+            color={JOIN_POPULATION_STATUS_COLOR[health.data?.status ?? ""] ?? "default"}
+            variant={health.data ? "filled" : "outlined"}
+          />
+          {health.data && (
+            <Typography variant="caption" color="text.secondary">
+              {t("modelHealth.joinPopulationCounts", {
+                evaluated: String(health.data.evaluated_count),
+                total: String(health.data.join_count),
+              })}
+            </Typography>
+          )}
+        </Stack>
+        <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+          {t("modelHealth.joinPopulationHelp")}
+        </Typography>
+        {!health.data?.warn_only && health.data?.status === "BLOCKED" && (
+          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.75 }}>
+            {t("modelHealth.joinPopulationEnforced")}
+          </Typography>
+        )}
+      </Paper>
+      {health.isLoading ? (
+        <CircularProgress size={18} />
+      ) : health.isError ? (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {t("modelHealth.joinPopulationHealthLoadError")}
+        </Alert>
+      ) : rows.length === 0 ? (
+        <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+          <Typography variant="body2" color="text.secondary">
+            {t("modelHealth.noJoinPopulationChecks")}
+          </Typography>
+        </Paper>
+      ) : (
+        <TableContainer component={Paper} variant="outlined" sx={{ mb: 2 }}>
+          <Table size="small">
+            <TableHead>
+              <TableRow sx={{ bgcolor: "grey.50" }}>
+                <TableCell>{t("modelHealth.joinPopulationJoin")}</TableCell>
+                <TableCell>{t("modelHealth.joinPopulationType")}</TableCell>
+                <TableCell>{t("modelHealth.joinPopulationParticipation")}</TableCell>
+                <TableCell>{t("modelHealth.joinPopulationClassification")}</TableCell>
+                <TableCell>{t("modelHealth.joinPopulationStatusLabel")}</TableCell>
+                <TableCell>{t("modelHealth.joinPopulationReason")}</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {rows.map((row: JoinPopulationHealthItem) => {
+                const status = row.stale ? "STALE" : row.status ?? "PENDING";
+                const statusColor = row.stale
+                  ? "warning"
+                  : JOIN_POPULATION_STATUS_COLOR[row.status ?? ""] ?? "default";
+                return (
+                  <TableRow key={row.join_id}>
+                    <TableCell>
+                      <Typography variant="body2">
+                        {row.left_table_name ?? "?"} → {row.right_table_name ?? "?"}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {row.left_column_name ?? "?"} = {row.right_column_name ?? "?"}
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      {t(`joins.type${row.join_type.charAt(0).toUpperCase()}${row.join_type.slice(1)}`)}
+                    </TableCell>
+                    <TableCell>
+                      {t(`joins.population${row.population_participation
+                        .split("_")
+                        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+                        .join("")}`)}
+                    </TableCell>
+                    <TableCell>
+                      {row.classification
+                        ? t(`modelHealth.joinPopulationClassification.${row.classification}`)
+                        : t("modelHealth.joinPopulationClassification.unavailable")}
+                    </TableCell>
+                    <TableCell>
+                      <Chip
+                        label={t(`modelHealth.joinPopulationStatus.${status}`)}
+                        size="small"
+                        color={statusColor}
+                        variant={status === "PENDING" ? "outlined" : "filled"}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="caption">
+                        {row.reason ?? t("modelHealth.joinPopulationNoReason")}
+                      </Typography>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         </TableContainer>

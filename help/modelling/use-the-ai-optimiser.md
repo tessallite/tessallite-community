@@ -2,7 +2,7 @@
 title: "Use the AI Optimiser"
 audience: modeller
 area: Modelling
-updated: 2026-04-17
+updated: 2026-08-20
 ---
 
 ![AI optimiser recommendations panel.](../assets/screencaps/ai-optimiser-recommendations.png)
@@ -82,6 +82,63 @@ Each recommendation carries a **confidence** score between 0 and 1. The **minimu
 ### Require review before applying
 
 By default, an approved AI suggestion is built and routed straight away. If you would rather check every change first, turn on **Require review before applying**. With it on, the advisor still studies the data and still proposes aggregates — but instead of building them it registers each one as a **disabled** aggregate. Nothing is built and no query is sped up until you open the aggregate and enable it yourself. This is the safe choice while you are learning how the advisor behaves on a model; turn it off once you trust the suggestions and want them applied automatically.
+
+### Dry run — see the plan without changing anything
+
+Turn on **Dry run** when you want to know what the advisor WOULD do without it
+doing any of it. The advisor still reads your query history, still asks the
+language model, and still writes a full run record you can open and read — every
+recommendation it would have acted on is listed, marked *skipped*.
+
+What a dry run will never do:
+
+- create an aggregate, enabled or disabled;
+- build, refresh, retire or delete a table in your database;
+- change which aggregate a query is answered from.
+
+This is a hard guarantee, not a promise about how carefully the code was
+written: every part of Tessallite that can write to your data refuses outright
+while a dry run is in progress. If something inside a dry run ever tried to
+write, the run stops and tells you, instead of writing.
+
+Use it the first time you point the advisor at a model, after a big change to
+the model, or whenever you simply want a second opinion on your aggregates. Then
+turn it off and run again to actually apply what you agreed with.
+
+### Keeping the language-model bill in check
+
+Every advisor run sends your query patterns to a language model, and language
+models charge by the *token* — roughly, by the amount of text in and out. Two
+limits protect you:
+
+- **Per run.** If one run's prompt would be too large to send, the run stops
+  before the model is called and tells you to narrow the model or shorten the
+  lookback window. You are never charged for a call that was always going to be
+  refused.
+- **Per day.** Set **AI optimiser daily token budget** (Model Settings → AI
+  optimizer) to cap what the advisor may spend on this model in a single UTC
+  day. Tessallite reserves each run's prompt plus the provider configuration's
+  maximum output before calling the provider, while completed runs record their
+  actual input/output usage for audit. A run whose reservation would go over
+  the cap stops **before** calling the provider and says so. Leave it at 0 for
+  no limit. This budget is separate from the conversational agent's, so a busy
+  advisor cannot eat the chat allowance.
+
+### How "worth building" is priced
+
+The optimiser weighs an aggregate's saved query time against what it costs to
+store and refresh. Those prices are yours to set, under Model Settings → AI
+optimizer:
+
+| Setting | What it means |
+|---|---|
+| ROI storage rate | What a gigabyte of storage costs you per month. |
+| ROI compute rate | What scanning a million source rows costs you. |
+| ROI assumed refresh frequency | How often an aggregate is rebuilt when no schedule says otherwise. |
+
+The shipped values are generic cloud list prices. If your platform is materially
+cheaper or dearer, set your own — these numbers decide which single aggregate
+gets built when several are competing for the same slot.
 
 ### Only one run at a time
 

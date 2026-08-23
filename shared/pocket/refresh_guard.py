@@ -124,10 +124,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-# The one status the pocket matcher serves. Every other status (stale / failed /
-# invalidating) is a refusal signal — the pocket analogue of an aggregate's
-# ``is_stale`` flag.
+# The one physical lifecycle status the pocket matcher serves. Population
+# eligibility is an orthogonal axis; an ineligible row keeps its physical
+# status so a later proof cannot make an old generation appear freshly built.
 POCKET_STATUS_FRESH = "fresh"
+POCKET_STATUS_FAILED = "failed"
 
 # The status a refusal lands on: the established "rebuild me" state, and exactly
 # what the control-plane invalidator writes.
@@ -136,6 +137,15 @@ POCKET_STATUS_STALE = "stale"
 # The status ``refresh_pocket_definition`` commits before the physical build.
 # Observing it again at finalisation is what proves nothing else wrote the row.
 POCKET_STATUS_INVALIDATING = "invalidating"
+
+# Legacy status token retained for migration/read compatibility only. Current
+# writers use the separate eligibility axis below and never park a row by
+# changing its physical lifecycle status.
+POCKET_STATUS_INELIGIBLE = "ineligible"
+POCKET_POPULATION_ELIGIBILITY_UNKNOWN = "unknown"
+POCKET_POPULATION_ELIGIBILITY_ELIGIBLE = "eligible"
+POCKET_POPULATION_ELIGIBILITY_INELIGIBLE = "ineligible"
+POCKET_INELIGIBLE_POPULATION_REASON = "Ineligible: population mismatch"
 
 _REASON_INVALIDATED = (
     "This cache was invalidated while it was being rebuilt, so the rows it just "

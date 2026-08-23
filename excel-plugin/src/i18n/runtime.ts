@@ -1,6 +1,10 @@
 type StringTree = { readonly [key: string]: string | StringTree };
 
-const RTL_LOCALES = new Set(["ar"]);
+// The task pane has no RTL theme/Arabic catalogue yet. Keep this allow-list
+// empty until both are shipped together; setting `dir=rtl` on the existing
+// LTR MUI controls mirrors the pane while leaving English copy in place and
+// can move actions off the narrow Office task-pane viewport (Bug-9211).
+const RTL_LOCALES = new Set<string>();
 let activeLocale = "en";
 
 const taskPaneTranslations: Record<string, Record<string, string>> = {
