@@ -54,6 +54,35 @@ def test_parse_escaped_key():
     assert path == ["a]b"]
 
 
+def test_bug_9806_preserves_key_spaces_and_escaped_closing_brackets():
+    assert parse_member_uname(
+        "[D].[H].[Lvl].&[  A]]B  ]"
+    ) == ("[D].[H]", "Lvl", "key", ["  A]B  "])
+
+
+def test_bug_9806_trims_only_outer_wire_whitespace():
+    from src.dax.member_uname import parse_member_keys
+
+    assert parse_member_keys("  &[  A  ]  ") == ["  A  "]
+    assert parse_member_keys("  [  caption  ]  ") == ["  caption  "]
+
+
+def test_bug_9806_matching_uses_preserved_key_content_exactly():
+    member = "[D].[H].[Lvl].&[  A]]B  ]"
+    assert member_filter_matches(
+        member,
+        candidate_hier_bracket="[D].[H]",
+        candidate_level_name="Lvl",
+        candidate_key_path=["  A]B  "],
+    )
+    assert not member_filter_matches(
+        member,
+        candidate_hier_bracket="[D].[H]",
+        candidate_level_name="Lvl",
+        candidate_key_path=["A]B"],
+    )
+
+
 def test_parse_invalid():
     assert parse_member_uname("garbage")[2] == "invalid"
     assert parse_member_uname("")[2] == "invalid"

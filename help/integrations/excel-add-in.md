@@ -2,7 +2,7 @@
 title: "Tessallite Excel Add-in"
 audience: analyst
 area: Integrations
-updated: 2026-07-09
+updated: 2026-09-11
 ---
 
 ## What This Covers
@@ -65,13 +65,17 @@ If the Shared Folder tab says there are no add-ins available, verify that the ca
 
 ## Report Builder
 
+Open **Analyse**. Click the project/model title in the header to choose the project, model and persona. The gear menu holds saved profiles, Diagnostics and sign-out; the footer shows connection status and persona. Click the brand mark for plugin information.
+
+The four compact field zones sit above an icon toolbar. Hover or focus an icon for its action label. Search, Certified and sort controls sit above the collapsible field sections.
+
 Report Builder assembles a query from governed objects and writes the result to the sheet:
 
 1. Pick a model. The measure, dimension, and hierarchy libraries populate with the objects you are allowed to see.
-2. Drag objects into the **Rows**, **Columns**, **Values**, and **Filters** zones, or start from a layout in the template picker.
-3. Click **Run**. The result range is written to the active sheet with friendly display names as headers.
+2. Use the field-row action icons to add objects to **Rows**, **Columns**, **Values**, and **Filters**, or start from a layout in the template picker.
+3. Click the **Table** toolbar icon. The result range is written to the active sheet with friendly display names as headers.
 
-Because the add-in queries the deployed model, aggregate routing, calculated measures, and time variants all apply automatically.
+Because the add-in queries the deployed model, aggregate routing, calculated measures, and time variants all apply automatically. Member-list requests use that same deployed definition and never fall back to draft metadata. If discovery fails because the deployed definition is unavailable, the failure is retained in query history as `snapshot_unavailable` so an operator can distinguish deployment repair from an invalid dimension request.
 
 ### Connectionless Values And Local PivotTables
 
@@ -83,6 +87,8 @@ The normal add-in insert path does not require a workbook-level OLAP connection 
 - Local PivotTable inserts only accept additive standard measures. Use **Insert Table** or the advanced CUBE formula path for calculated, variant, semi-additive, or non-additive measures so Excel does not re-aggregate a value that must stay at its governed grain.
 
 If a workbook is opened while a different model is selected in the task pane, the `TESSALLITE.*` functions fail with a clear model-mismatch message instead of returning a number from the wrong model. Select the model named in the formula and refresh values.
+
+When you change projects or models quickly, the latest selection wins. An older request that finishes later cannot replace the visible model, the formula context, the cache, or the workbook recalculation target.
 
 Hidden PivotTable backing sheets are still workbook data. Anyone with workbook edit access can unhide them, so do not share a workbook with people who should not see the data behind the pivot.
 
@@ -96,6 +102,8 @@ An object you drag into the **Filters** zone starts as a plain "equals" match. C
 - **Date Range** - keep rows between a start date and an end date. Type the two dates in either order; if they are high-to-low, the add-in swaps them and tells you.
 
 The label under the value box tells you what kind of value the column expects. If the model rejects a filter, the add-in shows the reason in plain words.
+
+Dimension filters select individual source rows before the result is grouped. Measure filters, such as `Total Fees > 10000`, test the grouped measure total after aggregation. Report Builder uses the aggregation in the deployed model and rejects measure types that cannot be filtered safely; it does not turn them into row filters.
 
 ### Using A Named List In A Zone
 
@@ -148,9 +156,54 @@ Ask a modeller to open the model in the web app and deploy it again, then refres
 
 ## Ask Tessallite
 
-The **Ask Tessallite** panel is the conversational agent inside Excel. Type a question in plain language; the answer streams back as it is generated, with the supporting query and a judge verdict on answer quality. Use the **insert** action to drop the answer text, the result table, or a chart onto the sheet.
+The **Ask** panel is the conversational agent inside Excel. Type a question in plain language; the answer streams back as it is generated, with the supporting query and a judge verdict on answer quality. Use the **insert** action to drop the answer text, the result table, or a chart onto the sheet.
+
+If an answer contains measures but no dimension, chart insertion adds one
+category called **Result** and keeps every measure as a numeric series. A
+single-value chart therefore keeps its value, and a two-measure chart keeps
+both measures.
 
 The agent honours the model's glossary, row security, and the persona you have selected, so it will not surface data you are not permitted to see.
+
+Click **Stop** at any point to cancel the current stream, including after text has started arriving. Late events from that stopped request cannot replace the partial response or alter a newer request. A saved conversation that contains a visual keeps its table, chart, PivotTable, and pop-out actions after the conversation is reopened.
+
+### The answer window
+
+The task pane is a narrow strip down the side of the workbook, and Excel gives
+add-ins no way to widen it. A wide table or a dense chart is therefore always
+cramped in the pane, no matter how the pane itself is arranged. The **pop-out**
+control on an answer, and the **maximise** control on its Visual panel, both
+open the answer in a separate resizable window that can fill the screen.
+
+The window shows whichever the answer is: a chart if the answer drew one, the
+result table otherwise. It carries three controls in its top-right corner.
+
+**Save** offers the formats that suit what is on screen. A table can be saved as
+**Excel**, **CSV**, or **TSV**; a chart as **SVG** or **PNG**. Every table
+export carries its column headers, so a saved file is readable on its own rather
+than a rectangle of anonymous numbers.
+
+Saving a table as **Excel** does not download a file. It opens the result as a
+new workbook in Excel, where you keep it with Excel's own **Save** and put it
+wherever your own filing conventions require. That is usually what you want:
+the result arrives as a live workbook you can immediately extend with formulas
+or a PivotTable, and nothing lands in a downloads folder to be tidied up later.
+On an Excel version too old to open a workbook this way, the same content is
+downloaded as an `.xlsx` file instead.
+
+**Copy** puts the answer on the clipboard in the form the destination expects. A
+table is copied both as a grid and as plain text, so pasting into a sheet gives
+you real cells with a header row, while pasting into an email or a chat message
+gives readable text. A chart is copied as an image, ready to paste into a
+document or a slide.
+
+**Close** returns you to the task pane. The conversation is untouched; the
+window is only a larger view of an answer that is still there.
+
+A practical note on why the export controls live in this window rather than in
+the task pane: browsers restrict file downloads and image clipboard writes
+inside an embedded pane, and Office task panes are embedded. The separate window
+is a full browser window, where both work reliably.
 
 ---
 
@@ -213,11 +266,11 @@ The historical short namespace is not a shipped namespace. Replace those formula
 
 ### Caching And Refresh
 
-Custom functions cache results for 60 seconds. To force a fresh evaluation, click **Refresh** in the Report Builder footer. This clears all caches and triggers a full workbook recalculation so every `TESSALLITE.*` formula fetches a fresh value immediately. Switching personas, switching connection profiles, and signing out also clear the caches automatically.
+Custom functions cache results for 60 seconds. To force a fresh evaluation, open the Report Builder toolbar's **Refresh** menu and choose **Refresh**. This clears all caches and triggers a full workbook recalculation so every `TESSALLITE.*` formula fetches a fresh value immediately. Switching personas, switching connection profiles, and signing out also clear the caches automatically.
 
 ### Refresh Sheet Data
 
-The **Refresh sheet data** button (next to the Refresh button in the Report Builder footer) re-runs every Tessallite-inserted table on the active worksheet. It reads each table's stored query and re-executes it against the current session and persona. Tables that belong to a different project or model than the one currently selected are skipped with a reason. Tables whose column structure has changed since insertion are also skipped to prevent data corruption.
+The **Refresh sheet data** item in the Report Builder's **Refresh** menu re-runs every Tessallite-inserted table on the active worksheet. It reads each table's stored query and re-executes it against the current session and persona. Tables that belong to a different project or model than the one currently selected are skipped with a reason. Tables whose column structure has changed since insertion are also skipped to prevent data corruption.
 
 When a table grows or shrinks, its attribution line (the small grey "Source: Tessallite ..." row underneath it) moves with it and picks up the new refresh time.
 
@@ -227,7 +280,7 @@ If a table needs to grow but the cells directly beneath it are not empty - your 
 
 ### Insert Mode (Live vs Static)
 
-A **Live / Static** toggle in the Report Builder footer controls how single-value inserts behave:
+The **Live** checkbox (checked for live formulas, unchecked for static values) in the Report Builder toolbar controls how single-value inserts behave:
 
 - **Live** (default): inserts a `TESSALLITE.VALUE(...)` or `TESSALLITE.KPI(...)` formula. The value refreshes automatically on workbook recalculation.
 - **Static**: fetches the current value once and writes it as a plain number. The cell does not update automatically.
@@ -256,9 +309,13 @@ This setting applies only to the default single-value insert actions (the sigma 
 | Numbers differ from the web app | An older sheet result predates a model change, or a formula was calculated while another model was selected | Re-run the report, or select the model named in the formula and click **Refresh values**. |
 | `#NAME?` for every TESSALLITE formula | The custom functions runtime did not register this Excel session (common on Office 2019/2021 perpetual) | Re-insert the add-in from **Insert > My Add-ins > Shared Folder**. A plain Excel restart is not always enough. |
 | The pane works but every formula shows `#VALUE!` after a few seconds, and the server is on `localhost` | The custom functions sandbox is blocked from local network access, or it does not trust the server certificate | Ask your administrator to apply the one-time machine setup described in the plugin README (loopback exemption plus installing the certificate authority into the machine store). |
+| A cell sits at `#GETTING_DATA` for 30 seconds and then shows "Request timed out" | The request never reached the server. On a `localhost` deployment this is the custom functions sandbox blocking local network access | Apply the one-time machine setup described in the plugin README (loopback exemption plus the certificate authority in the machine store), or point the connection profile at the server's real host name instead of `localhost`. Type `=TESSALLITE.DIAG()` to confirm: `FETCH=FAIL` means the server was never reached. |
 | The add-in half-works: formulas respond but the ribbon button is gone, or the reverse | The Office add-in cache has become inconsistent after repeated add and remove cycles | Close Excel, delete the contents of `%LOCALAPPDATA%\Microsoft\Office\16.0\Wef`, reopen Excel, and re-insert the add-in. Sign in again afterwards — clearing the cache also clears the saved session. |
 | A KPI or named list you just created is not in the pane | It has not been deployed yet. The add-in shows the published model only | Save and Deploy the model in the web app, then refresh the pane. To check the draft itself, use the model builder. |
 | A cell shows "Published model unavailable" | The model's published version could not be read | Ask a modeller to deploy the model again, then refresh. The add-in stops here on purpose rather than showing unpublished figures. |
+| A cell shows "Row-level security: your permissions grant you access to no rows for this query" | Row security applies to you and grants you no rows for this slice. This is a governed answer, not a fault | Ask your administrator for the access you need. The add-in refuses to write the `0` a count-shaped measure returns under a denial, because a zero in a spreadsheet reads as a fact about the business. |
+| A cell shows "Unknown column: '<name>' in model '<model>'" | The model does not publish a measure by that name — most often a spelling difference, or a measure that exists in the draft but has not been deployed | Check the name in the pane's measure library, or ask a modeller to deploy the measure. Measure names are the technical names shown in the library, not the display names. |
+| A cell shows "Period-aware time variant requires a time dimension in the query grain" | The formula asks for a year-to-date, prior-year or growth measure with no date context to compute against | Add a date filter to the formula, or use the report builder, which places the measure on a time axis. |
 
 Tip: type `=TESSALLITE.DIAG()` in any cell to see the add-in's own health
 report — whether storage works, which model is selected, which server it

@@ -97,3 +97,16 @@ describe("UsageAnalyticsTab error vs empty (Bug-7459)", () => {
     expect(screen.getAllByText("—").length).toBeGreaterThan(0);
   });
 });
+
+it("uses the three business routing labels", async () => {
+  resolveAllEmpty();
+  routingBreakdown.mockResolvedValue([
+    { route_type: "source", count: 2, pct: 28.6 },
+    { route_type: "aggregate", count: 2, pct: 28.6 },
+    { route_type: "cache", count: 3, pct: 42.9 },
+  ]);
+  renderTab();
+  expect(await screen.findByText("Source: 2 (28.6%)")).toBeInTheDocument();
+  expect(screen.getByText("Aggregation: 2 (28.6%)")).toBeInTheDocument();
+  expect(screen.getByText("Short memory cache: 3 (42.9%)")).toBeInTheDocument();
+});

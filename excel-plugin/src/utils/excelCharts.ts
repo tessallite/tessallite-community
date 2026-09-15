@@ -36,10 +36,107 @@ export function getChartTypeEnum(type: ChartTypeRecommendation): Excel.ChartType
   }
 }
 
-interface ChartAnnotation {
-  measures?: Record<string, { title: string; type: string }>;
-  dimensions?: Record<string, { title: string; type: string }>;
-  timeDimensions?: Record<string, { title: string; type: string }>;
+export interface ChartFieldAnnotation {
+  title: string;
+  type: string;
+}
+
+export interface ChartAnnotation {
+  measures?: Record<string, ChartFieldAnnotation>;
+  dimensions?: Record<string, ChartFieldAnnotation>;
+  timeDimensions?: Record<string, ChartFieldAnnotation>;
+}
+
+function annotationKeys(
+  fields: Record<string, ChartFieldAnnotation> | undefined,
+): Set<string> {
+  const keys = new Set<string>();
+  for (const [key, field] of Object.entries(fields || {})) {
+    keys.add(key);
+    keys.add(field.title);
+  }
+  return keys;
+}
+
+function numericValue(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : undefined;
+  }
+  if (typeof value !== 'string' || value.trim() === '') return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+const INTEGER_TEXT_PATTERN = /^[+-]?\d+$/;
+const DECIMAL_TEXT_PATTERN = /^[+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+)$/;
+const IDENTIFIER_HEADER_TOKENS = new Set([
+  'code',
+  'id',
+  'identifier',
+  'key',
+  'no',
+  'number',
+  'period',
+  'postal',
+  'postcode',
+  'year',
+  'zip',
+]);
+
+function isLikelyIntegerIdentifierColumn(header: string, values: unknown[]): boolean {
+  const headerTokens = header.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (headerTokens.some(token => IDENTIFIER_HEADER_TOKENS.has(token))) return true;
+
+  const nonEmptyStringValues = values
+    .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
+    .map(value => value.trim());
+  const integerTextValues = nonEmptyStringValues.filter(value => INTEGER_TEXT_PATTERN.test(value));
+  if (integerTextValues.length < 2 || integerTextValues.length !== nonEmptyStringValues.length) {
+    return false;
+  }
+
+  const lengths = new Set(integerTextValues.map(value => value.replace(/^[+-]/, '').length));
+  const [length] = [...lengths];
+  return lengths.size === 1 && length >= 4;
+}
+
+function unannotatedNumericValue(value: unknown, integerIdentifier = false): number | undefined {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : undefined;
+  }
+  if (typeof value !== 'string' || value.trim() === '') return undefined;
+  const trimmed = value.trim();
+  if (integerIdentifier && INTEGER_TEXT_PATTERN.test(trimmed)) return undefined;
+  if (!INTEGER_TEXT_PATTERN.test(trimmed) && !DECIMAL_TEXT_PATTERN.test(trimmed)) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * Build the row matrix used by the chart and local-pivot insertion paths.
+ *
+ * Agent-service queries use the general `/execute` route, whose Decimal values
+ * can still cross the JSON boundary as strings. The plugin-execute route is
+ * typed after Bug-9876, but this path must remain safe when the Agent sample
+ * or a legacy response contains a numeric string. Only annotated measure
+ * columns are coerced, so numeric-looking dimension keys retain their text.
+ */
+export function buildChartRowsFromRecords(
+  headers: string[],
+  records: Array<Record<string, unknown>>,
+  annotation?: ChartAnnotation,
+): (string | number)[][] {
+  const measureKeys = annotationKeys(annotation?.measures);
+  return records.map(record => headers.map(header => {
+    const value = record[header];
+    if (measureKeys.has(header)) {
+      const parsed = numericValue(value);
+      if (parsed !== undefined) return parsed;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string') return value;
+    return value == null ? '' : String(value);
+  }));
 }
 
 /**
@@ -87,11 +184,7 @@ export function enrichAnnotationTimeDimensions(
 export function recommendChartType(
   headers: string[],
   rows: (string | number)[][],
-  annotation?: {
-    measures?: Record<string, { title: string; type: string }>;
-    dimensions?: Record<string, { title: string; type: string }>;
-    timeDimensions?: Record<string, { title: string; type: string }>;
-  },
+  annotation?: ChartAnnotation,
 ): ChartRecommendation {
   const colCount = headers.length;
   const rowCount = rows.length;
@@ -100,25 +193,48 @@ export function recommendChartType(
     return { chartType: 'columnClustered', confidence: 'low', reason: 'Insufficient data for chart recommendation' };
   }
 
-  const timeColumns = new Set<string>();
+  const measureColumns = annotationKeys(annotation?.measures);
+  const dimensionColumns = new Set([
+    ...annotationKeys(annotation?.dimensions),
+    ...annotationKeys(annotation?.timeDimensions),
+  ]);
+  const timeColumns = annotationKeys(annotation?.timeDimensions);
   const numericColumns = new Set<string>();
   const stringColumns = new Set<string>();
-
-  if (annotation?.timeDimensions) {
-    for (const key of Object.keys(annotation.timeDimensions)) {
-      timeColumns.add(key);
-    }
-  }
 
   for (let col = 0; col < colCount; col++) {
     const header = headers[col];
     if (timeColumns.has(header)) continue;
 
+    // The citation-derived annotation is authoritative for Agent rows. It is
+    // deliberately checked before the value heuristic because a measure can
+    // be serialized as a numeric string on the general Agent execute path.
+    if (measureColumns.has(header)) {
+      numericColumns.add(header);
+      continue;
+    }
+    if (dimensionColumns.has(header)) {
+      stringColumns.add(header);
+      continue;
+    }
+    if (annotation) {
+      // An annotation is a partial classification contract: a returned
+      // column that is not cited as a measure is a category, even when its
+      // values happen to look numeric (years and postal codes are common).
+      stringColumns.add(header);
+      continue;
+    }
+
+    const sample = rows.slice(0, 20);
+    const integerIdentifier = isLikelyIntegerIdentifierColumn(
+      header,
+      sample.map(row => row[col]),
+    );
     let numericCount = 0;
     let stringCount = 0;
     for (let row = 0; row < Math.min(rowCount, 20); row++) {
       const val = rows[row][col];
-      if (typeof val === 'number') {
+      if (unannotatedNumericValue(val, integerIdentifier) !== undefined) {
         numericCount++;
       } else if (typeof val === 'string' && val.length > 0) {
         stringCount++;
@@ -131,7 +247,19 @@ export function recommendChartType(
     }
   }
 
-  const hasTimeAxis = timeColumns.size > 0;
+  // Keep the recommendation aligned with separateColumns when an unannotated
+  // result contains only numeric values: the first column is the category axis.
+  // Explicit measure annotations remain authoritative; a measure-only result
+  // uses a synthetic category and retains every numeric series.
+  if (!annotation && stringColumns.size === 0 && timeColumns.size === 0 && numericColumns.size > 1) {
+    const fallbackCategory = headers.find(header => numericColumns.has(header));
+    if (fallbackCategory) {
+      numericColumns.delete(fallbackCategory);
+      stringColumns.add(fallbackCategory);
+    }
+  }
+
+  const hasTimeAxis = headers.some(header => timeColumns.has(header));
   const numCategories = stringColumns.size + timeColumns.size;
   const numMeasures = numericColumns.size;
 
@@ -158,33 +286,13 @@ export function recommendChartType(
 export function separateColumns(
   headers: string[],
   rows: (string | number)[][],
-  annotation?: {
-    measures?: Record<string, { title: string; type: string }>;
-    dimensions?: Record<string, { title: string; type: string }>;
-    timeDimensions?: Record<string, { title: string; type: string }>;
-  },
+  annotation?: ChartAnnotation,
 ): { chartHeaders: string[]; chartRows: (string | number)[][] } {
-  const measureKeys = new Set<string>();
-  const dimKeys = new Set<string>();
-
-  if (annotation?.measures) {
-    for (const [key, m] of Object.entries(annotation.measures)) {
-      measureKeys.add(key);
-      measureKeys.add(m.title);
-    }
-  }
-  if (annotation?.dimensions) {
-    for (const [key, d] of Object.entries(annotation.dimensions)) {
-      dimKeys.add(key);
-      dimKeys.add(d.title);
-    }
-  }
-  if (annotation?.timeDimensions) {
-    for (const [key, d] of Object.entries(annotation.timeDimensions)) {
-      dimKeys.add(key);
-      dimKeys.add(d.title);
-    }
-  }
+  const measureKeys = annotationKeys(annotation?.measures);
+  const dimKeys = new Set([
+    ...annotationKeys(annotation?.dimensions),
+    ...annotationKeys(annotation?.timeDimensions),
+  ]);
 
   const dimIndices: number[] = [];
   const measureIndices: number[] = [];
@@ -195,9 +303,22 @@ export function separateColumns(
       measureIndices.push(i);
     } else if (dimKeys.has(h)) {
       dimIndices.push(i);
+    } else if (annotation) {
+      // An annotation may omit a returned dimension. Unknown columns remain
+      // categories; never infer a measure from their values in this case.
+      dimIndices.push(i);
     } else {
       const sample = rows.slice(0, 20);
-      const numCount = sample.filter(r => typeof r[i] === 'number').length;
+      // When annotation is unavailable, inspect the actual cell values. Decimal
+      // numeric strings are measures even when they contain display zeros, while
+      // identifier-shaped integer text remains a category.
+      const integerIdentifier = isLikelyIntegerIdentifierColumn(
+        h,
+        sample.map(row => row[i]),
+      );
+      const numCount = sample.filter(
+        r => unannotatedNumericValue(r[i], integerIdentifier) !== undefined,
+      ).length;
       if (numCount > sample.length / 2) {
         measureIndices.push(i);
       } else {
@@ -206,7 +327,14 @@ export function separateColumns(
     }
   }
 
-  if (dimIndices.length === 0) dimIndices.push(0);
+  const syntheticCategory = Boolean(annotation) && dimIndices.length === 0 && measureIndices.length > 0;
+  if (dimIndices.length === 0 && !syntheticCategory) {
+    // Every column can look numeric in an unannotated answer. Promote the
+    // conventional first column to the category axis and remove it from the
+    // measures so no index is emitted in both sets.
+    const fallbackDimension = measureIndices.shift() ?? 0;
+    dimIndices.push(fallbackDimension);
+  }
   if (measureIndices.length === 0) {
     for (let i = 0; i < headers.length; i++) {
       if (!dimIndices.includes(i)) measureIndices.push(i);
@@ -215,8 +343,10 @@ export function separateColumns(
 
   const chartHeaders = ['Category', ...measureIndices.map(i => headers[i])];
   const chartRows = rows.map(row => {
-    const label = dimIndices.map(i => String(row[i] ?? '')).join(' / ');
-    const values = measureIndices.map(i => row[i]);
+    const label = syntheticCategory
+      ? 'Result'
+      : dimIndices.map(i => String(row[i] ?? '')).join(' / ');
+    const values = measureIndices.map(i => numericValue(row[i]) ?? row[i]);
     return [label, ...values] as (string | number)[];
   });
 
@@ -237,11 +367,7 @@ export function createChartOnSheet(
   sheet: Excel.Worksheet,
   headers: string[],
   rows: (string | number)[][],
-  annotation?: {
-    measures?: Record<string, { title: string; type: string }>;
-    dimensions?: Record<string, { title: string; type: string }>;
-    timeDimensions?: Record<string, { title: string; type: string }>;
-  },
+  annotation?: ChartAnnotation,
   title?: string,
 ): { chart: Excel.Chart; chartHeaders: string[] } {
   const { chartHeaders, chartRows } = separateColumns(headers, rows, annotation);
@@ -301,4 +427,35 @@ export function applyChartAxisFormatting(
   const valueAxis = chart.axes.getItem(Excel.ChartAxisType.value);
   valueAxis.title.text = measureNames.join(' / ') || 'Value';
   valueAxis.title.visible = true;
+}
+
+/**
+ * Bug-9737: the Agent conversation turn carries no `annotation` field (unlike
+ * the plugin-execute response ReportBuilder reads), so every Ask & Insert
+ * chart/pivot call site was omitting `annotation` entirely and falling back
+ * to `separateColumns`'s `typeof val === 'number'` heuristic. The Agent API
+ * returns measure values as JSON strings (e.g. `"23332917.80"`), which always
+ * fails that check -- every column got classified as a dimension, collapsing
+ * the chart to one concatenated "Category" column with no measure series
+ * (an empty chart). `turn.citations` already carries the real measure/
+ * dimension classification per column (`kind`, `name`, `display_name`); this
+ * builds the same `{measures, dimensions}` shape the annotation-aware path
+ * already handles correctly, keyed by the citation's technical `name` (which
+ * matches the `query_result_sample` row keys used as chart headers).
+ */
+export function buildAnnotationFromCitations(
+  citations: Array<{ kind: string; name: string; display_name: string }> | null | undefined,
+): ChartAnnotation | undefined {
+  if (!citations || citations.length === 0) return undefined;
+  const measures: Record<string, { title: string; type: string }> = {};
+  const dimensions: Record<string, { title: string; type: string }> = {};
+  for (const c of citations) {
+    if (c.kind === 'measure') {
+      measures[c.name] = { title: c.display_name, type: 'measure' };
+    } else if (c.kind === 'dimension') {
+      dimensions[c.name] = { title: c.display_name, type: 'dimension' };
+    }
+  }
+  if (Object.keys(measures).length === 0 && Object.keys(dimensions).length === 0) return undefined;
+  return { measures, dimensions };
 }

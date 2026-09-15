@@ -26,21 +26,39 @@ import {
   type ReactFlowState,
 } from "reactflow";
 import { useBuilderStore } from "../../store/builderStore";
+import { useT } from "../../i18n";
 import { isOuterJoinType } from "../../lib/joinRules";
+import {
+  EdgeLabelRenderer,
+} from "reactflow";
 import {
   type Pt,
   awayVec,
-  autoOrthogonalRoute,
   polylinePath,
   closestSegIdx,
   applyOrthoSegmentDrag,
   applyFreeSegmentDrag,
   midpoints,
 } from "./edgeRouting";
+import {
+  SIDE_TO_POSITION,
+  isDrawableRoute,
+  resolveDisplayedDocking,
+  resolveDisplayedWaypoints,
+  routeEntersCard,
+} from "./edgeGeometry";
+// Docking maths comes from the module the worker uses, so a drawn dock and a
+// routed dock cannot drift apart.
+import { pointOnSide, ratioWithParallelOffset } from "./layout/docking";
+import type { Rect } from "./layout/types";
+import { applyOrthoBendDrag } from "./edgeOrthogonal";
 
 // ---------------------------------------------------------------------------
 // Public edge-data contract
 // ---------------------------------------------------------------------------
+
+/** Shared with `ERDTableNode`: one colour means "locked" across the canvas. */
+const LOCKED_ACCENT = "#C2185B";
 
 export interface CrowsFootEdgeData {
   joinType: string;
@@ -53,14 +71,29 @@ export interface CrowsFootEdgeData {
   targetIsDim?: boolean;
   offsetIndex?: number;
   totalEdges?: number;
+  /** Fan-out frozen at lock time; overrides the recomputed one while locked. */
+  lockedParallelOffset?: number;
   /** Legacy single waypoint — converted to array on first read. */
   waypoint?: { x: number; y: number };
   waypoints?: Pt[];
   pathing?: "orthogonal" | "straight";
+  /** Provenance of the stored bends: "auto" when the layout engine computed
+   *  them, "manual" when the user edited the route. Absent is resolved on read
+   *  (waypoints present => manual, none => auto), which is how layouts written
+   *  before this field existed stay correct. */
+  routeMode?: "auto" | "manual";
   sourceSide?: string;
   targetSide?: string;
   sourceRatio?: number;
   targetRatio?: number;
+  /** The complete displayed route and docking are frozen. Independent of a
+   *  table pin; unlocking never unpins. Absent means false, so a layout
+   *  written before route locking existed stays valid. */
+  locked?: boolean;
+  /** The columns this relationship joins on, shown when it is selected (R09). */
+  sourceColumn?: string | null;
+  targetColumn?: string | null;
+
   /** Read-only share-link mode (Bug-7636). When true, the edge suppresses
    *  waypoint, anchor, and pathing mutations so viewers cannot accidentally
    *  persist layout changes through the edge's own DOM handlers. */
@@ -76,31 +109,7 @@ export interface CrowsFootEdgeData {
 // Live node geometry from the ReactFlow store
 // ---------------------------------------------------------------------------
 
-interface Dims { x: number; y: number; w: number; h: number }
-
-type AnchorSide = "left" | "right" | "top" | "bottom";
-
-const ROUTE_MARGIN = 28;
-const ROUTE_STUB = 34;
-
-const SIDE_TO_POSITION: Record<AnchorSide, Position> = {
-  left: Position.Left,
-  right: Position.Right,
-  top: Position.Top,
-  bottom: Position.Bottom,
-};
-
-function clamp(n: number, min = 0, max = 1): number {
-  return Math.max(min, Math.min(max, n));
-}
-
-function asAnchorSide(value?: string): AnchorSide | null {
-  return value === "left" || value === "right" || value === "top" || value === "bottom"
-    ? value
-    : null;
-}
-
-function selectDimsString(id: string) {
+function selectRectString(id: string) {
   return (s: ReactFlowState): string | null => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const n = s.nodeInternals.get(id) as any;
@@ -114,13 +123,13 @@ function selectDimsString(id: string) {
   };
 }
 
-function parseDims(str: string | null): Dims | null {
+function parseRect(str: string | null): Rect | null {
   if (!str) return null;
   const [x, y, w, h] = str.split(",").map(Number);
-  return { x, y, w, h };
+  return { x, y, width: w, height: h };
 }
 
-function selectObstacleDimsString(sourceId: string, targetId: string) {
+function selectObstacleRectString(sourceId: string, targetId: string) {
   return (s: ReactFlowState): string => {
     const parts: string[] = [];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -137,7 +146,7 @@ function selectObstacleDimsString(sourceId: string, targetId: string) {
   };
 }
 
-function parseObstacleDims(str: string): Dims[] {
+function parseObstacleRects(str: string): Rect[] {
   if (!str) return [];
   return str.split("|").map((part) => {
     const pieces = part.split(",");
@@ -145,148 +154,8 @@ function parseObstacleDims(str: string): Dims[] {
     const y = Number(pieces[2]);
     const w = Number(pieces[3]);
     const h = Number(pieces[4]);
-    return { x, y, w, h };
-  }).filter((d) => Number.isFinite(d.x) && Number.isFinite(d.y) && d.w > 0 && d.h > 0);
-}
-
-function center(d: Dims): Pt {
-  return { x: d.x + d.w / 2, y: d.y + d.h / 2 };
-}
-
-function autoSide(from: Dims, to: Dims, endpoint: "source" | "target"): AnchorSide {
-  const fc = center(from);
-  const tc = center(to);
-  const dx = tc.x - fc.x;
-  const dy = tc.y - fc.y;
-  const horizontal = Math.abs(dx) >= Math.abs(dy);
-
-  if (endpoint === "source") {
-    return horizontal ? (dx >= 0 ? "right" : "left") : (dy >= 0 ? "bottom" : "top");
-  }
-  return horizontal ? (dx >= 0 ? "left" : "right") : (dy >= 0 ? "top" : "bottom");
-}
-
-function ratioToward(dims: Dims, side: AnchorSide, toward: Pt, parallelOffset: number): number {
-  if (side === "left" || side === "right") {
-    return clamp((toward.y + parallelOffset - dims.y) / dims.h, 0.08, 0.92);
-  }
-  return clamp((toward.x + parallelOffset - dims.x) / dims.w, 0.08, 0.92);
-}
-
-function ratioWithParallelOffset(
-  dims: Dims,
-  side: AnchorSide,
-  ratio: number,
-  parallelOffset: number,
-): number {
-  const span = side === "left" || side === "right" ? dims.h : dims.w;
-  return clamp(ratio + (span ? parallelOffset / span : 0), 0.08, 0.92);
-}
-
-function pointOnSide(dims: Dims, side: AnchorSide, ratio: number): Pt {
-  const r = clamp(ratio);
-  if (side === "left") return { x: dims.x, y: dims.y + dims.h * r };
-  if (side === "right") return { x: dims.x + dims.w, y: dims.y + dims.h * r };
-  if (side === "top") return { x: dims.x + dims.w * r, y: dims.y };
-  return { x: dims.x + dims.w * r, y: dims.y + dims.h };
-}
-
-function inflateRect(rect: Dims, margin: number): Dims {
-  return {
-    x: rect.x - margin,
-    y: rect.y - margin,
-    w: rect.w + margin * 2,
-    h: rect.h + margin * 2,
-  };
-}
-
-function segmentIntersectsRect(a: Pt, b: Pt, rect: Dims): boolean {
-  const minX = Math.min(a.x, b.x);
-  const maxX = Math.max(a.x, b.x);
-  const minY = Math.min(a.y, b.y);
-  const maxY = Math.max(a.y, b.y);
-  const rx2 = rect.x + rect.w;
-  const ry2 = rect.y + rect.h;
-
-  if (Math.abs(a.y - b.y) < 0.01) {
-    return a.y >= rect.y && a.y <= ry2 && maxX >= rect.x && minX <= rx2;
-  }
-  if (Math.abs(a.x - b.x) < 0.01) {
-    return a.x >= rect.x && a.x <= rx2 && maxY >= rect.y && minY <= ry2;
-  }
-  return maxX >= rect.x && minX <= rx2 && maxY >= rect.y && minY <= ry2;
-}
-
-function compactWaypoints(points: Pt[]): Pt[] {
-  const out: Pt[] = [];
-  for (const p of points) {
-    const prev = out[out.length - 1];
-    if (!prev || Math.abs(prev.x - p.x) > 0.5 || Math.abs(prev.y - p.y) > 0.5) {
-      out.push(p);
-    }
-  }
-  return out;
-}
-
-function routeScore(start: Pt, waypoints: Pt[], end: Pt, obstacles: Dims[]): number {
-  const pts = [start, ...waypoints, end];
-  let length = 0;
-  let intersections = 0;
-  for (let i = 0; i < pts.length - 1; i++) {
-    const a = pts[i];
-    const b = pts[i + 1];
-    length += Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
-    for (const obs of obstacles) {
-      if (segmentIntersectsRect(a, b, inflateRect(obs, 8))) intersections += 1;
-    }
-  }
-  return intersections * 100000 + length + waypoints.length * 20;
-}
-
-function autoOrthogonalRouteAvoiding(
-  sx: number, sy: number, sp: Position,
-  tx: number, ty: number, tp: Position,
-  obstacles: Dims[],
-): Pt[] {
-  const base = autoOrthogonalRoute(sx, sy, sp, tx, ty, tp);
-  if (obstacles.length === 0) return base;
-
-  const start = { x: sx, y: sy };
-  const end = { x: tx, y: ty };
-  const [sdx, sdy] = awayVec(sp);
-  const [tdx, tdy] = awayVec(tp);
-  const sEsc = { x: sx + sdx * ROUTE_STUB, y: sy + sdy * ROUTE_STUB };
-  const tEsc = { x: tx + tdx * ROUTE_STUB, y: ty + tdy * ROUTE_STUB };
-  const candidates: Pt[][] = [base];
-
-  for (const obs of obstacles) {
-    const expanded = inflateRect(obs, ROUTE_MARGIN);
-    const viaXs = [expanded.x, expanded.x + expanded.w];
-    const viaYs = [expanded.y, expanded.y + expanded.h];
-
-    for (const x of viaXs) {
-      candidates.push(compactWaypoints([
-        sEsc,
-        { x, y: sEsc.y },
-        { x, y: tEsc.y },
-        tEsc,
-      ]));
-    }
-    for (const y of viaYs) {
-      candidates.push(compactWaypoints([
-        sEsc,
-        { x: sEsc.x, y },
-        { x: tEsc.x, y },
-        tEsc,
-      ]));
-    }
-  }
-
-  return candidates.reduce((best, candidate) => (
-    routeScore(start, candidate, end, obstacles) < routeScore(start, best, end, obstacles)
-      ? candidate
-      : best
-  ), base);
+    return { x, y, width: w, height: h };
+  }).filter((d) => Number.isFinite(d.x) && Number.isFinite(d.y) && d.width > 0 && d.height > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -384,48 +253,63 @@ function CrowsFootEdge({
   sourcePosition, targetPosition,
   data, style = {}, selected,
 }: EdgeProps<CrowsFootEdgeData>) {
+  const t             = useT();
   const globalPathing = useBuilderStore((s) => s.relationPathing);
   const notation      = useBuilderStore((s) => s.relationNotation);
   const overrides     = useBuilderStore((s) => s.relationTerminalOverrides[id]);
   const isOrtho       = (data?.pathing ?? globalPathing) === "orthogonal";
 
   // ---- Live node geometry ----
-  const srcSelector = useCallback(selectDimsString(source), [source]);
-  const tgtSelector = useCallback(selectDimsString(target), [target]);
-  const obstacleSelector = useCallback(selectObstacleDimsString(source, target), [source, target]);
-  const srcDims = parseDims(useStore(srcSelector));
-  const tgtDims = parseDims(useStore(tgtSelector));
-  const obstacleDims = parseObstacleDims(useStore(obstacleSelector));
+  const srcSelector = useCallback(selectRectString(source), [source]);
+  const tgtSelector = useCallback(selectRectString(target), [target]);
+  const obstacleSelector = useCallback(selectObstacleRectString(source, target), [source, target]);
+  const srcRect = parseRect(useStore(srcSelector));
+  const tgtRect = parseRect(useStore(tgtSelector));
+  const obstacleRects = parseObstacleRects(useStore(obstacleSelector));
 
   // ---- Parallel-edge offset ----
+  // A locked route draws with the fan-out it was frozen with. Recomputing it
+  // from the CURRENT relationship set moved a frozen attachment whenever a
+  // parallel relationship was added or removed, while its frozen bends stayed
+  // absolute — which can turn a frozen orthogonal terminal into a diagonal.
   const idx     = data?.offsetIndex ?? 0;
   const total   = data?.totalEdges ?? 1;
   const spacing = 15;
-  const offset  = (idx - (total - 1) / 2) * spacing;
+  const offset  = data?.lockedParallelOffset ?? (idx - (total - 1) / 2) * spacing;
 
   // ---- Best-side border anchor selection ----
   let sx = sourceX, sy = sourceY + offset;
   let tx = targetX, ty = targetY + offset;
   let sp = sourcePosition, tp = targetPosition;
 
-  if (srcDims && tgtDims) {
-    const srcSide = asAnchorSide(data?.sourceSide) ?? autoSide(srcDims, tgtDims, "source");
-    const tgtSide = asAnchorSide(data?.targetSide) ?? autoSide(srcDims, tgtDims, "target");
-    const srcRatio = data?.sourceRatio !== undefined
-      ? ratioWithParallelOffset(srcDims, srcSide, data.sourceRatio, offset)
-      : ratioToward(srcDims, srcSide, center(tgtDims), offset);
-    const tgtRatio = data?.targetRatio !== undefined
-      ? ratioWithParallelOffset(tgtDims, tgtSide, data.targetRatio, offset)
-      : ratioToward(tgtDims, tgtSide, center(srcDims), offset);
-    const srcPoint = pointOnSide(srcDims, srcSide, srcRatio);
-    const tgtPoint = pointOnSide(tgtDims, tgtSide, tgtRatio);
+  if (srcRect && tgtRect) {
+    // The shared docking rule — the same call the lock action makes when it
+    // freezes this relationship, so the frozen docks are the drawn docks.
+    const docking = resolveDisplayedDocking({
+      source: srcRect,
+      target: tgtRect,
+      sourceSide: data?.sourceSide,
+      targetSide: data?.targetSide,
+      sourceRatio: data?.sourceRatio,
+      targetRatio: data?.targetRatio,
+    });
+    const srcPoint = pointOnSide(
+      srcRect,
+      docking.sourceSide,
+      ratioWithParallelOffset(srcRect, docking.sourceSide, docking.sourceRatio, offset),
+    );
+    const tgtPoint = pointOnSide(
+      tgtRect,
+      docking.targetSide,
+      ratioWithParallelOffset(tgtRect, docking.targetSide, docking.targetRatio, offset),
+    );
 
     sx = srcPoint.x;
     sy = srcPoint.y;
     tx = tgtPoint.x;
     ty = tgtPoint.y;
-    sp = SIDE_TO_POSITION[srcSide];
-    tp = SIDE_TO_POSITION[tgtSide];
+    sp = SIDE_TO_POSITION[docking.sourceSide];
+    tp = SIDE_TO_POSITION[docking.targetSide];
   }
 
   // ---- Drag state ----
@@ -433,8 +317,8 @@ function CrowsFootEdge({
   const [localWps, setLocalWps]     = useState<Pt[] | null>(null);
   const [localSrc, setLocalSrc]     = useState<Pt | null>(null);
   const [localTgt, setLocalTgt]     = useState<Pt | null>(null);
-  const dragRef = useRef({ sx, sy, tx, ty, srcDims, tgtDims, data, localWps, localSrc, localTgt, dragMode });
-  useEffect(() => { dragRef.current = { sx, sy, tx, ty, srcDims, tgtDims, data, localWps, localSrc, localTgt, dragMode }; });
+  const dragRef = useRef({ sx, sy, tx, ty, srcRect, tgtRect, data, localWps, localSrc, localTgt, dragMode });
+  useEffect(() => { dragRef.current = { sx, sy, tx, ty, srcRect, tgtRect, data, localWps, localSrc, localTgt, dragMode }; });
 
   const { screenToFlowPosition } = useReactFlow();
 
@@ -473,12 +357,28 @@ function CrowsFootEdge({
   const storedWps: Pt[] =
     data?.waypoints ??
     (data?.waypoint ? [data.waypoint] : []);
-  const wps: Pt[] = localWps ?? storedWps;
+  // Provenance resolution matches the worker snapshot: absent routeMode is
+  // manual when stored waypoints exist, otherwise auto (legacy layouts stay
+  // correct). In straight mode, engine-generated orthogonal bends are not valid
+  // straight geometry, so only manual free-angle bends are kept; a straight
+  // auto route is the direct heel-to-heel line (F08 / pathing setting). A live
+  // drag (`localWps`) always wins, so a straight-mode bend drag previews even
+  // before the commit marks the route manual.
+  const routeMode: "auto" | "manual" = data?.routeMode ?? (storedWps.length ? "manual" : "auto");
 
-  const effectiveWps: Pt[] =
-    isOrtho && wps.length === 0
-      ? autoOrthogonalRouteAvoiding(psx, psy, sp, ptx, pty, tp, obstacleDims)
-      : wps;
+  // A live drag always wins, so a bend drag previews even before the commit
+  // marks the route manual. Otherwise the shared resolution decides, which is
+  // again the call the lock action makes.
+  const effectiveWps: Pt[] = localWps ?? resolveDisplayedWaypoints({
+    heelSource: { x: psx, y: psy },
+    heelTarget: { x: ptx, y: pty },
+    sourcePosition: sp,
+    targetPosition: tp,
+    pathMode: isOrtho ? "orthogonal" : "straight",
+    routeMode,
+    stored: storedWps,
+    obstacles: obstacleRects,
+  });
 
   const startPt: Pt = { x: psx, y: psy };
   const endPt:   Pt = { x: ptx, y: pty };
@@ -493,19 +393,40 @@ function CrowsFootEdge({
   const my = mids[centerIdx]?.y ?? (psy + pty) / 2;
 
   // ---- Closest-side helper (for anchor drag) ----
-  const getClosestSide = (pos: Pt, dims: Dims | null) => {
-    if (!dims) return null;
-    const dL = Math.abs(pos.x - dims.x);
-    const dR = Math.abs(pos.x - (dims.x + dims.w));
-    const dT = Math.abs(pos.y - dims.y);
-    const dB = Math.abs(pos.y - (dims.y + dims.h));
+  const getClosestSide = (pos: Pt, rect: Rect | null) => {
+    if (!rect) return null;
+    const dL = Math.abs(pos.x - rect.x);
+    const dR = Math.abs(pos.x - (rect.x + rect.width));
+    const dT = Math.abs(pos.y - rect.y);
+    const dB = Math.abs(pos.y - (rect.y + rect.height));
     const min = Math.min(dL, dR, dT, dB);
     let side = "bottom", ratio = 0.5;
-    if (min === dL)      { side = "left";   ratio = dims.h ? (pos.y - dims.y) / dims.h : 0.5; }
-    else if (min === dR) { side = "right";  ratio = dims.h ? (pos.y - dims.y) / dims.h : 0.5; }
-    else if (min === dT) { side = "top";    ratio = dims.w ? (pos.x - dims.x) / dims.w : 0.5; }
-    else                 { side = "bottom"; ratio = dims.w ? (pos.x - dims.x) / dims.w : 0.5; }
+    if (min === dL)      { side = "left";   ratio = rect.height ? (pos.y - rect.y) / rect.height : 0.5; }
+    else if (min === dR) { side = "right";  ratio = rect.height ? (pos.y - rect.y) / rect.height : 0.5; }
+    else if (min === dT) { side = "top";    ratio = rect.width ? (pos.x - rect.x) / rect.width : 0.5; }
+    else                 { side = "bottom"; ratio = rect.width ? (pos.x - rect.x) / rect.width : 0.5; }
     return { side, ratio: Math.max(0, Math.min(1, ratio)) };
+  };
+
+  /**
+   * Whether a manually edited route may be persisted.
+   *
+   * Two ways an edit can end up undrawable: a diagonal in orthogonal mode (the
+   * repair should prevent it, so this is the backstop), and a bend dragged
+   * inside one of the relationship's own cards, which would draw the connector
+   * through the table it connects.
+   */
+  const manualEditIsValid = (wps: Pt[]): boolean => {
+    if (!isDrawableRoute([{ x: psx, y: psy }, ...wps, { x: ptx, y: pty }], isOrtho ? "orthogonal" : "straight")) {
+      return false;
+    }
+    // Card rectangles are read at commit time, not captured at render time:
+    // the pointer-up handler runs after a gesture that may itself have moved
+    // the cards, and the stale rects would test the wrong geometry.
+    const live = dragRef.current;
+    if (live.srcRect && routeEntersCard(wps, live.srcRect)) return false;
+    if (live.tgtRect && routeEntersCard(wps, live.tgtRect)) return false;
+    return true;
   };
 
   // ---- Can a segment be dragged? (both endpoints must be waypoints) ----
@@ -527,7 +448,10 @@ function CrowsFootEdge({
     if (isDraggableSeg(segIdx)) {
       setDragMode({ type: "segment", segIdx, origin: flowPos, initialWps: effectiveWps.map((p) => ({ ...p })) });
       setLocalWps(effectiveWps.map((p) => ({ ...p })));
-    } else if (!isOrtho) {
+    } else {
+      // Adding a bend works in both path modes. In orthogonal mode the new
+      // bend is repaired into the route as it is dragged, so the click cannot
+      // produce a diagonal (spec §4: add bend must not create diagonals).
       const newWps = [...effectiveWps];
       const insertIdx = Math.max(0, Math.min(segIdx, newWps.length));
       newWps.splice(insertIdx, 0, { ...flowPos });
@@ -576,6 +500,17 @@ function CrowsFootEdge({
       } else if (dm.type === "waypoint") {
         setLocalWps((prev) => {
           if (!prev) return prev;
+          // Orthogonal: the bend goes where the pointer is, its neighbouring
+          // bends follow on the coordinate they shared with it, and a dogleg is
+          // inserted where the neighbour is a fixed heel — so every segment
+          // stays axis-aligned and both terminals still leave their own card.
+          if (isOrtho) {
+            return applyOrthoBendDrag(
+              dm.wpIdx, pos, prev,
+              { x: psx, y: psy }, { x: ptx, y: pty },
+              sp, tp,
+            );
+          }
           const next = [...prev];
           next[dm.wpIdx] = { ...pos };
           return next;
@@ -594,19 +529,23 @@ function CrowsFootEdge({
 
       if (dm.type === "segment" || dm.type === "waypoint") {
         const finalWps = dr.localWps;
-        if (finalWps && dr.data?.onWaypointsChange) {
+        // Spec §4: restore the pre-gesture layout rather than persisting a
+        // broken connector. Dropping the local edit without calling back is
+        // exactly that restore — the stored route is untouched, so the edge
+        // redraws as it was.
+        if (finalWps && dr.data?.onWaypointsChange && manualEditIsValid(finalWps)) {
           dr.data.onWaypointsChange(finalWps);
         }
         setLocalWps(null);
       } else if (dm.type === "source") {
         if (dr.localSrc && dr.data?.onSourceSideChange) {
-          const res = getClosestSide(dr.localSrc, dr.srcDims);
+          const res = getClosestSide(dr.localSrc, dr.srcRect);
           if (res) dr.data.onSourceSideChange(res.side, res.ratio);
         }
         setLocalSrc(null);
       } else if (dm.type === "target") {
         if (dr.localTgt && dr.data?.onTargetSideChange) {
-          const res = getClosestSide(dr.localTgt, dr.tgtDims);
+          const res = getClosestSide(dr.localTgt, dr.tgtRect);
           if (res) dr.data.onTargetSideChange(res.side, res.ratio);
         }
         setLocalTgt(null);
@@ -624,6 +563,13 @@ function CrowsFootEdge({
 
   // ---- Double-click edge to reset waypoints ----
   const edgeReadOnly = data?.readOnly ?? false;
+  /**
+   * A locked relationship's path, docking and bends are frozen (R06), so every
+   * geometry gesture is withdrawn rather than merely refused on commit: an
+   * affordance that visibly moves and then snaps back reads as a bug. The route
+   * stays selectable — the user has to select it to unlock it.
+   */
+  const geometryFrozen = edgeReadOnly || data?.locked === true;
   const onDblClick = useCallback((e: ReactMouseEvent) => {
     e.stopPropagation();
     if (edgeReadOnly) return;
@@ -632,23 +578,31 @@ function CrowsFootEdge({
 
   // ---- Visual properties ----
   const baseStroke     = (style.stroke as string) ?? "#90a4ae";
-  const stroke         = selected ? "#D4AF37" : baseStroke;
+  // A locked route carries the lock colour, the same one a position-locked card
+  // uses. Selection still wins on colour, because a user needs to see what they
+  // have selected — the padlock glyph keeps the lock legible either way.
+  const stroke         = selected ? "#D4AF37" : data?.locked === true ? LOCKED_ACCENT : baseStroke;
   const isOuterJoin    = isOuterJoinType(data?.joinType);
   const strokeWidth    = selected ? 2.5 : 2;
   const strokeDasharray = isOuterJoin ? "5,5" : undefined;
   const isDragging     = dragMode !== null;
 
+  const locked = data?.locked === true;
+
   return (
-    <g data-testid={`edge-${id}`} style={{ color: stroke }}>
+    <g data-testid={`edge-${id}`} data-locked={locked ? "true" : undefined} style={{ color: stroke }}>
+      {/* Announced to assistive technology and shown as the native tooltip;
+          the glyph below carries the same state visually. */}
+      {locked && <title>{t("canvas.routeLockedEdge")}</title>}
       {/* Invisible wide hit target for selection and segment drag */}
       <path
         d={edgePath}
         fill="none"
         stroke="transparent"
         strokeWidth={20}
-        style={{ cursor: selected ? "grab" : "pointer" }}
-        onMouseDown={onPathDown}
-        onDoubleClick={onDblClick}
+        style={{ cursor: selected && !geometryFrozen ? "grab" : "pointer" }}
+        onMouseDown={geometryFrozen ? undefined : onPathDown}
+        onDoubleClick={geometryFrozen ? undefined : onDblClick}
       />
 
       {/* Visible polyline path */}
@@ -663,12 +617,71 @@ function CrowsFootEdge({
         style={{ zIndex: selected ? 100 : 1, pointerEvents: "none" }}
       />
 
+      {/* Lock indicator at the route midpoint: a padlock outline in the edge's
+          own colour, so a locked relationship reads as locked without opening
+          the panel. */}
+      {locked && (
+        <g pointerEvents="none" aria-hidden="true">
+          <rect
+            x={mx - 5} y={my - 3} width={10} height={8} rx={1.5}
+            fill="#ffffff" stroke={LOCKED_ACCENT} strokeWidth={1.5}
+          />
+          <path
+            d={`M ${mx - 2.8} ${my - 3} L ${mx - 2.8} ${my - 5.2} A 2.8 2.8 0 0 1 ${mx + 2.8} ${my - 5.2} L ${mx + 2.8} ${my - 3}`}
+            fill="none" stroke={LOCKED_ACCENT} strokeWidth={1.5}
+          />
+        </g>
+      )}
+
+      {/* Selected-relationship summary: the columns it joins on (R09).
+
+          A VISUAL surface only, deliberately. React Flow renders edge labels
+          inside a container marked `aria-hidden="true"`, so nothing placed here
+          reaches assistive technology, and `aria-hidden` is inherited — a
+          descendant cannot opt back in. Found by the production-browser gate;
+          the jsdom React Flow does not set that attribute, so a control here
+          looked correct in unit tests while being invisible to a screen reader.
+
+          There is no "open the join" button here, because selecting the
+          relationship has ALREADY opened its detail: `onEdgeClick` selects the
+          join and opens the Joins panel. A button whose action has happened by
+          the time it appears is not an affordance. The remaining gap — that a
+          keyboard user cannot select a relationship on the canvas at all — is
+          registered rather than papered over with a control that does nothing. */}
+      {selected && (
+        <EdgeLabelRenderer>
+          <div
+            style={{
+              position: "absolute",
+              transform: `translate(-50%, -50%) translate(${mx}px, ${my}px)`,
+              pointerEvents: "none",
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              background: "#ffffff",
+              border: "1px solid #cfd8dc",
+              borderRadius: 3,
+              padding: "2px 6px",
+              fontSize: 10,
+              whiteSpace: "nowrap",
+              zIndex: 101,
+            }}
+          >
+            <span>
+              {data?.sourceColumn && data?.targetColumn
+                ? `${data.sourceColumn} = ${data.targetColumn}`
+                : t("canvas.joinColumnsUnknown")}
+            </span>
+          </div>
+        </EdgeLabelRenderer>
+      )}
+
       {/* Markers at card borders */}
       {drawMarker(sx, sy, sp, srcMarker, notation)}
       {drawMarker(tx, ty, tp, tgtMarker, notation)}
 
       {/* Waypoint bend-point handles (squares, visible when selected) */}
-      {(selected || isDragging) && effectiveWps.map((wp, i) => {
+      {(selected || isDragging) && !geometryFrozen && effectiveWps.map((wp, i) => {
         const liveWp = localWps ? localWps[i] ?? wp : wp;
         return (
           <g
@@ -701,8 +714,9 @@ function CrowsFootEdge({
         </g>
       ))}
 
-      {/* Source anchor -- hidden in readOnly mode to prevent layout mutations (Bug-7636) */}
-      {!edgeReadOnly && (
+      {/* Source anchor -- hidden in readOnly mode to prevent layout mutations
+          (Bug-7636), and while the route is locked (R06). */}
+      {!geometryFrozen && (
       <g
         style={{ cursor: "grab", pointerEvents: selected ? "all" : "none", opacity: selected || dragMode?.type === "source" ? 1 : 0 }}
         onMouseDown={onSrcDown}
@@ -717,8 +731,9 @@ function CrowsFootEdge({
       </g>
       )}
 
-      {/* Target anchor -- hidden in readOnly mode to prevent layout mutations (Bug-7636) */}
-      {!edgeReadOnly && (
+      {/* Target anchor -- hidden in readOnly mode to prevent layout mutations
+          (Bug-7636), and while the route is locked (R06). */}
+      {!geometryFrozen && (
       <g
         style={{ cursor: "grab", pointerEvents: selected ? "all" : "none", opacity: selected || dragMode?.type === "target" ? 1 : 0 }}
         onMouseDown={onTgtDown}

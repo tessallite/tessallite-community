@@ -183,6 +183,37 @@ async def test_login_success(anon_client):
 
 
 @pytest.mark.asyncio
+async def test_bug9799_successful_tenant_login_commits_lockout_reset(anon_client):
+    """A successful tenant login durably clears its scoped failure counter."""
+    user = _make_local_user()
+    identity = UserIdentity(
+        email=user.email,
+        display_name="Test User",
+        source_backend="local",
+        raw_claims={},
+    )
+    tenant_db = _mock_db_with_user(user)
+    system_db = _mock_system_db()
+    reset_mock = AsyncMock()
+
+    with (
+        patch("src.api.auth.get_system_db", lambda: _yield(system_db)),
+        patch("src.api.auth.get_auth_chain", return_value=_mock_chain(identity)),
+        patch("src.api.auth.get_tenant_db", lambda tid: _yield(tenant_db)),
+        patch("src.api.auth.record_login_success", reset_mock),
+        patch("src.api.auth.audit", AsyncMock()),
+    ):
+        resp = await anon_client.post(
+            "/api/v1/auth/login",
+            json={"tenant_id": "acme", "email": user.email, "password": "secret"},
+        )
+
+    assert resp.status_code == 200
+    reset_mock.assert_awaited_once_with(system_db, "acme", user.email)
+    system_db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_logout_invalidates_bearer_jwt(anon_client):
     """F-021-01: logout then Bearer GET /users/me is 401 (cookie clear is not enough)."""
     user = _make_local_user()
@@ -362,6 +393,29 @@ async def test_login_unknown_tenant_returns_401(anon_client):
 
     assert resp.status_code == 401
     assert resp.json()["detail"] == "Invalid tenant or credentials"
+
+
+@pytest.mark.asyncio
+async def test_bug9799_unknown_tenant_does_not_increment_lockout_counter(anon_client):
+    """A model-slug/unknown tenant probe has no account to lock out."""
+    failure_mock = AsyncMock()
+
+    async def _raise_unknown_tenant():
+        raise ValueError("Tenant not found")
+        yield  # pragma: no cover
+
+    with (
+        patch("src.api.auth.get_auth_chain", return_value=_mock_chain(None)),
+        patch("src.api.auth.get_tenant_db", lambda tid: _raise_unknown_tenant()),
+        patch("src.api.auth.record_login_failure", failure_mock),
+    ):
+        resp = await anon_client.post(
+            "/api/v1/auth/login",
+            json={"tenant_id": "modelx", "email": "u@example.com", "password": "pw"},
+        )
+
+    assert resp.status_code == 401
+    failure_mock.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

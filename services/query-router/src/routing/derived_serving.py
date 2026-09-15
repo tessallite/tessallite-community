@@ -41,6 +41,7 @@ SOURCE_ONLY. The router NEVER serves on a non-EXACT verdict in Phase 5.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -155,10 +156,10 @@ class DerivedServeContext:
     connector_source_version: Optional[str] = None
 
 
-def _manifest_list(value: Any) -> list[dict]:
-    """Return a JSONB manifest column as a list of dicts, fail-closed to []."""
-    if isinstance(value, list):
-        return [v for v in value if isinstance(v, dict)]
+def _manifest_list(value: Any) -> list[Mapping[str, Any]]:
+    """Return a JSONB manifest as a list view, fail-closed to []."""
+    if isinstance(value, (list, tuple)):
+        return [v for v in value if isinstance(v, Mapping)]
     return []
 
 
@@ -226,7 +227,7 @@ def build_query_key_requests(bound_query: BoundQuery) -> list[QueryKeyRequest]:
         # and the (unserved) coarsening path both see identical inputs.
         time_unit = None
         sctx = bde.semantic_context or {}
-        if isinstance(sctx, dict):
+        if isinstance(sctx, Mapping):
             time_unit = sctx.get("date_trunc_unit") or sctx.get("time_unit")
         input_column_ids = tuple(
             str(ref.column_id) for ref in (bde.inputs or []) if ref.column_id
@@ -683,7 +684,7 @@ def _week_start_pinned(agg: AggregateDefinition) -> bool:
     """
     for gk in _manifest_list(agg.grain_keys):
         sctx = gk.get("semantic_context")
-        if isinstance(sctx, dict) and sctx.get("week_start_pinned"):
+        if isinstance(sctx, Mapping) and sctx.get("week_start_pinned"):
             return True
     return False
 

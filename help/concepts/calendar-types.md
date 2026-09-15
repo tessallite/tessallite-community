@@ -27,7 +27,7 @@ When a calendar table IS present, the system uses its pre-computed columns inste
 
 ## Calendar table binding rule
 
-Standard, fiscal, ISO Week, and Thai Buddhist calendars are expression-capable: Tessallite can compute their period boundaries from the hierarchy's calendar type and the fact date. Retail 4-4-5 and Hijri calendars are table-bound: they require a physical calendar table with real mapped source columns. A physical table is also required for dense date enumeration, custom business period columns, coverage checks, and role-playing calendar aliases.
+Standard, fiscal, ISO Week, and Thai Buddhist calendars are expression-capable: Tessallite can compute their period boundaries from the hierarchy's calendar type and the fact date. Retail 4-4-5 and Hijri calendars are table-bound: they require a physical calendar table with real mapped source columns. A physical table is also required for dense date enumeration, custom business period columns, coverage checks, and calendar dimension aliases.
 
 ## The six calendar types
 
@@ -98,7 +98,7 @@ A model can use any number of calendar types across its hierarchies. This is com
 - Your sales team uses 4-4-5 periods while finance uses standard months.
 - You serve both domestic (Hijri) and international (Gregorian) audiences.
 
-Each time hierarchy carries its own calendar type. When you create a time hierarchy, you set the calendar type on it. Different hierarchies on the same model can use different calendar types. Physical calendar tables are only needed for table-bound calendar types (retail 4-4-5 and Hijri) or physical-table workflows such as dense enumeration, custom period columns, coverage checks, and role-playing aliases.
+Each time hierarchy carries its own calendar type. When you create a time hierarchy, you set the calendar type on it. Different hierarchies on the same model can use different calendar types. Physical calendar tables are only needed for table-bound calendar types (retail 4-4-5 and Hijri) or physical-table workflows such as dense enumeration, custom period columns, coverage checks, and dimension aliases.
 
 **When one is enough:** If all your time-intelligence variants use the same calendar system, one hierarchy with one calendar type is sufficient. Don't create extra hierarchies "just in case" — each one adds complexity to the variant resolver.
 

@@ -34,6 +34,14 @@ To install or replace it, use the **Upload license file** button on the Licence 
 - A valid licence is **stored in the platform database** and applied immediately — no restart.
 - Because the licence lives in the database rather than a file, this works on **every** deployment, including read-only/serverless hosts such as Cloud Run. You do not need to configure a verification key or a writable licence file; the public verification key is built in.
 
+### Reading the edition indicators
+
+The top-bar edition chip and the Edition & capacity card can show a few distinct states, each meaning something different:
+
+- **A plain edition name** (e.g. "Community") with no other marker — enforcement is either off, or a valid licence for that edition is active. Nothing to do.
+- **"Not activated" next to the edition name** — enforcement is on but no valid licence is installed for a paid edition. The deployment is running with that edition's feature set unlocked but unlicensed; install a licence to clear this.
+- **A distinct error chip on the Licence Manager card, with a plain-language explanation** — the licence manager itself failed to load (a broken compiled manager, not a missing licence). This is different from "no licence installed": it means the platform could not even evaluate whatever licence state exists. A brief technical detail is shown only to system administrators, never to other users, to help diagnose the failure without exposing internals broadly.
+
 ## Required variables
 
 | Variable | Purpose |

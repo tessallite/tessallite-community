@@ -26,6 +26,10 @@ import {
   localizeKpiLabel,
   type KpiDisplayStatus,
 } from "./statusUtils";
+import {
+  FORMULA_FAMILIES,
+  TIME_WINDOW_PRESETS,
+} from "../KpiBusinessBuilder/businessDefinition";
 
 function localizedBusinessSummary(
   tokens: Record<string, unknown> | undefined,
@@ -57,7 +61,11 @@ function localizedBusinessSummary(
     const sla = (tokens.sla_type as string) ?? "compliance_pct";
     parts.push(`${t("kpiBusiness.summarySlA")} (${t(`kpiBusiness.sla${sla === "compliance_pct" ? "CompliancePct" : sla === "exception_count" ? "BreachCount" : "Backlog"}`)})`);
   } else {
-    parts.push(ft.replace(/_/g, " "));
+    // Bug-7222: every formula type the backend can produce is mapped to an
+    // i18n key (the finite FORMULA_FAMILIES domain). The raw-token fallback
+    // survives only for a genuinely unknown value.
+    const fam = FORMULA_FAMILIES.find((f) => f.type === ft);
+    parts.push(fam ? t(fam.labelKey) : ft.replace(/_/g, " "));
   }
 
   const tcType = tokens.time_calc_type as string | undefined;
@@ -69,16 +77,21 @@ function localizedBusinessSummary(
       period_to_date: ((tokens.time_calc_period as string) ?? "YTD").toUpperCase(),
       trailing_sum: `${t("kpiBusiness.tcTrailing")} ${tcPeriods ?? ""} ${tcGrain}s`,
       moving_average: `${tcPeriods ?? ""}-${tcGrain} ${t("kpiBusiness.tcMovingAvg")}`,
+      lag: t("kpiBusiness.timeCalcLag"),
+      lead: t("kpiBusiness.timeCalcLead"),
+      cagr: t("kpiBusiness.timeCalcCagr"),
       percentage_change: t("kpiBusiness.tcPctChange"),
-      yoy_value: "YoY",
-      yoy_growth_pct: "YoY %",
+      yoy_value: t("kpiBusiness.summaryYoyValue"),
+      yoy_growth_pct: t("kpiBusiness.summaryYoyGrowthPct"),
     };
     parts.push(tcLabels[tcType] ?? tcType.replace(/_/g, " "));
   }
 
   const twPreset = tokens.time_window_preset as string | undefined;
   if (twPreset) {
-    parts.push(`${t("kpiBusiness.summaryFor")} ${twPreset.replace(/_/g, " ")}`);
+    const twEntry = TIME_WINDOW_PRESETS.find((tw) => tw.preset === twPreset);
+    const twLabel = twEntry ? t(twEntry.labelKey) : twPreset.replace(/_/g, " ");
+    parts.push(`${t("kpiBusiness.summaryFor")} ${twLabel}`);
   }
 
   const filterDims = tokens.filter_dimensions as string[] | undefined;

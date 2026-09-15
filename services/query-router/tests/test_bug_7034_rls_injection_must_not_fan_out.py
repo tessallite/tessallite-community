@@ -223,9 +223,15 @@ def test_f007_05_star_join_with_owners_qualifies_fact_not_dimension():
 
 @pytest.mark.asyncio
 async def test_multi_owner_qualification_is_deterministic():
-    """Bug-9264: two tables both carrying the security column must qualify
-    the path/fact owner, not whichever row the unordered lookup returned
-    first. Still exactly one conjunct (Bug-7034 must stay green).
+    """Bug-9264: the owner ranking is deterministic — the path/fact owner is
+    first, not whichever row the unordered lookup returned first.
+
+    Bug-9373: when BOTH tables carrying the security column are scanned, BOTH
+    scans are constrained — one conjunct qualified to ``f`` AND one to ``d``.
+    The pre-fix code took only the first present owner, leaving the
+    ``dim_region`` scan row-unsecured. This is not the Bug-7034 fan-out: the
+    predicate is bound only to relations the model PROVES own the column
+    (``dim_product`` in the star test above still gets none).
     """
     from unittest.mock import AsyncMock
 
@@ -269,22 +275,18 @@ async def test_multi_owner_qualification_is_deterministic():
         "GROUP BY d.category"
     )
     out = _inject_security_where(sql, pred)
-    assert _security_conjunct_count(out) == 1, (
-        "Bug-7034: two owners must not fan the predicate. Got: " + out
+    assert _security_conjunct_count(out) == 2, (
+        "Bug-9373: both owning scans (sales f, dim_region d) must be "
+        "constrained, one conjunct each. Got: " + out
     )
     ast = sqlglot.parse_one(out, read="postgres")
     where = ast.args.get("where")
     assert where is not None, f"expected a WHERE clause, got: {out}"
-    dim_qualified = [
-        col for col in where.find_all(exp.Column)
-        if col.name == "region_code" and col.table == "d"
-    ]
-    assert not dim_qualified, (
-        "path/fact owner is sales, but the predicate qualified dim_region: "
-        f"{out}"
+    qualifying_aliases = {
+        col.table for col in where.find_all(exp.Column)
+        if col.name == "region_code"
+    }
+    assert qualifying_aliases == {"f", "d"}, (
+        "every owning scan must be constrained; got "
+        f"{sorted(qualifying_aliases)} in: {out}"
     )
-    fact_qualified = [
-        col for col in where.find_all(exp.Column)
-        if col.name == "region_code" and col.table == "f"
-    ]
-    assert fact_qualified, f"expected f.region_code qualification, got: {out}"

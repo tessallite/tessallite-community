@@ -25,7 +25,7 @@ Key differences from ``rewrite_for_source`` (source_sql.py):
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any
+from typing import Any, Sequence
 
 from shared.semantic.calculated_expression import (
     ExpressionValidationError,
@@ -99,7 +99,11 @@ def _pg_null(data_type: str | None, alias: str) -> str:
 
 
 async def rewrite_for_raw(
-    bound_query: BoundQuery, db: Any, *, target_dialect: str | None = None,
+    bound_query: BoundQuery,
+    db: Any,
+    *,
+    target_dialect: str | None = None,
+    security_column_owners: Sequence[tuple[str, str]] | None = None,
 ) -> str:
     """Build an ungrouped SQL query for the raw route.
 
@@ -107,6 +111,15 @@ async def rewrite_for_raw(
     declared orientation-aware JOINs for mandatory population edges, no
     aggregation, and typed-NULL placeholders for columns backed by unreachable
     tables or unsupported measure types.
+
+    Bug-9914: ``security_column_owners`` is the compiled row-security owner
+    metadata (``CompiledPredicate.security_column_owners``). When present, the
+    relation that owns the security column is kept in the join plan even if no
+    projected column references it -- the same rule ``rewrite_for_source``
+    applies (Bug-9837) -- so ``_inject_security_where`` can bind the predicate
+    to the owner scan. Without it a raw plan that did not happen to join the
+    owner dimension was refused ``security_column_owner_not_scanned`` for a
+    query the source route answers correctly.
     """
     if target_dialect is not None:
         _target_dialect = target_dialect
@@ -338,6 +351,31 @@ async def rewrite_for_raw(
 
     base_table_id = base_table.id
 
+    # Bug-9914: keep the row-security owner relation(s) in the raw join plan.
+    # The owner resolver is shared with the source rewriter so both routes
+    # require the same proven owner; an owner that cannot be resolved uniquely
+    # in this graph, or that the base can reach only across a many side
+    # (Bug-9930: another fact through a conformed dimension, which would
+    # repeat every queried row), hands the query back to the source route
+    # (fail closed there), never a bare predicate against the wrong scan.
+    # F-R2-02: owners are added AFTER the Bug-7016 base selection above so
+    # an owner fact can never take the FROM position from the queried fact.
+    security_owner_table_ids: set = set()
+    if security_column_owners:
+        from src.rewrite.source_sql import _resolve_security_owner_table_ids
+
+        try:
+            security_owner_table_ids = _resolve_security_owner_table_ids(
+                security_column_owners, tables_by_id,
+                joins=joins, base_table_id=base_table_id,
+                columns_by_id=columns_by_id,
+            )
+        except SemanticBindingError as exc:
+            raise RawRouteUnsupported(
+                f"raw source route cannot bind the row-security owner: {exc}"
+            ) from exc
+        required_table_ids |= security_owner_table_ids
+
     # Bug-8615 / G3: raw/source row serving must not drop a deployed
     # population-defining edge merely because no projected column names its
     # far table.  Use the shared closure and refuse malformed graph data.
@@ -397,6 +435,14 @@ async def rewrite_for_raw(
         if str(table_id) in population_table_ids
     }
     unreachable_table_ids = required_table_ids - reachable
+    if security_owner_table_ids & unreachable_table_ids:
+        # Bug-9914: an owner the raw plan cannot join would leave the security
+        # column unbound; the injector would refuse (403). Decline to the
+        # source route instead, which fails closed on the same condition.
+        raise RawRouteUnsupported(
+            "raw source route cannot join the relation that owns the "
+            "row-security column"
+        )
 
     alias_by_table_id: dict[Any, str] = {}
     for tid, t in tables_by_id.items():

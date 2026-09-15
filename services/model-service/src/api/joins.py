@@ -8,7 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 
-from shared.db.models import Join, ModelColumn, ModelTable
+from shared.db.models import CalendarTable, Join, ModelColumn, ModelTable
 from shared.db.session import get_tenant_db
 from shared.schemas.pydantic_models import (
     JoinCreate,
@@ -239,11 +239,22 @@ async def list_joins(
             select(Join).where(Join.model_id == model_id)
         )
         joins = result.scalars().all()
+        # Match the table catalogue's intentional automatic-calendar exclusion.
+        hidden_ids = set((await db.execute(
+            select(ModelTable.id)
+            .join(CalendarTable, ModelTable.calendar_table_id == CalendarTable.id)
+            .where(ModelTable.model_id == model_id, CalendarTable.autocreated.is_(True))
+        )).scalars().all())
         table_cache: dict[UUID, ModelTable] = {}
-        return [
-            await _build_join_response(db, j, table_cache=table_cache)
-            for j in joins
-        ]
+        responses = []
+        for join in joins:
+            response = await _build_join_response(db, join, table_cache=table_cache)
+            response.hidden_calendar_table_ids = [
+                table_id for table_id in dict.fromkeys((join.left_table_id, join.right_table_id))
+                if table_id in hidden_ids
+            ]
+            responses.append(response)
+        return responses
 
 
 @router.get("/{join_id}", response_model=JoinResponse, dependencies=[require_role("viewer")])

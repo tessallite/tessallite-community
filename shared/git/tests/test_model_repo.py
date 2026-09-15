@@ -464,6 +464,43 @@ class TestGetFileAt:
         content = get_file_at(TENANT, MODEL, sha, "canvas_layout.json")
         assert json.loads(content) == layout
 
+    def test_preserves_optional_presentation_fields(self):
+        """New optional layout fields survive commit and read-back untouched.
+
+        Pinning, route locking, route provenance and the last applied layout
+        options are presentation state the model owns. A serialiser that
+        enumerated keys would silently drop them (and would break reopening a
+        saved model), so the whole blob must round-trip -- including a key this
+        client version does not know about.
+        """
+        layout = {
+            "tables": {
+                "fact_sales": {"x": 100, "y": 200, "w": 320, "h": 420, "pinned": True},
+                "dim_date": {"x": 600, "y": 200, "pinned": False},
+            },
+            "edges": {
+                "join_1": {
+                    "waypoints": [{"x": 420, "y": 260}],
+                    "sourceSide": "right",
+                    "targetSide": "left",
+                    "sourceRatio": 0.5,
+                    "targetRatio": 0.5,
+                    "pathing": "orthogonal",
+                    "locked": True,
+                    "routeMode": "auto",
+                }
+            },
+            "layoutOptions": {"preset": "hierarchical", "direction": "DOWN", "spacing": "dense"},
+            "viewport": {"x": 0, "y": 0, "zoom": 1},
+            "notes": "keep me",
+            "futurePresentationField": {"nested": [1, 2, 3]},
+        }
+
+        sha = commit_layout(TENANT, MODEL, layout, "pin and lock", "dev@co.com")
+
+        content = get_file_at(TENANT, MODEL, sha, "canvas_layout.json")
+        assert json.loads(content) == layout
+
 
 # ---- Sanitise commit message ----
 

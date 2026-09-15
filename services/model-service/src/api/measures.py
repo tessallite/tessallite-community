@@ -135,6 +135,10 @@ def _measure_closure_context(
     """
     ctx = ClosureContext(
         restricted_uda_ids=_restricted_uda_ids(restricted_cols, uda_col_map),
+        # Honest by construction: complete only when the caller supplied the
+        # universe. A dependency-bearing object checked without one is now
+        # refused rather than silently reported restricted (Bug-9265).
+        measure_universe_complete=all_measures is not None,
     )
     if all_measures:
         for m in all_measures:
@@ -188,10 +192,33 @@ async def _load_uda_column_map(
     return mapping
 
 
+def _measure_has_dependency(measure) -> bool:
+    """True when the closure must walk beyond this object's own columns."""
+    return (
+        getattr(measure, "variant_of_measure_id", None) is not None
+        or getattr(measure, "measure_type", None) == "calculated"
+    )
+
+
+async def _dependency_measure_universe(db, model_id, measure, restricted_cols):
+    """The model's measures, loaded ONLY when the closure will need them.
+
+    Bug-9265 (review finding 3): a dependency-bearing object cannot be judged
+    against an empty measure map. Most measures carry no dependency, so the
+    load is skipped for them and the single-measure read keeps its cost.
+    """
+    if not restricted_cols or not _measure_has_dependency(measure):
+        return None
+    return (
+        await db.execute(select(Measure).where(Measure.model_id == model_id))
+    ).scalars().all()
+
+
 def _measure_touches_restricted_column(
     measure,
     restricted_cols: set[UUID],
     uda_col_map: dict[UUID, set[UUID]] | None = None,
+    all_measures=None,
 ) -> bool:
     """True when a measure is backed by a CLS-restricted column.
 
@@ -211,11 +238,21 @@ def _measure_touches_restricted_column(
     shared ``object_touches_restricted`` so both services apply ONE algorithm.
     (Transitive calc-measure hiding is handled separately by
     ``_compute_transitive_hidden_names``; this per-object check is the direct
-    seed, so no measure map is supplied here.)
+    seed.)
+
+    Bug-9265 (review finding 3): ``all_measures`` MUST be supplied whenever the
+    object carries a dependency — a variant base or a calculated expression.
+    The shared closure now fails closed on a base it cannot resolve, which is
+    correct only when the universe it was given is complete. Passing an empty
+    map for a dependency-bearing object asks the primitive for an authoritative
+    answer from a context the caller knows is incomplete, and it answered
+    "restricted" for every variant the moment any column in the model was
+    restricted. Use ``_dependency_measure_universe`` to load it only when the
+    object actually needs it.
     """
     if not restricted_cols:
         return False
-    ctx = _measure_closure_context(restricted_cols, uda_col_map)
+    ctx = _measure_closure_context(restricted_cols, uda_col_map, all_measures)
     return object_touches_restricted(
         measure, normalise_id_set(restricted_cols), ctx,
     )
@@ -252,7 +289,12 @@ async def _ensure_measure_visible_to_persona(
         # Bug-7606: load UDA column refs so UDA-backed measures are
         # CLS-checked against the columns their expression references.
         uda_col_map = await _load_uda_column_map(db, model_id) if restricted_cols else None
-        if _measure_touches_restricted_column(measure, restricted_cols, uda_col_map):
+        _dep_universe = await _dependency_measure_universe(
+            db, model_id, measure, restricted_cols,
+        )
+        if _measure_touches_restricted_column(
+            measure, restricted_cols, uda_col_map, _dep_universe,
+        ):
             raise HTTPException(status_code=404, detail="Measure not found")
         # Bug-6617 / Bug-6896: lineage-transitive CLS with fixed-point
         # closure.  A calculated measure whose expression references any
@@ -1243,7 +1285,12 @@ async def get_measure(
             # Bug-7606: load UDA column refs so UDA-backed measures are
             # CLS-checked against the columns their expression references.
             uda_col_map = await _load_uda_column_map(db, model_id) if restricted_cols else None
-            if _measure_touches_restricted_column(m, restricted_cols, uda_col_map):
+            _dep_universe = await _dependency_measure_universe(
+                db, model_id, m, restricted_cols,
+            )
+            if _measure_touches_restricted_column(
+                m, restricted_cols, uda_col_map, _dep_universe,
+            ):
                 raise HTTPException(status_code=404, detail="Measure not found")
             # Bug-6896: transitive CLS — a calculated measure referencing
             # any transitively-hidden measure is also hidden.

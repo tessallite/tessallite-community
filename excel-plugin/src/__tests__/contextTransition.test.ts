@@ -14,6 +14,7 @@
  * persona's values. These tests pin the two guarantees at the boundary.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createContextTransitionCoordinator } from '../utils/contextTransition';
 
 const mockStorage: Record<string, string> = {};
 
@@ -108,6 +109,102 @@ describe('applyContextTransition (F-025-03)', () => {
     expect(mockStorage['tessallite_active_persona']).toBe('persona-restricted');
   });
 });
+
+describe('context transition generation (Bug-9826)', () => {
+  it('aborts the older generation and commits only the latest queued transition', async () => {
+    const coordinator = createContextTransitionCoordinator();
+    const events: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstStarted!: () => void;
+    const firstStartedPromise = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+
+    const first = coordinator.begin();
+    const firstRun = coordinator.run(first, async (current) => {
+      events.push('first-state');
+      firstStarted();
+      await firstGate;
+      if (current.isCurrent()) events.push('first-storage');
+    });
+    await firstStartedPromise;
+
+    const second = coordinator.begin();
+    const secondRun = coordinator.run(second, async (current) => {
+      if (current.isCurrent()) events.push('second-storage');
+    });
+    releaseFirst();
+    await Promise.all([firstRun, secondRun]);
+
+    expect(first.generation).toBe(1);
+    expect(second.generation).toBe(2);
+    expect(first.signal.aborted).toBe(true);
+    expect(events).toEqual(['first-state', 'second-storage']);
+  });
+
+  it('uses a strictly increasing cache generation for rapid transitions', async () => {
+    const { bumpCacheGeneration, getCacheGeneration } = await import('../utils/storage');
+
+    await bumpCacheGeneration(1);
+    const first = Number(await getCacheGeneration());
+    await bumpCacheGeneration(2);
+    const second = Number(await getCacheGeneration());
+
+    expect(first).toBeGreaterThan(0);
+    expect(second).toBeGreaterThan(first);
+  });
+
+  it('skips obsolete storage, cache invalidation, and recalculation work', async () => {
+    const capture: RecalcCapture = { calls: [] };
+    stubExcel(capture);
+    const { applyContextTransition } = await import('../functions');
+    const events: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstPersistStarted!: () => void;
+    const firstPersistStartedPromise = new Promise<void>((resolve) => {
+      firstPersistStarted = resolve;
+    });
+    let firstCurrent = true;
+
+    const first = applyContextTransition({
+      generation: 1,
+      isCurrent: () => firstCurrent,
+      persist: async () => {
+        events.push('first-storage');
+        firstPersistStarted();
+        await firstGate;
+        if (firstCurrent) events.push('first-storage-commit');
+      },
+    });
+    await firstPersistStartedPromise;
+    firstCurrent = false;
+
+    const second = applyContextTransition({
+      generation: 2,
+      isCurrent: () => true,
+      persist: async () => {
+        events.push('second-storage-commit');
+      },
+    });
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(events).toEqual(['first-storage', 'second-storage-commit']);
+    expect(capture.calls).toEqual(['FullRebuild']);
+    expect(Number(await getStoredGeneration())).toBeGreaterThanOrEqual(2);
+  });
+});
+
+async function getStoredGeneration(): Promise<string | null> {
+  const { getCacheGeneration } = await import('../utils/storage');
+  return getCacheGeneration();
+}
 
 describe('refreshCustomFunctionValues (F-025-03: awaitable)', () => {
   it('bumps generation and requests a rebuild, and is awaitable', async () => {

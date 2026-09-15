@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import types
 import uuid
+from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1619,9 +1620,13 @@ def _refresh_db(ns):
 
 
 @pytest.mark.asyncio
-async def test_refresh_topn_success(client):
-    """Refresh a topN list returns updated members."""
-    ns = _dynamic_ns(btype="topN")
+async def test_refresh_topn_success_requires_deploy_and_keeps_served_members(client):
+    """Refresh updates the draft and explicitly requires publishing it."""
+    from shared.db.models import NamedSet
+    from src.named_set_deploy_resolver import build_served_named_set
+
+    ns = _dynamic_ns(btype="topN", members=["Previously published"])
+    deployed_definition = deepcopy(vars(ns))
     db = _refresh_db(ns)
     exec_rows = [{"Customer": "Alice"}, {"Customer": "Bob"}, {"Customer": "Charlie"}]
 
@@ -1637,6 +1642,10 @@ async def test_refresh_topn_success(client):
     bd = data["builder_definition"]
     assert bd["members"] == ["Alice", "Bob", "Charlie"]
     assert bd["last_refreshed_at"] is not None
+    assert data["deploy_required"] is True
+    db.commit.assert_awaited_once()
+    served = build_served_named_set(deployed_definition, NamedSet(**vars(ns)))
+    assert served.builder_definition["members"] == ["Previously published"]
 
 
 @pytest.mark.asyncio

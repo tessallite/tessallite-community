@@ -316,7 +316,7 @@ describe("KpiCard", () => {
     );
     // The i18n mock returns keys, so we check the structural parts are present
     const summaryText = screen.getByText(
-      /revenue.*kpiBusiness\.summaryFor.*last month.*kpiBusiness\.summaryWhere.*Country = Germany/,
+      /revenue.*kpiBusiness\.summaryFor.*kpiBusiness\.twLastMonth.*kpiBusiness\.summaryWhere.*Country = Germany/,
     );
     expect(summaryText).toBeTruthy();
   });
@@ -348,7 +348,103 @@ describe("KpiCard", () => {
         loading={false}
       />,
     );
-    expect(screen.getByText(/revenue.*YoY/)).toBeTruthy();
+    expect(screen.getByText(/revenue.*kpiBusiness\.summaryYoyValue/)).toBeTruthy();
+  });
+
+  // Bug-7222: every formula/time-calc/time-window token the backend can
+  // produce must resolve through a key — never render the raw English token.
+  it("keyes the formula_type fallback tokens (Bug-7222)", () => {
+    render(
+      <KpiCard
+        kpi={makeKpi({
+          business_definition: {
+            builder: "business_kpi",
+            version: 1,
+            formula: { type: "composite_score" },
+            _compiled: {
+              expression: "composite(...)",
+              filter_predicates: [],
+              time_window_predicates: [],
+              where_clause: null,
+              summary: "Composite score",
+              summary_tokens: { formula_type: "composite_score" },
+            },
+          },
+        } as Partial<Kpi>)}
+        evalData={makeEval()}
+        loading={false}
+      />,
+    );
+    expect(screen.getByText(/kpiBusiness\.formulaCompositeScore/)).toBeTruthy();
+    expect(screen.queryByText(/composite score/)).toBeNull();
+  });
+
+  it("keyes the yoy_growth_pct and time-window tokens (Bug-7222)", () => {
+    render(
+      <KpiCard
+        kpi={makeKpi({
+          business_definition: {
+            builder: "business_kpi",
+            version: 1,
+            formula: { type: "single_measure" },
+            _compiled: {
+              expression: 'measure("revenue")',
+              filter_predicates: [],
+              time_window_predicates: [],
+              where_clause: null,
+              summary: "Sum of revenue YoY growth % for last quarter",
+              summary_tokens: {
+                formula_type: "single_measure",
+                aggregation: "sum",
+                measure_name: "revenue",
+                time_calc_type: "yoy_growth_pct",
+                time_window_preset: "last_quarter",
+              },
+            },
+          },
+        } as Partial<Kpi>)}
+        evalData={makeEval()}
+        loading={false}
+      />,
+    );
+    expect(
+      screen.getByText(/kpiBusiness\.summaryYoyGrowthPct/),
+    ).toBeTruthy();
+    expect(screen.getByText(/kpiBusiness\.twLastQuarter/)).toBeTruthy();
+    expect(screen.queryByText(/YoY %/)).toBeNull();
+    expect(screen.queryByText(/last quarter/)).toBeNull();
+  });
+
+  it("localized summary keys the full time-window preset domain incl. last_60_days (P2-R1-001)", () => {
+    render(
+      <KpiCard
+        kpi={makeKpi({
+          business_definition: {
+            builder: "business_kpi",
+            version: 1,
+            _compiled: {
+              expression: 'measure("revenue")',
+              filter_predicates: [],
+              time_window_predicates: [],
+              where_clause: null,
+              summary: "Sum of revenue for last 60 days",
+              summary_tokens: {
+                formula_type: "single_measure",
+                aggregation: "sum",
+                measure_name: "revenue",
+                time_window_preset: "last_60_days",
+              },
+            },
+          },
+        } as Partial<Kpi>)}
+        evalData={makeEval()}
+        loading={false}
+      />,
+    );
+    expect(
+      screen.getByText(/kpiBusiness\.twLast60Days/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/last 60 days/)).toBeNull();
   });
 
   // Bug-4255: a composite whose child KPI errored shows a Degraded badge.

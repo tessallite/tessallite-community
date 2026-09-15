@@ -111,6 +111,20 @@ def test_followup_rules_preserve_dimension_exprs_grain():
     assert "dimension_exprs" in _TASK_PREAMBLE
 
 
+def test_Bug_9739_planner_prompt_distinguishes_continuity_and_replacement():
+    from src.prompt.assembler import _TASK_PREAMBLE
+
+    assert '"Break that down by year"' in _TASK_PREAMBLE
+    assert '"instead of"' in _TASK_PREAMBLE
+    assert '"rather than"' in _TASK_PREAMBLE
+    assert '"replace"' in _TASK_PREAMBLE
+    assert '"not by"' in _TASK_PREAMBLE
+    assert '"only by"' in _TASK_PREAMBLE
+    assert '"drop"' in _TASK_PREAMBLE
+    assert '"remove"' in _TASK_PREAMBLE
+    assert '"Break that down by year instead"' not in _TASK_PREAMBLE
+
+
 def test_no_safety_framing_when_policy_empty():
     cfg = _make_cfg(safety=None)
     result = _format_project_layer(cfg)

@@ -161,6 +161,8 @@
   "projectNav.demoTenant": "演示租户",
   "projectNav.setup": "设置",
   "projectNav.ssoMappings": "SSO 映射",
+  "projectNav.ssoIdp": "身份提供方",
+  "projectNav.embedTokens": "嵌入令牌",
   "projectNav.usersAccess": "用户与访问权限",
   "projectNav.webhooks": "Webhook",
   "ui.aServiceRestartIsRequiredForThisChangeTo": "此更改需要重启服务方可生效",

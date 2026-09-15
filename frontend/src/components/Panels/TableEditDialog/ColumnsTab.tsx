@@ -172,7 +172,7 @@ export default function ColumnsTab({ projectId, modelId, table, connectionId }: 
                   <TableCell sx={{ fontWeight: 600, fontSize: "0.8rem", bgcolor: "grey.50", width: 50, textAlign: "center" }}>
                     {t("columns.keyHeader")}
                   </TableCell>
-                  <TableCell sx={{ fontWeight: 600, fontSize: "0.8rem", bgcolor: "grey.50", width: 50, textAlign: "center" }}>
+                  <TableCell sx={{ fontWeight: 600, fontSize: "0.8rem", bgcolor: "grey.50", width: 150, textAlign: "center" }}>
                     <Tooltip title={t("columns.hiddenHeaderHelp")}>
                       <span>{t("columns.hiddenHeader")}</span>
                     </Tooltip>

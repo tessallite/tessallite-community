@@ -1876,6 +1876,76 @@ async def _ensure_token_active(tenant_id: str, jti: UUID) -> None:
             raise HTTPException(status_code=404, detail="Invalid or revoked token")
 
 
+async def _issue_share_token_in_session(
+    db: Any,
+    *,
+    project_id: UUID,
+    model_id: UUID,
+    current_user: CurrentUser,
+) -> UUID:
+    """Register one share token without committing or emitting a webhook.
+
+    The caller owns the transaction and must already hold the model lock. This
+    session-owned primitive lets regeneration revoke and issue as one atomic
+    state transition while standalone issue keeps its existing boundary.
+    """
+    jti = _uuid.uuid4()
+    db.add(
+        GlossaryShareToken(
+            id=jti,
+            model_id=model_id,
+            created_by=_coerce_user_uuid(current_user.user_id),
+        )
+    )
+    # F-022-01/F-022-02: minting a public share token creates a standalone
+    # access credential for the glossary. Record it fail-closed so a leaked
+    # or unexplained share link can always be traced to its issuer.
+    await audit_required(
+        db, action="glossary.share_token.issue", severity="critical",
+        actor_email=current_user.email,
+        target_type="model", target_id=model_id,
+        detail={"token_id": str(jti), "project_id": str(project_id)},
+    )
+    return jti
+
+
+async def _revoke_share_tokens_in_session(
+    db: Any,
+    *,
+    project_id: UUID,
+    model_id: UUID,
+    current_user: CurrentUser,
+) -> int:
+    """Revoke active share tokens without committing or emitting a webhook.
+
+    The caller owns the transaction and must already hold the model lock. The
+    ownership check remains in each public route, before the lock, so a caller
+    cannot contend for another model's lock before authorization is established.
+    """
+    result = await db.execute(
+        select(GlossaryShareToken)
+        .where(GlossaryShareToken.model_id == model_id)
+        .where(GlossaryShareToken.revoked_at.is_(None))
+    )
+    rows = result.scalars().all()
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        row.revoked_at = now
+    # F-022-01/F-022-02: revoking share tokens changes who can reach the
+    # public glossary. Record it fail-closed with the count revoked.
+    await audit_required(
+        db, action="glossary.share_token.revoke", severity="warn",
+        actor_email=current_user.email,
+        target_type="model", target_id=model_id,
+        detail={
+            "revoked_count": len(rows),
+            "token_ids": [str(r.id) for r in rows],
+            "project_id": str(project_id),
+        },
+    )
+    return len(rows)
+
+
 @router.post("/share", dependencies=[require_role("modeler")])
 async def issue_share_token(
     project_id: UUID,
@@ -1893,22 +1963,12 @@ async def issue_share_token(
     """
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
-        jti = _uuid.uuid4()
-        db.add(
-            GlossaryShareToken(
-                id=jti,
-                model_id=model_id,
-                created_by=_coerce_user_uuid(current_user.user_id),
-            )
-        )
-        # F-022-01/F-022-02: minting a public share token creates a standalone
-        # access credential for the glossary. Record it fail-closed so a leaked
-        # or unexplained share link can always be traced to its issuer.
-        await audit_required(
-            db, action="glossary.share_token.issue", severity="critical",
-            actor_email=current_user.email,
-            target_type="model", target_id=model_id,
-            detail={"token_id": str(jti), "project_id": str(project_id)},
+        await acquire_model_definition_lock(db, model_id)  # Bug-9602: serialize share lifecycle per model
+        jti = await _issue_share_token_in_session(
+            db,
+            project_id=project_id,
+            model_id=model_id,
+            current_user=current_user,
         )
         await db.commit()
         token = _issue_public_token(current_user.tenant_id, model_id, jti)
@@ -1935,34 +1995,20 @@ async def revoke_share_tokens(
     """
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
-        result = await db.execute(
-            select(GlossaryShareToken)
-            .where(GlossaryShareToken.model_id == model_id)
-            .where(GlossaryShareToken.revoked_at.is_(None))
-        )
-        rows = result.scalars().all()
-        now = datetime.now(timezone.utc)
-        for row in rows:
-            row.revoked_at = now
-        # F-022-01/F-022-02: revoking share tokens changes who can reach the
-        # public glossary. Record it fail-closed with the count revoked.
-        await audit_required(
-            db, action="glossary.share_token.revoke", severity="warn",
-            actor_email=current_user.email,
-            target_type="model", target_id=model_id,
-            detail={
-                "revoked_count": len(rows),
-                "token_ids": [str(r.id) for r in rows],
-                "project_id": str(project_id),
-            },
+        await acquire_model_definition_lock(db, model_id)  # Bug-9602: serialize share lifecycle per model
+        revoked_count = await _revoke_share_tokens_in_session(
+            db,
+            project_id=project_id,
+            model_id=model_id,
+            current_user=current_user,
         )
         await db.commit()
         await emit_webhook(current_user.tenant_id, "glossary.share_token.revoke", {
             "model_id": str(model_id),
-            "revoked_count": len(rows),
+            "revoked_count": revoked_count,
             "actor": current_user.email,
         })
-        return {"revoked_count": len(rows)}
+        return {"revoked_count": revoked_count}
 
 
 @router.post("/share/regenerate", dependencies=[require_role("modeler")])
@@ -1975,8 +2021,36 @@ async def regenerate_share_token(
     call. Phase 4 of the semantic-layer plan — the "regenerate" button
     on the glossary panel maps to this endpoint.
     """
-    await revoke_share_tokens(project_id, model_id, current_user)
-    return await issue_share_token(project_id, model_id, current_user)
+    async for db in get_tenant_db(current_user.tenant_id):
+        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        await acquire_model_definition_lock(db, model_id)  # Bug-9602: revoke + issue are one locked transaction
+        revoked_count = await _revoke_share_tokens_in_session(
+            db,
+            project_id=project_id,
+            model_id=model_id,
+            current_user=current_user,
+        )
+        jti = await _issue_share_token_in_session(
+            db,
+            project_id=project_id,
+            model_id=model_id,
+            current_user=current_user,
+        )
+        await db.commit()
+        token = _issue_public_token(current_user.tenant_id, model_id, jti)
+        # Both events are emitted only after the combined state transition is
+        # durable. Preserve the existing revoke-then-issue event order.
+        await emit_webhook(current_user.tenant_id, "glossary.share_token.revoke", {
+            "model_id": str(model_id),
+            "revoked_count": revoked_count,
+            "actor": current_user.email,
+        })
+        await emit_webhook(current_user.tenant_id, "glossary.share_token.issue", {
+            "model_id": str(model_id),
+            "token_id": str(jti),
+            "actor": current_user.email,
+        })
+        return {"token": token, "frontend_path": f"/g/{token}"}
 
 
 # A second router with a different prefix for the public, no-auth endpoints.

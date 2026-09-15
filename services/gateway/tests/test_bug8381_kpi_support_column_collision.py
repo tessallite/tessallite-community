@@ -110,7 +110,11 @@ async def test_goal_member_and_same_named_dimension_together_fails_loud(monkeypa
     )
 
     assert "Fault" in body, body
-    assert "collides with the column" in body, body
+    # Owner decision 2026-09-04: a goal member with ANY dimension breakdown is
+    # refused before the post-join runs, so the earlier collision guard is
+    # now the second line of defence for this shape (it still governs the
+    # info-measure constants below).
+    assert "dimension breakdown" in body or "collides with the column" in body, body
     # The wrong answer must never be produced: neither the flattened constant
     # nor a half-overwritten member set may reach the client.
     assert "188914000" not in body, body
@@ -131,12 +135,16 @@ async def test_collision_check_is_case_insensitive(monkeypatch):
         router_rows=[{"net revenue goal": "North", "fee_amount": 10.0}],
     )
     assert "Fault" in body, body
-    assert "collides with the column" in body, body
+    assert "dimension breakdown" in body or "collides with the column" in body, body
+    assert "188914000" not in body, body
 
 
 @pytest.mark.asyncio
-async def test_goal_member_without_a_colliding_column_still_serves(monkeypatch):
-    """Control: the ordinary goal post-join must be untouched by the guard."""
+async def test_goal_member_with_a_dimension_breakdown_is_refused(monkeypatch):
+    """Owner decision 2026-09-04 (manual KPI review): a KPI goal is one target
+    for the whole model. Repeating it on every Region row invited reading it
+    as a per-region figure, so it is refused like the status; only the KPI
+    value slices."""
     stmt = (
         "SELECT {[Measures].[fee_amount],[Measures].[Net Revenue Goal]} ON COLUMNS, "
         "{[Region].[Region].Members} ON ROWS FROM [m]"
@@ -150,8 +158,22 @@ async def test_goal_member_without_a_colliding_column_still_serves(monkeypatch):
             {"Region": "South", "fee_amount": 20.0},
         ],
     )
+    assert "Fault" in body, body
+    assert "KPI goal member 'Net Revenue Goal' was requested with a dimension breakdown" in body, body
+    assert "188914000" not in body, body
+
+
+@pytest.mark.asyncio
+async def test_goal_member_without_a_breakdown_still_serves(monkeypatch):
+    """Control: the goal post-join is untouched when no dimension is on an axis."""
+    stmt = "SELECT {[Measures].[fee_amount],[Measures].[Net Revenue Goal]} ON COLUMNS FROM [m]"
+    body = await _run(
+        stmt, monkeypatch,
+        dim_name="Region",
+        router_columns=["fee_amount"],
+        router_rows=[{"fee_amount": 30.0}],
+    )
     assert "Fault" not in body, body
-    assert "North" in body and "South" in body, body
     assert "188914000" in body, body
 
 
@@ -175,7 +197,10 @@ async def test_info_measure_constant_also_cannot_overwrite_a_column(monkeypatch)
         router_rows=[{"_info_owner": "North", "fee_amount": 10.0}],
     )
     assert "Fault" in body, body
-    assert "collides with the column" in body, body
+    # 2026-09-04: an info measure with a dimension on an axis is refused
+    # before the post-join (owner decision, same rule as KPI goal/status);
+    # the collision guard remains the second line of defence.
+    assert "dimension breakdown" in body or "collides with the column" in body, body
 
 
 def test_every_post_join_constant_writer_sits_after_the_collision_guard() -> None:

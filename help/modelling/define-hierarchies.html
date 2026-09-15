@@ -12,11 +12,15 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Define Hierarchies</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-05-15</span></div>
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-09-10</span></div>
     <h1>Define Hierarchies</h1>
     <h2>What this covers</h2>
     <p>The <strong>Hierarchies</strong> panel defines ordered drill paths such as Year &gt; Quarter &gt; Month, Country &gt; Region &gt; Store, or Segment &gt; Category &gt; Product. Hierarchies give Tessallite enough structure to generate time variants, guide drill-through, and expose business navigation paths to downstream consumers.</p>
     <p>This is different from the Dimensions panel. Dimensions expose individual attributes; hierarchies declare how attributes roll up.</p>
+    <h2>Levels and members</h2>
+    <p>A hierarchy has the standard <strong>(All)</strong> summary item used by BI tools, followed by only the levels you declare. Country &gt; City &gt; Channel has three data levels. Tessallite does not add a fourth raw-data level beneath Channel.</p>
+    <p>A member is one distinct value at a level. For example, <code>London</code> is one member of the City level even if thousands of source rows contain London. When Excel expands a hierarchy, Tessallite returns the distinct members needed for that level and applies the signed-in person&#x27;s security rules.</p>
+    <p>Low-cardinality fields from a fact table, such as status or channel, can be useful flat dimensions. They do not become a hierarchy unless a modeller creates a declared drill path from them.</p>
     <h2>Hierarchy types</h2>
     <div class="table-wrapper"><table><thead><tr><th>Type</th><th>Use it when</th></tr></thead><tbody><tr><td>Explicit</td><td>You already know each level and want to add them manually.</td></tr><tr><td>Date embedded</td><td>A date column can generate levels such as year, quarter, month, week, or day.</td></tr><tr><td>Segment</td><td>A code or text field contains multiple levels that can be split by delimiter or position.</td></tr></tbody></table></div>
     <h2>Time hierarchy fields</h2>

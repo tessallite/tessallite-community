@@ -19,7 +19,13 @@ from shared.model_dependency.snapshot import (
     TableRow,
 )
 from shared.model_dependency.structural_paths import relationship_removal_impact
-from shared.model_dependency.types import EdgeKind, NodeKey, ObjectType
+from shared.model_dependency.types import (
+    DependencyEdge,
+    DependencyNode,
+    EdgeKind,
+    NodeKey,
+    ObjectType,
+)
 
 from model_dependency_fixtures import (  # noqa: E402 - pytest adds test dir to path
     AGENT,
@@ -195,10 +201,225 @@ def test_cycle_handled_without_hang_or_duplicate():
     )
     g = graph.build_graph(snap)
     assert len(g.cycles) == 1
+    a_key = _key(ObjectType.MEASURE, "a")
+    b_key = _key(ObjectType.MEASURE, "b")
+    assert g.scc_of[a_key] == g.scc_of[b_key]
+    assert next(iter(g.cycles.values())) == tuple(
+        sorted((a_key, b_key), key=lambda key: key.sort_key)
+    )
     r = impact.inspect(g, _key(ObjectType.MEASURE, "a"))
     # KPI downstream of the cycle is still reached exactly once.
     kpi_hits = [i for i in r.impacts if i.node.key.object_id == "k"]
     assert len(kpi_hits) == 1
+
+
+def test_tarjan_high_fanout_sorts_each_successor_list_once(monkeypatch):
+    """A large fan-out remains complete while successor ordering stays linear.
+
+    The graph must visit every dependent and assign every node to an SCC.  The
+    sort-call guard makes the former quadratic traversal fail quickly if a
+    future change starts re-sorting the root's 5,000 successors on each DFS
+    frame again.
+    """
+    root = _key(ObjectType.MODEL, "fanout-root")
+    leaves = tuple(
+        _key(ObjectType.MEASURE, f"fanout-{index:05d}")
+        for index in range(5_000)
+    )
+
+    def edge(dependent: NodeKey) -> DependencyEdge:
+        return DependencyEdge(
+            dependency=root,
+            dependent=dependent,
+            kind=EdgeKind.CONTAINMENT,
+            source_field="test_fanout",
+            strength="soft",
+            delete_policy="detach",
+            effect="detached",
+            resolution="derived",
+        )
+
+    # Reverse input order to ensure the result is still determined by the
+    # stable NodeKey ordering rather than the source adjacency order.
+    forward = {root: [edge(leaf) for leaf in reversed(leaves)]}
+    ordered = (root, *leaves)
+
+    original_sorted = sorted
+    high_fanout_sorts = 0
+
+    def guarded_sorted(values, *, key=None, reverse=False):
+        nonlocal high_fanout_sorts
+        values = list(values)
+        if len(values) == len(leaves):
+            high_fanout_sorts += 1
+            assert high_fanout_sorts == 1, (
+                "high-fanout successor list was sorted more than once"
+            )
+        return original_sorted(values, key=key, reverse=reverse)
+
+    monkeypatch.setattr(graph, "sorted", guarded_sorted, raising=False)
+    scc_of, cycles = graph._tarjan_scc(ordered, forward)
+
+    assert set(scc_of) == set(ordered)
+    assert len(scc_of) == len(ordered)
+    assert cycles == {}
+    assert scc_of[root] != scc_of[leaves[0]]
+    assert high_fanout_sorts == 1
+
+
+def test_impact_paths_build_one_token_index_for_large_node_catalog():
+    """Alternate path expansion reuses one graph-token index per traversal."""
+    from dataclasses import replace
+
+    base = graph.build_graph(build_retail_snapshot(with_alternate_path=True))
+
+    class CountingNodeMap(dict):
+        iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+
+    nodes = CountingNodeMap(base.nodes)
+    # Keep the graph's reachable edges unchanged while making an accidental
+    # full-node scan in every path step materially expensive.
+    for index in range(5_000):
+        key = _key(ObjectType.MEASURE, f"lookup-padding-{index:05d}")
+        nodes[key] = DependencyNode(
+            key=key,
+            name=key.object_id,
+            display_name=key.object_id,
+        )
+    large_graph = replace(base, nodes=nodes)
+
+    result = impact.inspect(
+        large_graph,
+        _key(ObjectType.COLUMN, COL_GROSS),
+        max_paths_per_object=3,
+    )
+
+    assert result.summary.total > 0
+    assert nodes.iterations == 1
+    kpi = next(item for item in result.impacts if item.node.key.object_id == KPI_MARGIN)
+    assert kpi.paths[0].nodes == (
+        f"column:{COL_GROSS}",
+        f"measure:{MSR_GROSS}",
+        f"measure:{MSR_NET}",
+        f"kpi:{KPI_MARGIN}",
+    )
+
+
+def test_alternate_witness_paths_keep_canonical_order():
+    """Pruning keeps the existing primary and alternate witness order."""
+    g = graph.build_graph(build_retail_snapshot(with_alternate_path=True))
+    result = impact.inspect(
+        g,
+        _key(ObjectType.DIMENSION, DIM_CUSTOMER),
+        max_paths_per_object=3,
+        max_display_impacts=100,
+    )
+
+    named_list = next(
+        item for item in result.impacts if item.node.key.object_id == "nl-old"
+    )
+    assert [path.nodes for path in named_list.paths] == [
+        (
+            "dimension:dim-customer",
+            "named_list:nl-old",
+        ),
+        (
+            "dimension:dim-customer",
+            "named_list:nl-top10",
+            "named_list:nl-old",
+        ),
+    ]
+
+
+def test_alternate_paths_prune_primary_and_dead_high_fanout_branches():
+    """A primary interior and 5,000 dead branches are never expanded."""
+    from types import SimpleNamespace
+
+    root = _key(ObjectType.MEASURE, "path-root")
+    interior = _key(ObjectType.MEASURE, "path-interior")
+    dest = _key(ObjectType.KPI, "path-dest")
+    dead = tuple(
+        _key(ObjectType.MEASURE, f"dead-branch-{index:05d}")
+        for index in range(5_000)
+    )
+
+    def edge(dependency: NodeKey, dependent: NodeKey) -> DependencyEdge:
+        return DependencyEdge(
+            dependency=dependency,
+            dependent=dependent,
+            kind=EdgeKind.CONTAINMENT,
+            source_field="test_paths",
+            strength="soft",
+            delete_policy="detach",
+            effect="detached",
+            resolution="derived",
+        )
+
+    root_to_interior = edge(root, interior)
+    interior_to_dest = edge(interior, dest)
+    root_to_dead = tuple(edge(root, node) for node in dead)
+    dead_keys = set(dead)
+    path_adjacency = {
+        root: (
+            (interior.token(), root_to_interior),
+            *((node.token(), branch) for node, branch in zip(dead, root_to_dead)),
+        ),
+        interior: ((dest.token(), interior_to_dest),),
+    }
+
+    class GuardedAdjacency(dict):
+        def get(self, key, default=()):
+            assert key not in dead_keys, "dead branch was expanded"
+            return super().get(key, default)
+
+    reverse = {
+        dest: (interior_to_dest,),
+        interior: (root_to_interior,),
+    }
+    keys = (root, interior, dest, *dead)
+    token_to_key = {key.token(): key for key in keys}
+    token_by_key = {key: key.token() for key in keys}
+    result = impact._alternate_paths(
+        SimpleNamespace(reverse=reverse),
+        root,
+        dest,
+        limit=2,
+        exclude=(root.token(), interior.token(), dest.token()),
+        token_to_key=token_to_key,
+        token_by_key=token_by_key,
+        path_adjacency=GuardedAdjacency(path_adjacency),
+        reverse_reachability={},
+    )
+
+    assert result == []
+
+
+def test_impact_summary_keeps_full_count_when_paths_are_display_capped(monkeypatch):
+    """The display cap skips hidden path work without shrinking the summary."""
+    g = graph.build_graph(build_retail_snapshot(with_alternate_path=True))
+    real_witness_paths = impact._witness_paths
+    called_for: list[NodeKey] = []
+
+    def record_witness(*args, **kwargs):
+        called_for.append(args[2])
+        return real_witness_paths(*args, **kwargs)
+
+    monkeypatch.setattr(impact, "_witness_paths", record_witness)
+    result = impact.inspect(
+        g,
+        _key(ObjectType.DIMENSION, DIM_CUSTOMER),
+        max_paths_per_object=3,
+        max_display_impacts=1,
+    )
+
+    assert result.summary.total > 1
+    assert len(result.impacts) == 1
+    assert len(called_for) == 1
+    assert result.impacts[0].paths
 
 
 def test_cascade_closure_reported_separately():

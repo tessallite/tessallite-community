@@ -15,13 +15,13 @@ def test_rows_sets_marks_certified_in_description():
         ],
     )
     by_name = {r["SET_NAME"]: r for r in rows}
-    assert by_name["A"]["SET_DESCRIPTION"].startswith("[Certified]")
-    assert "Top sellers" in by_name["A"]["SET_DESCRIPTION"]
+    assert by_name["A"]["DESCRIPTION"].startswith("[Certified]")
+    assert "Top sellers" in by_name["A"]["DESCRIPTION"]
     # Drafts carry no marker.
-    assert "[Certified]" not in by_name["B"]["SET_DESCRIPTION"]
+    assert "[Certified]" not in by_name["B"]["DESCRIPTION"]
     # Bug-6264 (authority named_sets.py:238-241): "shared" is certified-
     # equivalent and MUST carry the marker, even with an empty base description.
-    assert by_name["C"]["SET_DESCRIPTION"].startswith("[Certified]")
+    assert by_name["C"]["DESCRIPTION"].startswith("[Certified]")
 
 
 @pytest.mark.asyncio

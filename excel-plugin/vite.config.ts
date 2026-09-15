@@ -5,8 +5,19 @@ import { dirname, resolve } from 'path';
 import { readFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { assertTestProfileBuildAllowed } from './scripts/testProfileGuard.mjs';
+import { resolveTestProfileDefinition } from './scripts/testProfileDefinition.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// TEST PROFILE build (harness deliverable (d)). Refused outright on a release
+// target — see scripts/testProfileGuard.mjs and src/testProfile.ts. `null` in
+// every ordinary build, so the whole preset-sign-in path is eliminated.
+const testProfileEnabled = assertTestProfileBuildAllowed(process.env);
+const testProfile = testProfileEnabled ? resolveTestProfileDefinition(process.env, __dirname) : null;
+
+const outDir = process.env.VITE_OUT_DIR || 'dist';
+
 const certDir = join(homedir(), '.office-addin-dev-certs');
 const certKey = join(certDir, 'localhost.key');
 const certCrt = join(certDir, 'localhost.crt');
@@ -17,6 +28,9 @@ const devCerts = existsSync(certKey) && existsSync(certCrt)
 export default defineConfig({
   plugins: [react()],
   base: process.env.VITE_BASE_PATH || '/excel-plugin/',
+  define: {
+    __TESSALLITE_TEST_PROFILE__: JSON.stringify(testProfile),
+  },
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),
@@ -68,12 +82,16 @@ export default defineConfig({
     ...(devCerts ? { https: devCerts } : {}),
   },
   build: {
-    outDir: 'dist',
+    // A test-profile build writes to its OWN directory (see
+    // tests-harness/pane-e2e/prepare.mjs), so a bundle carrying baked-in
+    // credentials can never end up in the `dist/` a deploy picks up.
+    outDir,
     emptyOutDir: true,
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
         functions: resolve(__dirname, 'functions.html'),
+        'chart-dialog': resolve(__dirname, 'chart-dialog.html'),
       },
     },
   },

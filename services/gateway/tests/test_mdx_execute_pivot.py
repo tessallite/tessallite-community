@@ -3,6 +3,7 @@ import pytest
 from src.dax.mdx_execute import build_real_execute_response
 from src.dax.mdschema import _rows_hierarchies, _rows_levels, _rows_md_properties, _rows_members
 from src.dax.xmla_server import _mdx_to_sql, _statement_to_sql
+from tests.test_subtotal_cell_ordinal_grid import _enable_rollup_all_grains
 
 
 from src.dax.mdschema import _rows_measures, _AGG_TO_XMLA
@@ -1214,12 +1215,12 @@ def test_execute_response_scopes_dimension_properties_per_hierarchy():
         dimensions_meta=dimensions_meta,
     )
 
-    assert '<HierarchyInfo name="[account_type].[account_type]">' in xml
-    assert 'name="[account_type].[account_type].[MEMBER_KEY]"' in xml
-    assert 'name="[account_type_name].[account_type_name].[MEMBER_KEY]"' in xml
-    assert xml.count('name="[account_type].[account_type].[MEMBER_KEY]"') == 1
-    assert xml.count('<PARENT_UNIQUE_NAME name="[account_type].[account_type].[PARENT_UNIQUE_NAME]"') == 1
-    assert xml.count('<HIERARCHY_UNIQUE_NAME name="[account_type].[account_type].[HIERARCHY_UNIQUE_NAME]"') == 1
+    assert '<HierarchyInfo name="[Dimensions].[account_type]">' in xml
+    assert 'name="[Dimensions].[account_type].[MEMBER_KEY]"' in xml
+    assert 'name="[Dimensions].[account_type_name].[MEMBER_KEY]"' in xml
+    assert xml.count('name="[Dimensions].[account_type].[MEMBER_KEY]"') == 1
+    assert xml.count('<PARENT_UNIQUE_NAME name="[Dimensions].[account_type].[PARENT_UNIQUE_NAME]"') == 1
+    assert xml.count('<HIERARCHY_UNIQUE_NAME name="[Dimensions].[account_type].[HIERARCHY_UNIQUE_NAME]"') == 1
 
 
 def test_execute_response_uses_level_one_children_for_drilldown_members():
@@ -1242,9 +1243,9 @@ def test_execute_response_uses_level_one_children_for_drilldown_members():
         dimensions_meta=[{"name": "account_type"}],
     )
 
-    assert '<LName>[account_type].[account_type].[account_type]</LName>' in xml
+    assert '<LName>[Dimensions].[account_type].[account_type]</LName>' in xml
     assert '<LNum>1</LNum>' in xml
-    assert '<PARENT_UNIQUE_NAME>[account_type].[account_type].[All]</PARENT_UNIQUE_NAME>' in xml
+    assert '<PARENT_UNIQUE_NAME>[Dimensions].[account_type].[All]</PARENT_UNIQUE_NAME>' in xml
     assert '<Axis name="SlicerAxis"><Tuples>' in xml
     assert "[Measures].[base_amount]" in xml
 
@@ -1311,7 +1312,7 @@ def test_mdschema_members_tree_op_self_only_for_all_member():
         dimensions=[{"name": "account_type"}],
         restrictions={
             "CUBE_NAME": ["m"],
-            "MEMBER_UNIQUE_NAME": ["[account_type].[account_type].[All]"],
+            "MEMBER_UNIQUE_NAME": ["[Dimensions].[account_type].[All]"],
             "TREE_OP": ["8"],
         },
         member_data={
@@ -1325,7 +1326,7 @@ def test_mdschema_members_tree_op_self_only_for_all_member():
     )
 
     assert [r["MEMBER_UNIQUE_NAME"] for r in rows] == [
-        "[account_type].[account_type].[All]"
+        "[Dimensions].[account_type].[All]"
     ]
 
 
@@ -1336,7 +1337,7 @@ def test_mdschema_members_tree_op_children_for_all_member():
         dimensions=[{"name": "account_type"}],
         restrictions={
             "CUBE_NAME": ["m"],
-            "MEMBER_UNIQUE_NAME": ["[account_type].[account_type].[All]"],
+            "MEMBER_UNIQUE_NAME": ["[Dimensions].[account_type].[All]"],
             "TREE_OP": ["1"],
         },
         member_data={
@@ -1353,8 +1354,8 @@ def test_mdschema_members_tree_op_children_for_all_member():
     # collides, so it keeps the caption-form uname (only multi-level hierarchies
     # switch to the canonical key form).
     assert [r["MEMBER_UNIQUE_NAME"] for r in rows] == [
-        "[account_type].[account_type].[CURRENT]",
-        "[account_type].[account_type].[LOAN]",
+        "[Dimensions].[account_type].[CURRENT]",
+        "[Dimensions].[account_type].[LOAN]",
     ]
 
 
@@ -1415,18 +1416,20 @@ def test_mdschema_properties_property_name_filter_returns_only_requested_propert
     assert {row["PROPERTY_NAME"] for row in rows} == {"MEMBER_VALUE"}
 
 
-def test_mdschema_hierarchies_omits_all_member_for_excel_discover():
+def test_bug_9789_excel_hierarchy_advertises_all_member_and_default_member():
+    """Excel binds the hierarchy field and grand tuple through one identity
+    (native-all, the only Excel profile since Bug-9874)."""
     rows = _rows_hierarchies(
         catalog="m",
-        dimensions=[{"name": "account_type"}],
+        dimensions=[{"name": "account_type", "display_name": "account type"}],
         measures=[{"name": "base_amount"}],
         member_data={"account_type": {"members": [{"name": "CURRENT"}]}},
-        properties={"SspropInitAppName": "Excel"},
+        properties={"SspropInitAppName": "Microsoft Office Excel"},
     )
 
-    dim_row = next(r for r in rows if r.get("HIERARCHY_UNIQUE_NAME") == "[account_type].[account_type]")
-    assert dim_row.get("DEFAULT_MEMBER") == "[account_type].[account_type].[All]"
-    assert "ALL_MEMBER" not in dim_row
+    dim_row = next(r for r in rows if r.get("HIERARCHY_UNIQUE_NAME") == "[Dimensions].[account_type]")
+    assert dim_row.get("DEFAULT_MEMBER") == "[Dimensions].[account_type].[All]"
+    assert dim_row.get("ALL_MEMBER") == "[Dimensions].[account_type].[All]"
 
 
 def test_mdschema_hierarchies_keeps_all_member_for_tabular_non_excel():
@@ -1438,8 +1441,95 @@ def test_mdschema_hierarchies_keeps_all_member_for_tabular_non_excel():
         properties={"Format": "Tabular", "SspropInitAppName": "OnlyOffice"},
     )
 
-    dim_row = next(r for r in rows if r.get("HIERARCHY_UNIQUE_NAME") == "[account_type].[account_type]")
-    assert dim_row.get("ALL_MEMBER") == "[account_type].[account_type].[All]"
+    dim_row = next(r for r in rows if r.get("HIERARCHY_UNIQUE_NAME") == "[Dimensions].[account_type]")
+    assert dim_row.get("ALL_MEMBER") == "[Dimensions].[account_type].[All]"
+
+
+def test_mdschema_all_level_caption_stays_distinct_for_excel():
+    """Excel flats: All unique name stays [(All)]; caption is the field name."""
+    from src.dax.mdschema import _rows_levels
+
+    rows = _rows_levels(
+        catalog="m",
+        dimensions=[{"name": "account_type", "display_name": "account type"}],
+        member_data={"account_type": {"members": [{"name": "CURRENT"}]}},
+        properties={"SspropInitAppName": "Microsoft Office Excel"},
+    )
+    hierarchy_levels = [
+        row for row in rows
+        if row.get("HIERARCHY_UNIQUE_NAME") == "[Dimensions].[account_type]"
+    ]
+    all_level = next(r for r in hierarchy_levels if r.get("LEVEL_NAME") == "(All)")
+    data_level = next(
+        r for r in hierarchy_levels if r.get("LEVEL_NAME") == "account_type"
+    )
+    assert all_level["LEVEL_UNIQUE_NAME"] == "[Dimensions].[account_type].[(All)]"
+    assert all_level["LEVEL_CAPTION"] == "account type"
+    assert all_level["LEVEL_TYPE"] == "1"
+    assert all_level["LEVEL_NUMBER"] == "0"
+    assert data_level["LEVEL_CAPTION"] == "account_type"
+    assert data_level["LEVEL_CAPTION"] != all_level["LEVEL_CAPTION"]
+    assert len({row["LEVEL_CAPTION"] for row in hierarchy_levels}) == 2
+
+
+def test_mdschema_all_level_caption_stays_all_for_non_excel():
+    from src.dax.mdschema import _rows_levels
+
+    rows = _rows_levels(
+        catalog="m",
+        dimensions=[{"name": "account_type", "display_name": "account type"}],
+        member_data={"account_type": {"members": [{"name": "CURRENT"}]}},
+        properties={"SspropInitAppName": "OnlyOffice"},
+    )
+    all_level = next(r for r in rows if r.get("LEVEL_NAME") == "(All)")
+    assert all_level["LEVEL_CAPTION"] == "(All)"
+
+
+def test_bug_9830_excel_discovers_only_executable_kpis():
+    """Excel receives only KPI rows whose value member Execute can resolve."""
+    from src.dax.mdschema import _rows_kpis
+
+    kpis = [
+        {
+            "id": "k1",
+            "name": "Fee Income",
+            "display_name": "Fee Income",
+            "value_measure_id": "m_fee",
+            "goal_measure_id": None,
+            "expression": "",
+            "presentation_type": "traffic_light",
+        },
+        {
+            "id": "k2",
+            "name": "Average Transaction Value",
+            "display_name": "Average Transaction Value",
+            "value_measure_id": None,
+            "goal_measure_id": None,
+            "expression": 'measure("Visits") + measure("Orders")',
+            "presentation_type": "traffic_light",
+        },
+    ]
+    measures = [
+        {"id": "m_fee", "name": "fee_amount"},
+        {"id": "m_visits", "name": "Visits"},
+        {"id": "m_orders", "name": "Orders"},
+    ]
+
+    excel_rows = _rows_kpis(
+        "modely",
+        kpis,
+        measures,
+        properties={"SspropInitAppName": "Microsoft Office Excel"},
+    )
+    other_rows = _rows_kpis(
+        "modely",
+        kpis,
+        measures,
+        properties={"SspropInitAppName": "OnlyOffice"},
+    )
+
+    assert [r["KPI_NAME"] for r in excel_rows] == ["Fee Income"]
+    assert [r["KPI_NAME"] for r in other_rows] == ["Fee Income"]
 
 
 def test_mdschema_levels_supports_multi_level_hierarchy_metadata():
@@ -1464,10 +1554,10 @@ def test_mdschema_levels_supports_multi_level_hierarchy_metadata():
         },
     )
 
-    level_unames = [row["LEVEL_UNIQUE_NAME"] for row in rows if row["HIERARCHY_UNIQUE_NAME"] == "[geo_hierarchy].[geo_hierarchy]"]
-    assert "[geo_hierarchy].[geo_hierarchy].[(All)]" in level_unames
-    assert "[geo_hierarchy].[geo_hierarchy].[Region]" in level_unames
-    assert "[geo_hierarchy].[geo_hierarchy].[Country]" in level_unames
+    level_unames = [row["LEVEL_UNIQUE_NAME"] for row in rows if row["HIERARCHY_UNIQUE_NAME"] == "[Hierarchies].[geo_hierarchy]"]
+    assert "[Hierarchies].[geo_hierarchy].[(All)]" in level_unames
+    assert "[Hierarchies].[geo_hierarchy].[Region]" in level_unames
+    assert "[Hierarchies].[geo_hierarchy].[Country]" in level_unames
 
 
 def test_mdschema_members_supports_children_for_hierarchy_member():
@@ -1483,8 +1573,8 @@ def test_mdschema_members_supports_children_for_hierarchy_member():
             ],
         }],
         restrictions={
-            "MEMBER_UNIQUE_NAME": ["[geo_hierarchy].[geo_hierarchy].[EMEA]"],
-            "LEVEL_UNIQUE_NAME": ["[geo_hierarchy].[geo_hierarchy].[Region]"],
+            "MEMBER_UNIQUE_NAME": ["[Hierarchies].[geo_hierarchy].[EMEA]"],
+            "LEVEL_UNIQUE_NAME": ["[Hierarchies].[geo_hierarchy].[Region]"],
             "TREE_OP": ["1"],
         },
         member_data={
@@ -1498,11 +1588,11 @@ def test_mdschema_members_supports_children_for_hierarchy_member():
         },
     )
 
-    member_unames = [row["MEMBER_UNIQUE_NAME"] for row in rows if row["HIERARCHY_UNIQUE_NAME"] == "[geo_hierarchy].[geo_hierarchy]"]
+    member_unames = [row["MEMBER_UNIQUE_NAME"] for row in rows if row["HIERARCHY_UNIQUE_NAME"] == "[Hierarchies].[geo_hierarchy]"]
     # Bug-3617 (Phase 2): canonical path-qualified uname (Region EMEA > Country UK).
-    assert "[geo_hierarchy].[geo_hierarchy].[Country].&[EMEA]&[United Kingdom]" in member_unames
-    assert "[geo_hierarchy].[geo_hierarchy].[United Kingdom]" not in member_unames
-    assert "[geo_hierarchy].[geo_hierarchy].[EMEA]" not in member_unames
+    assert "[Hierarchies].[geo_hierarchy].[Country].&[EMEA]&[United Kingdom]" in member_unames
+    assert "[Hierarchies].[geo_hierarchy].[United Kingdom]" not in member_unames
+    assert "[Hierarchies].[geo_hierarchy].[EMEA]" not in member_unames
 
 
 def test_mdx_where_filter_orders_where_before_group_by():
@@ -1585,7 +1675,7 @@ def test_execute_response_preserves_no_axis_filter_probe_shape():
     assert '<Axis name="Axis0">' not in xml
     assert '<Axis name="SlicerAxis"><Tuples>' in xml
     assert '<UName>[Measures].[base_amount]</UName>' in xml
-    assert '<UName>[account_type].[account_type].[All]</UName>' in xml
+    assert '<UName>[Dimensions].[account_type].[All]</UName>' in xml
 
 
 def test_execute_response_uses_all_member_for_slicer_dimension():
@@ -1611,7 +1701,7 @@ def test_execute_response_uses_all_member_for_slicer_dimension():
 
     assert '<Axis name="SlicerAxis"><Tuples>' in xml
     assert '<Caption>All account_type</Caption>' in xml
-    assert '<UName>[account_type].[account_type].[All]</UName>' in xml
+    assert '<UName>[Dimensions].[account_type].[All]</UName>' in xml
 
 
 def test_execute_response_uses_existing_multi_hierarchy_tuples_not_cross_product():
@@ -1636,7 +1726,7 @@ def test_execute_response_uses_existing_multi_hierarchy_tuples_not_cross_product
         dimensions_meta=[{"name": "account_type"}, {"name": "account_type_name"}],
     )
 
-    assert xml.count("<Tuple><Member Hierarchy=\"[account_type].[account_type]\">") == 2
+    assert xml.count("<Tuple><Member Hierarchy=\"[Dimensions].[account_type]\">") == 2
     assert "Current" in xml
     assert "Loan" in xml
 
@@ -1666,7 +1756,7 @@ def test_execute_response_returns_children_for_all_members_query():
     assert "<Caption>Current</Caption>" in xml
     assert "<Caption>Loan</Caption>" in xml
     assert "<LNum>1</LNum>" in xml
-    assert "<PARENT_UNIQUE_NAME>[account_type_name].[account_type_name].[All]</PARENT_UNIQUE_NAME>" in xml
+    assert "<PARENT_UNIQUE_NAME>[Dimensions].[account_type_name].[All]</PARENT_UNIQUE_NAME>" in xml
     assert "<MEMBER_ORDINAL>0</MEMBER_ORDINAL>" in xml
     assert "<MEMBER_ORDINAL>1</MEMBER_ORDINAL>" in xml
     assert "<MEMBER_KEY>Current</MEMBER_KEY>" in xml
@@ -1694,7 +1784,7 @@ def test_execute_response_uses_members_axis_by_default_for_single_hierarchy():
         dimensions_meta=[{"name": "account_type"}],
     )
 
-    assert '<Axis name="Axis0"><Members Hierarchy="[account_type].[account_type]">' in xml
+    assert '<Axis name="Axis0"><Members Hierarchy="[Dimensions].[account_type]">' in xml
     assert '<Axis name="Axis0"><Tuples>' not in xml
 
 
@@ -1719,7 +1809,7 @@ def test_execute_response_emits_member_value_for_dimension_members():
         dimensions_meta=[{"name": "account_type"}],
     )
 
-    assert 'name="[account_type].[account_type].[MEMBER_VALUE]"' in xml
+    assert 'name="[Dimensions].[account_type].[MEMBER_VALUE]"' in xml
     assert "<MEMBER_VALUE>CURRENT</MEMBER_VALUE>" in xml
     assert "<MEMBER_VALUE>LOAN</MEMBER_VALUE>" in xml
 
@@ -1872,10 +1962,10 @@ def test_execute_response_crossjoin_two_row_dimensions_emits_unique_member_ordin
     #    tuple count.
     per_tuple = re.findall(r'<Tuple>.*?</Tuple>', axis1.group(1), re.DOTALL)
     for i, t in enumerate(per_tuple):
-        assert 'Hierarchy="[country_code].[country_code]"' in t, (
+        assert 'Hierarchy="[Dimensions].[country_code]"' in t, (
             f"tuple {i} missing country_code hierarchy"
         )
-        assert 'Hierarchy="[customer_segment].[customer_segment]"' in t, (
+        assert 'Hierarchy="[Dimensions].[customer_segment]"' in t, (
             f"tuple {i} missing customer_segment hierarchy"
         )
 
@@ -1912,11 +2002,11 @@ def test_execute_response_crossjoin_two_row_dimensions_emits_unique_member_ordin
     #    {0, 1}.
     country_ordinals = {
         o for (h, o) in cap_by_ord.keys()
-        if h == "[country_code].[country_code]"
+        if h == "[Dimensions].[country_code]"
     }
     segment_ordinals = {
         o for (h, o) in cap_by_ord.keys()
-        if h == "[customer_segment].[customer_segment]"
+        if h == "[Dimensions].[customer_segment]"
     }
     assert country_ordinals == {"0", "1"}, country_ordinals
     assert segment_ordinals == {"0", "1"}, segment_ordinals
@@ -2120,8 +2210,8 @@ def test_mdx_drilldown_three_level_hierarchy_resolves_dimension():
 
     assert protocol == "jdbc"
     assert 'SUM("Amount")' in sql
-    # Hierarchy resolves to a dimension; query-router handles the mapping
-    assert "GROUP BY" in sql
+    assert 'GROUP BY "continent_dim"' in sql
+    assert "city_dim" not in sql
 
 
 def test_mdx_drilldown_explicit_level_resolves_to_correct_dimension():
@@ -2402,6 +2492,11 @@ class TestCrossAxisSubtotalCellData:
 class TestMultiHierarchySubtotalAxisShapes:
 
     _NS = "{urn:schemas-microsoft-com:xml-analysis:mddataset}"
+    # Bug-9788: run as a NON-Excel client — Excel's All-tuple suppression is
+    # pinned as part of the ALL_MEMBER pairing and no env flag re-enables it.
+    # The machinery under test is client-agnostic; the Excel-side contract is
+    # owned by test_bug9788_excel_rollup_all_pairing.py.
+    _CLIENT = "Tessallite Grid Harness"
 
     @staticmethod
     def _make_hier(name, mdx_dim, mdx_hier, levels, axis):
@@ -2430,16 +2525,18 @@ class TestMultiHierarchySubtotalAxisShapes:
         ]
 
     def _build(self, mdx, hierarchies):
-        return build_real_execute_response(
-            mdx=mdx,
-            catalog="demo",
-            columns=["country", "category", "Amount"],
-            rows=self._merged_rows(),
-            measures_meta=[{"name": "Amount", "default_agg": "sum"}],
-            dimensions_meta=[{"name": "country"}, {"name": "category"}],
-            client_app_name="Excel",
-            subtotal_hierarchies=hierarchies,
-        )
+        with _enable_rollup_all_grains():
+            return build_real_execute_response(
+                mdx=mdx,
+                catalog="demo",
+                columns=["country", "category", "Amount"],
+                rows=self._merged_rows(),
+                measures_meta=[{"name": "Amount", "default_agg": "sum"}],
+                dimensions_meta=[{"name": "country"}, {"name": "category"}],
+                client_app_name=self._CLIENT,
+                axis_format="tupleformat",
+                subtotal_hierarchies=hierarchies,
+            )
 
     def _parse(self, xml):
         """Return ({axis_name: [tuple captions]}, {ordinal: value})."""
@@ -2503,11 +2600,11 @@ class TestMultiHierarchySubtotalAxisShapes:
         assert value_by_tuple[("France", "Bikes")] == 100.0
         assert value_by_tuple[("France", "Cars")] == 200.0
         # France subtotal = Bikes + Cars
-        assert value_by_tuple[("France", "All")] == 300.0
+        assert value_by_tuple[("France", "All Product")] == 300.0
         assert value_by_tuple[("Germany", "Bikes")] == 50.0
-        assert value_by_tuple[("Germany", "All")] == 50.0
+        assert value_by_tuple[("Germany", "All Product")] == 50.0
         # Grand total = France subtotal + Germany subtotal
-        assert value_by_tuple[("All", "All")] == 350.0
+        assert value_by_tuple[("All Geography", "All Product")] == 350.0
 
     def test_two_hierarchies_on_columns_axis_builds_well_formed_response(self):
         """Mirror case: both subtotal hierarchies on the columns axis."""
@@ -2573,16 +2670,18 @@ class TestMultiHierarchySubtotalAxisShapes:
             {"country": "France", "year": "",     "month": "",   "Amount": 70,  g + "Geo": 0,  g + "Cal": -1},
             {"country": "",       "year": "",     "month": "",   "Amount": 70,  g + "Geo": -1, g + "Cal": -1},
         ]
-        xml = build_real_execute_response(
-            mdx=mdx,
-            catalog="demo",
-            columns=["country", "year", "month", "Amount"],
-            rows=rows,
-            measures_meta=[{"name": "Amount", "default_agg": "sum"}],
-            dimensions_meta=[{"name": "country"}, {"name": "year"}, {"name": "month"}],
-            client_app_name="Excel",
-            subtotal_hierarchies=[h_geo, h_cal],
-        )
+        with _enable_rollup_all_grains():
+            xml = build_real_execute_response(
+                mdx=mdx,
+                catalog="demo",
+                columns=["country", "year", "month", "Amount"],
+                rows=rows,
+                measures_meta=[{"name": "Amount", "default_agg": "sum"}],
+                dimensions_meta=[{"name": "country"}, {"name": "year"}, {"name": "month"}],
+                client_app_name=self._CLIENT,
+                axis_format="tupleformat",
+                subtotal_hierarchies=[h_geo, h_cal],
+            )
         axes, cells = self._parse(xml)
 
         # Month 4-2025 and month 4-2026 must remain distinct tuples:
@@ -2596,8 +2695,8 @@ class TestMultiHierarchySubtotalAxisShapes:
         assert value_by_pos[captions.index(("France", "4"))] in (10.0, 40.0)
         assert value_by_pos[captions.index(("France", "2025"))] == 30.0
         assert value_by_pos[captions.index(("France", "2026"))] == 40.0
-        assert value_by_pos[captions.index(("France", "All"))] == 70.0
-        assert value_by_pos[captions.index(("All", "All"))] == 70.0
+        assert value_by_pos[captions.index(("France", "All Calendar"))] == 70.0
+        assert value_by_pos[captions.index(("All Geography", "All Calendar"))] == 70.0
         # The two month-4 members carry path-qualified unames
         # (& is XML-escaped in the raw response).
         assert "[Calendar].[Cal].[Month].&amp;[2025]&amp;[4]" in xml
@@ -2632,6 +2731,11 @@ class TestMultiHierarchySubtotalAxisShapes:
 class TestSingleHierarchySubtotalUnames:
 
     _NS = "{urn:schemas-microsoft-com:xml-analysis:mddataset}"
+    # Bug-9788: run as a NON-Excel client — Excel's All-tuple suppression is
+    # pinned as part of the ALL_MEMBER pairing and no env flag re-enables it.
+    # The machinery under test is client-agnostic; the Excel-side contract is
+    # owned by test_bug9788_excel_rollup_all_pairing.py.
+    _CLIENT = "Tessallite Grid Harness"
 
     @staticmethod
     def _make_hier():
@@ -2684,24 +2788,34 @@ class TestSingleHierarchySubtotalUnames:
         # Captions stay the plain member value.
         assert by_uname["[Calendar].[Cal].[Month].&[2025]&[4]"]["caption"] == "4"
 
-    def test_member_ordinals_are_stable_per_distinct_member(self):
-        """Bug-XMLA-003 invariant: a repeated member must carry the same
-        ordinal everywhere it appears; distinct members carry distinct
-        ordinals."""
+    def test_member_ordinals_are_stable_and_unique_within_each_level(self):
+        """Bug-9789: ordinals are stable and unique within a level.
+
+        XMLA defines MEMBER_ORDINAL as the ordinal in the member's level. The
+        All member therefore has ordinal zero in level zero while the first
+        regular member independently has ordinal zero in its data level.
+        """
         from src.dax.mdx_execute import _build_subtotal_row_members
 
         rows = self._rows() + self._rows()[:1]  # repeat the first row
         members = _build_subtotal_row_members(
             rows, self._make_hier(), "Calendar", "Cal",
         )
-        ordinal_by_uname: dict[str, set[int]] = {}
+        ordinal_by_uname: dict[tuple[str, str], set[int]] = {}
         for m in members:
-            ordinal_by_uname.setdefault(m["uname"], set()).add(m["member_ordinal"])
+            ordinal_by_uname.setdefault(
+                (m["lname"], m["uname"]), set(),
+            ).add(m["member_ordinal"])
         # Same member -> always the same ordinal.
         assert all(len(s) == 1 for s in ordinal_by_uname.values())
-        # Distinct members -> distinct ordinals.
-        all_ordinals = [next(iter(s)) for s in ordinal_by_uname.values()]
-        assert len(all_ordinals) == len(set(all_ordinals))
+        # Distinct members -> distinct ordinals within each level. Different
+        # levels each begin at zero, as required by the XMLA contract.
+        ordinals_by_level: dict[str, list[int]] = {}
+        for (level, _), ordinals in ordinal_by_uname.items():
+            ordinals_by_level.setdefault(level, []).append(next(iter(ordinals)))
+        for ordinals in ordinals_by_level.values():
+            assert len(ordinals) == len(set(ordinals))
+            assert sorted(ordinals) == list(range(len(ordinals)))
 
     def test_cell_values_line_up_with_uname_positions(self):
         """Business outcome end to end: year subtotals equal the sum of
@@ -2711,16 +2825,18 @@ class TestSingleHierarchySubtotalUnames:
         mdx = """SELECT {[Measures].[Amount]} ON COLUMNS,
         [Calendar].[Cal].MEMBERS ON ROWS
         FROM [demo]"""
-        xml = build_real_execute_response(
-            mdx=mdx,
-            catalog="demo",
-            columns=["year", "month", "Amount"],
-            rows=self._rows(),
-            measures_meta=[{"name": "Amount", "default_agg": "sum"}],
-            dimensions_meta=[{"name": "year"}, {"name": "month"}],
-            client_app_name="Excel",
-            subtotal_hierarchy=self._make_hier(),
-        )
+        with _enable_rollup_all_grains():
+            xml = build_real_execute_response(
+                mdx=mdx,
+                catalog="demo",
+                columns=["year", "month", "Amount"],
+                rows=self._rows(),
+                measures_meta=[{"name": "Amount", "default_agg": "sum"}],
+                dimensions_meta=[{"name": "year"}, {"name": "month"}],
+                client_app_name=self._CLIENT,
+                axis_format="tupleformat",
+                subtotal_hierarchy=self._make_hier(),
+            )
         root = ET.fromstring(xml)
         cells = {
             int(c.get("CellOrdinal")): float(c.findtext(self._NS + "Value"))
@@ -2754,6 +2870,11 @@ class TestSingleHierarchySubtotalUnames:
 class TestMixedShapeFlatColumnDim:
 
     _NS = "{urn:schemas-microsoft-com:xml-analysis:mddataset}"
+    # Bug-9788: run as a NON-Excel client — Excel's All-tuple suppression is
+    # pinned as part of the ALL_MEMBER pairing and no env flag re-enables it.
+    # The machinery under test is client-agnostic; the Excel-side contract is
+    # owned by test_bug9788_excel_rollup_all_pairing.py.
+    _CLIENT = "Tessallite Grid Harness"
 
     @staticmethod
     def _make_hier(name, mdx_dim, mdx_hier, levels, axis):
@@ -2790,18 +2911,20 @@ class TestMixedShapeFlatColumnDim:
                                 [("Country", 0, "country")], axis=1)
         h_prod = self._make_hier("Prod", "Product", "Prod",
                                  [("Category", 0, "category")], axis=1)
-        return build_real_execute_response(
-            mdx=mdx,
-            catalog="demo",
-            columns=["country", "category", "channel", "Amount"],
-            rows=self._merged_rows(),
-            measures_meta=[{"name": "Amount", "default_agg": "sum"}],
-            dimensions_meta=[
-                {"name": "country"}, {"name": "category"}, {"name": "channel"},
-            ],
-            client_app_name="Excel",
-            subtotal_hierarchies=[h_geo, h_prod],
-        )
+        with _enable_rollup_all_grains():
+            return build_real_execute_response(
+                mdx=mdx,
+                catalog="demo",
+                columns=["country", "category", "channel", "Amount"],
+                rows=self._merged_rows(),
+                measures_meta=[{"name": "Amount", "default_agg": "sum"}],
+                dimensions_meta=[
+                    {"name": "country"}, {"name": "category"}, {"name": "channel"},
+                ],
+                client_app_name=self._CLIENT,
+                axis_format="tupleformat",
+                subtotal_hierarchies=[h_geo, h_prod],
+            )
 
     def _parse(self, xml):
         import xml.etree.ElementTree as ET
@@ -3025,9 +3148,9 @@ def _geo3_args(tree_op: str):
             ],
         }],
         restrictions={
-            "HIERARCHY_UNIQUE_NAME": ["[geo3].[geo3]"],
-            "LEVEL_UNIQUE_NAME": ["[geo3].[geo3].[City]"],
-            "MEMBER_UNIQUE_NAME": ["[geo3].[geo3].[City].&[EMEA]&[UK]&[London]"],
+            "HIERARCHY_UNIQUE_NAME": ["[Hierarchies].[geo3]"],
+            "LEVEL_UNIQUE_NAME": ["[Hierarchies].[geo3].[City]"],
+            "MEMBER_UNIQUE_NAME": ["[Hierarchies].[geo3].[City].&[EMEA]&[UK]&[London]"],
             "TREE_OP": [tree_op],
         },
         member_data={
@@ -3052,36 +3175,36 @@ def _geo3_args(tree_op: str):
 
 def _unames(rows):
     return [r["MEMBER_UNIQUE_NAME"] for r in rows
-            if r.get("HIERARCHY_UNIQUE_NAME") == "[geo3].[geo3]"]
+            if r.get("HIERARCHY_UNIQUE_NAME") == "[Hierarchies].[geo3]"]
 
 
 def test_tree_op_parent_returns_immediate_parent():
     rows = _rows_members(**_geo3_args("2"))  # PARENT
-    assert _unames(rows) == ["[geo3].[geo3].[Country].&[EMEA]&[UK]"]
+    assert _unames(rows) == ["[Hierarchies].[geo3].[Country].&[EMEA]&[UK]"]
 
 
 def test_tree_op_ancestors_returns_full_chain():
     rows = _rows_members(**_geo3_args("32"))  # ANCESTORS
     assert set(_unames(rows)) == {
-        "[geo3].[geo3].[Region].&[EMEA]",
-        "[geo3].[geo3].[Country].&[EMEA]&[UK]",
+        "[Hierarchies].[geo3].[Region].&[EMEA]",
+        "[Hierarchies].[geo3].[Country].&[EMEA]&[UK]",
     }
 
 
 def test_tree_op_siblings_returns_same_parent_members():
     rows = _rows_members(**_geo3_args("4"))  # SIBLINGS
     got = set(_unames(rows))
-    assert "[geo3].[geo3].[City].&[EMEA]&[UK]&[London]" in got
-    assert "[geo3].[geo3].[City].&[EMEA]&[UK]&[Manchester]" in got
+    assert "[Hierarchies].[geo3].[City].&[EMEA]&[UK]&[London]" in got
+    assert "[Hierarchies].[geo3].[City].&[EMEA]&[UK]&[Manchester]" in got
     # Paris is under FR, not a sibling.
-    assert "[geo3].[geo3].[City].&[EMEA]&[FR]&[Paris]" not in got
+    assert "[Hierarchies].[geo3].[City].&[EMEA]&[FR]&[Paris]" not in got
 
 
 def test_tree_op_parent_then_self_includes_both():
     rows = _rows_members(**_geo3_args("10"))  # PARENT(2) | SELF(8)
     got = set(_unames(rows))
-    assert "[geo3].[geo3].[Country].&[EMEA]&[UK]" in got
-    assert "[geo3].[geo3].[City].&[EMEA]&[UK]&[London]" in got
+    assert "[Hierarchies].[geo3].[Country].&[EMEA]&[UK]" in got
+    assert "[Hierarchies].[geo3].[City].&[EMEA]&[UK]&[London]" in got
 
 
 # ---------------------------------------------------------------------------
@@ -3142,6 +3265,14 @@ def test_format_cell_value_multi_section_uses_positive_section():
 # Bug-5432 — measure format TOKEN -> SSAS/.NET FORMAT_STRING resolver
 # ---------------------------------------------------------------------------
 from shared.schemas.measure_formats import format_token_to_mdx
+
+
+@pytest.fixture(autouse=True)
+def _select_calculated_total_profile(monkeypatch):
+    """This file specifies the calculated-total Excel profile. It is no longer
+    the default (owner decision 2026-09-04, native-all is), so select it
+    explicitly; the contract it pins is unchanged."""
+    monkeypatch.setenv("TESSALLITE_XMLA_EXCEL_PROFILE", "calculated-total")
 
 
 def test_format_token_to_mdx_known_tokens():

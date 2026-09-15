@@ -18,6 +18,7 @@ import hmac
 import json
 import logging
 import time
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 class WebhookPersistError(RuntimeError):
-    """Raised by :func:`emit_webhook` when delivery rows cannot be persisted.
+    """Raised when delivery rows cannot be safely persisted.
 
     F-022-05: a persistence failure must NOT be swallowed and must NOT look like
     "zero matching subscriptions". This exception is raised so the caller (which
@@ -58,6 +59,21 @@ class WebhookPersistError(RuntimeError):
     business operation reporting success with no delivery history and no DLQ
     entry.
     """
+
+
+class _WebhookSecretDecryptFailure:
+    """Internal marker for a signing-secret decryption outage.
+
+    ``None`` is reserved for a missing secret and a returned string can still
+    be checked for placeholder material.  Keeping decryption failure as a
+    distinct value lets the delivery state machine fail closed without
+    converting a temporary credential outage into a terminal DLQ row.
+    """
+
+    __slots__ = ()
+
+
+_WEBHOOK_SECRET_DECRYPT_FAILED = _WebhookSecretDecryptFailure()
 
 
 @dataclass
@@ -166,7 +182,9 @@ def _spawn_background(coro) -> asyncio.Task:
     return task
 
 
-def _decrypt_secret(encrypted: Optional[bytes]) -> Optional[str]:
+def _decrypt_secret(
+    encrypted: Optional[bytes],
+) -> Optional[str] | _WebhookSecretDecryptFailure:
     if not encrypted:
         return None
     try:
@@ -174,7 +192,7 @@ def _decrypt_secret(encrypted: Optional[bytes]) -> Optional[str]:
         return decrypt_str(encrypted)
     except Exception:
         logger.exception("Failed to decrypt webhook signing secret")
-        return None
+        return _WEBHOOK_SECRET_DECRYPT_FAILED
 
 
 def _is_valid_signing_secret(secret: Optional[str]) -> bool:
@@ -375,7 +393,7 @@ def _is_non_retryable(status_code: Optional[int]) -> bool:
 
 def rebuild_signed_body(
     endpoint: WebhookEndpoint, delivery: WebhookDelivery,
-) -> tuple[Optional[str], bytes, str]:
+) -> tuple[Optional[str], bytes, str | _WebhookSecretDecryptFailure]:
     """Rebuild the (url, body_bytes, signature) for an existing delivery row.
 
     Captures the timestamp once for both body and signature (F-022-11).
@@ -408,7 +426,9 @@ def rebuild_signed_body(
 
     A row with no frozen destination returns ``(None, b"", "")``. The caller
     MUST dead-letter it with :data:`INCOHERENT_DELIVERY_ROW_REASON` rather
-    than fall back to the live url — that fallback is the defect.
+    than fall back to the live url — that fallback is the defect. A decryption
+    outage returns a distinct internal signature marker so the caller can
+    leave the row pending and apply the normal backoff schedule.
     """
     target_url: Optional[str] = reveal_destination_url(
         getattr(delivery, "destination_url_snapshot", None)
@@ -424,6 +444,8 @@ def rebuild_signed_body(
         "emitted_at": ts,
     }
     body_bytes = json.dumps(body, default=str).encode()
+    if secret is _WEBHOOK_SECRET_DECRYPT_FAILED:
+        return target_url, body_bytes, _WEBHOOK_SECRET_DECRYPT_FAILED
     sig_header = ""
     if _is_valid_signing_secret(secret):
         sig_header = compute_signature(secret, ts, body_bytes)
@@ -456,11 +478,49 @@ def _dlq_incoherent_delivery(delivery: WebhookDelivery) -> None:
     )
 
 
+WEBHOOK_SECRET_DECRYPTION_RETRY_REASON = (
+    "webhook_secret_decryption_failed: the signing secret could not be "
+    "decrypted, so the payload was not sent; delivery will be retried."
+)
+WEBHOOK_SECRET_DECRYPTION_EXHAUSTED_REASON = (
+    "webhook_secret_decryption_failed: the signing secret could not be "
+    "decrypted before the retry limit was exhausted; restore the credential "
+    "and retry this delivery from the DLQ."
+)
+WEBHOOK_SECRET_DECRYPTION_TEST_REASON = (
+    "webhook_secret_decryption_failed: the signing secret could not be "
+    "decrypted, so the one-shot test payload was not sent; restore the "
+    "credential and run the test again."
+)
+
+
+def _record_secret_decrypt_failure(delivery: WebhookDelivery) -> None:
+    """Keep an unsignable delivery retryable during a decrypt outage.
+
+    This records a failed signing attempt without making an HTTP request. It
+    uses the same bounded retry budget as receiver failures; once that budget
+    is exhausted the row becomes a visible DLQ entry instead of remaining due
+    forever.
+    """
+    delivery.attempts = (delivery.attempts or 0) + 1
+    delivery.last_attempt_at = datetime.now(timezone.utc)
+    delivery.response_code = None
+    delay = _backoff_delay(delivery.attempts)
+    if delay is None:
+        delivery.status = "dlq"
+        delivery.next_attempt_at = None
+        delivery.error_message = WEBHOOK_SECRET_DECRYPTION_EXHAUSTED_REASON
+        return
+    delivery.status = "pending"
+    delivery.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    delivery.error_message = WEBHOOK_SECRET_DECRYPTION_RETRY_REASON
+
+
 async def attempt_delivery(
     delivery: WebhookDelivery,
     url: str,
     body_bytes: bytes,
-    sig_header: str,
+    sig_header: str | _WebhookSecretDecryptFailure,
 ) -> None:
     """Make one POST attempt and update ``delivery`` in place.
 
@@ -469,15 +529,24 @@ async def attempt_delivery(
     ``next_attempt_at`` set for the drain job to pick up later. Never sleeps.
 
     Bug-8056 (F-022-07): an outbound webhook MUST carry a valid HMAC signature.
-    An empty ``sig_header`` means no signature could be produced — the signing
-    secret is missing, a known placeholder, or undecryptable. That is a terminal
-    configuration/security failure, not a transient one. The payload is NOT
-    transmitted (a receiver could never authenticate it) and the row is recorded
-    as a terminal FAILED (``dlq``) state so the outcome is operator-visible.
+    An empty ``sig_header`` means no signature could be produced because the
+    signing secret is missing or a known placeholder. That is a terminal
+    configuration/security failure. A distinct decryption-failure marker is
+    treated as a transient credential/infrastructure failure: the payload is
+    still NOT transmitted, but the row remains pending with bounded backoff.
     Crucially, an unsigned send is NEVER recorded as ``delivered``: without this
     guard, ``_post_once`` would POST the unsigned body and a 2xx would be logged
     as a successful delivery, contrary to the outbound-signing contract.
     """
+    if sig_header is _WEBHOOK_SECRET_DECRYPT_FAILED:
+        _record_secret_decrypt_failure(delivery)
+        logger.warning(
+            "Webhook delivery %s could not decrypt its signing secret; "
+            "payload not sent and delivery remains retryable.",
+            getattr(delivery, "id", "<new>"),
+        )
+        return
+
     if not sig_header:
         delivery.attempts = (delivery.attempts or 0) + 1
         delivery.last_attempt_at = datetime.now(timezone.utc)
@@ -662,7 +731,9 @@ async def deliver_test_event(
 
     # Bug-5951: validate the secret before signing.
     sig_header = ""
-    if _is_valid_signing_secret(secret):
+    if secret is _WEBHOOK_SECRET_DECRYPT_FAILED:
+        sig_header = _WEBHOOK_SECRET_DECRYPT_FAILED
+    elif _is_valid_signing_secret(secret):
         sig_header = compute_signature(secret, ts, body_bytes)
     elif secret is not None:
         logger.warning(
@@ -695,6 +766,8 @@ async def deliver_test_event(
     )
     # A test never schedules a retry — report the single outcome.
     if delivery.status == "pending":
+        if sig_header is _WEBHOOK_SECRET_DECRYPT_FAILED:
+            delivery.error_message = WEBHOOK_SECRET_DECRYPTION_TEST_REASON
         delivery.status = "dlq"
     delivery.next_attempt_at = None
     await db.flush()
@@ -709,7 +782,10 @@ def endpoint_can_sign(endpoint: WebhookEndpoint) -> bool:
     decrypt + placeholder validation the signed dispatch path uses, so the
     selection and the sign/refuse decision can never disagree.
     """
-    return _is_valid_signing_secret(_decrypt_secret(endpoint.signing_secret))
+    secret = _decrypt_secret(endpoint.signing_secret)
+    if secret is _WEBHOOK_SECRET_DECRYPT_FAILED:
+        return False
+    return _is_valid_signing_secret(secret)
 
 
 async def enqueue_signed_callback(
@@ -731,37 +807,16 @@ async def enqueue_signed_callback(
     subscription path uses. The caller commits the row and kicks the async
     dispatch (mirroring :func:`emit_webhook`).
 
-    FAIL CLOSED: an endpoint with no valid signing secret yields a TERMINAL
-    ``dlq`` refusal row (``UNSIGNED_WEBHOOK_REFUSAL_REASON``) and NOTHING is
-    sent — the completion callback is never delivered unsigned. This is the same
-    fail-closed rule :func:`attempt_delivery` enforces at dispatch time, applied
-    up front so the trigger endpoint can report the refusal to its caller
-    synchronously.
+    FAIL CLOSED: an endpoint with no signing secret or placeholder material
+    yields a TERMINAL ``dlq`` refusal row
+    (``UNSIGNED_WEBHOOK_REFUSAL_REASON``) and NOTHING is sent. If decrypting an
+    encrypted secret raises, the callback is persisted as ``pending`` and the
+    normal dispatcher retry path gets a chance to recover after the credential
+    outage. In either case the callback is never delivered unsigned.
 
     Returns the persisted (flushed) delivery. Does not commit.
     """
     secret = _decrypt_secret(endpoint.signing_secret)
-    if not _is_valid_signing_secret(secret):
-        delivery = WebhookDelivery(
-            endpoint_id=endpoint.id,
-            event_type=event_type,
-            payload=payload,
-            status="dlq",
-            attempts=0,
-            next_attempt_at=None,
-            destination_url_snapshot=seal_destination_url(endpoint.url),
-            error_message=UNSIGNED_WEBHOOK_REFUSAL_REASON,
-        )
-        db.add(delivery)
-        await db.flush()
-        logger.error(
-            "Completion callback refused for endpoint %s: no valid signing "
-            "secret; payload not sent (never delivered unsigned) — recorded as "
-            "a terminal dlq refusal. Rotate the secret to restore signed "
-            "delivery.",
-            endpoint.id,
-        )
-        return delivery
 
     # E-3 (DeepSeek): apply the same oversize guard :func:`emit_webhook` applies,
     # so this new enqueue path shares the shared body-size contract instead of
@@ -788,6 +843,49 @@ async def enqueue_signed_callback(
             "Completion callback refused for endpoint %s: payload exceeds the "
             "%d byte limit; not sent.",
             endpoint.id, _MAX_BODY_BYTES,
+        )
+        return delivery
+
+    if secret is _WEBHOOK_SECRET_DECRYPT_FAILED:
+        delivery = WebhookDelivery(
+            endpoint_id=endpoint.id,
+            event_type=event_type,
+            payload=payload,
+            status="pending",
+            attempts=0,
+            next_attempt_at=datetime.now(timezone.utc),
+            signing_secret_snapshot=endpoint.signing_secret,
+            destination_url_snapshot=seal_destination_url(endpoint.url),
+            error_message=WEBHOOK_SECRET_DECRYPTION_RETRY_REASON,
+        )
+        db.add(delivery)
+        await db.flush()
+        logger.warning(
+            "Completion callback for endpoint %s could not decrypt its "
+            "signing secret; persisted as pending for retry.",
+            endpoint.id,
+        )
+        return delivery
+
+    if not _is_valid_signing_secret(secret):
+        delivery = WebhookDelivery(
+            endpoint_id=endpoint.id,
+            event_type=event_type,
+            payload=payload,
+            status="dlq",
+            attempts=0,
+            next_attempt_at=None,
+            destination_url_snapshot=seal_destination_url(endpoint.url),
+            error_message=UNSIGNED_WEBHOOK_REFUSAL_REASON,
+        )
+        db.add(delivery)
+        await db.flush()
+        logger.error(
+            "Completion callback refused for endpoint %s: no valid signing "
+            "secret; payload not sent (never delivered unsigned) — recorded as "
+            "a terminal dlq refusal. Rotate the secret to restore signed "
+            "delivery.",
+            endpoint.id,
         )
         return delivery
 
@@ -825,7 +923,7 @@ async def dispatch_persisted_deliveries(
 async def emit_webhook(
     tenant_id: str, event_type: str, payload: dict[str, Any],
 ) -> WebhookEmitResult:
-    """Durably persist webhook delivery rows, then dispatch asynchronously.
+    """Open a tenant session, persist delivery rows, then dispatch asynchronously.
 
     Delivery rows are committed before this function returns so events survive
     process restarts. Actual HTTP delivery still happens in a background task.
@@ -836,6 +934,62 @@ async def emit_webhook(
     the failure being indistinguishable from "no endpoint subscribed". Returns a
     :class:`WebhookEmitResult` describing what was matched and persisted.
     """
+    try:
+        # D20-R1-F1: this wrapper owns the async session provider. Returning
+        # directly from an async-for leaves provider finalisation to a later
+        # event-loop turn, so close it explicitly on success and failure.
+        async with aclosing(get_tenant_db(tenant_id)) as tenant_sessions:
+            async for db in tenant_sessions:
+                return await emit_webhook_with_session(
+                    db, tenant_id, event_type, payload,
+                )
+
+            raise WebhookPersistError(
+                f"Tenant session provider yielded no session for {tenant_id!r}"
+            )
+    except WebhookPersistError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Webhook tenant session acquisition failed for tenant=%s event=%s",
+            tenant_id,
+            event_type,
+        )
+        raise WebhookPersistError(
+            f"Failed to acquire tenant session for event {event_type!r}"
+        ) from exc
+
+
+def _validate_webhook_session_tenant(db: AsyncSession, tenant_id: str) -> None:
+    """Fail before any write when a supplied session has no matching tenant."""
+
+    info = getattr(db, "info", None)
+    bound_tenant = info.get("tenant_id") if isinstance(info, dict) else None
+    if bound_tenant != tenant_id:
+        raise WebhookPersistError(
+            "Webhook tenant session identity mismatch: "
+            f"requested={tenant_id!r}, bound={bound_tenant!r}"
+        )
+
+
+async def emit_webhook_with_session(
+    db: AsyncSession,
+    tenant_id: str,
+    event_type: str,
+    payload: dict[str, Any],
+) -> WebhookEmitResult:
+    """Persist one event through a caller-owned tenant session.
+
+    Bug-9613 / D20: refresh callers already own a tenant ORM session while a
+    dedicated advisory-lock connection is held. Reusing that session avoids a
+    nested checkout. The caller must commit its originating operation first;
+    this function owns only the webhook transaction. It validates tenant
+    identity before any query/write, commits all delivery rows, rolls back and
+    raises :class:`WebhookPersistError` on persistence failure, and starts
+    asynchronous delivery only after the commit has released its checkout.
+    """
+    _validate_webhook_session_tenant(db, tenant_id)
+
     if event_type not in WEBHOOK_EVENT_TYPES and event_type != "test.ping":
         logger.error(
             "emit_webhook called with unknown event_type=%s (not in WEBHOOK_EVENT_TYPES). "
@@ -846,92 +1000,90 @@ async def emit_webhook(
     result = WebhookEmitResult()
     delivery_ids: list = result.delivery_ids
     try:
-        async for db in get_tenant_db(tenant_id):
-            ep_result = await db.execute(
-                select(WebhookEndpoint).where(WebhookEndpoint.is_active == True)  # noqa: E712
-            )
-            endpoints = ep_result.scalars().all()
+        ep_result = await db.execute(
+            select(WebhookEndpoint).where(WebhookEndpoint.is_active == True)  # noqa: E712
+        )
+        endpoints = ep_result.scalars().all()
 
-            for ep in endpoints:
-                # Bug-6313: no empty->all coercion here. Empty/NULL filters mean
-                # "no subscription" (fail-closed); _event_matches owns that rule.
-                if not _event_matches(ep.event_filters, event_type):
-                    continue
+        for ep in endpoints:
+            # Bug-6313: no empty->all coercion here. Empty/NULL filters mean
+            # "no subscription" (fail-closed); _event_matches owns that rule.
+            if not _event_matches(ep.event_filters, event_type):
+                continue
 
-                result.endpoints_matched += 1
+            result.endpoints_matched += 1
 
-                # F-022-05: reject unsafe URLs up-front.
-                try:
-                    validate_webhook_url(ep.url)
-                except ValueError as exc:
-                    delivery = WebhookDelivery(
-                        endpoint_id=ep.id,
-                        event_type=event_type,
-                        payload=payload,
-                        status="dlq",
-                        attempts=0,
-                        # Bug-8430 (related-defect sweep) -- see
-                        # deliver_test_event above: the rejection reason can
-                        # quote the destination URL.
-                        error_message=scrub_url_from_text(
-                            f"Rejected unsafe URL: {exc}", ep.url,
-                        ),
-                        next_attempt_at=None,
-                        # Bug-8557: self-describing terminal row (see
-                        # deliver_test_event).
-                        destination_url_snapshot=seal_destination_url(ep.url),
-                    )
-                    db.add(delivery)
-                    await db.commit()
-                    continue
-
-                ts = int(time.time())
-                body = {
-                    "event_type": event_type,
-                    "payload": payload,
-                    "emitted_at": ts,
-                }
-                body_bytes = json.dumps(body, default=str).encode()
-
-                if len(body_bytes) > _MAX_BODY_BYTES:
-                    delivery = WebhookDelivery(
-                        endpoint_id=ep.id,
-                        event_type=event_type,
-                        payload=payload,
-                        status="dlq",
-                        error_message=f"Payload exceeds {_MAX_BODY_BYTES} byte limit",
-                        # Bug-8557: self-describing terminal row.
-                        destination_url_snapshot=seal_destination_url(ep.url),
-                    )
-                    db.add(delivery)
-                    await db.commit()
-                    continue
-
-                # Persist the delivery row as "pending" so it survives crashes.
-                # F-022-06: pin the endpoint's signing secret to this delivery
-                # at enqueue time so a later secret rotation never re-signs the
-                # in-flight retry with the new secret.
-                # Bug-8557: pin the DESTINATION alongside it. The url below was
-                # just validated by validate_webhook_url; freezing it here is
-                # what makes the pinned secret coherent, and stops an endpoint
-                # edit from redirecting rows already queued for the previous
-                # receiver.
+            # F-022-05: reject unsafe URLs up-front.
+            try:
+                validate_webhook_url(ep.url)
+            except ValueError as exc:
                 delivery = WebhookDelivery(
                     endpoint_id=ep.id,
                     event_type=event_type,
                     payload=payload,
-                    status="pending",
-                    next_attempt_at=datetime.now(timezone.utc),
-                    signing_secret_snapshot=ep.signing_secret,
+                    status="dlq",
+                    attempts=0,
+                    # Bug-8430 (related-defect sweep) -- see
+                    # deliver_test_event above: the rejection reason can
+                    # quote the destination URL.
+                    error_message=scrub_url_from_text(
+                        f"Rejected unsafe URL: {exc}", ep.url,
+                    ),
+                    next_attempt_at=None,
+                    # Bug-8557: self-describing terminal row (see
+                    # deliver_test_event).
                     destination_url_snapshot=seal_destination_url(ep.url),
                 )
                 db.add(delivery)
-                await db.flush()
-                delivery_ids.append(delivery.id)
+                continue
 
-            await db.commit()
-            result.persisted = len(delivery_ids)
+            ts = int(time.time())
+            body = {
+                "event_type": event_type,
+                "payload": payload,
+                "emitted_at": ts,
+            }
+            body_bytes = json.dumps(body, default=str).encode()
+
+            if len(body_bytes) > _MAX_BODY_BYTES:
+                delivery = WebhookDelivery(
+                    endpoint_id=ep.id,
+                    event_type=event_type,
+                    payload=payload,
+                    status="dlq",
+                    error_message=f"Payload exceeds {_MAX_BODY_BYTES} byte limit",
+                    # Bug-8557: self-describing terminal row.
+                    destination_url_snapshot=seal_destination_url(ep.url),
+                )
+                db.add(delivery)
+                continue
+
+            # Persist the delivery row as "pending" so it survives crashes.
+            # F-022-06: pin endpoint signing secret and destination at enqueue.
+            delivery = WebhookDelivery(
+                endpoint_id=ep.id,
+                event_type=event_type,
+                payload=payload,
+                status="pending",
+                next_attempt_at=datetime.now(timezone.utc),
+                signing_secret_snapshot=ep.signing_secret,
+                destination_url_snapshot=seal_destination_url(ep.url),
+            )
+            db.add(delivery)
+            await db.flush()
+            delivery_ids.append(delivery.id)
+
+        await db.commit()
+        result.persisted = len(delivery_ids)
     except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:  # pragma: no cover - preserve the persistence cause
+            logger.exception(
+                "Webhook rollback also failed for tenant=%s event=%s",
+                tenant_id,
+                event_type,
+            )
         # F-022-05: do NOT swallow. A lost delivery row is a lost event; raise
         # so the caller's try/except records durable operator evidence instead
         # of the event vanishing while the business op reports success.

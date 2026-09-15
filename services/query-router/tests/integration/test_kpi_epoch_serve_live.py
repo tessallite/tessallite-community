@@ -46,7 +46,16 @@ from sqlalchemy.ext.asyncio import (
 
 from src.ir.logical_query import LogicalQuery
 
-pytestmark = [pytest.mark.integration]
+# Bug-9901: this suite exercises the REAL production snapshot resolver (the
+# module docstring's whole point -- "the exact SQL predicate that ships in
+# routes.py is what runs"). The package's own conftest.py autouse fixture
+# patches ``resolve_deployed_shape`` to always return an empty shape as a
+# convenience default for every OTHER test here; opting out with
+# ``real_snapshot_resolver`` is the documented escape hatch (see
+# conftest.py's own comment on that marker) and is required for
+# ``_seed_model_kpi_and_latest``'s real ``ModelVersion``/``kpis`` snapshot to
+# actually reach ``_handle_kpi_table_query``'s row-authorisation check.
+pytestmark = [pytest.mark.integration, pytest.mark.real_snapshot_resolver]
 
 _DB_URL = os.environ.get("TESSALLITE_VERSIONING_DB_URL") or os.environ.get(
     "TESSALLITE_IMPORTER_REHYDRATION_DB_URL"
@@ -153,11 +162,37 @@ def _patch_observation(monkeypatch):
 async def _seed_model_kpi_and_latest(
     s: AsyncSession, *, deploy_epoch: int, latest_epoch: int,
 ) -> tuple[uuid.UUID, uuid.UUID]:
-    """Seed a deployed Model + deployed KPI + one KPILatest row.
+    """Seed a deployed Model + a REAL deployed-snapshot ModelVersion + a
+    deployed KPI + one KPILatest row.
 
     Returns (model_id, kpi_id).
+
+    Bug-9901: the handler under test authorises every served row against the
+    DEPLOYED snapshot's ``kpis`` section (Bug-9490) -- ``_deployed_kpis_by_id``
+    is built from ``resolve_snapshot_authority(model, db)``, which reads a
+    real ``ModelVersion.snapshot_json`` row via
+    ``shared.model_snapshot`` / ``src.semantic.snapshot_resolver``. The
+    original fixture pointed ``Model.deployed_version_id`` at a
+    ``ModelVersion`` row that was NEVER CREATED, and the test suite's own
+    ``conftest.py`` autouse fixture patches ``resolve_deployed_shape`` to
+    always return an EMPTY shape (its documented convenience default for
+    every OTHER test in this package -- see conftest.py's
+    ``real_snapshot_resolver`` marker doc). This test never opted out, so
+    every served row was withheld regardless of the epoch predicate being
+    tested: ``_deployed_kpis_by_id`` stayed empty and
+    ``_handle_kpi_table_query`` withheld the KPI unconditionally, which is
+    exactly the "always empty, epoch predicate never actually exercised"
+    failure this integration test exists to catch. Seed a real
+    ``ModelVersion`` with a snapshot that carries the KPI (this test module
+    now marks ``real_snapshot_resolver`` to use the real resolver).
+
+    Also acquires the Bug-7982 per-model definition lock before writing the
+    snapshot-owned ``model_versions``/``kpis``/``kpi_latest`` rows, mirroring
+    every production writer -- the unlocked raw inserts previously tripped
+    ``shared/db/model_write_lock_guard.py``'s own correctness guard.
     """
-    from shared.db.models import KPI, KPILatest, Model, Project
+    from shared.db.model_lock import acquire_model_definition_lock
+    from shared.db.models import KPI, KPILatest, Model, ModelVersion, Project
 
     project_id = uuid.uuid4()
     model_id = uuid.uuid4()
@@ -174,6 +209,32 @@ async def _seed_model_kpi_and_latest(
             seed=uuid.uuid4().hex,
             deployed_version_id=deployed_v,
             deploy_epoch=deploy_epoch,
+        )
+    )
+    await s.flush()
+
+    # Bug-7982: every writer of a snapshot-owned table holds the per-model
+    # definition lock for the duration of the write, same as the real deploy
+    # pipeline (model-service) does.
+    await acquire_model_definition_lock(s, model_id)
+
+    s.add(
+        ModelVersion(
+            id=deployed_v,
+            model_id=model_id,
+            version_number=1,
+            # Minimal but genuine deployed shape: a non-empty ``hierarchies``
+            # family satisfies ``_snapshot_has_shape`` (measures/dimensions/
+            # columns/hierarchies), and the ``kpis`` entry is what
+            # ``_build_shape`` turns into ``kpi_rows`` -- the row
+            # ``_handle_kpi_table_query`` looks up by id to authorise the
+            # served KPI (Bug-9490). No persona is bound in this test, so no
+            # measure-lineage fields are needed for the row to be allowed.
+            snapshot_json={
+                "hierarchies": [{"id": "h-dummy"}],
+                "kpis": [{"id": str(kpi_id), "name": "Revenue"}],
+            },
+            created_by="test",
         )
     )
     s.add(KPI(id=kpi_id, model_id=model_id, name="Revenue", is_deployed=True))

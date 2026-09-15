@@ -29,6 +29,19 @@ All three kinds are **governed model content**: they travel in the model's deplo
 
 ---
 
+## Deployed vs. Define: two views of the same MDX Named Sets
+
+The panel that opens MDX Named Sets from the toolbelt shows two tabs: **Deployed** and **Define**.
+
+- **Define** is the authoring surface described in the rest of this page — the live list you edit, backed by whatever is currently saved to the model's draft, whether or not it has been deployed yet.
+- **Deployed** is a read-only viewer of exactly what BI tools currently see: only sets that belong to the **last deployed** model version, grouped by folder, with a certification filter. It exists so a modeller can check what Excel and Power BI actually query right now without leaving Model Builder, opening a separate BI client, or guessing whether an edit has gone live.
+
+This split matters because editing a definition never changes what BI tools see until you deploy (see *Deploy semantics* below) — a set you just created or renamed only appears under **Deployed** after that deploy completes. If you edit a set and it still looks unchanged in Excel, check **Deployed** first: if the edit is not there either, the model has not been redeployed since you made it.
+
+The KPI Scorecard panel uses the identical Deployed/Define split for the same reason: separating "what I am authoring" from "what is actually live" for any governed model object.
+
+---
+
 ## MDX Named Sets
 
 An MDX Named Set is a reusable collection of dimension members expressed in MDX. It resolves inside the XMLA engine at query time, so it is the right kind for Excel PivotTables and Power BI.

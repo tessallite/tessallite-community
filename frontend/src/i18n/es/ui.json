@@ -161,6 +161,8 @@
   "projectNav.demoTenant": "Inquilino de demostración",
   "projectNav.setup": "Configuración",
   "projectNav.ssoMappings": "Asignaciones de SSO",
+  "projectNav.ssoIdp": "Proveedor de identidad",
+  "projectNav.embedTokens": "Tokens de inserción",
   "projectNav.usersAccess": "Usuarios y Acceso",
   "projectNav.webhooks": "Webhooks",
   "ui.aServiceRestartIsRequiredForThisChangeTo": "Se requiere reiniciar el servicio para que este cambio surta efecto",

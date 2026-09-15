@@ -3,7 +3,7 @@
 Tests the gateway's ability to expose KPIs to BI clients through:
 1. JDBC: $KPIs virtual table with KPI columns
 2. JDBC: Inline KPI columns (when expose_kpis_inline=true)
-3. XMLA: MDSCHEMA_KPIS rowset with v2 expression and composite support
+3. XMLA: MDSCHEMA_KPIS rowset with executable v2 expressions
 """
 import sys
 from pathlib import Path
@@ -89,6 +89,14 @@ V2_KPIS = [
         "value_measure_id": None,
         "goal_measure_id": None,
     },
+]
+
+# Native XMLA KPI rows need a single executable value member. These variants
+# retain the v2 target/presentation metadata while using addressable values so
+# the metadata tests exercise the supported surface rather than an empty row.
+NATIVE_V2_KPIS = [
+    {**V2_KPIS[0], "expression": 'measure("Revenue")'},
+    {**V2_KPIS[1], "expression": 'measure("Units")'},
 ]
 
 COMPOSITE_KPIS = [
@@ -231,11 +239,10 @@ class TestRowsKpisV2:
         # inline column is never present in the XMLA measure set, so Execute
         # refused it. A COMPOSITE expression (safe_div(measure("Orders"),
         # measure("Visits"))) has no single executable measure member, so KPI_VALUE
-        # is "" (undefined) rather than a member Execute cannot run — catalogue and
-        # Execute agree by construction.
+        # is withheld rather than advertising a member Execute cannot run —
+        # catalogue and Execute agree by construction.
         rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
-        assert len(rows) == 2
-        assert rows[0]["KPI_VALUE"] == ""
+        assert rows == []
 
     def test_v2_single_measure_expression_value_is_executable_member(self):
         # Bug-6702: a v2 KPI whose value expression is a single bare measure
@@ -253,41 +260,39 @@ class TestRowsKpisV2:
         # Bug-6608 (un-gated): MDSCHEMA_KPIS advertises the addressable status
         # MEMBER (never a band CASE). The live −1/0/1 verdict is governed by the
         # model-service authority, not this metadata string. Bug-6702: a composite
-        # expression with no single executable member has "" (== KPI_VALUE), never a
+        # expression with no single executable member is withheld, never a
         # synthetic inline column.
-        rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
+        rows = mdschema._rows_kpis(CATALOG, NATIVE_V2_KPIS, MEASURES)
         status = rows[0]["KPI_STATUS"]
-        assert status == ""
-        assert status == rows[0]["KPI_VALUE"]
+        assert status == "[Measures].[Conversion Rate Status]"
+        assert status != rows[0]["KPI_VALUE"]
         assert not status.upper().startswith("CASE")
 
     def test_v2_static_target(self):
         # Bug-6888: a static target is advertised as the synthetic goal support
         # MEMBER (a bare scalar is not addable from Excel's KPI field list);
         # the Execute path resolves the member to the 0.05 constant.
-        rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
+        rows = mdschema._rows_kpis(CATALOG, NATIVE_V2_KPIS, MEASURES)
         assert rows[0]["KPI_GOAL"] == "[Measures].[Conversion Rate Goal]"
 
     def test_v2_measure_target(self):
         # Bug-6259: a measure target resolves to an EXECUTABLE MDX member
         # reference (via target_measure_id), never the raw Tessallite DSL string.
-        rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
+        rows = mdschema._rows_kpis(CATALOG, NATIVE_V2_KPIS, MEASURES)
         assert rows[1]["KPI_GOAL"] == "[Measures].[Target_AOV]"
 
     def test_v2_weight(self):
-        rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
+        rows = mdschema._rows_kpis(CATALOG, NATIVE_V2_KPIS, MEASURES)
         assert rows[0]["KPI_WEIGHT"] == "0.4"
         assert rows[1]["KPI_WEIGHT"] == "0.6"
 
-    def test_v2_status_graphic_suppressed_without_authored_status(self):
-        # Fable R1 finding 1: MDSCHEMA KPI_STATUS is the value member, which a
-        # native pivot binds directly (no KPIStatus() interception) -> graphic
-        # suppressed to avoid clamping a raw value onto -1/0/1 icon domain. Only
-        # authored status_expression KPIs keep the graphic. (Both V2_KPIS lack
-        # an authored status_expression.)
-        rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
-        assert rows[0]["KPI_STATUS_GRAPHIC"] == ""
-        assert rows[1]["KPI_STATUS_GRAPHIC"] == ""
+    def test_bug_9830_executable_v2_status_graphics_are_addressable(self):
+        # A native status checkbox needs a real governed support member. Both
+        # executable v2 rows have a target basis, so their synthetic status
+        # members and graphics are advertised together.
+        rows = mdschema._rows_kpis(CATALOG, NATIVE_V2_KPIS, MEASURES)
+        assert rows[0]["KPI_STATUS_GRAPHIC"] == "Gauge"
+        assert rows[1]["KPI_STATUS_GRAPHIC"] == "Gauge"
 
     def test_authored_status_expression_keeps_graphic(self):
         # A modeller-authored status expression IS a verdict, so its graphic stays.
@@ -296,32 +301,16 @@ class TestRowsKpisV2:
         assert rows[0]["KPI_STATUS_GRAPHIC"] == "Traffic Light"
 
     def test_v2_display_folder(self):
-        rows = mdschema._rows_kpis(CATALOG, V2_KPIS, MEASURES)
+        rows = mdschema._rows_kpis(CATALOG, NATIVE_V2_KPIS, MEASURES)
         assert rows[0]["KPI_DISPLAY_FOLDER"] == "Marketing"
         assert rows[1]["KPI_DISPLAY_FOLDER"] == "Sales"
 
 
 class TestRowsKpisComposite:
-    """Tests for composite KPI parent/child relationships."""
+    """Composite KPI trees are withheld when the parent is not native-executable."""
 
-    def test_composite_parent_has_no_parent_name(self):
-        rows = mdschema._rows_kpis(CATALOG, COMPOSITE_KPIS, MEASURES)
-        parent_row = [r for r in rows if r["KPI_NAME"] == "overall_health"][0]
-        assert parent_row["KPI_PARENT_KPI_NAME"] == ""
-
-    def test_composite_children_reference_parent(self):
-        rows = mdschema._rows_kpis(CATALOG, COMPOSITE_KPIS, MEASURES)
-        child_rows = [r for r in rows if r["KPI_PARENT_KPI_NAME"] == "overall_health"]
-        assert len(child_rows) == 2
-        names = {r["KPI_NAME"] for r in child_rows}
-        assert names == {"child_revenue", "child_satisfaction"}
-
-    def test_composite_children_have_weights(self):
-        rows = mdschema._rows_kpis(CATALOG, COMPOSITE_KPIS, MEASURES)
-        rev_row = [r for r in rows if r["KPI_NAME"] == "child_revenue"][0]
-        sat_row = [r for r in rows if r["KPI_NAME"] == "child_satisfaction"][0]
-        assert rev_row["KPI_WEIGHT"] == "0.7"
-        assert sat_row["KPI_WEIGHT"] == "0.3"
+    def test_bug_9830_composite_tree_has_no_dangling_parent_rows(self):
+        assert mdschema._rows_kpis(CATALOG, COMPOSITE_KPIS, MEASURES) == []
 
 
 class TestRowsKpisEdgeCases:
@@ -333,9 +322,7 @@ class TestRowsKpisEdgeCases:
 
     def test_kpi_with_no_measures(self):
         rows = mdschema._rows_kpis(CATALOG, LEGACY_KPIS, [])
-        assert len(rows) == 1
-        assert rows[0]["KPI_VALUE"] == ""
-        assert rows[0]["KPI_GOAL"] == ""
+        assert rows == []
 
     def test_kpi_with_no_expression_and_no_measure(self):
         kpi = {
@@ -357,9 +344,7 @@ class TestRowsKpisEdgeCases:
             "target_expression": None,
         }
         rows = mdschema._rows_kpis(CATALOG, [kpi], MEASURES)
-        assert len(rows) == 1
-        assert rows[0]["KPI_VALUE"] == ""
-        assert rows[0]["KPI_GOAL"] == ""
+        assert rows == []
 
     def test_kpi_weight_none_emits_empty_string(self):
         rows = mdschema._rows_kpis(CATALOG, LEGACY_KPIS, MEASURES)
@@ -376,7 +361,7 @@ class TestRowsKpisEdgeCases:
             "KPI_CURRENT_TIME_MEMBER", "KPI_PARENT_KPI_NAME",
             "ANNOTATIONS",
         }
-        rows = mdschema._rows_kpis(CATALOG, V2_KPIS + COMPOSITE_KPIS, MEASURES)
+        rows = mdschema._rows_kpis(CATALOG, LEGACY_KPIS + NATIVE_V2_KPIS, MEASURES)
         for row in rows:
             missing = required_keys - set(row.keys())
             assert not missing, f"Missing XMLA columns: {missing}"

@@ -316,7 +316,7 @@ async def test_evaluate_kpi_in_target(client):
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     data = resp.json()
     assert data["value"] == 1000.0
@@ -345,7 +345,7 @@ async def test_evaluate_kpi_off_target(client):
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == -1
@@ -382,7 +382,7 @@ async def test_evaluate_variance_kpi_exposes_deviation_position_and_bands(client
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     data = resp.json()
     # Badge GREEN.
@@ -432,7 +432,7 @@ async def test_evaluate_variance_kpi_missing_target_is_red_and_agrees(client):
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == -1
@@ -491,7 +491,7 @@ async def test_evaluate_z_score_without_custom_bands_uses_statistical_basis(clie
          patch("src.api.kpis.resolve_effective_persona", new_callable=AsyncMock, return_value=None), \
          patch("src.api.kpis._kpi_outer_cache_allowed", new_callable=AsyncMock, return_value=True), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == 1
@@ -544,7 +544,7 @@ async def test_evaluate_percentile_without_custom_bands_uses_percentile_basis(cl
              return_value=[50, 60, 70, 80, 90, 100],
          ):
         resp = await client.post(
-            f"{PREFIX}/{kpi.id}/evaluate",
+            f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false",
             headers={"Authorization": "Bearer test-token"},
         )
     assert resp.status_code == 200
@@ -651,7 +651,7 @@ async def test_evaluate_kpi_no_expression(client):
     db.get = AsyncMock(side_effect=side_get)
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     data = resp.json()
     assert data["value"] is None
@@ -745,7 +745,7 @@ async def test_evaluate_kpi_router_failure_returns_nulls(client):
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", AsyncMock(side_effect=ValueError("Router down"))):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     data = resp.json()
     assert data["value"] is None
@@ -774,7 +774,7 @@ async def test_evaluate_kpi_with_target(client):
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     data = resp.json()
     assert data["value"] == 850.0
 
@@ -824,7 +824,7 @@ async def test_evaluate_kpi_uses_raw_token(override_auth):
     ) as ac:
         with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
              patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-            resp = await ac.post(f"{PREFIX}/{kpi.id}/evaluate")
+            resp = await ac.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
 
     assert resp.status_code == 200
     assert len(captured_bearers) >= 1
@@ -863,7 +863,7 @@ async def test_evaluate_batch_prefetch_uses_effective_persona(client):
         patch("src.api.kpis._upsert_kpi_latest_batch", new_callable=AsyncMock),
     ):
         resp = await client.post(
-            f"{PREFIX}/evaluate-batch?persona_id={persona_id}",
+            f"{PREFIX}/evaluate-batch?persona_id={persona_id}&deployed_only=false",
             json={"kpi_ids": [str(kpi.id)]},
         )
 
@@ -1009,7 +1009,7 @@ async def test_service_token_with_kpi_scope_accepted_on_evaluate_batch(client):
     with patch("src.api.kpis.get_tenant_db", async_gen_from(mock_db)):
         try:
             resp = await client.post(
-                f"{PREFIX}/evaluate-batch",
+                f"{PREFIX}/evaluate-batch?deployed_only=false",
                 json={"kpi_ids": []},
             )
             # 200 (empty batch) or 404 (model not found) are acceptable — we're

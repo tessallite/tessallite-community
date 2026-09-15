@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { Box, Typography, Chip, CircularProgress, Collapse, IconButton } from '@mui/material';
 import {
-  Add as AddIcon,
-  Visibility as PreviewIcon,
+  FilterListOutlined,
+  TableRowsOutlined,
+  VisibilityOutlined,
   InfoOutlined,
   KeyboardArrowUpOutlined,
 } from '@mui/icons-material';
@@ -125,18 +126,16 @@ export default function NamedSetCard({
       <Box
         sx={{
           display: 'flex', alignItems: 'center', gap: 0.75,
-          px: 1.25, py: 0.5, minHeight: 36, cursor: 'pointer',
+          pl: '10px', pr: '4px', py: 0, height: 28, minHeight: 28, cursor: 'pointer',
           borderBottom: `1px solid ${tokens.colorBorderLight}`,
           '&:hover': { bgcolor: tokens.colorSubtleFill },
         }}
       >
-          <Typography sx={{ fontSize: 14, lineHeight: 1, flexShrink: 0 }}>
-            {'\u{1F4CB}'}
-          </Typography>
-          <Box sx={{ flex: 1, overflow: 'hidden' }}>
+          <FilterListOutlined sx={{ fontSize: 16, color: tokens.colorTextSecondary, flexShrink: 0 }} />
+          <Box sx={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
             <Typography
               sx={{
-                fontSize: 13, fontWeight: 400,
+                fontSize: 12, fontWeight: 400,
                 color: namedSet.certification_status === 'deprecated' ? tokens.colorTextSecondary : tokens.colorCharcoal,
                 textDecoration: namedSet.certification_status === 'deprecated' ? 'line-through' : 'none',
                 overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
@@ -144,29 +143,24 @@ export default function NamedSetCard({
             >
               {namedSet.display_name || namedSet.name}
             </Typography>
-            {explanation && (
-              <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {explanation}
-              </Typography>
-            )}
           </Box>
           <Chip
             label={typeLabel}
             size="small"
-            sx={{ fontSize: 9, height: 16, bgcolor: tokens.colorSubtleFill, color: tokens.colorTextSecondary, fontWeight: 600, flexShrink: 0 }}
+            sx={{ fontSize: 9, height: 14, bgcolor: tokens.colorSubtleFill, color: tokens.colorTextSecondary, fontWeight: 600, flexShrink: 0, borderRadius: '7px' }}
           />
           {namedSet.certification_status === 'certified' && (
             <Chip
-              label="Certified"
+              label={strings.kpiCard.chipCertified}
               size="small"
-              sx={{ fontSize: 9, height: 16, bgcolor: 'rgba(46,125,50,0.08)', color: '#2e7d32', fontWeight: 600, flexShrink: 0 }}
+              sx={{ fontSize: 9, height: 14, bgcolor: 'rgba(46,125,50,0.08)', color: '#2e7d32', fontWeight: 600, flexShrink: 0, borderRadius: '7px' }}
             />
           )}
           {namedSet.certification_status === 'deprecated' && (
             <Chip
-              label="Deprecated"
+              label={strings.kpiCard.chipDeprecated}
               size="small"
-              sx={{ fontSize: 9, height: 16, bgcolor: 'rgba(237,108,2,0.08)', color: '#ed6c02', fontWeight: 600, flexShrink: 0 }}
+              sx={{ fontSize: 9, height: 14, bgcolor: 'rgba(237,108,2,0.08)', color: '#ed6c02', fontWeight: 600, flexShrink: 0, borderRadius: '7px' }}
             />
           )}
           {detailRows.length > 0 && (
@@ -176,8 +170,8 @@ export default function NamedSetCard({
               title={detailsOpen ? 'Hide details' : 'Show details'}
               aria-label={`${detailsOpen ? 'Hide' : 'Show'} details for ${namedSet.display_name || namedSet.name}`}
               sx={{
-                width: 28,
-                height: 28,
+                width: 22,
+                height: 22,
                 color: detailsOpen ? tokens.colorPrimary : tokens.colorTextSecondary,
                 '&:hover': { bgcolor: tokens.colorSubtleFill },
               }}
@@ -189,41 +183,39 @@ export default function NamedSetCard({
             className="ns-actions"
             sx={{ display: 'flex', alignItems: 'center', gap: 0.25, flexShrink: 0 }}
           >
-            <Box
-              component="span"
+            <IconButton
               onClick={(e) => { e.stopPropagation(); handlePreviewToggle(); }}
               title="Preview members"
+              aria-label={`Preview members for ${namedSet.display_name || namedSet.name}`}
               sx={{
-                display: 'flex', alignItems: 'center',
-                p: '2px', borderRadius: 0.5, color: tokens.colorTextSecondary,
+                width: 22, height: 22, color: tokens.colorTextSecondary,
                 '&:hover': { bgcolor: tokens.colorPrimaryBg, color: tokens.colorPrimary },
               }}
             >
-              <PreviewIcon sx={{ fontSize: 14 }} />
-            </Box>
-            <Box
-              component="span"
+              <VisibilityOutlined sx={{ fontSize: 15 }} />
+            </IconButton>
+            <IconButton
               onClick={(e) => { e.stopPropagation(); onAddToRows(); }}
               title="Add to Rows"
+              aria-label={`Add ${namedSet.display_name || namedSet.name} to Rows`}
               sx={{
-                display: 'flex', alignItems: 'center',
-                p: '2px', borderRadius: 0.5, color: tokens.colorPrimary,
+                width: 22, height: 22, color: tokens.colorPrimary,
                 '&:hover': { bgcolor: tokens.colorPrimaryBg },
               }}
             >
-              <AddIcon sx={{ fontSize: 14 }} />
-            </Box>
+              <TableRowsOutlined sx={{ fontSize: 15 }} />
+            </IconButton>
           </Box>
       </Box>
 
       <Collapse in={detailsOpen}>
-        <Box sx={{ px: 2, py: 1, bgcolor: tokens.colorSubtleFill, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
+        <Box sx={{ px: 1.25, py: 0.75, bgcolor: tokens.colorSubtleFill, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
           {detailRows.map(row => (
-            <Box key={row.label} sx={{ mb: 0.6 }}>
+            <Box key={row.label} sx={{ mb: 0.4 }}>
               <Typography sx={{ fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, textTransform: 'uppercase', lineHeight: 1.2 }}>
                 {row.label}
               </Typography>
-              <Typography sx={{ fontSize: 11.5, color: tokens.colorCharcoal, lineHeight: 1.35 }}>
+              <Typography sx={{ fontSize: 11, color: tokens.colorCharcoal, lineHeight: 1.3 }}>
                 {row.value}
               </Typography>
             </Box>
@@ -233,7 +225,7 @@ export default function NamedSetCard({
 
       {/* Inline preview panel */}
       {previewOpen && (
-        <Box sx={{ px: 2, py: 1, bgcolor: tokens.colorSubtleFill, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
+        <Box sx={{ px: 1.25, py: 0.75, bgcolor: tokens.colorSubtleFill, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
           {previewLoading ? (
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
               <CircularProgress size={12} />

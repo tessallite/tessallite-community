@@ -275,11 +275,8 @@ describe("VersionsDialog revert (Bug-6201)", () => {
   });
 });
 
-// The history table row order: the version the gateway is currently serving
-// must always sort first, then the rest by version_number descending. Deploy
-// can point the runtime at ANY existing version, so version_number-desc order
-// alone can bury a deployed older version below newer, undeployed drafts.
-describe("VersionsDialog history table — deployed-first ordering", () => {
+// Deployment status must not change the numeric history order.
+describe("VersionsDialog history table — newest version first", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
@@ -293,22 +290,38 @@ describe("VersionsDialog history table — deployed-first ordering", () => {
       .map((el) => Number(el.textContent!.slice(1)));
   }
 
-  it("puts an older deployed version above newer, undeployed drafts", async () => {
-    // Server order is plain version_number desc (v3, v2, v1); v2 is the one
-    // currently deployed, and would otherwise render second, not first.
+  it("keeps an older deployed version in numeric order below newer drafts", async () => {
+    // Even an unordered response must render in descending numeric order.
     listMock.mockResolvedValue([
-      { id: "v3", version_number: 3, summary: "third", created_at: "2026-07-03T00:00:00Z", created_by: "a@x.com", is_deployed: false },
-      { id: "v2", version_number: 2, summary: "second", created_at: "2026-07-02T00:00:00Z", created_by: "a@x.com", is_deployed: true },
       { id: "v1", version_number: 1, summary: "first", created_at: "2026-07-01T00:00:00Z", created_by: "a@x.com", is_deployed: false },
+      { id: "v2", version_number: 2, summary: "second", created_at: "2026-07-02T00:00:00Z", created_by: "a@x.com", is_deployed: true },
+      { id: "v3", version_number: 3, summary: "third", created_at: "2026-07-03T00:00:00Z", created_by: "a@x.com", is_deployed: false },
     ]);
     renderDialog();
 
-    await waitFor(() => expect(versionOrderInTable()).toEqual([2, 3, 1]));
+    await waitFor(() => expect(versionOrderInTable()).toEqual([3, 2, 1]));
     // The deployed row still carries its "currently serving" marker.
     expect(screen.getByText("Currently serving")).toBeInTheDocument();
   });
 
-  it("falls back to plain version_number-desc order when nothing is deployed", async () => {
+  it("keeps version actions pinned inside a horizontally constrained dialog", async () => {
+    listMock.mockResolvedValue([
+      { id: "v23", version_number: 23, summary: "a long saved-version summary", created_at: "2026-09-12T13:57:41Z", created_by: "admin@example.com", is_deployed: false },
+      { id: "v22", version_number: 22, summary: "currently serving", created_at: "2026-09-12T03:16:10Z", created_by: "seed", is_deployed: true },
+    ]);
+    renderDialog();
+
+    const deployButton = await screen.findByRole("button", { name: /deploy/i });
+    const actionCell = deployButton.closest("td");
+    expect(actionCell).toHaveAttribute("data-testid", "version-actions-cell");
+    expect(actionCell).toHaveStyle({ position: "sticky", right: "0px" });
+    expect(screen.getByTestId("version-actions-header")).toHaveStyle({
+      position: "sticky",
+      right: "0px",
+    });
+  });
+
+  it("sorts versions numerically when nothing is deployed", async () => {
     listMock.mockResolvedValue([
       { id: "v2", version_number: 2, summary: "second", created_at: "2026-07-02T00:00:00Z", created_by: "a@x.com", is_deployed: false },
       { id: "v1", version_number: 1, summary: "first", created_at: "2026-07-01T00:00:00Z", created_by: "a@x.com", is_deployed: false },

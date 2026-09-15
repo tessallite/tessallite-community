@@ -23,8 +23,13 @@ from shared.miss_reason_taxonomy import (
     REPAIR,
     classify_reason,
 )
+from shared.query_log_client_kinds import (
+    OPTIMIZER_EXCLUDED_CLIENT_KINDS,
+    OPTIMIZER_EXCLUDED_ROUTE_TYPES,
+)
 from shared.pocket.fingerprint import predicate_set_hash
 from src.ir.logical_query import BoundQuery, RouteDecision
+from src.routing.aggregate_matcher import AggregateSkipReason
 
 # F-004-11: matches the widened query_miss_logs.miss_reason column (migration
 # 0135). The aggregate-skip reason joins several skip tokens and overran 64.
@@ -57,6 +62,9 @@ async def _source_baseline_ms(
             QueryLog.route_type == "source",
             QueryLog.status == "success",
             QueryLog.cache_status.is_distinct_from("cache_hit"),
+            QueryLog.client_kind.is_(None)
+            | QueryLog.client_kind.notin_(OPTIMIZER_EXCLUDED_CLIENT_KINDS),
+            QueryLog.route_type.notin_(OPTIMIZER_EXCLUDED_ROUTE_TYPES),
         )
     )
     avg = result.scalar_one_or_none()
@@ -629,6 +637,8 @@ async def log_query(
         decision.route_type == "pocket"
         and decision.pocket_id
         and cache_status != "cache_hit"
+        and client_kind not in OPTIMIZER_EXCLUDED_CLIENT_KINDS
+        and decision.route_type not in OPTIMIZER_EXCLUDED_ROUTE_TYPES
     ):
         try:
             pocket_id = uuid.UUID(str(decision.pocket_id))
@@ -753,6 +763,10 @@ async def log_query_miss(
     """
     fingerprint = bound_query.logical_query.query_fingerprint
     model_id = bound_query.model.id
+    # Query-local aggregate operands are not declared model measures. Preserve
+    # their workload history, but do not recommend an unrepresentable build.
+    if any(getattr(m, "is_query_only", False) is True for m in bound_query.resolved_measures):
+        miss_reason = f"aggregate_skip:{AggregateSkipReason.QUERY_ONLY_MEASURE}"
     stored_reason = miss_reason[:_MISS_REASON_MAX_LEN]
     now = datetime.now(timezone.utc)
 

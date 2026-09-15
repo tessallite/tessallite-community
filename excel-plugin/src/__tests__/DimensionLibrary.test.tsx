@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import DimensionLibrary from '../components/ReportBuilder/DimensionLibrary';
 import type { Dimension } from '../types/tessallite';
+import { strings } from '../i18n/strings';
 
 const DIMENSIONS = [
   { id: 'dim-product', name: 'product', display_name: 'Product', data_type: 'string', source_type: 'dim' },
@@ -64,8 +65,9 @@ describe('DimensionLibrary member-preview close + header (Bug-6713 / Bug-6712)',
       />,
     );
 
-    // Bug-6712: the header label comes from templates.library.dimensionsHeader.
-    expect(screen.getByText('Dimensions (1)')).toBeDefined();
+    // Compact header keeps the section label and count as separate elements.
+    expect(screen.getByText(strings.library.dimensionsSection)).toBeDefined();
+    expect(screen.getByText('1')).toBeDefined();
 
     // Bug-6713: the close control was a mouse-only span; it must be a real
     // button (focusable, Enter/Space activatable) with an accessible name.

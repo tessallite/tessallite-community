@@ -6,7 +6,9 @@ Builds properly formatted MDDataSet XML that MSOLAP/Excel can parse.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import time
 from typing import Any
 from itertools import product
 
@@ -16,6 +18,11 @@ from src.dax.mdx_calc_members import (
     BLANK_MEMBER,
     parse_calc_members,
     evaluate_calc_members,
+)
+from src.dax.member_uname import (
+    canonical_member_uname,
+    synthetic_all_member_metadata,
+    synthetic_all_member_uname,
 )
 
 logger = logging.getLogger(__name__)
@@ -985,60 +992,6 @@ def _extract_all_drilldown_members(axis_expr: str) -> dict[str, str]:
     return result
 
 
-def _extract_drilldown_member_expansions(axis_expr: str) -> dict[str, list[str]]:
-    """
-    Parse DrilldownMember({{base_set}}, {member_list}) from axis expression.
-    Returns dict: {hierarchy_unique_name: [member_names_to_expand]}
-
-    DrilldownMember means: take the base set, and for each member in the
-    drill list, replace it with itself + its children.
-
-    Example: DrilldownMember({{DrilldownLevel({[Time].[Time].[All]})}}, {[Time].[Time].[2024]})
-    → hierarchy=[Time].[Time], expand members=["2024"]
-
-    B8 round-2 fix (deep-review Finding 4): member references may be
-    path-qualified key form — ``[Time].[Time].[Month].&[2025]&[4]`` —
-    the grammar the server itself emits on subtotal axes. The member to
-    expand is the deepest key of the path; previously the level name was
-    misread as the member.
-    """
-    from src.dax.member_uname import parse_member_keys
-
-    result: dict[str, list[str]] = {}
-    for m in re.finditer(
-        r'DrilldownMember\s*\(\s*\{\{.+?\}\}\s*,\s*\{([^}]+)\}\s*\)',
-        axis_expr,
-        re.IGNORECASE,
-    ):
-        member_list_str = m.group(1).strip()
-        # Parse member references: [Dim].[Hier].[Member] /
-        # [Dim].[Hier].[Level].&[k0]&[k1]... / [Dim].[Hier].&[k0]&[k1]...
-        members: list[str] = []
-        hier = None
-        for member_match in re.finditer(
-            rf'\[{_BB}\]\.\[{_BB}\](?:\.\[{_BB}\])?((?:\.?\&\[[^\]]+\])+)?',
-            member_list_str,
-        ):
-            dim = member_match.group(1).strip()
-            hier_name = member_match.group(2).strip()
-            caption_part = member_match.group(3)
-            keys_part = member_match.group(4)
-            if keys_part:
-                keys = parse_member_keys(keys_part)
-                if not keys:
-                    continue
-                member_name = _normalize_member_name(keys[-1].strip())
-            elif caption_part:
-                member_name = _normalize_member_name(caption_part.strip())
-            else:
-                continue
-            hier = f"[{dim}].[{hier_name}]"
-            members.append(member_name)
-        if hier and members:
-            result[hier] = members
-    return result
-
-
 def _parse_where_measure(mdx: str) -> str | None:
     """Extract measure name from WHERE ([Measures].[MeasureName]) clause.
 
@@ -1169,6 +1122,123 @@ def _hierarchy_data_levels(
         return [dim_name]
 
     return []
+
+
+def _defined_data_levels(
+    hier: str,
+    dimensions_meta: list[dict[str, Any]] | None,
+    hierarchy_defs: list[dict[str, Any]] | None,
+) -> list[str]:
+    """Data levels of ``[Dim].[Hier]`` as the MODEL defines them (Bug-9856).
+
+    The rollup builders used to derive "is this a multi-level hierarchy" and
+    "is this level the leaf" from the levels a single REQUEST registered, so
+    a Bug-9764 first-level drill named Year ``[H].[H].[2025]`` and marked it a
+    leaf, while Discover and the expanded request named the same member
+    ``[H].[H].[Year].&[2025]`` with children. Identity is a property of the
+    model, so it is read from the definition here. Empty when unknown.
+    """
+    return [
+        name for name in _hierarchy_data_levels(hier, dimensions_meta, hierarchy_defs)
+        if name.strip().lower() not in {"all", "(all)"}
+    ]
+
+
+def _flat_axis_level_identity(
+    hier: str,
+    dname: str,
+    filter_spec: tuple[str, str] | None,
+    dimensions_meta: list[dict[str, Any]] | None,
+    hierarchy_defs: list[dict[str, Any]] | None,
+) -> tuple[str, str, bool, bool]:
+    """``(level_name, level_number, is_multi_level, has_children)`` for the
+    members a non-rollup axis loop emits on ``hier`` (Bug-9856).
+
+    A flat attribute keeps its single self-named level. A defined multi-level
+    hierarchy answering ``[H].[H].[Level].Members`` must name that level:
+    Excel binds cells only to levels MDSCHEMA_LEVELS advertised, and the
+    member identity must be the ancestor-qualified form Discover emits. The
+    row set for this shape carries no ancestor columns, so the parent stays
+    the All member; the rollup builders own the expanded shapes.
+    """
+    defined = _defined_data_levels(hier, dimensions_meta, hierarchy_defs)
+    if len(defined) > 1 and filter_spec and filter_spec[1] == "members":
+        wanted = filter_spec[0].strip().lower()
+        for idx, name in enumerate(defined):
+            if name.lower() == wanted:
+                return name, str(idx + 1), True, idx < len(defined) - 1
+    return dname, "1", False, False
+
+
+def _hierarchy_level_key_paths(
+    hier: str,
+    level_name: str,
+    rows: list[dict[str, Any]],
+    dimensions_meta: list[dict[str, Any]] | None,
+    hierarchy_defs: list[dict[str, Any]] | None,
+) -> list[list[str]] | None:
+    """Distinct ancestor-first key paths of ``level_name`` present in ``rows``
+    (Bug-9870 follow-on).
+
+    Excel's "expand all" on a placed hierarchy sends the bare
+    ``[H].[H].[City].Members``; the SQL translator groups by the level AND
+    its ancestors, so every row carries the path. Discover names such a
+    member ``[H].[H].[City].&[GB]&[London]`` with parent
+    ``[H].[H].[Country].&[GB]``; the axis must say the same or Excel cannot
+    place the city under its country. Returns None when the ancestor columns
+    are not in the rows (a first-level request, or a hierarchy the map does
+    not resolve), and the caller keeps the single-key form.
+    """
+    from shared.semantic.hierarchy_resolver import resolve_hierarchy_dimension_map
+
+    m = re.match(rf'\[{_BB}\]\.\[{_BB}\]', hier)
+    if not m:
+        return None
+    hier_name = _unbracket(m.group(2).strip())
+    _, level_dim_map, _ = resolve_hierarchy_dimension_map(
+        list(dimensions_meta or []), list(hierarchy_defs or []),
+    )
+    by_level = level_dim_map.get(hier_name.lower()) or {}
+    data_levels = _defined_data_levels(hier, dimensions_meta, hierarchy_defs)
+    lower = [n.lower() for n in data_levels]
+    if level_name.lower() not in lower:
+        return None
+    depth = lower.index(level_name.lower())
+    if depth == 0:
+        return None
+    dims = [by_level.get(n) for n in lower[: depth + 1]]
+    if any(d is None for d in dims) or not rows or any(d not in rows[0] for d in dims):
+        return None
+    seen: set[tuple[str, ...]] = set()
+    out: list[list[str]] = []
+    for row in rows:
+        path = tuple(str(row.get(d, "")) for d in dims)
+        if path[-1] and path not in seen:
+            seen.add(path)
+            out.append(list(path))
+    return out
+
+
+def _hierarchy_level_dims(
+    hier: str,
+    level_name: str,
+    dimensions_meta: list[dict[str, Any]] | None,
+    hierarchy_defs: list[dict[str, Any]] | None,
+) -> list[str]:
+    """Dimension column per data level, ancestor-first, down to ``level_name``."""
+    from shared.semantic.hierarchy_resolver import resolve_hierarchy_dimension_map
+
+    m = re.match(rf'\[{_BB}\]\.\[{_BB}\]', hier)
+    if not m:
+        return []
+    _, level_dim_map, _ = resolve_hierarchy_dimension_map(
+        list(dimensions_meta or []), list(hierarchy_defs or []),
+    )
+    by_level = level_dim_map.get(_unbracket(m.group(2).strip()).lower()) or {}
+    lower = [n.lower() for n in _defined_data_levels(hier, dimensions_meta, hierarchy_defs)]
+    if level_name.lower() not in lower:
+        return []
+    return [str(by_level.get(n, "")) for n in lower[: lower.index(level_name.lower()) + 1]]
 
 
 def _member_children_resolution(
@@ -1573,13 +1643,15 @@ def _build_existing_axis_tuples(
 
             members.append({
                 "hierarchy": hier,
-                "uname": f"{hier}.[{sval}]",
+                "uname": canonical_member_uname(
+                    hier, dname, [sval], is_multi_level=False,
+                ),
                 "name": sval,
                 "key": sval,
                 "caption": sval,
                 "lname": f"{hier}.[{dname}]",
                 "lnum": "1",
-                "parent": f"{hier}.[All]",
+                "parent": synthetic_all_member_uname(hier),
                 "has_children": False,
                 "member_type": 1,
                 "member_ordinal": member_ordinal,
@@ -1668,20 +1740,36 @@ def _build_axes(
     for dname in slicer_dims:
         dim = dims[dname]
         hier = dim["hierarchy"]
-        first_member = dim["members"][0] if dim["members"] else {"name": "All", "level": "(All)", "member_type": 2}
-        mlevel = first_member.get("level", "(All)")
-        uname = f'{hier}.[{first_member["name"]}]'
-        slicer_members.append({
-            "hierarchy": hier,
-            "uname": uname,
-            "caption": first_member.get("caption", first_member["name"]),
-            "lname": f'{hier}.[{mlevel}]',
-            "lnum": 0,
-            "has_children": False,
-            "parent": "",
-            "member_type": first_member.get("member_type", 2 if first_member["name"] == "All" else 1),
-            "children_cardinality": first_member.get("children_cardinality", 0),
-        })
+        first_member = (
+            dim["members"][0]
+            if dim["members"]
+            else {"name": "All", "level": "(All)", "member_type": 2}
+        )
+        first_member_name = str(first_member["name"])
+        is_all = str(first_member.get("member_type", "")) == "2"
+        if is_all:
+            slicer_members.append(
+                synthetic_all_member_metadata(
+                    hier,
+                    dname,
+                    children_cardinality=first_member.get("children_cardinality", 0),
+                )
+            )
+        else:
+            mlevel = first_member.get("level", dname)
+            slicer_members.append({
+                "hierarchy": hier,
+                "uname": canonical_member_uname(
+                    hier, str(mlevel), [first_member_name], is_multi_level=False,
+                ),
+                "caption": first_member.get("caption", first_member_name),
+                "lname": f'{hier}.[{mlevel}]',
+                "lnum": 0,
+                "has_children": False,
+                "parent": synthetic_all_member_uname(hier),
+                "member_type": 1,
+                "children_cardinality": first_member.get("children_cardinality", 0),
+            })
         
     if slicer_members:
         xml += '<Axis name="SlicerAxis"><Tuples>'
@@ -1723,10 +1811,43 @@ def _member_xml(
     """Build a single Member element."""
     hier = member["hierarchy"]
     is_measure = "[Measures]" in hier
-    # DisplayInfo: MSOLAP uses bit flags. 131072 = has children flag.
-    # OlaPy uses 131076 for members with children, 0 for leaf members.
+    # Bug-9781: DISPLAY_INFO is a BIT FIELD, not a magic constant. Per the XMLA
+    # spec: bits 0-15 carry the member's CHILDREN CARDINALITY, 0x10000 is
+    # DRILLED_DOWN, 0x20000 is PARENT_SAME_AS_PREV. The previous value was the
+    # literal `131076` for every member with children -- copied from OlaPy with
+    # no Tessallite rationale, exactly like the ALL_MEMBER suppression that
+    # turned out to be Bug-9772's root cause. Decoded, that constant asserted
+    # three things at once, two of them false and one of them false-by-default:
+    #
+    #   0x20000  PARENT_SAME_AS_PREV, set UNCONDITIONALLY -- necessarily wrong
+    #            for the first member of every group, which is precisely where a
+    #            client decides a new group (and therefore a subtotal boundary)
+    #            begins.
+    #   0x00004  a hard-coded FOUR children, regardless of the real count.
+    #   DRILLED_DOWN NEVER set -- so the client was told no member was expanded
+    #            even in a response that carries that member's children.
+    #
+    # Now derived from the member itself. `children_cardinality` counts the
+    # children actually present in THIS response (see the post-pass in the axis
+    # builders), so a non-zero count is exactly the condition under which
+    # DRILLED_DOWN is true. PARENT_SAME_AS_PREV is deliberately NOT set: it is
+    # a positional hint about the PRECEDING tuple, and this function sees one
+    # member with no cross-tuple context. Omitting an optional hint is truthful;
+    # asserting it unconditionally is not.
     has_children = member.get("has_children", False)
-    display_info = "131076" if has_children else "0"
+    try:
+        _cc = int(member.get("children_cardinality", 0) or 0)
+    except (TypeError, ValueError):
+        _cc = 0
+    if _cc > 0:
+        display_info = str(0x10000 | min(_cc, 0xFFFF))
+    elif has_children:
+        # Expandable, but this response carries no children for it, so the true
+        # count is unknown here. Report 1 -- the boolean we DO know ("not a
+        # leaf") in the field the client reads -- without claiming DRILLED_DOWN.
+        display_info = "1"
+    else:
+        display_info = "0"
 
     xml = f'<Member Hierarchy="{_xe(hier)}">'
     xml += f'<UName>{_xe(member["uname"])}</UName>'
@@ -1757,11 +1878,17 @@ def _member_xml(
     member_ordinal = member.get("member_ordinal", 0)
     member_value = member.get("value", member.get("key", member["caption"]))
 
+    def parent_unique_name_xml() -> str:
+        parent = member.get("parent")
+        if parent is None:
+            return '<PARENT_UNIQUE_NAME xsi:nil="true"/>'
+        return f'<PARENT_UNIQUE_NAME>{_xe(parent)}</PARENT_UNIQUE_NAME>'
+
     if minimal_excel_props:
         xml += f'<MEMBER_TYPE>{member.get("member_type", 1)}</MEMBER_TYPE>'
         emitted_props.add("MEMBER_TYPE")
     else:
-        xml += f'<PARENT_UNIQUE_NAME>{_xe(member.get("parent", ""))}</PARENT_UNIQUE_NAME>'
+        xml += parent_unique_name_xml()
         xml += f'<HIERARCHY_UNIQUE_NAME>{_xe(hier)}</HIERARCHY_UNIQUE_NAME>'
         xml += f'<MEMBER_TYPE>{member.get("member_type", 1)}</MEMBER_TYPE>'
         emitted_props.update(
@@ -1795,9 +1922,9 @@ def _member_xml(
             continue
         emitted_props.add(prop)
         if prop == "PARENT_UNIQUE_NAME":
-            # Must be present on ALL members — empty string for root members
-            val = member.get("parent", "")
-            xml += f'<PARENT_UNIQUE_NAME>{_xe(val)}</PARENT_UNIQUE_NAME>'
+            # HierarchyInfo requires the property on every member. Root members
+            # therefore carry XML null rather than an empty member unique name.
+            xml += parent_unique_name_xml()
         elif prop == "HIERARCHY_UNIQUE_NAME":
             xml += f'<HIERARCHY_UNIQUE_NAME>{_xe(hier)}</HIERARCHY_UNIQUE_NAME>'
         elif prop == "MEMBER_TYPE":
@@ -1831,11 +1958,41 @@ def _member_xml(
     return xml
 
 
+def _drop_rollup_all_grain_rows(
+    rows: list[dict[str, Any]],
+    subtotal_hierarchy: Any | None,
+    subtotal_hierarchies: list | None,
+) -> list[dict[str, Any]]:
+    """Drop rows whose subtotal grain is the All member (Bug-9789 experiment).
+
+    Grain ``-1`` is the grand-total / nested-subtotal All slot. Removing those
+    rows before axis and cell assembly keeps the two in lock-step and leaves
+    only regular members on the rollup axis.
+    """
+    from src.dax.subtotal_engine import SUBTOTAL_GRAIN_KEY, SUBTOTAL_GRAIN_PREFIX
+
+    hier_names: list[str] = []
+    if subtotal_hierarchies:
+        hier_names = [h.hierarchy_name for h in subtotal_hierarchies]
+    elif subtotal_hierarchy is not None:
+        hier_names = [subtotal_hierarchy.hierarchy_name]
+
+    def _has_all_grain(row: dict[str, Any]) -> bool:
+        if row.get(SUBTOTAL_GRAIN_KEY) == -1:
+            return True
+        return any(
+            row.get(SUBTOTAL_GRAIN_PREFIX + name) == -1 for name in hier_names
+        )
+
+    return [row for row in rows if not _has_all_grain(row)]
+
+
 def _build_subtotal_row_members(
     rows: list[dict[str, Any]],
     subtotal_hierarchy: Any,
     mdx_dim_name: str,
     mdx_hier_name: str,
+    defined_levels: list[str] | None = None,
 ) -> list[dict[str, str]]:
     """Build multi-level row axis members from subtotal-tagged rows.
 
@@ -1843,9 +2000,9 @@ def _build_subtotal_row_members(
     (All) member, subtotal rows get their level member, detail rows
     get the leaf level member.
 
-    B8 round-2 fix (deep-review Finding 2): this builder now uses the
-    same path-qualified uname grammar and stable per-member ordinals as
-    ``_build_multi_hierarchy_row_tuples``. Previously it emitted
+    B8 round-2 fix (deep-review Finding 2): this builder now uses stable
+    per-member ordinals and ancestor-qualified names for multi-level
+    hierarchies. Previously it emitted
     ``[Cal].[Cal].[Month].&[4]`` for month 4 of both 2025 and 2026 with
     raw-row-index ordinals — one member identity with two contradictory
     parents and ordinals, violating the MSOLAP uniqueness invariant
@@ -1859,13 +2016,22 @@ def _build_subtotal_row_members(
 
     levels = subtotal_hierarchy.levels
     leaf_ordinal = levels[-1].ordinal if levels else 0
+    # Bug-9856: identity and leaf-ness follow the model definition when known,
+    # not the subset of levels this request happened to register.
+    is_multi_level = (
+        len(defined_levels) > 1 if defined_levels else len(levels) > 1
+    )
+    defined_leaf = defined_levels[-1] if defined_levels else None
 
-    ordinal_by_member: dict[str, int] = {}
+    ordinal_by_member: dict[tuple[str, str], int] = {}
+    ordinal_counter: dict[str, int] = {}
 
-    def _stable_ordinal(uname: str) -> int:
-        if uname not in ordinal_by_member:
-            ordinal_by_member[uname] = len(ordinal_by_member)
-        return ordinal_by_member[uname]
+    def _stable_ordinal(level_uname: str, uname: str) -> int:
+        key = (level_uname, uname)
+        if key not in ordinal_by_member:
+            ordinal_by_member[key] = ordinal_counter.get(level_uname, 0)
+            ordinal_counter[level_uname] = ordinal_counter.get(level_uname, 0) + 1
+        return ordinal_by_member[key]
 
     for row in rows:
         grain = row.get(SUBTOTAL_GRAIN_KEY, leaf_ordinal)
@@ -1874,20 +2040,15 @@ def _build_subtotal_row_members(
             # Bug-5433: the (All) MEMBER unique name is [Hier].[All] (member name
             # "All"); [(All)] is the LEVEL name, kept on lname only. Aligns the
             # Execute axis with DISCOVER (MDSCHEMA_MEMBERS), which emits [All].
-            all_uname = f"{hier_bracket}.[All]"
-            members.append({
-                "hierarchy": hier_bracket,
-                "uname": all_uname,
-                "name": "All",
-                "key": "All",
-                "caption": "All",
-                "lname": f"{hier_bracket}.[(All)]",
-                "lnum": "0",
-                "parent": "",
-                "has_children": True,
-                "member_type": 2,
-                "member_ordinal": _stable_ordinal(all_uname),
-            })
+            all_uname = synthetic_all_member_uname(hier_bracket)
+            all_level_uname = f"{hier_bracket}.[(All)]"
+            members.append(
+                synthetic_all_member_metadata(
+                    hier_bracket,
+                    mdx_dim_name,
+                    member_ordinal=_stable_ordinal(all_level_uname, all_uname),
+                )
+            )
             continue
 
         level_idx = next(
@@ -1897,6 +2058,8 @@ def _build_subtotal_row_members(
         level = levels[level_idx] if levels else None
         is_leaf = grain == leaf_ordinal
         lname = level.name if level else ("Detail" if is_leaf else "Unknown")
+        if defined_leaf is not None and level is not None:
+            is_leaf = lname == defined_leaf
         dim_name = level.dim_name if level else ""
         val = str(row.get(dim_name, ""))
         # Ancestor key path read straight off the row — every higher-level
@@ -1911,24 +2074,48 @@ def _build_subtotal_row_members(
                     hier_bracket, parent_level.name, key_path[:-1],
                 )
                 if str(row.get(parent_level.dim_name, ""))
-                else f"{hier_bracket}.[All]"  # Bug-5433: (All) member form
+                else synthetic_all_member_uname(hier_bracket)  # Bug-5433
             )
         else:
-            parent_uname = f"{hier_bracket}.[All]"  # Bug-5433: (All) member form
-        uname = _path_qualified_uname(hier_bracket, lname, key_path)
+            parent_uname = synthetic_all_member_uname(hier_bracket)  # Bug-5433
+        uname = canonical_member_uname(
+            hier_bracket,
+            lname,
+            key_path,
+            is_multi_level=is_multi_level,
+        )
+        level_uname = f"{hier_bracket}.[{lname}]"
         members.append({
             "hierarchy": hier_bracket,
             "uname": uname,
             "name": val,
             "key": val,
             "caption": val,
-            "lname": f"{hier_bracket}.[{lname}]",
-            "lnum": str(len(levels)) if is_leaf else str(level_idx + 1),
+            "lname": level_uname,
+            "lnum": str(level_idx + 1),
             "parent": parent_uname,
             "has_children": not is_leaf,
             "member_type": 1,
-            "member_ordinal": _stable_ordinal(uname),
+            "member_ordinal": _stable_ordinal(level_uname, uname),
         })
+
+    # Bug-9780: same contradictory pair as the multi-hierarchy builder --
+    # `has_children: True` emitted alongside a CHILDREN_CARDINALITY that
+    # defaults to 0 (the key is absent entirely here, which reaches the same
+    # place via `member.get("children_cardinality", 0)`). Both builders are
+    # fixed together deliberately: fixing only the one whose symptom was
+    # reported would leave an identical defect in the sibling path that serves
+    # the single-hierarchy case.
+    children_by_parent: dict[str, set[str]] = {}
+    for m in members:
+        parent = m.get("parent")
+        if parent:
+            children_by_parent.setdefault(parent, set()).add(m["uname"])
+    for m in members:
+        child_count = len(children_by_parent.get(m["uname"], ()))
+        m["children_cardinality"] = child_count
+        if m.get("member_type") == 2:
+            m["has_children"] = child_count > 0
 
     return members
 
@@ -1946,39 +2133,46 @@ def _path_qualified_uname(
     subsequent cell against the axis). The SSAS convention is
     ``[Cal].[Cal].[Month].&[2025]&[4]``.
 
-    B8 round-2: delegates to ``member_uname.qualify_member_uname`` — the
-    single grammar shared with every parser that consumes unames.
+    Parent members are always multi-level, but still go through the canonical
+    producer so server emitters have one policy owner.
     """
-    from src.dax.member_uname import qualify_member_uname
-    return qualify_member_uname(hier_bracket, level_name, key_path)
+    return canonical_member_uname(
+        hier_bracket,
+        level_name,
+        key_path,
+        is_multi_level=True,
+    )
 
 
 def _build_multi_hierarchy_row_tuples(
     rows: list[dict[str, Any]],
     subtotal_hierarchies: list,
+    defined_levels_by_hierarchy: dict[str, list[str]] | None = None,
 ) -> list[list[dict[str, str]]]:
     """Build row axis tuples for multi-hierarchy subtotal responses.
 
     Each row maps to exactly one tuple. For each hierarchy, the
     per-hierarchy grain tag determines which level the member belongs to.
 
-    Member unames are path-qualified (see ``_path_qualified_uname``) so
-    that members with equal captions at the same level but different
-    ancestors stay distinct, and ``member_ordinal`` is stable per distinct
-    member within its hierarchy (Bug-XMLA-003 invariant: repeated members
-    across tuples must carry identical ordinals or MSOLAP rejects the
-    response).
+    Multi-level member unames are path-qualified (see
+    ``_path_qualified_uname``) so members with equal captions under different
+    ancestors stay distinct. Flat attributes use their discovery name form.
+    ``member_ordinal`` is stable per distinct member within its level. XMLA
+    defines the ordinal in that scope, so the hidden All level and each data
+    level independently begin at zero. Repeated members across tuples retain
+    one ordinal (Bug-XMLA-003 / Bug-9789).
     """
     from src.dax.subtotal_engine import SUBTOTAL_GRAIN_PREFIX
 
-    ordinal_by_member: dict[tuple[str, str], int] = {}
-    ordinal_counter: dict[str, int] = {}
+    ordinal_by_member: dict[tuple[str, str, str], int] = {}
+    ordinal_counter: dict[tuple[str, str], int] = {}
 
-    def _stable_ordinal(hier_bracket: str, uname: str) -> int:
-        key = (hier_bracket, uname)
+    def _stable_ordinal(hier_bracket: str, level_uname: str, uname: str) -> int:
+        key = (hier_bracket, level_uname, uname)
+        counter_key = (hier_bracket, level_uname)
         if key not in ordinal_by_member:
-            ordinal_by_member[key] = ordinal_counter.get(hier_bracket, 0)
-            ordinal_counter[hier_bracket] = ordinal_counter.get(hier_bracket, 0) + 1
+            ordinal_by_member[key] = ordinal_counter.get(counter_key, 0)
+            ordinal_counter[counter_key] = ordinal_counter.get(counter_key, 0) + 1
         return ordinal_by_member[key]
 
     tuples: list[list[dict[str, str]]] = []
@@ -1988,24 +2182,25 @@ def _build_multi_hierarchy_row_tuples(
             hier_bracket = f"[{h.mdx_dim_name}].[{h.mdx_hier_name}]"
             grain = row.get(SUBTOTAL_GRAIN_PREFIX + h.hierarchy_name, -2)
             leaf_ordinal = h.levels[-1].ordinal if h.levels else 0
+            # Bug-9856: see _build_subtotal_row_members -- identity follows
+            # the model definition, not the request's registered levels.
+            defined = (defined_levels_by_hierarchy or {}).get(hier_bracket) or []
+            is_multi_level = len(defined) > 1 if defined else len(h.levels) > 1
+            defined_leaf = defined[-1] if defined else None
 
             if grain == -1:
                 # Bug-5433: (All) MEMBER uname is [Hier].[All]; [(All)] is the level.
-                all_uname = f"{hier_bracket}.[All]"
-                members.append({
-                    "hierarchy": hier_bracket,
-                    "uname": all_uname,
-                    "name": "All",
-                    "key": "All",
-                    "caption": "All",
-                    "lname": f"{hier_bracket}.[(All)]",
-                    "lnum": "0",
-                    "parent": "",
-                    "has_children": True,
-                    "member_type": 2,
-                    "member_ordinal": _stable_ordinal(hier_bracket, all_uname),
-                    "children_cardinality": 0,
-                })
+                all_uname = synthetic_all_member_uname(hier_bracket)
+                all_level_uname = f"{hier_bracket}.[(All)]"
+                members.append(
+                    synthetic_all_member_metadata(
+                        hier_bracket,
+                        h.mdx_dim_name,
+                        member_ordinal=_stable_ordinal(
+                            hier_bracket, all_level_uname, all_uname,
+                        ),
+                    )
+                )
                 continue
 
             level_idx = next(
@@ -2015,6 +2210,8 @@ def _build_multi_hierarchy_row_tuples(
             level = h.levels[level_idx] if h.levels else None
             is_leaf = grain == leaf_ordinal
             lname = level.name if level else ("Detail" if is_leaf else "Unknown")
+            if defined_leaf is not None and level is not None:
+                is_leaf = lname == defined_leaf
             dim_name = level.dim_name if level else ""
             val = str(row.get(dim_name, ""))
             # Ancestor key path: the row carries every higher-level dim
@@ -2029,26 +2226,62 @@ def _build_multi_hierarchy_row_tuples(
                         hier_bracket, parent_level.name, key_path[:-1],
                     )
                     if str(row.get(parent_level.dim_name, ""))
-                    else f"{hier_bracket}.[All]"  # Bug-5433
+                    else synthetic_all_member_uname(hier_bracket)  # Bug-5433
                 )
             else:
-                parent_uname = f"{hier_bracket}.[All]"  # Bug-5433
-            uname = _path_qualified_uname(hier_bracket, lname, key_path)
+                parent_uname = synthetic_all_member_uname(hier_bracket)  # Bug-5433
+            uname = canonical_member_uname(
+                hier_bracket,
+                lname,
+                key_path,
+                is_multi_level=is_multi_level,
+            )
+            level_uname = f"{hier_bracket}.[{lname}]"
             members.append({
                 "hierarchy": hier_bracket,
                 "uname": uname,
                 "name": val,
                 "key": val,
                 "caption": val,
-                "lname": f"{hier_bracket}.[{lname}]",
-                "lnum": str(len(h.levels)) if is_leaf else str(level_idx + 1),
+                "lname": level_uname,
+                "lnum": str(level_idx + 1),
                 "parent": parent_uname,
                 "has_children": not is_leaf,
                 "member_type": 1,
-                "member_ordinal": _stable_ordinal(hier_bracket, uname),
-                "children_cardinality": 0,
+                "member_ordinal": _stable_ordinal(
+                    hier_bracket, level_uname, uname,
+                ),
+                "children_cardinality": 0,  # filled by the post-pass below
             })
         tuples.append(members)
+
+    # Bug-9780: CHILDREN_CARDINALITY must report the real number of children.
+    # Every member above was emitted with 0, including All members carrying
+    # `has_children: True` -- an internally contradictory pair that tells a
+    # client "this member has children" and "it has none" in the same response.
+    # A client reading CHILDREN_CARDINALITY to decide whether a member is a
+    # rollup header rather than a leaf is told it is a leaf, and the subtotal
+    # rows it explicitly asked for (the `[CREDIT] x [All]` tuples of a nested
+    # PivotTable) have nowhere to render. Every member already carries its
+    # `parent`, so the honest count is derivable from what is actually in this
+    # response -- no extra query, no guess. Counting DISTINCT child unames
+    # matters because a member repeats once per tuple it appears in.
+    children_by_parent: dict[tuple[str, str], set[str]] = {}
+    for members in tuples:
+        for m in members:
+            parent = m.get("parent")
+            if parent:
+                children_by_parent.setdefault(
+                    (m["hierarchy"], parent), set(),
+                ).add(m["uname"])
+    for members in tuples:
+        for m in members:
+            child_count = len(
+                children_by_parent.get((m["hierarchy"], m["uname"]), ()),
+            )
+            m["children_cardinality"] = child_count
+            if m.get("member_type") == 2:
+                m["has_children"] = child_count > 0
     return tuples
 
 
@@ -2064,6 +2297,209 @@ def _deduplicate_axis_tuples(
             seen[key] = len(unique)
             unique.append(t)
     return unique
+
+
+def _validate_rollup_tuples(
+    rows: list[dict[str, Any]],
+    per_row_tuples: list[list[dict[str, str]]],
+    hierarchy_names: list[str],
+    grain_names: list[str],
+    axis_tuples: list[list[dict[str, str]]],
+) -> None:
+    """Validate the rollup source-to-axis contract before XML serialisation.
+
+    A rollup response must have one member per declared hierarchy for every
+    source row. A synthetic All member is valid only for the row whose subtotal
+    grain requested All; it must never be inserted as an extra axis tuple. The
+    output axis may deduplicate repeated tuples, but it may not contain a tuple
+    that was not produced for a source row. This is the save-safe structural
+    invariant for Bug-9772: it checks the XMLA contract itself, not an OOXML
+    fixture or an assumption about Excel's private cache format.
+    """
+    from src.dax.subtotal_engine import SUBTOTAL_GRAIN_KEY, SUBTOTAL_GRAIN_PREFIX
+
+    if len(hierarchy_names) != len(grain_names):
+        raise ValueError("rollup hierarchy/grain declaration count mismatch")
+    if len(rows) != len(per_row_tuples):
+        raise ValueError(
+            "rollup axis/source row count mismatch: "
+            f"{len(per_row_tuples)} tuples for {len(rows)} rows"
+        )
+
+    source_keys: set[tuple[str, ...]] = set()
+    for row, members in zip(rows, per_row_tuples):
+        if len(members) != len(hierarchy_names):
+            raise ValueError(
+                "rollup tuple arity does not match AxisInfo declarations: "
+                f"{len(members)} != {len(hierarchy_names)}"
+            )
+        actual_hierarchies = [m.get("hierarchy", "") for m in members]
+        if actual_hierarchies != hierarchy_names:
+            raise ValueError(
+                "rollup tuple hierarchy order does not match AxisInfo: "
+                f"{actual_hierarchies!r} != {hierarchy_names!r}"
+            )
+
+        for index, (grain_name, member) in enumerate(
+            zip(grain_names, members),
+        ):
+            # The one-hierarchy builder uses the global grain key; the
+            # multi-hierarchy builder uses one prefixed key per hierarchy.
+            per_hierarchy_key = SUBTOTAL_GRAIN_PREFIX + grain_name
+            if per_hierarchy_key in row:
+                # A multi-hierarchy grain ordinal is the sum of the per-
+                # hierarchy ordinals. For example, detail (0) x All (-1)
+                # also has a global value of -1, which must not make the
+                # detail member in the other hierarchy look like All.
+                requested_all = row.get(per_hierarchy_key) == -1
+            else:
+                requested_all = row.get(SUBTOTAL_GRAIN_KEY) == -1
+            emitted_all = member.get("member_type") == 2
+            if emitted_all != requested_all:
+                raise ValueError(
+                    "rollup emitted an unrequested synthetic All member at "
+                    f"tuple member {index}: requested={requested_all}, "
+                    f"emitted={emitted_all}"
+                )
+        source_keys.add(tuple(m.get("uname", "") for m in members))
+
+    output_keys = {
+        tuple(m.get("uname", "") for m in members)
+        for members in axis_tuples
+    }
+    if not output_keys.issubset(source_keys):
+        raise ValueError(
+            "rollup axis contains a tuple that was not produced by a source row"
+        )
+
+
+def _validate_axis_structure(
+    axis_name: str,
+    hierarchies: list[str],
+    members: list[dict[str, str]],
+    tuples: list[list[dict[str, str]]] | None,
+) -> None:
+    """Validate AxisInfo hierarchy order and member identity stability.
+
+    Repeated members may occur in several tuples, but their XMLA identity
+    fields must remain stable. In particular, a synthetic All member and a
+    child are distinct members even when they share a display caption.
+    """
+    expected = list(hierarchies)
+    if tuples is not None:
+        for item in tuples:
+            actual = [m.get("hierarchy", "") for m in item]
+            if actual != expected:
+                raise ValueError(
+                    f"{axis_name} tuple arity/order does not match AxisInfo: "
+                    f"{actual!r} != {expected!r}"
+                )
+    elif len(expected) == 1:
+        for member in members:
+            if member.get("hierarchy", "") != expected[0]:
+                raise ValueError(
+                    f"{axis_name} member hierarchy does not match AxisInfo: "
+                    f"{member.get('hierarchy')!r} != {expected[0]!r}"
+                )
+
+    seen: dict[tuple[str, str], tuple[Any, ...]] = {}
+    all_members: list[dict[str, str]] = (
+        [m for item in tuples for m in item] if tuples is not None else members
+    )
+    for member in all_members:
+        identity = (member.get("hierarchy", ""), member.get("uname", ""))
+        signature = (
+            member.get("member_ordinal"),
+            member.get("lname", ""),
+            member.get("parent", ""),
+            member.get("member_type"),
+        )
+        previous = seen.setdefault(identity, signature)
+        if previous != signature:
+            raise ValueError(
+                f"{axis_name} member identity changed across tuples: {identity!r}"
+            )
+
+
+# Bug-9862 F6: how strictly the rollup lattice/identity checks act. "strict"
+# (default) turns an omission into a SOAP fault -- the loud failure Bug-9891
+# lacked; "warn" logs and serves; "off" skips. Operational override only; the
+# value is read per response so it can be changed without a code edit.
+_ROLLUP_VALIDATION_ENV = "TESSALLITE_XMLA_ROLLUP_VALIDATION"
+
+
+def _validate_requested_rollup_lattice(
+    requested_rollups: list | None,
+    rows: list[dict[str, Any]],
+    col_hierarchies: list[str],
+    col_members: list[dict[str, str]],
+    col_axis_tuples: list[list[dict[str, str]]] | None,
+    row_hierarchies: list[str],
+    row_members: list[dict[str, str]],
+    row_axis_tuples: list[list[dict[str, str]]] | None,
+    dimensions_meta: list[dict[str, Any]] | None,
+    hierarchy_defs: list[dict[str, Any]] | None,
+    *,
+    all_grain_suppressed: bool = False,
+) -> None:
+    """Prove the finished axes cover the requested rollup lattice (Bug-9862 F6).
+
+    Splits the detected rollups by the axis they were requested on, normalises
+    each axis to a tuple list, and runs the lattice-coverage and member-identity
+    checks. A request with no rollups returns before doing any work, so the
+    plain path's cost is unchanged.
+    """
+    mode = (os.environ.get(_ROLLUP_VALIDATION_ENV) or "strict").strip().lower()
+    if mode == "off" or not requested_rollups:
+        return
+
+    from src.dax.rollup_validator import (
+        RollupValidationError,
+        axis_tuples_from,
+        catalogue_level_shape,
+        validate_member_identity,
+        validate_rollup_lattice,
+    )
+
+    def _data_levels_for(hier: str) -> list[str]:
+        return _defined_data_levels(hier, dimensions_meta, hierarchy_defs)
+
+    axes = (
+        ("Axis0", 0, col_hierarchies, col_members, col_axis_tuples),
+        ("Axis1", 1, row_hierarchies, row_members, row_axis_tuples),
+    )
+    started = time.perf_counter()
+    try:
+        for axis_name, axis_idx, hierarchies, members, tuples in axes:
+            rollups = [
+                r for r in requested_rollups
+                if getattr(r, "axis", 1) == axis_idx
+            ]
+            if not rollups:
+                continue
+            axis_tuples = axis_tuples_from(tuples, members)
+            validate_rollup_lattice(
+                axis_name, rollups, rows, axis_tuples,
+                all_grain_suppressed=all_grain_suppressed,
+            )
+            validate_member_identity(
+                axis_name,
+                axis_tuples,
+                catalogue_level_shape(rollups, _data_levels_for),
+            )
+    except RollupValidationError as exc:
+        if mode == "warn":
+            logger.warning("[XMLA-ROLLUP-VALIDATE] %s", exc)
+            return
+        raise
+    logger.info(
+        "[XMLA-ROLLUP-VALIDATE] rollups=%d rows=%d axis0=%d axis1=%d ok in %.2fms",
+        len(requested_rollups),
+        len(rows),
+        len(col_axis_tuples if col_axis_tuples is not None else col_members),
+        len(row_axis_tuples if row_axis_tuples is not None else row_members),
+        (time.perf_counter() - started) * 1000.0,
+    )
 
 
 def _build_cross_axis_subtotal_cell_data(
@@ -2611,6 +3047,115 @@ def _mdx_strip_literals_and_comments(mdx: str) -> str:
     return ''.join(out)
 
 
+def wire_hierarchy_map(
+    dimensions_meta: list[dict[str, Any]] | None,
+    hierarchy_defs: list[dict[str, Any]] | None,
+) -> dict[str, str]:
+    """Map INTERNAL ``[Name].[Name]`` hierarchy brackets to their WIRE form.
+
+    Bug-9771. The field-list grouping puts standalone attributes under a shared
+    ``[Dimensions]`` dimension node (and multi-level hierarchies under
+    ``[Hierarchies]``), so their conformant wire hierarchy name is
+    ``[Dimensions].[account_type]`` — see ``cube_model.hierarchy_unique_name_for``
+    for why the previous ``[account_type].[account_type]`` broke Excel's field
+    captions.
+
+    Every parser, member builder and axis resolver in this module works in the
+    INTERNAL form, so rather than reteaching ~10 bracket-parsing sites the
+    grouped grammar, the translation happens once at the response boundary
+    (outbound) and once on the incoming statement (inbound, in ``xmla_server``).
+    Only entries whose wire form actually differs are returned, so an ungrouped
+    field (the flat time dimensions) costs nothing and is left untouched.
+
+    Fails LOUD. An earlier version swallowed exceptions and returned an empty
+    map, which is the most dangerous possible behaviour here: DISCOVER would
+    already have advertised the WIRE names while Execute silently fell back to
+    INTERNAL ones, reproducing exactly the identity mismatch this bridge exists
+    to remove — intermittently, with a 200 and no fault. A naming failure must
+    surface as a fault, not as a subtly wrong response.
+    """
+    from src.dax.cube_model import build_cube_dimensions
+
+    return wire_hierarchy_map_from_cube_dims(
+        build_cube_dimensions(
+            list(dimensions_meta or []), list(hierarchy_defs or []),
+        )
+    )
+
+
+def wire_hierarchy_map_from_cube_dims(
+    cube_dims: list[dict[str, Any]] | None,
+) -> dict[str, str]:
+    """``wire_hierarchy_map`` for an ALREADY-BUILT cube-dimension list.
+
+    The DISCOVER member path has the built cube dimensions in hand and must not
+    re-derive them, both to avoid the cost and because re-running
+    ``build_cube_dimensions`` over its own output is not guaranteed to be
+    idempotent. Both entry points share this one body so inbound and outbound
+    translation can never disagree about an identity.
+    """
+    from src.dax.cube_model import (
+        hierarchy_unique_name_for,
+        internal_hierarchy_unique_name_for,
+    )
+
+    out: dict[str, str] = {}
+    seen_wire: dict[str, str] = {}
+    for d in cube_dims or []:
+        if not str(d.get("name") or "").strip():
+            continue
+        internal = internal_hierarchy_unique_name_for(d)
+        wire = hierarchy_unique_name_for(d)
+        # Two fields collapsing onto ONE wire identity would make the axis
+        # ambiguous and silently mis-route members between them. Refuse.
+        # DEFENSIVE: unreachable today (build_cube_dimensions dedupes by name,
+        # and both names are pure functions of (group, name), so equal wire
+        # implies equal internal). Kept as cheap insurance in case the naming
+        # functions ever stop being name-derived — see
+        # test_bug9626_wire_name_invariants.py for the reachable property.
+        prior = seen_wire.get(wire)
+        if prior is not None and prior != internal:
+            raise ValueError(
+                "Bug-9771: duplicate XMLA hierarchy identity "
+                f"{wire!r} generated by both {prior!r} and {internal!r}. "
+                "Two fields cannot share one hierarchy unique name."
+            )
+        seen_wire[wire] = internal
+        if wire != internal:
+            out[internal] = wire
+    return out
+
+
+def _to_wire(name: str, hier_map: dict[str, str]) -> str:
+    """Rewrite ONE unique name from internal to wire form (Bug-9771).
+
+    Level and member unique names are the hierarchy bracket plus a suffix
+    (``[account_type].[account_type].[All]``), so this is a prefix swap. An
+    exact hierarchy match is handled first so a bare hierarchy reference maps
+    too.
+    """
+    if not name or not hier_map:
+        return name
+    for internal, wire in hier_map.items():
+        if name == internal:
+            return wire
+        if name.startswith(internal + "."):
+            return wire + name[len(internal):]
+    return name
+
+
+def _wire_member(member: dict, hier_map: dict[str, str]) -> dict:
+    """Copy a member dict with every unique-name field mapped to wire form."""
+    if not hier_map or not isinstance(member, dict):
+        return member
+    out = dict(member)
+    for key in ("hierarchy", "uname", "lname", "parent"):
+        value = out.get(key)
+        if isinstance(value, str) and value:
+            out[key] = _to_wire(value, hier_map)
+    return out
+
+
 def build_real_execute_response(
     mdx: str,
     catalog: str,
@@ -2626,6 +3171,7 @@ def build_real_execute_response(
     hierarchy_defs: list[dict[str, Any]] | None = None,
     denom_requery_results: dict[tuple, Any] | None = None,
     last_data_update: str | None = None,
+    requested_rollups: list | None = None,
 ) -> str:
     """
     Build an MDDataSet Execute response from real query-router results.
@@ -2643,6 +3189,12 @@ def build_real_execute_response(
     When subtotal_hierarchy is provided, rows include tagged subtotal/grand-total
     entries that are rendered as multi-level axis members with proper parent-child
     relationships.
+
+    ``requested_rollups`` are the rollups DETECTED on the parsed axis
+    expressions, passed whether or not the pipeline went on to serve them
+    (Bug-9862 F6). The finished axis is proved to cover the grain lattice they
+    describe; without them a guard that drops every rollup produces a response
+    no structural check can fault (Bug-9891).
     """
     cube = catalog
 
@@ -2996,31 +3548,31 @@ def build_real_execute_response(
             # Bug-6746: dname keys into raw member maps/rows; unescape ]].
             dname = _unbracket(dim_match.group(1).strip())
             drill_member = _normalize_member_name(col_drilldowns.get(hier, ""))
+            # Bug-9856: level identity for a defined hierarchy's level request.
+            _lv_name, _lv_num, _lv_multi, _lv_children = _flat_axis_level_identity(
+                hier, dname, col_member_filters.get(hier),
+                dimensions_meta, hierarchy_defs,
+            )
             if hier in col_ascendants:
-                col_members.append({
-                    "hierarchy": hier,
-                    "uname": f"{hier}.[All]",
-                    "name": "All",
-                    "key": "All",
-                    "caption": f"All {dname}",
-                    "lname": f"{hier}.[(All)]",
-                    "lnum": "0",
-                    "parent": "",
-                    "has_children": bool(dim_members_map.get(dname)),
-                    "member_type": 2,
-                    "children_cardinality": len(dim_members_map.get(dname, [])),
-                })
+                col_members.append(
+                    synthetic_all_member_metadata(
+                        hier, dname,
+                        children_cardinality=len(dim_members_map.get(dname, [])),
+                    )
+                )
                 continue
             if drill_member == "All":
                 for mval in dim_members_map.get(dname, []):
                     col_members.append({
                         "hierarchy": hier,
-                        "uname": f"{hier}.[{mval}]",
+                        "uname": canonical_member_uname(
+                            hier, _lv_name, [str(mval)], is_multi_level=_lv_multi,
+                        ),
                         "caption": mval,
-                        "lname": f"{hier}.[{dname}]",
-                        "lnum": "1",
-                        "parent": f"{hier}.[All]",
-                        "has_children": False,
+                        "lname": f"{hier}.[{_lv_name}]",
+                        "lnum": _lv_num,
+                        "parent": synthetic_all_member_uname(hier),
+                        "has_children": _lv_children,
                         "member_type": 1,
                     })
                 continue
@@ -3047,52 +3599,75 @@ def build_real_execute_response(
                 # them as children. Only fall back to the (All) placeholder
                 # when there is no data to show (schema probe / empty cube).
                 member_values = dim_members_map.get(dname, [])
-                only_all = (
-                    len(member_values) == 1
-                    and _normalize_member_name(member_values[0]) == "All"
-                )
-                if not member_values or only_all:
-                    col_members.append({
-                        "hierarchy": hier,
-                        "uname": f"{hier}.[All]",
-                        "name": "All",
-                        "key": "All",
-                        "caption": f"All {dname}",
-                        "lname": f"{hier}.[(All)]",
-                        "lnum": "0",
-                        "parent": "",
-                        "has_children": bool(dim_members_map.get(dname)),
-                        "member_type": 2,
-                        "member_ordinal": 0,
-                        "children_cardinality": len(dim_members_map.get(dname, [])),
-                    })
+                if not member_values:
+                    col_members.append(
+                        synthetic_all_member_metadata(
+                            hier, dname,
+                            children_cardinality=len(dim_members_map.get(dname, [])),
+                        )
+                    )
                 else:
                     for idx, mval in enumerate(member_values):
                         col_members.append({
                             "hierarchy": hier,
-                            "uname": f"{hier}.[{mval}]",
+                            "uname": canonical_member_uname(
+                                hier, _lv_name, [str(mval)], is_multi_level=_lv_multi,
+                            ),
                             "name": mval,
                             "key": mval,
                             "caption": mval,
-                            "lname": f"{hier}.[{dname}]",
-                            "lnum": "1",
-                            "parent": f"{hier}.[All]",
-                            "has_children": False,
+                            "lname": f"{hier}.[{_lv_name}]",
+                            "lnum": _lv_num,
+                            "parent": synthetic_all_member_uname(hier),
+                            "has_children": _lv_children,
                             "member_type": 1,
                             "member_ordinal": idx,
                             "children_cardinality": 0,
                         })
                 continue
+            _lv_paths = (
+                _hierarchy_level_key_paths(
+                    hier, _lv_name, rows, dimensions_meta, hierarchy_defs,
+                )
+                if _lv_multi else None
+            )
+            if _lv_paths is not None:
+                # Bug-9870 follow-on: a level below the first, named with its
+                # full ancestor path and parented on the real ancestor.
+                _parent_level = _defined_data_levels(
+                    hier, dimensions_meta, hierarchy_defs,
+                )[len(_lv_paths[0]) - 2] if _lv_paths else ""
+                _lv_dims = _hierarchy_level_dims(hier, _lv_name, dimensions_meta, hierarchy_defs)
+                for idx, _path in enumerate(_lv_paths):
+                    col_members.append({
+                        "dim_values": dict(zip(_lv_dims[:-1], _path[:-1])),
+                        "hierarchy": hier,
+                        "uname": canonical_member_uname(
+                            hier, _lv_name, _path, is_multi_level=True,
+                        ),
+                        "caption": _path[-1],
+                        "lname": f"{hier}.[{_lv_name}]",
+                        "lnum": _lv_num,
+                        "parent": _path_qualified_uname(
+                            hier, _parent_level, _path[:-1],
+                        ),
+                        "has_children": _lv_children,
+                        "member_type": 1,
+                        "member_ordinal": idx,
+                    })
+                continue
             for idx, mval in enumerate(dim_members_map.get(dname, [])):
-                all_member = f"{hier}.[All]"
+                all_member = synthetic_all_member_uname(hier)
                 col_members.append({
                     "hierarchy": hier,
-                    "uname": f"{hier}.[{mval}]",
+                    "uname": canonical_member_uname(
+                        hier, _lv_name, [str(mval)], is_multi_level=_lv_multi,
+                    ),
                     "caption": mval,
-                    "lname": f"{hier}.[{dname}]",
-                    "lnum": "1",
+                    "lname": f"{hier}.[{_lv_name}]",
+                    "lnum": _lv_num,
                     "parent": all_member,
-                    "has_children": False,
+                    "has_children": _lv_children,
                     "member_type": 1,
                     "member_ordinal": idx,
                 })
@@ -3121,31 +3696,31 @@ def build_real_execute_response(
             # Bug-6746: dname keys into raw member maps/rows; unescape ]].
             dname = _unbracket(dim_match.group(1).strip())
             drill_member = _normalize_member_name(row_drilldowns.get(hier, ""))
+            # Bug-9856: level identity for a defined hierarchy's level request.
+            _lv_name, _lv_num, _lv_multi, _lv_children = _flat_axis_level_identity(
+                hier, dname, row_member_filters.get(hier),
+                dimensions_meta, hierarchy_defs,
+            )
             if hier in row_ascendants:
-                row_members.append({
-                    "hierarchy": hier,
-                    "uname": f"{hier}.[All]",
-                    "name": "All",
-                    "key": "All",
-                    "caption": f"All {dname}",
-                    "lname": f"{hier}.[(All)]",
-                    "lnum": "0",
-                    "parent": "",
-                    "has_children": bool(dim_members_map.get(dname)),
-                    "member_type": 2,
-                    "children_cardinality": len(dim_members_map.get(dname, [])),
-                })
+                row_members.append(
+                    synthetic_all_member_metadata(
+                        hier, dname,
+                        children_cardinality=len(dim_members_map.get(dname, [])),
+                    )
+                )
                 continue
             if drill_member == "All":
                 for mval in dim_members_map.get(dname, []):
                     row_members.append({
                         "hierarchy": hier,
-                        "uname": f"{hier}.[{mval}]",
+                        "uname": canonical_member_uname(
+                            hier, _lv_name, [str(mval)], is_multi_level=_lv_multi,
+                        ),
                         "caption": mval,
-                        "lname": f"{hier}.[{dname}]",
-                        "lnum": "1",
-                        "parent": f"{hier}.[All]",
-                        "has_children": False,
+                        "lname": f"{hier}.[{_lv_name}]",
+                        "lnum": _lv_num,
+                        "parent": synthetic_all_member_uname(hier),
+                        "has_children": _lv_children,
                         "member_type": 1,
                     })
                 continue
@@ -3163,52 +3738,75 @@ def build_real_execute_response(
                 # Bug-XMLA-001 fix: see column-axis branch above. `(All).Members`
                 # means children-of-All, not the All node itself.
                 member_values = dim_members_map.get(dname, [])
-                only_all = (
-                    len(member_values) == 1
-                    and _normalize_member_name(member_values[0]) == "All"
-                )
-                if not member_values or only_all:
-                    row_members.append({
-                        "hierarchy": hier,
-                        "uname": f"{hier}.[All]",
-                        "name": "All",
-                        "key": "All",
-                        "caption": f"All {dname}",
-                        "lname": f"{hier}.[(All)]",
-                        "lnum": "0",
-                        "parent": "",
-                        "has_children": bool(dim_members_map.get(dname)),
-                        "member_type": 2,
-                        "member_ordinal": 0,
-                        "children_cardinality": len(dim_members_map.get(dname, [])),
-                    })
+                if not member_values:
+                    row_members.append(
+                        synthetic_all_member_metadata(
+                            hier, dname,
+                            children_cardinality=len(dim_members_map.get(dname, [])),
+                        )
+                    )
                 else:
                     for idx, mval in enumerate(member_values):
                         row_members.append({
                             "hierarchy": hier,
-                            "uname": f"{hier}.[{mval}]",
+                            "uname": canonical_member_uname(
+                                hier, _lv_name, [str(mval)], is_multi_level=_lv_multi,
+                            ),
                             "name": mval,
                             "key": mval,
                             "caption": mval,
-                            "lname": f"{hier}.[{dname}]",
-                            "lnum": "1",
-                            "parent": f"{hier}.[All]",
-                            "has_children": False,
+                            "lname": f"{hier}.[{_lv_name}]",
+                            "lnum": _lv_num,
+                            "parent": synthetic_all_member_uname(hier),
+                            "has_children": _lv_children,
                             "member_type": 1,
                             "member_ordinal": idx,
                             "children_cardinality": 0,
                         })
                 continue
+            _lv_paths = (
+                _hierarchy_level_key_paths(
+                    hier, _lv_name, rows, dimensions_meta, hierarchy_defs,
+                )
+                if _lv_multi else None
+            )
+            if _lv_paths is not None:
+                # Bug-9870 follow-on: a level below the first, named with its
+                # full ancestor path and parented on the real ancestor.
+                _parent_level = _defined_data_levels(
+                    hier, dimensions_meta, hierarchy_defs,
+                )[len(_lv_paths[0]) - 2] if _lv_paths else ""
+                _lv_dims = _hierarchy_level_dims(hier, _lv_name, dimensions_meta, hierarchy_defs)
+                for idx, _path in enumerate(_lv_paths):
+                    row_members.append({
+                        "dim_values": dict(zip(_lv_dims[:-1], _path[:-1])),
+                        "hierarchy": hier,
+                        "uname": canonical_member_uname(
+                            hier, _lv_name, _path, is_multi_level=True,
+                        ),
+                        "caption": _path[-1],
+                        "lname": f"{hier}.[{_lv_name}]",
+                        "lnum": _lv_num,
+                        "parent": _path_qualified_uname(
+                            hier, _parent_level, _path[:-1],
+                        ),
+                        "has_children": _lv_children,
+                        "member_type": 1,
+                        "member_ordinal": idx,
+                    })
+                continue
             for idx, mval in enumerate(dim_members_map.get(dname, [])):
-                all_member = f"{hier}.[All]"
+                all_member = synthetic_all_member_uname(hier)
                 row_members.append({
                     "hierarchy": hier,
-                    "uname": f"{hier}.[{mval}]",
+                    "uname": canonical_member_uname(
+                        hier, _lv_name, [str(mval)], is_multi_level=_lv_multi,
+                    ),
                     "caption": mval,
-                    "lname": f"{hier}.[{dname}]",
-                    "lnum": "1",
+                    "lname": f"{hier}.[{_lv_name}]",
+                    "lnum": _lv_num,
                     "parent": all_member,
-                    "has_children": False,
+                    "has_children": _lv_children,
                     "member_type": 1,
                     "member_ordinal": idx,
                 })
@@ -3245,6 +3843,34 @@ def build_real_execute_response(
     _mirror_row_flat_dims: list[str] = []
     _mirror_measures_on_cols = False
     _orig_col_has_measures = any("[Measures]" in h for h in col_hierarchies)
+    # Bug-9788: hierarchy-level ALL_MEMBER metadata and Execute rollup tuples
+    # are ONE paired wire contract. A client whose DISCOVER omitted ALL_MEMBER
+    # (Excel) must not receive All members as axis data -- its pivot-cache
+    # writer refuses Workbook.SaveAs when the axis carries members the
+    # metadata never declared (the two-flat-attribute save failure, proven by
+    # env A/B on ALEX 2026-09-02). suppress_rollup_all_member owns the pairing;
+    # the env switch stays an explicit emergency override for other clients.
+    # Bug-9772: ONE decision for how every aggregate coordinate is represented,
+    # taken before any rollup row is touched. Excel gets the native All member
+    # (the calculated-total profile was retired by Bug-9874).
+    from src.dax.cube_model import rollup_wire_mode as _rwm, RollupWireMode
+
+    _wire_mode = _rwm(client_app_name)
+    if (
+        rows
+        and (subtotal_hierarchy is not None or subtotal_hierarchies)
+    ):
+        if _wire_mode is RollupWireMode.SUPPRESS:
+            _before = len(rows)
+            rows = _drop_rollup_all_grain_rows(
+                rows, subtotal_hierarchy, subtotal_hierarchies,
+            )
+            logger.info(
+                "[XMLA-9644] suppress_rollup_all dropped %s/%s "
+                "All-grain rows from the rollup response",
+                _before - len(rows),
+                _before,
+            )
     if subtotal_hierarchies and len(subtotal_hierarchies) > 1 and rows:
         row_sub_hiers = [h for h in subtotal_hierarchies if h.axis == 1]
         col_sub_hiers = [h for h in subtotal_hierarchies if h.axis == 0]
@@ -3255,23 +3881,51 @@ def build_real_execute_response(
                 all_hier_dim_cols.add(lvl.dim_name)
         dim_cols = [d for d in dim_cols if d not in all_hier_dim_cols]
 
+        # Bug-9856: model-defined data levels per hierarchy for identity.
+        _defined_levels_by_hier = {
+            f"[{h.mdx_dim_name}].[{h.mdx_hier_name}]": _defined_data_levels(
+                f"[{h.mdx_dim_name}].[{h.mdx_hier_name}]",
+                dimensions_meta, hierarchy_defs,
+            )
+            for h in subtotal_hierarchies
+        }
         if row_sub_hiers:
-            _per_row_row_tuples = _build_multi_hierarchy_row_tuples(rows, row_sub_hiers)
+            _per_row_row_tuples = _build_multi_hierarchy_row_tuples(
+                rows, row_sub_hiers,
+                defined_levels_by_hierarchy=_defined_levels_by_hier,
+            )
             row_axis_tuples = _deduplicate_axis_tuples(_per_row_row_tuples)
             row_hierarchies = [
                 f"[{h.mdx_dim_name}].[{h.mdx_hier_name}]"
                 for h in row_sub_hiers
             ]
+            _validate_rollup_tuples(
+                rows,
+                _per_row_row_tuples,
+                row_hierarchies,
+                [h.hierarchy_name for h in row_sub_hiers],
+                row_axis_tuples,
+            )
             row_members = []
             _subtotal_row_tuples_set = True
             _subtotal_members_on_rows = True
         if col_sub_hiers:
-            _per_row_col_tuples = _build_multi_hierarchy_row_tuples(rows, col_sub_hiers)
+            _per_row_col_tuples = _build_multi_hierarchy_row_tuples(
+                rows, col_sub_hiers,
+                defined_levels_by_hierarchy=_defined_levels_by_hier,
+            )
             col_axis_tuples = _deduplicate_axis_tuples(_per_row_col_tuples)
             col_hierarchies = [
                 f"[{h.mdx_dim_name}].[{h.mdx_hier_name}]"
                 for h in col_sub_hiers
             ]
+            _validate_rollup_tuples(
+                rows,
+                _per_row_col_tuples,
+                col_hierarchies,
+                [h.hierarchy_name for h in col_sub_hiers],
+                col_axis_tuples,
+            )
             col_members = []
             _subtotal_col_tuples_set = True
         _cross_axis_subtotals = bool(row_sub_hiers and col_sub_hiers)
@@ -3285,6 +3939,16 @@ def build_real_execute_response(
             rows, subtotal_hierarchy,
             subtotal_hierarchy.mdx_dim_name,
             subtotal_hierarchy.mdx_hier_name,
+            defined_levels=_defined_data_levels(
+                _st_bracket, dimensions_meta, hierarchy_defs,
+            ),
+        )
+        _validate_rollup_tuples(
+            rows,
+            [[member] for member in _st_members],
+            [_st_bracket],
+            [subtotal_hierarchy.hierarchy_name],
+            [[member] for member in _st_members],
         )
         if getattr(subtotal_hierarchy, "axis", 1) == 0:
             col_members = _st_members
@@ -3381,23 +4045,89 @@ def build_real_execute_response(
             }],
         }
 
+    # Bug-9771: everything above resolved members/axes in the INTERNAL
+    # [Name].[Name] grammar. Translate to the conformant WIRE grammar here —
+    # the single boundary between resolution and serialisation — so the
+    # response Excel receives declares each hierarchy under the dimension node
+    # that actually owns it. Applied to the hierarchy lists, every member dict
+    # (hierarchy/uname/lname/parent), the pre-built axis tuples, the slicer
+    # dims, AND dim_props: _hierarchy_info matches a requested DIMENSION
+    # PROPERTY against the axis hierarchy by string equality, so leaving
+    # dim_props in the internal form would silently drop every requested
+    # property from the grouped hierarchies' HierarchyInfo.
+    _wire_map = wire_hierarchy_map(dimensions_meta, hierarchy_defs)
+    if _wire_map:
+        _w_col_hierarchies = [_to_wire(h, _wire_map) for h in col_hierarchies]
+        _w_row_hierarchies = [_to_wire(h, _wire_map) for h in row_hierarchies]
+        _w_col_members = [_wire_member(m, _wire_map) for m in col_members]
+        _w_row_members = [_wire_member(m, _wire_map) for m in row_members]
+        _w_col_axis_tuples = (
+            None if col_axis_tuples is None
+            else [[_wire_member(m, _wire_map) for m in tup] for tup in col_axis_tuples]
+        )
+        _w_row_axis_tuples = (
+            None if row_axis_tuples is None
+            else [[_wire_member(m, _wire_map) for m in tup] for tup in row_axis_tuples]
+        )
+        _w_dims_for_slicer = {
+            k: (
+                {**v, "hierarchy": _to_wire(v["hierarchy"], _wire_map)}
+                if isinstance(v, dict) and isinstance(v.get("hierarchy"), str)
+                else v
+            )
+            for k, v in (dims_for_slicer or {}).items()
+        }
+        _w_dim_props = [
+            (
+                {**p, "hierarchy": _to_wire(p["hierarchy"], _wire_map)}
+                if isinstance(p, dict) and isinstance(p.get("hierarchy"), str) and p.get("hierarchy")
+                else p
+            )
+            for p in (dim_props or [])
+        ]
+    else:
+        _w_col_hierarchies, _w_row_hierarchies = col_hierarchies, row_hierarchies
+        _w_col_members, _w_row_members = col_members, row_members
+        _w_col_axis_tuples, _w_row_axis_tuples = col_axis_tuples, row_axis_tuples
+        _w_dims_for_slicer, _w_dim_props = dims_for_slicer, dim_props
+
+    _validate_axis_structure(
+        "Axis0", _w_col_hierarchies, _w_col_members, _w_col_axis_tuples,
+    )
+    _validate_axis_structure(
+        "Axis1", _w_row_hierarchies, _w_row_members, _w_row_axis_tuples,
+    )
+    # Bug-9862 F6: prove the axis COVERS what was asked for, not merely that it
+    # invented nothing. Run on the internal (pre-wire) structures: the wire map
+    # renames hierarchies consistently across every member field, so identity
+    # and coverage are unchanged by it, and the rollup hierarchy names are in
+    # the internal form. Costs nothing when no rollup was requested.
+    _validate_requested_rollup_lattice(
+        requested_rollups,
+        rows,
+        col_hierarchies, col_members, col_axis_tuples,
+        row_hierarchies, row_members, row_axis_tuples,
+        dimensions_meta, hierarchy_defs,
+        all_grain_suppressed=_wire_mode is RollupWireMode.SUPPRESS,
+    )
+
     olap_info = _build_olap_info(
-        cube, col_hierarchies, row_hierarchies,
-        slicer_dims, slicer_measure, dims_for_slicer, dim_props,
+        cube, _w_col_hierarchies, _w_row_hierarchies,
+        slicer_dims, slicer_measure, _w_dims_for_slicer, _w_dim_props,
         minimal_excel_props=minimal_excel_props,
         last_data_update=last_data_update,
     )
 
     # Build Axes
     axes_xml = _build_axes(
-        col_hierarchies, col_members,
-        row_hierarchies, row_members,
+        _w_col_hierarchies, _w_col_members,
+        _w_row_hierarchies, _w_row_members,
         slicer_dims, slicer_measure,
-        dims_for_slicer, {},  # empty measures dict (not needed for slicer rendering)
-        dim_props,
+        _w_dims_for_slicer, {},  # empty measures dict (not needed for slicer rendering)
+        _w_dim_props,
         axis_format,
-        col_axis_tuples,
-        row_axis_tuples,
+        _w_col_axis_tuples,
+        _w_row_axis_tuples,
         minimal_excel_props=minimal_excel_props,
     )
 
@@ -3523,6 +4253,9 @@ def _build_real_cell_data(
                     if dim_match:
                         # Bug-6746: dim key matched against raw result columns.
                         entry[_unbracket(dim_match.group(1))] = cm["caption"]
+                        # Bug-9870 follow-on: a path-qualified hierarchy member supplies
+                        # its ancestor columns so the row key resolves.
+                        entry.update(cm.get("dim_values") or {})
             col_tuples.append(entry)
     else:
         for cm in col_members:
@@ -3534,6 +4267,9 @@ def _build_real_cell_data(
                 if dim_match:
                     # Bug-6746: dim key matched against raw result columns.
                     entry[_unbracket(dim_match.group(1))] = cm["caption"]
+                    # Bug-9870 follow-on: a path-qualified hierarchy member supplies
+                    # its ancestor columns so the row key resolves.
+                    entry.update(cm.get("dim_values") or {})
             col_tuples.append(entry)
 
     # Build row tuples
@@ -3550,6 +4286,9 @@ def _build_real_cell_data(
                     if dim_match:
                         # Bug-6746: dim key matched against raw result columns.
                         entry[_unbracket(dim_match.group(1))] = rm["caption"]
+                        # Bug-9870 follow-on: a path-qualified hierarchy member supplies
+                        # its ancestor columns so the row key resolves.
+                        entry.update(rm.get("dim_values") or {})
             row_tuples.append(entry)
     else:
         for rm in row_members:
@@ -3561,6 +4300,9 @@ def _build_real_cell_data(
                 if dim_match:
                     # Bug-6746: dim key matched against raw result columns.
                     entry[_unbracket(dim_match.group(1))] = rm["caption"]
+                    # Bug-9870 follow-on: a path-qualified hierarchy member supplies
+                    # its ancestor columns so the row key resolves.
+                    entry.update(rm.get("dim_values") or {})
             row_tuples.append(entry)
 
     if not row_tuples:

@@ -55,10 +55,11 @@ const STORAGE_KEYS = {
   // custom-functions runtime (a separate JS context that cannot read pane
   // React state) can scope KPI evaluations to the same persona the pane shows.
   ACTIVE_PERSONA_ID: 'tessallite_active_persona',
-  // Bug-6912: cross-runtime cache invalidation token. The pane bumps this on
-  // Refresh / persona switch / profile switch / logout; the functions runtime
-  // compares against its module-level lastSeenGeneration and clears caches on
-  // change. Only the CHANGE matters, not ordering.
+  // Bug-6912: cross-runtime cache invalidation generation. The pane bumps this
+  // on Refresh / persona switch / profile switch / logout; the functions
+  // runtime compares against its module-level lastSeenGeneration and clears
+  // caches on change. The value is numeric and strictly increasing so a rapid
+  // sequence cannot make an older transition look newer.
   CACHE_GENERATION: 'tessallite_cache_generation',
   // Task 3: global insert-mode default (live formulas vs static snapshot).
   INSERT_MODE: 'tessallite_insert_mode',
@@ -262,17 +263,42 @@ export async function getCacheGeneration(): Promise<string | null> {
 }
 
 /**
- * Write a new cache generation token. The functions runtime detects the change
- * and clears its local KPI/list/named-set caches. Value format:
- * `<Date.now() base-36>-<random suffix>` — only CHANGE matters, not ordering.
+ * Write a new cache generation. The functions runtime detects the change and
+ * clears its local KPI/list/named-set caches. Legacy non-numeric values are
+ * treated as generation zero and replaced by the next numeric value.
  */
-export async function bumpCacheGeneration(): Promise<void> {
-  const token = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
-  try {
-    await storage().setItem(STORAGE_KEYS.CACHE_GENERATION, token);
-  } catch {
-    // Storage unavailable — fire-and-forget (tests, degraded hosts).
-  }
+let lastWrittenCacheGeneration = 0;
+let cacheGenerationQueue: Promise<void> = Promise.resolve();
+
+export async function bumpCacheGeneration(minGeneration?: number): Promise<void> {
+  const write = cacheGenerationQueue.then(async () => {
+    try {
+      const stored = await storage().getItem(STORAGE_KEYS.CACHE_GENERATION);
+      const storedGeneration = stored && /^\d+$/.test(stored) ? Number(stored) : 0;
+      const requestedGeneration =
+        minGeneration !== undefined && Number.isSafeInteger(minGeneration)
+          ? minGeneration
+          : 0;
+      const nextGeneration = Math.max(
+        storedGeneration + 1,
+        lastWrittenCacheGeneration + 1,
+        requestedGeneration,
+      );
+      lastWrittenCacheGeneration = nextGeneration;
+      await storage().setItem(
+        STORAGE_KEYS.CACHE_GENERATION,
+        String(nextGeneration),
+      );
+    } catch {
+      // Storage unavailable — retain the in-memory monotonic sequence and let
+      // the next available write catch up.
+    }
+  });
+  cacheGenerationQueue = write.then(
+    () => undefined,
+    () => undefined,
+  );
+  await write;
 }
 
 // ---------------------------------------------------------------------------

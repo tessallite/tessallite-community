@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Analyst Guides</span> / <span>Build a Report with the Excel Add-in</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">end user</span><span class="updated">Updated 2026-08-04</span></div>
+    <div class="article-meta"><span class="audience-badge">end user</span><span class="updated">Updated 2026-09-09</span></div>
     <h1>Build a Report with the Excel Add-in</h1>
 <h2>What this covers</h2>
 <p>The Tessallite Excel add-in is a task pane that lives inside Excel and builds reports from governed measures and dimensions — no workbook connection to configure, no SQL to write. This page walks through a full reporting session with it: signing in, assembling a sales table by dragging fields, filtering it, asking the built-in agent a question, inserting a chart and a KPI card, drilling to the rows behind a number, and refreshing everything the next day.</p>
@@ -28,14 +28,14 @@
 <ol>
 <li>Open Excel, find the Tessallite ribbon button (usually on <strong>Home</strong> or <strong>Insert</strong>), and click it. The task pane opens on the right.</li>
 <li>Sign in with your tenant slug (<code>acme-demo</code>), email, and password.</li>
-<li>At the top of the pane, choose the <strong><code>modelx</code></strong> model. The measure, dimension, and hierarchy libraries fill in — with only the objects you are allowed to see. If your list looks shorter than a colleague's, that is your persona doing its job, not a missing feature.</li>
+<li>Click the project/model title at the top of the pane, then choose the <strong><code>modelx</code></strong> model. The measure, dimension, and hierarchy libraries fill in — with only the objects you are allowed to see. If your list looks shorter than a colleague's, that is your persona doing its job, not a missing feature.</li>
 </ol>
 <h2>Step 2 — Drag a report together in Report Builder</h2>
-<p>The <strong>Report Builder</strong> tab is where tables get assembled.</p>
+<p>The <strong>Analyse</strong> tab is where tables get assembled.</p>
 <ol>
 <li>Drag <strong><code>region_code</code></strong> into the <strong>Rows</strong> zone.</li>
 <li>Drag <strong><code>net_sales</code></strong> and <strong><code>gross_margin</code></strong> into the <strong>Values</strong> zone.</li>
-<li>Click <strong>Run</strong>.</li>
+<li>Click the <strong>Table</strong> toolbar icon.</li>
 </ol>
 <p>A grouped table lands on the sheet: one row per region, net sales and gross margin beside each, with friendly headers. Underneath, the add-in asked Tessallite for exactly that grouping — and Tessallite routed the question to a pre-computed summary if one covers it, so the answer comes back fast even over a hundred thousand rows.</p>
 <h3>Tighten it with a filter</h3>
@@ -49,12 +49,13 @@
 <p>The small label under the value box says what kind of value the column expects, and if the model cannot accept a filter, the add-in explains why in plain words rather than showing an error code.</p>
 <blockquote><p><strong>Tip: named lists as filters.</strong> If your modeller saved a named list — "Focus Products", say — you can drag it into a zone two ways. A plain drag writes the list's members as they are right now (a snapshot). <strong>Insert as formulas</strong> writes a live <code>CUBESET</code> that re-evaluates on every refresh. For anything that changes over time — a dynamic Top N, a filtered list — choose the formula version so next month's members flow in by themselves.</p></blockquote>
 <h2>Step 3 — Ask the question out loud</h2>
-<p>The <strong>Ask Tessallite</strong> panel is the conversational agent, inside Excel.</p>
+<p>The <strong>Ask</strong> panel is the conversational agent, inside Excel.</p>
 <ol>
 <li>Type: <em>which channel grew fastest last month?</em></li>
 <li>The answer streams back as it is generated — a sentence, the supporting query, and a judge verdict on the answer's quality.</li>
 <li>Click the <strong>insert</strong> action to drop the answer text, the result table, or a chart straight onto the sheet.</li>
 </ol>
+<p>Chart inserts use dimensions as category labels and measures as numeric series. Measure values returned as numeric text are converted to numbers; dimension identifiers such as <code>0042</code> keep their leading zeros.</p>
 <p>The agent plays by the same rules as everything else: it honours the model's glossary (so "channel" means what the model says it means), your row security, and your persona. It cannot show you data you are not permitted to see, no matter how the question is phrased.</p>
 <h2>Step 4 — KPI cards and a chart</h2>
 <p>Switch to the <strong>KPIs</strong> tab. Every KPI on the model — Net Sales, Revenue, Gross Margin % — appears as a live card with its current value, status, and trend.</p>

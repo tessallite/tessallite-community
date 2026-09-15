@@ -269,58 +269,89 @@ def test_kpi_persona_rejects_transitive_kpi_hidden_dimension():
 
 @pytest.mark.asyncio
 async def test_named_set_persona_rejects_hidden_dimension_via_dimensions_field():
-    """Bug-6329 model-side: a named set whose persisted dimensions field
-    names a dimension the persona cannot see must be hidden."""
-    from src.api.named_sets import _named_set_visible_to_persona
+    """Bug-6329 model-side, re-expressed for Bug-9877.
 
-    visible_d_id = uuid.uuid4()
-    hidden_d_id = uuid.uuid4()
+    The persisted ``dimensions`` field is still authoritative lineage, but it
+    is now FOLDED INTO the model query the persona gate judges rather than
+    checked by a private name comparison. A set naming a dimension outside the
+    persona surface is refused by that bind, so this asserts the dimension
+    reaches the probe and that the probe's answer is the verdict.
+    """
+    from src.api.named_set_visibility import (
+        ModelSurface,
+        build_probe_for_named_set,
+        clear_named_set_visibility_cache,
+        named_set_binds_for_persona,
+    )
+    import src.api.named_set_visibility as nsv
+
+    clear_named_set_visibility_cache()
     model_id = uuid.uuid4()
+    surface = ModelSurface(
+        dimensions={"visible_dim": "visible_dim", "hidden_dim": "hidden_dim"},
+        measures={},
+    )
     ns = types.SimpleNamespace(
+        id=uuid.uuid4(),
         expression=None,
         dimensions="hidden_dim",
+        builder_definition=None,
     )
+    probe = build_probe_for_named_set(ns, surface, "modelx")
+    assert probe is not None and "hidden_dim" in probe
 
-    class _DimDB:
-        async def execute(self, _stmt):
-            class _R:
-                def all(self):
-                    return [
-                        (visible_d_id, "visible_dim"),
-                        (hidden_d_id, "hidden_dim"),
-                    ]
-            return _R()
+    _original = nsv.probe_binds
 
-    result = await _named_set_visible_to_persona(
-        _DimDB(), ns, model_id, [visible_d_id],
-    )
-    assert not result
+    async def _refuse(*, model_id, sql, persona_id, bearer, timeout_s=15.0):
+        return False
+
+    nsv.probe_binds = _refuse
+    try:
+        assert not await named_set_binds_for_persona(
+            ns, model_id=model_id, model_slug="modelx", surface=surface,
+            persona=types.SimpleNamespace(id=uuid.uuid4()), bearer="t",
+        )
+    finally:
+        nsv.probe_binds = _original
+        clear_named_set_visibility_cache()
 
 
 @pytest.mark.asyncio
 async def test_named_set_persona_allows_when_dimension_visible():
-    """Bug-6329 model-side: a named set whose dimensions field only names
-    visible dimensions is accessible."""
-    from src.api.named_sets import _named_set_visible_to_persona
+    """Bug-6329 model-side, re-expressed for Bug-9877: a set whose references
+    are all inside the persona surface binds, and is therefore served."""
+    from src.api.named_set_visibility import (
+        ModelSurface,
+        clear_named_set_visibility_cache,
+        named_set_binds_for_persona,
+    )
+    import src.api.named_set_visibility as nsv
 
-    visible_d_id = uuid.uuid4()
-    model_id = uuid.uuid4()
+    clear_named_set_visibility_cache()
+    surface = ModelSurface(
+        dimensions={"visible_dim": "visible_dim"}, measures={},
+    )
     ns = types.SimpleNamespace(
+        id=uuid.uuid4(),
         expression=None,
         dimensions="visible_dim",
+        builder_definition=None,
     )
+    _original = nsv.probe_binds
 
-    class _DimDB:
-        async def execute(self, _stmt):
-            class _R:
-                def all(self):
-                    return [(visible_d_id, "visible_dim")]
-            return _R()
+    async def _allow(*, model_id, sql, persona_id, bearer, timeout_s=15.0):
+        assert "visible_dim" in sql
+        return True
 
-    result = await _named_set_visible_to_persona(
-        _DimDB(), ns, model_id, [visible_d_id],
-    )
-    assert result
+    nsv.probe_binds = _allow
+    try:
+        assert await named_set_binds_for_persona(
+            ns, model_id=uuid.uuid4(), model_slug="modelx", surface=surface,
+            persona=types.SimpleNamespace(id=uuid.uuid4()), bearer="t",
+        )
+    finally:
+        nsv.probe_binds = _original
+        clear_named_set_visibility_cache()
 
 
 @pytest.mark.asyncio

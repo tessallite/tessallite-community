@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Agent</span> / <span>Agent Chat</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-06-21</span></div>
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-09-11</span></div>
     <h1>Agent Chat</h1>
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/agent-chat.png" alt="Live Agent Chat workspace for the acme-demo project."></figure>
 <h2>What this covers</h2>
@@ -23,6 +23,10 @@
 <ul><li><strong>New conversation</strong> starts a fresh thread with its own memory window.</li><li><strong>Conversation list</strong> lets users return to previous work.</li><li><strong>Persona or model controls</strong> narrow the semantic context when configured.</li><li><strong>Trace and citations</strong> show which model objects, glossary terms, and query steps influenced the answer. Click a citation chip to open its provenance: the field's definition, the value, which data route answered it (a pre-built rollup, a smaller pocket table, or the live source), and the exact filters and grouping used — so a number can be checked, not just trusted. A "view technical trace" link inside that panel opens the same detailed trace shown for the whole answer.</li><li><strong>Judge verdicts</strong> flag whether the answer passed the configured quality rubric.</li><li><strong>Visuals and data</strong> show polished Tessallite-themed ECharts by default, with the data table kept in its own expandable section. Diagnostics such as thought summary and generated queries stay collapsed until opened.</li></ul>
 <h2>Writing effective questions</h2>
 <p>Ask in business terms first: &quot;What changed in April margin for EMEA?&quot; is better than starting with table names. If the answer is ambiguous, add grain and filters: region, date range, merchant category, fiscal period, or persona. The agent can plan multi-step answers, but it is still governed by the semantic model; undefined measures need to be created in Model Builder first.</p>
+<h2>Reading time ranges and comparisons</h2>
+<p>A row grouped by year can add up many days. The year label is not the date range. Check the filters in the answer's trace to see which days were included.</p>
+<p>When you ask for category totals and a comparison with their average, the totals stay visible. The comparison uses the complete set of totals. If the result is incomplete, the answer explains that it cannot establish the comparison from those rows.</p>
+<p>If you ask for a fixed baseline divided by each category total, the answer keeps that ratio. If you ask how many average-sized rows make up a total, it keeps that meaning too. Tessallite only replaces an unsafe average-across-categories plan when both sides cover the same dates, filters, and people or records. If they do not match, it refuses the substitution instead of answering a different question.</p>
 <h2>When to switch to Model Builder</h2>
 <p>Use Agent Chat for exploration and explanation. Switch to Model Builder when the answer reveals missing semantics: a measure needs a clearer definition, a dimension alias is confusing, a glossary term is missing, an aggregate is needed, or a row-security/persona rule blocks the intended audience.</p>
 <h2>Related</h2>

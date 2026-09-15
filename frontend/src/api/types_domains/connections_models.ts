@@ -30,7 +30,17 @@ export interface ModelCreate {
   pocket_size_budget_bytes?: number | null;
 }
 export interface CanvasLayout {
-  tables?: Record<string, { x: number; y: number; w?: number; h?: number }>;
+  tables?: Record<string, {
+    x: number;
+    y: number;
+    w?: number;
+    h?: number;
+    /**
+     * Auto-placement protection for this table. Absent means false, so a layout
+     * written before pinning existed stays valid.
+     */
+    pinned?: boolean;
+  }>;
   edges?: Record<string, {
     waypoint?: { x: number; y: number };
     waypoints?: { x: number; y: number }[];
@@ -39,7 +49,46 @@ export interface CanvasLayout {
     targetSide?: string;
     sourceRatio?: number;
     targetRatio?: number;
+    /**
+     * The complete displayed route and docking for this relationship are
+     * frozen. Independent of `tables[id].pinned`; unlocking never unpins.
+     */
+    locked?: boolean;
+    /**
+     * Provenance of the stored bends. Legacy entries with saved waypoints but no
+     * `routeMode` are treated as "manual".
+     */
+    routeMode?: "auto" | "manual";
+    /**
+     * The parallel fan-out in force when this route was locked.
+     *
+     * The fan-out is normally derived from the current set of relationships
+     * between the two cards, so adding one moved an existing LOCKED
+     * attachment while its frozen bends stayed absolute. A locked route draws
+     * with the offset it was frozen with. Absent on an unlocked route and on
+     * every layout saved before locks carried it.
+     */
+    lockedParallelOffset?: number;
+    /**
+     * `pathing` was written by the lock, not chosen by the user.
+     *
+     * A locked route must own its resolved path mode, or a later change to the
+     * model-wide Edge Pathing setting discards the bends the lock froze.
+     * Recording that the override is the lock's own doing is what lets Unlock
+     * return the relationship to the model setting instead of leaving a
+     * permanent style override nobody asked for.
+     */
+    pathingFrozenByLock?: boolean;
   }>;
+  /**
+   * Last successfully applied layout preferences. Absent or unknown values fall
+   * back to validated defaults.
+   */
+  layoutOptions?: {
+    preset?: "hierarchical" | "compact" | "radial";
+    direction?: "DOWN" | "RIGHT";
+    spacing?: "normal" | "dense";
+  };
   viewport?: { x: number; y: number; zoom: number };
   notes?: string;
 }

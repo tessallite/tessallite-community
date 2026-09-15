@@ -83,6 +83,7 @@ export function buildFormulaScorecardRows(
   modelSlug: string,
 ): string[][] {
   const m = escapeFormulaString(modelSlug);
+  const kpiFn = 'TESSALLITE.KPI';
   return kpis.map(kpi => {
     const label = kpi.display_name || kpi.name;
     const kpiName = escapeFormulaString(label);
@@ -90,9 +91,9 @@ export function buildFormulaScorecardRows(
       // Bug-7393 (R3): the label is written to the formula channel, so a
       // formula-leading label must be neutralised before it can execute.
       neutraliseLabelForFormulaChannel(label),
-      `=TESSALLITE.KPI("${m}","${kpiName}","value")`,
-      `=TESSALLITE.KPI("${m}","${kpiName}","goal")`,
-      `=TESSALLITE.KPI("${m}","${kpiName}","status")`,
+      `=${kpiFn}("${m}","${kpiName}","value")`,
+      `=${kpiFn}("${m}","${kpiName}","goal")`,
+      `=${kpiFn}("${m}","${kpiName}","status")`,
     ];
   });
 }

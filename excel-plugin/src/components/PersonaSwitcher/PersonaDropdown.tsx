@@ -7,6 +7,7 @@ interface PersonaDropdownProps {
   personas: Persona[];
   activePersonaId: string | null;
   onSelect: (persona: Persona | null) => void;
+  compact?: boolean;
 }
 
 const audienceStyle: Record<string, { bg: string; text: string }> = {
@@ -14,28 +15,26 @@ const audienceStyle: Record<string, { bg: string; text: string }> = {
   technical: { bg: tokens.colorPurpleBg, text: tokens.colorPurple },
 };
 
-export default function PersonaDropdown({ personas, activePersonaId, onSelect }: PersonaDropdownProps) {
-  if (personas.length === 0) return null;
-
-  const activePersona = personas.find(p => p.id === activePersonaId) || null;
-  const isNonDefault = activePersonaId !== null;
+export default function PersonaDropdown({ personas, activePersonaId, onSelect, compact = false }: PersonaDropdownProps) {
+  if (personas.length === 0 && !compact) return null;
 
   return (
-    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-      <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>
+    <Box sx={{ display: 'flex', flexDirection: compact ? 'column' : 'row', alignItems: compact ? 'stretch' : 'center', gap: 0.5 }}>
+      <Typography sx={{ fontSize: compact ? 10 : 11, fontWeight: compact ? 600 : 400, textTransform: compact ? 'uppercase' : 'none', color: tokens.colorTextSecondary }}>
         {strings.persona.label}
       </Typography>
       <Select
         size="small"
+        inputProps={{ 'aria-label': strings.persona.label }}
         value={activePersonaId || ''}
         onChange={e => {
           const pid = e.target.value as string;
           onSelect(pid ? personas.find(p => p.id === pid) || null : null);
         }}
         sx={{
-          fontSize: 11, height: 22,
+          fontSize: compact ? 12 : 11, height: compact ? 26 : 22, borderRadius: '2px',
           '& .MuiSelect-select': { py: 0, pr: 3 },
-          '& fieldset': { border: 'none' },
+          ...(!compact && { '& fieldset': { border: 'none' } }),
         }}
         displayEmpty
       >

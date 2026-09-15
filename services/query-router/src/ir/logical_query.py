@@ -24,6 +24,23 @@ class LogicalFilter:
 
 
 @dataclass
+class LogicalMeasurePredicate:
+    """A typed predicate over a measure's grouped value.
+
+    This stays separate from ``LogicalFilter`` so a measure condition cannot
+    accidentally enter the row-level WHERE path. The binder replaces the
+    producer-carried aggregation with the deployed measure metadata before
+    either renderer consumes it.
+    """
+
+    measure_id: str
+    operator: str
+    value: Any
+    effective_aggregation: str
+    like_escape: Optional[str] = None
+
+
+@dataclass
 class SelectExpression:
     """A single item in the SELECT list with classification metadata."""
     raw_text: str                    # Original SQL text: "COUNT(1)", "SUM(revenue)"
@@ -198,6 +215,14 @@ class LogicalQuery:
     offset: Optional[int]
     query_fingerprint: str                  # SHA-256 (hex[:64]) of normalised structure
     select_star: bool = False               # True when query uses SELECT *
+    # Bug-9899 / audit row A13: this explicit projection WAS a ``SELECT *``
+    # over the model until a server-side expansion made it explicit (the
+    # Named Query star expansion, shared/named_query/star_expansion.py). No
+    # caller asked for these columns by name, so the persona allow-list gate
+    # and the column-level-security gate must NARROW it exactly as they narrow
+    # a star -- their DENY branches exist for a caller who named a field they
+    # may not see, which is not what happened here. Never set from parsed SQL.
+    star_expanded: bool = False
     select_expressions: list[SelectExpression] = field(default_factory=list)
     from_tables: list[str] = field(default_factory=list)  # Table names from FROM / JOIN
     syntax_warnings: list[str] = field(default_factory=list)
@@ -254,6 +279,37 @@ class LogicalQuery:
     # unrecognized, this stays empty and the query falls through to source
     # via has_function_grain passthrough.
     time_period_grains: list[tuple[str, str]] = field(default_factory=list)
+    # Bug-9824: structured grouped-value predicates. These are rendered after
+    # GROUP BY (or against a stored aggregate column at exact grain).
+    measure_filters: list[LogicalMeasurePredicate] = field(default_factory=list)
+    # Bug-9864: rollup-lattice grouping sets. NOT parsed from the raw SQL --
+    # ``GROUP BY GROUPING SETS`` in client SQL is still complex SQL and still
+    # routes to passthrough. This field carries the STRUCTURED lattice the XMLA
+    # gateway asks for on ``ExecuteRequest.grouping_sets``: each entry is a list
+    # of semantic dimension names that MUST be a subset of ``grain``, and the
+    # source rewriter renders one ``GROUP BY GROUPING SETS ((...), ...)`` plus a
+    # ``GROUPING(<expr>)`` marker per grain column instead of a plain GROUP BY.
+    #
+    # Expressing the lattice here rather than in the client SQL is what keeps
+    # rule 4 true: the router still forms the persona model query (bind, persona
+    # gate, default filters, CLS, RLS) exactly as for the per-grain queries this
+    # replaces, and the lattice is layered on top of it at emission time. A
+    # grouping-sets request is source-only (``force_route="source"``); aggregate
+    # and pocket serving of a lattice is a later enhancement.
+    grouping_sets: Optional[list[list[str]]] = None
+    # Bug-9740: SELECT items that are TRULY bare columns (``exp.Column`` at the
+    # top of the select item, not a column buried inside an expression) AND are
+    # NOT in the GROUP BY grain. The parser already computes this set for the
+    # strict JDBC GROUP BY gate; publishing it lets the BINDER — the only stage
+    # that knows whether such a name is a model MEASURE — decide the projection
+    # correctly. A bare measure name in a grouped query means "this measure at
+    # its ``default_agg`` over the grain" (what ``SELECT *`` already does); a
+    # bare measure name in an UNGROUPED query means the raw value column (what
+    # drill-through leaf detail relies on). Without this list the binder cannot
+    # tell a bare projection apart from a measure column referenced inside an
+    # arithmetic/CASE expression, whose passthrough rendering must not change.
+    # Empty for DAX/XMLA (no explicit GROUP BY) and for ungrouped SQL.
+    ungrouped_bare_columns: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -340,6 +396,24 @@ class BoundQuery:
     # backward revert may delete after binding. Appended to preserve the
     # positional constructor contract for older integrations and fixtures.
     deployed_shape: Any = None
+    # Bug-9824: measure predicates bound to stable deployed measure metadata.
+    # Appended so older positional BoundQuery fixtures retain their contract.
+    # Renderers consume these as HAVING, never as source-row WHERE.
+    resolved_measure_filters: list["BoundMeasurePredicate"] = field(default_factory=list)
+
+
+@dataclass
+class BoundMeasurePredicate:
+    """A measure predicate after binding to deployed measure metadata."""
+
+    measure_id: str
+    measure_name: str
+    operator: str
+    value: Any
+    effective_aggregation: str
+    value_type: Optional[str] = None
+    like_escape: Optional[str] = None
+    measure: Any = None
 
 
 @dataclass
@@ -431,6 +505,10 @@ class PocketMatchResult:
 
 class SemanticBindingError(ValueError):
     """Raised when a measure or dimension name cannot be resolved."""
+
+
+class UnsupportedMeasurePredicateError(SemanticBindingError):
+    """Raised when a measure predicate cannot be safely grouped and served."""
 
 
 class ModelNotDeployedError(SemanticBindingError):

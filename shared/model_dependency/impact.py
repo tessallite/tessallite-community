@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import heapq
 from collections import deque
-from typing import Optional
+from dataclasses import replace
+from typing import Mapping, Optional
 
 from .edge_catalogue import SECURITY_OBJECT_TYPES, reason_key
 from .graph import DependencyGraph
@@ -92,6 +93,34 @@ def _traverse(
     target_node = graph.node(target)
     if target_node is None:
         raise KeyError(f"target node not in graph: {target.token()}")
+
+    # Witness paths carry compact node tokens, so path expansion needs to
+    # resolve those tokens back to graph keys. Build the indexes once for this
+    # traversal. ``setdefault`` preserves the old first-match behaviour when
+    # two models happen to contain the same type/object-id token. The path
+    # adjacency keeps the existing token sort order, but moves that sort out of
+    # every alternate-path expansion.
+    token_to_key: dict[str, NodeKey] = {}
+    token_by_key: dict[NodeKey, str] = {}
+    path_adjacency: dict[NodeKey, tuple[tuple[str, DependencyEdge], ...]] = {}
+    for key in graph.nodes:
+        token = key.token()
+        token_to_key.setdefault(token, key)
+        token_by_key[key] = token
+        ordered_edges = sorted(
+            graph.dependents_of(key),
+            key=lambda edge: edge.dependent.token(),
+        )
+        path_adjacency[key] = tuple(
+            (
+                token_by_key[edge.dependent]
+                if edge.dependent in token_by_key
+                else edge.dependent.token(),
+                edge,
+            )
+            for edge in ordered_edges
+        )
+    reverse_reachability: dict[str, frozenset[str]] = {}
 
     # BFS by min-depth over forward adjacency. For delete, cascade-closure
     # members are reported as cascade_deleted, not as broken survivors.
@@ -195,7 +224,6 @@ def _traverse(
         if effect == "cascade_deleted":
             cascade_count += 1
 
-        paths = _witness_paths(graph, target, key, best_path, max_paths_per_object)
         # reason_edge is the SAME edge that determined severity (from _classify),
         # so the reason label never diverges from the severity/effect shown.
         impacts.append(
@@ -208,7 +236,10 @@ def _traverse(
                 min_depth=depth,
                 reason_key=reason_key(reason_edge.kind) if reason_edge else "impactAnalysis.reason.generic",
                 reason_params={"field": reason_edge.source_field} if reason_edge else {},
-                paths=paths,
+                # Paths are filled only for impacts that survive the display
+                # cap below. Counts and classifications above always cover the
+                # complete reachable set.
+                paths=(),
                 scc_id=graph.scc_of.get(key) if graph.scc_of.get(key) in graph.cycles else None,
             )
         )
@@ -216,6 +247,23 @@ def _traverse(
     impacts.sort(key=_impact_sort_key)
 
     truncated = len(impacts) > max_display_impacts
+    display_path_count = len(impacts[:max_display_impacts]) if truncated else len(impacts)
+    for index in range(display_path_count):
+        item = impacts[index]
+        impacts[index] = replace(
+            item,
+            paths=_witness_paths(
+                graph,
+                target,
+                item.node.key,
+                best_path,
+                max_paths_per_object,
+                token_to_key,
+                token_by_key,
+                path_adjacency,
+                reverse_reachability,
+            ),
+        )
     display_impacts = tuple(impacts[:max_display_impacts]) if truncated else tuple(impacts)
 
     summary = ImpactSummary(
@@ -435,6 +483,10 @@ def _witness_paths(
     dest: NodeKey,
     best_path: dict[NodeKey, tuple[list[str], list[DependencyEdge]]],
     max_paths: int,
+    token_to_key: Mapping[str, NodeKey],
+    token_by_key: Mapping[NodeKey, str],
+    path_adjacency: Mapping[NodeKey, tuple[tuple[str, DependencyEdge], ...]],
+    reverse_reachability: dict[str, frozenset[str]],
 ) -> tuple[ImpactPath, ...]:
     """One deterministic shortest witness path (from BFS) plus up to
     ``max_paths - 1`` additional materially-distinct paths (spec §7.5)."""
@@ -442,7 +494,17 @@ def _witness_paths(
     paths = [ImpactPath(nodes=tuple(primary_nodes), edges=tuple(primary_edges))]
     if max_paths <= 1:
         return tuple(paths)
-    extra = _alternate_paths(graph, target, dest, max_paths - 1, exclude=tuple(primary_nodes))
+    extra = _alternate_paths(
+        graph,
+        target,
+        dest,
+        max_paths - 1,
+        exclude=tuple(primary_nodes),
+        token_to_key=token_to_key,
+        token_by_key=token_by_key,
+        path_adjacency=path_adjacency,
+        reverse_reachability=reverse_reachability,
+    )
     paths.extend(extra)
     return tuple(paths)
 
@@ -453,6 +515,10 @@ def _alternate_paths(
     dest: NodeKey,
     limit: int,
     exclude: tuple[str, ...],
+    token_to_key: Mapping[str, NodeKey],
+    token_by_key: Mapping[NodeKey, str],
+    path_adjacency: Mapping[NodeKey, tuple[tuple[str, DependencyEdge], ...]],
+    reverse_reachability: dict[str, frozenset[str]],
 ) -> list[ImpactPath]:
     """Deterministic additional shortest paths avoiding the primary's interior
     nodes, found by Dijkstra-like search ordered by (depth, node token). Bounded:
@@ -460,6 +526,16 @@ def _alternate_paths(
     if limit <= 0:
         return []
     interior = set(exclude[1:-1])  # exclude endpoints
+    dest_token = dest.token()
+    can_reach_dest = reverse_reachability.get(dest_token)
+    if can_reach_dest is None:
+        can_reach_dest = _reverse_reachable_tokens(
+            graph,
+            dest,
+            token_to_key=token_to_key,
+            token_by_key=token_by_key,
+        )
+        reverse_reachability[dest_token] = can_reach_dest
     results: list[ImpactPath] = []
     # priority queue of (depth, tiebreak_seq, path_node_tokens, path_edges).
     # The monotonic ``seq`` guarantees heap comparison never reaches the token
@@ -474,22 +550,22 @@ def _alternate_paths(
         guard += 1
         depth, _seq, tokens, edges = heapq.heappop(heap)
         last_token = tokens[-1]
-        if last_token == dest.token() and len(tokens) > 1:
+        if last_token == dest_token and len(tokens) > 1:
             sig = tuple(tokens)
             # materially distinct = does not reuse the primary path's interior.
             if sig not in seen_signatures and not (interior & set(tokens[1:-1])):
                 seen_signatures.add(sig)
                 results.append(ImpactPath(nodes=tuple(tokens), edges=tuple(edges)))
             continue
+        if last_token in interior or last_token not in can_reach_dest:
+            continue
         # expand
-        cur_key = _token_to_key(graph, last_token)
+        cur_key = token_to_key.get(last_token)
         if cur_key is None:
             continue
-        for edge in sorted(
-            graph.dependents_of(cur_key),
-            key=lambda e: e.dependent.token(),
-        ):
-            child = edge.dependent.token()
+        for child, edge in path_adjacency.get(cur_key, ()):
+            if child not in can_reach_dest:
+                continue
             if child in tokens:  # avoid cycles in a simple path
                 continue
             seq += 1
@@ -497,11 +573,38 @@ def _alternate_paths(
     return results
 
 
-def _token_to_key(graph: DependencyGraph, token: str) -> Optional[NodeKey]:
-    for key in graph.nodes:
-        if key.token() == token:
-            return key
-    return None
+def _reverse_reachable_tokens(
+    graph: DependencyGraph,
+    dest: NodeKey,
+    *,
+    token_to_key: Mapping[str, NodeKey],
+    token_by_key: Mapping[NodeKey, str],
+) -> frozenset[str]:
+    """Return tokens that can reach ``dest`` through the graph's reverse index.
+
+    Alternate paths are token-based for compatibility with the existing witness
+    contract. Canonicalising each predecessor through ``token_to_key`` keeps the
+    same first-match behaviour as the path expansion lookup when duplicate
+    compact tokens occur across models.
+    """
+    dest_token = token_by_key.get(dest, dest.token())
+    canonical_dest = token_to_key.get(dest_token, dest)
+    reachable: set[str] = {dest_token}
+    visited: set[NodeKey] = {canonical_dest}
+    queue: deque[NodeKey] = deque([canonical_dest])
+    while queue:
+        node = queue.popleft()
+        for edge in graph.reverse.get(node, ()):
+            predecessor = edge.dependency
+            predecessor_token = token_by_key.get(predecessor)
+            if predecessor_token is None:
+                predecessor_token = predecessor.token()
+            reachable.add(predecessor_token)
+            canonical_predecessor = token_to_key.get(predecessor_token, predecessor)
+            if canonical_predecessor not in visited:
+                visited.add(canonical_predecessor)
+                queue.append(canonical_predecessor)
+    return frozenset(reachable)
 
 
 _RESULT_SEVERITY_RANK = {"hard_break": 0, "soft_degrade": 1, "informational": 2}

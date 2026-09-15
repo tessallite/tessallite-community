@@ -464,7 +464,10 @@ async def test_introspect_route_rejects_cross_project_source_connection(
         user_identity="user@example.com",
         project_id=project_id,
         model_id=None,
-        role="viewer",
+        # Bug-9896: /introspect is modeller-gated (a raw physical read is a
+        # modelling surface). A viewer binding would now 403 before the
+        # cross-project guard, hiding what this test asserts.
+        role="modeler",
     )
     data_source = types.SimpleNamespace(
         id=uuid.uuid4(),
@@ -509,8 +512,14 @@ async def test_introspect_route_rejects_cross_project_source_connection(
 
 @pytest.mark.asyncio
 async def test_introspect_route_allows_bound_normal_user(route_client, monkeypatch):
-    """A normal member WITH a viewer binding on the project reaches the source
-    layer and gets a 200 from the real route."""
+    """A normal member WITH a modeller binding on the project reaches the source
+    layer and gets a 200 from the real route.
+
+    Bug-9896: the binding tier was "viewer" until /introspect was raised to
+    modeller-or-above (a raw physical read is a modelling surface, decision
+    4.4c). The viewer denial is asserted in
+    tests/test_bug9896_introspect_modeller_gate.py.
+    """
     project_id = uuid.uuid4()
     model_id = uuid.uuid4()
     model = types.SimpleNamespace(id=model_id, project_id=project_id)
@@ -521,7 +530,7 @@ async def test_introspect_route_allows_bound_normal_user(route_client, monkeypat
                 user_identity="user@example.com",
                 project_id=project_id,
                 model_id=None,
-                role="viewer",
+                role="modeler",
             )
         ],
     )
@@ -580,7 +589,9 @@ async def test_introspect_route_denies_user_bound_only_to_other_project(
                 user_identity="user@example.com",
                 project_id=other_project_id,
                 model_id=None,
-                role="viewer",
+                # Bug-9896: modeller tier, so the 403 proves the PROJECT
+                # mismatch rather than the raised role gate.
+                role="modeler",
             ),
         ],
     )

@@ -32,6 +32,7 @@ if _LOG_LEVEL_NAME == "DEBUG":
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 
 from shared.config.bootstrap import refresh_system_snapshot
 from shared.config.settings import get_settings
@@ -39,11 +40,20 @@ from shared.gateway_liveness import probe_jdbc_accept_loop_async
 from shared.config.shutdown_budget import (
     declare_pre_close_drain as _declare_pre_close_drain,
 )
-from shared.metrics import PrometheusMiddleware, metrics_response
+from shared.metrics import (
+    JDBC_LISTENER_UP,
+    JDBC_WATCHDOG_UP,
+    PrometheusMiddleware,
+    metrics_response,
+)
 from shared.middleware.rate_limiter import attach_limiter, build_limiter
 from src.dax.auth_basic import BasicAuthMiddleware
 from src.dax.xmla_server import router as xmla_router
-from src.jdbc.liveness_watchdog import run_jdbc_liveness_watchdog
+from src.jdbc.liveness_watchdog import (
+    run_jdbc_liveness_watchdog,
+    seed_exit_counter_from_disk,
+    watchdog_state_path,
+)
 from src.jdbc.server import start_jdbc_server
 
 logger = logging.getLogger(__name__)
@@ -58,6 +68,15 @@ async def _jdbc_serve(server: asyncio.Server) -> None:
         logger.error("JDBC server crashed: %s", exc, exc_info=True)
 
 
+# DR2-07/DR3I-06: module-global handle so the chaos-test endpoint (registered
+# only when GATEWAY_ALLOW_CHAOS_TESTING=1) can close the accept loop's
+# listening socket specifically, leaving the rest of the event loop --
+# including the watchdog's own probe task -- running. Set during lifespan
+# startup, mirroring the `_scheduler` global pattern already used by the
+# scheduler/optimizer services for their own admin-triggered actions.
+_jdbc_server: asyncio.Server | None = None
+
+
 # Bug-8041 R7 round-2 F3: the gateway is the ONLY service with a second drain
 # phase inside its lifespan shutdown (the JDBC asyncio.Server below). Declaring
 # it here -- at import, before any budget is resolved for a real timeout -- funds
@@ -70,17 +89,48 @@ _declare_pre_close_drain()
 async def lifespan(app: FastAPI):
     await refresh_system_snapshot()
 
+    # Bug-9834 (review F3): carry the exit tally recorded by previous
+    # incarnations into this process's counter. Without it the Prometheus series
+    # resets to zero on every watchdog restart and ``increase()`` can stay flat
+    # through any number of wedges, so the recurrence alert never fires — the
+    # exact detection gap this issue exists to close.
+    #
+    # Seeded HERE, before the listener is attempted, and unconditionally. It
+    # used to happen inside the watchdog branch, which is only reached when the
+    # listener started AND the watchdog is enabled. That is precisely backwards
+    # for the case that matters most: a gateway that self-restarted over a dead
+    # accept loop and then could not bind on the way back would report a tally
+    # of zero, so the alert for "the restart did not recover it" had nothing to
+    # correlate against. The tally is a fact about this container, not about
+    # whether the watchdog happens to be switched on.
+    _prior_exits = seed_exit_counter_from_disk()
+    if _prior_exits:
+        logger.warning(
+            "This gateway has self-restarted over a dead JDBC accept loop "
+            "%d time(s) previously (tally at %s). A recurring wedge is "
+            "masked by the restart — see Bug-8533.",
+            _prior_exits, watchdog_state_path(),
+        )
+
     # Start JDBC TCP server as a background asyncio task
+    global _jdbc_server
     try:
         jdbc_server = await start_jdbc_server()
+        _jdbc_server = jdbc_server
         jdbc_task = asyncio.create_task(_jdbc_serve(jdbc_server))
+        JDBC_LISTENER_UP.set(1)
         logger.info(
             "Gateway started — XMLA on :%d, JDBC on :%d",
             settings.XMLA_PORT,
             settings.JDBC_PORT,
         )
     except Exception as exc:
+        # The gateway keeps serving HTTP, so nothing else about this process
+        # looks wrong. Without the gauge below this is the silent failure: no
+        # listener to probe, so no probe failure and no watchdog exit ever
+        # appears, and a restart would not help because the bind is what failed.
         logger.error("Failed to start JDBC server: %s", exc, exc_info=True)
+        JDBC_LISTENER_UP.set(0)
         jdbc_server = None
         jdbc_task = None
 
@@ -111,6 +161,7 @@ async def lifespan(app: FastAPI):
                 ),
             )
         )
+        JDBC_WATCHDOG_UP.set(1)
         logger.info(
             "JDBC liveness watchdog started — probing :%d every %ss, exiting "
             "after %d consecutive failures",
@@ -118,6 +169,12 @@ async def lifespan(app: FastAPI):
             settings.GATEWAY_JDBC_WATCHDOG_INTERVAL_SECONDS,
             settings.GATEWAY_JDBC_WATCHDOG_FAILURE_LIMIT,
         )
+    else:
+        # Serving JDBC with no auto-recovery, or not serving it at all. Either
+        # way, say so rather than leaving the series absent — an absent series
+        # and a healthy one are indistinguishable to an alert that only tests
+        # for zero.
+        JDBC_WATCHDOG_UP.set(0)
 
     yield
 
@@ -126,6 +183,7 @@ async def lifespan(app: FastAPI):
     # the probe from the wedge this watchdog exists to catch -- leaving it
     # running would let an orderly stop trigger a non-zero exit and a restart.
     if watchdog_task:
+        JDBC_WATCHDOG_UP.set(0)
         watchdog_task.cancel()
         try:
             await watchdog_task
@@ -176,6 +234,9 @@ async def lifespan(app: FastAPI):
         logger.warning("DAX session-store flush failed during shutdown",
                        exc_info=True)
     if jdbc_server:
+        # Stops being true the moment the accept loop is closed, so the
+        # gauge must not outlive it during a drawn-out drain.
+        JDBC_LISTENER_UP.set(0)
         jdbc_server.close()
         # ``asyncio.Server.wait_closed()`` blocks until every active connection
         # handler finishes, and a JDBC client mid-query is precisely the
@@ -239,6 +300,84 @@ app.include_router(xmla_router, prefix="/api/v1")
 app.include_router(xmla_router)
 
 
+async def _probe_direct_dependency(
+    client: httpx.AsyncClient,
+    name: str,
+    base_url: str,
+) -> tuple[str, bool, str]:
+    """Probe one configured gateway dependency exactly one hop deep."""
+    url = f"{base_url.rstrip('/')}/readiness"
+    try:
+        reply = await client.get(url)
+    except Exception as exc:  # noqa: BLE001 — readiness must never raise
+        return name, False, type(exc).__name__
+    if 200 <= reply.status_code < 300:
+        return name, True, "ok"
+    return name, False, f"HTTP {reply.status_code}"
+
+
+async def _direct_dependencies_ready() -> dict[str, tuple[bool, str]]:
+    """Check only the gateway's direct model and query-router dependencies."""
+    timeout = httpx.Timeout(settings.READINESS_PROBE_TIMEOUT_SECONDS)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        results = await asyncio.gather(
+            _probe_direct_dependency(client, "model-service", settings.MODEL_SERVICE_URL),
+            _probe_direct_dependency(client, "query-router", settings.QUERY_ROUTER_URL),
+        )
+    return {name: (ready, detail) for name, ready, detail in results}
+
+
+async def _jdbc_readiness() -> tuple[bool | None, str]:
+    """Probe JDBC concurrently with HTTP peers without inventing a cascade."""
+    if not settings.GATEWAY_HEALTH_JDBC_PROBE_ENABLED:
+        return None, "disabled"
+    return await probe_jdbc_accept_loop_async(
+        "127.0.0.1",
+        settings.JDBC_PORT,
+        timeout=settings.GATEWAY_HEALTH_JDBC_PROBE_TIMEOUT_SECONDS,
+    )
+
+
+@app.get("/liveness")
+async def liveness() -> dict:
+    """Process liveness only; it never depends on JDBC or peer services."""
+    return {"status": "ok", "service": "gateway"}
+
+
+@app.get("/readiness")
+async def readiness(response: Response) -> dict:
+    """Bounded gateway readiness for JDBC and its direct HTTP dependencies.
+
+    The gateway checks model-service and query-router one hop deep. Those
+    services check only their own metadata database, so this endpoint cannot
+    form a recursive dependency cascade.
+    """
+    body: dict = {"status": "ok", "service": "gateway", "dependencies": {}}
+    jdbc_result, dependencies = await asyncio.gather(
+        _jdbc_readiness(), _direct_dependencies_ready()
+    )
+    jdbc_ready, jdbc_detail = jdbc_result
+    if jdbc_ready is not None:
+        body["jdbc_listening"] = jdbc_ready
+        body["dependencies"]["jdbc"] = jdbc_detail if jdbc_ready else "unavailable"
+        if not jdbc_ready:
+            body["status"] = "degraded"
+    else:
+        body["jdbc_listening"] = None
+        body["dependencies"]["jdbc"] = "unproven"
+        body["status"] = "degraded"
+
+    for name, (ready, detail) in dependencies.items():
+        body["dependencies"][name] = detail if ready else "unavailable"
+        if not ready:
+            body["status"] = "degraded"
+
+    if body["status"] != "ok":
+        response.status_code = 503
+        logger.error("Gateway /readiness DEGRADED: %s", body["dependencies"])
+    return body
+
+
 @app.get("/metrics", include_in_schema=False)
 async def prometheus_metrics(request: Request):
     return metrics_response(request)
@@ -264,9 +403,9 @@ async def health(response: Response) -> dict:
     deliberately does NOT run a query: a query needs auth via model-service, so
     a model-service blip would mark the GATEWAY unhealthy and (under Kubernetes)
     restart it — turning someone else's outage into a gateway restart loop.
-    Readiness, which SHOULD depend on model-service, is a separate question
-    answered by callers that hold credentials running
-    ``shared.gateway_liveness.READINESS_PROBE_SQL`` over an ordinary connection.
+    ``/readiness`` is the separate dependency-aware contract. It checks the
+    gateway's direct model-service and query-router dependencies without
+    changing this JDBC liveness endpoint.
     """
     body: dict = {
         "status": "ok",
@@ -297,6 +436,46 @@ async def health(response: Response) -> dict:
             "answering on port %d: %s", settings.JDBC_PORT, detail,
         )
     return body
+
+
+if settings.GATEWAY_ALLOW_CHAOS_TESTING:
+    # DR2-07/DR3I-06 (investor Demo RC): this route is only REGISTERED — it
+    # does not exist as an app.routes entry at all — when
+    # GATEWAY_ALLOW_CHAOS_TESTING=1 is explicitly set. Zero attack surface in
+    # any deployment that has not opted in.
+    from shared.auth.middleware import CurrentUser, require_system_admin
+    from fastapi import Depends
+
+    @app.post("/admin/chaos/close-jdbc-listener", include_in_schema=False)
+    async def _chaos_close_jdbc_listener(
+        current_user: CurrentUser = Depends(require_system_admin),
+    ) -> dict:
+        """Close the JDBC accept loop's listening socket ONLY.
+
+        Reproduces Bug-8533's actual failure shape for a live fault-injection
+        proof: the accept loop stops accepting NEW connections while the rest
+        of this process — including the liveness watchdog's own probe task,
+        started separately in `lifespan` — keeps running untouched. A full
+        process kill (`docker kill`) is NOT a substitute: Docker's ordinary
+        `restart: unless-stopped` policy recovers from that regardless of
+        whether the watchdog exists, so it would "pass" even if the watchdog
+        code were removed entirely. This is the one thing that actually
+        exercises the watchdog's own probe-and-exit mechanism end to end.
+
+        Irreversible for this process: once closed, the only recovery is the
+        watchdog detecting three consecutive probe failures and exiting so
+        the container's restart policy recycles it — which is the exact
+        mechanism this endpoint exists to prove.
+        """
+        global _jdbc_server
+        if _jdbc_server is None:
+            return {"status": "no-op", "detail": "JDBC server was not running"}
+        logger.warning(
+            "[CHAOS TEST] closing JDBC accept loop on demand (GATEWAY_ALLOW_CHAOS_TESTING) "
+            "— recovery depends on the liveness watchdog now"
+        )
+        _jdbc_server.close()
+        return {"status": "closed", "detail": "JDBC accept loop closed; watchdog recovery expected"}
 
 
 # ---------------------------------------------------------------------------

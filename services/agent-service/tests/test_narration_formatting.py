@@ -243,6 +243,50 @@ class TestNarrationPromptGuards:
         assert "2025-01-01" in user_prompt
         assert "2025-08-01" in user_prompt
 
+    def test_Bug_9971_prompt_trusts_explicit_top_one_boundary(self):
+        from src.narrate.narrate import _build_narrate_prompt
+        from src.exec.query import QueryExecution
+
+        execution = QueryExecution(
+            sql="SELECT ...",
+            columns=["account_type", "transaction_amount"],
+            rows=[{
+                "account_type": "WALLET",
+                "transaction_amount": 32829598.09,
+            }],
+            rows_returned=1,
+            route_type="source",
+            routed_sql=None,
+            aggregate_id=None,
+            pocket_id=None,
+            execution_ms=10,
+        )
+        shape_trace = {
+            "shape": "ranking",
+            "narration_facts": {
+                "ranking": {
+                    "sort_metric": "transaction_amount",
+                    "direction": "desc",
+                    "limit": 1,
+                    "limit_explicit": True,
+                    "top_boundary": {
+                        "account_type": "WALLET",
+                        "transaction_amount": 32829598.09,
+                    },
+                },
+            },
+        }
+
+        _, user_prompt = _build_narrate_prompt(
+            "sys", "Which account type has processed the most money in 2026?",
+            execution, shape_trace=shape_trace,
+        )
+
+        lower = user_prompt.lower()
+        assert "definitive requested result" in lower
+        assert "do not say the requested winner cannot be confirmed" in lower
+        assert "rerunning without the row cap" in lower
+
     def test_prompt_includes_format_hints(self):
         from src.narrate.narrate import _build_narrate_prompt
         from src.exec.query import QueryExecution

@@ -44,7 +44,16 @@ Output contains:
 
 Generated views query governed adapter relations named
 `public.<model_slug>__<table_alias>`. The gateway exposes these only when
-`LOOKER_GATEWAY_ENABLED=true`.
+`LOOKER_GATEWAY_ENABLED=true` AND the connected user holds a modeller,
+tenant-admin or system-admin role.
+
+The second condition is deliberate. These adapter relations deliberately carry
+hidden declared key columns and apply no persona narrowing, because Looker needs
+the declared key to write symmetric-aggregate SQL. That makes them a privileged
+technical surface rather than a business one, so the connection Looker uses must
+be a privileged, documented service account. A viewer connecting to the same
+gateway sees only the ordinary persona-scoped model relations and never these.
+Point the LookML connection at a dedicated modeller-or-above account.
 
 ## Check drift
 

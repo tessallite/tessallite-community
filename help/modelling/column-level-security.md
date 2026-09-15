@@ -47,6 +47,20 @@ A persona can have both row rules and column restrictions. They apply simultaneo
 
 ---
 
+## Everything built from the model inherits this restriction
+
+A restricted column is not just missing from a plain query. It is missing from the model itself, for that persona.
+
+Everything else builds from that same smaller model too. This includes a named set, a saved Named Query, and a KPI. It also includes a summary table, a subtotal, a preview, and an export. It even includes an answer from the assistant. So the restricted column cannot appear in any of them either.
+
+Some measures and KPIs are built from other columns. If one of them uses a restricted column, that measure or KPI is blocked too. You restrict the raw column once. You do not have to find and restrict everything built from it.
+
+A summary table built with the restricted column is not served to that persona at all. Tessallite computes the answer live instead, from the model as the persona sees it. A named set built on a restricted measure is not offered to the persona in the picker. The assistant is grounded on the same restricted catalogue. So it cannot describe, name, or chart a column the persona could not query directly.
+
+Restrict a column once, here. It stays restricted everywhere that column feeds into.
+
+---
+
 ## Setting restrictions
 
 1. Open the persona in the **Personas** panel (Toolbelt → Personas → click the persona name).
@@ -104,6 +118,18 @@ The `email` column is silently excluded from the result. The persona sees `custo
 - **Calculated measures that depend on restricted columns are blocked.** If a calculated measure (or a time variant, or a computed attribute) reads a restricted column anywhere in its formula, restricted personas get `OBJECT_NOT_AVAILABLE`. Either remove the dependency or don't restrict the column.
 - **Tag assignment is model-scoped.** Restricting `PII` in one model doesn't affect another model, even if they share the same source tables. Each model's tags and restrictions are independent.
 - **Restrictions travel with exports.** Data tags and persona restrictions are part of the model snapshot, so project export/import and version restore keep your column security intact.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `SELECT *` returns fewer columns than expected | One or more columns carry a tag this persona is restricted from | Check the column's data tags in Data Tags, and the persona's Column Restrictions |
+| Query returns `OBJECT_NOT_AVAILABLE` for a column you expect to see | The column, or a column feeding a calculated measure you queried, is tagged with a restricted tag | Remove the restriction, or don't restrict the tag if this persona needs the column |
+| A new column shows up for a persona that should not see it | New columns are untagged by default and visible until tagged | Tag the column and confirm the persona's Column Restrictions cover the tag |
+| A named set, KPI, or summary table is missing for this persona but present for another | It reads a restricted column somewhere in its definition | Expected. It cannot be built from this persona's smaller model, so it is not offered |
+| Restriction disappeared after importing a project | The tag or the restriction was not part of the imported snapshot | Re-check Data Tags and Column Restrictions after import. Both travel with the model snapshot. But they only travel if they existed at export time |
 
 ---
 

@@ -63,18 +63,21 @@ export default function NamedSetLibrary({
     <>
       <Box
         sx={{
-          display: 'flex', alignItems: 'center', px: 1.5, py: 0.75,
+          display: 'flex', alignItems: 'center', px: 1.25, height: 24,
           cursor: namedSets.length > 0 || loading ? 'pointer' : 'default',
           borderTop: `1px solid ${tokens.colorBorderLight}`,
+          borderBottom: `1px solid ${tokens.colorBorderLight}`,
+          bgcolor: tokens.colorSubtleFill,
           opacity: namedSets.length > 0 || loading ? 1 : 0.68,
         }}
         onClick={() => {
           if (namedSets.length > 0 || loading || searchQuery) onToggleExpanded();
         }}
       >
-        <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-          {templates.library.namedSetsHeader(namedSets.length)}
+        <Typography sx={{ fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, flex: 1, textTransform: 'uppercase', letterSpacing: '0.03em' }}>
+          {strings.library.namedSetsSection}
         </Typography>
+        <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>{namedSets.length}</Typography>
         {/* Bug-6710: keyboard path to expand/collapse (header Box is mouse-only). */}
         {(namedSets.length > 0 || loading || searchQuery) && (
           <IconButton
@@ -82,7 +85,7 @@ export default function NamedSetLibrary({
             onClick={(e) => { e.stopPropagation(); onToggleExpanded(); }}
             aria-expanded={expanded}
             aria-label={templates.library.toggleSectionAria(expanded, strings.library.namedSetsSection)}
-            sx={{ width: 24, height: 24, color: tokens.colorTextSecondary }}
+            sx={{ width: 22, height: 22, color: tokens.colorTextSecondary }}
           >
             {expanded ? <ExpandLess sx={{ fontSize: 16 }} /> : <ExpandMore sx={{ fontSize: 16 }} />}
           </IconButton>
@@ -90,9 +93,9 @@ export default function NamedSetLibrary({
       </Box>
       <Collapse in={expanded}>
         {loading ? (
-          <Box sx={{ p: 1 }}>
-            <Skeleton variant="rectangular" height={48} sx={{ mb: 0.5, borderRadius: 1 }} />
-            <Skeleton variant="rectangular" height={48} sx={{ mb: 0.5, borderRadius: 1 }} />
+          <Box sx={{ p: 0.5 }}>
+            <Skeleton variant="rectangular" height={30} sx={{ mb: 0.25, borderRadius: 0.5 }} />
+            <Skeleton variant="rectangular" height={30} sx={{ mb: 0.25, borderRadius: 0.5 }} />
           </Box>
         ) : namedSets.length === 0 ? (
           <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, px: 1.5, py: 1 }}>
@@ -104,7 +107,7 @@ export default function NamedSetLibrary({
               {group.folder && (
                 <Typography sx={{
                   fontSize: 10, fontWeight: 600, color: tokens.colorTextSecondary,
-                  px: 1.5, py: 0.5, textTransform: 'uppercase', bgcolor: tokens.colorSubtleFill,
+                  px: 1.25, py: 0.25, minHeight: 20, textTransform: 'uppercase', bgcolor: tokens.colorSubtleFill,
                 }}>
                   {group.folder}
                 </Typography>

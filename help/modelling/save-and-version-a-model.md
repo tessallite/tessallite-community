@@ -2,10 +2,14 @@
 title: "Save and Version a Model"
 audience: modeller
 area: modelling
-updated: 2026-08-18
+updated: 2026-09-12
 ---
 
 ![Model Builder toolbar showing the Save, Deploy, and Versions buttons.](../assets/screencaps/model-builder-toolbar-save.png)
+
+## History order
+
+Model versions history lists the newest version first, ordered by version number. The Currently serving badge marks the deployed version without changing the order.
 
 ## What this covers
 
@@ -78,6 +82,7 @@ You can always switch between the two options before clicking Save.
 1. On the toolbar, click the **Versions** button (clock icon).
 2. The Versions dialog lists every saved version with version number, who saved it, when, and an optional summary.
 3. The version that is currently deployed shows a green badge.
+4. Use the **Actions** column at the right edge to deploy a saved version or revert to it. This column stays visible when the rest of the history table is wider than the dialog.
 
 ---
 
@@ -88,7 +93,7 @@ At any moment a model can be in three states at once: the **draft** you are edit
 Open the Versions dialog (clock icon) and select the **Pending changes** tab. It shows two groups:
 
 - **Unsaved edits** — everything you have changed in the editor since your last Save, compared against the last saved version. This is the work that would be lost if you closed the model without saving.
-- **Saved but not deployed** — the difference between your last saved version and the version currently serving queries. These are changes that are safely saved but that live BI users are not seeing yet, because only a Deploy makes a version live.
+- **Saved but not deployed** — the difference between your last saved version and the version currently serving queries. These are changes that are safely saved but that live BI users are not seeing yet, until you deploy them. Revert can also change the live version, as explained below.
 
 Each group shows a count and a **Review changes** button. Reviewing opens the same field-by-field difference view you get when comparing two saved versions, so you can see exactly which measures, dimensions, calendars, named queries, and relationships changed before you decide.
 
@@ -101,6 +106,24 @@ If you have been experimenting and want to throw the experiment away, click **Di
 **Discard to deployed version** goes further: it resets the whole draft back to the version that is currently live, throwing away both your unsaved edits and any saved-but-undeployed changes. Your saved versions are **not** deleted — they stay in the history and an admin can redeploy or revert to them later. This is the "start again from what is in production" button, so it carries the same admin permission and typed confirmation as Revert, and it never changes governance (personas, row security, data tags, or certification).
 
 ---
+
+A model that has not been deployed shows a neutral setup message: add tables, then save and deploy to run queries. Zero tables, joins, dimensions, measures and aggregates are normal for a new empty model. The warning about results coming from a deployed version applies only when a deployed version exists and differs from the draft.
+
+## Deploy or Revert: which button should I use?
+
+| Button | What it does |
+|---|---|
+| **Deploy** | Makes the selected saved version the one used by queries, Excel, the scheduler and optimiser. It does not create a new version. |
+| **Revert** | Restores the selected older definition into the editable model and saves it as a new version. Later versions remain in history. |
+
+**If the model is already deployed, Revert also makes the newly restored version live immediately.** If it is undeployed, it stays undeployed. Revert preserves current security and governance settings, including personas and row-security rules.
+
+For example, suppose v23 is the latest version:
+
+- **Deploy v22** makes v22 the version serving queries.
+- **Revert to v22** creates v24 containing v22's model definition. If the model is already deployed, v24 immediately serves queries.
+
+Use **Deploy** to publish a saved version. Use **Revert** to undo model-definition changes.
 
 ## Reverting to an older version
 

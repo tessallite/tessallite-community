@@ -321,3 +321,115 @@ async def test_audit_write_failure_never_propagates_to_the_query_path():
 
     assert decision is not None
     assert decision.route_type == "aggregate"
+
+
+# ---------------------------------------------------------------------------
+# Bug-8121 — a tenant preference must not delete the bypass evidence
+#
+# Every test above patches ``src.routing.router.audit`` away, so none of them
+# ever reaches the tenant ``audit.log_level`` gate inside the real writer. That
+# gate returns None (not an exception) when it suppresses an event, so a tenant
+# with ``audit.log_level=off`` — or ``critical``, which outranks the WARN bypass
+# event — silently discarded every durable RLS-bypass record AND left the
+# Bug-8121 evidence-gap counter at zero, because gating is not a write failure.
+#
+# The bypass record is security evidence of a privileged control being skipped,
+# exactly the class the tenant plane protects with ``force=True``
+# (``audit_required``, F-022-07; Bug-8131 durable refusal evidence). These tests
+# use the REAL writer so the gate is actually exercised.
+# ---------------------------------------------------------------------------
+
+
+def _db_with_audit_level(rules, level):
+    """``_db_returning`` plus a tenant ``audit.log_level`` and a real ``add``."""
+    from unittest.mock import MagicMock
+
+    db = _db_returning(rules)
+    inner_execute = db.execute
+    added: list = []
+
+    class _SettingResult:
+        def scalar_one_or_none(self):
+            return level
+
+    async def _execute(stmt):
+        if "tenant_settings" in str(stmt).lower():
+            return _SettingResult()
+        return await inner_execute(stmt)
+
+    db.execute = _execute
+    db.add = MagicMock(side_effect=added.append)
+    db.flush = AsyncMock()
+    return db, added
+
+
+def _bypass_fixture():
+    m = make_measure("revenue")
+    d = make_dimension("region_code")
+    agg = make_aggregate(["region_code"], [make_agg_col(m)])
+    sql = "SELECT region_code, SUM(revenue) FROM sales GROUP BY region_code"
+    bq = _bind(sql, [m], [d])
+    bq.model.id = uuid.uuid4()
+    bq.model.display_name = "Revenue Model"
+    rule = _role_rule(
+        "region.region_code",
+        "dimension_equals('region.region_code', 'NORTH')",
+        ["region_manager_north"],
+    )
+    principal = Principal(
+        user_identity="alice@x", roles=frozenset({"region_manager_north"})
+    )
+    return agg, bq, rule, principal
+
+
+@pytest.mark.parametrize("level", ["off", "critical"])
+async def test_bug8121_bypass_evidence_survives_the_tenant_audit_level(level):
+    """A tenant setting must not be able to delete RLS-bypass evidence.
+
+    ``off`` suppresses everything; ``critical`` outranks the WARN bypass event.
+    Either one used to drop the only durable record that a privileged persona
+    skipped active row-security rules, with no error and no counter movement.
+    """
+    from shared.db.models import AuditEvent
+    from shared.metrics import RLS_BYPASS_AUDIT_FAILURES
+
+    agg, bq, rule, principal = _bypass_fixture()
+    db, added = _db_with_audit_level([rule], level)
+    persona = _persona(bypass=True)
+    before = RLS_BYPASS_AUDIT_FAILURES._value.get()
+
+    with patch(_PATCH_LOAD, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        decision = await route_query(bq, db, principal=principal, persona=persona)
+
+    assert decision.route_type == "aggregate"
+    events = [e for e in added if isinstance(e, AuditEvent)]
+    assert len(events) == 1, (
+        f"tenant audit.log_level={level!r} suppressed the RLS-bypass audit "
+        "event; a privileged row-security bypass committed with no durable "
+        "evidence and no error"
+    )
+    assert events[0].action == "query.rls_bypass"
+    assert events[0].severity == "warn"
+    assert events[0].actor_email == "alice@x"
+    # Gating is not a write failure, so the evidence-gap counter must not move.
+    assert RLS_BYPASS_AUDIT_FAILURES._value.get() == before
+
+
+async def test_bug8121_inert_bypass_evidence_also_survives_the_tenant_level():
+    """The inert-flag record (Bug-7046) is INFO, the first severity a tenant
+    level drops. It is the same security-configuration evidence."""
+    from shared.db.models import AuditEvent
+
+    agg, bq, _rule, principal = _bypass_fixture()
+    db, added = _db_with_audit_level([], "warn")
+    persona = _persona(bypass=True)
+
+    with patch(_PATCH_LOAD, new_callable=AsyncMock) as mock_load:
+        mock_load.return_value = [agg]
+        await route_query(bq, db, principal=principal, persona=persona)
+
+    events = [e for e in added if isinstance(e, AuditEvent)]
+    assert len(events) == 1
+    assert events[0].severity == "info"
+    assert events[0].detail["inert"] is True

@@ -20,13 +20,17 @@ from functools import lru_cache
 
 from shared.auth.backend import AuthBackend, AuthChain, AuthOutcome, UserIdentity
 from shared.config.settings import get_settings
+from shared.db.tenant_readiness import TenantReadinessError
 
 from src.auth.pat import is_pat_scheme
 
 logger = logging.getLogger(__name__)
 
 
-_REDIRECT_BACKENDS = frozenset({"saml", "oidc"})
+# The redirect-based backends. Public because the SSO endpoints need the same
+# definition to decide whether this deployment must declare a public origin
+# (Bug-9225); one list, so the two readers cannot drift apart.
+REDIRECT_BACKENDS = frozenset({"saml", "oidc"})
 _PAT_BACKEND_NAME = "pat"
 
 
@@ -58,6 +62,10 @@ class PatTerminalAuthChain(AuthChain):
                 return await backend.authenticate(
                     tenant_id=tenant_id, email=email, password=password, **kwargs
                 )
+            except TenantReadinessError:
+                # A stale or unreadable tenant is unavailable; do not turn the
+                # common boundary's typed 503 into a rejected PAT.
+                raise
             except Exception:
                 logger.warning(
                     "PAT backend raised during authenticate for %s", email,
@@ -79,6 +87,9 @@ class PatTerminalAuthChain(AuthChain):
                 identity = await backend.authenticate(
                     tenant_id=tenant_id, email=email, password=password, **kwargs
                 )
+            except TenantReadinessError:
+                # Keep tenant readiness distinct from invalid PAT credentials.
+                raise
             except Exception as exc:
                 logger.warning(
                     "PAT backend raised during authenticate for %s", email,
@@ -128,7 +139,7 @@ def _build_backends() -> list[AuthBackend]:
         elif name == "gcp_iam":
             from src.auth.gcp_iam_backend import GcpIamAuthBackend
             backends.append(GcpIamAuthBackend())
-        elif name in _REDIRECT_BACKENDS:
+        elif name in REDIRECT_BACKENDS:
             logger.info("Redirect-based backend %r registered (handled by SSO endpoints)", name)
         else:
             logger.warning("Unknown auth backend %r — skipping", name)

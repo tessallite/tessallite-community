@@ -55,6 +55,7 @@ async def test_handle_discover_members_excel_self_query_survives_member_fetch_fa
         jwt_token: str,
         *,
         persona_id: str | None = None,
+        limit: int | None = None,
     ):
         raise RuntimeError("simulated member discovery failure")
 
@@ -71,7 +72,7 @@ async def test_handle_discover_members_excel_self_query_survives_member_fetch_fa
       <Restrictions>
         <RestrictionList>
           <CUBE_NAME>m</CUBE_NAME>
-          <MEMBER_UNIQUE_NAME>[account_type].[account_type].[All]</MEMBER_UNIQUE_NAME>
+          <MEMBER_UNIQUE_NAME>[Dimensions].[account_type].[All]</MEMBER_UNIQUE_NAME>
           <TREE_OP>8</TREE_OP>
         </RestrictionList>
       </Restrictions>
@@ -96,7 +97,7 @@ async def test_handle_discover_members_excel_self_query_survives_member_fetch_fa
     assert response.status_code == 200
     assert "<soap11env:Fault>" not in body
     assert "<tns:DiscoverResponse>" in body
-    assert "[account_type].[account_type].[All]" in body
+    assert "[Dimensions].[account_type].[All]" in body
 
 
 @pytest.mark.asyncio
@@ -134,6 +135,7 @@ async def test_handle_discover_members_excel_children_query_returns_members_for_
         jwt_token: str,
         *,
         persona_id: str | None = None,
+        limit: int | None = None,
     ):
         return {
             "members": [
@@ -156,7 +158,7 @@ async def test_handle_discover_members_excel_children_query_returns_members_for_
       <Restrictions>
         <RestrictionList>
           <CUBE_NAME>m</CUBE_NAME>
-          <MEMBER_UNIQUE_NAME>[account_type].[account_type].[All]</MEMBER_UNIQUE_NAME>
+          <MEMBER_UNIQUE_NAME>[Dimensions].[account_type].[All]</MEMBER_UNIQUE_NAME>
           <TREE_OP>1</TREE_OP>
         </RestrictionList>
       </Restrictions>
@@ -182,9 +184,9 @@ async def test_handle_discover_members_excel_children_query_returns_members_for_
     assert "<soap11env:Fault>" not in body
     # Bug-3617 (Phase 2): account_type is a FLAT dimension — keeps caption-form
     # unames (only multi-level hierarchies switch to the canonical key form).
-    assert "[account_type].[account_type].[CURRENT]" in body
-    assert "[account_type].[account_type].[LOAN]" in body
-    assert "<MEMBER_UNIQUE_NAME>[account_type].[account_type].[All]</MEMBER_UNIQUE_NAME>" not in body
+    assert "[Dimensions].[account_type].[CURRENT]" in body
+    assert "[Dimensions].[account_type].[LOAN]" in body
+    assert "<MEMBER_UNIQUE_NAME>[Dimensions].[account_type].[All]</MEMBER_UNIQUE_NAME>" not in body
 
 
 @pytest.mark.asyncio
@@ -245,7 +247,7 @@ async def test_handle_execute_excel_member_query_remains_stable_with_uda_metadat
     <Execute xmlns="urn:schemas-microsoft-com:xml-analysis">
       <Command>
         <Statement>
-          SELECT {AddCalculatedMembers({[account_type].[account_type].[(All)].Members})}
+          SELECT {AddCalculatedMembers({[Dimensions].[account_type].[(All)].Members})}
           DIMENSION PROPERTIES MEMBER_TYPE
           ON COLUMNS
           FROM [m]
@@ -273,10 +275,14 @@ async def test_handle_execute_excel_member_query_remains_stable_with_uda_metadat
     assert response.status_code == 200
     assert "<soap11env:Fault>" not in body
     assert "<tns:ExecuteResponse>" in body
-    # Bug-XMLA-001: `[(All)].Members` must expand to the children, not [All]
+    # Bug-XMLA-001: `[(All)].Members` must expand to the children ...
     assert "<Caption>CURRENT</Caption>" in body
     assert "<Caption>LOAN</Caption>" in body
-    assert "<Caption>All account_type</Caption>" not in body
+    # ... and, since the set names the (All) level explicitly, the native All
+    # member is the grand-total row on the same axis (Bug-9772 one-field
+    # shape; native-all is the only Excel profile since Bug-9874).
+    assert "<Caption>All account_type</Caption>" in body
+    assert "[Dimensions].[account_type].[All]" in body
 
 
 @pytest.mark.asyncio
@@ -454,7 +460,7 @@ async def test_handle_execute_maps_hierarchy_level_to_dimension_before_query_rou
       <Command>
         <Statement>
           SELECT {[Measures].[base_amount]} ON COLUMNS,
-                 {[GeoHierarchy].[GeoHierarchy].[Region].Members} ON ROWS
+                 {[Hierarchies].[GeoHierarchy].[Region].Members} ON ROWS
           FROM [m]
         </Statement>
       </Command>
@@ -569,7 +575,7 @@ async def test_handle_execute_subselect_filter_reaches_subtotal_grain_queries(mo
       <Command>
         <Statement>
           SELECT {[Measures].[base_amount]} ON COLUMNS,
-                 NON EMPTY {[GeoHierarchy].[GeoHierarchy].Members} ON ROWS
+                 NON EMPTY {[Hierarchies].[GeoHierarchy].Members} ON ROWS
           FROM (SELECT ({[city_dim].[city_dim].&amp;[Berlin]}) ON COLUMNS FROM [m])
         </Statement>
       </Command>
@@ -790,7 +796,7 @@ async def test_handle_execute_dax_ambiguous_hierarchy_level_returns_client_fault
 
     body = response.body.decode("utf-8")
     assert response.status_code == 200
-    assert "<soap11env:Fault>" in body
+    assert "<soap11env:Fault" in body
     assert "Ambiguous DAX dimension reference 'Region'" in body
 
 
@@ -860,8 +866,8 @@ async def test_handle_discover_levels_includes_hierarchy_levels_from_model_servi
 
     body = response.body.decode("utf-8")
     assert response.status_code == 200
-    assert "[GeoHierarchy].[GeoHierarchy].[Region]" in body
-    assert "[GeoHierarchy].[GeoHierarchy].[Country]" in body
+    assert "[Hierarchies].[GeoHierarchy].[Region]" in body
+    assert "[Hierarchies].[GeoHierarchy].[Country]" in body
 
 
 @pytest.mark.asyncio
@@ -918,6 +924,8 @@ async def test_handle_discover_members_for_hierarchy_uses_preview_expansion(monk
         parent_key: str | None = None,
         persona_id: str | None = None,
         include_key_path: bool = False,
+        ancestor_keys: list[str] | None = None,
+        include_level_counts: bool = True,
     ):
         preview_calls.append(
             {
@@ -961,9 +969,9 @@ async def test_handle_discover_members_for_hierarchy_uses_preview_expansion(monk
       <RequestType>MDSCHEMA_MEMBERS</RequestType>
       <Restrictions>
         <RestrictionList>
-          <HIERARCHY_UNIQUE_NAME>[GeoHierarchy].[GeoHierarchy]</HIERARCHY_UNIQUE_NAME>
-          <MEMBER_UNIQUE_NAME>[GeoHierarchy].[GeoHierarchy].[EMEA]</MEMBER_UNIQUE_NAME>
-          <LEVEL_UNIQUE_NAME>[GeoHierarchy].[GeoHierarchy].[Region]</LEVEL_UNIQUE_NAME>
+          <HIERARCHY_UNIQUE_NAME>[Hierarchies].[GeoHierarchy]</HIERARCHY_UNIQUE_NAME>
+          <MEMBER_UNIQUE_NAME>[Hierarchies].[GeoHierarchy].[EMEA]</MEMBER_UNIQUE_NAME>
+          <LEVEL_UNIQUE_NAME>[Hierarchies].[GeoHierarchy].[Region]</LEVEL_UNIQUE_NAME>
           <TREE_OP>1</TREE_OP>
         </RestrictionList>
       </Restrictions>
@@ -985,7 +993,7 @@ async def test_handle_discover_members_for_hierarchy_uses_preview_expansion(monk
     # Bug-3617 (Phase 2): canonical path-qualified uname (Region EMEA > Country UK),
     # & XML-escaped in the response body.
     assert (
-        "[GeoHierarchy].[GeoHierarchy].[Country].&amp;[EMEA]&amp;[United Kingdom]"
+        "[Hierarchies].[GeoHierarchy].[Country].&amp;[EMEA]&amp;[United Kingdom]"
         in body
     )
     assert preview_calls

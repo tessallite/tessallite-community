@@ -347,6 +347,7 @@ export interface JoinCreate {
   right_column_name: string;
 }
 export interface Join {
+  hidden_calendar_table_ids?: string[];
   id: string;
   left_table_id: string;
   right_table_id: string;

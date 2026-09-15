@@ -32,6 +32,7 @@ from shared.db.models import (
     ModelColumn,
     PocketDefinition,
 )
+from shared.semantic.join_planner import plan_join_tree
 from shared.semantic.graph_order import (
     CANONICAL_ORDER_DESCRIPTION,
     anchor_is_by_convention,
@@ -116,14 +117,6 @@ async def build_from_clause(
             model_id, CANONICAL_ORDER_DESCRIPTION, anchor.physical_name,
         )
 
-    # Build adjacency map for join closure computation.
-    adjacency: dict[object, list[object]] = {}
-    for j in joins:
-        lid, rid = j.left_table_id, j.right_table_id
-        if tables.get(lid) and tables.get(rid):
-            adjacency.setdefault(lid, []).append(rid)
-            adjacency.setdefault(rid, []).append(lid)
-
     # Bug-8615 / G3: population-defining edges are mandatory even when no
     # selected aggregate/pocket column comes from their far table.  Validate
     # the graph for both the pruned and full-component paths; only augment the
@@ -138,11 +131,26 @@ async def build_from_clause(
             "join graph."
         )
 
-    # Compute the minimal join closure when pruning.
-    allowed_table_ids: set | None = None
-    if needed_table_ids is not None:
-        allowed_table_ids = _join_closure(
-            anchor.id, _required_with_population, adjacency,
+    # Bug-8637: the spanning tree comes from the ONE shared planner the live
+    # query path renders too (``shared.semantic.join_planner``), so an
+    # aggregate is materialised along exactly the joins a live query at the
+    # same grain would use. Without pruning the whole known graph is required,
+    # which keeps the full-component behaviour ``needed_table_ids=None`` had.
+    required = (
+        set(_required_with_population) if needed_table_ids is not None
+        else set(tables)
+    )
+    plan = plan_join_tree(anchor.id, required, joins, table_ids=set(tables))
+    if plan is None and needed_table_ids is None:
+        # A disconnected model: join the anchor's component only, as before.
+        plan = plan_join_tree(
+            anchor.id, _reachable_from(anchor.id, joins, tables), joins,
+            table_ids=set(tables),
+        )
+    if plan is None:
+        raise ValueError(
+            f"Cannot reach tables {sorted(str(t) for t in required - {anchor.id})} "
+            f"from anchor via joins for model {model_id}"
         )
 
     _overrides = physical_name_overrides or {}
@@ -153,69 +161,43 @@ async def build_from_clause(
     alias: dict = {anchor.id: "base"}
     from_parts = [f"{quote_table_ref(connector, _phys(anchor.id, anchor))} AS base"]
     visited = {anchor.id}
+    q = lambda col: quote_identifier(connector, col)  # noqa: E731
 
-    changed = True
-    while changed:
-        changed = False
-        for j in joins:
-            lid, rid = j.left_table_id, j.right_table_id
-            lc = cols.get(j.left_column_id)
-            rc = cols.get(j.right_column_id)
-            lt = tables.get(lid)
-            rt = tables.get(rid)
-            if not (lc and rc and lt and rt):
-                continue
-            q = lambda col: quote_identifier(connector, col)  # noqa: E731
-
-            if lid in visited and rid not in visited:
-                if allowed_table_ids is not None and rid not in allowed_table_ids:
-                    continue
-                # Bug-8628: FORWARD traversal — the already-visited table is
-                # the modeller's LEFT table, so the emitted keyword matches
-                # the declaration as written.
-                sql_join = join_keyword(j.join_type, flipped=False)
-                a = f"t{len(alias)}"
-                alias[rid] = a
-                lhs_expr = f"{alias[lid]}.{q(lc.column_name)}"
-                rhs_expr = f"{a}.{q(rc.column_name)}"
-                lhs_expr, rhs_expr = coerce_join_types(
-                    lhs_expr, getattr(lc, "data_type", None),
-                    rhs_expr, getattr(rc, "data_type", None),
-                )
-                from_parts.append(
-                    f"{sql_join} {quote_table_ref(connector, _phys(rid, rt))} AS {a} "
-                    f"ON {lhs_expr} = {rhs_expr}"
-                )
-                visited.add(rid)
-                changed = True
-            elif rid in visited and lid not in visited:
-                if allowed_table_ids is not None and lid not in allowed_table_ids:
-                    continue
-                # Bug-8628: REVERSED traversal — the already-visited table is
-                # the modeller's RIGHT table, so the newly added table (the
-                # modeller's LEFT one) lands on the physical right of the JOIN
-                # and the keyword must FLIP to keep the same relation
-                # preserved. This branch previously appended the SAME keyword
-                # string as the forward branch above, so a declared
-                # ``dim LEFT JOIN fact`` materialised as ``fact LEFT JOIN dim``
-                # — the opposite row population to what the source route
-                # (``rewrite/joins.py``, which has flipped since Bug-7775)
-                # serves for the same model.
-                sql_join = join_keyword(j.join_type, flipped=True)
-                a = f"t{len(alias)}"
-                alias[lid] = a
-                lhs_expr = f"{a}.{q(lc.column_name)}"
-                rhs_expr = f"{alias[rid]}.{q(rc.column_name)}"
-                lhs_expr, rhs_expr = coerce_join_types(
-                    lhs_expr, getattr(lc, "data_type", None),
-                    rhs_expr, getattr(rc, "data_type", None),
-                )
-                from_parts.append(
-                    f"{sql_join} {quote_table_ref(connector, _phys(lid, lt))} AS {a} "
-                    f"ON {lhs_expr} = {rhs_expr}"
-                )
-                visited.add(lid)
-                changed = True
+    for step in plan:
+        j = step.join
+        lc = cols.get(j.left_column_id)
+        rc = cols.get(j.right_column_id)
+        nt = tables.get(step.to_table_id)
+        if not (lc and rc and nt):
+            raise ValueError(
+                f"Cannot build SQL FROM clause for model {model_id}: join "
+                f"{getattr(j, 'id', '?')} references an unknown table or column."
+            )
+        a = f"t{len(alias)}"
+        alias[step.to_table_id] = a
+        # Bug-8628: the declared keyword is relative to the modeller's LEFT
+        # table; when the already-joined side is the RIGHT table the keyword
+        # flips so the same relation is preserved.
+        sql_join = join_keyword(j.join_type, flipped=step.flipped)
+        if not step.flipped:
+            lhs_expr = f"{alias[step.from_table_id]}.{q(lc.column_name)}"
+            rhs_expr = f"{a}.{q(rc.column_name)}"
+            lhs_expr, rhs_expr = coerce_join_types(
+                lhs_expr, getattr(lc, "data_type", None),
+                rhs_expr, getattr(rc, "data_type", None),
+            )
+        else:
+            lhs_expr = f"{a}.{q(lc.column_name)}"
+            rhs_expr = f"{alias[step.from_table_id]}.{q(rc.column_name)}"
+            lhs_expr, rhs_expr = coerce_join_types(
+                lhs_expr, getattr(lc, "data_type", None),
+                rhs_expr, getattr(rc, "data_type", None),
+            )
+        from_parts.append(
+            f"{sql_join} {quote_table_ref(connector, _phys(step.to_table_id, nt))} AS {a} "
+            f"ON {lhs_expr} = {rhs_expr}"
+        )
+        visited.add(step.to_table_id)
 
     if needed_table_ids is not None:
         missing = _required_with_population - visited
@@ -226,6 +208,25 @@ async def build_from_clause(
             )
 
     return "\n  ".join(from_parts), alias
+
+
+def _reachable_from(anchor_id: object, joins: list, tables: dict) -> set:
+    """Tables in the anchor's connected component (known tables only)."""
+    adjacency: dict[object, list[object]] = {}
+    for j in joins:
+        lid, rid = j.left_table_id, j.right_table_id
+        if tables.get(lid) and tables.get(rid):
+            adjacency.setdefault(lid, []).append(rid)
+            adjacency.setdefault(rid, []).append(lid)
+    seen = {anchor_id}
+    stack = [anchor_id]
+    while stack:
+        node = stack.pop()
+        for nbr in adjacency.get(node, []):
+            if nbr not in seen:
+                seen.add(nbr)
+                stack.append(nbr)
+    return seen
 
 
 def _join_closure(

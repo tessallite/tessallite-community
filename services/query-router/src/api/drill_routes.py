@@ -41,6 +41,8 @@ from src.drill.semantic_builder import (
     DrillableHierarchy,
     HierarchyPathEntry,
     build_drill_sql,
+    filter_drillable_by_persona,
+    normalize_object_id,
     resolve_drill_options,
 )
 
@@ -174,6 +176,143 @@ class DrillOptionsResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Shared identity + persona gate for BOTH drill endpoints
+# ---------------------------------------------------------------------------
+
+
+class _DrillScope:
+    """The persona decision both drill endpoints act on.
+
+    Bug-8560 (audit row A34): ``/drill-options`` and ``/drill-through`` used to
+    resolve the identity and re-implement the persona allow-lists separately.
+    The executor resolved the SIMULATED identity (Bug-8363) while the option
+    catalogue resolved the REAL admin, so an admin previewing a restricted user
+    was offered drills that the very next call refused with 403 — a catalogue
+    that disagrees with its own executor.
+
+    Both endpoints now build this object from the same function, so the
+    identity, the measure allow-list and the hierarchy allow-list are one code
+    path rather than two kept in step.
+    """
+
+    __slots__ = ("model_id", "persona", "persona_id", "allowed_hierarchy_ids")
+
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        persona: Any | None,
+        allowed_hierarchy_ids: set[str] | None,
+    ) -> None:
+        self.model_id = model_id
+        self.persona = persona
+        self.persona_id = str(persona.id) if persona else None
+        self.allowed_hierarchy_ids = allowed_hierarchy_ids
+
+
+async def _resolve_drill_scope(
+    db: AsyncSession,
+    *,
+    measure_id: UUID,
+    current_user: CurrentUser,
+    persona_current_user: CurrentUser,
+    requested_persona_id: str | None,
+) -> _DrillScope:
+    """Resolve the model, the effective persona, and the persona allow-lists.
+
+    ``current_user`` is the REAL caller: embed model scope and project/model
+    RBAC are properties of the token that was presented and must never be
+    widened by simulate-as. ``persona_current_user`` is the identity the
+    PERSONA is resolved against — the simulated user when simulate-as is
+    active, otherwise the same real caller (``_simulate.persona_current_user_for_principal``,
+    which carries only the simulated roles and therefore cannot escalate).
+
+    Raises 404 when the measure does not exist and 403 when the effective
+    persona does not include the measure.
+    """
+    await _enforce_measure_model_scope(db, current_user, measure_id)
+
+    mid_row = await db.execute(
+        sa_select(Measure.model_id).where(Measure.id == measure_id)
+    )
+    measure_model_id = mid_row.scalar_one_or_none()
+    if measure_model_id is None:
+        raise HTTPException(status_code=404, detail="Measure not found")
+    # Bug-8613: enforce project/model RBAC and refuse unverified service
+    # principals. require_capability("query") does not scope-check service
+    # tokens, so the shared primitive's default (refuse) applies here.
+    await load_authorized_model(
+        db, current_user, model_id=str(measure_model_id), min_role="viewer",
+    )
+
+    persona = await resolve_execution_persona(
+        db,
+        current_user=persona_current_user,
+        model_id=str(measure_model_id),
+        requested_persona_id=requested_persona_id,
+    )
+
+    allowed_hierarchy_ids: set[str] | None = None
+    if persona:
+        # SECURITY: the persona MEASURE allow-list. A persona scoped to a
+        # subset of measures may neither read another measure's detail rows nor
+        # be told which drills that measure offers. Empty list = no restriction.
+        # Bug-6832: normalise ids before comparing so a case variant cannot
+        # false-403 an ALLOWED object.
+        measure_allow = {
+            normalize_object_id(x) for x in (persona.included_measure_ids or [])
+        }
+        if measure_allow and normalize_object_id(measure_id) not in measure_allow:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Measure not included in effective persona",
+            )
+
+        # Bug-6274 [SECURITY]: the persona HIERARCHY allow-list. Carried as a
+        # normalised set so the catalogue filter and the executor's step-down
+        # selection apply the identical narrowing
+        # (``semantic_builder.filter_drillable_by_persona``).
+        hier_allow = {
+            normalize_object_id(x) for x in (persona.included_hierarchy_ids or [])
+        }
+        if hier_allow:
+            allowed_hierarchy_ids = hier_allow
+
+    return _DrillScope(
+        model_id=str(measure_model_id),
+        persona=persona,
+        allowed_hierarchy_ids=allowed_hierarchy_ids,
+    )
+
+
+def _persona_identity_for_drill(
+    current_user: CurrentUser,
+    x_simulate_principal: str | None,
+    x_simulate_roles: str | None,
+    x_simulate_groups: str | None,
+    x_simulate_claims: str | None,
+):
+    """Return ``(principal, persona_current_user)`` for a drill request.
+
+    Bug-8363 fixed this for ``/drill-through``; Bug-8560 gives ``/drill-options``
+    the identical resolution so the catalogue and the executor answer to the
+    same identity. ``persona_current_user_for_principal`` carries ONLY the
+    simulated roles, so simulate-as can never widen persona entitlement.
+    """
+    principal = resolve_principal(
+        current_user, x_simulate_principal, x_simulate_roles,
+        x_simulate_groups, x_simulate_claims,
+    )
+    simulated = simulate_headers_present(
+        x_simulate_principal, x_simulate_roles, x_simulate_groups,
+        x_simulate_claims,
+    )
+    return principal, persona_current_user_for_principal(
+        current_user, principal, simulated=simulated,
+    )
+
+
+# ---------------------------------------------------------------------------
 # /drill-options
 # ---------------------------------------------------------------------------
 
@@ -185,41 +324,28 @@ async def drill_options(
     body: DrillThroughRequest,
     measure_id: UUID = Path(...),
     current_user: CurrentUser = Depends(require_capability("query")),
+    x_simulate_principal: str | None = Header(default=None, alias="X-Tessallite-Simulate-Principal"),
+    x_simulate_roles: str | None = Header(default=None, alias="X-Tessallite-Simulate-Roles"),
+    x_simulate_groups: str | None = Header(default=None, alias="X-Tessallite-Simulate-Groups"),
+    x_simulate_claims: str | None = Header(default=None, alias="X-Tessallite-Simulate-Claims"),
 ) -> DrillOptionsResponse:
+    # Bug-8560 (audit row A34): accept the same four simulate-as headers
+    # ``/drill-through`` accepts and resolve the persona against the same
+    # identity. Without this the catalogue was computed from the REAL admin's
+    # persona while the executor enforced the SIMULATED user's — the preview
+    # offered a drill the next call refused.
+    _, _persona_current_user = _persona_identity_for_drill(
+        current_user, x_simulate_principal, x_simulate_roles,
+        x_simulate_groups, x_simulate_claims,
+    )
     async for db in get_tenant_db(current_user.tenant_id):
-        await _enforce_measure_model_scope(db, current_user, measure_id)
-
-        mid_row = await db.execute(
-            sa_select(Measure.model_id).where(Measure.id == measure_id)
-        )
-        measure_model_id = mid_row.scalar_one_or_none()
-        if measure_model_id is None:
-            raise HTTPException(status_code=404, detail="Measure not found")
-        # Bug-8613: enforce project/model RBAC and refuse unverified service
-        # principals. require_capability("query") does not scope-check service
-        # tokens, so the shared primitive's default (refuse) applies here.
-        await load_authorized_model(
-            db, current_user, model_id=str(measure_model_id), min_role="viewer",
-        )
-
-        persona = await resolve_execution_persona(
+        scope = await _resolve_drill_scope(
             db,
+            measure_id=measure_id,
             current_user=current_user,
-            model_id=str(measure_model_id),
+            persona_current_user=_persona_current_user,
             requested_persona_id=body.persona_id,
         )
-
-        if persona:
-            # Bug-6832: normalize UUIDs to lowercase (no braces) before
-            # comparison. Case-variant UUID representations (upper vs lower
-            # hex) must not produce a false 403 on ALLOWED objects.
-            measure_allow = {str(x).lower().strip("{}") for x in (persona.included_measure_ids or [])}
-            mid_norm = str(measure_id).lower().strip("{}")
-            if measure_allow and mid_norm not in measure_allow:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Measure not included in effective persona",
-                )
 
         try:
             drillable = await resolve_drill_options(
@@ -230,13 +356,10 @@ async def drill_options(
         except DrillSemanticError as exc:
             raise HTTPException(status_code=400, detail={"error_code": exc.error_code, "detail": str(exc)})
 
-        options = [_hierarchy_out(h) for h in drillable]
-        if persona:
-            hier_allow = {str(x).lower().strip("{}") for x in (persona.included_hierarchy_ids or [])}
-            if hier_allow:
-                options = [o for o in options if str(o.hierarchy_id).lower().strip("{}") in hier_allow]
-
-        return DrillOptionsResponse(hierarchies=options)
+        # The catalogue is narrowed by the SAME function the executor narrows
+        # its step-down candidates with, so nothing offered here is unreachable.
+        visible = filter_drillable_by_persona(drillable, scope.allowed_hierarchy_ids)
+        return DrillOptionsResponse(hierarchies=[_hierarchy_out(h) for h in visible])
 
 
 # ---------------------------------------------------------------------------
@@ -256,10 +379,6 @@ async def drill_through(
     x_simulate_groups: str | None = Header(default=None, alias="X-Tessallite-Simulate-Groups"),
     x_simulate_claims: str | None = Header(default=None, alias="X-Tessallite-Simulate-Claims"),
 ) -> DrillThroughResponse:
-    principal = resolve_principal(
-        current_user, x_simulate_principal, x_simulate_roles,
-        x_simulate_groups, x_simulate_claims,
-    )
     # Bug-8363 (Bug-8301 class): drill-through already applies the SIMULATED
     # principal for row security, but resolved the persona against the REAL
     # (privileged admin) caller — so an admin previewing "what does this
@@ -270,71 +389,38 @@ async def drill_through(
     # as /execute and /explain do. persona_current_user_for_principal carries
     # ONLY the simulated roles, so this can never ESCALATE: a simulated viewer
     # gets viewer persona entitlement, not the admin's.
-    _drill_simulated = simulate_headers_present(
-        x_simulate_principal, x_simulate_roles, x_simulate_groups,
-        x_simulate_claims,
-    )
-    _persona_current_user = persona_current_user_for_principal(
-        current_user, principal, simulated=_drill_simulated,
+    # Bug-8560: /drill-options now shares this resolution, so the catalogue and
+    # this executor always answer to the same identity.
+    principal, _persona_current_user = _persona_identity_for_drill(
+        current_user, x_simulate_principal, x_simulate_roles,
+        x_simulate_groups, x_simulate_claims,
     )
     async for db in get_tenant_db(current_user.tenant_id):
-        await _enforce_measure_model_scope(db, current_user, measure_id)
+        scope = await _resolve_drill_scope(
+            db,
+            measure_id=measure_id,
+            current_user=current_user,
+            persona_current_user=_persona_current_user,
+            requested_persona_id=body.persona_id,
+        )
+        body.persona_id = scope.persona_id
+        allowed_hierarchy_ids = scope.allowed_hierarchy_ids
 
-        mid_row = await db.execute(
-            sa_select(Measure.model_id).where(Measure.id == measure_id)
-        )
-        measure_model_id = mid_row.scalar_one_or_none()
-        if measure_model_id is None:
-            raise HTTPException(status_code=404, detail="Measure not found")
-        # Bug-8613: enforce project/model RBAC and refuse unverified service
-        # principals. require_capability("query") does not scope-check service
-        # tokens, so the shared primitive's default (refuse) applies here.
-        await load_authorized_model(
-            db, current_user, model_id=str(measure_model_id), min_role="viewer",
-        )
-        allowed_hierarchy_ids: set[str] | None = None
-        if measure_model_id is not None:
-            persona = await resolve_execution_persona(
-                db,
-                current_user=_persona_current_user,
-                model_id=str(measure_model_id),
-                requested_persona_id=body.persona_id,
+        # Bug-6274 [SECURITY]: an EXPLICITLY requested hierarchy outside the
+        # persona allow-list fails loudly here rather than silently falling
+        # through to leaf detail. The allow-list itself travels into
+        # build_drill_sql, which narrows the drillable set with the same
+        # function /drill-options advertises with, so the single-hierarchy
+        # auto-select cannot pick a non-allowed one either.
+        if (
+            allowed_hierarchy_ids
+            and body.hierarchy_id
+            and normalize_object_id(body.hierarchy_id) not in allowed_hierarchy_ids
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Hierarchy not included in effective persona",
             )
-            body.persona_id = str(persona.id) if persona else None
-
-            # SECURITY: enforce the persona MEASURE allow-list that
-            # /drill-options enforces (drill_options lines above). Without this,
-            # a persona scoped to a subset of measures could call
-            # /measures/{forbidden}/drill-through and read the forbidden
-            # measure's detail rows — a persona-scope bypass of the same class
-            # as Bug-6274. Empty list imposes no restriction.
-            # Bug-6832: normalize UUIDs to lowercase (no braces) before
-            # comparison so case-variant representations do not false-403.
-            if persona:
-                measure_allow = {str(x).lower().strip("{}") for x in (persona.included_measure_ids or [])}
-                mid_norm = str(measure_id).lower().strip("{}")
-                if measure_allow and mid_norm not in measure_allow:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Measure not included in effective persona",
-                    )
-
-            # Bug-6274 [SECURITY]: enforce the persona hierarchy allow-list that
-            # /drill-options already enforces. A persona with a non-empty
-            # included_hierarchy_ids may only drill those hierarchies; an empty
-            # list imposes no restriction. Reject an explicitly-requested
-            # non-allowed hierarchy loudly (403), and pass the allow-list down
-            # so the single-hierarchy auto-select cannot pick a non-allowed one.
-            # Bug-6832: normalize UUIDs to lowercase (no braces).
-            if persona:
-                hier_allow = {str(x).lower().strip("{}") for x in (persona.included_hierarchy_ids or [])}
-                if hier_allow:
-                    allowed_hierarchy_ids = hier_allow
-                    if body.hierarchy_id and str(body.hierarchy_id).lower().strip("{}") not in hier_allow:
-                        raise HTTPException(
-                            status_code=status.HTTP_403_FORBIDDEN,
-                            detail="Hierarchy not included in effective persona",
-                        )
 
         # ``fact_table`` is the PHYSICAL source table name. R5 finding F5 used
         # to null it for an embed token; that withhold was removed 2026-08-11
@@ -468,10 +554,11 @@ async def _handle_drill_through(
         # error naming the physical table, a generation-guard message carrying
         # ``(schema=... table=...)``, a rewriter assertion quoting the rewritten
         # SQL — and used to return ``str(exc)`` verbatim to a caller that may be
-        # an embed session. ``sanitize_error_for_client`` is not a control here
-        # either: per ``shared/error_sanitizer.py`` it scrubs connection
-        # strings, file paths and SQLAlchemy class names only, NOT table or
-        # column names. The caller gets the fact; the log gets the cause.
+        # an embed session. ``shared/error_sanitizer.py`` now returns a fixed
+        # message for any error we did not author, so it would be safe here
+        # too; this route keeps its own structured ``error_code`` contract
+        # because drill-through clients branch on that code. Either way the
+        # caller gets the fact and the log gets the cause.
         logger.exception("drill-through execution failed: %s", exc)
         raise HTTPException(
             status_code=502,

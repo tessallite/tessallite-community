@@ -37,6 +37,7 @@ import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import { dataQualityApi } from "../../api/client";
 import { useConfirm } from "../Confirm";
+import { extractApiError } from "../../utils/extractApiError";
 import type {
   DataQualityRule,
   DataQualityRuleCreate,
@@ -530,7 +531,7 @@ export default function DataQualityPanel() {
 
           {createRule.isError && (
             <Alert severity="error" sx={{ mt: 1 }}>
-              {t("dataQuality.createRuleError")}
+              {extractApiError(createRule.error, t("dataQuality.createRuleError"))}
             </Alert>
           )}
         </DialogContent>

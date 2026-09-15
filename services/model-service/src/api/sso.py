@@ -87,6 +87,53 @@ def _configured_origins() -> list[str]:
     return origins
 
 
+class SsoConfigError(RuntimeError):
+    """The process is configured for SSO but cannot publish a callback URL."""
+
+
+def sso_startup_validate() -> None:
+    """Bug-9225: refuse to start an SSO deployment that has no public origin.
+
+    ``AUTH_BACKENDS`` naming ``saml`` or ``oidc`` puts redirect-based login in
+    the chain, and redirect-based login has to publish an absolute callback
+    address to the identity provider. That address comes from
+    ``PUBLIC_BASE_URL`` and is never reconstructed from a request header (see
+    :func:`_base_url`), so without it the first sign-in attempt — possibly weeks
+    after the install — is the thing that discovers the deployment was never
+    finished. The community ``.env.example`` shipped without the variable at
+    all, which is how the defect was reported.
+
+    An operator who has not configured SSO is unaffected: with the default
+    ``AUTH_BACKENDS=local`` this returns immediately. SSO enabled per workspace
+    from the app's Identity provider settings is not visible here — that path
+    keeps the fail-closed refusal in :func:`_base_url`, which already names this
+    same variable — so this is the earliest honest point, not the only one.
+
+    Raises ``SsoConfigError`` naming the variable; returns ``None`` otherwise.
+    """
+    from shared.config.settings import get_settings
+    from src.auth.chain import REDIRECT_BACKENDS
+
+    settings = get_settings()
+    names = {n.strip().lower() for n in (settings.AUTH_BACKENDS or "").split(",")}
+    enabled = sorted(names & REDIRECT_BACKENDS)
+    if not enabled:
+        return None
+    if (settings.PUBLIC_BASE_URL or "").strip():
+        return None
+    raise SsoConfigError(
+        "AUTH_BACKENDS enables redirect-based SSO ("
+        + ", ".join(enabled)
+        + ") but PUBLIC_BASE_URL is empty. Redirect-based sign-in publishes this "
+        "deployment's external origin to the identity provider as the SAML "
+        "AssertionConsumerService URL and the OIDC redirect_uri, and it is never "
+        "taken from a request header. Set PUBLIC_BASE_URL to the externally "
+        "reachable origin of this deployment, without a trailing slash "
+        "(for example https://tessallite.example.com), or remove saml/oidc from "
+        "AUTH_BACKENDS."
+    )
+
+
 def _base_url(request: Request) -> str:
     """Return the absolute, externally-reachable origin of this deployment.
 

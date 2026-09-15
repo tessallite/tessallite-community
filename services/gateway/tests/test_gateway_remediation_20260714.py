@@ -16,6 +16,7 @@ from __future__ import annotations
 import struct
 
 import pytest
+from unittest.mock import patch
 
 from src.jdbc import protocol as proto
 from src.jdbc.server import _map_type_oid
@@ -199,12 +200,14 @@ class TestBug6746BracketEscaping:
 
     def test_emit_side_escapes_dimension_uname_roundtrip(self):
         # Bug-6806 (absorbed): the DIMENSION_UNIQUE_NAME emitter escapes ] so the
-        # parse-side reads the dimension name back whole. A flat TIME dimension
-        # keeps its OWN node (not the [Dimensions] group), taking the name branch.
+        # parse-side reads the dimension name back whole. With grouping OFF a
+        # dimension keeps its OWN node, taking the name branch (Bug-9878 moved
+        # the grouped flat time dimension under [Time]).
         from src.dax import cube_model
-        uname = cube_model.dimension_unique_name_for(
-            {"name": "we]rd", "is_time_dim": True}
-        )
+        with patch.object(cube_model, "field_list_grouping_enabled", return_value=False):
+            uname = cube_model.dimension_unique_name_for(
+                {"name": "we]rd", "is_time_dim": True}
+            )
         assert uname == "[we]]rd]"
         # Round-trip: the mdx_execute dim extractor recovers "we]rd".
         import re

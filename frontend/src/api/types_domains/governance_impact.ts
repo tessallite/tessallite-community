@@ -314,6 +314,19 @@ export interface BuilderDefinition {
   query?: string;
   /** ISO timestamp of the last refresh (sql_query / sql_fixed). */
   last_refreshed_at?: string | null;
+  /**
+   * Bug-9893: the context the stored members were computed under. The query
+   * router uses it to decide whether a persona may be served these members or
+   * must evaluate the list live over its own model query. Read-only: written
+   * by the refresh endpoint, never by the model builder.
+   */
+  refresh_context?: {
+    principal_id?: string | null;
+    persona_id?: string | null;
+    bypass_row_security?: boolean;
+    refreshed_at?: string | null;
+    probe_sql?: string | null;
+  } | null;
 }
 
 export interface NamedSetCreate {
@@ -366,8 +379,20 @@ export interface NamedSet {
   owner_user_id: string | null;
   /** Shared freshness/source/owner metadata for the served named-set object. */
   trust_meta?: TrustMeta | null;
+  /**
+   * Bug-9877: whether this set binds over the effective persona's model query.
+   * Present only when the caller asked for persona-hidden sets too
+   * (`include_persona_hidden`), which only the XMLA Execute path does; `null`
+   * everywhere else, where every set returned is visible.
+   */
+  persona_visible?: boolean | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface NamedSetRefreshResponse extends NamedSet {
+  /** Refreshed draft members reach queries only after model Save + Deploy. */
+  deploy_required: true;
 }
 
 export interface NamedSetValidateRequest {

@@ -42,6 +42,7 @@ from shared.db.models import (
     ProjectAgentConfig,
 )
 from shared.semantic.kpi_expression import _collect_references, parse_kpi_expression
+from shared.semantic.named_set_binding import extract_named_set_references
 from src.chart_config import effective_chart_selector
 from src.citations.builder import build_citations, describe_filter_grain
 from src.charts.selector import select_chart_type
@@ -77,7 +78,10 @@ from src.narrate.narrate import (
 from src.planning.validation import (
     apply_shape_contract_repairs,
     apply_pre_validation_repairs,
+    detect_benchmark_containment,
+    is_absolute_totals_benchmark_request,
     invalid_plan_message,
+    repair_benchmark_to_grouped_breakdown,
     validate_shape_contract_before_execution,
     validate_tool_call_against_bundle,
     validation_feedback_for_correction,
@@ -87,7 +91,7 @@ from src.planning.contracts import ShapeLimits
 from src.planning.intent import detect_analytical_intent
 from src.planning.matcher import match_shape_contract
 from src.planning.roles import infer_field_roles
-from src.planning.shape import normalize_result_shape
+from src.planning.shape import add_average_comparison_fact, normalize_result_shape
 from src.prompt.assembler import assemble_prompt
 from src.charts.renderer import (
     render_chart,
@@ -1096,7 +1100,7 @@ async def _allow_list_refusal_outcome(
         if isinstance(call, PreviewNamedSetToolCall):
             ns_id = getattr(call, "named_set_id", None)
             if await _named_set_outside_persona_scope(
-                db, ns_id, model_uuid, scope.dimensions
+                db, ns_id, model_uuid, scope.dimensions, scope.measures
             ):
                 violations.append(f"named_set:{ns_id}")
 
@@ -1120,23 +1124,6 @@ async def _allow_list_refusal_outcome(
 
     return None
 
-
-# Mirrors the MDX bracket-token extraction in model-service
-# ``named_sets.py`` (Bug-5963): member keys ``&[key]`` are stripped first
-# so source values are never mistaken for dimension-name references, then
-# structural tokens that can never name a dimension are dropped.
-_NS_MEMBER_KEY_RE = re.compile(r"&\[[^\]]*\]")
-_NS_BRACKET_REF_RE = re.compile(r"\[([^\]]+)\]")
-_NS_NON_DIMENSION_TOKENS = frozenset({"measures", "model", "members", "all"})
-
-
-def _named_set_referenced_dimension_names(expression: str | None) -> set[str]:
-    """Candidate dimension-name references in an MDX set expression."""
-    if not expression:
-        return set()
-    expr_without_keys = _NS_MEMBER_KEY_RE.sub("", expression)
-    refs = _NS_BRACKET_REF_RE.findall(expr_without_keys)
-    return {r for r in refs if r.lower() not in _NS_NON_DIMENSION_TOKENS}
 
 
 def _kpi_expr_refs(expr: str) -> tuple[set[str], set[str], set[str]]:
@@ -1280,22 +1267,23 @@ async def _named_set_outside_persona_scope(
     ns_id: Any,
     model_uuid: UUID,
     visible_dimensions: frozenset[str],
+    visible_measures: frozenset[str] = frozenset(),
 ) -> bool:
-    """True when the named set references a real model dimension the
-    persona cannot see (Bug-6329 / F-023-01).
+    """True when the named set references a model object the persona cannot
+    see (Bug-6329 / F-023-01 / Bug-9877, audit row A46).
 
-    Mirrors model-service ``_named_set_visible_to_persona``: an MDX
-    expression's bracket tokens also cover hierarchy/level names and
-    literal member captions, so this restricts only on a confident match
-    to a real model dimension outside the persona's visible dimension set.
-    Fail-closed on a missing DB session, an unparseable id, or a named set
-    that does not belong to the model.
+    Prompt-side defence in depth. The AUTHORITY is model-service
+    ``preview_named_set``, which decides by attempting to BIND the set over
+    the persona model query; this precheck reads the same definition through
+    the same shared extraction primitive
+    (``shared.semantic.named_set_binding``) so the two cannot disagree about
+    WHICH objects a set references.
 
-    Bug-7348 -- accepted risk: bracket tokens that are NOT real model
-    dimension names (hierarchy names, level names, member captions) pass
-    through this heuristic silently.  This is intentional: the true
-    enforcement is at the query-router binder, which refuses any dimension
-    reference outside the persona's visible set at SQL generation time."""
+    Bug-9877 closed the two holes the previous private token scan had: the
+    ranking/filter MEASURE inside ``TopCount(...)`` / ``Filter(...)`` is now
+    checked, and a reference that resolves to no model object at all refuses
+    the call instead of passing silently. Fail-closed on a missing DB session,
+    an unparseable id, or a named set that does not belong to the model."""
     if db is None:
         return True
     try:
@@ -1333,23 +1321,46 @@ async def _named_set_outside_persona_scope(
     # populated it) and (2) confident dimension-name references extracted
     # from the MDX expression. Refuse when EITHER names a real model
     # dimension the persona cannot see.
-    referenced = _named_set_referenced_dimension_names(snapshot_ns.get("expression"))
-    raw_dims = snapshot_ns.get("dimensions")
-    if raw_dims:
-        for part in re.split(r"[;,]", str(raw_dims)):
-            token = part.strip()
-            if token:
-                referenced.add(token)
-    if not referenced:
-        return False
-    rows = await db.execute(
+    refs = extract_named_set_references(
+        expression=snapshot_ns.get("expression"),
+        builder_definition=snapshot_ns.get("builder_definition"),
+        persisted_dimensions=snapshot_ns.get("dimensions"),
+    )
+    if refs.undecidable:
+        return True
+    if refs.raw_sql:
+        # A free-hand SQL named list is decided by the model-service bind, not
+        # by this precheck; refuse here so the prompt side never over-permits.
+        return True
+    if not refs.dimension_names and not refs.measure_names:
+        return True
+
+    dim_rows = await db.execute(
         sa_select(Dimension.name).where(Dimension.model_id == model_uuid)
     )
-    all_dim_lower = {name.lower() for (name,) in rows.all()}
-    visible_lower = {d.lower() for d in visible_dimensions}
-    for ref in referenced:
+    all_dim_lower = {name.lower() for (name,) in dim_rows.all()}
+    meas_rows = await db.execute(
+        sa_select(Measure.name).where(Measure.model_id == model_uuid)
+    )
+    all_meas_lower = {name.lower() for (name,) in meas_rows.all()}
+    visible_dim_lower = {d.lower() for d in visible_dimensions}
+    visible_meas_lower = {m.lower() for m in visible_measures}
+
+    for ref in refs.dimension_names:
         rl = ref.lower()
-        if rl in all_dim_lower and rl not in visible_lower:
+        head = rl.split(".", 1)[0].strip()
+        if rl in all_dim_lower:
+            if rl not in visible_dim_lower:
+                return True
+        elif head in all_dim_lower:
+            if head not in visible_dim_lower:
+                return True
+        else:
+            # Resolves to no model dimension -- fail closed (Bug-9877).
+            return True
+    for ref in refs.measure_names:
+        rl = ref.lower()
+        if rl not in all_meas_lower or rl not in visible_meas_lower:
             return True
     return False
 
@@ -1424,7 +1435,16 @@ async def run_turn(
         db, cfg, conversation.id, user_message,
         persona_id=resolved_project_persona_id,
         pinned_model_id=getattr(conversation, "pinned_model_id", None),
+        # Bug-9972 — both sync and streaming callers reserve the current
+        # AgentTurn placeholder before entering the pipeline. Exclude that
+        # row from planner history so the current question cannot be relabeled
+        # as a completed prior question or selected as the previous plan.
+        exclude_turn_id=turn_id,
         embed_model_ids=embed_model_ids,
+        # Bug-9897: the grounding catalogue is resolved from the query-router
+        # under the CALLER'S OWN bearer, so it is the surface the executor
+        # will accept for this identity and nothing wider.
+        jwt_token=jwt_token,
     )
     _prompt_msgs = {"system": bundle.system, "user": bundle.user}
 
@@ -1652,6 +1672,29 @@ async def run_turn(
                 llm_raw_response=raw,
             )
 
+    if isinstance(call, CompoundQueryToolCall):
+        # Bug-9738 — a benchmark plan that divides by a peer figure no step
+        # computed (a category total over an ungrouped per-row mean, or a
+        # single-slice scalar over the step grouped by the same dimension)
+        # returns a plausible wrong ratio. Rewrite it to the grouped breakdown
+        # the question asks for; a plan that cannot be rewritten is refused by
+        # the validation gate below, so neither shape reaches the router.
+        benchmark_containment = detect_benchmark_containment(
+            call, bundle, user_message,
+        )
+        if benchmark_containment is not None:
+            breakdown_call = repair_benchmark_to_grouped_breakdown(
+                call, benchmark_containment, bundle,
+            )
+            if breakdown_call is not None:
+                call = breakdown_call
+                await _emit(
+                    publisher,
+                    "plan.repaired",
+                    reason=benchmark_containment.reason,
+                    plan=_plan_dict(call),
+                )
+
     if isinstance(call, QueryToolCall):
         pre_validation_intent = detect_analytical_intent(
             user_message,
@@ -1665,7 +1708,9 @@ async def run_turn(
                 plan=_plan_dict(call),
             )
 
-    validation_issues = validate_tool_call_against_bundle(call, bundle)
+    validation_issues = validate_tool_call_against_bundle(
+        call, bundle, user_message,
+    )
     if validation_issues:
         raw_plan = _plan_dict(call)
         raw_validation = validation_trace(validation_issues)
@@ -1689,7 +1734,7 @@ async def run_turn(
             try:
                 corrected_call = parse_tool_call(corrected)
                 corrected_issues = validate_tool_call_against_bundle(
-                    corrected_call, bundle
+                    corrected_call, bundle, user_message,
                 )
                 if not corrected_issues:
                     call = corrected_call
@@ -2141,6 +2186,18 @@ async def run_turn(
             field_roles,
             contract,
             shape_limits,
+            filter_where=call.where,
+        )
+        add_average_comparison_fact(
+            shaped.narration_facts,
+            execution.rows,
+            user_message=user_message,
+            complete=(
+                not bool(getattr(execution, "truncated", False))
+                and execution.rows_returned == len(execution.rows)
+                and not bool(getattr(call, "limit_explicit", False))
+            ),
+            requested=is_absolute_totals_benchmark_request(user_message),
         )
         shape_trace = shaped.as_trace()
         chart_type = shaped.chart_type
@@ -2660,7 +2717,7 @@ async def _run_compound_query_branch(
                     # having; without this re-check it would bypass the metadata
                     # gate and only surface as a raw binder error downstream.
                     new_bundle_issues = validate_tool_call_against_bundle(
-                        new_call, bundle,
+                        new_call, bundle, user_message,
                     )
                     if not new_errors and not new_bundle_issues:
                         call = new_call
@@ -3371,9 +3428,13 @@ async def _run_evaluate_kpi_branch(
     # F-023-09 — thread the real project id; model-service validates the
     # path segment as a UUID, so the old literal `_` always 422'd.
     project_seg = str(project_id) if project_id is not None else str(cfg.project_id)
+    # Bug-9881: the agent quotes a SERVED number, so KPI evaluation is pinned
+    # to the deployed snapshot — never a modeller's unsaved draft definition.
+    # Same authority as the named-set preview below (F-013-01).
     url = (
         f"{settings.MODEL_SERVICE_URL}/api/v1/projects/{project_seg}/models/"
         f"{call.model_id}/kpis/{call.kpi_id}/evaluate"
+        f"?deployed_only=true"
     )
     # internal_request_headers: agent -> model-service metadata reads are
     # internal pipeline traffic — exempt from the per-tenant rate limiter.

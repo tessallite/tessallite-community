@@ -16,6 +16,7 @@ from __future__ import annotations
 import types
 
 import pytest
+from result_fakes import ScalarResult
 
 from conftest import attach_fixture_deployed_shape
 import sqlglot
@@ -41,7 +42,7 @@ class _Result:
         self._rows = list(rows)
 
     def scalars(self):
-        return self
+        return ScalarResult(self._rows)
 
     def all(self):
         return list(self._rows)

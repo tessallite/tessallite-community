@@ -48,7 +48,7 @@ export default function SearchBar({
       InputProps={{
         startAdornment: (
           <InputAdornment position="start">
-            <SearchOutlined sx={{ fontSize: 18, color: tokens.colorTextSecondary }} />
+            <SearchOutlined sx={{ fontSize: 14, color: tokens.colorTextSecondary }} />
           </InputAdornment>
         ),
         endAdornment: localValue ? (
@@ -62,11 +62,11 @@ export default function SearchBar({
                 onChange('');
               }}
             >
-              <CloseOutlined sx={{ fontSize: 16 }} />
+              <CloseOutlined sx={{ fontSize: 14 }} />
             </IconButton>
           </InputAdornment>
         ) : null,
-        sx: { fontSize: 13 },
+        sx: { fontSize: 12, height: 24, borderRadius: '2px', pl: 1, pr: 0.5, '& input': { py: 0.5 }, '& .MuiInputAdornment-root': { mr: 0.5 }, '& .MuiIconButton-root': { p: 0.25 } },
       }}
     />
   );

@@ -756,9 +756,16 @@ export function useExcel(confirmGuard?: ConfirmGuard, onBusy?: () => void, model
           }
 
           const pivotRange = pivotSheet.getRange('A1');
+          // Bug-9909: the PivotTable's source is the TABLE, not the cells it
+          // currently covers. A range-bound cache is pinned to the addresses it
+          // was created with, so a later refresh that writes a different number
+          // of rows leaves the pivot reading a stale slice -- a wrong total with
+          // no error anywhere. A table-bound cache follows the table as it grows
+          // and shrinks. `savedRangeAddress` below stays the RANGE: it is the
+          // provenance-tagging key and this function's return contract.
           const pivotTable = pivotSheet.pivotTables.add(
             pivotTableName,
-            qualifiedAddr,
+            table,
             pivotRange,
           );
           await context.sync();

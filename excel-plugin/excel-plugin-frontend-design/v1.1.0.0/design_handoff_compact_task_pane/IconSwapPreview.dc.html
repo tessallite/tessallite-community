@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<!-- @template name="Icon swap preview" description="Before/after of NamedSetCard and ExcelChatShell icon replacements" -->
+<helmet><script src="./ds-base.js"></script></helmet>
+<div style="font-family:'Segoe UI',system-ui,sans-serif;background:#f5f5f5;min-height:100vh;padding:32px;color:#242424">
+<h1 style="font-size:18px;font-weight:600;margin:0 0 4px">Icon replacements — preview</h1>
+<p style="font-size:13px;color:#616161;margin:0 0 28px">Left: current. Right: proposed. Colours unchanged.</p>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:32px;max-width:760px">
+<div>
+<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:#616161;margin-bottom:10px">NamedSetCard</div>
+<div style="background:#fff;border:1px solid #e1e1e1;width:340px">
+<div style="height:28px;display:flex;align-items:center;padding:0 10px;font-size:10px;font-weight:600;color:#616161;background:#f5f5f5;border-bottom:1px solid #e1e1e1;text-transform:uppercase">Before</div>
+<div style="display:flex;align-items:center;gap:6px;padding:4px 10px;min-height:36px;border-bottom:1px solid #e1e1e1"><span style="font-size:14px;line-height:1">📋</span><div style="flex:1;overflow:hidden"><div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Top 10 Customers</div><div style="font-size:10px;color:#616161;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Top 10 by Revenue</div></div><span style="font-size:9px;height:16px;line-height:16px;padding:0 6px;border-radius:8px;background:#f5f5f5;color:#616161;font-weight:600;white-space:nowrap">Top N</span></div>
+<div style="display:flex;align-items:center;gap:6px;padding:4px 10px;min-height:36px;border-bottom:1px solid #e1e1e1"><span style="font-size:14px;line-height:1">📋</span><div style="flex:1;overflow:hidden"><div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">EMEA Regions</div><div style="font-size:10px;color:#616161">Static list · 6 members</div></div><span style="font-size:9px;height:16px;line-height:16px;padding:0 6px;border-radius:8px;background:#f5f5f5;color:#616161;font-weight:600;white-space:nowrap">Set</span><span style="font-size:9px;height:16px;line-height:16px;padding:0 6px;border-radius:8px;background:rgba(46,125,50,.08);color:#2e7d32;font-weight:600;white-space:nowrap">Certified</span></div>
+<div style="height:28px;display:flex;align-items:center;padding:0 10px;font-size:10px;font-weight:600;color:#217346;background:#f5f5f5;border-bottom:1px solid #e1e1e1;text-transform:uppercase">After — FilterListOutlined, 16px, colorTextSecondary</div>
+<div style="display:flex;align-items:center;gap:6px;padding:4px 10px;min-height:36px;border-bottom:1px solid #e1e1e1"><svg width="16" height="16" viewBox="0 0 24 24" fill="#616161" style="flex-shrink:0"><path d="M10 18h4v-2h-4zM3 6v2h18V6zm3 7h12v-2H6z"></path></svg><div style="flex:1;overflow:hidden"><div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Top 10 Customers</div><div style="font-size:10px;color:#616161;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Top 10 by Revenue</div></div><span style="font-size:9px;height:16px;line-height:16px;padding:0 6px;border-radius:8px;background:#f5f5f5;color:#616161;font-weight:600;white-space:nowrap">Top N</span></div>
+<div style="display:flex;align-items:center;gap:6px;padding:4px 10px;min-height:36px"><svg width="16" height="16" viewBox="0 0 24 24" fill="#616161" style="flex-shrink:0"><path d="M10 18h4v-2h-4zM3 6v2h18V6zm3 7h12v-2H6z"></path></svg><div style="flex:1;overflow:hidden"><div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">EMEA Regions</div><div style="font-size:10px;color:#616161">Static list · 6 members</div></div><span style="font-size:9px;height:16px;line-height:16px;padding:0 6px;border-radius:8px;background:#f5f5f5;color:#616161;font-weight:600;white-space:nowrap">Set</span><span style="font-size:9px;height:16px;line-height:16px;padding:0 6px;border-radius:8px;background:rgba(46,125,50,.08);color:#2e7d32;font-weight:600;white-space:nowrap">Certified</span></div>
+</div>
+<p style="font-size:12px;color:#616161;margin:10px 0 0;max-width:340px">Replaces the 📋 emoji (renders differently per OS) with the same outlined MUI icon family used across the pane, in <code>tokens.colorTextSecondary</code>.</p>
+</div>
+<div>
+<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:#616161;margin-bottom:10px">ExcelChatShell — empty state</div>
+<div style="display:flex;gap:12px">
+<div style="background:#fff;border:1px solid #e1e1e1;width:164px">
+<div style="height:28px;display:flex;align-items:center;padding:0 10px;font-size:10px;font-weight:600;color:#616161;background:#f5f5f5;border-bottom:1px solid #e1e1e1;text-transform:uppercase">Before</div>
+<div style="display:flex;flex-direction:column;align-items:center;text-align:center;padding:28px 14px;gap:8px"><svg width="48" height="48" viewBox="0 0 24 24" fill="#a67c00"><path d="M20 9V7c0-1.1-.9-2-2-2h-3c0-1.66-1.34-3-3-3S9 3.34 9 5H6c-1.1 0-2 .9-2 2v2c-1.66 0-3 1.34-3 3s1.34 3 3 3v4c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2v-4c1.66 0 3-1.34 3-3s-1.34-3-3-3M7.5 11.5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5S9.83 13 9 13s-1.5-.67-1.5-1.5M16 17H8v-2h8zm-1-4c-.83 0-1.5-.67-1.5-1.5S14.17 10 15 10s1.5.67 1.5 1.5S15.83 13 15 13"></path></svg><div style="font-size:13px;font-weight:600">Ask Tessallite unavailable</div><div style="font-size:11px;color:#616161">Configure an AI provider in settings.</div></div>
+</div>
+<div style="background:#fff;border:1px solid #e1e1e1;width:164px">
+<div style="height:28px;display:flex;align-items:center;padding:0 10px;font-size:10px;font-weight:600;color:#217346;background:#f5f5f5;border-bottom:1px solid #e1e1e1;text-transform:uppercase">After</div>
+<div style="display:flex;flex-direction:column;align-items:center;text-align:center;padding:28px 14px;gap:8px"><svg width="48" height="48" viewBox="0 0 24 24" fill="#a67c00"><path d="m19 9 1.25-2.75L23 5l-2.75-1.25L19 1l-1.25 2.75L15 5l2.75 1.25zm0 6-1.25 2.75L15 19l2.75 1.25L19 23l1.25-2.75L23 19l-2.75-1.25zm-7.5-5.5L9 4 6.5 9.5 1 12l5.5 2.5L9 20l2.5-5.5L17 12zm-1.51 3.49L9 15.17l-.99-2.18L5.83 12l2.18-.99L9 8.83l.99 2.18 2.18.99z"></path></svg><div style="font-size:13px;font-weight:600">Ask Tessallite unavailable</div><div style="font-size:11px;color:#616161">Configure an AI provider in settings.</div></div>
+</div>
+</div>
+<p style="font-size:12px;color:#616161;margin:10px 0 0;max-width:340px">Replaces <code>SmartToy</code> with <code>AutoAwesomeOutlined</code> — the same sparkle already used on the "Ask" tab — at 48px in <code>tokens.colorGoldDark</code>.</p>
+</div>
+</div>
+<div style="margin-top:32px;max-width:760px;background:#fff;border:1px solid #e1e1e1;padding:14px 16px">
+<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:#616161;margin-bottom:8px">Change spec for the repo</div>
+<pre style="margin:0;font:11px/1.6 'Cascadia Code',Consolas,monospace;white-space:pre-wrap;color:#242424">NamedSetCard.tsx
+  import FilterListOutlined from '@mui/icons-material/FilterListOutlined';
+  - &lt;Typography sx=&#123;&#123; fontSize: 14, lineHeight: 1, flexShrink: 0 &#125;&#125;&gt;📋&lt;/Typography&gt;
+  + &lt;FilterListOutlined sx=&#123;&#123; fontSize: 16, color: tokens.colorTextSecondary, flexShrink: 0 &#125;&#125; /&gt;
+
+ExcelChatShell.tsx
+  - import SmartToy from '@mui/icons-material/SmartToy';
+  + import AutoAwesomeOutlined from '@mui/icons-material/AutoAwesomeOutlined';
+  - icon={&lt;SmartToy sx=&#123;&#123; fontSize: 48, color: tokens.colorGoldDark &#125;&#125; /&gt;}
+  + icon={&lt;AutoAwesomeOutlined sx=&#123;&#123; fontSize: 48, color: tokens.colorGoldDark &#125;&#125; /&gt;}</pre>
+</div>
+</div>
+</x-dc>
+</body>
+</html>

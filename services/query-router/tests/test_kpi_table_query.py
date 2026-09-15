@@ -250,8 +250,12 @@ import uuid
 from datetime import datetime, timezone
 
 
-def _kpi_latest(name, value=100.0):
+def _kpi_latest(name, value=100.0, *, kpi_id=None):
     r = MagicMock()
+    # A real id, not the auto-generated MagicMock attribute: the handler keys
+    # the deployed KPI definition off it, so the fixtures must be able to bind
+    # a snapshot entry to the same row.
+    r.kpi_id = kpi_id if kpi_id is not None else uuid.uuid4()
     r.kpi_name = name
     r.value = value
     r.target = 90.0
@@ -306,6 +310,16 @@ class _StatefulDB:
         result = self._results[self._i]
         self._i += 1
         return result
+
+    async def get(self, *_a, **_kw):
+        """Report "no such row".
+
+        These tests bind the deployment authority explicitly via
+        ``_patch_authority``, so nothing on the handler path should reach this.
+        It stays so that an unpatched path degrades to a missing row rather than
+        an AttributeError, which is far easier to read in a failure.
+        """
+        return None
 
 
 def _patch_observation(monkeypatch):
@@ -365,13 +379,69 @@ def _make_logical_query(model_id, *, limit=None):
     )
 
 
-def _fake_model(model_id):
+def _fake_model(model_id, *, deployed_version_id="v1", deploy_epoch=1):
     return types.SimpleNamespace(
         id=uuid.UUID(model_id),
         display_name="ModelX",
         project=types.SimpleNamespace(display_name="ProjectX"),
-        deployed_version_id="v1",
+        deployed_version_id=deployed_version_id,
+        deploy_epoch=deploy_epoch,
     )
+
+
+def _deployed_shape(*, kpi_rows=(), measures=()):
+    """A minimal stand-in for the pinned ``DeployedShape``.
+
+    $KPIs serves ONLY rows whose KPI is present in the deployed snapshot: the
+    served value was evaluated under the deployed definition, so that is the
+    only definition it can be authorised against. There is no live-definition
+    fallback, so every test expecting a row to be served must place that KPI in
+    ``kpi_rows``.
+    """
+    return types.SimpleNamespace(
+        measures=list(measures),
+        kpi_rows=list(kpi_rows),
+        uda_column_ref_rows=[],
+        columns_by_id={},
+    )
+
+
+def _deploy_row(kpi_latest, *, name=None, expression=None,
+                target_expression=None, target_measure_id=None,
+                parent_kpi_id=None):
+    """A deployed snapshot KPI entry bound to a ``kpi_latest`` row's id.
+
+    ``name`` defaults to the live name; pass it explicitly to model a draft
+    rename, where the deployed and live names deliberately differ.
+    """
+    return {
+        "id": str(kpi_latest.kpi_id),
+        "name": kpi_latest.kpi_name if name is None else name,
+        "expression": expression,
+        "target_expression": target_expression,
+        "target_measure_id": target_measure_id,
+        "parent_kpi_id": parent_kpi_id,
+        "value_measure_id": None,
+        "goal_measure_id": None,
+    }
+
+
+def _patch_authority(monkeypatch, shape):
+    """Bind the handler's single deployment authority for one test.
+
+    The handler captures deployment state exactly once per request and derives
+    the value epoch, the CLS blocked set, the row authorisation and the served
+    name from that one capture. Passing ``None`` models an undeployed model.
+    """
+    from src.api import routes as routes_mod
+    from src.semantic.snapshot_resolver import SnapshotAuthority
+
+    async def _authority(_model, _db):
+        if shape is None:
+            return SnapshotAuthority.UNDEPLOYED, None
+        return SnapshotAuthority.DEPLOYED, shape
+
+    monkeypatch.setattr(routes_mod, "resolve_snapshot_authority", _authority)
 
 
 class TestKpiPersonaLineageHelpers:
@@ -483,9 +553,14 @@ class TestKpiTableQueryGateAndObserve:
 
         kpi_a = _kpi_latest("Revenue KPI")
         kpi_b = _kpi_latest("Cost KPI")
+        _patch_authority(monkeypatch, _deployed_shape(
+            kpi_rows=[_deploy_row(kpi_a), _deploy_row(kpi_b)],
+        ))
+        # The model is loaded FIRST: deployment state is captured once, before
+        # anything reads it, and every later step derives from that capture.
         db = _StatefulDB([
-            _ScalarsResult([(kpi_a, _kpi_def()), (kpi_b, _kpi_def())]),
             _ScalarsResult([], scalar=_fake_model(model_id)),
+            _ScalarsResult([(kpi_a, _kpi_def()), (kpi_b, _kpi_def())]),
         ])
 
         resp = await _handle_kpi_table_query(
@@ -518,23 +593,29 @@ class TestKpiTableQueryGateAndObserve:
 
         kpi_rev = _kpi_latest("Revenue KPI")
         kpi_cost = _kpi_latest("Cost KPI")
+        # Measure names and KPI definitions both come from the deployed shape,
+        # so neither needs a database lookup.
+        _patch_authority(monkeypatch, _deployed_shape(
+            measures=[
+                types.SimpleNamespace(id=revenue_mid, name="Revenue"),
+                types.SimpleNamespace(id=cost_mid, name="Cost"),
+            ],
+            kpi_rows=[
+                _deploy_row(kpi_rev, expression='measure("Revenue")'),
+                _deploy_row(kpi_cost, expression='measure("Cost")'),
+            ],
+        ))
         db = _StatefulDB([
+            _ScalarsResult([], scalar=_fake_model(model_id)),
             # (KPILatest, KPI) pairs
             _ScalarsResult([
                 (kpi_rev, _kpi_def(expression='measure("Revenue")')),
                 (kpi_cost, _kpi_def(expression='measure("Cost")')),
             ]),
-            # Bug-6139: CLS gate first probes the persona's tag restrictions.
-            # This persona has none, so the CLS helper short-circuits after a
-            # single (empty) lookup and only the measure allow-list gate applies.
+            # Bug-6139: CLS gate probes the persona's tag restrictions. This
+            # persona has none, so the helper short-circuits after that single
+            # (empty) lookup and only the measure allow-list gate applies.
             _ScalarsResult([]),
-            # measure name -> id lookup
-            _ScalarsResult([("Revenue", revenue_mid), ("Cost", cost_mid)]),
-            # Bug-6139: all-KPI name map for nested kpi() lineage resolution.
-            # These KPIs have no nested refs, so an empty map is sufficient.
-            _ScalarsResult([]),
-            # Model load for observation
-            _ScalarsResult([], scalar=_fake_model(model_id)),
         ])
 
         resp = await _handle_kpi_table_query(
@@ -554,9 +635,12 @@ class TestKpiTableQueryGateAndObserve:
         model_id = str(uuid.uuid4())
 
         kpis = [(_kpi_latest(f"KPI {i}"), _kpi_def()) for i in range(5)]
+        _patch_authority(monkeypatch, _deployed_shape(
+            kpi_rows=[_deploy_row(latest) for latest, _ in kpis],
+        ))
         db = _StatefulDB([
-            _ScalarsResult(kpis),
             _ScalarsResult([], scalar=_fake_model(model_id)),
+            _ScalarsResult(kpis),
         ])
 
         resp = await _handle_kpi_table_query(
@@ -578,10 +662,11 @@ class TestKpiTableQueryGateAndObserve:
         _patch_observation(monkeypatch)
         model_id = str(uuid.uuid4())
 
-        # model_result.scalar_one_or_none() returns None -> model deleted.
+        # The model load is the FIRST statement the handler runs, and the only
+        # one it may run before the 404: a single queued result proves nothing
+        # else is read for a model that no longer exists.
         db = _StatefulDB([
-            _ScalarsResult([]),          # no KPI rows
-            _ScalarsResult([], scalar=None),  # model is None
+            _ScalarsResult([], scalar=None),  # model is None -> deleted
         ])
 
         with pytest.raises(HTTPException) as exc_info:
@@ -632,8 +717,9 @@ class TestKpiTableQueryRowSecurity:
         model_id = str(uuid.uuid4())
         principal = types.SimpleNamespace(user_identity="u@t.com", roles=[], groups=[], claims={})
 
-        # withhold path skips the KPILatest fetch + gating; only the model load
-        # for observation runs.
+        # The withhold path still captures the model (the deleted-model 404 and
+        # the observation tail both need it) but skips the KPILatest fetch, the
+        # authority resolution and all gating.
         db = _StatefulDB([
             _ScalarsResult([], scalar=_fake_model(model_id)),
         ])
@@ -686,11 +772,14 @@ class TestKpiTableQueryRowSecurity:
         )
 
         kpi_a = _kpi_latest("Revenue KPI")
+        _patch_authority(monkeypatch, _deployed_shape(
+            kpi_rows=[_deploy_row(kpi_a)],
+        ))
         db = _StatefulDB([
+            _ScalarsResult([], scalar=_fake_model(model_id)),
             _ScalarsResult([(kpi_a, _kpi_def())]),   # KPILatest fetch runs
             # Bug-6139 CLS gate probes the persona's tag restrictions (none here).
             _ScalarsResult([]),
-            _ScalarsResult([], scalar=_fake_model(model_id)),
         ])
 
         resp = await _handle_kpi_table_query(
@@ -711,9 +800,12 @@ class TestKpiTableQueryRowSecurity:
         principal = types.SimpleNamespace(user_identity="u@t.com", roles=[], groups=[], claims={})
 
         kpi_a = _kpi_latest("Revenue KPI")
+        _patch_authority(monkeypatch, _deployed_shape(
+            kpi_rows=[_deploy_row(kpi_a)],
+        ))
         db = _StatefulDB([
-            _ScalarsResult([(kpi_a, _kpi_def())]),
             _ScalarsResult([], scalar=_fake_model(model_id)),
+            _ScalarsResult([(kpi_a, _kpi_def())]),
         ])
 
         resp = await _handle_kpi_table_query(
@@ -728,48 +820,28 @@ class TestKpiTableQueryRowSecurity:
 # Bug-8305 — $KPIs kpi_name is DEPLOYED-SNAPSHOT-authoritative
 # ---------------------------------------------------------------------------
 
-class _StatefulDBWithGet(_StatefulDB):
-    """``_StatefulDB`` plus ``db.get`` — returns scripted objects by class name
-    so the Bug-8305 deployed-snapshot name lookup can be exercised."""
-
-    def __init__(self, results, *, get_by_class=None):
-        super().__init__(results)
-        self._get_by_class = get_by_class or {}
-
-    async def get(self, cls, _pk):
-        return self._get_by_class.get(getattr(cls, "__name__", None))
-
-
 class TestKpiNameSnapshotAuthority:
     @pytest.mark.asyncio
     async def test_kpi_name_uses_deployed_snapshot_not_live_latest(self, monkeypatch):
         """Bug-8305: a DRAFT rename (reflected in kpi_latest.kpi_name via a
         scorecard evaluation) must NOT leak into $KPIs. The served name comes
-        from the DEPLOYED version snapshot. Reverting the fix (serving
-        kpi_latest.kpi_name) would make this assert 'RENAMED-DRAFT' and fail."""
+        from the deployed definition — the same one that authorised the row, so
+        the name and the authorisation cannot come from different versions."""
         from src.api.routes import _handle_kpi_table_query
-        from shared.db.models import Model, ModelVersion
 
         _patch_observation(monkeypatch)
         model_id = str(uuid.uuid4())
-        kpi_id = uuid.uuid4()
 
         latest = _kpi_latest("RENAMED-DRAFT")  # live/draft name after a rename
-        latest.kpi_id = kpi_id
+        # The deployment froze the KPI under its published name.
+        _patch_authority(monkeypatch, _deployed_shape(
+            kpi_rows=[_deploy_row(latest, name="Published Revenue")],
+        ))
 
-        # Deployed snapshot froze the KPI under its published name.
-        version = types.SimpleNamespace(
-            snapshot_json={"kpis": [{"id": str(kpi_id), "name": "Published Revenue"}]}
-        )
-        model = types.SimpleNamespace(deployed_version_id="v1")
-
-        db = _StatefulDBWithGet(
-            [
-                _ScalarsResult([(latest, _kpi_def())]),
-                _ScalarsResult([], scalar=_fake_model(model_id)),
-            ],
-            get_by_class={"Model": model, "ModelVersion": version},
-        )
+        db = _StatefulDB([
+            _ScalarsResult([], scalar=_fake_model(model_id)),
+            _ScalarsResult([(latest, _kpi_def())]),
+        ])
 
         resp = await _handle_kpi_table_query(
             db, model_id, _make_logical_query(model_id),
@@ -781,33 +853,413 @@ class TestKpiNameSnapshotAuthority:
         assert resp.rows[0]["value"] == 100.0
 
     @pytest.mark.asyncio
-    async def test_kpi_name_falls_back_to_latest_when_snapshot_lacks_entry(self, monkeypatch):
-        """When the deployed snapshot has no entry for a KPI (e.g. a legacy
-        snapshot predating KPI serialisation), the served name falls back to
-        kpi_latest.kpi_name — the fix must not blank out unmatched KPIs."""
+    async def test_kpi_absent_from_the_deployment_is_withheld_even_unrestricted(
+        self, monkeypatch,
+    ):
+        """A KPI the deployed snapshot does not describe is WITHHELD, including
+        for a caller under no persona or row restriction at all.
+
+        This replaces an earlier contract in which such a row was served under
+        its live name. That fallback existed for deployments predating KPI
+        serialisation, whose snapshots carry no KPI section, but it meant a
+        value could be served with nothing authoritative to authorise it
+        against — decided by the age of the deployment rather than by any
+        security property. The rule is now unconditional (user decision,
+        2026-09-01): those deployments serve an empty scorecard until they are
+        redeployed, which is the behaviour operations expects.
+        """
         from src.api.routes import _handle_kpi_table_query
 
         _patch_observation(monkeypatch)
         model_id = str(uuid.uuid4())
-        kpi_id = uuid.uuid4()
 
         latest = _kpi_latest("Latest Name")
-        latest.kpi_id = kpi_id
+        _patch_authority(monkeypatch, _deployed_shape(kpi_rows=[]))  # no entry
 
-        version = types.SimpleNamespace(snapshot_json={"kpis": []})  # no entry
-        model = types.SimpleNamespace(deployed_version_id="v1")
-
-        db = _StatefulDBWithGet(
-            [
-                _ScalarsResult([(latest, _kpi_def())]),
-                _ScalarsResult([], scalar=_fake_model(model_id)),
-            ],
-            get_by_class={"Model": model, "ModelVersion": version},
-        )
+        db = _StatefulDB([
+            _ScalarsResult([], scalar=_fake_model(model_id)),
+            _ScalarsResult([(latest, _kpi_def())]),
+        ])
 
         resp = await _handle_kpi_table_query(
             db, model_id, _make_logical_query(model_id),
             persona=None, user_identity="u@t.com", tenant_id="acme",
         )
 
-        assert [r["kpi_name"] for r in resp.rows] == ["Latest Name"]
+        assert resp.rows == [], (
+            "a KPI absent from the deployed snapshot has no authoritative "
+            "definition to be checked against and must not be served"
+        )
+        # The zero-row read is still observed for audit.
+        assert resp.rows_returned == 0
+
+
+class TestKpiDeployedDefinitionAuthority:
+    """Bug-9490 (review F1) — authorise the DEPLOYED KPI definition.
+
+    The scorecard serves a value evaluated under the deployed definition. It
+    used to authorise that value against the LIVE one, so editing a KPI in
+    draft decided what an already-deployed value had been checked for.
+
+    These drive the real handler. A unit test of the authorisation function
+    alone proves the function can tell two definitions apart; it does NOT prove
+    the handler hands it the deployed one, which is the whole defect. Reverting
+    the fix must fail a test here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_deployed_definition_withholds_a_kpi_a_clean_draft_would_serve(
+        self, monkeypatch,
+    ):
+        from src.api import routes as routes_mod
+        from src.api.routes import _handle_kpi_table_query
+        from src.semantic.snapshot_resolver import SnapshotAuthority
+
+        _patch_observation(monkeypatch)
+        model_id = str(uuid.uuid4())
+        salary_mid = uuid.uuid4()      # restricted by the persona
+        headcount_mid = uuid.uuid4()   # clean
+
+        persona = types.SimpleNamespace(
+            id=uuid.uuid4(), included_measure_ids=[str(headcount_mid)],
+        )
+
+        kpi_id = uuid.uuid4()
+        payroll = _kpi_latest("Payroll KPI")
+        payroll.kpi_id = kpi_id
+
+        # DEPLOYED definition reads the restricted measure.
+        deployed_shape = types.SimpleNamespace(
+            # With a pinned shape the handler resolves measure names from it,
+            # not from the database — so no name lookup is queued below.
+            measures=[
+                types.SimpleNamespace(id=salary_mid, name="Salary"),
+                types.SimpleNamespace(id=headcount_mid, name="Headcount"),
+            ],
+            uda_column_ref_rows=[], columns_by_id={},
+            kpi_rows=[{
+                "id": str(kpi_id), "name": "Payroll KPI",
+                "expression": 'measure("Salary")', "parent_kpi_id": None,
+                "value_measure_id": None, "goal_measure_id": None,
+                "target_measure_id": None,
+            }],
+        )
+
+        async def _authority(*_a, **_kw):
+            return SnapshotAuthority.DEPLOYED, deployed_shape
+
+        monkeypatch.setattr(routes_mod, "resolve_snapshot_authority", _authority)
+
+        db = _StatefulDB([
+            _ScalarsResult([], scalar=_fake_model(model_id)),
+            # The LIVE row the join returns reads the CLEAN measure — this is
+            # the draft edit that used to decide the outcome.
+            _ScalarsResult([(payroll, _kpi_def(expression='measure("Headcount")'))]),
+            _ScalarsResult([]),  # persona tag restrictions: none
+        ])
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=persona, user_identity="u@t.com", tenant_id="acme",
+        )
+
+        assert [r["kpi_name"] for r in resp.rows] == [], (
+            "the DEPLOYED definition reads a measure outside the persona scope, "
+            "so the served value must be withheld — authorising the clean draft "
+            "definition instead is the Bug-9490 F1 bypass"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_kpi_absent_from_the_deployment_is_withheld(self, monkeypatch):
+        """No deployed definition means nothing authoritative to check against."""
+        from src.api import routes as routes_mod
+        from src.api.routes import _handle_kpi_table_query
+        from src.semantic.snapshot_resolver import SnapshotAuthority
+
+        _patch_observation(monkeypatch)
+        model_id = str(uuid.uuid4())
+        headcount_mid = uuid.uuid4()
+        persona = types.SimpleNamespace(
+            id=uuid.uuid4(), included_measure_ids=[str(headcount_mid)],
+        )
+
+        ghost = _kpi_latest("Draft Only KPI")
+        ghost.kpi_id = uuid.uuid4()
+
+        deployed_shape = types.SimpleNamespace(
+            measures=[types.SimpleNamespace(id=headcount_mid, name="Headcount")],
+            uda_column_ref_rows=[], columns_by_id={}, kpi_rows=[],
+        )
+
+        async def _authority(*_a, **_kw):
+            return SnapshotAuthority.DEPLOYED, deployed_shape
+
+        monkeypatch.setattr(routes_mod, "resolve_snapshot_authority", _authority)
+
+        db = _StatefulDB([
+            _ScalarsResult([], scalar=_fake_model(model_id)),
+            _ScalarsResult([(ghost, _kpi_def(expression='measure("Headcount")'))]),
+            _ScalarsResult([]),
+        ])
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=persona, user_identity="u@t.com", tenant_id="acme",
+        )
+        assert [r["kpi_name"] for r in resp.rows] == []
+
+    @pytest.mark.asyncio
+    async def test_unrestricted_persona_still_receives_its_scorecard(
+        self, monkeypatch,
+    ):
+        """Review finding 1A — an unrestricted persona must not get an empty
+        scorecard.
+
+        An empty ``included_measure_ids`` means UNRESTRICTED (the parser returns
+        None for it), so no lineage gate runs. The deployed-definition map was
+        only built when a gate WAS active, while the row loop demanded a entry
+        from it whenever a deployed shape existed — so every row was discarded
+        and the persona saw nothing at all. Personas that restrict only
+        dimensions, and RLS-bypass personas, hit the same state.
+        """
+        from src.api import routes as routes_mod
+        from src.api.routes import _handle_kpi_table_query
+        from src.semantic.snapshot_resolver import SnapshotAuthority
+
+        _patch_observation(monkeypatch)
+        model_id = str(uuid.uuid4())
+        kpi_id = uuid.uuid4()
+        row = _kpi_latest("Revenue KPI")
+        row.kpi_id = kpi_id
+
+        persona = types.SimpleNamespace(id=uuid.uuid4(), included_measure_ids=[])
+
+        deployed_shape = types.SimpleNamespace(
+            measures=[], uda_column_ref_rows=[], columns_by_id={},
+            kpi_rows=[{
+                "id": str(kpi_id), "name": "Revenue KPI", "expression": None,
+                "parent_kpi_id": None, "value_measure_id": None,
+                "goal_measure_id": None, "target_measure_id": None,
+            }],
+        )
+
+        async def _authority(*_a, **_kw):
+            return SnapshotAuthority.DEPLOYED, deployed_shape
+
+        monkeypatch.setattr(routes_mod, "resolve_snapshot_authority", _authority)
+
+        db = _StatefulDB([
+            _ScalarsResult([], scalar=_fake_model(model_id)),
+            _ScalarsResult([(row, _kpi_def())]),
+            _ScalarsResult([]),  # persona tag restrictions: none
+        ])
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=persona, user_identity="u@t.com", tenant_id="acme",
+        )
+        assert [r["kpi_name"] for r in resp.rows] == ["Revenue KPI"], (
+            "an unrestricted persona received an empty scorecard"
+        )
+
+
+class TestKpiSingleDeploymentAuthority:
+    """Consolidation (review 1B/1C) — ONE deployment authority per request.
+
+    The handler used to decide deployment three separate times: the value query
+    joined live ``Model.deploy_epoch``, the security shape was resolved only
+    when a persona happened to exist, and the served names came from an
+    independent ``ModelVersion`` reload. Nothing tied the three to one moment,
+    so a deploy landing mid-request could pair a value evaluated under the NEW
+    definition with lineage and metadata from the OLD one.
+
+    These guard the property that replaced it: deployment state is captured
+    once, and every consumer derives from that single capture.
+    """
+
+    class _RecordingDB(_StatefulDB):
+        """``_StatefulDB`` that keeps the text of every statement executed."""
+
+        def __init__(self, results):
+            super().__init__(results)
+            self.statements: list[str] = []
+
+        async def execute(self, stmt, *a, **kw):
+            self.statements.append(str(stmt))
+            return await super().execute(stmt, *a, **kw)
+
+    @pytest.mark.asyncio
+    async def test_deployment_state_is_read_exactly_once(self, monkeypatch):
+        """One model load and one authority resolution for the whole request.
+
+        A second read of either is a second point in time, which is the defect
+        this consolidation removed.
+        """
+        from src.api import routes as routes_mod
+        from src.api.routes import _handle_kpi_table_query
+        from src.semantic.snapshot_resolver import SnapshotAuthority
+
+        _patch_observation(monkeypatch)
+        model_id = str(uuid.uuid4())
+        latest = _kpi_latest("Revenue KPI")
+        shape = _deployed_shape(kpi_rows=[_deploy_row(latest)])
+
+        calls = {"authority": 0}
+
+        async def _authority(_model, _db):
+            calls["authority"] += 1
+            return SnapshotAuthority.DEPLOYED, shape
+
+        monkeypatch.setattr(routes_mod, "resolve_snapshot_authority", _authority)
+
+        db = self._RecordingDB([
+            _ScalarsResult([], scalar=_fake_model(model_id)),
+            _ScalarsResult([(latest, _kpi_def())]),
+        ])
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=None, user_identity="u@t.com", tenant_id="acme",
+        )
+
+        assert [r["kpi_name"] for r in resp.rows] == ["Revenue KPI"]
+        assert calls["authority"] == 1, (
+            "the deployment authority must be resolved once per request"
+        )
+        model_reads = [t for t in db.statements if "FROM models " in t]
+        assert len(model_reads) == 1, (
+            f"expected exactly one model load, got {len(model_reads)}: {db.statements}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_value_query_pins_the_captured_epoch_without_rereading_it(
+        self, monkeypatch,
+    ):
+        """The value query filters on the CAPTURED epoch, not a fresh join.
+
+        Joining ``Model`` re-read deployment state at statement time, so a
+        deploy landing between the capture and the value fetch could hand back
+        a value from one deployment to be authorised against another's lineage.
+        """
+        from src.api.routes import _handle_kpi_table_query
+
+        _patch_observation(monkeypatch)
+        model_id = str(uuid.uuid4())
+        latest = _kpi_latest("Revenue KPI")
+        _patch_authority(monkeypatch, _deployed_shape(
+            kpi_rows=[_deploy_row(latest)],
+        ))
+
+        db = self._RecordingDB([
+            _ScalarsResult([], scalar=_fake_model(model_id, deploy_epoch=7)),
+            _ScalarsResult([(latest, _kpi_def())]),
+        ])
+
+        await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=None, user_identity="u@t.com", tenant_id="acme",
+        )
+
+        value_queries = [t for t in db.statements if "kpi_latest" in t]
+        assert len(value_queries) == 1, db.statements
+        value_query = value_queries[0]
+        assert "evaluated_for_epoch" in value_query, (
+            "the served value must be pinned to a deploy epoch"
+        )
+        assert "FROM models " not in value_query and "JOIN models " not in value_query, (
+            "the value query must use the captured epoch, not re-read the "
+            f"model's deployment state: {value_query}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_undeployed_model_serves_nothing(self, monkeypatch):
+        """No deploy pointer means no captured version, so no rows are served
+        even if stale ``kpi_latest`` rows survive an undeploy."""
+        from src.api.routes import _handle_kpi_table_query
+
+        _patch_observation(monkeypatch)
+        model_id = str(uuid.uuid4())
+        latest = _kpi_latest("Stale KPI")
+        _patch_authority(monkeypatch, None)  # UNDEPLOYED
+
+        db = _StatefulDB([
+            _ScalarsResult([], scalar=_fake_model(
+                model_id, deployed_version_id=None,
+            )),
+            _ScalarsResult([(latest, _kpi_def())]),
+        ])
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=None, user_identity="u@t.com", tenant_id="acme",
+        )
+        assert resp.rows == []
+
+    @pytest.mark.asyncio
+    async def test_unreadable_deployment_snapshot_fails_closed_with_503(
+        self, monkeypatch,
+    ):
+        """A deployed model whose snapshot cannot be read is NOT 'undeployed'.
+
+        Serving it would fall back to live draft metadata. It is refused, and —
+        unlike before this consolidation — the check runs for every row-serving
+        caller, not only when a persona happens to be bound.
+        """
+        from fastapi import HTTPException
+        from src.api import routes as routes_mod
+        from src.api.routes import _handle_kpi_table_query
+        from src.semantic.snapshot_resolver import SnapshotAuthority
+
+        _patch_observation(monkeypatch)
+        model_id = str(uuid.uuid4())
+
+        async def _authority(_model, _db):
+            return SnapshotAuthority.DEPLOYED_SNAPSHOT_INVALID, None
+
+        monkeypatch.setattr(routes_mod, "resolve_snapshot_authority", _authority)
+
+        db = _StatefulDB([
+            _ScalarsResult([], scalar=_fake_model(model_id)),
+        ])
+
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_kpi_table_query(
+                db, model_id, _make_logical_query(model_id),
+                persona=None, user_identity="u@t.com", tenant_id="acme",
+            )
+        assert exc_info.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_missing_deploy_epoch_serves_nothing(self, monkeypatch):
+        """A deployed model with no epoch stamp must serve no rows.
+
+        The value predicate compares the CAPTURED epoch, and ``column == None``
+        compiles to ``IS NULL`` — which MATCHES every unstamped legacy
+        ``kpi_latest`` row rather than rejecting it. The join this replaced
+        failed closed on that case for free, because SQL ``NULL = NULL`` is not
+        true, so the capture has to refuse it explicitly.
+        """
+        from src.api.routes import _handle_kpi_table_query
+
+        _patch_observation(monkeypatch)
+        model_id = str(uuid.uuid4())
+        latest = _kpi_latest("Unstamped KPI")
+        _patch_authority(monkeypatch, _deployed_shape(
+            kpi_rows=[_deploy_row(latest)],
+        ))
+
+        db = self._RecordingDB([
+            _ScalarsResult([], scalar=_fake_model(model_id, deploy_epoch=None)),
+            # Queued but must never be consumed: the epoch check comes first.
+            _ScalarsResult([(latest, _kpi_def())]),
+        ])
+
+        resp = await _handle_kpi_table_query(
+            db, model_id, _make_logical_query(model_id),
+            persona=None, user_identity="u@t.com", tenant_id="acme",
+        )
+
+        assert resp.rows == []
+        assert not [t for t in db.statements if "kpi_latest" in t], (
+            "no value query should be issued when the epoch cannot be pinned"
+        )

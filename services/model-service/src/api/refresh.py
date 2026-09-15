@@ -163,7 +163,7 @@ async def list_refresh_runs(
         result = await db.execute(
             select(AggregateRefreshRun)
             .where(AggregateRefreshRun.aggregate_definition_id == agg_id)
-            .order_by(AggregateRefreshRun.started_at.desc())
+            .order_by(AggregateRefreshRun.started_at.desc(), AggregateRefreshRun.id.desc())
             .limit(100)
         )
         return [_serialize_run(r, table_name) for r in result.scalars().all()]
@@ -193,7 +193,7 @@ async def list_model_refresh_runs(
         result = await db.execute(
             select(AggregateRefreshRun)
             .where(AggregateRefreshRun.aggregate_definition_id.in_(list(table_by_id.keys())))
-            .order_by(AggregateRefreshRun.started_at.desc())
+            .order_by(AggregateRefreshRun.started_at.desc(), AggregateRefreshRun.id.desc())
             .limit(200)
         )
         return [

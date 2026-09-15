@@ -2,7 +2,7 @@
 title: "Configure Environment Variables"
 audience: system-admin
 area: system-admin
-updated: 2026-06-24
+updated: 2026-08-26
 ---
 
 ## What this covers
@@ -41,7 +41,7 @@ On GCP the Cloud Run services cannot reach the local Docker network. Instead of 
 |---|---|
 | `SYSTEM_DATABASE_URL` | Full PostgreSQL connection URL. Format: `postgresql+asyncpg://postgres:<password>@<vm-ip>:5432/tessallite_system` |
 
-The scripted GCP deploy (`deploy/gcp/`) sets this automatically using the Compute Engine VM's IP address. You do not set it by hand unless you are connecting to a custom database host.
+The scripted GCP deploy (`deploy/gcp/`) sets this automatically using the Compute Engine VM's IP address. You do not set it by hand unless you are connecting to a custom database host. The same deploy persists `ENFORCE_SECRET_STRENGTH=true` and passes it to every backend Cloud Run service and the VM gateway; local, test, CI, and demo defaults remain warning-only.
 
 ---
 

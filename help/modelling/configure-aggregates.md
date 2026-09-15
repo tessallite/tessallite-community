@@ -39,6 +39,10 @@ The Query Router matches an incoming query to an aggregate when the query's requ
 
 For additive measures (SUM, COUNT, AVG, MAX, MIN), the router can re-aggregate from coarser summaries. For COUNT DISTINCT, the grain must match exactly.
 
+## How aggregate builds use the model query
+
+When an aggregate is created or refreshed, the Optimizer and Scheduler submit its semantic grain and measures to the Query Router's `/api/v1/explain` endpoint with `force_route=source`. The returned SQL is the SQL materialised in the target. This keeps the model query's source relations and join closure authoritative for both full and incremental refreshes; the build services do not construct a separate executable `FROM`/`JOIN` clause.
+
 ---
 
 ## Cron schedule presets
@@ -134,11 +138,11 @@ Non-median percentiles (p90, p95, p99, and the rest) are **temporarily served fr
 
 **Functions that always hit the source.** Order-dependent or distribution-shaped functions — `MODE`, `STRING_AGG`/`ARRAY_AGG`/`LISTAGG`, and `APPROX_COUNT_DISTINCT` — cannot be served from pre-computed columns and always route to the source table.
 
-**Include all measures.** This model setting is **off by default**, and new models start with it off. With it off, each summary table holds only the measures the queries that triggered it actually asked for. That is usually what you want: a narrow summary table is faster to build, cheaper to store, and — importantly — much more likely to be usable.
+**Include all measures.** This model setting is **on by default**, and new models start with it on. With it off, each summary table holds only the measures the queries that triggered it actually asked for. Existing models keep their saved setting.
 
-Turn it on when you want every summary table on a model to carry every measure, so that a brand-new question about an existing grouping is answered instantly instead of waiting for the Optimizer to notice it. The trade is size and build time, and one subtler cost worth understanding.
+When enabled, each summary includes eligible measures that fit the same grouping and row population, so more questions can reuse it. The trade is size and build time, and one subtler cost worth understanding.
 
-**Why "all measures" is not always better.** A summary table is only allowed to answer a question when it was built over exactly the same set of rows the question would have scanned. Adding a measure that lives on a different table pulls that table into the summary's build, and if joining it drops or duplicates rows, the summary now covers a *different* population — so Tessallite refuses to answer from it and quietly goes back to the source table. Switch the setting on for a model with measures spread across several tables and you can end up with many summary tables that are never used. Tessallite guards against this automatically: when the setting is on, it only adds the measures that fit the same population as the query that triggered the build. But the narrower default avoids the problem entirely.
+**Why "all measures" is not always better.** A summary table is only allowed to answer a question when it was built over exactly the same set of rows the question would have scanned. Adding a measure that lives on a different table pulls that table into the summary's build, and if joining it drops or duplicates rows, the summary now covers a *different* population — so Tessallite refuses to answer from it and quietly goes back to the source table. Switch the setting on for a model with measures spread across several tables and you can end up with many summary tables that are never used. Tessallite guards against this automatically: when the setting is on, it only adds the measures that fit the same population as the query that triggered the build.
 
 **Existing summary tables when you change the setting.** Nothing is destroyed the moment you flip the switch.
 

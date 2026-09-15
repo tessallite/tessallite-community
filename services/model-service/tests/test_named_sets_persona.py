@@ -1,5 +1,11 @@
 """Bug-5963: named-set listing and preview must honour the active persona.
 
+Bug-9877 changed the BASIS of the decision, not the behaviour asserted here.
+The set's definition is turned into the model query it layers on and that
+query is submitted to the query-router persona path; visible iff it binds. The
+router hop is stubbed below with a gate that mirrors what ``/explain`` does
+with an allow-list, so these stay route-level behaviour tests.
+
 Tests that:
 1. Listing filters out a named set built on a dimension outside the
    persona's ``included_dimension_ids`` allow-list.
@@ -32,6 +38,29 @@ from .conftest import (
 pytestmark = pytest.mark.unit
 
 PREFIX = f"/api/v1/projects/{TEST_PROJECT_ID}/models/{TEST_MODEL_ID}/named-sets"
+
+
+def _bind_gate(allowed_dimension_names: set[str]):
+    """Stand in for query-router ``/explain``'s persona gate.
+
+    Refuses the probe when it projects a dimension outside the allow-list —
+    the same verdict the real gate reaches, without the HTTP hop.
+    """
+    async def _probe(*, model_id, sql, persona_id, bearer, timeout_s=15.0):
+        lowered = sql.lower()
+        for name in ("customer", "region", "product"):
+            if f'"{name}"' in lowered and name not in allowed_dimension_names:
+                return False
+        return True
+    return _probe
+
+
+@pytest.fixture(autouse=True)
+def _reset_visibility_cache():
+    from src.api.named_set_visibility import clear_named_set_visibility_cache
+    clear_named_set_visibility_cache()
+    yield
+    clear_named_set_visibility_cache()
 
 
 def _make_persona(*, included_dimension_ids: list | None = None):
@@ -79,13 +108,14 @@ async def test_list_named_sets_filters_out_of_persona_scope(client):
     db.execute = AsyncMock(
         side_effect=routed_execute(
             named_sets=[ns],
-            dimensions=[(customer_dim.id, customer_dim.name)],
+            dimensions=[(customer_dim.name,)],
         )
     )
 
     with (
         patch("src.api.named_sets.get_tenant_db", async_gen_from(db)),
         patch("src.api.named_sets.resolve_effective_persona", new=AsyncMock(return_value=persona)),
+        patch("src.api.named_set_visibility.probe_binds", _bind_gate(set())),
     ):
         resp = await client.get(f"{PREFIX}?persona_id={persona.id}")
 
@@ -105,13 +135,14 @@ async def test_list_named_sets_keeps_in_scope_set(client):
     db.execute = AsyncMock(
         side_effect=routed_execute(
             named_sets=[ns],
-            dimensions=[(customer_dim.id, customer_dim.name)],
+            dimensions=[(customer_dim.name,)],
         )
     )
 
     with (
         patch("src.api.named_sets.get_tenant_db", async_gen_from(db)),
         patch("src.api.named_sets.resolve_effective_persona", new=AsyncMock(return_value=persona)),
+        patch("src.api.named_set_visibility.probe_binds", _bind_gate({"customer"})),
     ):
         resp = await client.get(f"{PREFIX}?persona_id={persona.id}")
 
@@ -131,12 +162,13 @@ async def test_preview_named_set_404_when_persona_excludes_dimension(client):
     db = make_mock_db()
     db.get = AsyncMock(side_effect=[make_model(), ns])
     db.execute = AsyncMock(
-        side_effect=routed_execute(dimensions=[(customer_dim.id, customer_dim.name)])
+        side_effect=routed_execute(dimensions=[(customer_dim.name,)])
     )
 
     with (
         patch("src.api.named_sets.get_tenant_db", async_gen_from(db)),
         patch("src.api.named_sets.resolve_effective_persona", new=AsyncMock(return_value=persona)),
+        patch("src.api.named_set_visibility.probe_binds", _bind_gate(set())),
     ):
         resp = await client.post(f"{PREFIX}/{ns.id}/preview?persona_id={persona.id}")
 
@@ -157,13 +189,12 @@ async def test_preview_named_set_forwards_persona_id_to_router(client):
 
     db = make_mock_db()
     db.get = AsyncMock(side_effect=[make_model(), ns])
-    dim_result = types.SimpleNamespace(scalar=lambda: "Customer")
-    dim_result.scalars = lambda: types.SimpleNamespace(all=lambda: [])
-    meas_result = types.SimpleNamespace()
-    meas_result.all = lambda: [("Revenue", "sum")]
-
-    async def db_execute_side_effect(*_args, **_kwargs):
-        return dim_result
+    db.execute = AsyncMock(
+        side_effect=routed_execute(
+            dimensions=[("Customer",)],
+            measures=[("Revenue", "sum")],
+        )
+    )
 
     captured: dict = {}
 
@@ -177,6 +208,7 @@ async def test_preview_named_set_forwards_persona_id_to_router(client):
         patch("src.api.named_sets._resolve_dim_name", new=AsyncMock(return_value="Customer")),
         patch("src.api.named_sets._resolve_measure", new=AsyncMock(return_value=("Revenue", "sum"))),
         patch("src.api.named_sets._execute_via_router", side_effect=fake_router),
+        patch("src.api.named_set_visibility.probe_binds", _bind_gate({"customer"})),
     ):
         resp = await client.post(f"{PREFIX}/{ns.id}/preview?persona_id={persona.id}")
 

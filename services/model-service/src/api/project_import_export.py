@@ -132,6 +132,13 @@ async def export_project_endpoint(
             detail="passphrase is required when include_credentials is true",
         )
 
+    # Bug-9344 / Bug-6868: a hosted or license-classified demo may export
+    # project metadata, but its fixed source credentials must never leave the
+    # deployment. Reuse the connection/import lock before loading either
+    # credential key or any project data.
+    if body.include_credentials:
+        enforce_demo_source_locked(current_user.tenant_id)
+
     # Rotation-aware: MultiFernet encrypts under the current key and decrypts
     # under the current or any previous key (F-014-03). Drop-in for a raw
     # Fernet — the serialiser/rehydrator call .encrypt/.decrypt on it.

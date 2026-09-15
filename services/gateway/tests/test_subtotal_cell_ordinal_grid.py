@@ -26,8 +26,10 @@ business outcome a BI client observes.
 """
 from __future__ import annotations
 
+import os
 import re
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 
 from src.dax.mdx_execute import build_real_execute_response
 from src.dax.mdschema import _rows_members
@@ -39,6 +41,36 @@ from src.dax.subtotal_engine import (
 )
 
 _NS = "{urn:schemas-microsoft-com:xml-analysis:mddataset}"
+
+# Subtotal grid tests assert requested All-grain rollups. Explicitly disable the
+# emergency containment switch so they stay independent of deployment state.
+#
+# Bug-9788: the client identity here must NOT be Excel. All-grain rollup tuples
+# are one paired contract with ALL_MEMBER advertising, and Excel (which never
+# receives ALL_MEMBER) now has its All-grain tuples suppressed unconditionally —
+# the two-flat-attribute save refusal proved live that Excel cannot cache All
+# members its DISCOVER disclaimed. The ordinal-grid machinery under test is
+# client-agnostic, so these tests pin it through a client that legitimately
+# receives All tuples. The Excel-side contract (no All tuples on the axis) is
+# owned by test_bug9788_excel_rollup_all_pairing.py.
+_SUBTOTAL_GRID_CLIENT = "Tessallite Grid Harness"
+
+
+@contextmanager
+def _enable_rollup_all_grains():
+    """Env override so subtotal grid tests see requested All-grain tuples."""
+    keys = ("TESSALLITE_XMLA_ALL_MEMBER", "TESSALLITE_XMLA_SUPPRESS_ROLLUP_ALL")
+    saved = {k: os.environ.get(k) for k in keys}
+    os.environ["TESSALLITE_XMLA_ALL_MEMBER"] = "false"
+    os.environ["TESSALLITE_XMLA_SUPPRESS_ROLLUP_ALL"] = "false"
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _mk(name, mdx_dim, mdx_hier, levels, axis):
@@ -97,15 +129,17 @@ def _build_rows_only(measures):
     )
     h_geo = _mk("Geo", "Geography", "Geo", [("Country", 0, "country")], axis=1)
     h_prod = _mk("Prod", "Product", "Prod", [("Category", 0, "category")], axis=1)
-    return build_real_execute_response(
-        mdx=mdx, catalog="demo",
-        columns=["country", "category", *measures],
-        rows=_rows_only_data(),
-        measures_meta=[{"name": m, "default_agg": "sum"} for m in measures],
-        dimensions_meta=[{"name": "country"}, {"name": "category"}],
-        client_app_name="Excel",
-        subtotal_hierarchies=[h_geo, h_prod],
-    )
+    with _enable_rollup_all_grains():
+        return build_real_execute_response(
+            mdx=mdx, catalog="demo",
+            columns=["country", "category", *measures],
+            rows=_rows_only_data(),
+            measures_meta=[{"name": m, "default_agg": "sum"} for m in measures],
+            dimensions_meta=[{"name": "country"}, {"name": "category"}],
+            client_app_name=_SUBTOTAL_GRID_CLIENT,
+            axis_format="tupleformat",
+            subtotal_hierarchies=[h_geo, h_prod],
+        )
 
 
 def test_rows_one_measure():
@@ -116,8 +150,8 @@ def test_rows_one_measure():
     by_tuple = {tuple(c): cells[i] for i, c in enumerate(axes["Axis1"])}
     assert by_tuple[("France", "Bikes")] == 100.0
     assert by_tuple[("France", "Cars")] == 200.0
-    assert by_tuple[("France", "All")] == 300.0
-    assert by_tuple[("All", "All")] == 300.0
+    assert by_tuple[("France", "All Product")] == 300.0
+    assert by_tuple[("All Geography", "All Product")] == 300.0
 
 
 def test_rows_two_measures():
@@ -136,7 +170,7 @@ def test_rows_two_measures():
     r_fb = row_pos[("France", "Bikes")]
     assert cells[r_fb * n_axis0 + amt] == 100.0
     assert cells[r_fb * n_axis0 + qty] == 1.0
-    r_all = row_pos[("All", "All")]
+    r_all = row_pos[("All Geography", "All Product")]
     assert cells[r_all * n_axis0 + amt] == 300.0
     assert cells[r_all * n_axis0 + qty] == 3.0
 
@@ -159,15 +193,17 @@ def _build_cols_only(measures):
     )
     h_geo = _mk("Geo", "Geography", "Geo", [("Country", 0, "country")], axis=0)
     h_prod = _mk("Prod", "Product", "Prod", [("Category", 0, "category")], axis=0)
-    return build_real_execute_response(
-        mdx=mdx, catalog="demo",
-        columns=["country", "category", *measures],
-        rows=rows,
-        measures_meta=[{"name": m, "default_agg": "sum"} for m in measures],
-        dimensions_meta=[{"name": "country"}, {"name": "category"}],
-        client_app_name="Excel",
-        subtotal_hierarchies=[h_geo, h_prod],
-    )
+    with _enable_rollup_all_grains():
+        return build_real_execute_response(
+            mdx=mdx, catalog="demo",
+            columns=["country", "category", *measures],
+            rows=rows,
+            measures_meta=[{"name": m, "default_agg": "sum"} for m in measures],
+            dimensions_meta=[{"name": "country"}, {"name": "category"}],
+            client_app_name=_SUBTOTAL_GRID_CLIENT,
+            axis_format="tupleformat",
+            subtotal_hierarchies=[h_geo, h_prod],
+        )
 
 
 def test_cols_one_measure():
@@ -179,8 +215,8 @@ def test_cols_one_measure():
     # single measure: ordinal == col position
     col_pos = {tuple(c): i for i, c in enumerate(axes["Axis0"])}
     assert cells[col_pos[("France", "Bikes")]] == 11.0
-    assert cells[col_pos[("France", "All")]] == 12.0
-    assert cells[col_pos[("All", "All")]] == 13.0
+    assert cells[col_pos[("France", "All Product")]] == 12.0
+    assert cells[col_pos[("All Geography", "All Product")]] == 13.0
 
 
 def test_cols_two_measures_ordinal_is_axis_major():
@@ -198,11 +234,11 @@ def test_cols_two_measures_ordinal_is_axis_major():
     amt, qty = m_pos[("Amount",)], m_pos[("Qty",)]
     # Amount row occupies the whole first Axis0 span; Qty the second.
     assert cells[amt * n_axis0 + col_pos[("France", "Bikes")]] == 11.0
-    assert cells[amt * n_axis0 + col_pos[("France", "All")]] == 12.0
-    assert cells[amt * n_axis0 + col_pos[("All", "All")]] == 13.0
+    assert cells[amt * n_axis0 + col_pos[("France", "All Product")]] == 12.0
+    assert cells[amt * n_axis0 + col_pos[("All Geography", "All Product")]] == 13.0
     assert cells[qty * n_axis0 + col_pos[("France", "Bikes")]] == 91.0
-    assert cells[qty * n_axis0 + col_pos[("France", "All")]] == 92.0
-    assert cells[qty * n_axis0 + col_pos[("All", "All")]] == 93.0
+    assert cells[qty * n_axis0 + col_pos[("France", "All Product")]] == 92.0
+    assert cells[qty * n_axis0 + col_pos[("All Geography", "All Product")]] == 93.0
 
 
 # ---------------------------------------------------------------------------
@@ -240,15 +276,17 @@ def _build_mirror(measures):
             "[channel].[channel].MEMBERS ON ROWS FROM [demo]"
         )
     h_prod = _mk("Prod", "Product", "Prod", [("Category", 0, "category")], axis=0)
-    return build_real_execute_response(
-        mdx=mdx, catalog="demo",
-        columns=["channel", "category", *measures],
-        rows=rows,
-        measures_meta=[{"name": m, "default_agg": "sum"} for m in measures],
-        dimensions_meta=[{"name": "channel"}, {"name": "category"}],
-        client_app_name="Excel",
-        subtotal_hierarchy=h_prod,
-    )
+    with _enable_rollup_all_grains():
+        return build_real_execute_response(
+            mdx=mdx, catalog="demo",
+            columns=["channel", "category", *measures],
+            rows=rows,
+            measures_meta=[{"name": m, "default_agg": "sum"} for m in measures],
+            dimensions_meta=[{"name": "channel"}, {"name": "category"}],
+            client_app_name=_SUBTOTAL_GRID_CLIENT,
+            axis_format="tupleformat",
+            subtotal_hierarchy=h_prod,
+        )
 
 
 def test_mirror_one_measure():
@@ -262,7 +300,7 @@ def test_mirror_one_measure():
     # Axis0 = deduplicated category subtotal members.
     col_caps = [tuple(c) for c in axes["Axis0"]]
     assert ("Bikes",) in col_caps
-    assert ("All",) in col_caps
+    assert ("All Product",) in col_caps
     assert len(col_caps) == len(set(col_caps)), "Axis0 not deduplicated"
     n_axis0 = len(col_caps)
     row_caps = [tuple(c) for c in axes["Axis1"]]
@@ -270,9 +308,9 @@ def test_mirror_one_measure():
     col_pos = {c: i for i, c in enumerate(col_caps)}
     row_pos = {c: i for i, c in enumerate(row_caps)}
     assert cells[row_pos[("Web",)] * n_axis0 + col_pos[("Bikes",)]] == 10.0
-    assert cells[row_pos[("Web",)] * n_axis0 + col_pos[("All",)]] == 15.0
+    assert cells[row_pos[("Web",)] * n_axis0 + col_pos[("All Product",)]] == 15.0
     assert cells[row_pos[("Store",)] * n_axis0 + col_pos[("Bikes",)]] == 20.0
-    assert cells[row_pos[("Store",)] * n_axis0 + col_pos[("All",)]] == 20.0
+    assert cells[row_pos[("Store",)] * n_axis0 + col_pos[("All Product",)]] == 20.0
 
 
 def test_mirror_two_measures():
@@ -290,8 +328,8 @@ def test_mirror_two_measures():
     # Web/Bikes/Amount and Web/Bikes/Qty land at distinct ordinals.
     assert cells[row_pos[("Web",)] * n_axis0 + col_pos[("Bikes", "Amount")]] == 10.0
     assert cells[row_pos[("Web",)] * n_axis0 + col_pos[("Bikes", "Qty")]] == 1.0
-    assert cells[row_pos[("Store",)] * n_axis0 + col_pos[("All", "Amount")]] == 20.0
-    assert cells[row_pos[("Store",)] * n_axis0 + col_pos[("All", "Qty")]] == 4.0
+    assert cells[row_pos[("Store",)] * n_axis0 + col_pos[("All Product", "Amount")]] == 20.0
+    assert cells[row_pos[("Store",)] * n_axis0 + col_pos[("All Product", "Qty")]] == 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -308,14 +346,16 @@ def _build_flat(measures):
         f"SELECT {measure_set} ON COLUMNS, "
         "[country].[country].MEMBERS ON ROWS FROM [demo]"
     )
-    return build_real_execute_response(
-        mdx=mdx, catalog="demo",
-        columns=["country", *measures],
-        rows=rows,
-        measures_meta=[{"name": m, "default_agg": "sum"} for m in measures],
-        dimensions_meta=[{"name": "country"}],
-        client_app_name="Excel",
-    )
+    with _enable_rollup_all_grains():
+        return build_real_execute_response(
+            mdx=mdx, catalog="demo",
+            columns=["country", *measures],
+            rows=rows,
+            measures_meta=[{"name": m, "default_agg": "sum"} for m in measures],
+            dimensions_meta=[{"name": "country"}],
+            client_app_name=_SUBTOTAL_GRID_CLIENT,
+            axis_format="tupleformat",
+        )
 
 
 def test_flat_one_measure():
@@ -352,10 +392,12 @@ def _discover_members(dname, level_names, members_by_level):
         restrictions={},
         member_data=member_data,
     )
-    # Bug-6891: hierarchies group under [Hierarchies]; select by hierarchy grammar.
+    # Bug-6891 groups hierarchies under [Hierarchies], and Bug-9771 makes the
+    # hierarchy unique name carry that owning dimension as its prefix. Select on
+    # the trailing hierarchy-name segment, which is stable either way.
     return [
         r for r in rows
-        if str(r.get("HIERARCHY_UNIQUE_NAME", "")).startswith(f"[{dname}].")
+        if str(r.get("HIERARCHY_UNIQUE_NAME", "")).endswith(f".[{dname}]")
     ]
 
 
@@ -389,15 +431,17 @@ def test_discover_member_unames_match_execute_for_subtotal_hierarchy():
         "SELECT {[Measures].[Amount]} ON COLUMNS, "
         "[Calendar].[Cal].MEMBERS ON ROWS FROM [demo]"
     )
-    xml = build_real_execute_response(
-        mdx=mdx, catalog="demo",
-        columns=["year", "month", "Amount"],
-        rows=rows,
-        measures_meta=[{"name": "Amount", "default_agg": "sum"}],
-        dimensions_meta=[{"name": "year"}, {"name": "month"}],
-        client_app_name="Excel",
-        subtotal_hierarchy=h_cal,
-    )
+    with _enable_rollup_all_grains():
+        xml = build_real_execute_response(
+            mdx=mdx, catalog="demo",
+            columns=["year", "month", "Amount"],
+            rows=rows,
+            measures_meta=[{"name": "Amount", "default_agg": "sum"}],
+            dimensions_meta=[{"name": "year"}, {"name": "month"}],
+            client_app_name=_SUBTOTAL_GRID_CLIENT,
+            axis_format="tupleformat",
+            subtotal_hierarchy=h_cal,
+        )
     _, _, unames = _parse(xml)
     execute_unames = {u for t in unames["Axis1"] for u in t}
     # The path-qualified month members the Execute (subtotal) axis emits.
@@ -425,10 +469,10 @@ def test_discover_member_unames_match_execute_for_subtotal_hierarchy():
     discover_unames = [r["MEMBER_UNIQUE_NAME"] for r in members]
 
     # The two month-4 members are now DISTINCT canonical unames, each emitted once.
-    assert discover_unames.count("[Calendar].[Calendar].[Month].&[2025]&[4]") == 1
-    assert discover_unames.count("[Calendar].[Calendar].[Month].&[2026]&[4]") == 1
+    assert discover_unames.count("[Hierarchies].[Calendar].[Month].&[2025]&[4]") == 1
+    assert discover_unames.count("[Hierarchies].[Calendar].[Month].&[2026]&[4]") == 1
     # The old caption-form collision string is no longer emitted at all.
-    assert "[Calendar].[Calendar].[4]" not in discover_unames
+    assert "[Hierarchies].[Calendar].[4]" not in discover_unames
 
     # Identity is now separate from the display caption: both month-4 members keep
     # MEMBER_CAPTION "4" (the human label) but carry distinct keys/unique names.
@@ -436,13 +480,13 @@ def test_discover_member_unames_match_execute_for_subtotal_hierarchy():
     assert len(month_4_rows) == 2
     assert all(r["MEMBER_CAPTION"] == "4" for r in month_4_rows)
     assert {r["MEMBER_UNIQUE_NAME"] for r in month_4_rows} == {
-        "[Calendar].[Calendar].[Month].&[2025]&[4]",
-        "[Calendar].[Calendar].[Month].&[2026]&[4]",
+        "[Hierarchies].[Calendar].[Month].&[2025]&[4]",
+        "[Hierarchies].[Calendar].[Month].&[2026]&[4]",
     }
     # PARENT_UNIQUE_NAME is the canonical parent (year) path, not caption form.
     assert {r["PARENT_UNIQUE_NAME"] for r in month_4_rows} == {
-        "[Calendar].[Calendar].[Year].&[2025]",
-        "[Calendar].[Calendar].[Year].&[2026]",
+        "[Hierarchies].[Calendar].[Year].&[2025]",
+        "[Hierarchies].[Calendar].[Year].&[2026]",
     }
 
     # DISCOVER<->Execute parity: DISCOVER members use the identical key-path grammar
@@ -451,3 +495,145 @@ def test_discover_member_unames_match_execute_for_subtotal_hierarchy():
     for u in discover_unames:
         if "].[Month]." in u:
             assert ".&[" in u, f"month member must be path-qualified, got {u}"
+
+
+def test_bug_9644_flat_rollup_member_unames_match_discover():
+    """Bug-9789: a flat rollup axis must reuse its DISCOVER member identity.
+
+    Excel builds its OLAP PivotCache from ``MDSCHEMA_MEMBERS`` and later sees
+    the same members on an Execute axis.  A two-attribute CrossJoin takes the
+    subtotal path, so this guards the production shape that corrupted the
+    workbook while preserving the independently-covered multi-level key path.
+    """
+    grain = SUBTOTAL_GRAIN_PREFIX
+    h_account = _mk(
+        "account_type", "account_type", "account_type",
+        [("account_type", 0, "account_type")], axis=1,
+    )
+    h_channel = _mk(
+        "channel_name", "channel_name", "channel_name",
+        [("channel_name", 0, "channel_name")], axis=1,
+    )
+    rows = [
+        {
+            "account_type": "CREDIT", "channel_name": "Web", "Amount": 90,
+            grain + "account_type": 0, grain + "channel_name": 0,
+        },
+        {
+            "account_type": "CREDIT", "channel_name": "", "Amount": 100,
+            grain + "account_type": 0, grain + "channel_name": -1,
+        },
+        {
+            "account_type": "", "channel_name": "", "Amount": 100,
+            grain + "account_type": -1, grain + "channel_name": -1,
+        },
+    ]
+    xml = build_real_execute_response(
+        mdx=(
+            "SELECT {[Measures].[Amount]} ON COLUMNS, CrossJoin("
+            "[account_type].[account_type].[(All)].Members, "
+            "[channel_name].[channel_name].[(All)].Members) ON ROWS "
+            "FROM [demo]"
+        ),
+        catalog="demo",
+        columns=["account_type", "channel_name", "Amount"],
+        rows=rows,
+        measures_meta=[{"name": "Amount", "default_agg": "sum"}],
+        dimensions_meta=[{"name": "account_type"}, {"name": "channel_name"}],
+        client_app_name="Excel",
+        subtotal_hierarchies=[h_account, h_channel],
+    )
+    _, _, unames = _parse(xml)
+    execute_regular = {
+        uname
+        for member_tuple in unames["Axis1"]
+        for uname in member_tuple
+        if uname and not uname.endswith(".[All]")
+    }
+
+    discover_regular: set[str] = set()
+    for dname, member_name in (("account_type", "CREDIT"), ("channel_name", "Web")):
+        # Discover under the SAME client identity Execute ran with. Bug-9772:
+        # for Excel that declares the calculated Total (MEMBER_TYPE=4) beside
+        # the regular members, and Execute now carries the rollup rows on it —
+        # so parity is asserted over both, a stronger guard than before.
+        discovered = _rows_members(
+            catalog="demo",
+            measures=[],
+            dimensions=[{"name": dname}],
+            restrictions={},
+            member_data={
+                dname: {
+                    "members": [
+                        {"name": member_name, "ordinal": 0, "parent": ""},
+                    ],
+                },
+            },
+            properties={"SspropInitAppName": "Excel"},
+        )
+        discover_regular.update(
+            row["MEMBER_UNIQUE_NAME"]
+            for row in discovered
+            if row["MEMBER_TYPE"] in ("1", "4")
+        )
+
+    assert execute_regular == discover_regular
+
+
+def test_bug_9644_suppress_rollup_all_drops_all_axis_members(monkeypatch):
+    """Containment mode omits All grains from rollup axes.
+
+    Axis and cell counts stay aligned because the filter runs before both
+    builders. Env force keeps the unit test independent of client app name.
+    """
+    monkeypatch.setenv("TESSALLITE_XMLA_SUPPRESS_ROLLUP_ALL", "true")
+    grain = SUBTOTAL_GRAIN_PREFIX
+    h_account = _mk(
+        "account_type", "account_type", "account_type",
+        [("account_type", 0, "account_type")], axis=1,
+    )
+    h_channel = _mk(
+        "channel_name", "channel_name", "channel_name",
+        [("channel_name", 0, "channel_name")], axis=1,
+    )
+    rows = [
+        {
+            "account_type": "CREDIT", "channel_name": "Web", "Amount": 90,
+            grain + "account_type": 0, grain + "channel_name": 0,
+        },
+        {
+            "account_type": "CREDIT", "channel_name": "", "Amount": 100,
+            grain + "account_type": 0, grain + "channel_name": -1,
+        },
+        {
+            "account_type": "", "channel_name": "", "Amount": 100,
+            grain + "account_type": -1, grain + "channel_name": -1,
+        },
+    ]
+    xml = build_real_execute_response(
+        mdx=(
+            "SELECT {[Measures].[Amount]} ON COLUMNS, CrossJoin("
+            "[account_type].[account_type].[(All)].Members, "
+            "[channel_name].[channel_name].[(All)].Members) ON ROWS "
+            "FROM [demo]"
+        ),
+        catalog="demo",
+        columns=["account_type", "channel_name", "Amount"],
+        rows=rows,
+        measures_meta=[{"name": "Amount", "default_agg": "sum"}],
+        dimensions_meta=[{"name": "account_type"}, {"name": "channel_name"}],
+        client_app_name=_SUBTOTAL_GRID_CLIENT,
+            axis_format="tupleformat",
+        subtotal_hierarchies=[h_account, h_channel],
+    )
+    axes, cells, unames = _parse(xml)
+    axis_unames = {
+        uname
+        for member_tuple in unames["Axis1"]
+        for uname in member_tuple
+        if uname
+    }
+    assert axes["Axis1"] == [["CREDIT", "Web"]]
+    assert not any(u.endswith(".[All]") for u in axis_unames)
+    assert cells == {0: 90.0}
+    assert len(_ordinals(xml)) == len(cells)

@@ -4,6 +4,7 @@ import { useChatContext } from "../providers/ChatProvider";
 
 interface CitationChipsProps {
   citations: Citation[];
+  compact?: boolean;
   // Bug-8181 — each chip is independently checkable now (opens its OWN
   // provenance dialog), so the handler receives the citation that was
   // clicked rather than firing one shared action for every chip.
@@ -36,7 +37,7 @@ function chipLabel(c: Citation, index: number): string {
   return formatted ? `${name}: ${formatted}` : name;
 }
 
-export function CitationChips({ citations, onClick }: CitationChipsProps) {
+export function CitationChips({ citations, onClick, compact = false }: CitationChipsProps) {
   const { t } = useChatContext();
   if (!citations.length) return null;
 
@@ -46,7 +47,9 @@ export function CitationChips({ citations, onClick }: CitationChipsProps) {
       aria-label={t("citations.label")}
     >
       {citations.map((c, i) => {
-        const label = chipLabel(c, i);
+        const label = compact
+          ? `${c.display_name || c.name || `[${i + 1}]`} · ${c.kind || t("citations.source").toLowerCase()}`
+          : chipLabel(c, i);
         const tooltip = c.kind
           ? `${c.kind === "measure" ? t("citations.measure") : t("citations.dimension")}: ${c.display_name || c.name || ""}`.trim()
           : t("citations.source");
@@ -57,10 +60,11 @@ export function CitationChips({ citations, onClick }: CitationChipsProps) {
               size="small"
               onClick={onClick ? () => onClick(c, i) : undefined}
               sx={{
-                fontSize: 11,
-                height: 20,
-                maxWidth: 320,
+                fontSize: compact ? 10 : 11,
+                height: compact ? 16 : 20,
+                maxWidth: compact ? 240 : 320,
                 cursor: onClick ? "pointer" : undefined,
+                ...(compact ? { borderRadius: 1, px: 0.25 } : {}),
               }}
             />
           </Tooltip>

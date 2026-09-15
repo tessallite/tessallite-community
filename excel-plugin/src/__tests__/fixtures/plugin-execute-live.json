@@ -1,0 +1,212 @@
+{
+  "admin_sum_and_count": {
+    "status": 200,
+    "body": {
+      "query": {
+        "measures": [
+          "base_amount",
+          "transaction_count"
+        ],
+        "dimensions": [],
+        "measure_filters": [],
+        "limit": 50000,
+        "offset": 0
+      },
+      "data": [
+        {
+          "base_amount": 180442041.28,
+          "transaction_count": 100000
+        }
+      ],
+      "annotation": {
+        "measures": {
+          "base_amount": {
+            "title": "base amount",
+            "type": "sum",
+            "format": "decimal_3"
+          },
+          "transaction_count": {
+            "title": "transaction count",
+            "type": "sum",
+            "format": null
+          }
+        },
+        "dimensions": {},
+        "timeDimensions": {}
+      },
+      "row_limit": 50000,
+      "has_more": false,
+      "complete": true,
+      "security_rules_applied": []
+    }
+  },
+  "admin_count_distinct": {
+    "status": 200,
+    "body": {
+      "query": {
+        "measures": [
+          "unique_customers"
+        ],
+        "dimensions": [],
+        "measure_filters": [],
+        "limit": 50000,
+        "offset": 0
+      },
+      "data": [
+        {
+          "unique_customers": 99993
+        }
+      ],
+      "annotation": {
+        "measures": {
+          "unique_customers": {
+            "title": "Unique Customers",
+            "type": "count_distinct",
+            "format": "#,##0"
+          }
+        },
+        "dimensions": {},
+        "timeDimensions": {}
+      },
+      "row_limit": 50000,
+      "has_more": false,
+      "complete": true,
+      "security_rules_applied": []
+    }
+  },
+  "admin_variant_with_time_grain": {
+    "status": 200,
+    "body": {
+      "query": {
+        "measures": [
+          "base_amount_ytd"
+        ],
+        "dimensions": [
+          "business_date_calendar_year"
+        ],
+        "measure_filters": [],
+        "limit": 50000,
+        "offset": 0
+      },
+      "data": [
+        {
+          "business_date_calendar_year": "2025",
+          "base_amount_ytd": 58314825.8
+        },
+        {
+          "business_date_calendar_year": "2026",
+          "base_amount_ytd": 122127215.48
+        }
+      ],
+      "annotation": {
+        "measures": {
+          "base_amount_ytd": {
+            "title": "Base amount ytd",
+            "type": "sum",
+            "format": "decimal_3"
+          }
+        },
+        "dimensions": {
+          "business_date_calendar_year": {
+            "title": "Year (business_date Calendar)",
+            "type": "string"
+          }
+        },
+        "timeDimensions": {
+          "business_date_calendar_year": {
+            "title": "Year (business_date Calendar)",
+            "type": "time"
+          }
+        }
+      },
+      "row_limit": 50000,
+      "has_more": false,
+      "complete": true,
+      "security_rules_applied": []
+    }
+  },
+  "deny_all_count_distinct": {
+    "status": 200,
+    "body": {
+      "query": {
+        "measures": [
+          "unique_customers"
+        ],
+        "dimensions": [],
+        "measure_filters": [],
+        "limit": 50000,
+        "offset": 0
+      },
+      "data": [
+        {
+          "unique_customers": 0
+        }
+      ],
+      "annotation": {
+        "measures": {
+          "unique_customers": {
+            "title": "Unique Customers",
+            "type": "count_distinct",
+            "format": "#,##0"
+          }
+        },
+        "dimensions": {},
+        "timeDimensions": {}
+      },
+      "row_limit": 50000,
+      "has_more": false,
+      "complete": true,
+      "security_rules_applied": [
+        "__deny_all__"
+      ]
+    }
+  },
+  "deny_all_sum": {
+    "status": 200,
+    "body": {
+      "query": {
+        "measures": [
+          "base_amount"
+        ],
+        "dimensions": [],
+        "measure_filters": [],
+        "limit": 50000,
+        "offset": 0
+      },
+      "data": [
+        {
+          "base_amount": null
+        }
+      ],
+      "annotation": {
+        "measures": {
+          "base_amount": {
+            "title": "base amount",
+            "type": "sum",
+            "format": "decimal_3"
+          }
+        },
+        "dimensions": {},
+        "timeDimensions": {}
+      },
+      "row_limit": 50000,
+      "has_more": false,
+      "complete": true,
+      "security_rules_applied": [
+        "__deny_all__"
+      ]
+    }
+  },
+  "refused_measure_422": {
+    "status": 422,
+    "body": {
+      "detail": "Unknown column: 'not_a_measure' in model 'modely'"
+    }
+  },
+  "variant_without_time_grain_422": {
+    "status": 422,
+    "body": {
+      "detail": "Period-aware time variant requires a time dimension in the query grain; none was found."
+    }
+  }
+}

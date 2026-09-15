@@ -28,13 +28,16 @@ When you preview or dry-run a model export, Tessallite maps these objects into g
 | Measures | Metric assets |
 | KPIs | KPI assets |
 | Glossary terms | Business Term assets |
-| Downstream assets | Report / Dashboard / Application assets |
+| Downstream assets (dashboards, reports, APIs) | Report assets |
 | Aggregates | Table assets (materialized) |
 | Data tags | Data Classification assets |
+| Materialisation targets (technical export only) | Data Store assets |
+
+Every downstream asset uses the same default asset type (`Report`), whatever kind of consumer it represents; if your Collibra operating model separates dashboards from reports or applications, override the asset type as described in Step 4.
 
 Each asset carries its Tessallite attributes (descriptions, types, formulas, visibility). Relationships link assets together — for example, a Metric "is based on" a Measure, which "is source of" a Column.
 
-Ownership information becomes Collibra responsibilities, so stewards can see who owns each governed asset. Ownership is exported for objects that carry an explicit owner: **KPIs** (their owner) and **downstream assets** (reports, dashboards, applications). Measures and dimensions do not carry an owner field, so they are exported without a responsibility.
+Ownership information becomes Collibra responsibilities, so stewards can see who owns each governed asset. Ownership is exported for objects that carry an explicit owner: **KPIs** (their owner) and **downstream assets** (reports, dashboards, applications). Measures and dimensions do not carry an owner field, so they are exported without a responsibility. The responsibility carries the owner value exactly as it is stored on the object in Tessallite — for a KPI that is the internal Tessallite user identifier — so plan how those identifiers map to Collibra users or groups before a live push is available.
 
 Lifecycle statuses are mapped automatically:
 - Deployed models → **Accepted**
@@ -72,6 +75,11 @@ Before you start, ask your Collibra administrator for:
 1. In the settings drawer, scroll the tabs until you see **Collibra**.
 2. Click the Collibra tab.
 
+The tab appears only for users who may author this model. Creating, editing,
+deleting, activating and deactivating a connection require a tenant admin;
+Test Connection and Dry Run require a modeller; the preview, run history and
+mapping lists are readable by any user who can open the model.
+
 ### Step 4 — Add a connection
 
 1. Click the **Add Connection** button.
@@ -82,6 +90,16 @@ Before you start, ask your Collibra administrator for:
    - **Community ID** — the Collibra Community ID from Step 1
    - **Domain ID** — the Collibra Domain ID from Step 1
 3. Click **Save**.
+
+The dialog collects those five values and nothing else. A connection can also
+carry custom asset-type, relation-type and responsibility-role names for a
+Collibra operating model that does not use the defaults, but those overrides
+are not editable in this dialog: set them with the Collibra configuration API
+(`PUT /api/v1/projects/{project_id}/models/{model_id}/collibra/config/{connection_id}`,
+fields `asset_type_mapping`, `relation_type_mapping`,
+`responsibility_mapping`). The effective mapping — defaults merged with your
+overrides — is readable at
+`GET /api/v1/projects/{project_id}/models/{model_id}/collibra/asset-types?connection_id={connection_id}`.
 
 ### Step 5 — Test the connection
 
@@ -98,14 +116,34 @@ Before you start, ask your Collibra administrator for:
    - How many **responsibilities** will be assigned (ownership mappings)
 3. The preview breaks down counts by asset type so you can verify coverage.
 
+A preview is a calculation only: it does not create a run in history and it
+contacts nothing outside Tessallite.
+
 ### Step 7 — Dry run
 
 1. Click the **Dry Run** button.
 2. Tessallite runs the full sync pipeline — builds the graph, maps to Collibra assets/relations/responsibilities, calculates what would change — but does NOT push to Collibra.
+3. A row appears in **Run History** with mode `Dry run`, status `Succeeded`, the asset and relation counts, the model snapshot the run was built from, and any governance warnings.
+
+The run row is the only thing the dry run writes. No object mapping, no
+deprecation record, and no remote change is stored.
 
 ### Step 8 — Live push (not yet available)
 
-Live push to Collibra is not implemented in this build, so the **Sync** button is disabled. The dry run in Step 7 lets you confirm exactly what would be created. When a live Collibra client is wired in, this button will push the previewed assets, relations, and responsibilities and record the result in run history.
+Live push to Collibra is not implemented in this build. In the Collibra tab the
+push button is disabled and reads **Sync Unavailable**; hovering it explains
+that live push is not implemented and that Dry Run is the way to validate the
+export payload. Pressing it does nothing, because it cannot be pressed.
+
+Calling the API directly does not get further. A sync request with
+`dry_run: false` is refused at the boundary with HTTP 501 and the code
+`collibra_push_not_implemented`, before any graph is built, and the refused
+attempt is recorded as a `collibra.sync.rejected` audit event naming the
+connection and the reason.
+
+The dry run in Step 7 lets you confirm exactly what would be created. When a
+live Collibra client is wired in, this button will push the previewed assets,
+relations, and responsibilities and record the result in run history.
 
 ## Available now: preview and dry run
 
@@ -131,12 +169,13 @@ the fingerprints above will drive an incremental create/update/deprecate diff.
 Live validation and live push are **not implemented** in this build. Until a
 tenant-specific Collibra client is wired in, the following do NOT happen:
 
-- **Live push** — the Sync button is disabled and the API returns "not
-  implemented". No asset, relation, or responsibility is created or updated in
-  Collibra.
-- **Remote deprecation** — when you remove objects from your model, the dry run
-  records them as removed locally, but nothing is marked Deprecated inside
-  Collibra, because no remote call is made.
+- **Live push** — the push button reads **Sync Unavailable** and is disabled,
+  and the API refuses a non-dry-run request with "not implemented". No asset,
+  relation, or responsibility is created or updated in Collibra.
+- **Remote deprecation** — removing an object from your model deprecates
+  nothing, in Collibra or in Tessallite. The deprecation step runs only in push
+  mode, which is refused, so a dry run neither marks the object Deprecated
+  remotely nor records the removal locally.
 - **Live connection checks** — Test Connection is simulated (see Step 5); a
   wrong URL, expired token, or missing Community/Domain is not caught until live
   validation exists.
@@ -151,7 +190,7 @@ deprecation, and troubleshooting behaviour it introduces.
 - **Read the governance warnings** — A dry run flags objects missing a description or owner, and KPIs / calculated measures whose expression could not be fully resolved.
 - **Check the recorded snapshot** — Each run records the exact model snapshot it was built from.
 - **Business vs Technical** — The export supports separate business and technical views. Hidden columns are included in technical exports with `is_hidden = true` metadata.
-- **Asset type mappings** — The default asset type names work with standard Collibra installations. If your organization uses custom asset types, configure the mapping in the connection settings.
+- **Asset type mappings** — The default asset type names work with standard Collibra installations. If your organization uses custom asset types, set the per-connection overrides through the configuration API shown in Step 4; there is no mapping editor in the Collibra tab yet.
 
 ## Troubleshooting (preview / dry run)
 
@@ -165,7 +204,7 @@ troubleshooting yet because no remote call is made.
 | Preview shows 0 assets | Model has no objects yet | Add tables, measures, dimensions first |
 | Preview warns about unresolved KPI/measure lineage | A KPI or calculated-measure expression references a measure that is missing or misspelled | Open the measure/KPI and fix the reference |
 | "Model not deployed" warning | Model has no deployed version | Deploy the model first |
-| Missing asset types | Custom Collibra setup | Use the asset type mapping config to match your Collibra operating model |
+| Preview shows a Collibra asset type your operating model does not have | Your Collibra setup renames or omits the default types | Set the per-connection type overrides through the configuration API in Step 4. Tessallite cannot detect the mismatch for you: the missing-type check belongs to live validation, which is not implemented, so Test Connection always reports no missing types |
 
 ## Related
 

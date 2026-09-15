@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from result_fakes import ScalarResult
 from fastapi import HTTPException
 
 from src.api.routes import ExecuteRequest, _handle_execute, _handle_explain, _handle_validate
@@ -146,7 +147,7 @@ class _EmptyResult:
         self._rows = list(rows or [])
 
     def scalars(self):
-        return self
+        return ScalarResult(self._rows)
 
     def all(self):
         return list(self._rows)
@@ -507,3 +508,63 @@ async def test_explain_blocks_incompatible_fields_before_routing(monkeypatch):
     detail = exc_info.value.detail
     assert detail["error_type"] == "field_compatibility"
     assert detail["field_compatibility"]["issues"][0]["dimension_name"] == "teacher_name"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coverage", ["active", "pending", "absent"])
+@pytest.mark.parametrize("force_source", [True, False])
+async def test_source_build_compatibility_independent_of_inventory(monkeypatch, coverage, force_source):
+    logical, bound, metadata = _fixture()
+    measure = metadata[0][0]
+    measure.is_additive = False
+    # A declared relationship makes this a valid source grouping.
+    metadata[4].append(_Join(uuid4(), metadata[2][0].id, metadata[2][2].id))
+    other = SimpleNamespace(id=uuid4(), status="active", grain=["school"])
+    target = SimpleNamespace(id=uuid4(), status=coverage, grain=["teacher_name"])
+    metadata[6].append(other)
+    metadata[7].append(SimpleNamespace(aggregate_definition_id=other.id, measure_id=measure.id))
+    if coverage != "absent":
+        metadata[6].append(target)
+        metadata[7].append(SimpleNamespace(aggregate_definition_id=target.id, measure_id=measure.id))
+    _patch_parse_bind_and_metadata(monkeypatch, logical, bound, metadata)
+    request = _request(bound.model.id)
+    request.force_route = "source" if force_source else None
+    response = await _handle_validate(request, _EmptyDB())
+    assert response.ok is (force_source or coverage == "active")
+
+
+@pytest.mark.asyncio
+async def test_source_build_still_rejects_missing_relationship(monkeypatch):
+    logical, bound, metadata = _fixture()
+    _patch_parse_bind_and_metadata(monkeypatch, logical, bound, metadata)
+    request = _request(bound.model.id)
+    request.force_route = "source"
+    response = await _handle_validate(request, _EmptyDB())
+    assert not response.ok
+    assert response.field_compatibility.issues[0].code == "NO_JOIN_PATH"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler", [_handle_explain, _handle_execute])
+async def test_source_build_reaches_router_without_matching_aggregate(monkeypatch, handler):
+    from src.api import routes as routes_mod
+    logical, bound, metadata = _fixture()
+    measure = metadata[0][0]
+    measure.is_additive = False
+    metadata[4].append(_Join(uuid4(), metadata[2][0].id, metadata[2][2].id))
+    aggregate = SimpleNamespace(id=uuid4(), status="active", grain=["school"])
+    metadata[6].append(aggregate)
+    metadata[7].append(SimpleNamespace(aggregate_definition_id=aggregate.id, measure_id=measure.id))
+    _patch_parse_bind_and_metadata(monkeypatch, logical, bound, metadata)
+
+    async def route_sentinel(*args, **kwargs):
+        assert kwargs["force_route"] == "source"
+        raise HTTPException(status_code=422, detail="source routing reached")
+
+    monkeypatch.setattr(routes_mod, "route_query", route_sentinel)
+    request = _request(bound.model.id)
+    request.force_route = "source"
+    kwargs = {"user_identity": "analyst@example.com", "tenant_id": "tenant-1"} if handler is _handle_execute else {}
+    with pytest.raises(HTTPException) as exc:
+        await handler(request, _EmptyDB(), **kwargs)
+    assert exc.value.detail == "source routing reached"

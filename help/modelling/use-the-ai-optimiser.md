@@ -2,7 +2,7 @@
 title: "Use the AI Optimiser"
 audience: modeller
 area: Modelling
-updated: 2026-08-20
+updated: 2026-09-12
 ---
 
 ![AI optimiser recommendations panel.](../assets/screencaps/ai-optimiser-recommendations.png)
@@ -20,6 +20,10 @@ Every time a query reaches the Query Router and no suitable aggregate exists to 
 The Optimiser requires data in the query miss log before it can make recommendations. At least some queries must have run against the model after it was published. If no queries have run yet, the recommendation list will be empty.
 
 ---
+
+Automatic optimisation uses workload records from the selected model. A field used inside a one-off calculation is not automatically a saved measure. Such queries remain in the history but do not become summary-build candidates when their calculation cannot be represented. Older records that name measures absent from the deployed model are also excluded; valid records remain eligible.
+
+Only successful, valid report queries contribute to automatic optimisation demand. This includes reports from BI tools, Excel, applications, the Agent and scheduled KPI evaluations. Queries rejected for unknown or forbidden fields, and queries that fail during execution, remain in error history but do not count as demand. Hierarchy previews, metadata discovery, pocket refreshes and dry-runs, security simulations, and named-set previews and refreshes are maintenance work, not report demand. You can filter explicitly labelled maintenance calls in query history using the Maintenance origin. A service account alone does not make a report internal maintenance.
 
 ## Opening the AI Optimiser
 

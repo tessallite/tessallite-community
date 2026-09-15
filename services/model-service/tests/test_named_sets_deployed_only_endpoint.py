@@ -247,8 +247,14 @@ async def test_persona_scope_still_applies_on_top_of_deployed_pinning(client):
         model=_deployed_model(),
         version=_version([snap]),
         live_sets=[live],
-        dim_rows=[(product_dim_id, "Product"), (customer_dim_id, "Customer")],
+        dim_rows=[("Product",), ("Customer",)],
     )
+
+    async def _gate(*, model_id, sql, persona_id, bearer, timeout_s=15.0):
+        # Bug-9877: what query-router /explain answers for this persona — the
+        # probe over the DEPLOYED definition projects Customer, which the
+        # allow-list excludes.
+        return '"customer"' not in sql.lower()
 
     with (
         patch("src.api.named_sets.get_tenant_db", async_gen_from(db)),
@@ -256,8 +262,49 @@ async def test_persona_scope_still_applies_on_top_of_deployed_pinning(client):
             "src.api.named_sets.resolve_effective_persona",
             new=AsyncMock(return_value=persona),
         ),
+        patch("src.api.named_set_visibility.probe_binds", new=_gate),
     ):
         resp = await client.get(f"{PREFIX}?deployed_only=true&persona_id={persona.id}")
 
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_reference_filter_probes_only_exact_deployed_set_and_dependencies(client):
+    """Execute tokens must not cause persona probes for unrelated saved sets."""
+    child_id = uuid.uuid4()
+    unrelated_id = uuid.uuid4()
+    parent = _live_set(name="Draft Parent")
+    child = _live_set(child_id, name="Child Set")
+    unrelated = _live_set(unrelated_id, name="Unrelated Set")
+    snapshot_rows = [
+        _snapshot_row(name="Published Parent", expression="{[Child Set]}"),
+        _snapshot_row(child_id, name="Child Set", expression="{[Customer].[Customer].Members}"),
+        _snapshot_row(unrelated_id, name="Unrelated Set", expression="{[Product].[Product].Members}"),
+    ]
+    persona = types.SimpleNamespace(id=uuid.uuid4())
+    db = _db(
+        model=_deployed_model(), version=_version(snapshot_rows),
+        live_sets=[parent, child, unrelated], dim_rows=[("Customer",), ("Product",)],
+    )
+    binds = AsyncMock(return_value=True)
+
+    with (
+        patch("src.api.named_sets.get_tenant_db", async_gen_from(db)),
+        patch(
+            "src.api.named_sets.resolve_effective_persona",
+            new=AsyncMock(return_value=persona),
+        ),
+        patch("src.api.named_sets.named_set_binds_for_persona", new=binds),
+    ):
+        resp = await client.get(
+            f"{PREFIX}?deployed_only=true&persona_id={persona.id}"
+            "&reference_name=SELECT&reference_name=published%20parent"
+        )
+
+    assert resp.status_code == 200
+    assert [row["name"] for row in resp.json()] == ["Child Set", "Published Parent"]
+    assert binds.await_count == 2
+    probed_names = {call.args[0].name for call in binds.await_args_list}
+    assert probed_names == {"Published Parent", "Child Set"}

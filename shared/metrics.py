@@ -13,6 +13,7 @@ from typing import Callable
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     Counter,
+    Gauge,
     Histogram,
     generate_latest,
 )
@@ -105,6 +106,52 @@ SLA_CHECK_ERRORS = Counter(
 RLS_BYPASS_AUDIT_FAILURES = Counter(
     "tessallite_rls_bypass_audit_failures_total",
     "RLS bypass audit writes that failed (bypass proceeded, but durable evidence is missing)",
+)
+
+
+# Bug-9834: JDBC accept-loop liveness. The watchdog restarts a wedged gateway
+# (Bug-8533), which is the right recovery but makes the underlying defect
+# INVISIBLE — a wedge recurring hourly self-heals and looks exactly like one
+# that never came back.
+#
+# These counters are supplementary, NOT the durable signal. An in-process
+# counter cannot survive the very exit it is meant to record, so the durable
+# carrier is the structured ``jdbc_watchdog_exit`` log event the watchdog emits
+# and flushes before terminating. The failure counter below is still useful on
+# its own: it rises during the strike window, before any exit, and a sustained
+# non-zero rate that never reaches the strike limit is a degrading listener
+# nobody would otherwise see.
+JDBC_PROBE_FAILURES = Counter(
+    "tessallite_gateway_jdbc_probe_failures_total",
+    "JDBC accept-loop liveness probes that did not answer",
+)
+JDBC_WATCHDOG_EXITS = Counter(
+    "tessallite_gateway_jdbc_watchdog_exits_total",
+    "Times the watchdog proved the JDBC accept loop dead and exited the process",
+)
+
+# Bug-9834 (review finding 5): monitor JDBC DIRECTLY.
+#
+# Every alert above is derived from the watchdog, and the watchdog only runs
+# when the listener started. So the one failure it cannot describe is the
+# listener never binding at all: the HTTP surface stays healthy, ``up`` stays
+# 1, no probe ever fails, no exit is ever recorded, and JDBC is dead in total
+# silence. Alerting on ``up{job="gateway"}`` cannot see it either — that is the
+# scrape endpoint, not the accept loop, and the two are independent.
+#
+# These two gauges are the direct statement. They are set once at start-up and
+# on shutdown rather than sampled, because both describe a decision the process
+# made, not a quantity that drifts.
+JDBC_LISTENER_UP = Gauge(
+    "tessallite_gateway_jdbc_listener_up",
+    "1 when the gateway's JDBC accept loop is bound and serving, 0 when it is not",
+)
+# A watchdog believed to be running while it is not is worse than none, because
+# the auto-recovery Bug-8533 depends on is assumed to be there. Reported
+# separately from the listener so "serving with no auto-recovery" is expressible.
+JDBC_WATCHDOG_UP = Gauge(
+    "tessallite_gateway_jdbc_watchdog_up",
+    "1 when the JDBC liveness watchdog is running, 0 when it is not",
 )
 
 

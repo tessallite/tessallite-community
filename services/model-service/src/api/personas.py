@@ -434,6 +434,8 @@ async def _cls_blocked_object_ids(
         restricted_uda_ids=restricted_uda,
         measures_by_id={str(m.id): m for m in measures},
         measures_by_name={m.name: m for m in measures if getattr(m, "name", None)},
+        # _load_cls_closure_base selects every Measure on the model.
+        measure_universe_complete=True,
         restricted_physical_names=restricted_phys,
         known_physical_names=known_phys,
         table_identifiers=table_idents,

@@ -8,8 +8,9 @@ Bug-6945: Timeline range sentinel must not corrupt bounds for member keys
 Bug-6933: Pre-auth rejections (malformed dbname, empty password) must count
           toward the brute-force throttle.
 
-Bug-6946: Subtotal grain-query failures must surface a client-visible SOAP
-          Warning instead of degrading silently.
+Bug-6946: The former partial-result Warning contract is superseded by
+          Bug-9837's fail-whole SOAP fault. Its single- and multi-grain
+          behavior guards live in test_bug9766_flat_attribute_subtotals.py.
 
 Bug-7842: test_bug_5888_xmla_cancel fake_get_model_hierarchies must match
           the production signature (positional model_id, tenant_slug,
@@ -166,31 +167,6 @@ class TestBug6933PreAuthThrottle:
 
         assert result is False
         assert len(governor._failures.get("1.2.3.4", [])) == 1
-
-
-# ---------------------------------------------------------------------------
-# Bug-6946: subtotal grain-query failure warning
-# ---------------------------------------------------------------------------
-
-class TestBug6946SubtotalWarning:
-    """Failed subtotal grain queries must produce a SOAP <Warning>."""
-
-    def test_failed_grain_labels_produce_warning_xml(self):
-        """Verify the warning XML generation pattern works end-to-end.
-        (The full integration requires a live server; this tests the
-        contract that _failed_grain_labels -> Messages XML.)"""
-        from dax.xmla_server import _escape_xml
-
-        labels = ["grand_total", "year_subtotal"]
-        msgs = "".join(
-            f'<Warning><Description>{_escape_xml("Subtotal grain query failed for level: " + lbl)}</Description></Warning>'
-            for lbl in labels
-        )
-        messages_xml = f"<Messages>{msgs}</Messages>"
-        assert "<Warning>" in messages_xml
-        assert "grand_total" in messages_xml
-        assert "year_subtotal" in messages_xml
-        assert messages_xml.count("<Warning>") == 2
 
 
 # ---------------------------------------------------------------------------

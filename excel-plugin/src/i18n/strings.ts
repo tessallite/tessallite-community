@@ -22,6 +22,9 @@ const englishStrings = {
     title: "Tessallite",
     subtitle: "Excel plugin v1.0.0.4",
     askTessallite: "Ask Tessallite",
+    ask: "Ask",
+    scopeSelectorAria: "Select project, model and persona",
+    signedIn: "Signed in",
     loadingProviderInfo: "Loading provider info...",
     selectedValue: "Selected value",
     drillThrough: "Drill through",
@@ -44,6 +47,10 @@ const englishStrings = {
     reportBuilderAria: "Report Builder",
     kpiScorecardAria: "KPI Scorecard",
     profileRemoved: "Profile removed",
+    // Shown only by a VITE_TESSALLITE_TEST_PROFILE=1 build, so a test bundle
+    // can never be mistaken for a shipping one.
+    testBuildMarker: "TEST BUILD",
+    testBuildSignInFailed: "TEST BUILD - preset sign-in failed",
   },
 
   // ── Projects ────────────────────────────────────────────────────────
@@ -83,7 +90,11 @@ const englishStrings = {
   // ── Connection ──────────────────────────────────────────────────────
   connection: {
     restored: "Connection restored",
-    lost: "Connection lost. Retrying...",
+    // Bug-7390: the old "Retrying..." wording did not say the health check
+    // keeps running in the background (App.tsx polls every 30s) — a user who
+    // saw this banner and left the pane had no way to know whether the plugin
+    // was still trying or had given up silently.
+    lost: "Connection lost. Checking again every 30 seconds.",
   },
 
   // ── Toasts ──────────────────────────────────────────────────────────
@@ -161,7 +172,9 @@ const englishStrings = {
     poor: "Poor",
     filterAll: "All",
     filterCertified: "Certified",
-    searchPlaceholder: "Search...",
+    searchPlaceholder: "Search KPIs",
+    statusFilterHint: "Click a status to filter",
+    notEvaluated: "not evaluated",
     noSearchMatch: "No KPIs match your search",
     insertTableTitle: "Insert this KPI as a mini-table in the worksheet",
     insertTable: "Insert Table",
@@ -198,10 +211,12 @@ const englishStrings = {
 
   // ── Measure Card (Bug-6713 + Bug-6705 i18n sweep) ────────────────────
   measureCard: {
+    chipCalculated: "Calc",
     removeFromValues: "Remove from Values",
     insertAsFunction: "Insert as formula",
     insertAsCubeFormula: "Advanced: Insert as CUBEVALUE formula (requires workbook connection)",
     addToValues: "Add to Values",
+    addToFilter: "Add to Filter",
     hideDetails: "Hide details",
     showDetails: "Show details",
     detailDescription: "Description",
@@ -361,6 +376,9 @@ const englishStrings = {
   reportBuilder: {
     refreshValues: "Refresh",
     modelLabel: "Model",
+    searchFields: "Search fields",
+    certifiedHint: "Show certified fields only",
+    certified: "Certified",
     modelSelectorAria: "Model selector",
     sortBy: "Sort by",
     sortNone: "None",
@@ -602,6 +620,38 @@ const englishStrings = {
     composerPlaceholder: "Ask a question about your data...",
   },
 
+  // ── Answer pop-out ──────────────────────────────────────────────────
+  chartPopout: {
+    action: "Pop out",
+    tooltip: "Open this answer in a resizable window",
+    loading: "Loading...",
+    empty: "This answer has nothing to show.",
+    alreadyOpen: "An answer window is already open. Close it and try again.",
+    openFailed: "The answer window could not be opened.",
+    closeFailed: "Close this window from its title bar.",
+    // Toolbar in the popped-out window.
+    save: "Save",
+    copy: "Copy",
+    close: "Close",
+    saveExcel: "Excel",
+    saveCsv: "CSV",
+    saveTsv: "TSV",
+    saveSvg: "SVG",
+    savePng: "PNG",
+    // Outcomes. Every save and copy reports one of these, so a refusal by the
+    // browser or the host is visible rather than a click that did nothing.
+    copiedTable: "Table copied. Paste into a sheet to get a grid with headers.",
+    copiedChart: "Chart copied as an image.",
+    copyFailed: "The clipboard is not available in this window.",
+    savedFile: "Saved.",
+    saveFailed: "The file could not be saved.",
+    openedInExcel: "Opened in a new Excel workbook. Use Excel's Save to keep it.",
+    openingInExcel: "Opening in Excel...",
+    workbookFailed: "Excel could not open the workbook.",
+    chartNotReady: "The chart is still drawing. Try again in a moment.",
+    nothingToExport: "There is no data to save.",
+  },
+
   // ── Error Boundary ──────────────────────────────────────────────────
   errorBoundary: {
     title: "Something went wrong",
@@ -613,6 +663,7 @@ const englishStrings = {
   common: {
     cancel: "Cancel",
     close: "Close",
+    continue: "Continue",
   },
 } as const;
 
@@ -756,7 +807,7 @@ export const templates = {
     connectionHintWithName: (name: string) => `CUBE formulas resolve against a workbook connection named "${name}". If you have not set one up yet, open Report Builder and use "Live connection" to create it. The formula is inserted regardless; it will show #N/A until the connection exists.`,
   },
   kpiPanel: {
-    kpiCount: (count: number) => `KPIs (${count})`,
+    kpiCount: (count: number) => `${count} KPIs`,
     statusCount: (count: number, label: string) => `${count} ${label}`,
   },
   kpiLibrary: {
@@ -778,7 +829,14 @@ export const templates = {
     spikeFailed: (message: string) => `failed: ${message}`,
   },
   trace: {
-    modelPersona: (modelId: string, personaId?: string | null) => personaId ? `Model: ${modelId} | Persona: ${personaId}` : `Model: ${modelId}`,
+    // Bug-7396: takes resolved display names, never raw ids. A name that
+    // could not be resolved is omitted rather than falling back to a UUID.
+    modelPersona: (modelName: string | null, personaName?: string | null) => {
+      const parts: string[] = [];
+      if (modelName) parts.push(`Model: ${modelName}`);
+      if (personaName) parts.push(`Persona: ${personaName}`);
+      return parts.join(' | ');
+    },
   },
   chatShell: {
     deleteConversationAria: (title: string) => `Delete conversation ${title}`,
@@ -818,6 +876,7 @@ export const templates = {
   measureCardDetail: {
     detailsAria: (action: string, name: string) => `${action} for ${name}`,
     addToValuesAria: (name: string) => `Add ${name} to Values`,
+    addToFilterAria: (name: string) => `Add ${name} to Filter`,
   },
   // Accessible names for the hierarchy "Rows" assign actions (Bug-6708 class).
   hierarchyCard: {

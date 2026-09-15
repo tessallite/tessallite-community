@@ -83,13 +83,11 @@ def _clean_caches():
     into the next and the fail-closed assertions pass for the wrong reason.
     """
     _snap.invalidate()
-    _snap.invalidate_live_metadata()
     _snap.reset_request_pins()
     invalidate_named_list_cache()
     invalidate_named_query_cache()
     yield
     _snap.invalidate()
-    _snap.invalidate_live_metadata()
     _snap.reset_request_pins()
     invalidate_named_list_cache()
     invalidate_named_query_cache()
@@ -497,13 +495,15 @@ def _discover_invalidators() -> tuple[list[tuple[str, str]], list[str], int]:
 def test_the_invalidator_scanner_actually_scans() -> None:
     """Anti-blind-spot: a scanner that silently found nothing would make the
     coverage test below vacuously green. Pin a floor on both the files walked
-    and the invalidators discovered."""
+    and the invalidators discovered. Bug-8517 intentionally removed the dead
+    live-metadata invalidator, so the current floor is eight; the coverage
+    test below still enumerates every invalidator that remains."""
     model_scoped, _, files_scanned = _discover_invalidators()
     assert files_scanned >= 30, (
         f"the AST scan walked only {files_scanned} files under {_SRC_ROOT} — "
         "the discovery mechanism is broken, not the code it verifies"
     )
-    assert len(model_scoped) >= 9, (
+    assert len(model_scoped) >= 8, (
         f"only {len(model_scoped)} model-scoped invalidators discovered: "
         f"{model_scoped}. If one was legitimately removed, lower this floor "
         "deliberately; do not let the scanner quietly stop finding them."
@@ -867,6 +867,97 @@ async def test_a_named_query_with_no_definition_is_reported_unusable() -> None:
         result.named_queries[0].unusable_reason
         == _routes.NAMED_OBJECT_DEFINITION_MISSING
     )
+
+
+def _two_named_query_snapshot() -> dict:
+    """One Named Query a restricted persona can run, one it cannot."""
+    snap = _snapshot()
+    snap["named_queries"] = [
+        {
+            "id": "33333333-3333-3333-3333-333333333333",
+            "name": "in_scope", "shape": "aggregated",
+            "definition_sql":
+                "SELECT region, SUM(txns) AS n FROM acme GROUP BY region",
+            "output_columns": [{"name": "region", "type": "string"}],
+        },
+        {
+            "id": "44444444-4444-4444-4444-444444444444",
+            "name": "out_of_scope", "shape": "aggregated",
+            "definition_sql":
+                "SELECT region, SUM(secret) AS n FROM acme GROUP BY region",
+            "output_columns": [{"name": "region", "type": "string"}],
+        },
+    ]
+    return snap
+
+
+async def test_bug_9186_the_catalogue_advertises_only_what_binds(
+    monkeypatch,
+) -> None:
+    """Rule 4: a Named Query is advertised to a persona iff it BINDS for it.
+
+    The verdict is the router's own plan path (``_handle_explain`` under the
+    persona), so the catalogue and the executor cannot disagree. Before this
+    the route applied NO persona filter at all and offered every deployed
+    Named Query to every caller -- including on an embed-reachable surface
+    (audit row A17).
+    """
+    planned: list[str] = []
+
+    async def fake_explain(body, db, principal=None, persona_id=None,
+                           persona=None):
+        planned.append(body.raw_query)
+        if "secret" in body.raw_query:
+            raise HTTPException(status_code=403, detail="denied")
+        return types.SimpleNamespace(route_type="source")
+
+    monkeypatch.setattr(_routes, "_handle_explain", fake_explain)
+    persona = types.SimpleNamespace(id=uuid.uuid4())
+    db = _db(snapshot=_two_named_query_snapshot())
+
+    result = await _routes._build_deployed_named_objects(
+        _MODEL_ID, db, persona=persona,
+    )
+
+    assert [n.name for n in result.named_queries] == ["in_scope"]
+    # Both definitions were actually planned -- the verdict is a bind, not a
+    # name scan over the definition text.
+    assert len(planned) == 2
+    assert any("secret" in sql for sql in planned)
+
+
+async def test_bug_9186_no_persona_sees_every_named_query(monkeypatch) -> None:
+    """An unrestricted caller (no persona in force) keeps the whole catalogue
+    and costs no bind probes."""
+    async def unexpected(*a, **kw):  # pragma: no cover - must not run
+        raise AssertionError("no bind probe may run without a persona")
+
+    monkeypatch.setattr(_routes, "_handle_explain", unexpected)
+    db = _db(snapshot=_two_named_query_snapshot())
+
+    result = await _routes._build_deployed_named_objects(_MODEL_ID, db)
+
+    assert [n.name for n in result.named_queries] == ["in_scope", "out_of_scope"]
+
+
+async def test_bug_9186_an_unprovable_verdict_hides_the_named_query(
+    monkeypatch,
+) -> None:
+    """Fail CLOSED. A bind probe that faults for any other reason -- not a
+    persona denial -- must not be read in the caller's favour, because the
+    catalogue is the promise the executor has to keep."""
+    async def boom(*a, **kw):
+        raise RuntimeError("the plan path is unavailable")
+
+    monkeypatch.setattr(_routes, "_handle_explain", boom)
+    persona = types.SimpleNamespace(id=uuid.uuid4())
+    db = _db(snapshot=_two_named_query_snapshot())
+
+    result = await _routes._build_deployed_named_objects(
+        _MODEL_ID, db, persona=persona,
+    )
+
+    assert result.named_queries == []
 
 
 async def test_a_duplicate_named_set_key_refuses_the_catalogue() -> None:

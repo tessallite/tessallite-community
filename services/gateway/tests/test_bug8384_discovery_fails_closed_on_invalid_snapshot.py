@@ -152,7 +152,13 @@ async def test_execute_409_invalid_snapshot_is_a_soap_fault_not_a_bare_500(monke
     broken model returns a clear fault. Two surfaces, one broken state,
     contradictory answers.
     """
-    mdx = "SELECT {[Measures].[Revenue]} ON COLUMNS FROM [modelx]"
+    # Bug-9979 skips the named-set service for statements that provably cannot
+    # reference one.  Include a real saved-set reference so this test continues
+    # to exercise the deployed-snapshot failure on the path where it matters.
+    mdx = (
+        "SELECT {[Measures].[Revenue]} ON COLUMNS, "
+        "{[Saved Set]} ON ROWS FROM [modelx]"
+    )
     exec_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>

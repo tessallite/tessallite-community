@@ -6,10 +6,16 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build && vite build --config vite.config.functions.ts",
+    "build:test-profile": "node scripts/build-test-profile.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "certs:install": "node scripts/install-certs.mjs"
+    "certs:install": "node scripts/install-certs.mjs",
+    "harness:functions": "vite build --config vite.config.functions.ts && node tests-harness/runFunctions.mjs",
+    "harness:functions:run": "node tests-harness/runFunctions.mjs",
+    "harness:pane": "vitest run --config vitest.harness.config.ts",
+    "harness:pane:playwright": "node tests-harness/pane-e2e/prepare.mjs && playwright test",
+    "harness:typecheck": "tsc --noEmit -p tsconfig.harness.json"
   },
   "dependencies": {
     "@emotion/react": "^11.13.0",
@@ -31,6 +37,7 @@
     "zustand": "^5.0.14"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/custom-functions-runtime": "^1.6.12",

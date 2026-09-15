@@ -2,7 +2,7 @@
 title: "Webhooks"
 audience: tenant-admin
 area: Admin
-updated: 2026-05-01
+updated: 2026-08-29
 ---
 
 # Webhooks
@@ -10,6 +10,10 @@ updated: 2026-05-01
 ## What this covers
 
 Tessallite can push notifications to external systems when significant events occur — a model is deployed, a user is created, or a setting changes. This page explains the webhook system: which events are available, how to create and manage endpoints, how to verify payload signatures, and how to handle delivery failures.
+
+For access grants, administrator repairs, and revocations, Tessallite queues the
+event only after the binding change commits. If the binding commit fails, no
+access event is queued.
 
 ---
 
@@ -113,6 +117,15 @@ A delivery is considered successful when the endpoint returns an HTTP 2xx status
 
 After all retries are exhausted, the delivery moves to the **dead-letter queue** (DLQ).
 
+Tessallite never sends an unsigned payload. A missing or placeholder signing
+secret is a terminal refusal and is written directly to the DLQ without an
+HTTP request. If the encrypted secret raises an error while being decrypted,
+the payload is still withheld, but the delivery remains **pending** and follows
+the same bounded backoff schedule. If that retry budget is exhausted, restore
+the credential and use **Retry** from the DLQ. A **Test delivery** is a
+one-shot request: a decryption error records a failed test result and does not
+schedule an automatic retry.
+
 ---
 
 ## Managing endpoints
@@ -123,8 +136,12 @@ The *Admin > Webhooks* page provides:
 - **Active toggle** — disable an endpoint without deleting it. Disabled endpoints stop receiving deliveries immediately.
 - **Edit** — change the name, URL, or event filters. **Changing the URL replaces the signing secret.** A secret is a key cut for one particular door: if the endpoint now points somewhere else, whoever runs the old address must not still be holding a working key. Tessallite therefore cuts a new one whenever you save a different URL — and shows it to you straight away, in the same one-time dialog you saw when you created the endpoint. Copy it before you close that dialog and give it to the new receiver: until the new receiver has it, it cannot verify the signature and will reject every delivery. If you close the dialog without copying the value, press **Rotate secret** to cut another one. Changing only the name or the event filters never touches the secret, and no dialog appears. Deliveries that were already waiting in the queue when you saved are not redirected: each one remembers the address it was queued for, so it still goes to the old receiver. The new address applies to events raised from now on.
 - **Delete** — permanently remove the endpoint and all its delivery history.
-- **Test delivery** — send a synthetic `webhook.test` event to verify connectivity and signature handling.
-- **Rotate secret** — generate a new signing secret. The old secret stops working immediately; the new secret is shown once so you can copy it to your receiving system.
+- **Test delivery** — send a synthetic `webhook.test` event to verify connectivity and signature handling. A chip next to the button reports the outcome: success with the response code, or failure with the server's reason (or the request error if the endpoint could not be reached at all). Clicking Test again clears the previous outcome the moment the new request starts, so a stale result is never left showing during a fresh test.
+- **Rotate secret** — generate a new signing secret. **Requires confirmation**, since the old secret stops working immediately and cannot be recovered: the confirmation dialog names this consequence before you commit. The new secret is shown once so you can copy it to your receiving system.
+
+Saving a different endpoint URL invalidates its previous test outcome. A result
+from a test still running against the old URL is not shown for the new receiver.
+Use **Test delivery** again to verify the new URL after configuring its secret.
 
 ### Delivery history
 

@@ -31,8 +31,11 @@ When you preview or dry-run a model export, Tessallite maps these objects into S
 | Downstream assets | Consumer Asset nodes (dashboards, reports, APIs) |
 | Aggregates | Materialized Aggregate nodes |
 | Data tags | Governance Tag nodes |
+| Materialisation targets (technical export only) | Data Store nodes |
 
 Relationships (edges) connect these nodes — for example, a Source System "contains" a Table, which "contains" Columns, which "define" Dimensions and Measures.
+
+The node and edge type names above are fixed defaults. Unlike Collibra, a Solidatus connection does not carry per-connection type overrides, so every export uses these names.
 
 ## Step-by-step: Set up and sync
 
@@ -56,7 +59,11 @@ Before you start, ask your Solidatus administrator for:
 1. In the settings drawer, scroll the tabs at the top until you see **Solidatus**.
 2. Click the Solidatus tab.
 
-If you don't see the Solidatus tab, make sure you are inside a model (not just a project). The tab only appears when a model is selected.
+If you don't see the Solidatus tab, make sure you are inside a model (not just a project). The tab only appears when a model is selected and only for users who may author that model.
+
+Creating, editing, deleting, activating and deactivating a connection require a
+tenant admin; Test Connection and Dry Run require a modeller; the preview, run
+history and mapping lists are readable by any user who can open the model.
 
 ### Step 4 — Add a connection
 
@@ -83,15 +90,36 @@ If you don't see the Solidatus tab, make sure you are inside a model (not just a
    - How many **edges** will be exported (relationships between them)
 3. Review the counts to make sure everything looks right.
 
+A preview is a calculation only: it does not create a run in history and it
+contacts nothing outside Tessallite.
+
 ### Step 7 — Dry run
 
 1. Click the **Dry Run** button.
 2. Tessallite runs the full sync pipeline — builds the graph, maps it to Solidatus format, and calculates what would change — but does NOT push anything to Solidatus.
-3. The run history shows what WOULD be created or updated.
+3. A row appears in **Run History** with mode `Dry run`, status `Succeeded`, the node and edge counts, the model snapshot the run was built from, and any governance warnings.
+
+The run row is the only thing the dry run writes. No object mapping, no
+deprecation record, and no remote change is stored.
 
 ### Step 8 — Live push (not yet available)
 
-Live push to Solidatus is not implemented in this build, so the **Sync** button is disabled. The dry run in Step 7 lets you confirm exactly what would be created. When a live Solidatus client is wired in, this button will push the previewed nodes and edges and record the result in run history.
+Live push to Solidatus is not implemented in this build. In the Solidatus tab
+the push button is disabled and reads **Sync Unavailable**; hovering it explains
+that live push is not implemented and that Dry Run is the way to validate the
+export payload. Pressing it does nothing, because it cannot be pressed.
+
+Calling the API directly does not get further. A sync request with
+`mode: "push"` is refused at the boundary with HTTP 501 and the code
+`solidatus_push_not_implemented`, before any graph is built, and the refused
+attempt is recorded as a `solidatus.sync.rejected` audit event naming the
+connection and the reason. The only accepted mode is `dry_run`; any other value
+is rejected as an invalid mode, and `mode: "push"` combined with
+`dry_run: true` is rejected as inconsistent.
+
+The dry run in Step 7 lets you confirm exactly what would be created. When a
+live Solidatus client is wired in, this button will push the previewed nodes and
+edges and record the result in run history.
 
 ## Available now: preview and dry run
 
@@ -120,11 +148,13 @@ diff.
 Live validation and live push are **not implemented** in this build. Until a
 tenant-specific Solidatus client is wired in, the following do NOT happen:
 
-- **Live push** — the Sync button is disabled and the API returns "not
-  implemented". No node or edge is created or updated in Solidatus.
-- **Remote deprecation** — when you remove objects from your model, the dry run
-  records them as removed locally, but nothing is deprecated inside Solidatus,
-  because no remote call is made.
+- **Live push** — the push button reads **Sync Unavailable** and is disabled,
+  and the API refuses a push-mode request with "not implemented". No node or
+  edge is created or updated in Solidatus.
+- **Remote deprecation** — removing an object from your model deprecates
+  nothing, in Solidatus or in Tessallite. The deprecation step runs only in push
+  mode, which is refused, so a dry run neither deprecates the object remotely nor
+  records the removal locally.
 - **Live connection checks** — Test Connection is simulated (see Step 5); a
   wrong URL or expired token is not caught until live validation exists.
 

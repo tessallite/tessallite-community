@@ -3,6 +3,7 @@ Hierarchy CRUD, level CRUD, and reorder routes.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -12,7 +13,11 @@ import logging
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import and_, delete, or_, select, update
+from shared.security.execute_contract import (
+    RowSecurityDeniedError,
+    execute_response_denied_all,
+)
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
@@ -20,8 +25,7 @@ import sqlglot
 from sqlglot import exp
 
 from shared.config.settings import get_settings
-from shared.connector_qualify import quote_identifier, quote_table_ref
-from shared.schemas.connection_type import normalize_connection_type
+from shared.connector_qualify import quote_identifier, safe_ident
 from shared.schemas.measure_formats import (
     are_valid_time_calcs,
     is_valid_dimension_kind,
@@ -31,6 +35,7 @@ from shared.semantic.calendar_dialects import (
     CALENDAR_COLUMN_SETS,
     EXPRESSION_CAPABLE_CALENDAR_TYPES,
     TABLE_BOUND_CALENDAR_TYPES,
+    _get_dialect_config as _get_calendar_dialect_config,
 )
 from shared.semantic.calendar_types import (
     CALENDAR_TYPES,
@@ -39,7 +44,6 @@ from shared.semantic.calendar_types import (
 from shared.semantic.graph_order import is_fact_table
 from shared.db.models import (
     CalendarTable,
-    DataSource,
     Dimension,
     HierarchyDefinition,
     HierarchyLevel,
@@ -49,7 +53,6 @@ from shared.db.models import (
     Model,
     ModelColumn,
     ModelTable,
-    ProjectConnection,
     UserDefinedAttribute,
     UserDefinedAttributeColumnRef,
 )
@@ -81,9 +84,8 @@ from src.api._model_lock import acquire_model_definition_lock
 from src.auth.middleware import CurrentUser, enforce_model_scope, get_current_user
 from src.auth.rbac import require_role
 from src.api._persona_scope import get_excluded_level_attribute_ids, parse_allowed_ids, resolve_effective_persona
-from shared.security import Principal, RowSecurityCompileError, compile_row_security
 
-from shared.connector_qualify import CONNECTOR_TO_SQLGLOT as _CONNECTOR_TO_SQLGLOT, transpile_preview_sql
+from shared.connector_qualify import CONNECTOR_TO_SQLGLOT as _CONNECTOR_TO_SQLGLOT
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +123,43 @@ def _transpile_uda_expression(
                 return exp.column(node.name, table=table_alias, quoted=True)
             return node
         tree = tree.transform(_qualify)
+    if target != "postgres":
+        # PostgreSQL's WEEK extract is ISO-8601, while BigQuery and Snowflake
+        # give WEEK different semantics.  Use the shared calendar dialect
+        # helper for the target-specific ISO expression before the final
+        # SQLGlot render.  The replacement is structural, so nested WEEK
+        # expressions receive the same treatment and no connector SQL is
+        # handwritten in this producer.
+        try:
+            dialect_config = _get_calendar_dialect_config(connector)
+        except ValueError:
+            dialect_config = None
+        if dialect_config is not None:
+            operand_placeholder = "__tessallite_iso_week_operand__"
+
+            def _rewrite_iso_week(node):
+                if not isinstance(node, exp.Extract):
+                    return node
+                part = node.this
+                if not isinstance(part, exp.Var) or (part.this or "").upper() != "WEEK":
+                    return node
+                tree_operand = node.expression
+
+                def _replace_operand_placeholder(replacement_node):
+                    if (
+                        isinstance(replacement_node, exp.Column)
+                        and replacement_node.name == operand_placeholder
+                    ):
+                        return tree_operand.copy()
+                    return replacement_node
+
+                rendered = dialect_config.iso_week_expr(
+                    operand_placeholder, connector,
+                )
+                replacement = sqlglot.parse_one(rendered, read=target)
+                return replacement.transform(_replace_operand_placeholder)
+
+            tree = tree.transform(_rewrite_iso_week)
     return tree.sql(dialect=target)
 
 
@@ -263,6 +302,171 @@ async def _introspect_batch_via_router(
         for item in data.get("results", []):
             out[item["key"]] = (item["rows"], item["columns"], item.get("error"))
         return out
+
+
+async def _execute_via_router(
+    model_id: str,
+    sql: str,
+    bearer: str,
+    *,
+    persona_id: str | None = None,
+    timeout_s: float = 60.0,
+) -> list[dict]:
+    """Bug-9895: run one hierarchy-preview derivation on the PERSONA MODEL QUERY.
+
+    The preview used to build ``SELECT DISTINCT <key> FROM <physical table>``
+    with the compiled row-security predicate spliced into its ``WHERE`` and run
+    it through ``/introspect/batch``, which applies no persona, no
+    column-level security and no row-level security (persona-layering rule 4,
+    audit row A37). It now posts the derivation to the query-router
+    ``/execute`` path with the CALLER'S OWN bearer, so binding, the persona
+    allow-list, persona default filters, column-level security and row-level
+    security are applied by the one authority that applies them to every other
+    query — the "equivalent by construction" shape of the rule, the same
+    re-entry KPI evaluation uses (``api/kpis.py::_execute_via_router``).
+
+    Unlike the KPI bridge this hop carries NO internal service scope: the
+    caller's own privileges are the only privileges in play, which is what
+    lets a viewer enumerate hierarchy members again (Bug-9900 closed the
+    ``/introspect/batch`` route at modeller).
+    """
+    url = f"{settings.QUERY_ROUTER_URL}/api/v1/execute"
+    body: dict = {
+        "model_id": model_id,
+        "raw_query": sql,
+        "protocol": "jdbc",
+        # Bug-8070 discipline: declare the origin so hierarchy-preview traffic
+        # is separable from BI-client traffic in the query log.
+        "client_kind": "hierarchy_preview",
+    }
+    if persona_id is not None:
+        body["persona_id"] = persona_id
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        resp = await client.post(
+            url, json=body, headers={"Authorization": f"Bearer {bearer}"},
+        )
+        if resp.status_code >= 400:
+            try:
+                payload = resp.json()
+                detail = payload.get("detail") if isinstance(payload, dict) else resp.text
+            except Exception:
+                detail = resp.text or f"Query router returned HTTP {resp.status_code}"
+            raise HTTPException(status_code=resp.status_code, detail=detail)
+        payload = resp.json()
+        # Bug-9920: an /execute client MUST tell "matched nothing" apart from
+        # "row security denied every row" (shared/security/execute_contract.py).
+        # Without this the preview reports an empty member list to a persona
+        # that is simply not permitted to see any member -- the swallowed-denial
+        # class of Bug-9880, on the hierarchy surface. The rows are already
+        # empty in that case; what was missing is SAYING SO.
+        if execute_response_denied_all(payload):
+            raise RowSecurityDeniedError(
+                "row security denies every row of this model for the caller, "
+                "so no hierarchy member can be previewed"
+            )
+        return payload.get("rows") or []
+
+
+async def _resolve_level_dimension_name(
+    db, *, model_id: UUID, attribute_id: UUID, source: str,
+) -> str | None:
+    """Bug-9895: the MODEL DIMENSION a hierarchy level's key attribute is
+    exposed as, or ``None`` when the attribute is not published as one.
+
+    The preview is expressed over the persona model query, so a level is
+    addressed by the name the binder resolves — never by its physical column.
+    A level with no dimension cannot be expressed that way and is reported as
+    a preview warning rather than silently falling back to a physical scan.
+    """
+    stmt = select(Dimension.name).where(
+        Dimension.model_id == model_id,
+        Dimension.is_invalid.is_(False),
+    )
+    if source == "physical_column":
+        stmt = stmt.where(Dimension.source_column_id == attribute_id)
+    else:
+        stmt = stmt.where(Dimension.user_defined_attribute_id == attribute_id)
+    return (await db.execute(stmt.order_by(Dimension.name).limit(1))).scalars().first()
+
+
+async def _resolve_level_caption_dimension_name(
+    db, *, model_id: UUID, level: HierarchyLevel,
+) -> str | None:
+    """Dimension name of a level's DISPLAY attribute (Bug-3617), or ``None``.
+
+    When present it is selected alongside the key so ``MEMBER_CAPTION`` can
+    differ from ``MEMBER_KEY`` on the XMLA wire.
+    """
+    row = (
+        await db.execute(
+            select(HierarchyLevelAttribute)
+            .where(
+                HierarchyLevelAttribute.level_id == level.id,
+                HierarchyLevelAttribute.role == "display",
+            )
+            .order_by(HierarchyLevelAttribute.id)
+        )
+    ).scalars().first()
+    if row is None:
+        return None
+    return await _resolve_level_dimension_name(
+        db, model_id=model_id, attribute_id=row.attribute_id,
+        source=row.attribute_source,
+    )
+
+
+def _preview_member_sql(
+    model_slug: str,
+    *,
+    key_dimensions: list[str],
+    caption_dimension: str | None,
+    filters: list[tuple[str, str]],
+    limit: int,
+) -> str:
+    """``SELECT DISTINCT <level dims> FROM <model> WHERE <ancestor path> ...``.
+
+    Bug-9895: the FROM is the MODEL, not a physical table, so the query-router
+    binds it into the persona model query and layers this projection over it.
+    The ancestor/parent bounding (Bug-9871) is expressed as equality filters on
+    the ancestor LEVELS' dimensions, cast to text exactly as the physical
+    builder did, so a level whose keys repeat under different ancestors still
+    returns only the requested branch. Literals are produced by sqlglot, never
+    spliced raw (F-016-19).
+    """
+    select_dims = list(key_dimensions)
+    if caption_dimension is not None and caption_dimension not in select_dims:
+        select_dims.append(caption_dimension)
+    cols = ", ".join(safe_ident(d) for d in select_dims)
+    sql = f"SELECT DISTINCT {cols} FROM {safe_ident(model_slug)}"
+    if filters:
+        preds = " AND ".join(
+            f"CAST({safe_ident(dim)} AS VARCHAR) = "
+            f"{exp.Literal.string(value).sql(dialect='postgres')}"
+            for dim, value in filters
+        )
+        sql += f" WHERE {preds}"
+    # Order by the KEY columns only; the caption rides along.
+    sql += " ORDER BY " + ", ".join(str(i + 1) for i in range(len(key_dimensions)))
+    return f"{sql} LIMIT {int(limit)}"
+
+
+def _preview_level_count_sql(model_slug: str, *, dimension: str, limit: int) -> str:
+    """Bounded distinct-member probe for one level's ``estimated_members``.
+
+    Bug-9895: a PROJECTION, not an aggregate. ``COUNT(DISTINCT <dim>)`` binds
+    the level's dimension as a MEASURE, so the persona gate denies it for every
+    persona whose ``included_measure_ids`` does not list that dimension
+    (``[PERSONA_DENY] reason=measure_not_included``) and the level count is
+    lost for exactly the restricted personas the preview now serves. Counting
+    the rows of the same bounded ``SELECT DISTINCT`` the members use keeps the
+    probe on the persona's own projection surface, so it answers for every
+    persona. The value stays what its field name says — an estimate bounded by
+    the caller's ``sample_size``.
+    """
+    return (
+        f"SELECT DISTINCT {safe_ident(dimension)} FROM {safe_ident(model_slug)} "
+        f"LIMIT {int(limit)}"
+    )
 
 
 def _validation_error(message: str, *, field: str, code: str) -> HTTPException:
@@ -785,41 +989,6 @@ async def _create_generated_uda(
         )
     return uda
 
-
-async def _resolve_model_source_connection(db, model_id: UUID) -> tuple[ProjectConnection | None, str | None]:
-    source = (
-        await db.execute(
-            select(DataSource).where(DataSource.model_id == model_id).limit(1)
-        )
-    ).scalar_one_or_none()
-    if source is None:
-        return None, "No data source configured for this model."
-    # Bug-5325: fail closed if a legacy/imported source points its connection at
-    # a different project. Derive the source's owning project from its model and
-    # reject a cross-project connection (via the shared fail-closed resolver)
-    # rather than previewing the wrong project's source data.
-    from src.api._scope import resolve_source_connection
-    model = await db.get(Model, model_id)
-    if model is None:
-        return None, "Model not found for source connection resolution."
-    conn = await resolve_source_connection(
-        db, source, expected_project_id=model.project_id
-    )
-    return conn, None
-
-
-async def _resolve_preview_connection(
-    db,
-    *,
-    model_id: UUID,
-):
-    conn, err = await _resolve_model_source_connection(db, model_id)
-    if conn is None:
-        return None, None, err
-    connector = normalize_connection_type(
-        (conn.connection_type or "").lower()
-    )
-    return conn, connector, None
 
 async def _resolve_attribute(
     db,
@@ -1532,186 +1701,6 @@ async def _generated_ref(
     )
     return resolved.ref
 
-
-def _build_estimate_sql(
-    connector: str,
-    *,
-    table_name: str,
-    key_expr: str,
-    sample_size: int,
-    rls_where: str | None = None,
-) -> str:
-    pg_quoted = quote_table_ref("postgresql", table_name)
-    where = f"({key_expr}) IS NOT NULL"
-    if rls_where:
-        where += f" AND ({rls_where})"
-    canonical = (
-        "SELECT COUNT(*) AS c FROM ("
-        f"SELECT DISTINCT {key_expr} AS k "
-        f"FROM {pg_quoted} AS t "
-        f"WHERE {where} "
-        f"LIMIT {sample_size * 20}"
-        ") s"
-    )
-    return transpile_preview_sql(connector, canonical)
-
-
-def _build_sample_sql(
-    connector: str,
-    *,
-    table_name: str,
-    key_expr: str,
-    sample_size: int,
-    parent_expr: str | None = None,
-    parent_key: str | None = None,
-    rls_where: str | None = None,
-    caption_expr: str | None = None,
-) -> str:
-    pg_quoted = quote_table_ref("postgresql", table_name)
-    where = f"({key_expr}) IS NOT NULL"
-    if parent_expr is not None and parent_key is not None:
-        # F-016-19: build the string literal through sqlglot's literal builder
-        # so escaping is library-handled rather than a hand-rolled
-        # ``replace("'", "''")``. The whole statement is parsed (read="postgres")
-        # and re-emitted per dialect by transpile_preview_sql, so the literal is
-        # produced by sqlglot, never spliced raw.
-        safe_key = exp.Literal.string(parent_key).sql(dialect="postgres")
-        # Canonical CAST; transpile_preview_sql renders the dialect-specific type.
-        where += f" AND CAST(({parent_expr}) AS TEXT) = {safe_key}"
-    if rls_where:
-        where += f" AND ({rls_where})"
-    # Bug-3617 (Phase 0.5a): select the display caption alongside the key when
-    # the level has a display-role attribute. Omitted (single-column, identical
-    # to the legacy query) when no caption_expr is supplied — back-compatible.
-    select_cols = f"{key_expr} AS key_value"
-    if caption_expr is not None:
-        select_cols += f", {caption_expr} AS caption_value"
-    canonical = (
-        f"SELECT DISTINCT {select_cols} "
-        f"FROM {pg_quoted} AS t "
-        f"WHERE {where} "
-        "ORDER BY 1 "
-        f"LIMIT {sample_size}"
-    )
-    return transpile_preview_sql(connector, canonical)
-
-
-def _build_ancestor_path_sample_sql(
-    connector: str,
-    *,
-    table_name: str,
-    key_exprs: list[str],
-    sample_size: int,
-    rls_where: str | None = None,
-    caption_expr: str | None = None,
-) -> str:
-    """Bug-3617 (Phase 0.5b): sample distinct ancestor key TUPLES for a level.
-
-    Returns one row per member at the target level carrying its full
-    ancestor-first key path (``key_0 .. key_n``, where ``key_n`` is the level's
-    own key). Used for parent-less whole-level enumeration of a single-table
-    hierarchy, where the flat per-level sample (``_build_sample_sql``) would lose
-    the ancestor context the canonical composite member unique name needs
-    (e.g. distinguishing month 4 of 2025 from month 4 of 2026). Canonical-PG,
-    transpiled once; key/caption expressions are already resolved + quoted
-    against alias ``t`` by the caller (``connector_qualify`` convention).
-    """
-    pg_quoted = quote_table_ref("postgresql", table_name)
-    select_parts = [f"{expr} AS key_{i}" for i, expr in enumerate(key_exprs)]
-    if caption_expr is not None:
-        select_parts.append(f"{caption_expr} AS caption_value")
-    where_parts = [f"({expr}) IS NOT NULL" for expr in key_exprs]
-    if rls_where:
-        where_parts.append(f"({rls_where})")
-    order_by = ", ".join(str(i + 1) for i in range(len(key_exprs)))
-    canonical = (
-        f"SELECT DISTINCT {', '.join(select_parts)} "
-        f"FROM {pg_quoted} AS t "
-        f"WHERE {' AND '.join(where_parts)} "
-        f"ORDER BY {order_by} "
-        f"LIMIT {sample_size}"
-    )
-    return transpile_preview_sql(connector, canonical)
-
-
-async def _resolve_join_between(
-    db, *, model_id: UUID, table_a_id: UUID, table_b_id: UUID,
-) -> tuple[str, str] | None:
-    """Find a single model ``Join`` connecting two tables and return the
-    ``(column_on_a, column_on_b)`` physical column names.
-
-    F-016-24: cross-table hierarchy preview filters a child level by its parent
-    via the model's defined join. Only a direct (one-hop) join is resolved —
-    multi-hop paths return None and the caller falls back to the unsupported
-    warning. The join is symmetric, so we check both orientations.
-    """
-    from shared.db.models import Join
-
-    rows = (
-        await db.execute(
-            select(Join).where(
-                Join.model_id == model_id,
-                or_(
-                    and_(Join.left_table_id == table_a_id, Join.right_table_id == table_b_id),
-                    and_(Join.left_table_id == table_b_id, Join.right_table_id == table_a_id),
-                ),
-            )
-        )
-    ).scalars().all()
-    if not rows:
-        return None
-    join = rows[0]
-    left_col = await db.get(ModelColumn, join.left_column_id)
-    right_col = await db.get(ModelColumn, join.right_column_id)
-    if left_col is None or right_col is None:
-        return None
-    # Orient to (column_on_a, column_on_b).
-    if join.left_table_id == table_a_id:
-        return left_col.column_name, right_col.column_name
-    return right_col.column_name, left_col.column_name
-
-
-def _build_cross_table_sample_sql(
-    connector: str,
-    *,
-    child_table: str,
-    child_key_expr: str,
-    child_join_col: str,
-    parent_table: str,
-    parent_key_expr: str,
-    parent_join_col: str,
-    parent_key: str,
-    sample_size: int,
-    rls_where: str | None = None,
-    caption_expr: str | None = None,
-) -> str:
-    """Sample distinct child-level keys filtered to one parent member, joining
-    the child table to the parent table on the model's defined join columns
-    (F-016-24). Canonical-PG, then transpiled to the source dialect; the parent
-    filter literal is produced by sqlglot, never spliced raw (F-016-19 pattern).
-    The key expressions are resolved against alias ``t`` (child) but the join
-    columns are quoted bare and prefixed here so they bind to the right side."""
-    pg_child = quote_table_ref("postgresql", child_table)
-    pg_parent = quote_table_ref("postgresql", parent_table)
-    child_jc = quote_identifier("postgresql", child_join_col)
-    parent_jc = quote_identifier("postgresql", parent_join_col)
-    safe_key = exp.Literal.string(parent_key).sql(dialect="postgres")
-    rls_clause = f" AND ({rls_where})" if rls_where else ""
-    # Bug-3617 (Phase 0.5a): caption selected alongside key when available.
-    select_cols = f"{child_key_expr} AS key_value"
-    if caption_expr is not None:
-        select_cols += f", {caption_expr} AS caption_value"
-    canonical = (
-        f"SELECT DISTINCT {select_cols} "
-        f"FROM {pg_child} AS t "
-        f"JOIN {pg_parent} AS p ON t.{child_jc} = p.{parent_jc} "
-        f"WHERE ({child_key_expr}) IS NOT NULL "
-        f"AND CAST(({parent_key_expr}) AS TEXT) = {safe_key}"
-        f"{rls_clause} "
-        "ORDER BY 1 "
-        f"LIMIT {sample_size}"
-    )
-    return transpile_preview_sql(connector, canonical)
 
 
 @router.post(
@@ -2733,45 +2722,6 @@ async def generate_segment_hierarchy(
         )
 
 
-async def _resolve_level_caption_expr(
-    db, *, model_id: UUID, level: HierarchyLevel, table_alias: str = "t",
-) -> str | None:
-    """Resolve the SQL expression for a hierarchy level's display caption.
-
-    Bug-3617 (Phase 0.5a): a level may carry a display-role
-    ``HierarchyLevelAttribute`` distinct from its key attribute. When present
-    it is selected as the member caption so ``MEMBER_CAPTION`` can differ from
-    ``MEMBER_KEY`` on the XMLA wire. Returns ``None`` when the level has no
-    display attribute (caption falls back to the key) or it cannot be resolved
-    — resolved canonical (PostgreSQL); the caller transpiles once.
-    """
-    row = (
-        await db.execute(
-            select(HierarchyLevelAttribute)
-            .where(
-                HierarchyLevelAttribute.level_id == level.id,
-                HierarchyLevelAttribute.role == "display",
-            )
-            .order_by(HierarchyLevelAttribute.id)
-        )
-    ).scalars().first()
-    if row is None:
-        return None
-    try:
-        resolved = await _resolve_sql_attribute(
-            db,
-            model_id=model_id,
-            attribute_id=row.attribute_id,
-            source=row.attribute_source,
-            require_dimension_table=False,
-            connector="postgresql",
-            table_alias=table_alias,
-        )
-    except HTTPException:
-        return None
-    return resolved.expression
-
-
 @router.get("/hierarchies/{hierarchy_id}/preview", response_model=HierarchyPreviewResponse)
 async def preview_hierarchy(
     request: Request,
@@ -2781,19 +2731,51 @@ async def preview_hierarchy(
     sample_size: int = Query(default=100, ge=10, le=settings.MEMBER_DISCOVERY_LIMIT),
     expand_level: int | None = Query(default=None, ge=0),
     parent_key: str | None = Query(default=None),
+    ancestor_keys: list[str] | None = Query(default=None),
     persona_id: UUID | None = Query(default=None),
     include_key_path: bool = Query(default=False),
+    include_level_counts: bool = Query(default=True),
     current_user: CurrentUser = Depends(get_current_user),
     _: None = require_role("viewer"),
 ) -> HierarchyPreviewResponse:
+    """Sample the members of one hierarchy level for the CALLING persona.
+
+    Bug-9895 (persona-layering rule 4, audit row A37): the preview is a DATA
+    surface and is now expressed as a derivation over the persona model query.
+    Every member, level-count and drill query is
+    ``SELECT DISTINCT <level dimensions> FROM <model> ...`` posted to the
+    query-router ``/execute`` path with the caller's own bearer, so the
+    allow-list, persona default filters, column-level security and row-level
+    security are applied by the one authority that applies them to every other
+    query. It no longer builds a physical-table scan with the compiled
+    row-security predicate spliced into its ``WHERE``, and it no longer uses
+    ``/introspect/batch`` — which is why a VIEWER can enumerate hierarchy
+    members again after Bug-9900 closed that route at modeller.
+
+    Bug-9871: ``ancestor_keys`` are the keys of the levels ABOVE the parent,
+    root first (for a drill under [2025].[9] into Day: parent_key="9",
+    ancestor_keys=["2025"]). The drill is bounded by the full path, so a level
+    whose keys repeat under different ancestors returns only the requested
+    branch. Ignored, with a warning, when its length does not match the
+    parent's depth.
+
+    ``include_level_counts`` (default on, so the REST contract is unchanged)
+    runs one bounded distinct probe per level to refine
+    ``levels_summary.estimated_members`` beyond the stored table row estimate.
+    The XMLA member path reads only ``members``, so the gateway turns it off
+    and spends nothing on counts nobody reads.
+    """
     enforce_model_scope(current_user, str(model_id), project_id=str(project_id))
     bearer = _extract_bearer(request)
 
     async for db in get_tenant_db(current_user.tenant_id):
-        await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        model = await _ensure_model_in_project(db, project_id=project_id, model_id=model_id)
 
         # ---- Bug-5424: persona-scoped hierarchy preview ----
-        # Resolve the effective persona (mirrors list/get endpoints).
+        # Resolve the effective persona (mirrors list/get endpoints). It scopes
+        # the METADATA decisions below (is this hierarchy visible, which levels
+        # are hidden) and is forwarded to the router so the DATA decisions are
+        # made against the same persona.
         persona = await resolve_effective_persona(
             db, current_user=current_user, model_id=model_id,
             requested_persona_id=persona_id,
@@ -2805,39 +2787,6 @@ async def preview_hierarchy(
             allowed_hier = parse_allowed_ids(persona.included_hierarchy_ids)
             if allowed_hier is not None and hierarchy.id not in allowed_hier:
                 raise HTTPException(status_code=404, detail="Hierarchy not found")
-
-        # Bug-7205: compile RLS predicate unconditionally for the requesting
-        # principal. RLS rules (role_predicate, user_mapping) fire for
-        # principals with or without personas. Skip ONLY when an explicit
-        # bypass_row_security persona is present.
-        rls_where: str | None = None
-        if persona is None or not persona.bypass_row_security:
-            principal = Principal.from_current_user(current_user)
-            try:
-                compiled = await compile_row_security(model_id, principal, db)
-            except RowSecurityCompileError as exc:
-                # F-007-16 / Bug-9021: same typed 422 as /execute. Do not
-                # import query-router _sql_disclosure from model-service.
-                _logger.warning(
-                    "row-security rule failed to compile on hierarchy preview: "
-                    "%s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={
-                        "message": (
-                            "A row-level security rule on this model is "
-                            "misconfigured and could not be compiled. The "
-                            "query was blocked (fail closed); ask a modeler "
-                            "to fix the rule's predicate."
-                        ),
-                        "error_type": "row_security_misconfigured",
-                    },
-                )
-            if compiled is not None:
-                rls_where = compiled.sql_expression
 
         # Build excluded level attribute set for this persona.
         excluded_attrs = (
@@ -2867,28 +2816,38 @@ async def preview_hierarchy(
             parent_key = None
 
         warnings: list[HierarchyPreviewWarning] = []
-        conn_obj, connector, preview_err = await _resolve_preview_connection(
-            db, model_id=model_id,
-        )
-        level_sql: list[_ResolvedSqlAttribute | None] = []
+        level_dims: list[str | None] = []
         level_summaries: list[HierarchyPreviewLevelSummary] = []
 
         for lvl in levels:
-            resolved_sql: _ResolvedSqlAttribute | None = None
+            dim_name: str | None = None
+            estimate: int | None = None
             try:
-                # Resolve key expressions canonical (PostgreSQL); the preview SQL
-                # builders translate the full statement to the source dialect once
-                # via transpile_preview_sql. Mixing dialects here would embed
-                # source-dialect quoting into a postgres-canonical string.
-                resolved_sql = await _resolve_sql_attribute(
+                resolved = await _resolve_attribute(
                     db,
                     model_id=model_id,
                     attribute_id=lvl.key_attribute_id,
                     source=lvl.key_attribute_source,
                     require_dimension_table=False,
-                    connector="postgresql",
-                    table_alias="t",
                 )
+                estimate = resolved.table.row_count_estimate
+                dim_name = await _resolve_level_dimension_name(
+                    db, model_id=model_id,
+                    attribute_id=lvl.key_attribute_id,
+                    source=lvl.key_attribute_source,
+                )
+                if dim_name is None:
+                    warnings.append(
+                        HierarchyPreviewWarning(
+                            level_name=lvl.name,
+                            type="level_not_published_as_dimension",
+                            message=(
+                                f"Level '{lvl.name}' has no model dimension, so its "
+                                "members cannot be read through the model query. "
+                                "Publish the level's attribute as a dimension."
+                            ),
+                        )
+                    )
             except HTTPException as exc:
                 if exc.status_code == status.HTTP_404_NOT_FOUND:
                     warnings.append(
@@ -2903,12 +2862,7 @@ async def preview_hierarchy(
                     )
                 else:
                     raise
-            level_sql.append(resolved_sql)
-            estimate = (
-                resolved_sql.resolved.table.row_count_estimate
-                if resolved_sql is not None
-                else None
-            )
+            level_dims.append(dim_name)
             if estimate is not None and estimate > 50000:
                 warnings.append(
                     HierarchyPreviewWarning(
@@ -2925,7 +2879,7 @@ async def preview_hierarchy(
                 )
             )
 
-        if level_sql[target_level] is None:
+        if level_dims[target_level] is None:
             return HierarchyPreviewResponse(
                 hierarchy_id=hierarchy.id,
                 hierarchy_name=hierarchy.name,
@@ -2937,211 +2891,167 @@ async def preview_hierarchy(
 
         # Bug-3617 (Phase 0.5a/b): each entry is (key, caption, key_path);
         # caption defaults to the key when the level has no display attribute,
-        # key_path is the ancestor-first tuple when include_key_path resolved one
-        # (parent-less single-table enumeration), else None.
+        # key_path is the ancestor-first tuple when include_key_path resolved
+        # one (parent-less whole-level enumeration), else None.
         sampled_members: list[tuple[str, str, list[str] | None]] = []
-        if preview_err:
-            warnings.append(
-                HierarchyPreviewWarning(
-                    level_name=levels[target_level].name,
-                    type="preview_unavailable",
-                    message=preview_err,
-                )
-            )
-        elif conn_obj is not None:
-            try:
-                batch_queries: list[tuple[str, str]] = []
-                # Bug-3617 (Phase 0.5b): set when the "sample" query returns
-                # ancestor key tuples (key_0..key_n) rather than a flat key.
-                ancestor_path_mode = False
 
-                for idx, lvl in enumerate(levels):
-                    if level_sql[idx] is None:
-                        continue
-                    sql = _build_estimate_sql(
-                        connector,
-                        table_name=level_sql[idx].resolved.table.physical_name,
-                        key_expr=level_sql[idx].expression,
-                        sample_size=sample_size,
-                        rls_where=rls_where,
+        # Bug-9871: bound the drill by the ancestors above the parent as well.
+        member_filters: list[tuple[str, str]] = []
+        if target_level > 0 and parent_key is not None:
+            if target_level > 1 and ancestor_keys:
+                if len(ancestor_keys) != target_level - 1:
+                    warnings.append(
+                        HierarchyPreviewWarning(
+                            level_name=levels[target_level].name,
+                            type="ancestor_keys_mismatch",
+                            message=(
+                                f"ancestor_keys carries {len(ancestor_keys)} key(s) but the "
+                                f"parent level sits at depth {target_level - 1}; the drill "
+                                "is bounded by the parent key only."
+                            ),
+                        )
                     )
-                    batch_queries.append((f"est_{idx}", sql))
-
-                target_sql_attr = level_sql[target_level]
-                parent_expr = None
-                # F-016-24: when parent and child live in different tables we
-                # join the two on the model's defined relationship instead of
-                # bailing. cross_table holds the resolved join + parent-side
-                # expression (aliased to ``p``) when that path is available.
-                cross_table: dict | None = None
-                can_sample = target_sql_attr is not None
-                if target_level > 0 and parent_key is not None:
-                    parent_sql = level_sql[target_level - 1]
-                    if parent_sql is None:
-                        can_sample = False
-                        warnings.append(
-                            HierarchyPreviewWarning(
-                                level_name=levels[target_level].name,
-                                type="invalid_level_attribute",
-                                message=(
-                                    "Parent level attribute is missing. "
-                                    "Update hierarchy level keys and retry preview."
-                                ),
-                            )
-                        )
-                    elif target_sql_attr is not None and parent_sql.resolved.table.id != target_sql_attr.resolved.table.id:
-                        # Cross-table: resolve a one-hop join between the child
-                        # and parent tables. If found, build a joined sample;
-                        # otherwise fall back to the honest unsupported warning.
-                        join_cols = await _resolve_join_between(
-                            db,
-                            model_id=model_id,
-                            table_a_id=target_sql_attr.resolved.table.id,
-                            table_b_id=parent_sql.resolved.table.id,
-                        )
-                        parent_sql_p = None
-                        if join_cols is not None:
-                            try:
-                                parent_sql_p = await _resolve_sql_attribute(
-                                    db,
-                                    model_id=model_id,
-                                    attribute_id=levels[target_level - 1].key_attribute_id,
-                                    source=levels[target_level - 1].key_attribute_source,
-                                    require_dimension_table=False,
-                                    connector="postgresql",
-                                    table_alias="p",
-                                )
-                            except HTTPException:
-                                parent_sql_p = None
-                        if join_cols is not None and parent_sql_p is not None:
-                            child_jc, parent_jc = join_cols
-                            cross_table = {
-                                "child_join_col": child_jc,
-                                "parent_join_col": parent_jc,
-                                "parent_table": parent_sql.resolved.table.physical_name,
-                                "parent_expr": parent_sql_p.expression,
-                            }
-                        else:
-                            can_sample = False
+                else:
+                    for anc_idx, anc_key in enumerate(ancestor_keys):
+                        anc_dim = level_dims[anc_idx]
+                        if anc_dim is None:
                             warnings.append(
                                 HierarchyPreviewWarning(
-                                    level_name=levels[target_level].name,
-                                    type="cross_table_preview_not_supported",
+                                    level_name=levels[anc_idx].name,
+                                    type="ancestor_bound_unsupported",
                                     message=(
-                                        "Preview expansion across this level needs a "
-                                        "direct join between the parent and child "
-                                        "tables; none is defined in the model."
+                                        "This ancestor level has no model dimension, so it "
+                                        "cannot bound the drill; members under other "
+                                        "ancestors may be included."
                                     ),
                                 )
                             )
-                    else:
-                        parent_expr = parent_sql.expression
-
-                if can_sample and target_sql_attr is not None:
-                    # Bug-3617 (Phase 0.5a): resolve the target level's display
-                    # caption (alias ``t`` — same table as the key) so the
-                    # sample carries caption alongside key. None → caption=key.
-                    caption_expr = await _resolve_level_caption_expr(
-                        db, model_id=model_id, level=levels[target_level],
+                            continue
+                        member_filters.append((anc_dim, anc_key))
+            parent_dim = level_dims[target_level - 1]
+            if parent_dim is None:
+                warnings.append(
+                    HierarchyPreviewWarning(
+                        level_name=levels[target_level].name,
+                        type="invalid_level_attribute",
+                        message=(
+                            "Parent level attribute is missing. "
+                            "Update hierarchy level keys and retry preview."
+                        ),
                     )
-                    # Bug-3617 (Phase 0.5b): for a parent-less whole-level
-                    # enumeration of a SINGLE-table hierarchy, sample the full
-                    # ancestor key tuple per member so the caller can build the
-                    # canonical composite member unique name. Cross-table or
-                    # parent-filtered drills keep the flat per-level sample (the
-                    # drill path reconstructs the path from the parent key).
-                    ancestor_path_mode = (
-                        include_key_path
-                        and target_level > 0
-                        and parent_key is None
-                        and cross_table is None
-                        and all(level_sql[i] is not None for i in range(target_level + 1))
-                        and len({level_sql[i].resolved.table.id for i in range(target_level + 1)}) == 1
-                    )
-                    if ancestor_path_mode:
-                        sample_sql = _build_ancestor_path_sample_sql(
-                            connector,
-                            table_name=target_sql_attr.resolved.table.physical_name,
-                            key_exprs=[level_sql[i].expression for i in range(target_level + 1)],
-                            sample_size=sample_size,
-                            rls_where=rls_where,
-                            caption_expr=caption_expr,
-                        )
-                    elif cross_table is not None:
-                        sample_sql = _build_cross_table_sample_sql(
-                            connector,
-                            child_table=target_sql_attr.resolved.table.physical_name,
-                            child_key_expr=target_sql_attr.expression,
-                            child_join_col=cross_table["child_join_col"],
-                            parent_table=cross_table["parent_table"],
-                            parent_key_expr=cross_table["parent_expr"],
-                            parent_join_col=cross_table["parent_join_col"],
-                            parent_key=parent_key,
-                            sample_size=sample_size,
-                            rls_where=rls_where,
-                            caption_expr=caption_expr,
-                        )
-                    else:
-                        sample_sql = _build_sample_sql(
-                            connector,
-                            table_name=target_sql_attr.resolved.table.physical_name,
-                            key_expr=target_sql_attr.expression,
-                            sample_size=sample_size,
-                            parent_expr=parent_expr,
-                            parent_key=parent_key,
-                            rls_where=rls_where,
-                            caption_expr=caption_expr,
-                        )
-                    batch_queries.append(("sample", sample_sql))
-
-                results = await _introspect_batch_via_router(
-                    str(model_id), batch_queries, bearer,
                 )
+            else:
+                member_filters.append((parent_dim, parent_key))
 
-                for idx in range(len(levels)):
-                    key = f"est_{idx}"
-                    if key not in results:
-                        continue
-                    rows, _cols, err = results[key]
-                    if err or not rows:
-                        continue
-                    val = rows[0].get("c")
-                    if val is not None:
-                        level_summaries[idx].estimated_members = int(val)
+        # Bug-3617 (Phase 0.5b): for a parent-less enumeration below the root,
+        # select the whole ancestor key tuple per member so the caller can build
+        # the canonical composite member unique name without a drill per member.
+        # The model query resolves the joins, so — unlike the physical-scan
+        # builder this replaced — the levels need not share one table.
+        ancestor_path_mode = (
+            include_key_path
+            and target_level > 0
+            and parent_key is None
+            and all(level_dims[i] is not None for i in range(target_level + 1))
+        )
+        key_dims = (
+            [level_dims[i] for i in range(target_level + 1)]
+            if ancestor_path_mode
+            else [level_dims[target_level]]
+        )
+        caption_dim = await _resolve_level_caption_dimension_name(
+            db, model_id=model_id, level=levels[target_level],
+        )
 
-                if "sample" in results:
-                    rows, _cols, err = results["sample"]
-                    if not err and ancestor_path_mode:
-                        # Each row is (key_0..key_target, caption_value).
-                        for row in rows:
-                            path: list[str] = []
-                            for i in range(target_level + 1):
-                                kv = row.get(f"key_{i}")
-                                if kv is None:
-                                    break
-                                path.append(str(kv))
-                            if len(path) != target_level + 1:
-                                continue
-                            key = path[-1]
-                            cap = row.get("caption_value")
-                            caption = str(cap) if cap is not None else key
-                            sampled_members.append((key, caption, path))
-                    elif not err:
-                        for row in rows:
-                            val = row.get("key_value")
-                            if val is not None:
-                                cap = row.get("caption_value")
-                                caption = str(cap) if cap is not None else str(val)
-                                sampled_members.append((str(val), caption, None))
+        sample_sql = _preview_member_sql(
+            model.slug,
+            key_dimensions=key_dims,
+            caption_dimension=caption_dim,
+            filters=member_filters,
+            limit=sample_size,
+        )
+        count_sqls = {
+            idx: _preview_level_count_sql(
+                model.slug, dimension=dim, limit=sample_size,
+            )
+            for idx, dim in enumerate(level_dims)
+            if dim is not None
+        } if include_level_counts else {}
+        router_persona_id = str(persona.id) if persona is not None else None
 
-            except Exception as exc:
+        async def _run(sql: str) -> list[dict]:
+            return await _execute_via_router(
+                str(model_id), sql, bearer, persona_id=router_persona_id,
+            )
+
+        count_keys = list(count_sqls)
+        results = await asyncio.gather(
+            _run(sample_sql),
+            *(_run(count_sqls[k]) for k in count_keys),
+            return_exceptions=True,
+        )
+        sample_result, count_results = results[0], results[1:]
+
+        if isinstance(sample_result, BaseException):
+            # A typed authorization / row-security failure is the router's
+            # verdict on this caller and must reach the client unchanged
+            # (F-007-16 / Bug-9021 keeps the 422 contract now that the router,
+            # not this endpoint, compiles the predicate). Anything else is
+            # reported the way a failed sample always was: a warning on a 200.
+            if (
+                isinstance(sample_result, HTTPException)
+                and sample_result.status_code in (401, 403, 422)
+            ):
+                raise sample_result
+            if isinstance(sample_result, RowSecurityDeniedError):
+                # Bug-9920: row security denied EVERY row. The member list is
+                # empty either way, so the only thing that distinguishes a
+                # governed denial from "this level has no members" is saying
+                # which one it is. Reported as a typed warning on the 200 --
+                # the same shape the KPI path uses when it marks a result
+                # restricted, rather than an error the caller cannot act on.
+                warnings.append(
+                    HierarchyPreviewWarning(
+                        level_name=levels[target_level].name,
+                        type="row_security_denied_all",
+                        message=(
+                            "Row security denies every row of this model for "
+                            "you, so no member of this level can be shown."
+                        ),
+                    )
+                )
+                sample_result = []
+            else:
                 warnings.append(
                     HierarchyPreviewWarning(
                         level_name=levels[target_level].name,
                         type="preview_query_failed",
-                        message=f"Failed to sample hierarchy members: {exc}",
+                        message=f"Failed to sample hierarchy members: {sample_result}",
                     )
                 )
+        if not isinstance(sample_result, BaseException):
+            for row in sample_result:
+                if ancestor_path_mode:
+                    path = [row.get(d) for d in key_dims]
+                    if any(v is None for v in path):
+                        continue
+                    path = [str(v) for v in path]
+                    key = path[-1]
+                else:
+                    val = row.get(key_dims[0])
+                    if val is None:
+                        continue
+                    key = str(val)
+                    path = None
+                cap = row.get(caption_dim) if caption_dim is not None else None
+                sampled_members.append((key, str(cap) if cap is not None else key, path))
+
+        for idx, count_rows in zip(count_keys, count_results):
+            # Level counts are estimates: a failure leaves the metadata
+            # row_count_estimate in place rather than failing the preview.
+            if isinstance(count_rows, BaseException):
+                continue
+            level_summaries[idx].estimated_members = len(count_rows)
 
         members = [
             HierarchyPreviewMember(

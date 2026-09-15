@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Integrations</span> / <span>Named List MDX Composition</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-05-23</span></div>
+    <div class="article-meta"><span class="audience-badge">analyst</span><span class="updated">Updated 2026-09-10</span></div>
     <h1>Named List MDX Composition</h1>
 <h2>What this covers</h2>
 <p>Named lists (called named sets in the underlying OLAP model) define reusable groups of dimension members. The Report Builder offers four builder types — Fixed Members, Top N, Filter, and Advanced MDX. This page explains the MDX expression that each builder type produces, how to read and hand-edit it, and how the resulting set is consumed by Excel CUBE formulas.</p>
@@ -78,6 +78,9 @@
 <p>The engine validates the MDX expression when you save a named list:</p>
 <ul><li><strong>Syntax check:</strong> The expression must parse as a valid MDX set expression.</li><li><strong>Member resolution:</strong> Referenced dimensions and hierarchies must exist in the deployed model.</li><li><strong>Evaluation:</strong> A preview query runs the expression and returns the first 100 members so you can confirm the result before saving.</li></ul>
 <p>If validation fails, the error message identifies the problematic portion of the expression.</p>
+<h2>Who can see a named list</h2>
+<p>A named list is offered to a user only when every dimension and measure its expression references is inside that user's perspective. A Top N list ranked by a measure a perspective does not include is therefore not listed for that perspective, and a query that names it is refused with a message saying so rather than returning an empty result.</p>
+<p>When Excel runs a query, Tessallite matches names in that query to exact deployed named-list names before it checks access. Normal field names and Excel functions do not make it check unrelated lists. If one named list uses another, Tessallite checks both. If access cannot be checked, the query stops with a readable server error instead of returning empty or misleading data.</p>
 <h2>Related</h2>
 <ul><li><a href="excel-add-in.html">Tessallite Excel Add-in</a></li><li><a href="named-list-parameterisation.html">Named List Parameterisation</a></li><li><a href="../modelling/define-dimensions.html">Define Dimensions</a></li><li><a href="../modelling/define-measures.html">Define Measures</a></li></ul>
 <nav class="page-nav"><a href="excel-add-in.html" class="page-nav-btn prev">&larr; Excel Add-in</a><a href="../index.html" class="page-nav-btn home">Home</a><a href="named-list-parameterisation.html" class="page-nav-btn next">Named List Parameterisation &rarr;</a></nav>

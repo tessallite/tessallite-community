@@ -9,8 +9,10 @@ import type {
   Persona, GlossaryEntry, AliasMapEntry, DrillThroughSet, FieldCompatibilityResponse,
 } from '../types/tessallite';
 
-export async function getProjects(): Promise<Project[]> {
-  const raw = await apiClient.get<Record<string, unknown>[]>('/api/v1/projects');
+export async function getProjects(signal?: AbortSignal): Promise<Project[]> {
+  const raw = await apiClient.get<Record<string, unknown>[]>('/api/v1/projects', {
+    signal,
+  });
   return raw.map(p => ({
     id: String(p.id),
     name: String(p.display_name ?? p.name ?? p.slug ?? ''),
@@ -18,8 +20,11 @@ export async function getProjects(): Promise<Project[]> {
   }));
 }
 
-export async function getModels(projectId: string): Promise<Model[]> {
-  const raw = await apiClient.get<Record<string, unknown>[]>(`/api/v1/projects/${projectId}/models`);
+export async function getModels(projectId: string, signal?: AbortSignal): Promise<Model[]> {
+  const raw = await apiClient.get<Record<string, unknown>[]>(
+    `/api/v1/projects/${projectId}/models`,
+    { signal },
+  );
   return raw.map(m => ({
     id: String(m.id),
     name: String(m.display_name ?? m.name ?? m.slug ?? ''),
@@ -120,8 +125,11 @@ export async function evaluateKpi(projectId: string, modelId: string, kpiId: str
   // Bug-6361: thread the active persona so the single-KPI evaluation (Report
   // Builder KPI cards) returns the same value the batch path and the rest of the
   // pane show, instead of the default-persona value (cross-surface mismatch).
-  const params = personaId ? `?persona_id=${encodeURIComponent(personaId)}` : '';
-  return apiClient.post<KpiEvaluateResponse>(`/api/v1/projects/${projectId}/models/${modelId}/kpis/${kpiId}/evaluate${params}`);
+  // Bug-9881: and deployed_only, because the number the card shows is a served
+  // number — it must come from the deployed snapshot, not a live editor draft.
+  return apiClient.post<KpiEvaluateResponse>(
+    `/api/v1/projects/${projectId}/models/${modelId}/kpis/${kpiId}/evaluate${consumptionQuery(personaId)}`,
+  );
 }
 
 /**
@@ -141,9 +149,8 @@ export async function evaluateKpiBatch(
   personaId?: string,
 ): Promise<KpiBatchResult[]> {
   if (kpiIds.length === 0) return [];
-  const params = personaId ? `?persona_id=${encodeURIComponent(personaId)}` : '';
   const resp = await apiClient.post<KpiBatchResponse>(
-    `/api/v1/projects/${projectId}/models/${modelId}/kpis/evaluate-batch${params}`,
+    `/api/v1/projects/${projectId}/models/${modelId}/kpis/evaluate-batch${consumptionQuery(personaId)}`,
     { kpi_ids: kpiIds },
   );
   return resp.results ?? [];

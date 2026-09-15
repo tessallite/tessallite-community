@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import {
   Alert,
   Box,
+  Button,
   Chip,
   CircularProgress,
   Collapse,
@@ -51,7 +52,12 @@ export default function KpiScorecardTab({ projectId, modelId }: Props) {
   // and XMLA MDSCHEMA_KPIS advertise. A certified-but-undeployed edit must not
   // change the executive card before Deploy. The model builder (KpisPanel) keeps
   // its own live list for authoring drafts.
-  const { data: kpis, isLoading: kpisLoading } = useKpis(
+  // Bug-9585 (round-3 external review): a failed request must be shown as an
+  // explicit, retryable error — not silently collapsed into the "no KPIs"
+  // empty state, which would misrepresent an outage/permissions failure as a
+  // legitimate "nothing deployed yet" finding. Mirrors UsageAnalyticsTab's
+  // Bug-7459 pattern and NamedSetsScorecardTab's identical fix.
+  const { data: kpis, isLoading: kpisLoading, isError: kpisError, refetch: refetchKpis } = useKpis(
     projectId, modelId, personaId || null, true,
   );
   const { data: personas } = usePersonas(projectId, modelId);
@@ -160,6 +166,25 @@ export default function KpiScorecardTab({ projectId, modelId }: Props) {
     return (
       <Box sx={{ p: 4, textAlign: "center" }}>
         <CircularProgress sx={{ color: ui.green }} />
+      </Box>
+    );
+  }
+
+  if (kpisError) {
+    return (
+      <Box sx={{ p: 3 }}>
+        <Alert
+          severity="error"
+          data-testid="kpi-scorecard-load-error"
+          sx={{ maxWidth: 600 }}
+          action={
+            <Button color="inherit" size="small" onClick={() => refetchKpis()}>
+              {t("common.retry")}
+            </Button>
+          }
+        >
+          {t("kpiScorecard.loadError")}
+        </Alert>
       </Box>
     );
   }

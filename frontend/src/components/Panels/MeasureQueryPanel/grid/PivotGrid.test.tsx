@@ -151,6 +151,58 @@ describe("PivotGrid drillable total-cell accessible names (Bug-8505)", () => {
   });
 });
 
+describe("PivotGrid drillable value cells are keyboard-accessible (Bug-8514)", () => {
+  // Total cells already carried tabIndex/Enter-Space/aria-label (Bug-8505); the
+  // ordinary data value cells were mouse-only (onClick only, no keyboard path
+  // and no accessible name distinguishing one cell's grain from another's).
+  it("gives a drillable value cell tabIndex 0 and a grain-specific accessible name", () => {
+    const onCellClick = vi.fn();
+    const { container } = renderTotals(onCellClick);
+    const cell = screen.getByLabelText("10. Revenue. Row: North / Boston. Column: 2024 / Jan. Activate to drill through.");
+    expect(container.contains(cell)).toBe(true);
+    expect(cell).toHaveAttribute("tabindex", "0");
+  });
+
+  it("supports keyboard activation (Enter/Space) for a value cell", () => {
+    const onCellClick = vi.fn();
+    renderTotals(onCellClick);
+    const cell = screen.getByLabelText("10. Revenue. Row: North / Boston. Column: 2024 / Jan. Activate to drill through.");
+    fireEvent.keyDown(cell, { key: "Enter" });
+    expect(onCellClick).toHaveBeenCalledTimes(1);
+    expect(onCellClick.mock.calls[0][0]).toMatchObject({ rowValues: ["North", "Boston"], colValues: [2024, "Jan"] });
+    fireEvent.keyDown(cell, { key: " " });
+    expect(onCellClick).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not make a non-clickable (record-count) measure's value cell focusable", () => {
+    const recordCountMeasure = { ...measure, id: "record-count", name: "Record Count", _recordCount: true } as Measure & { _recordCount: boolean };
+    const model = computePivot(response, recordCountMeasure, [dimension("region"), dimension("city")], [dimension("year"), dimension("month")]);
+    const { container } = render(
+      <I18nContext.Provider value={en}>
+        <PivotGrid
+          model={model}
+          measure={recordCountMeasure}
+          allTotals={new Map()}
+          showSubtotals={false}
+          showGrandTotals={false}
+          emptyCellMode="blank"
+          conditionalFormat={{ kind: "none" }}
+          sort={null}
+          onSortChange={vi.fn()}
+          onCellClick={vi.fn()}
+        />
+      </I18nContext.Provider>,
+    );
+    const dataCells = container.querySelectorAll("td");
+    dataCells.forEach((cell) => {
+      if (cell.textContent === "10") {
+        expect(cell).not.toHaveAttribute("tabindex");
+        expect(cell).not.toHaveAttribute("aria-label");
+      }
+    });
+  });
+});
+
 describe("PivotGrid controlled saved sort (Bug-8069)", () => {
   it.each([
     ["asc" as const, [["North", "Boston"], ["North", "New York"]]],

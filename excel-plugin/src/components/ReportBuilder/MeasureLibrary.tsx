@@ -12,6 +12,8 @@ interface MeasureLibraryProps {
   selectedMeasureIds: string[];
   onToggleMeasure: (measureId: string) => void;
   onAddToValues: (measureId: string) => void;
+  /** Bug-9747: add a HAVING-style filter on the measure's aggregated value. */
+  onAddToFilter?: (measureId: string) => void;
   /** Phase A default: insert as TESSALLITE.VALUE() formula (connectionless). */
   onInsertMeasureAsFunction?: (measureId: string) => void;
   /** Advanced: insert as CUBEVALUE formula (requires workbook connection). */
@@ -28,6 +30,7 @@ export default function MeasureLibrary({
   selectedMeasureIds,
   onToggleMeasure,
   onAddToValues,
+  onAddToFilter,
   onInsertMeasureAsFunction,
   onInsertMeasureAsFormula,
   expanded,
@@ -36,17 +39,18 @@ export default function MeasureLibrary({
   glossaryEntries,
 }: MeasureLibraryProps) {
   const groupedMeasures = useMemo(() => {
+    // Bug-9882: this used to also nest time variants under their base measure,
+    // keyed on `base_measure_id` — a field the producer never sends, so the
+    // branch never ran and every variant has always rendered as an ordinary
+    // measure. Removed rather than repointed at the real field
+    // (`variant_of_measure_id`): nesting makes a variant unreachable whenever
+    // the search filters its BASE out of the list, so a user searching "cagr"
+    // would find nothing. Nesting that survives search is a UI design task,
+    // tracked on Bug-9882, not a rename.
     const grouped = new Map<string, Measure[]>();
     const ungrouped: Measure[] = [];
-    const variantIdx = new Map<string, Measure[]>();
 
     for (const m of measures) {
-      if (m.base_measure_id) {
-        const variants = variantIdx.get(m.base_measure_id) || [];
-        variants.push(m);
-        variantIdx.set(m.base_measure_id, variants);
-        continue;
-      }
       if (m.display_folder) {
         const group = grouped.get(m.display_folder) || [];
         group.push(m);
@@ -56,21 +60,9 @@ export default function MeasureLibrary({
       }
     }
 
-    const result: { folder?: string; measures: Measure[]; variants: Measure[] }[] = [];
-
-    for (const [folder, list] of grouped) {
-      result.push({ folder, measures: list, variants: [] });
-    }
-    if (ungrouped.length > 0) {
-      result.push({ measures: ungrouped, variants: [] });
-    }
-
-    for (const entry of result) {
-      for (const m of entry.measures) {
-        const vars = variantIdx.get(m.id);
-        if (vars) entry.variants.push(...vars);
-      }
-    }
+    const result: { folder?: string; measures: Measure[] }[] = [];
+    for (const [folder, list] of grouped) result.push({ folder, measures: list });
+    if (ungrouped.length > 0) result.push({ measures: ungrouped });
 
     return result;
   }, [measures]);
@@ -79,18 +71,21 @@ export default function MeasureLibrary({
     <>
       <Box
         sx={{
-          display: 'flex', alignItems: 'center', px: 1.5, py: 0.75,
+          display: 'flex', alignItems: 'center', px: 1.25, height: 24,
           cursor: measures.length > 0 || loading ? 'pointer' : 'default',
           borderTop: `1px solid ${tokens.colorBorderLight}`,
+          borderBottom: `1px solid ${tokens.colorBorderLight}`,
+          bgcolor: tokens.colorSubtleFill,
           opacity: measures.length > 0 || loading ? 1 : 0.68,
         }}
         onClick={() => {
           if (measures.length > 0 || loading || searchQuery) onToggleExpanded();
         }}
       >
-        <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-          {templates.library.measuresHeader(measures.length)}
+        <Typography sx={{ fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, flex: 1, textTransform: 'uppercase', letterSpacing: '0.03em' }}>
+          {strings.library.measuresSection}
         </Typography>
+        <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>{measures.length}</Typography>
         {/* Bug-6710: keyboard path to expand/collapse (header Box is mouse-only). */}
         {(measures.length > 0 || loading || searchQuery) && (
           <IconButton
@@ -98,7 +93,7 @@ export default function MeasureLibrary({
             onClick={(e) => { e.stopPropagation(); onToggleExpanded(); }}
             aria-expanded={expanded}
             aria-label={templates.library.toggleSectionAria(expanded, strings.library.measuresSection)}
-            sx={{ width: 24, height: 24, color: tokens.colorTextSecondary }}
+            sx={{ width: 22, height: 22, color: tokens.colorTextSecondary }}
           >
             {expanded ? <ExpandLess sx={{ fontSize: 16 }} /> : <ExpandMore sx={{ fontSize: 16 }} />}
           </IconButton>
@@ -106,10 +101,10 @@ export default function MeasureLibrary({
       </Box>
       <Collapse in={expanded}>
         {loading ? (
-          <Box sx={{ p: 1 }}>
-            <Skeleton variant="rectangular" height={48} sx={{ mb: 0.5, borderRadius: 1 }} />
-            <Skeleton variant="rectangular" height={48} sx={{ mb: 0.5, borderRadius: 1 }} />
-            <Skeleton variant="rectangular" height={48} sx={{ mb: 0.5, borderRadius: 1 }} />
+          <Box sx={{ p: 0.5 }}>
+            <Skeleton variant="rectangular" height={28} sx={{ mb: 0.25, borderRadius: 0.5 }} />
+            <Skeleton variant="rectangular" height={28} sx={{ mb: 0.25, borderRadius: 0.5 }} />
+            <Skeleton variant="rectangular" height={28} sx={{ mb: 0.25, borderRadius: 0.5 }} />
           </Box>
         ) : measures.length === 0 ? (
           <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, px: 1.5, py: 1 }}>
@@ -121,35 +116,23 @@ export default function MeasureLibrary({
               {group.folder && (
                 <Typography sx={{
                   fontSize: 10, fontWeight: 600, color: tokens.colorTextSecondary,
-                  px: 1.5, py: 0.5, textTransform: 'uppercase', bgcolor: tokens.colorSubtleFill,
+                  px: 1.25, py: 0.25, minHeight: 20, textTransform: 'uppercase', bgcolor: tokens.colorSubtleFill,
                 }}>
                   {group.folder}
                 </Typography>
               )}
               {group.measures.map(m => (
-                <Box key={m.id}>
-                  <MeasureCard
-                    measure={m}
-                    checked={selectedMeasureIds.includes(m.id)}
-                    onToggle={() => onToggleMeasure(m.id)}
-                    onAddToValues={() => onAddToValues(m.id)}
-                    onInsertAsFunction={onInsertMeasureAsFunction ? () => onInsertMeasureAsFunction(m.id) : undefined}
-                    onInsertAsFormula={onInsertMeasureAsFormula ? () => onInsertMeasureAsFormula(m.id) : undefined}
-                    glossaryEntries={glossaryEntries}
-                  />
-                  {group.variants.filter(v => v.base_measure_id === m.id).map(v => (
-                    <Box key={v.id} sx={{ ml: 2 }}>
-                      <MeasureCard
-                        measure={v}
-                        checked={selectedMeasureIds.includes(v.id)}
-                        onToggle={() => onToggleMeasure(v.id)}
-                        onAddToValues={() => onAddToValues(v.id)}
-                        onInsertAsFormula={onInsertMeasureAsFormula ? () => onInsertMeasureAsFormula(v.id) : undefined}
-                        glossaryEntries={glossaryEntries}
-                      />
-                    </Box>
-                  ))}
-                </Box>
+                <MeasureCard
+                  key={m.id}
+                  measure={m}
+                  checked={selectedMeasureIds.includes(m.id)}
+                  onToggle={() => onToggleMeasure(m.id)}
+                  onAddToValues={() => onAddToValues(m.id)}
+                  onAddToFilter={onAddToFilter ? () => onAddToFilter(m.id) : undefined}
+                  onInsertAsFunction={onInsertMeasureAsFunction ? () => onInsertMeasureAsFunction(m.id) : undefined}
+                  onInsertAsFormula={onInsertMeasureAsFormula ? () => onInsertMeasureAsFormula(m.id) : undefined}
+                  glossaryEntries={glossaryEntries}
+                />
               ))}
             </Box>
           ))

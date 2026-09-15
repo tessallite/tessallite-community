@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Alert, Box, Button, Collapse, IconButton, Snackbar, Typography } from "@mui/material";
 import { ExpandLess, ExpandMore } from "@mui/icons-material";
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { useAutoScroll } from "../hooks/useAutoScroll";
 import { useConversationStore } from "../stores/conversationStore";
 import { useChatContext } from "../providers/ChatProvider";
@@ -12,6 +12,7 @@ import { resolveStreamErrorMessage } from "../types/streaming";
 import type { TraceVisibility } from "./TraceStrip";
 import { UserMessage } from "./UserMessage";
 import { AssistantTurn } from "./AssistantTurn";
+import { parseVisualArtifact } from "./VisualArtifactBlock";
 import { ChatComposer } from "./ChatComposer";
 import { EmptyChatState } from "./EmptyChatState";
 import { ScrollToBottomButton } from "./ScrollToBottomButton";
@@ -93,6 +94,14 @@ export interface ChatCanvasProps {
   showModelPicker?: boolean;
   headerSlot?: React.ReactNode;
   renderTurnActions?: (turn: TurnResponse, resultRows?: Record<string, unknown>[]) => React.ReactNode;
+  /**
+   * Take over the Visual panel's maximise, compact hosts only. Excel supplies
+   * this so the control opens a real Office dialog window instead of an overlay
+   * that cannot outgrow the task pane. Left undefined, the overlay stays.
+   */
+  onMaximizeVisual?: (turn: TurnResponse, resultRows?: Record<string, unknown>[]) => void;
+  /** Opt-in compact task-pane presentation. Transport and state remain unchanged. */
+  compact?: boolean;
 }
 
 export function ChatCanvas({
@@ -108,8 +117,10 @@ export function ChatCanvas({
   showModelPicker,
   headerSlot,
   renderTurnActions,
+  onMaximizeVisual,
+  compact = false,
 }: ChatCanvasProps) {
-  const { adapter, t, projectId, isEmbed } = useChatContext();
+  const { adapter, t, projectId, isEmbed, activeModelId } = useChatContext();
   const activeConversationId = useConversationStore(
     (s) => s.activeConversationId,
   );
@@ -140,6 +151,38 @@ export function ChatCanvas({
   const resultSamplesRef = useRef<Map<string, Record<string, unknown>[]>>(
     new Map(),
   );
+  const sendGenerationRef = useRef(0);
+  const activeSendRef = useRef<{
+    generation: number;
+    controller: AbortController;
+  } | null>(null);
+  const currentContextRef = useRef({
+    projectId,
+    modelId: activeModelId ?? null,
+  });
+  currentContextRef.current = {
+    projectId,
+    modelId: activeModelId ?? null,
+  };
+  const previousContextRef = useRef({
+    projectId,
+    modelId: activeModelId ?? null,
+  });
+
+  useEffect(() => {
+    const modelId = activeModelId ?? null;
+    const previous = previousContextRef.current;
+    if (previous.projectId !== projectId || previous.modelId !== modelId) {
+      activeSendRef.current?.controller.abort();
+      activeSendRef.current = null;
+      sendGenerationRef.current += 1;
+      setStreamingDraft(null);
+      setStreaming(false);
+      setAbortController(null);
+      setOptimisticMessages([]);
+    }
+    previousContextRef.current = { projectId, modelId };
+  }, [activeModelId, projectId, setStreaming]);
 
   const { containerRef, scrollToBottom, showScrollButton } = useAutoScroll([
     optimisticMessages,
@@ -160,6 +203,30 @@ export function ChatCanvas({
     async (text: string) => {
       if (!projectId || isStreaming || disabled) return;
 
+      // Bug-9805 / Bug-9826: one generation owns the complete send lifecycle.
+      // It aborts the transport when superseded and remains the final authority
+      // for every callback, including reconciliation and title persistence.
+      activeSendRef.current?.controller.abort();
+      const generation = sendGenerationRef.current + 1;
+      sendGenerationRef.current = generation;
+      const controller = new AbortController();
+      activeSendRef.current = { generation, controller };
+      let streamFinished = false;
+      const sendProjectId = projectId;
+      const sendModelId = activeModelId ?? null;
+      const isSendCurrent = () =>
+        sendGenerationRef.current === generation &&
+        currentContextRef.current.projectId === sendProjectId &&
+        currentContextRef.current.modelId === sendModelId &&
+        !controller.signal.aborted;
+      const isCallbackCurrent = () => isSendCurrent() && !streamFinished;
+      const finishSend = () => {
+        streamFinished = true;
+        if (activeSendRef.current?.generation === generation) {
+          activeSendRef.current = null;
+        }
+      };
+
       // Bug-6521 — one idempotency key per logical send, generated ABOVE the
       // retry loop and captured in the fetchStream closure so every automatic
       // retry re-sends the SAME key and the backend dedupes the turn.
@@ -168,26 +235,16 @@ export function ChatCanvas({
       setOptimisticMessages((prev) => [...prev, { text, id: optimisticId }]);
       setRetryText(null);
 
-      // Bug-8336 — snapshot the turn ids that already exist BEFORE this send, so
-      // the onError reconcile can tell a turn THIS send produced apart from an
-      // older turn that merely shares the same text (re-asking the same
-      // question is a normal pattern). Distinguish an UNLOADED cache (undefined
-      // — the turns query has not resolved yet, e.g. a send right after
-      // switching conversations) from a LOADED-EMPTY cache ([] or a just-created
-      // conversation): with an unloaded cache we cannot prove a matching turn is
-      // new, so the text fallback must NOT fire (it would let an older
-      // identical-text turn falsely reconcile a genuinely failed send). Also
-      // capture the server turn_id from turn.started so reconciliation can match
-      // on identity if the backend ever supplies it (today it does not — see
-      // Bug intake to emit turn_id on turn.started); until then the newness
-      // snapshot is the sole discriminator, hence the unloaded-cache guard.
+      // Bug-8336 — snapshot the turn ids that already exist BEFORE this send,
+      // so reconciliation cannot mistake an older identical question for this
+      // send's persisted turn.
       const priorTurnsSnapshot = activeConversationId
         ? queryClient.getQueryData<TurnResponse[]>([
             "turns",
             projectId,
             activeConversationId,
           ])
-        : []; // no active conversation yet -> genuinely no prior turns
+        : [];
       const priorTurnsLoaded = priorTurnsSnapshot !== undefined;
       const priorTurnIds = new Set(
         (priorTurnsSnapshot ?? []).map((turn) => turn.id),
@@ -204,11 +261,13 @@ export function ChatCanvas({
             pinnedModelId: pendingModelId,
             personaId: pendingPersonaId,
           });
+          if (!isSendCurrent()) return;
           convId = conv.id;
           createdConversation = true;
           setActiveConversation(convId);
           setDraftTitleCandidate(titleCandidate);
         } catch {
+          if (!isSendCurrent()) return;
           setToast(t("chat.createConversationFailed"));
           setRetryText(text);
           setPrefillText(text);
@@ -216,39 +275,48 @@ export function ChatCanvas({
           setOptimisticMessages((prev) =>
             prev.filter((m) => m.id !== optimisticId),
           );
+          finishSend();
           return;
         }
       }
 
       // Persist the auto-derived conversation title once a terminal turn has
-      // landed. Split out from the refetch so the Bug-8336 onError reconcile
-      // path (which already refetched to detect the persisted turn) can finalize
-      // the title without triggering a redundant second refetch.
+      // landed. Every post-await mutation checks this send generation first.
       async function finalizeCreatedConversationTitle() {
         if (!createdConversation || !projectId || !convId || !titleCandidate)
           return;
+        if (!isSendCurrent()) return;
         if (isEmbed) {
-          setDraftTitleCandidate(null);
+          if (isSendCurrent()) setDraftTitleCandidate(null);
           return;
         }
         try {
           await adapter.updateConversation(projectId, convId, {
             title: titleCandidate,
           });
+          if (!isSendCurrent()) return;
           setDraftTitleCandidate(null);
           queryClient.invalidateQueries({
             queryKey: ["conversations", projectId],
           });
         } catch {
-          setToast(t("chat.titleSaveFailed"));
+          if (isSendCurrent()) setToast(t("chat.titleSaveFailed"));
         }
       }
 
       async function finalizeCompletedTurn() {
-        refetch();
+        if (!isSendCurrent()) return;
+        try {
+          await refetch();
+        } catch {
+          // The persisted turn remains the source of truth; the next query
+          // refresh can reconcile a transient refetch failure.
+        }
+        if (!isSendCurrent()) return;
         await finalizeCreatedConversationTitle();
       }
 
+      if (!isSendCurrent()) return;
       setStreaming(true);
       setStreamThoughtOpen(false);
       setStreamingDraft({
@@ -258,8 +326,6 @@ export function ChatCanvas({
         status: "streaming",
         steps: [],
       });
-
-      const controller = new AbortController();
       setAbortController(controller);
 
       const fetchStream = () =>
@@ -271,8 +337,11 @@ export function ChatCanvas({
           idempotencyKey,
         );
 
-      sendMessageStream(fetchStream, {
+      sendMessageStream(
+        fetchStream,
+        {
           onEvent: (eventName, data) => {
+            if (!isCallbackCurrent()) return;
             switch (eventName) {
               case "turn.started":
                 if (typeof data.turn_id === "string" && data.turn_id) {
@@ -289,8 +358,7 @@ export function ChatCanvas({
                   d
                     ? {
                         ...d,
-                        thought:
-                          d.thought + ((data.text as string) || ""),
+                        thought: d.thought + ((data.text as string) || ""),
                       }
                     : d,
                 );
@@ -300,8 +368,7 @@ export function ChatCanvas({
                   d
                     ? {
                         ...d,
-                        narration:
-                          d.narration + ((data.text as string) || ""),
+                        narration: d.narration + ((data.text as string) || ""),
                       }
                     : d,
                 );
@@ -326,6 +393,7 @@ export function ChatCanvas({
                 setOptimisticMessages((prev) =>
                   prev.filter((m) => m.id !== optimisticId),
                 );
+                finishSend();
                 void finalizeCompletedTurn();
                 break;
               }
@@ -336,7 +404,8 @@ export function ChatCanvas({
                 setOptimisticMessages((prev) =>
                   prev.filter((m) => m.id !== optimisticId),
                 );
-                refetch();
+                finishSend();
+                if (isSendCurrent()) void refetch().catch(() => {});
                 break;
               case "turn.error":
                 setStreamingDraft(null);
@@ -349,45 +418,32 @@ export function ChatCanvas({
                 setOptimisticMessages((prev) =>
                   prev.filter((m) => m.id !== optimisticId),
                 );
+                finishSend();
                 break;
             }
           },
           onError: async (err) => {
+            if (!isCallbackCurrent()) return;
             setStreamingDraft(null);
             setStreaming(false);
             setAbortController(null);
             setOptimisticMessages((prev) =>
               prev.filter((m) => m.id !== optimisticId),
             );
-            // Bug-8336 (G-037-01) — an onError can fire AFTER the server has
-            // already persisted the terminal turn (post-token connection loss,
-            // proxy close, EOF without a terminal event). Reconcile FIRST:
-            // refetch the persisted turns and, if the turn for this send now
-            // exists, treat it as a success — do NOT surface an error and do
-            // NOT offer a retry, which would re-ask an already-answered
-            // question. This mirrors the onComplete/finalizeCompletedTurn
-            // refetch path so both terminal outcomes converge on server truth.
-            // If no persisted turn is found, the request genuinely failed:
-            // show the error and offer an (idempotent) retry as before.
+            finishSend();
+            // Bug-8336 (G-037-01) — reconcile a persisted terminal turn before
+            // showing an error after a dropped stream. The generation guard
+            // makes the whole async reconcile obsolete when a newer send or
+            // context transition takes over.
             let reconciled = false;
             try {
+              if (!isSendCurrent()) return;
               const { data: latestTurns } = await refetch();
+              if (!isSendCurrent()) return;
               reconciled = Boolean(
                 latestTurns?.some((turn) => {
-                  // Must be a real, persisted terminal turn — never the
-                  // "streaming" reservation placeholder or a withheld
-                  // judge_pending row (see TERMINAL_TURN_STATUSES).
                   if (!isReconcilableTurn(turn)) return false;
-                  // Prefer identity: the turn_id the server assigned to THIS
-                  // send (from turn.started), if the backend supplies it. This
-                  // is unambiguous even when the same question was asked earlier
-                  // in the conversation.
                   if (startedTurnId) return turn.id === startedTurnId;
-                  // No turn_id available. Fall back to "a turn that did NOT
-                  // exist before this send and matches this text". This is only
-                  // trustworthy when we actually had the prior turns loaded;
-                  // with an unloaded snapshot we cannot tell new from old, so we
-                  // decline to reconcile and let the error/retry path run.
                   return (
                     priorTurnsLoaded &&
                     !priorTurnIds.has(turn.id) &&
@@ -396,34 +452,33 @@ export function ChatCanvas({
                 }),
               );
             } catch {
-              // refetch failed — fall through to the error/retry path so the
-              // user is never left silently stuck.
+              // refetch failed — fall through to the error/retry path.
             }
+            if (!isSendCurrent()) return;
             if (reconciled) {
-              // The turn was persisted; finalize the created-conversation title
-              // exactly as a normal completion would, without a second refetch.
               void finalizeCreatedConversationTitle();
               return;
             }
-            // Bug-8370 — resolve the typed StreamErrorCode to a friendly,
-            // i18n-backed message instead of surfacing messagesStream.ts's
-            // raw English `err.message` verbatim. An unrecognised code (or a
-            // non-StreamError) degrades to the generic connection-error copy.
+            if (!isSendCurrent()) return;
             setToast(resolveStreamErrorMessage(err, t));
             setRetryText(text);
             setPrefillText(text);
             setComposerKey((k) => k + 1);
           },
           onComplete: () => {
+            if (!isCallbackCurrent()) return;
             setStreamingDraft(null);
             setStreaming(false);
             setAbortController(null);
+            finishSend();
           },
         },
+        { signal: controller.signal, isCurrent: isSendCurrent },
       );
     },
     [
       projectId,
+      activeModelId,
       disabled,
       isEmbed,
       activeConversationId,
@@ -449,7 +504,12 @@ export function ChatCanvas({
   }, [retryText, handleSend]);
 
   const handleAbort = useCallback(() => {
-    abortController?.abort();
+    // Bug-9805: abort the controller held by the send lifecycle, not only the
+    // render snapshot, and advance the generation so callbacks already queued
+    // by the transport cannot clear or repopulate the current conversation.
+    (activeSendRef.current?.controller ?? abortController)?.abort();
+    activeSendRef.current = null;
+    sendGenerationRef.current += 1;
     setStreamingDraft(null);
     setStreaming(false);
     setAbortController(null);
@@ -483,8 +543,8 @@ export function ChatCanvas({
       <Box sx={{ height: "100%", display: "flex", flexDirection: "column" }}>
         {headerSlot}
         {modelPickerSlot}
-        <Box sx={{ flex: 1 }}>
-          <EmptyChatState />
+        <Box sx={{ flex: 1, ...(compact ? { minHeight: 0 } : {}) }}>
+          <EmptyChatState compact={compact} onSelectExample={compact ? handleRephrase : undefined} />
         </Box>
         <ChatComposer
           key={composerKey}
@@ -495,6 +555,7 @@ export function ChatCanvas({
           disabled={disabled}
           maxChars={maxChars}
           placeholder={composerPlaceholder}
+          compact={compact}
         />
       </Box>
     );
@@ -520,24 +581,28 @@ export function ChatCanvas({
         aria-live="polite"
         sx={{
           flex: 1,
+          ...(compact ? { minHeight: 0 } : {}),
           overflow: "auto",
-          px: 2,
-          py: 2,
-          maxWidth: 960,
-          mx: "auto",
+          px: compact ? 1.25 : 2,
+          py: compact ? 1 : 2,
+          maxWidth: compact ? "none" : 960,
+          mx: compact ? 0 : "auto",
           width: "100%",
         }}
       >
-        {isLoading && activeConversationId && <LoadingSkeleton />}
+        {isLoading && activeConversationId && <LoadingSkeleton compact={compact} />}
 
         {turns.map((turn) => {
+          const cachedRows = resultSamplesRef.current.get(turn.id);
+          const sampleRows = turn.query_result_sample ?? undefined;
+          const artifactRows = parseVisualArtifact(turn.rendered_output)?.rows;
           const rows =
-            resultSamplesRef.current.get(turn.id) ??
-            turn.query_result_sample ??
-            undefined;
+            (cachedRows && cachedRows.length > 0 ? cachedRows : undefined) ??
+            (sampleRows && sampleRows.length > 0 ? sampleRows : undefined) ??
+            artifactRows;
           return (
             <Box key={turn.id}>
-              <UserMessage text={turn.user_message} />
+              <UserMessage text={turn.user_message} compact={compact} />
               <AssistantTurn
                 turn={turn}
                 resultRows={rows}
@@ -556,8 +621,15 @@ export function ChatCanvas({
                 }
                 echartsTheme={echartsTheme}
                 chartsCss={chartsCss}
+                compact={compact}
+                turnActions={compact ? renderTurnActions?.(turn, rows) : undefined}
+                onMaximizeVisual={
+                  compact && onMaximizeVisual
+                    ? () => onMaximizeVisual(turn, rows)
+                    : undefined
+                }
               />
-              {renderTurnActions?.(turn, rows)}
+              {!compact && renderTurnActions?.(turn, rows)}
             </Box>
           );
         })}
@@ -565,17 +637,17 @@ export function ChatCanvas({
         {optimisticMessages
           .filter((m) => !turns.some((t) => t.user_message === m.text))
           .map((m) => (
-            <UserMessage key={m.id} text={m.text} />
+            <UserMessage key={m.id} text={m.text} compact={compact} />
           ))}
 
         {streamingDraft && (
-          <Box sx={{ mb: 2 }}>
+          <Box sx={{ mb: compact ? 1 : 2 }}>
             <Box
               sx={{
-                p: 2,
+                p: compact ? 0 : 2,
                 border: 1,
                 borderColor: "divider",
-                borderRadius: 2,
+                borderRadius: compact ? 0.5 : 2,
                 bgcolor: "background.paper",
               }}
             >
@@ -586,18 +658,28 @@ export function ChatCanvas({
               {streamingDraft.thought && visibility?.showThoughtProcess !== false && (
                 <Box
                   sx={{
-                    mb: 1,
-                    p: 0.75,
+                    mb: compact ? 0.5 : 1,
+                    p: compact ? 0.5 : 0.75,
                     bgcolor: "action.hover",
                     borderRadius: 1,
                   }}
                 >
-                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                  <Box
+                    sx={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 0.5,
+                      minHeight: compact ? 22 : undefined,
+                    }}
+                  >
                     <IconButton
                       size="small"
                       onClick={() => setStreamThoughtOpen((v) => !v)}
                       aria-label={streamThoughtOpen ? t("chat.collapseThought") : t("chat.expandThought")}
-                      sx={{ p: 0.25 }}
+                      sx={{
+                        p: compact ? 0.125 : 0.25,
+                        ...(compact ? { width: 18, height: 18 } : {}),
+                      }}
                     >
                       {streamThoughtOpen ? (
                         <ExpandLess fontSize="small" />
@@ -605,7 +687,12 @@ export function ChatCanvas({
                         <ExpandMore fontSize="small" />
                       )}
                     </IconButton>
-                    <Typography variant="caption" color="text.secondary" fontWeight={650}>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      fontWeight={650}
+                      sx={compact ? { fontSize: 10 } : undefined}
+                    >
                       {t("turn.thinking")}
                     </Typography>
                   </Box>
@@ -618,7 +705,7 @@ export function ChatCanvas({
                         mt: 0.5,
                         maxHeight: "5.5em",
                         overflowY: "auto",
-                        fontSize: 12,
+                        fontSize: compact ? 10.5 : 12,
                         lineHeight: 1.35,
                         color: "text.secondary",
                         whiteSpace: "pre-wrap",
@@ -639,8 +726,8 @@ export function ChatCanvas({
                   </Collapse>
                   <Box
                     sx={{
-                      fontSize: 12,
-                      lineHeight: 1.4,
+                      fontSize: compact ? 10.5 : 12,
+                      lineHeight: compact ? 1.35 : 1.4,
                       color: "text.secondary",
                       display: streamThoughtOpen ? "none" : "block",
                       pl: 3.5,
@@ -651,14 +738,14 @@ export function ChatCanvas({
                 </Box>
               )}
               {streamingDraft.steps.length > 0 && (
-                <Box sx={{ mb: 1 }}>
-                  <InlineStepCard steps={streamingDraft.steps} />
+                <Box sx={{ mb: compact ? 0.5 : 1 }}>
+                  <InlineStepCard steps={streamingDraft.steps} compact={compact} />
                 </Box>
               )}
               <Box
                 sx={{
-                  fontSize: 15,
-                  lineHeight: 1.6,
+                  fontSize: compact ? 12 : 15,
+                  lineHeight: compact ? 1.4 : 1.6,
                   whiteSpace: "pre-wrap",
                 }}
               >
@@ -707,7 +794,7 @@ export function ChatCanvas({
         )}
       </Box>
 
-      {showScrollButton && <ScrollToBottomButton onClick={scrollToBottom} />}
+      {showScrollButton && <ScrollToBottomButton onClick={scrollToBottom} compact={compact} />}
 
       <ChatComposer
         key={composerKey}
@@ -718,6 +805,7 @@ export function ChatCanvas({
         disabled={disabled}
         maxChars={maxChars}
         placeholder={composerPlaceholder}
+        compact={compact}
       />
 
       <Snackbar
@@ -730,6 +818,7 @@ export function ChatCanvas({
           severity="error"
           onClose={() => setToast(null)}
           variant="filled"
+          sx={compact ? { fontSize: 11, borderRadius: 0.5 } : undefined}
         >
           {retryText && (
             <Button

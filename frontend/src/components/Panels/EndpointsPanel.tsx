@@ -742,7 +742,7 @@ function ExcelPluginEndpoint({ tenantSlug }: EndpointPanelProps) {
           {t("endpoints.downloadDeployedManifest")}
         </Button>
         <Link
-          href="/help/excel-plugin.html"
+          href="/help/integrations/excel-add-in.html"
           target="_blank"
           rel="noopener"
           sx={{ fontSize: "0.8rem", display: "inline-flex", alignItems: "center", gap: 0.5 }}

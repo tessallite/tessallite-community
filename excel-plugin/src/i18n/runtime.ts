@@ -42,7 +42,7 @@ const taskPaneTranslations: Record<string, Record<string, string>> = {
     "projects.noneSelected": "Kein Projekt ausgewählt. Fügen Sie ein Projekt in der Tessallite-Webanwendung hinzu.",
     "auth.loginFailed": "Anmeldung fehlgeschlagen",
     "connection.restored": "Verbindung wiederhergestellt",
-    "connection.lost": "Verbindung verloren. Wiederholung läuft...",
+    "connection.lost": "Verbindung verloren. Prüfe erneut alle 30 Sekunden.",
     "chatShell.newConversation": "Neue Unterhaltung",
     "chatShell.conversationHistory": "Unterhaltungsverlauf",
     "chatShell.deleteTitle": "Unterhaltung löschen",
@@ -90,7 +90,7 @@ const taskPaneTranslations: Record<string, Record<string, string>> = {
     "projects.noneSelected": "Aucun projet sélectionné. Ajoutez un projet dans l'application web Tessallite.",
     "auth.loginFailed": "Échec de la connexion",
     "connection.restored": "Connexion rétablie",
-    "connection.lost": "Connexion perdue. Nouvelle tentative...",
+    "connection.lost": "Connexion perdue. Nouvelle vérification toutes les 30 secondes.",
     "chatShell.newConversation": "Nouvelle conversation",
     "chatShell.conversationHistory": "Historique des conversations",
     "chatShell.deleteTitle": "Supprimer la conversation",
@@ -124,6 +124,17 @@ const chatTranslations: Record<string, Record<string, string>> = {
     "chart.truncated": "Zeige die ersten {{count}} von {{total}} Zeilen",
     "steps.header": "Schritte ({{n}})",
     "steps.step": "Schritt {{n}}",
+    // R2-B04: these 7 keys were added to chatStrings.ts's English fallback
+    // only, not here, despite the L0 commit claiming "en + de/fr" — an
+    // external cross-family review caught the gap. Translations match
+    // tessallite/frontend's de locale for the same keys.
+    "chart.measuresDimension": "Kennzahlen",
+    "chart.rowLabel": "Zeile {{n}}",
+    "chart.rowsDimension": "Zeilen",
+    "chart.valueSeriesName": "Wert",
+    "chat.scrollToBottomAria": "Nach unten scrollen",
+    "queryBlock.copied": "Kopiert",
+    "queryBlock.copy": "Kopieren",
   },
   fr: {
     "chat.chatAria": "Chat",
@@ -142,6 +153,14 @@ const chatTranslations: Record<string, Record<string, string>> = {
     "chart.truncated": "Affichage des {{count}} premières lignes sur {{total}}",
     "steps.header": "Étapes ({{n}})",
     "steps.step": "Étape {{n}}",
+    // R2-B04: see the matching comment in the `de` block above.
+    "chart.measuresDimension": "Mesures",
+    "chart.rowLabel": "Ligne {{n}}",
+    "chart.rowsDimension": "Lignes",
+    "chart.valueSeriesName": "Valeur",
+    "chat.scrollToBottomAria": "Défiler vers le bas",
+    "queryBlock.copied": "Copié",
+    "queryBlock.copy": "Copier",
   },
 };
 

@@ -2,7 +2,7 @@
 title: "Build a Report with the Excel Add-in"
 audience: end user
 area: analyst-guides
-updated: 2026-08-04
+updated: 2026-09-09
 ---
 
 ## What this covers
@@ -29,17 +29,17 @@ Maya (from the dashboard walkthrough) has a new request: a quick regional sales 
 
 1. Open Excel, find the Tessallite ribbon button (usually on **Home** or **Insert**), and click it. The task pane opens on the right.
 2. Sign in with your tenant slug (`acme-demo`), email, and password.
-3. At the top of the pane, choose the **`modelx`** model. The measure, dimension, and hierarchy libraries fill in — with only the objects you are allowed to see. If your list looks shorter than a colleague's, that is your persona doing its job, not a missing feature.
+3. Click the project/model title at the top of the pane, then choose the **`modelx`** model. The measure, dimension, and hierarchy libraries fill in — with only the objects you are allowed to see. If your list looks shorter than a colleague's, that is your persona doing its job, not a missing feature.
 
 ---
 
 ## Step 2 — Drag a report together in Report Builder
 
-The **Report Builder** tab is where tables get assembled.
+The **Analyse** tab is where tables get assembled.
 
 1. Drag **`region_code`** into the **Rows** zone.
 2. Drag **`net_sales`** and **`gross_margin`** into the **Values** zone.
-3. Click **Run**.
+3. Click the **Table** toolbar icon.
 
 A grouped table lands on the sheet: one row per region, net sales and gross margin beside each, with friendly headers. Underneath, the add-in asked Tessallite for exactly that grouping — and Tessallite routed the question to a pre-computed summary if one covers it, so the answer comes back fast even over a hundred thousand rows.
 
@@ -60,11 +60,15 @@ The small label under the value box says what kind of value the column expects, 
 
 ## Step 3 — Ask the question out loud
 
-The **Ask Tessallite** panel is the conversational agent, inside Excel.
+The **Ask** panel is the conversational agent, inside Excel.
 
 1. Type: *which channel grew fastest last month?*
 2. The answer streams back as it is generated — a sentence, the supporting query, and a judge verdict on the answer's quality.
 3. Click the **insert** action to drop the answer text, the result table, or a chart straight onto the sheet.
+
+Chart inserts use dimensions as category labels and measures as numeric series.
+Measure values returned as numeric text are converted to numbers; dimension
+identifiers such as `0042` keep their leading zeros.
 
 The agent plays by the same rules as everything else: it honours the model's glossary (so "channel" means what the model says it means), your row security, and your persona. It cannot show you data you are not permitted to see, no matter how the question is phrased.
 

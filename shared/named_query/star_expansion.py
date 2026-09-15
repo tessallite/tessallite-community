@@ -29,10 +29,11 @@ TWO PREDICATES, NEVER MERGED (NQ2C-F2/F6): the narrow
 ``is_row_preserving_star_definition`` stays frozen as the pocket RLS
 materialised-serving SECURITY proof (it must stay narrow — a DISTINCT/LIMIT
 definition is materialised-INELIGIBLE under RLS); the wide
-``is_expandable_star_definition`` is the POPULATION trigger. The NQ serve
-handler additionally pre-narrows the expansion to the persona/CLS-permitted
-subset via ``allowed_fields`` (NQ2C-F1), so a restricted reader gets a narrowed
-live result instead of the explicit-projection deny branch's 403.
+``is_expandable_star_definition`` is the POPULATION trigger. The expansion
+itself never narrows: the live dispatch marks the expanded projection
+``star_expanded`` and the persona/CLS gates narrow it as they narrow a literal
+star (Bug-9899), so a restricted reader gets a narrowed live result instead of
+the explicit-projection deny branch's 403.
 
 The enumeration mirrors the binder's own ``SELECT *`` resolution for a deployed
 model with ``include_hidden=False`` (``semantic/binder.py``): visible dimensions
@@ -232,10 +233,8 @@ def exposed_star_fields(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     AGGREGATED measure path (probe-verified), changing the star's row
     population.
 
-    Public so the query-router's NQ handler can compute the persona/CLS-
-    PERMITTED SUBSET of the same field set (NQ2C-F1) and pass it back as
-    ``allowed_fields`` — the narrowing must be applied to exactly the fields
-    the expansion would emit, never a parallel enumeration.
+    Public so callers that need the same enumeration read it here rather than
+    building a parallel one.
     """
     dim_fields, meas_fields = exposed_star_fields_by_kind(snapshot)
     return [*dim_fields, *meas_fields]
@@ -249,8 +248,6 @@ def _exposed_star_columns(snapshot: dict[str, Any]) -> list[str]:
 def expand_named_query_star_definition(
     definition_sql: str,
     deployed_snapshot: dict[str, Any],
-    *,
-    allowed_fields: set[str] | None = None,
 ) -> str:
     """Expand a star definition to an explicit projection of the model's
     exposed (non-hidden) fields.
@@ -262,32 +259,28 @@ def expand_named_query_star_definition(
     OFFSET / DISTINCT / WHERE / ORDER BY) because it only replaces
     ``ast.args["expressions"]``.
 
-    ``allowed_fields`` (NQ2C-F1): a set of semantic field names the caller
-    (the NQ serve handler) has pre-narrowed to the persona/CLS-PERMITTED
-    subset of the exposed set. The expansion projects only those fields, so
-    the live compile under a restricted principal narrows instead of hitting
-    the explicit-projection DENY branch of the persona gate / CLS gate. Only
-    the LIVE path ever passes this — the build never narrows, so build == live
-    holds for every artifact a restricted principal can reach (they cannot
-    reach the materialised path at all).
+    The expansion NEVER narrows (Bug-9899). It used to accept an
+    ``allowed_fields`` subset the Named Query serve handler had pre-computed
+    from its own copy of the persona allow-list and column-level-security star
+    narrowing, because expanding a star erased ``select_star`` and the two
+    gates would then DENY the expanded projection instead of narrowing it. The
+    expansion is now marked ``star_expanded`` on the logical query and the
+    gates narrow it themselves, so there is one narrowing implementation and
+    the build and the live compile expand identically again.
 
     Both the refresh build and the live serve path call this with the SAME
     deployed snapshot, so the expanded definition — the input to the canonical
     compile AND the population fingerprint — is deterministic and identical on
     both sides.
 
-    Raises ``ValueError`` when the definition IS the star shape but nothing is
-    left to project (the deployed model exposes no field, or ``allowed_fields``
-    intersects the exposure to empty — the latter case is pre-empted by the
-    handler's CLS-style 403, so this is fail-closed belt-and-braces).
+    Raises ``ValueError`` when the definition IS the star shape but the
+    deployed model exposes no field to project.
     """
     if not isinstance(deployed_snapshot, dict):
         return definition_sql
     if not is_expandable_star_definition(definition_sql):
         return definition_sql
     names = _exposed_star_columns(deployed_snapshot)
-    if allowed_fields is not None:
-        names = [n for n in names if n in allowed_fields]
     if not names:
         raise ValueError(
             "The Named Query definition is a SELECT * but the deployed model "

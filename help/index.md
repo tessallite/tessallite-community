@@ -84,6 +84,7 @@ End-to-end walkthroughs for the people who consume the models: building dashboar
 - [Source Statistics](modelling/source-statistics.md)
 - [Table Auto-Analysis](modelling/table-auto-analysis.md)
 - [Model Canvas Tour](modelling/model-canvas-tour.md)
+- [Arrange the Canvas](modelling/arrange-the-canvas.md)
 - [Canvas Undo/Redo](modelling/canvas-undo-redo.md)
 - [Define Joins](modelling/define-joins.md)
 - [Define Hierarchies](modelling/define-hierarchies.md)

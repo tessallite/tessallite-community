@@ -17,15 +17,20 @@ identifier quoting (``[identifier]``).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import time
+from base64 import b64encode
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, time as datetime_time, timezone
+from decimal import Decimal
 from typing import Any
+from uuid import UUID, uuid4
 
 from shared.config.source_db import resolve_source_db_endpoint
 from shared.dry_run_write_fence import (
@@ -760,14 +765,13 @@ async def _execute_pg(
             quoted_schema = _qi("postgresql", schema)
             await conn.execute(f"SET search_path TO {quoted_schema}, public")
         try:
-            records = await conn.fetch(sql)
+            records, columns = await _fetch_pg_records_with_columns(conn, sql)
         except Exception as exc:
             if "canceling statement due to statement timeout" in str(exc):
                 raise QueryTimeoutError(
                     f"Source query exceeded {timeout_s}s statement timeout."
                 ) from exc
             raise
-        columns = list(records[0].keys()) if records else []
         rows = [dict(r) for r in records]
         return rows, columns
 
@@ -1293,6 +1297,43 @@ def _disambiguate_columns(
     return rows, out_cols
 
 
+async def _fetch_pg_records_with_columns(
+    conn: Any,
+    sql: str,
+    *,
+    max_rows: int | None = None,
+) -> tuple[list[Any], list[str]]:
+    """Execute one PostgreSQL query while preserving empty-result metadata.
+
+    ``asyncpg.Connection.fetch`` exposes column names through the first returned
+    ``Record``.  That makes a valid zero-row SELECT look like a result with no
+    columns, which breaks the query-router/gateway result-shape contract.  A
+    prepared statement supplies the server-authoritative attributes before any
+    rows are fetched, so the same metadata is available for empty and non-empty
+    results.
+
+    The routed path uses the cursor branch when ``max_rows`` is configured; it
+    deliberately keeps that bounded streaming behavior while obtaining the
+    attributes from the same prepared statement.
+    """
+    statement = await conn.prepare(sql)
+    columns = [str(attribute.name) for attribute in statement.get_attributes()]
+    if max_rows is None:
+        records = await statement.fetch()
+        return records, columns
+
+    records: list[Any] = []
+    async with conn.transaction():
+        async for record in statement.cursor():
+            records.append(record)
+            if len(records) > max_rows:
+                raise SourceResultTooLargeError(
+                    f"Result exceeds {max_rows} rows. "
+                    "Add filters or raise the result.max_rows setting."
+                )
+    return records, columns
+
+
 async def _execute_pg_routed(
     conn_obj: Any, sql: str, *, tenant_session: Any = None,
     max_rows: int | None = None, tenant_slug: str | None = None,
@@ -1323,20 +1364,9 @@ async def _execute_pg_routed(
             quoted_schema = _qi("postgresql", schema)
             await conn.execute(f"SET search_path TO {quoted_schema}, public")
         try:
-            if max_rows is None:
-                records = await conn.fetch(sql)
-            else:
-                # F-014-08: stream and abort — do not materialise the full
-                # result then count it.
-                records = []
-                async with conn.transaction():
-                    async for rec in conn.cursor(sql):
-                        records.append(rec)
-                        if len(records) > max_rows:
-                            raise SourceResultTooLargeError(
-                                f"Result exceeds {max_rows} rows. "
-                                "Add filters or raise the result.max_rows setting."
-                            )
+            records, columns = await _fetch_pg_records_with_columns(
+                conn, sql, max_rows=max_rows,
+            )
         except SourceResultTooLargeError:
             raise
         except Exception as exc:
@@ -1345,7 +1375,6 @@ async def _execute_pg_routed(
                     f"Source query exceeded {timeout_s}s statement timeout."
                 ) from exc
             raise
-        columns = list(records[0].keys()) if records else []
         rows = [dict(r) for r in records]
         rows, columns = _disambiguate_columns(rows, columns, raw_records=records)
         return rows, 0, columns
@@ -2002,6 +2031,249 @@ async def _bulk_insert_pg(
     return total
 
 
+# BigQuery's JSON insert endpoint rejects request bodies at 10 MiB. Keep a
+# conservative margin for the request envelope added by the client library;
+# these are protocol limits, not business-configurable batch settings.
+_BQ_INSERT_REQUEST_LIMIT_BYTES = 10 * 1024 * 1024
+_BQ_INSERT_SAFE_LIMIT_BYTES = _BQ_INSERT_REQUEST_LIMIT_BYTES - 1 * 1024 * 1024
+_BQ_INT64_MIN = -(2**63)
+_BQ_INT64_MAX = 2**63 - 1
+
+
+def _bq_type_name(type_definition: str | None) -> str | None:
+    if not type_definition:
+        return None
+    return type_definition.strip().upper().split("(", 1)[0].split("<", 1)[0].strip()
+
+
+def _bq_decimal_text(value: Any, type_name: str, column: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, (Decimal, int, str)):
+        raise ValueError(
+            f"BigQuery column {column!r} ({type_name}) requires an exact Decimal, "
+            f"integer, or decimal string; got {type(value).__name__}"
+        )
+    try:
+        decimal_value = value if isinstance(value, Decimal) else Decimal(str(value))
+    except Exception as exc:
+        raise ValueError(
+            f"BigQuery column {column!r} ({type_name}) has an invalid decimal value"
+        ) from exc
+    if not decimal_value.is_finite():
+        raise ValueError(
+            f"BigQuery column {column!r} ({type_name}) does not accept NaN or infinity"
+        )
+
+    # NUMERIC is precision 38/scale 9; BIGNUMERIC is precision 76/scale 38.
+    # Checking the integer and fractional portions before network I/O gives a
+    # stable product error instead of a connector-specific insert failure.
+    if type_name == "NUMERIC":
+        max_integer_digits, max_fractional_digits = 29, 9
+    else:
+        max_integer_digits, max_fractional_digits = 38, 38
+    _, _, exponent = decimal_value.as_tuple()
+    fractional_digits = max(-exponent, 0)
+    integer_digits = max(decimal_value.copy_abs().adjusted() + 1, 0)
+    if integer_digits > max_integer_digits or fractional_digits > max_fractional_digits:
+        raise ValueError(
+            f"BigQuery column {column!r} ({type_name}) value is outside the "
+            f"supported precision/scale ({max_integer_digits} integer digits, "
+            f"{max_fractional_digits} fractional digits)"
+        )
+    return format(decimal_value, "f")
+
+
+def _bq_json_value(value: Any, target_type: str | None, column: str) -> Any:
+    """Convert one source-driver value to a BigQuery JSON insert value.
+
+    The target DDL is authoritative.  When it is unavailable (direct legacy
+    callers), the fallback still converts common asyncpg-native values rather
+    than handing non-JSON objects to ``insert_rows_json``.
+    """
+    if value is None:
+        return None
+
+    type_name = _bq_type_name(target_type)
+    if type_name in {"NUMERIC", "DECIMAL"}:
+        return _bq_decimal_text(value, "NUMERIC", column)
+    if type_name == "BIGNUMERIC":
+        return _bq_decimal_text(value, "BIGNUMERIC", column)
+    if type_name in {"INT64", "INTEGER"}:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"BigQuery column {column!r} (INT64) requires an integer, "
+                f"got {type(value).__name__}"
+            )
+        if not _BQ_INT64_MIN <= value <= _BQ_INT64_MAX:
+            raise ValueError(f"BigQuery column {column!r} (INT64) is out of range")
+        return value
+    if type_name in {"FLOAT64", "FLOAT", "DOUBLE"}:
+        if isinstance(value, bool):
+            raise ValueError(f"BigQuery column {column!r} (FLOAT64) rejects boolean values")
+        try:
+            converted = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"BigQuery column {column!r} (FLOAT64) requires a numeric value"
+            ) from exc
+        if not math.isfinite(converted):
+            raise ValueError(
+                f"BigQuery column {column!r} (FLOAT64) does not accept NaN or infinity"
+            )
+        return converted
+    if type_name in {"BOOL", "BOOLEAN"}:
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"BigQuery column {column!r} (BOOL) requires a boolean, "
+                f"got {type(value).__name__}"
+            )
+        return value
+    if type_name == "DATE":
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, str):
+            return value
+        raise ValueError(f"BigQuery column {column!r} (DATE) requires a date value")
+    if type_name == "DATETIME":
+        if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                value = value.astimezone(timezone.utc).replace(tzinfo=None)
+            return value.isoformat(sep=" ", timespec="microseconds")
+        if isinstance(value, str):
+            return value
+        raise ValueError(
+            f"BigQuery column {column!r} (DATETIME) requires a datetime value"
+        )
+    if type_name == "TIMESTAMP":
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).isoformat(
+                sep=" ", timespec="microseconds"
+            ).replace("+00:00", "Z")
+        if isinstance(value, str):
+            return value
+        raise ValueError(
+            f"BigQuery column {column!r} (TIMESTAMP) requires a datetime value"
+        )
+    if type_name == "TIME":
+        if isinstance(value, datetime_time):
+            if value.tzinfo is not None:
+                raise ValueError(
+                    f"BigQuery column {column!r} (TIME) rejects timezone-aware values"
+                )
+            return value.isoformat(timespec="microseconds")
+        if isinstance(value, str):
+            return value
+        raise ValueError(f"BigQuery column {column!r} (TIME) requires a time value")
+    if type_name == "BYTES":
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return b64encode(bytes(value)).decode("ascii")
+        if isinstance(value, str):
+            return value
+        raise ValueError(f"BigQuery column {column!r} (BYTES) requires bytes or base64 text")
+    if type_name in {"STRING", "GEOGRAPHY"}:
+        return str(value)
+    if type_name in {"JSON", "RECORD", "STRUCT", "ARRAY"}:
+        # Nested source values are uncommon for aggregate materialisation, but
+        # recursively normalise them when the target explicitly permits them.
+        if isinstance(value, dict):
+            return {str(k): _bq_json_value(v, None, f"{column}.{k}") for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_bq_json_value(item, None, column) for item in value]
+
+    if isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"BigQuery column {column!r} does not accept NaN or infinity")
+        return value
+    if isinstance(value, Decimal):
+        return _bq_decimal_text(value, "NUMERIC", column)
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ", timespec="microseconds")
+    if isinstance(value, (date, datetime_time)):
+        return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return b64encode(bytes(value)).decode("ascii")
+    if isinstance(value, dict):
+        return {str(k): _bq_json_value(v, None, f"{column}.{k}") for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_bq_json_value(item, None, column) for item in value]
+    raise ValueError(
+        f"BigQuery column {column!r} has unsupported non-JSON value "
+        f"{type(value).__name__}"
+    )
+
+
+def _bq_json_row(
+    row: dict[str, Any], columns: list[str], type_by_col: dict[str, str]
+) -> tuple[dict[str, Any], int]:
+    converted = {
+        column: _bq_json_value(row.get(column), type_by_col.get(column), column)
+        for column in columns
+    }
+    encoded = json.dumps(
+        converted, ensure_ascii=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return converted, len(encoded)
+
+
+_BQ_INSERT_REQUEST_PREFIX_BYTES = len(b'{"rows": [')
+_BQ_INSERT_REQUEST_SUFFIX_BYTES = len(b"]}")
+_BQ_INSERT_REQUEST_SEPARATOR_BYTES = len(b", ")
+_BQ_INSERT_EMPTY_REQUEST_BYTES = (
+    _BQ_INSERT_REQUEST_PREFIX_BYTES + _BQ_INSERT_REQUEST_SUFFIX_BYTES
+)
+
+
+def _bq_insert_id(load_id: str, table_ref: str, source_row_index: int) -> str:
+    """Return a stable insertAll ID for one row in one logical load.
+
+    The logical-load namespace prevents separate refreshes from being
+    de-duplicated as the same BigQuery rows. The absolute source-row index
+    keeps IDs stable when one load is split differently after a retry. A digest
+    also keeps the ID within BigQuery's insert-ID size budget regardless of
+    identifier lengths.
+    """
+    if source_row_index < 0:
+        raise ValueError("BigQuery source row index cannot be negative")
+    identity = f"{load_id}\x00{table_ref}\x00{source_row_index}".encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
+
+
+def _bq_insert_entry_bytes(json_row: dict[str, Any], insert_id: str) -> int:
+    """Measure one entry using the JSON serializer used by the pinned client."""
+    return len(
+        json.dumps(
+            {"json": json_row, "insertId": insert_id}, ensure_ascii=True
+        ).encode("utf-8")
+    )
+
+
+def _bq_insert_request_bytes(total_entry_bytes: int, entry_count: int) -> int:
+    """Measure the complete ``insertAll`` JSON request envelope.
+
+    ``google.cloud._http.JSONConnection.api_request`` serializes the request
+    dictionary with ``json.dumps``' default separators. Keep the prefix,
+    suffix, and separator accounting explicit so the production splitter does
+    not repeatedly serialize an ever-growing batch.
+    """
+    if entry_count < 0:
+        raise ValueError("BigQuery insertAll entry count cannot be negative")
+    if entry_count == 0:
+        return _BQ_INSERT_EMPTY_REQUEST_BYTES
+    return (
+        _BQ_INSERT_REQUEST_PREFIX_BYTES
+        + total_entry_bytes
+        + _BQ_INSERT_REQUEST_SEPARATOR_BYTES * (entry_count - 1)
+        + _BQ_INSERT_REQUEST_SUFFIX_BYTES
+    )
+
+
 async def _bulk_insert_bq(
     conn_obj: Any,
     schema: str,
@@ -2010,9 +2282,23 @@ async def _bulk_insert_bq(
     rows: list[dict],
     batch_size: int,
     target_project: str | None = None,
+    *,
+    column_types: list[tuple[str, str]] | None = None,
+    source_row_offset: int = 0,
+    load_id: str | None = None,
 ) -> int:
+    if isinstance(source_row_offset, bool) or not isinstance(source_row_offset, int):
+        raise ValueError("BigQuery source row offset must be a non-negative integer")
+    if source_row_offset < 0:
+        raise ValueError("BigQuery source row offset must be a non-negative integer")
+    if load_id is not None and (not isinstance(load_id, str) or not load_id):
+        raise ValueError("BigQuery load ID must be a non-empty string")
+    load_namespace = load_id or uuid4().hex
+
     def _run() -> int:
         from google.cloud import bigquery
+        from google.cloud.bigquery.retry import DEFAULT_RETRY
+
         creds = _decrypt(conn_obj.encrypted_credentials)
         sa_info = creds.get("service_account_json", creds)
         if isinstance(sa_info, str):
@@ -2027,22 +2313,105 @@ async def _bulk_insert_bq(
         client = bigquery.Client(
             credentials=gc,
             project=project_id,
-            location=(conn_obj.config or {}).get("location") or creds.get("location") or None,
+            location=(conn_obj.config or {}).get("location")
+            or creds.get("location")
+            or None,
         )
         try:
-            table_ref = f"{project_id}.{schema}.{table}" if project_id else f"{schema}.{table}"
+            table_ref = (
+                f"{project_id}.{schema}.{table}"
+                if project_id
+                else f"{schema}.{table}"
+            )
+            ddl_timeout = _get_ddl_timeout()
+            deadline = time.monotonic() + ddl_timeout if ddl_timeout > 0 else None
+            type_by_col = {name: typ for name, typ in (column_types or [])}
             total = 0
-            for offset in range(0, len(rows), batch_size):
-                batch = rows[offset:offset + batch_size]
-                json_rows = [{c: row.get(c) for c in columns} for row in batch]
-                errors = client.insert_rows_json(table_ref, json_rows)
+            batch_rows: list[dict[str, Any]] = []
+            batch_row_ids: list[str] = []
+            batch_entry_bytes = 0
+            batch_start = 0
+
+            def _send_batch(start: int) -> int:
+                if not batch_rows:
+                    return 0
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise QueryTimeoutError(
+                            "BigQuery bulk load exceeded the single materialisation "
+                            "deadline (SOURCE_DDL_TIMEOUT_SECONDS)."
+                        )
+                    request_kwargs: dict[str, Any] = {
+                        "timeout": remaining,
+                        "retry": DEFAULT_RETRY.with_timeout(remaining),
+                    }
+                else:
+                    request_kwargs = {}
+                errors = client.insert_rows_json(
+                    table_ref,
+                    batch_rows,
+                    row_ids=batch_row_ids,
+                    **request_kwargs,
+                )
                 if errors:
-                    raise RuntimeError(f"BigQuery insert errors: {errors[:3]}")
-                total += len(batch)
+                    # BigQuery reports indexes relative to this request. Map
+                    # them back to the source batch before exposing an error so
+                    # callers can identify the failing source row.
+                    mapped_errors = []
+                    for error in errors[:3]:
+                        if isinstance(error, dict) and isinstance(error.get("index"), int):
+                            error = dict(error)
+                            error["index"] += source_row_offset + start
+                        mapped_errors.append(error)
+                    raise RuntimeError(f"BigQuery insert errors: {mapped_errors}")
+                return len(batch_rows)
+
+            for offset, row in enumerate(rows):
+                json_row, _row_bytes = _bq_json_row(row, columns, type_by_col)
+                insert_id = _bq_insert_id(
+                    load_namespace, table_ref, source_row_offset + offset
+                )
+                entry_bytes = _bq_insert_entry_bytes(json_row, insert_id)
+                candidate_entry_count = len(batch_rows) + 1
+                candidate_entry_bytes = batch_entry_bytes + entry_bytes
+                candidate_bytes = _bq_insert_request_bytes(
+                    candidate_entry_bytes, candidate_entry_count
+                )
+                if batch_rows and (
+                    len(batch_rows) >= batch_size
+                    or candidate_bytes > _BQ_INSERT_SAFE_LIMIT_BYTES
+                ):
+                    total += _send_batch(batch_start)
+                    batch_rows = []
+                    batch_row_ids = []
+                    batch_entry_bytes = 0
+                    batch_start = offset
+                    candidate_entry_count = 1
+                    candidate_entry_bytes = entry_bytes
+                    candidate_bytes = _bq_insert_request_bytes(
+                        candidate_entry_bytes, candidate_entry_count
+                    )
+                if candidate_bytes > _BQ_INSERT_SAFE_LIMIT_BYTES:
+                    raise ValueError(
+                        f"BigQuery row {source_row_offset + offset} exceeds the safe "
+                        "insertAll request limit "
+                        f"({_BQ_INSERT_SAFE_LIMIT_BYTES} bytes)"
+                    )
+                batch_rows.append(json_row)
+                batch_row_ids.append(insert_id)
+                batch_entry_bytes = candidate_entry_bytes
+
+            total += _send_batch(batch_start)
             return total
         finally:
             client.close()
 
+    # Bug-9649 keeps the existing bounded streaming transfer. BigQuery makes
+    # acknowledged rows immediately queryable, but may prohibit copy/rename for
+    # days while its streaming buffer drains. The BigQuery swap therefore uses
+    # a query replacement below rather than turning every application batch
+    # into a quota-consuming load job.
     return await _run_ddl_bounded(_run, "BigQuery bulk load")
 
 
@@ -2263,6 +2632,8 @@ async def bulk_insert_batched(
     column_types: list[tuple[str, str]] | None = None,
     target_project: str | None = None,
     tenant_slug: str | None = None,
+    source_row_offset: int = 0,
+    load_id: str | None = None,
 ) -> int:
     """Insert rows into a target table in batches.
 
@@ -2301,6 +2672,9 @@ async def bulk_insert_batched(
         return await executor(
             conn_obj, schema, table, columns, rows, batch_size,
             target_project=target_project,
+            column_types=column_types,
+            source_row_offset=source_row_offset,
+            load_id=load_id,
         )
     return await executor(conn_obj, schema, table, columns, rows, batch_size)
 
@@ -2311,32 +2685,18 @@ async def _staging_swap(
     staging_ref: str, live_ref: str, backup_ref: str,
     quote_identifier_fn,
 ) -> None:
-    """Connector-specific safe swap: staging → live with rollback on failure."""
+    """Connector-specific safe finalisation that preserves live on failure."""
     if connector == "bigquery":
-        # BigQuery: CREATE TABLE ... COPY for backup, then DROP + RENAME.
-        # BigQuery RENAME takes a bare table name (not fully qualified).
-        await sc.execute(f"DROP TABLE IF EXISTS {backup_ref}")
-        try:
-            await sc.execute(f"CREATE TABLE {backup_ref} COPY {live_ref}")
-            live_existed = True
-        except Exception:
-            live_existed = False
-        if live_existed:
-            await sc.execute(f"DROP TABLE {live_ref}")
-        try:
-            await sc.execute(
-                f"ALTER TABLE {staging_ref} RENAME TO "
-                f"{quote_identifier_fn(connector, table)}"
-            )
-        except Exception:
-            if live_existed:
-                await sc.execute(
-                    f"ALTER TABLE {backup_ref} RENAME TO "
-                    f"{quote_identifier_fn(connector, table)}"
-                )
-            raise
-        if live_existed:
-            await sc.execute(f"DROP TABLE IF EXISTS {backup_ref}")
+        # Bug-9649: acknowledged REST streaming rows are immediately queryable,
+        # but BigQuery can prohibit copy/rename for days while the streaming
+        # buffer drains. A single query job atomically replaces the live table
+        # from the validated staging snapshot. If it fails, BigQuery leaves the
+        # old live table intact; no DROP or RENAME precedes the replacement.
+        await sc.execute(
+            f"CREATE OR REPLACE TABLE {live_ref} AS "
+            f"SELECT * FROM {staging_ref}"
+        )
+        await sc.execute(f"DROP TABLE IF EXISTS {staging_ref}")
     elif connector in ("hadoop_spark", "snowflake"):
         # Spark/Hive/Snowflake: ALTER TABLE ... RENAME TO requires fully qualified name.
         schema_prefix = f"{quote_identifier_fn(connector, schema)}."
@@ -2436,13 +2796,12 @@ async def refresh_table_atomic_swap(
 
     Build-then-switch (Bug-3732 / Bug-8768 B8768-R1-01): the caller has already
     materialised the fresh rows into ``{table}__staging`` while the LIVE table
-    kept serving the old rows. This performs only the switch — rename live to a
-    backup, staging into place, drop the backup — through the connector-specific
-    :func:`_staging_swap`, which runs the PostgreSQL/Redshift rename inside ONE
-    transaction so a mid-swap connection loss rolls back with the live table
-    intact. On any failure the live table is preserved (never dropped before the
-    replacement is in place). The staging table must already exist; this function
-    does not create it and does not read the source.
+    kept serving the old rows. This performs only the connector-specific switch
+    through :func:`_staging_swap`: PostgreSQL/Redshift rename inside one
+    transaction, while BigQuery uses one query replacement because streaming
+    buffers prohibit rename. On any replacement failure the live table is
+    preserved. The staging table must already exist; this function does not
+    create it and does not read the source.
 
     Bug-9036: a preview must not swap a live table.
     """
@@ -2491,6 +2850,7 @@ async def stream_to_staging_table(
     tenant_slug: str | None = None,
     tenant_session: Any = None,
     target_project: str | None = None,
+    load_id: str | None = None,
 ) -> int:
     """Stream rows into a staging table and atomically swap with the live table.
 
@@ -2508,6 +2868,10 @@ async def stream_to_staging_table(
     For BigQuery targets, pass ``target_project`` to use a project override
     different from the connection default.
 
+    For BigQuery targets, ``load_id`` identifies one logical materialisation.
+    All streamed source batches use that namespace, while a separate call
+    without an explicit ID receives a new namespace.
+
     Returns total rows inserted.
 
     Bug-9036: a preview must not stream rows into a target.
@@ -2520,6 +2884,9 @@ async def stream_to_staging_table(
     connector = normalize_connection_type(
         (conn_obj.connection_type or "").lower()
     )
+    if load_id is not None and (not isinstance(load_id, str) or not load_id):
+        raise ValueError("BigQuery load ID must be a non-empty string")
+    load_namespace = load_id or uuid4().hex
 
     staging_table = f"{table}__staging"
     backup_table = f"{table}__backup"
@@ -2657,6 +3024,8 @@ async def stream_to_staging_table(
                 column_types=resolved_defs,
                 target_project=target_project,
                 tenant_slug=tenant_slug,
+                source_row_offset=total_rows,
+                load_id=load_id or load_namespace,
             )
             total_rows += inserted
 
@@ -2677,9 +3046,10 @@ async def stream_to_staging_table(
                     f"got {staged_count} in {staging_ref}"
                 )
 
-        # Bug-8416: validation is one read checkout; only the rename sequence
-        # is a genuine multi-statement transaction and therefore keeps one
-        # checkout until commit/rollback.
+        # Bug-8416: validation is one read checkout. PostgreSQL/Redshift need a
+        # retained checkout for their transactional rename sequence; other
+        # connectors ignore the transactional hint and use their safe
+        # connector-specific finalisation.
         async with open_source_connection(
             conn_obj, purpose="aggregate_materialise",
             tenant_session=tenant_session, tenant_slug=tenant_slug,

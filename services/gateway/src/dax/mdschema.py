@@ -16,20 +16,30 @@ from src.dax.constants import PROVIDER_VERSION, SERVER_NAME
 # Bug-6603: single source of the cube SHAPE (dimension -> hierarchy origin) and the
 # field-list grouping key (standalone dims -> one [Dimensions] group node).
 from src.dax.cube_model import (
+    advertise_member_properties,
+    field_list_grouping_enabled,
     HIERARCHY_GROUP_NAME,
     HIERARCHY_GROUP_UNIQUE_NAME,
+    TIME_GROUP_NAME,
+    TIME_GROUP_UNIQUE_NAME,
     STANDALONE_GROUP_NAME,
     STANDALONE_GROUP_UNIQUE_NAME,
     dimension_unique_name_for,
+    hierarchy_unique_name_for,
     hierarchy_origin_for,
+    is_excel_xmla_client,
     is_grouped_hierarchy,
+    is_time_group_member,
     is_standalone_attribute,
 )
 from src.dax.member_uname import (
     ancestor_key_path_from_parent_chain,
+    build_parent_index,
+    canonical_member_uname,
     member_filter_matches,
     parse_member_uname,
-    qualify_member_uname,
+    synthetic_all_member_metadata,
+    synthetic_all_member_uname,
     unescape_member_key,
 )
 # Bug-9178: Named Query ``@name`` relations are advertised in the XMLA table
@@ -37,6 +47,10 @@ from src.dax.member_uname import (
 # JDBC catalogue registration uses, so the two channels advertise identical
 # column metadata from the deployed snapshot's ``output_columns``.
 from src.router_client import build_named_query_relation_columns
+from src.dax.catalog_naming import (
+    CATALOG_NAME_MAX_LENGTH,
+    build_catalog_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +89,29 @@ _SCHEMA_GUIDS: dict[str, str] = _cfg.get("schema_guids", {})
 _ROWSET_NS = "urn:schemas-microsoft-com:xml-analysis:rowset"
 _SQL_NS    = "urn:schemas-microsoft-com:xml-sql"
 
+# Bug-9786: MDSCHEMA_PROPERTIES.PROPERTY_ORIGIN, per the MDPROP_ORIGIN
+# enumeration:
+#
+#   1  MD_PROPERTY_ORIGIN_USER_DEFINED      a property the MODELLER defined
+#   2  MD_PROPERTY_ORIGIN_SYSTEM_ENABLED    an INTRINSIC property every provider has
+#   4  MD_PROPERTY_ORIGIN_SYSTEM_INTERNAL   provider-internal, not for clients
+#
+# Every property this module advertises -- MEMBER_KEY, MEMBER_CAPTION,
+# PARENT_UNIQUE_NAME, DISPLAY_INFO, VALUE, FORMAT_STRING and the rest -- is
+# INTRINSIC. They were all emitted as USER_DEFINED, which tells a client the cube
+# carries 13 custom member properties on EVERY level (2,419 rows across this
+# model's 186 levels).
+#
+# Excel believed it and tried to write them into the PivotTable cache as custom
+# member properties whose names collide with its own intrinsic ones. The saved
+# workbook came back "Damage to the file was so extensive that repairs were not
+# possible", and reopened as plain values with no PivotTable. Saving a
+# measure-only sheet worked, because with no dimension on the axis Excel never
+# asks for member properties -- which is exactly the difference the user
+# observed, and the request Excel made immediately before each failed save.
+_PROPERTY_ORIGIN_INTRINSIC = "2"
+
+
 def build_discover_response(
     request_type: str,
     catalog_name: str,
@@ -102,9 +139,97 @@ def build_discover_response(
         properties or {}, restrictions or {}, tenant_models or [], member_data or {},
         trust_meta or {}, named_sets or [], kpis or [], named_queries or [],
     )
+    rows = _apply_restrictions(rtype, rows, restrictions or {})
 
     col_defs = _ROWSETS[rtype]["columns"] if rtype in _ROWSETS else [{"name": k, "type": "string"} for k in (rows[0].keys() if rows else [])]
     return _build_rowset_xml(col_defs, rows)
+
+
+# Bug-9775: rowsets whose builder ALREADY consumes `restrictions` itself, with
+# semantics the generic filter must not second-guess (MDSCHEMA_MEMBERS resolves
+# TREE_OP relative to a member; the others are shaped by their own rules).
+_SELF_RESTRICTING_ROWSETS = frozenset({
+    "MDSCHEMA_CATALOGS",  # alias-aware in _get_rows (Bug-9853)
+    "DBSCHEMA_CATALOGS",
+    "MDSCHEMA_MEMBERS",
+    "MDSCHEMA_PROPERTIES",
+    "DISCOVER_PROPERTIES",
+    "DISCOVER_SCHEMA_ROWSETS",
+})
+
+# Restriction columns that are BITMASKS, not string values. Bit 1 = the
+# "normal" case (visible / user-defined), bit 2 = the complement. Comparing
+# these with string equality would wrongly drop every row.
+_VISIBILITY_RESTRICTIONS = {
+    "HIERARCHY_VISIBILITY": "HIERARCHY_IS_VISIBLE",
+    "LEVEL_VISIBILITY": "LEVEL_IS_VISIBLE",
+    "DIMENSION_VISIBILITY": "DIMENSION_IS_VISIBLE",
+    "MEASURE_VISIBILITY": "MEASURE_IS_VISIBLE",
+}
+_BITMASK_RESTRICTIONS = frozenset({"HIERARCHY_ORIGIN"})
+
+
+def _apply_restrictions(
+    rtype: str,
+    rows: list[dict[str, str]],
+    restrictions: dict[str, list[str]],
+) -> list[dict[str, str]]:
+    """Filter a built rowset by the client's DISCOVER restrictions (Bug-9775).
+
+    The rowset builders were written to emit the whole catalogue and never
+    consulted restrictions, so a request for ONE hierarchy returned all 86 rows
+    — including rows for other dimensions and for [Measures]. The gateway
+    ADVERTISES restriction support in DISCOVER_SCHEMA_ROWSETS, so returning
+    unrelated rows breaks the provider contract Excel relies on when it
+    assembles the field list.
+
+    Deliberately CONSERVATIVE: a restriction is only applied when the column it
+    names actually exists on the emitted rows. An unrecognised restriction is
+    IGNORED rather than matched against nothing — narrowing only where the
+    semantics are understood means this can never blank out a rowset and make
+    the client worse off than the unfiltered behaviour it replaces.
+    """
+    if not rows or not restrictions or rtype in _SELF_RESTRICTING_ROWSETS:
+        return rows
+
+    available = set(rows[0].keys())
+    out = rows
+    for key, values in restrictions.items():
+        wanted = [v for v in (values or []) if v not in (None, "")]
+        if not wanted:
+            continue
+        column = _VISIBILITY_RESTRICTIONS.get(key, key)
+        if column not in available:
+            continue  # not a column of this rowset — ignore, never match-nothing
+
+        if key in _VISIBILITY_RESTRICTIONS:
+            try:
+                mask = int(wanted[0])
+            except (TypeError, ValueError):
+                continue
+            want_visible = bool(mask & 1)
+            want_hidden = bool(mask & 2)
+            if want_visible and want_hidden:
+                continue  # both accepted: no narrowing
+            out = [
+                r for r in out
+                if (str(r.get(column, "")).lower() == "true") == want_visible
+            ]
+        elif key in _BITMASK_RESTRICTIONS:
+            try:
+                mask = int(wanted[0])
+            except (TypeError, ValueError):
+                continue
+            def _origin_ok(r: dict[str, str]) -> bool:
+                try:
+                    return bool(int(r.get(column, "0") or 0) & mask)
+                except (TypeError, ValueError):
+                    return True
+            out = [r for r in out if _origin_ok(r)]
+        else:
+            allowed = set(wanted)
+            out = [r for r in out if str(r.get(column, "")) in allowed]
+    return out
 
 # XSD built-in types must be referenced with the ``xs:`` prefix. The inline rowset
 # schema is nested under a ``<root xmlns="...rowset">`` element, so an UNPREFIXED
@@ -140,7 +265,7 @@ def _qualify_xsd_type(xsd_type: str) -> str:
     return xsd_type
 
 
-def _build_rowset_xml(col_defs: list[dict], rows: list[dict[str, str]]) -> str:
+def _build_rowset_xml(col_defs: list[dict], rows: list[dict[str, Any]]) -> str:
     """
     Render a MSOLAP-compatible rowset string with proper XSD types.
     Column definitions from mdschema_config.json specify name, type, required,
@@ -199,8 +324,14 @@ def _build_rowset_xml(col_defs: list[dict], rows: list[dict[str, str]]) -> str:
     for row_dict in rows:
         cells = ""
         for col in col_names:
-            if col in row_dict:
-                cells += f"<{col}>{_xe(str(row_dict[col]))}</{col}>"
+            value = row_dict.get(col)
+            # An empty string is a valid xs:string cell but an invalid cell for
+            # every other XSD type (MSOLAP refuses to parse an empty
+            # NUMERIC_PRECISION); treat it as absent for non-string columns.
+            if value is not None and (
+                value != "" or col_type_map.get(col, "string") == "string"
+            ):
+                cells += f"<{col}>{_xe(str(value))}</{col}>"
             elif col in required_cols:
                 # Required column missing from data — emit type-appropriate default
                 default = _TYPE_DEFAULTS.get(col_type_map.get(col, "string"), "")
@@ -460,20 +591,30 @@ def _get_rows(rtype, catalog, model_id, measures, dimensions, url, properties, r
     if rtype == "DISCOVER_DATASOURCES": return _rows_datasources(url)
     if rtype == "DISCOVER_PROPERTIES": return _rows_properties(restrictions, catalog)
     if rtype == "DISCOVER_LITERALS": return _rows_literals()
-    if rtype in ("MDSCHEMA_CATALOGS", "DBSCHEMA_CATALOGS"): return _rows_catalogs(catalog, tenant_models)
+    if rtype in ("MDSCHEMA_CATALOGS", "DBSCHEMA_CATALOGS"):
+        # Bug-9853 / deep-review B5: a CATALOG_NAME restriction may carry the
+        # legacy bare or persona spelling a saved workbook echoes back; the
+        # row builder is alias-aware (Bug-9825) but the generic restriction
+        # compares against the emitted canonical name and dropped the row.
+        # Apply the restriction here, once, and keep the rowset out of the
+        # generic filter (it is self-restricting).
+        _wanted = (restrictions or {}).get("CATALOG_NAME") or []
+        _filter = str(_wanted[0]) if len(_wanted) == 1 and _wanted[0] else catalog
+        return _rows_catalogs(_filter, tenant_models)
     if rtype == "MDSCHEMA_CUBES": return _rows_cubes(catalog, tenant_models)
     if rtype == "MDSCHEMA_DIMENSIONS": return _rows_dimensions(catalog, dimensions, member_data, trust_meta)
     if rtype == "MDSCHEMA_MEASURES": return _rows_measures(catalog, measures, trust_meta)
     if rtype == "DBSCHEMA_TABLES": return _rows_tables(catalog, measures, dimensions, trust_meta, named_queries)
     if rtype == "DBSCHEMA_COLUMNS": return _rows_columns(catalog, measures, dimensions, trust_meta, named_queries)
     if rtype == "MDSCHEMA_HIERARCHIES": return _rows_hierarchies(catalog, dimensions, measures, member_data, properties, trust_meta)
-    if rtype == "MDSCHEMA_LEVELS": return _rows_levels(catalog, dimensions, member_data, trust_meta)
+    if rtype == "MDSCHEMA_LEVELS": return _rows_levels(catalog, dimensions, member_data, trust_meta, properties)
     if rtype == "MDSCHEMA_MEASUREGROUPS": return _rows_measuregroups(catalog, measures)
     if rtype == "MDSCHEMA_MEASUREGROUP_DIMENSIONS": return _rows_measuregroup_dimensions(catalog, dimensions, measures)
-    if rtype == "MDSCHEMA_MEMBERS": return _rows_members(catalog, measures, dimensions, restrictions, member_data)
-    if rtype == "MDSCHEMA_PROPERTIES": return _rows_md_properties(catalog, dimensions, measures, restrictions)
-    if rtype == "MDSCHEMA_SETS": return _rows_sets(catalog, named_sets)
-    if rtype == "MDSCHEMA_KPIS": return _rows_kpis(catalog, kpis, measures)
+    if rtype == "MDSCHEMA_MEMBERS": return _rows_members(catalog, measures, dimensions, restrictions, member_data, properties=properties)
+    if rtype == "MDSCHEMA_PROPERTIES": return _rows_md_properties(catalog, dimensions, measures, restrictions, properties=properties)
+    if rtype == "MDSCHEMA_SETS": return _rows_sets(catalog, named_sets, dimensions)
+    if rtype == "MDSCHEMA_KPIS":
+        return _rows_kpis(catalog, kpis, measures, properties=properties)
     # Bug-5430: Power BI / Tabular discovery rowsets.
     if rtype == "DISCOVER_CSDL_METADATA": return _rows_csdl_metadata(catalog, measures, dimensions)
     if rtype == "DISCOVER_CALC_DEPENDENCY": return _rows_calc_dependency(catalog)
@@ -553,7 +694,12 @@ def _rows_literals() -> list[dict[str, str]]:
         if invalid_start: row["LiteralInvalidStartingChars"] = invalid_start
         return row
     return [
-        _lit("DBLITERAL_CATALOG_NAME", invalid=".", invalid_start="0123456789", max_len="24", enum_val="2"),
+        # Bug-9825: 24 was copied from OlaPy and was never true here — a
+        # ``<slug>_<persona-slug>`` catalog passes it easily, and the qualified
+        # identity always does. Advertising a limit shorter than the names
+        # actually emitted invites a strict client to truncate one.
+        _lit("DBLITERAL_CATALOG_NAME", invalid=".", invalid_start="0123456789",
+             max_len=str(CATALOG_NAME_MAX_LENGTH), enum_val="2"),
         _lit("DBLITERAL_CATALOG_SEPARATOR", value=".", max_len="0", enum_val="3"),
         _lit("DBLITERAL_COLUMN_ALIAS", invalid="'\"[]", invalid_start="0123456789", enum_val="5"),
         _lit("DBLITERAL_COLUMN_NAME", invalid=".", invalid_start="0123456789", enum_val="6"),
@@ -604,15 +750,32 @@ def _rows_catalogs(catalog, tenant_models):
                 if not pslug:
                     continue
                 plabel = persona.get("description") or persona.get("name") or pslug
-                variants.append((f"_{pslug}", f" ({plabel})"))
-            for suffix, label_suffix in variants:
-                cname = f"{base}{suffix}"
-                if catalog and cname != catalog:
+                variants.append((pslug, f" ({plabel})"))
+            for persona_slug, label_suffix in variants:
+                # Bug-9825: the published name is the combination that actually
+                # is unique — tenant, project, model, persona. Built through the
+                # shared helper so this row and the resolver cannot disagree
+                # about what a catalog is called.
+                cname = build_catalog_name(
+                    m.get("tenant_slug") or "", m.get("project_slug") or "",
+                    base, persona_slug,
+                )
+                # A Catalog restriction may arrive as either spelling: the
+                # qualified name, or the bare slug a workbook saved before this
+                # change still carries.
+                legacy = f"{base}_{persona_slug}" if persona_slug else base
+                if catalog and catalog not in (cname, legacy):
                     continue
                 rows.append(_row(cname, f"{display}{label_suffix}".strip()))
         if rows:
             return rows
+        # A tenant listing is available and nothing matched: the name is
+        # not a catalog of this tenant, so advertise nothing (deep-review B5
+        # -- echoing it back invented a catalog that does not exist).
+        return []
     if catalog:
+        # No listing available (metadata outage): echo the connection's own
+        # catalog so an established session keeps its identity.
         return [_row(catalog, "")]
     return []
 
@@ -659,9 +822,20 @@ def _rows_cubes(catalog, tenant_models=None):
                 if not pslug:
                     continue
                 plabel = persona.get("description") or persona.get("name") or pslug
-                variants.append((f"_{pslug}", f" ({plabel})"))
-            for suffix, label in variants:
-                rows.append(_cube_row(f"{base}{suffix}", f"{display}{label}".strip()))
+                variants.append((pslug, f" ({plabel})"))
+            for persona_slug, label in variants:
+                # Bug-9825: CUBE_NAME is the catalog name (see ``_cube_row``), so
+                # this MUST build it the same way ``_rows_catalogs`` does, or a
+                # cube is advertised that belongs to no catalog. Carrying the
+                # persona in that shared name is also what gives the cube list a
+                # visible viewpoint to pick.
+                rows.append(_cube_row(
+                    build_catalog_name(
+                        m.get("tenant_slug") or "", m.get("project_slug") or "",
+                        base, persona_slug,
+                    ),
+                    f"{display}{label}".strip(),
+                ))
         return rows
     return [_cube_row(catalog, "")]
 
@@ -701,10 +875,12 @@ def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
     into ONE ``[Dimensions]`` group node (mirroring the excel-plugin's single
     "Dimensions" section); each user/calendar hierarchy keeps its OWN node (its own
     group, which preserves its per-dimension time typing); KPIs are their own group
-    natively via MDSCHEMA_KPIS. Grouping is by the DIMENSION_UNIQUE_NAME column only —
+    natively via MDSCHEMA_KPIS. Grouping sets the DIMENSION_UNIQUE_NAME column and the
+    rest of the unique-name tree nests under it (Bug-9771) —
     the individual attribute hierarchies still appear under the group (emitted by
-    ``_rows_hierarchies`` with the unchanged ``[Attr].[Attr]`` unique names), so a
-    standalone dimension is NOT flattened.
+    ``_rows_hierarchies``, which since Bug-9771 prefixes them with the group node —
+    ``[Dimensions].[Attr]``, NOT the old ``[Attr].[Attr]``), so a standalone
+    dimension is NOT flattened.
 
     Phase 1: friendly ``display_name`` -> DIMENSION_CAPTION, business description ->
     DESCRIPTION, cascaded hidden dims dropped, visible dims marked visible.
@@ -713,13 +889,24 @@ def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
     rows = []
     footer = _build_trust_footer_xmla(trust_meta)
     visible_dims = [d for d in dims if not _effective_hidden(d)]
-    standalone_dims = [d for d in visible_dims if is_standalone_attribute(d)]
-    hierarchy_dims = [d for d in visible_dims if not is_standalone_attribute(d)]
+    # Bug-9788: when grouping is OFF every dimension gets its own node, so the
+    # group-node branches below must see EMPTY partitions. Without this the
+    # rowset still advertises [Dimensions]/[Hierarchies] while
+    # dimension_unique_name_for has already stopped using them -- every
+    # hierarchy would then reference a DIMENSION_UNIQUE_NAME absent from this
+    # rowset, which is a worse cube than either mode. The flag must move both
+    # sides together or not at all.
+    _grouped = field_list_grouping_enabled()
+    standalone_dims = [
+        d for d in visible_dims if _grouped and is_standalone_attribute(d)
+    ]
+    hierarchy_dims = [
+        d for d in visible_dims if not (_grouped and is_standalone_attribute(d))
+    ]
     ordinal = 0
 
     # One group node for every standalone attribute dimension.
     if standalone_dims:
-        first_name = standalone_dims[0].get("name", "")
         rows.append({
             "CATALOG_NAME": catalog,
             "SCHEMA_NAME": "",
@@ -734,7 +921,7 @@ def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
             "DIMENSION_TYPE": "3",
             # Cardinality here is the count of grouped attribute hierarchies.
             "DIMENSION_CARDINALITY": str(len(standalone_dims)),
-            "DEFAULT_HIERARCHY": f"[{_escape_mdx_bracket(first_name)}].[{_escape_mdx_bracket(first_name)}]",
+            "DEFAULT_HIERARCHY": hierarchy_unique_name_for(standalone_dims[0]),
             "DESCRIPTION": _with_footer("", footer),
             "IS_VIRTUAL": "false",
             "IS_READWRITE": "false",
@@ -744,14 +931,46 @@ def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
         })
         ordinal += 1
 
-    # Bug-6891: multi-level user/calendar hierarchies collapse into ONE
-    # [Hierarchies] group node; only flat time dimensions keep their own node
-    # (preserving their per-dimension time typing / Excel timeline).
-    grouped_hiers = [d for d in hierarchy_dims if is_grouped_hierarchy(d)]
-    own_node_dims = [d for d in hierarchy_dims if not is_grouped_hierarchy(d)]
+    # Bug-9878: every time-typed field (flat date attributes and calendar
+    # hierarchies) collapses into ONE time-typed [Time] node -- the SSAS date
+    # dimension shape, which keeps Excel's Timeline filter and removes the
+    # stray top-level date nodes. Bug-9788: same both-sides rule as above.
+    time_dims = [
+        d for d in hierarchy_dims if _grouped and is_time_group_member(d)
+    ]
+    if time_dims:
+        rows.append({
+            "CATALOG_NAME": catalog,
+            "SCHEMA_NAME": "",
+            "CUBE_NAME": catalog,
+            "DIMENSION_NAME": TIME_GROUP_NAME,
+            "DIMENSION_UNIQUE_NAME": TIME_GROUP_UNIQUE_NAME,
+            "DIMENSION_GUID": "00000000-0000-0000-0000-000000000000",
+            "DIMENSION_CAPTION": TIME_GROUP_NAME,
+            "DIMENSION_ORDINAL": str(ordinal),
+            "DIMENSION_TYPE": "1",
+            "DIMENSION_CARDINALITY": str(len(time_dims)),
+            "DEFAULT_HIERARCHY": hierarchy_unique_name_for(time_dims[0]),
+            "DESCRIPTION": _with_footer("", footer),
+            "IS_VIRTUAL": "false",
+            "IS_READWRITE": "false",
+            "DIMENSION_UNIQUE_SETTINGS": "1",
+            "DIMENSION_MASTER_NAME": TIME_GROUP_NAME,
+            "DIMENSION_IS_VISIBLE": "true",
+        })
+        ordinal += 1
+
+    # Bug-6891: the remaining multi-level user hierarchies collapse into ONE
+    # [Hierarchies] group node. Bug-9788: same both-sides rule as above.
+    grouped_hiers = [
+        d for d in hierarchy_dims if _grouped and is_grouped_hierarchy(d)
+    ]
+    own_node_dims = [
+        d for d in hierarchy_dims
+        if not (_grouped and (is_grouped_hierarchy(d) or is_time_group_member(d)))
+    ]
 
     if grouped_hiers:
-        first_hname = grouped_hiers[0].get("name", "")
         rows.append({
             "CATALOG_NAME": catalog,
             "SCHEMA_NAME": "",
@@ -765,7 +984,7 @@ def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
             # time typing lives in MDSCHEMA_LEVELS.
             "DIMENSION_TYPE": "3",
             "DIMENSION_CARDINALITY": str(len(grouped_hiers)),
-            "DEFAULT_HIERARCHY": f"[{_escape_mdx_bracket(first_hname)}].[{_escape_mdx_bracket(first_hname)}]",
+            "DEFAULT_HIERARCHY": hierarchy_unique_name_for(grouped_hiers[0]),
             "DESCRIPTION": _with_footer("", footer),
             "IS_VIRTUAL": "false",
             "IS_READWRITE": "false",
@@ -775,7 +994,7 @@ def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
         })
         ordinal += 1
 
-    # Remaining dims (flat time dimensions) keep their own dimension node.
+    # Remaining dims (only when grouping is off) keep their own dimension node.
     for d in own_node_dims:
         dname = d.get("name", "")
         caption = d.get("display_name") or dname
@@ -797,7 +1016,7 @@ def _rows_dimensions(catalog, dims, member_data, trust_meta=None):
             "DIMENSION_ORDINAL": str(ordinal),
             "DIMENSION_TYPE": dim_type,
             "DIMENSION_CARDINALITY": card,
-            "DEFAULT_HIERARCHY": f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]",
+            "DEFAULT_HIERARCHY": hierarchy_unique_name_for(d),
             "DESCRIPTION": description,
             "IS_VIRTUAL": "false",
             "IS_READWRITE": "false",
@@ -863,6 +1082,7 @@ def _rows_measures(catalog, measures, trust_meta=None):
         )
         folder = m.get("display_folder") or ""
         agg_code = _AGG_TO_XMLA.get((m.get("default_agg") or "sum").lower(), "1")
+        data_type = _measure_data_type(m)
         # Bug-6889: the measure group carries the cube (model) name, matching
         # SSAS convention. A literal "default" surfaced as a meaningless
         # folder over every measure in Excel's field list.
@@ -876,9 +1096,14 @@ def _rows_measures(catalog, measures, trust_meta=None):
             "MEASURE_CAPTION": caption,
             "MEASURE_GUID": "00000000-0000-0000-0000-000000000000",
             "MEASURE_AGGREGATOR": agg_code,
-            "DATA_TYPE": "5",
-            "NUMERIC_PRECISION": "16",
-            "NUMERIC_SCALE": "-1",
+            # Bug-9847: from the measure's own declared wire type, not a
+            # hardcoded double. The Info measures return string cells.
+            "DATA_TYPE": data_type,
+            # None -> the optional element is omitted; an EMPTY element for
+            # an integer-typed column breaks MSOLAP's rowset parser
+            # ("error while parsing the 'NUMERIC_PRECISION' element").
+            "NUMERIC_PRECISION": "16" if data_type == "5" else None,
+            "NUMERIC_SCALE": "-1" if data_type == "5" else None,
             "MEASURE_UNITS": "",
             "DESCRIPTION": description,
             "EXPRESSION": "",
@@ -960,6 +1185,33 @@ def _rows_tables(catalog, measures, dimensions, trust_meta=None, named_queries=N
     return rows
 
 
+# Bug-9847: OLE DB type codes for a MEASURE cell. Every measure used to
+# advertise 5 (DBTYPE_R8) unconditionally, including the synthetic Info
+# measures whose Execute cells are ``<Value xsi:type="xsd:string">``. A client
+# that allocates its cache column from the advertised type -- Excel does -- was
+# told to expect a number and handed text.
+#
+# The key is ``xmla_data_type``, the WIRE type of the measure's cells, NOT the
+# measure's ``data_type`` (that is the SOURCE COLUMN's type: a count over a
+# text column is a text column and a numeric cell, so reading it here would
+# advertise the wrong type for a real measure). An aggregated measure produces
+# a number, so the default stays 5 and only a producer that knows its cells are
+# text says so.
+_MEASURE_WIRE_TYPE_TO_OLE_DB: dict[str, str] = {
+    "string": "130",  # DBTYPE_WSTR
+    "number": "5",    # DBTYPE_R8
+}
+_MEASURE_DATA_TYPE_DEFAULT = "5"
+
+
+def _measure_data_type(measure: dict) -> str:
+    """OLE DB DATA_TYPE code this measure's Execute cells actually carry."""
+    declared = str(measure.get("xmla_data_type") or "").strip().lower()
+    if not declared:
+        return _MEASURE_DATA_TYPE_DEFAULT
+    return _MEASURE_WIRE_TYPE_TO_OLE_DB.get(declared, _MEASURE_DATA_TYPE_DEFAULT)
+
+
 # Bug-9178: map the gateway catalogue data_type strings emitted by
 # ``build_named_query_relation_columns`` to OLE DB DATA_TYPE codes for the
 # DBSCHEMA_COLUMNS rowset. Codes match the sibling rows: measures -> 5
@@ -993,16 +1245,22 @@ def _rows_columns(catalog, measures, dimensions, trust_meta=None, named_queries=
         if _effective_hidden(m):
             continue
         mname = m.get("name", "")
-        rows.append({
+        # Bug-9847: the same declared wire type MDSCHEMA_MEASURES advertises --
+        # the two rowsets describe one measure and must not disagree.
+        measure_type = _measure_data_type(m)
+        column_row: dict[str, str] = {
             "TABLE_CATALOG": name, "TABLE_NAME": name,
             "COLUMN_NAME": mname, "ORDINAL_POSITION": str(ordinal),
-            "IS_NULLABLE": "true", "DATA_TYPE": "5",
-            "NUMERIC_PRECISION": "19", "NUMERIC_SCALE": "4",
+            "IS_NULLABLE": "true", "DATA_TYPE": measure_type,
             "DESCRIPTION": _with_footer(
                 m.get("effective_description") or m.get("description") or "",
                 footer,
             ),
-        })
+        }
+        if measure_type == "5":
+            column_row["NUMERIC_PRECISION"] = "19"
+            column_row["NUMERIC_SCALE"] = "4"
+        rows.append(column_row)
         ordinal += 1
     for d in dimensions:
         if _effective_hidden(d):
@@ -1087,6 +1345,7 @@ def _resolve_member_key_path(
     level_idx: int,
     members_by_level: dict[int, list[dict]],
     member_filter: str | None,
+    parent_index: dict[int, dict[str, str]] | None = None,
 ) -> list[str]:
     """Ancestor-first key path for a DISCOVER member (Bug-3617 Phase 2).
 
@@ -1107,7 +1366,8 @@ def _resolve_member_key_path(
         return [str(k) for k in explicit]
     mem_key = str(mem.get("key") or mname)
     walked = ancestor_key_path_from_parent_chain(
-        mname, level_idx, parent_name, members_by_level
+        mname, level_idx, parent_name, members_by_level,
+        parent_index=parent_index,
     )
     if len(walked) >= level_idx + 1:
         return walked
@@ -1149,11 +1409,12 @@ def _rows_hierarchies(catalog, dimensions, measures=None, member_data=None, prop
     name = catalog
     rows = []
     footer = _build_trust_footer_xmla(trust_meta)
-    app_name = (properties.get("SspropInitAppName") or "").strip().lower()
-    format_name = (properties.get("Format") or "").strip().upper()
-    # Align with OlaPy's Excel-specific compatibility tweak from its filters
-    # branch: avoid emitting ALL_MEMBER for Excel discover requests.
-    include_all_member = format_name == "TABULAR" and "excel" not in app_name
+    # Bug-9789: live Excel A/B proved that omitting ALL_MEMBER does not repair
+    # Save and prevents Excel from binding the source-computed grand tuple.
+    # Keep it aligned with DEFAULT_MEMBER, member discovery, and Execute.
+    from src.dax.cube_model import advertise_all_member
+
+    include_all_member = advertise_all_member(properties=properties)
     visible_dimensions = [d for d in dimensions if not _effective_hidden(d)]
     for i, d in enumerate(visible_dimensions):
         dname = d.get("name", "")
@@ -1164,19 +1425,20 @@ def _rows_hierarchies(catalog, dimensions, measures=None, member_data=None, prop
         )
         folder = d.get("display_folder") or ""
         dim_data = member_data.get(dname, {})
-        hier = f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]"
+        hier = hierarchy_unique_name_for(d)
         members_by_level = _dimension_members_by_level(dim_data)
         # Count root-level members for cardinality when available.
         card = str(len(members_by_level.get(0, []))) if members_by_level.get(0) else "6"
         # All member — points to the (All) level member.
         # LEVEL_UNIQUE_NAME uses [(All)], MEMBER_UNIQUE_NAME uses [All] (SSAS convention).
-        all_member = f"{hier}.[All]"
+        all_member = synthetic_all_member_uname(hier)
         dim_type = "1" if d.get("is_time_dim", False) else "3"
         row = {
             "CATALOG_NAME": name, "CUBE_NAME": name,
-            # Bug-6603: group column — standalone attrs share [Dimensions]; the
-            # HIERARCHY_UNIQUE_NAME below stays [dname].[dname] so Execute/member
-            # discovery are unaffected.
+            # Bug-6603: group column — standalone attrs share [Dimensions].
+            # Bug-9771: HIERARCHY_UNIQUE_NAME below is PREFIXED by this value
+            # ([Dimensions].[dname] when grouped), not the old [dname].[dname];
+            # Execute/member discovery consume the same prefixed names.
             "DIMENSION_UNIQUE_NAME": dimension_unique_name_for(d),
             "HIERARCHY_NAME": dname,
             "HIERARCHY_UNIQUE_NAME": hier,
@@ -1190,7 +1452,14 @@ def _rows_hierarchies(catalog, dimensions, measures=None, member_data=None, prop
             "IS_READWRITE": "false",
             "DIMENSION_UNIQUE_SETTINGS": "1",
             "DIMENSION_IS_VISIBLE": "true",
-            "HIERARCHY_ORDINAL": "1",
+            # Bug-9773: a DISTINCT ordinal per hierarchy. This was hardcoded to
+            # "1" for every hierarchy in the cube (86 of them on the demo model)
+            # while the enclosing loop already produced an unused index. SSAS
+            # numbers hierarchies across the cube and clients may index, sort or
+            # de-duplicate on this, so 86 aliases of the same position is a
+            # conformance defect regardless of whether a given client trips on
+            # it. Emitted in the same order as the rows themselves.
+            "HIERARCHY_ORDINAL": str(i + 1),
             "DIMENSION_IS_SHARED": "true",
             "HIERARCHY_IS_VISIBLE": "true",
             # Bug-6603: origin 1 (user-defined) only for multi-level model
@@ -1223,7 +1492,9 @@ def _rows_hierarchies(catalog, dimensions, measures=None, member_data=None, prop
         "IS_READWRITE": "false",
         "DIMENSION_UNIQUE_SETTINGS": "1",
         "DIMENSION_IS_VISIBLE": "true",
-        "HIERARCHY_ORDINAL": "1",
+        # Bug-9773: continue the cube-wide sequence past the last dimension
+        # hierarchy rather than aliasing position 1.
+        "HIERARCHY_ORDINAL": str(len(visible_dimensions) + 1),
         "DIMENSION_IS_SHARED": "true",
         "HIERARCHY_IS_VISIBLE": "true",
         "HIERARCHY_ORIGIN": "1",
@@ -1297,7 +1568,56 @@ def _dimension_levels_detailed(dimension: dict, dim_data: dict | None = None) ->
     return [{"name": dimension.get("name", ""), "time_unit": None}]
 
 
-def _rows_levels(catalog, dimensions, member_data, trust_meta=None):
+def _excel_flat_level_captions(
+    dimension: dict,
+    properties: dict | None,
+) -> tuple[str | None, str]:
+    """Distinct All vs data captions for Excel standalone flats (Bug-9772).
+
+    Excel binds the All level as the row field when ``ALL_MEMBER`` is omitted.
+    The All unique name stays ``[hier].[(All)]`` so Save keeps working. Giving
+    that level the display name, and keeping the data-level caption different,
+    is the non-colliding label strategy left open in
+    ``work/evidence/save-open-repair-2026-08-29/README.md``. Captioning both
+    levels with the same display name repaired the workbook on Open
+    (``a0e029179``, reverted ``fad3f0c7f``).
+    """
+    dname = str(dimension.get("name") or "")
+    display = str(dimension.get("display_name") or dname)
+    if not (
+        is_excel_xmla_client(properties=properties)
+        and is_standalone_attribute(dimension)
+    ):
+        return None, display
+    all_caption = display
+    data_caption = dname if dname and dname != all_caption else f"{display} values"
+    if data_caption == all_caption:
+        data_caption = f"{dname or display} values"
+    return all_caption, data_caption
+
+
+def _excel_flat_all_member_caption(
+    dimension: dict,
+    properties: dict | None,
+) -> str | None:
+    """Excel-flat All member caption override, or None to keep the default.
+
+    Excel caches ``MEMBER_CAPTION`` on the All unique name and repeats it as
+    the nested blank row under every parent (Book5: ``All channel_name``
+    under each account type). The unique name stays ``[hier].[All]``. ``All``
+    is the SSAS default and reads as the All of the parent group. A
+    per-parent caption such as ``All WEB`` cannot be cached on one unique
+    name without advertising All, which refuses Save.
+    """
+    if not (
+        is_excel_xmla_client(properties=properties)
+        and is_standalone_attribute(dimension)
+    ):
+        return None
+    return "All"
+
+
+def _rows_levels(catalog, dimensions, member_data, trust_meta=None, properties=None):
     """MDSCHEMA_LEVELS — levels per hierarchy + MeasuresLevel.
     Every hierarchy must have an (All) level at LEVEL_NUMBER=0 (LEVEL_TYPE=1)
     followed by the data level at LEVEL_NUMBER=1.  Without the (All) level
@@ -1314,7 +1634,7 @@ def _rows_levels(catalog, dimensions, member_data, trust_meta=None):
         if _effective_hidden(d):
             continue
         dname = d.get("name", "")
-        caption = d.get("display_name") or dname
+        all_caption, data_caption_default = _excel_flat_level_captions(d, properties)
         description = _with_footer(
             d.get("effective_description") or d.get("description") or "",
             footer,
@@ -1324,20 +1644,24 @@ def _rows_levels(catalog, dimensions, member_data, trust_meta=None):
         # Bug-6603: carry each level's time_unit so calendar levels type
         # correctly even when the level names are not the canonical words.
         level_details = _dimension_levels_detailed(d, dim_data)
-        hier = f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]"
-        # Bug-6603: group column (standalone attrs -> [Dimensions]); hierarchy/level
-        # unique names below are unchanged.
+        hier = hierarchy_unique_name_for(d)
+        # Bug-6603: group column (standalone attrs -> [Dimensions]). Bug-9771:
+        # hierarchy and level unique names below NEST under this value; they are
+        # not independent of grouping.
         dim_uname = dimension_unique_name_for(d)
 
         # (All) level is always level 0 — MSOLAP requires it to match
-        # the ALL_MEMBER / DEFAULT_MEMBER declared in MDSCHEMA_HIERARCHIES.
+        # DEFAULT_MEMBER (and ALL_MEMBER when advertised) in MDSCHEMA_HIERARCHIES.
+        # Keep the All-level caption distinct from the business data level.
+        # Excel uses the hierarchy caption for the mounted field when the
+        # hierarchy's ALL_MEMBER metadata is present.
         rows.append({
             "CATALOG_NAME": name, "CUBE_NAME": name,
             "DIMENSION_UNIQUE_NAME": dim_uname,
             "HIERARCHY_UNIQUE_NAME": hier,
             "LEVEL_NAME": "(All)",
             "LEVEL_UNIQUE_NAME": f"{hier}.[(All)]",
-            "LEVEL_CAPTION": "(All)",
+            "LEVEL_CAPTION": all_caption or "(All)",
             "LEVEL_NUMBER": "0",
             "LEVEL_CARDINALITY": "1",
             "LEVEL_TYPE": "1",  # MDLEVEL_TYPE_ALL
@@ -1355,7 +1679,9 @@ def _rows_levels(catalog, dimensions, member_data, trust_meta=None):
         for idx, level in enumerate(level_details):
             level_name = level["name"]
             card = str(len(members_by_level.get(idx, [])))
-            level_caption = caption if level_name == dname else level_name
+            level_caption = data_caption_default if level_name == dname else level_name
+            if all_caption and level_caption == all_caption:
+                level_caption = dname if dname != all_caption else f"{level_name} values"
             level_type = "0"
             if is_time:
                 level_type = _level_time_type(level_name, level.get("time_unit"))
@@ -1404,6 +1730,7 @@ def _rows_members(
     dimensions: list[dict],
     restrictions: dict[str, list[str]],
     member_data: dict[str, dict] | None = None,
+    properties: dict | None = None,
 ) -> list[dict]:
     """
     MDSCHEMA_MEMBERS — return members for dimensions/measures.
@@ -1473,11 +1800,12 @@ def _rows_members(
             continue
         dname = d.get("name", "")
         # Bug-6603: DIMENSION_UNIQUE_NAME is the group column (standalone attrs ->
-        # [Dimensions]); the hierarchy uname stays [dname].[dname]. A client that
+        # [Dimensions]). Bug-9771: the hierarchy uname is PREFIXED by it
+        # ([Dimensions].[dname] when grouped), not [dname].[dname]. A client that
         # restricts members by the group DIMENSION_UNIQUE_NAME keeps every standalone
         # dimension in scope; per-hierarchy narrowing still comes from hier_filter.
         dim_uname = dimension_unique_name_for(d)
-        hier = f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]"
+        hier = hierarchy_unique_name_for(d)
 
         # Apply DIMENSION_UNIQUE_NAME restriction
         if dim_filter and dim_filter != dim_uname:
@@ -1489,9 +1817,27 @@ def _rows_members(
         dim_data = member_data.get(dname) or {}
         level_names = _dimension_level_names(d, dim_data)
         members_by_level = _dimension_members_by_level(dim_data)
+        # Bug-9865: an unrestricted browse emits EVERY member of this
+        # hierarchy, and both the ancestor walk and the child count used to
+        # rescan a whole level per member -- quadratic in the member count
+        # (measured: 24k members took 4.6s of pure CPU in this builder alone,
+        # and the demo model's admin surface is 31.6k). Both indexes are built
+        # ONCE per dimension here and read as dict lookups below.
+        parent_index = build_parent_index(members_by_level)
+        child_counts_by_level: dict[int, dict[str, int]] = {}
+        for _lvl, _members in members_by_level.items():
+            _counts: dict[str, int] = {}
+            for _mem in _members:
+                _pkey = str(_mem.get("parent") or "")
+                _counts[_pkey] = _counts.get(_pkey, 0) + 1
+            child_counts_by_level[_lvl] = _counts
         root_members = members_by_level.get(0, [])
         all_level_uname = f"{hier}.[(All)]"
-        all_member_uname = f"{hier}.[All]"
+        all_member = synthetic_all_member_metadata(
+            hier, dname, children_cardinality=len(root_members),
+            caption=_excel_flat_all_member_caption(d, properties),
+        )
+        all_member_uname = str(all_member["uname"])
         # Bug-3617 (Phase 2): emit the canonical ancestor-qualified uname only for
         # MULTI-LEVEL hierarchies — that is where caption-form members collide
         # (month 4 of 2025 vs 2026) and where the Execute SUBTOTAL axis already
@@ -1523,17 +1869,21 @@ def _rows_members(
                 "CUBE_NAME": name,
                 "DIMENSION_UNIQUE_NAME": dim_uname,
                 "HIERARCHY_UNIQUE_NAME": hier,
-                "LEVEL_UNIQUE_NAME": all_level_uname,
-                "LEVEL_NUMBER": "0",
-                "MEMBER_ORDINAL": "0",
-                "MEMBER_NAME": "All",
+                "LEVEL_UNIQUE_NAME": str(all_member["lname"]),
+                "LEVEL_NUMBER": str(all_member["lnum"]),
+                "MEMBER_ORDINAL": str(all_member["member_ordinal"]),
+                "MEMBER_NAME": str(all_member["name"]),
                 "MEMBER_UNIQUE_NAME": all_member_uname,
-                "MEMBER_TYPE": "2",  # MDMEMBER_TYPE_ALL
-                "MEMBER_CAPTION": f"All {dname}",
-                "CHILDREN_CARDINALITY": str(len(root_members)),
+                "MEMBER_TYPE": str(all_member["member_type"]),
+                "MEMBER_CAPTION": str(all_member["caption"]),
+                "CHILDREN_CARDINALITY": str(all_member["children_cardinality"]),
                 "PARENT_LEVEL": "0",
                 "PARENT_COUNT": "0",
-                "MEMBER_KEY": "All",
+                "MEMBER_KEY": str(all_member["key"]),
+                # Root members have no parent.  Leaving this optional rowset
+                # cell absent is XMLA NULL; the previous empty string was a
+                # second, invalid member identity that Excel could persist.
+                "PARENT_UNIQUE_NAME": all_member["parent"],
                 "IS_PLACEHOLDERMEMBER": "false",
                 "IS_DATAMEMBER": "false",
             })
@@ -1565,10 +1915,13 @@ def _rows_members(
                 mem_caption = str(mem.get("caption") or mname)
                 mem_key_path = _resolve_member_key_path(
                     mem, mname, parent_name, level_idx, members_by_level, member_filter,
+                    parent_index,
                 )
-                mem_uname = (
-                    qualify_member_uname(hier, level_name, mem_key_path)
-                    if is_multi_level else f"{hier}.[{_escape_mdx_bracket(mname)}]"
+                mem_uname = canonical_member_uname(
+                    hier,
+                    level_name,
+                    mem_key_path,
+                    is_multi_level=is_multi_level,
                 )
                 matches_self = member_filter_matches(
                     member_filter,
@@ -1621,8 +1974,9 @@ def _rows_members(
                     elif not matches_self:
                         continue
 
-                next_level_members = members_by_level.get(level_idx + 1, [])
-                child_count = sum(1 for m in next_level_members if str(m.get("parent") or "") == mname)
+                # Bug-9865: precomputed per-level child counts (see above);
+                # this was a full scan of the next level for every member.
+                child_count = child_counts_by_level.get(level_idx + 1, {}).get(mname, 0)
 
                 # Bug-5434: flat (single-level) dimension with a distinct display
                 # attribute. SSAS surfaces the display name as MEMBER_NAME /
@@ -1650,8 +2004,11 @@ def _rows_members(
                 if is_multi_level:
                     parent_idx = len(mem_key_path) - 2
                     if 0 <= parent_idx < len(level_names):
-                        parent_uname = qualify_member_uname(
-                            hier, level_names[parent_idx], mem_key_path[:-1]
+                        parent_uname = canonical_member_uname(
+                            hier,
+                            level_names[parent_idx],
+                            mem_key_path[:-1],
+                            is_multi_level=True,
                         )
                     else:
                         parent_uname = all_member_uname
@@ -1660,7 +2017,12 @@ def _rows_members(
                     if level_idx == 0 or not parent_name:
                         parent_uname = all_member_uname
                     else:
-                        parent_uname = f"{hier}.[{_escape_mdx_bracket(parent_name)}]"
+                        parent_uname = canonical_member_uname(
+                            hier,
+                            level_name,
+                            [parent_name],
+                            is_multi_level=False,
+                        )
                 rows.append({
                     "CATALOG_NAME": name,
                     "CUBE_NAME": name,
@@ -1749,7 +2111,7 @@ def _rows_measuregroup_dimensions(
                 "DIMENSION_CARDINALITY": "MANY",
                 "DIMENSION_IS_VISIBLE": "true",
                 "DIMENSION_IS_FACT_DIMENSION": "false",
-                "DIMENSION_GRANULARITY": f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]",
+                "DIMENSION_GRANULARITY": hierarchy_unique_name_for(d),
             })
     return rows
 
@@ -1761,6 +2123,7 @@ def _rows_md_properties(
     dimensions: list[dict],
     measures: list[dict],
     restrictions: dict[str, list[str]],
+    properties: dict | None = None,
 ) -> list[dict]:
     """
     MDSCHEMA_PROPERTIES — cell and member properties.
@@ -1768,8 +2131,17 @@ def _rows_md_properties(
       1 = MDPROP_MEMBER (intrinsic member properties like KEY, ID)
       2 = MDPROP_CELL (cell properties like VALUE, FORMAT_STRING)
     Excel queries both types — we must return the correct type for each query.
+
+    Bug-9772: member-property rows are a profile decision. Excel on the
+    ``native-all`` profile receives none (``advertise_member_properties``);
+    that single change is what makes the native All member persist in
+    ``.xlsx``. Cell properties are unaffected.
     """
     name = catalog
+    emit_member_properties = advertise_member_properties(
+        client_app_name=(properties or {}).get("SspropInitAppName"),
+        properties=properties,
+    )
 
     prop_type_filter = (restrictions.get("PROPERTY_TYPE") or [None])[0]
     hier_filter = (restrictions.get("HIERARCHY_UNIQUE_NAME") or [None])[0]
@@ -1811,11 +2183,12 @@ def _rows_md_properties(
             if _effective_hidden(d):
                 continue
             dname = d.get("name", "")
-            hier = f"[{_escape_mdx_bracket(dname)}].[{_escape_mdx_bracket(dname)}]"
+            hier = hierarchy_unique_name_for(d)
             if hier_filter and hier_filter != hier:
                 continue
             # Bug-6603: carry the group DIMENSION_UNIQUE_NAME (standalone attrs ->
-            # [Dimensions]); the hierarchy uname stays [dname].[dname].
+            # [Dimensions]). Bug-9771: the hierarchy uname is prefixed by it
+            # ([Dimensions].[dname] when grouped), not [dname].[dname].
             target_dimensions.append(
                 (dimension_unique_name_for(d), hier, _dimension_level_names(d))
             )
@@ -1867,7 +2240,7 @@ def _rows_md_properties(
                         "DATA_TYPE": str(data_type),
                         "DESCRIPTION": "",
                         "PROPERTY_CONTENT_TYPE": "0",
-                        "PROPERTY_ORIGIN": "1",
+                        "PROPERTY_ORIGIN": _PROPERTY_ORIGIN_INTRINSIC,
                         "PROPERTY_IS_VISIBLE": "true",
                     })
         return rows
@@ -1890,16 +2263,17 @@ def _rows_md_properties(
                 "DATA_TYPE": str(data_type),
                 "DESCRIPTION": "",
                 "PROPERTY_CONTENT_TYPE": "0",
-                "PROPERTY_ORIGIN": "1",
+                "PROPERTY_ORIGIN": _PROPERTY_ORIGIN_INTRINSIC,
                 "PROPERTY_IS_VISIBLE": "true",
             })
         return rows
 
+    member_rows = _member_property_rows() if emit_member_properties else []
     if prop_type_filter == "1":
-        return _member_property_rows()
+        return member_rows
     if prop_type_filter == "2":
         return _cell_property_rows()
-    return _member_property_rows() + _cell_property_rows()
+    return member_rows + _cell_property_rows()
 
 def build_execute_response(catalog_name: str, columns: list[dict[str, Any]], rows: list[list[Any]]) -> str:
     col_defs = []
@@ -1918,7 +2292,38 @@ def build_execute_response(catalog_name: str, columns: list[dict[str, Any]], row
     return _build_rowset_xml(col_defs, dict_rows)
 
 
-def _rows_sets(catalog: str, named_sets: list[dict[str, Any]]) -> list[dict[str, str]]:
+def _set_expression_to_wire(
+    expression: str,
+    dimensions: list[dict[str, Any]] | None,
+) -> str:
+    """Rewrite a stored named-set expression into the WIRE name grammar (Bug-9774).
+
+    Uses the same identity map as every other translation seam, so a set can
+    never advertise a hierarchy identity the hierarchies rowset does not list.
+    Longest wire name first so a field whose name prefixes another's is not
+    partially rewritten. Any failure leaves the expression untouched — a
+    stale-looking set is far better than a corrupted one.
+    """
+    if not expression or not dimensions:
+        return expression
+    try:
+        from src.dax.mdx_execute import wire_hierarchy_map_from_cube_dims
+        hier_map = wire_hierarchy_map_from_cube_dims(dimensions)
+    except Exception:
+        return expression
+    for internal, wire in sorted(
+        hier_map.items(), key=lambda kv: len(kv[0]), reverse=True
+    ):
+        if internal in expression:
+            expression = expression.replace(internal, wire)
+    return expression
+
+
+def _rows_sets(
+    catalog: str,
+    named_sets: list[dict[str, Any]],
+    dimensions: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
     rows = []
     for ns in named_sets:
         # Bug-7925: sql_fixed named lists carry no MDX expression and
@@ -1929,6 +2334,14 @@ def _rows_sets(catalog: str, named_sets: list[dict[str, Any]]) -> list[dict[str,
         # sets appear in the XMLA catalogue; sql_fixed lists remain
         # available through JDBC / REST / SQL authoring surfaces.
         if ns.get("list_type") == "sql_fixed":
+            continue
+
+        # Bug-9877: never advertise a set that does not bind for the effective
+        # persona. Discovery does not ask model-service for the hidden sets, so
+        # this is a belt-and-braces guard on the one verdict both surfaces use
+        # -- the Discover catalogue and the Execute path must list exactly the
+        # same sets.
+        if ns.get("persona_visible") is False:
             continue
 
         # F-018-13: deprecated sets are already filtered out at the gateway
@@ -1947,20 +2360,49 @@ def _rows_sets(catalog: str, named_sets: list[dict[str, Any]]) -> list[dict[str,
         description = _with_footer(
             description, _build_trust_footer_xmla(ns.get("trust_meta")),
         )
+        wire_expression = _set_expression_to_wire(
+            ns.get("expression", ""), dimensions,
+        )
         rows.append({
             "CATALOG_NAME": catalog,
             "SCHEMA_NAME": "",
             "CUBE_NAME": catalog,
             "SET_NAME": ns.get("name", ""),
             "SET_CAPTION": ns.get("display_name") or ns.get("name", ""),
-            "SET_DESCRIPTION": description,
+            "DESCRIPTION": description,
             "SET_DISPLAY_FOLDER": ns.get("display_folder", ""),
             "SCOPE": str(ns.get("scope", 1)),
-            "EXPRESSION": ns.get("expression", ""),
-            "DIMENSIONS": ns.get("dimensions", ""),
+            # Bug-9774: a named set is STORED in the internal [Name].[Name]
+            # grammar, but every other rowset now advertises the conformant
+            # wire form. Advertising the stored form here would hand Excel a
+            # hierarchy identity that appears nowhere in MDSCHEMA_HIERARCHIES.
+            # Translate on the way out; the stored expression is untouched, and
+            # Execute still accepts either grammar.
+            "EXPRESSION": wire_expression,
+            # Bug-9883: the hierarchies the set spans, as WIRE unique names.
+            # Excel refuses to place a set whose DIMENSIONS column is empty
+            # (COM 0x800A03EC on Orientation); SSAS lists every hierarchy the
+            # set's members belong to, comma-separated.
+            "DIMENSIONS": _set_dimensions_from_expression(wire_expression),
             "SET_EVALUATION_CONTEXT": "0",
         })
     return rows
+
+
+_SET_HIERARCHY_REF_RE = re.compile(r"\[[^\]]+\]\.\[[^\]]+\]")
+
+
+def _set_dimensions_from_expression(wire_expression: str) -> str:
+    """Comma-separated hierarchy unique names a set expression ranges over
+    (Bug-9883): every ``[Dim].[Hier]`` reference except ``[Measures].[x]``,
+    first occurrence first, deduplicated."""
+    seen: list[str] = []
+    for ref in _SET_HIERARCHY_REF_RE.findall(wire_expression or ""):
+        if ref.startswith("[Measures]."):
+            continue
+        if ref not in seen:
+            seen.append(ref)
+    return ",".join(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -2216,7 +2658,11 @@ def kpi_status_synthetic_measures(
 
 
 def _rows_kpis(
-    catalog: str, kpis: list[dict[str, Any]], measures: list[dict[str, Any]],
+    catalog: str,
+    kpis: list[dict[str, Any]],
+    measures: list[dict[str, Any]],
+    *,
+    properties: dict | None = None,
 ) -> list[dict[str, str]]:
     """MDSCHEMA_KPIS — one row per KPI.
 
@@ -2224,7 +2670,18 @@ def _rows_kpis(
     For v2 KPIs the expression is emitted directly as KPI_VALUE. For legacy
     KPIs the value/goal measure names are wrapped in [Measures].[...] syntax.
     Composite KPIs populate KPI_PARENT_KPI_NAME for child KPIs.
+
+    Bug-9830: only deployed-snapshot KPIs with a fully resolved, executable
+    value member are advertised. The same eligibility helper is used by the
+    XMLA Execute support-member path, so ``KPI_VALUE`` cannot point at a member
+    that Execute will reject.
     """
+    from src.dax.cube_model import advertise_kpis_in_discover
+    from src.dax.kpi_persona_filter import filter_kpis_for_native_xmla
+
+    if not advertise_kpis_in_discover(properties=properties):
+        return []
+    kpis = filter_kpis_for_native_xmla(kpis, measures)
     measure_map = {str(m.get("id", "")): m for m in measures}
     # Build KPI name lookup for parent references
     kpi_name_map = {str(k.get("id", "")): k.get("name", "") for k in kpis}
@@ -2366,6 +2823,7 @@ def _rows_kpis(
             "UNARY_OPERATOR": "",
             "ASSOCIATE_MEASURE_GROUP_NAME": catalog,
         })
+
     return rows
 
 

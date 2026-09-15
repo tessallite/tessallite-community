@@ -149,3 +149,14 @@ async def test_correctly_scoped_request_is_allowed():
             project_id, model_id, uuid.uuid4(), current_user=TENANT
         )
     assert runs == []
+
+
+@pytest.mark.asyncio
+async def test_aggregate_history_orders_equal_timestamps_by_id():
+    project_id, model_id = uuid.uuid4(), uuid.uuid4()
+    db = _db(model_project_id=project_id, agg_model_id=model_id)
+    with _patch(db):
+        await list_refresh_runs(project_id, model_id, uuid.uuid4(), current_user=TENANT)
+    statements = [str(call.args[0]) for call in db.execute.call_args_list]
+    history = next(sql for sql in statements if "ORDER BY" in sql)
+    assert "aggregate_refresh_runs.started_at DESC, aggregate_refresh_runs.id DESC" in history

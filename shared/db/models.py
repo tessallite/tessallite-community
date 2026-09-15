@@ -102,6 +102,24 @@ class SystemAuditEvent(SystemBase):
     ip_address: Mapped[Optional[str]] = mapped_column(Text)
 
 
+class SystemLog(SystemBase):
+    """Raw application log messages, separate from durable audit events."""
+
+    __tablename__ = "system_logs"
+    __table_args__ = (
+        Index("ix_system_logs_timestamp_id", "timestamp", "id"),
+        Index("ix_system_logs_errors_timestamp", "timestamp", postgresql_where=text("level IN ('ERROR', 'CRITICAL')")),
+        {"schema": "tess_system"},
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    timestamp: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False)
+    service: Mapped[str] = mapped_column(String(64), nullable=False)
+    level: Mapped[str] = mapped_column(String(16), nullable=False)
+    logger: Mapped[str] = mapped_column(String(255), nullable=False)
+    instance: Mapped[str] = mapped_column(String(255), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 class LoginLockout(SystemBase):
     """Per-account login lockout (G-021-04). System-schema so discover can lock
     unknown-email probes without a tenant session.
@@ -341,13 +359,10 @@ class Model(TenantBase):
     refresh_strategy: Mapped[str] = mapped_column(String(32), nullable=False, default="scheduled")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     aggregations_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    # Bug-9409 (user decision F-102-26 = A): FALSE for new models. Migration
-    # 0216 alters the column DEFAULT only — every existing row keeps its
-    # persisted value. See shared/model_defaults.py for the rationale.
     include_all_measures: Mapped[bool] = mapped_column(
         Boolean, nullable=False,
         default=DEFAULT_INCLUDE_ALL_MEASURES,
-        server_default=text("false"),
+        server_default=text("true"),
     )
     seed: Mapped[str] = mapped_column(String(64), nullable=False)
     max_aggregates: Mapped[int] = mapped_column(Integer, nullable=False, default=50)

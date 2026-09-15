@@ -58,7 +58,7 @@
   "glossary.failedToRejectEntry": "Failed to reject entry.",
   "glossary.failedToSaveChanges": "Failed to save changes.",
   "glossary.hideButton": "Hide",
-  "glossary.hideColumnHelp": "When approved, the underlying column is hidden from the catalogue and from BI clients (Excel, Power BI).",
+  "glossary.hideColumnHelp": "When approved, the underlying column is removed from the catalogue and from the default business view in BI clients (Excel, Power BI). This is curation, not access control — a caller that names the column explicitly can still read it.",
   "glossary.hideColumnLabel": "Hide column",
   "glossary.hideOnApprove": "Hide on approve",
   "glossary.hideOnApproveTooltip": "Automatically hide entry after approval.",

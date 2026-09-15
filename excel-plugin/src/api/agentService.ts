@@ -10,8 +10,8 @@ function projectPath(projectId: string) {
   return `/api/v1/projects/${projectId}/agent`;
 }
 
-export async function getAgentConfig(projectId: string): Promise<AgentConfig> {
-  return apiClient.get<AgentConfig>(`${projectPath(projectId)}/config`);
+export async function getAgentConfig(projectId: string, signal?: AbortSignal): Promise<AgentConfig> {
+  return apiClient.get<AgentConfig>(`${projectPath(projectId)}/config`, { signal });
 }
 
 export async function sendFeedback(

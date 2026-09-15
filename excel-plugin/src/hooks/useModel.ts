@@ -10,13 +10,17 @@ import {
 } from '../api/modelService';
 
 export function useProjects() {
-  return useQuery({ queryKey: ['projects'], queryFn: getProjects, enabled: false });
+  return useQuery({
+    queryKey: ['projects'],
+    queryFn: ({ signal }) => getProjects(signal),
+    enabled: false,
+  });
 }
 
 export function useModels(projectId: string | null) {
   return useQuery({
     queryKey: ['models', projectId],
-    queryFn: () => getModels(projectId!),
+    queryFn: ({ signal }) => getModels(projectId!, signal),
     enabled: !!projectId,
   });
 }

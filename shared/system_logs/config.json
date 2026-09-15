@@ -1,0 +1,41 @@
+{
+  "batch_size": 100,
+  "message_max_chars": 16384,
+  "purge_batch_size": 5000,
+  "purge_max_batches": 20,
+  "poll_seconds": 5,
+  "page_size": 100,
+  "levels": [
+    "DEBUG",
+    "INFO",
+    "WARNING",
+    "ERROR",
+    "CRITICAL"
+  ],
+  "services": [
+    "model-service",
+    "query-router",
+    "gateway",
+    "scheduler",
+    "optimizer",
+    "agent-service",
+    "frontend",
+    "postgres"
+  ],
+  "clock_skew_seconds": 300,
+  "volume_refresh_seconds": 60,
+  "purge_interval_seconds": 3600,
+  "collector_output_bytes": 2097152,
+  "collector_command_timeout_seconds": 20,
+  "collector_api_timeout_seconds": 30,
+  "collector_initial_lookback_seconds": 300,
+  "collector_tail_lines": 1000,
+  "collector_own_access_pattern": "\"POST /api/v1/admin/system-logs/ingest(?:\\?[^ ]*)? HTTP/[0-9.]+\"",
+  "collector_level_pattern": "(?i)(?:^|\\s|\\[)(CRITICAL|FATAL|PANIC|ERROR|WARNING|WARN|DEBUG|INFO|LOG)(?:\\s|:|\\])",
+  "collector_level_aliases": {
+    "FATAL": "CRITICAL",
+    "PANIC": "CRITICAL",
+    "WARN": "WARNING",
+    "LOG": "INFO"
+  }
+}

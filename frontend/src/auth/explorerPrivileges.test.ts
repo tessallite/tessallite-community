@@ -26,6 +26,12 @@ const MODELLER_ACTIONS: ExplorerAction[] = [
   "model.delete",
   "model.importExport",
   "model.deploy",
+  // Bug-9896: the raw source-table preview is a modelling surface (no persona,
+  // no CLS, no RLS), so a viewer must not be offered it.
+  "table.previewData",
+  // Bug-9900: the calendar coverage probe is the same class of modelling
+  // surface — raw MIN/MAX on the physical tables via /introspect/batch.
+  "calendar.checkCoverage",
 ];
 
 function setRole(role: string | null) {

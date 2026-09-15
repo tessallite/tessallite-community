@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import pytest
+from result_fakes import ScalarResult
 
 from src.ir.logical_query import BoundQuery, LogicalFilter, LogicalQuery
 from src.security.query_audit import (
@@ -1125,7 +1126,7 @@ class _FakeResult:
         self._rows = rows
 
     def scalars(self):
-        return self
+        return ScalarResult(self._rows)
 
     def all(self):
         return self._rows

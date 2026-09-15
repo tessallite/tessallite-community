@@ -258,10 +258,16 @@ def enforce_execution_scope(
 
     Raises :class:`ModelNotAllowListedError` when the model is outside
     the project agent allow-list and :class:`PersonaScopeViolationError`
-    when the conversation's persona excludes the model or any referenced
-    field. ``persona_scopes is None`` means the conversation has no
-    persona; an empty mapping means the persona exposes no models at
-    all (fail closed)."""
+    when the active scope excludes the model or any referenced field.
+    ``persona_scopes is None`` means no field scope was resolved at all; an
+    empty mapping means the scope exposes no models (fail closed).
+
+    Bug-9897: since the grounding catalogue is narrowed to the surface the
+    query-router says it will accept for this caller, a scope is now present
+    for EVERY caller, not only one holding a ProjectPersona. What the prompt
+    advertises and what this chokepoint accepts are therefore the same set by
+    construction, and a field the executor would refuse is refused here with a
+    plain explanation instead of surfacing as a router 403."""
     try:
         model_uuid = UUID(call.model_id)
     except ValueError as exc:

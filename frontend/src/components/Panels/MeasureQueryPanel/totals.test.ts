@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { Dimension, ExecuteResponse, Measure } from "../../../api/types";
 import { computePivot } from "./pivot";
-import { NOT_ADDITIVE, computeTotals } from "./totals";
+import { NOT_ADDITIVE, computeTotals, isTotalableMeasure } from "./totals";
 
 // Bug-7278: computeTotals is on the core "run a query, see results" path. The
 // previous implementation re-scanned the full row×col grid once per
@@ -60,6 +60,30 @@ function exec(rows: Record<string, unknown>[]): ExecuteResponse {
     trace: { stages: [] },
   } as unknown as ExecuteResponse;
 }
+
+describe("isTotalableMeasure — default_agg fallback (Bug-8548)", () => {
+  // Bug-8548: isTotalableMeasure only gated on the pivot column's chosen `_agg`
+  // override; a measure with no override but a non-summable `default_agg`
+  // (AVG/MIN/MAX/COUNT_DISTINCT) fell through to `true` and got client-side
+  // summed instead of the NOT_ADDITIVE marker. Mirrors
+  // subtotalRequery.ts's needsServerSubtotals fallback (`_agg || default_agg`).
+  it("is not totalable when default_agg is non-summable and no _agg override is set", () => {
+    const m = measure("avg_measure", { default_agg: "AVG" });
+    expect(isTotalableMeasure(m)).toBe(false);
+  });
+
+  it("is totalable when default_agg is SUM/COUNT and no _agg override is set", () => {
+    expect(isTotalableMeasure(measure("sum_measure", { default_agg: "sum" }))).toBe(true);
+    expect(isTotalableMeasure(measure("count_measure", { default_agg: "COUNT" }))).toBe(true);
+  });
+
+  it("an explicit _agg override still takes precedence over default_agg", () => {
+    const summableOverride = measure("m1", { default_agg: "AVG", _agg: "SUM" } as Partial<Measure>);
+    expect(isTotalableMeasure(summableOverride)).toBe(true);
+    const nonSummableOverride = measure("m2", { default_agg: "SUM", _agg: "AVG" } as Partial<Measure>);
+    expect(isTotalableMeasure(nonSummableOverride)).toBe(false);
+  });
+});
 
 describe("computeTotals — correctness (single-pass, Bug-7278)", () => {
   // Two-level row and col keys so cross subtotals, per-head subtotals, and

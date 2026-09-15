@@ -706,7 +706,10 @@ export default function DimensionsPanel() {
 
           {(createDim.isError || updateDim.isError) && (
             <Alert severity="error" sx={{ mt: 1 }}>
-              {t(editingDimId ? "dimensions.updateFailed" : "dimensions.createFailed")}
+              {extractApiError(
+                editingDimId ? updateDim.error : createDim.error,
+                t(editingDimId ? "dimensions.updateFailed" : "dimensions.createFailed"),
+              )}
             </Alert>
           )}
           {calendarError && (

@@ -71,9 +71,9 @@ async def test_single_rls_model_never_replays_same_subject_across_principal_chan
         patch("src.api.kpis._evaluate_expression_via_sql", values),
     ):
         _set_rls_subject(override_auth, field, first)
-        first_response = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        first_response = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
         _set_rls_subject(override_auth, field, second)
-        second_response = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        second_response = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
 
     assert first_response.status_code == 200
     assert second_response.status_code == 200
@@ -102,8 +102,8 @@ async def test_single_new_rls_policy_bypasses_an_existing_unrestricted_entry(
         ),
         patch("src.api.kpis._evaluate_expression_via_sql", values),
     ):
-        before_policy = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
-        after_policy = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        before_policy = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
+        after_policy = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
 
     assert before_policy.json()["value"] == 100.0
     assert after_policy.json()["value"] == 20.0
@@ -149,11 +149,11 @@ async def test_batch_rls_model_never_replays_same_subject_across_principal_chang
     ):
         _set_rls_subject(override_auth, field, first)
         first_response = await client.post(
-            f"{PREFIX}/evaluate-batch", json={"kpi_ids": [str(kpi.id)]},
+            f"{PREFIX}/evaluate-batch?deployed_only=false", json={"kpi_ids": [str(kpi.id)]},
         )
         _set_rls_subject(override_auth, field, second)
         second_response = await client.post(
-            f"{PREFIX}/evaluate-batch", json={"kpi_ids": [str(kpi.id)]},
+            f"{PREFIX}/evaluate-batch?deployed_only=false", json={"kpi_ids": [str(kpi.id)]},
         )
 
     assert first_response.status_code == 200
@@ -182,10 +182,10 @@ async def test_batch_new_rls_policy_bypasses_existing_unrestricted_entries(clien
         patch("src.api.kpis._evaluate_single_kpi", evaluate),
     ):
         before_policy = await client.post(
-            f"{PREFIX}/evaluate-batch", json={"kpi_ids": [str(kpi.id)]},
+            f"{PREFIX}/evaluate-batch?deployed_only=false", json={"kpi_ids": [str(kpi.id)]},
         )
         after_policy = await client.post(
-            f"{PREFIX}/evaluate-batch", json={"kpi_ids": [str(kpi.id)]},
+            f"{PREFIX}/evaluate-batch?deployed_only=false", json={"kpi_ids": [str(kpi.id)]},
         )
 
     assert before_policy.json()["results"][0]["value"] == 100.0
@@ -220,10 +220,10 @@ async def test_single_persona_policy_mutation_bypasses_outer_cache(client):
             patch("src.api.kpis.resolve_effective_persona", new_callable=AsyncMock, return_value=persona),
             patch("src.api.kpis._evaluate_expression_via_sql", values),
         ):
-            before = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+            before = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
             persona.audience_filters = {"region": "south"}
             persona.tag_restrictions = ["restricted"]
-            after = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+            after = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
 
         assert before.status_code == 200
         assert after.status_code == 200
@@ -252,12 +252,12 @@ async def test_batch_persona_policy_mutation_bypasses_outer_cache(client):
             patch("src.api.kpis._evaluate_single_kpi", evaluate),
         ):
             before = await client.post(
-                f"{PREFIX}/evaluate-batch", json={"kpi_ids": [str(kpi.id)]},
+                f"{PREFIX}/evaluate-batch?deployed_only=false", json={"kpi_ids": [str(kpi.id)]},
             )
             persona.audience_filters = {"region": "south"}
             persona.tag_restrictions = ["restricted"]
             after = await client.post(
-                f"{PREFIX}/evaluate-batch", json={"kpi_ids": [str(kpi.id)]},
+                f"{PREFIX}/evaluate-batch?deployed_only=false", json={"kpi_ids": [str(kpi.id)]},
             )
 
         assert before.status_code == 200

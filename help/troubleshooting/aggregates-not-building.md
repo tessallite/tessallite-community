@@ -13,6 +13,10 @@ Diagnosing situations where aggregates fail to build, are stuck building, or nev
 
 ---
 
+## Refresh history and defaults
+
+Refresh history shows the most recent start first. Manual refresh means a user or API requested the rebuild. Optimiser: add missing measures means the optimiser replaced a summary to add eligible measures. Both can run at the same time. New models have Include all measures enabled by default; a saved off setting stays off.
+
 ## Symptom reference
 
 | Symptom | Likely cause | Resolution |
@@ -27,6 +31,10 @@ Diagnosing situations where aggregates fail to build, are stuck building, or nev
 | Existing aggregate disappears | Optimizer retired unused aggregate | Re-create manually in Model Builder, or lower the retirement threshold. |
 
 ---
+
+## Optimiser database connections
+
+The optimiser uses database connections to read settings and record its work. In Compose and local setup, OPTIMIZER_SYSTEM_DB_POOL_SIZE defaults to 0, meaning no application pool-size limit. A positive integer sets a limit, with no installer maximum. Existing explicit settings are preserved. The database server still enforces its own connection limit.
 
 ## View Scheduler logs
 

@@ -5,6 +5,10 @@ area: modelling
 updated: 2026-04-24
 ---
 
+## Hidden calendar tables
+
+Automatically created calendar tables and their joins can be hidden from the model canvas. This does not delete them from the model. The missing-endpoint warning excludes these intentionally hidden calendar endpoints.
+
 ## Why the canvas matters
 
 A semantic model is a graph. It has fact tables, dimension tables, joins between them, hierarchies inside the dimensions, and performance artefacts (aggregates, pockets) attached to the facts. Every popular BI tool represents this graph as a list of clickable things in a left sidebar — which works for a five-table model and falls apart at fifty tables.
@@ -143,16 +147,20 @@ Most issues are clickable: an issue about a dimension or measure opens that obje
 
 ---
 
-## Layout and persistence
+## Navigating and arranging
 
 The canvas supports:
 
 - **Pan.** Click-and-drag empty canvas to pan. Two-finger trackpad also pans.
 - **Zoom.** `Ctrl/Cmd + scroll`, `+` / `-` keys, or the zoom-to-fit and zoom-100% icons in the status bar.
-- **Layout.** Node positions are saved on the model. The first time a model is opened, Tessallite auto-lays-out using a star-schema radial layout. After that, every move the modeller makes is persisted.
 - **Zoom-to-fit.** The zoom-to-fit icon restores the view to "whole model in frame". Helpful after a deep zoom into one node.
+- **Arrange.** The layout panel offers three presets with direction and spacing controls, arrangement of the whole model or just a selection, and rerouting of the relationship lines without moving anything.
+
+Table positions, sizes, pins, relationship routes and route locks are saved on the model. Newly added tables are placed automatically once the canvas has measured them; nothing else moves unless you ask for an arrangement.
 
 Layouts are per-model, not per-user — every modeller on the same model sees the same layout. This is a deliberate trade-off: shared layouts make conversations about the model easier ("the customer dim on the top-right"). If two modellers disagree about layout, the last save wins.
+
+Arrangement, pinning, route locking and editing a route by hand are covered in [Arrange the Canvas](arrange-the-canvas.md).
 
 ---
 
@@ -208,6 +216,7 @@ control, so a digit typed into an editor is never treated as navigation.
 
 ## Related
 
+- [Arrange the Canvas](arrange-the-canvas.md)
 - [Add Tables to a Model](add-tables-to-a-model.md)
 - [Define Joins](define-joins.md)
 - [Define Dimensions](define-dimensions.md)
@@ -217,4 +226,4 @@ control, so a digit typed into an editor is never treated as navigation.
 
 ---
 
-← [Table Auto-Analysis](table-auto-analysis.md) | [Home](../index.md) | [Canvas Undo/Redo →](canvas-undo-redo.md)
+← [Table Auto-Analysis](table-auto-analysis.md) | [Home](../index.md) | [Arrange the Canvas →](arrange-the-canvas.md)

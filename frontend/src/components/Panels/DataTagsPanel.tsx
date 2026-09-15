@@ -34,6 +34,7 @@ import { dataTagsApi, tableAttributesApi } from "../../api/client";
 import { useAllModelTables, useDataTags, useSources } from "../../api/hooks";
 import { useConfirm } from "../Confirm";
 import { useT } from "../../i18n";
+import { extractApiError } from "../../utils/extractApiError";
 import type {
   DataTag,
   DataTagCreate,
@@ -109,7 +110,7 @@ export default function DataTagsPanel() {
     },
     onError: (e: unknown) =>
       setFormError(
-        t("dataTags.saveFailed", { error: extractError(e) || t("errors.requestFailed") }),
+        t("dataTags.saveFailed", { error: extractApiError(e, "") || t("errors.requestFailed") }),
       ),
   });
 
@@ -123,7 +124,7 @@ export default function DataTagsPanel() {
     },
     onError: (e: unknown) =>
       setFormError(
-        t("dataTags.saveFailed", { error: extractError(e) || t("errors.requestFailed") }),
+        t("dataTags.saveFailed", { error: extractApiError(e, "") || t("errors.requestFailed") }),
       ),
   });
 
@@ -136,7 +137,7 @@ export default function DataTagsPanel() {
     // F-008-17: a delete failure must surface, not vanish silently.
     onError: (e: unknown) =>
       setPanelError(
-        t("dataTags.saveFailed", { error: extractError(e) || t("errors.requestFailed") }),
+        t("dataTags.saveFailed", { error: extractApiError(e, "") || t("errors.requestFailed") }),
       ),
   });
 
@@ -506,13 +507,3 @@ export default function DataTagsPanel() {
   );
 }
 
-function extractError(e: unknown): string {
-  const err = e as {
-    response?: { data?: { detail?: string | { message?: string } } };
-    message?: string;
-  };
-  const detail = err?.response?.data?.detail;
-  if (typeof detail === "string") return detail;
-  if (detail && typeof detail === "object" && detail.message) return detail.message;
-  return err?.message ?? "";
-}

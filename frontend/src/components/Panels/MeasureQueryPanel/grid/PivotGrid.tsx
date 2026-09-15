@@ -773,11 +773,22 @@ export default function PivotGrid({
           // Conditional formatting applies only to the first measure.
           const bg = mi === 0 ? getCellBg(rawVal) : undefined;
           const isGradient = bg?.startsWith("linear-gradient");
+          // Bug-8514: value cells were mouse-only (click handler, no
+          // tabIndex/keyboard/aria-label) while total cells already carried
+          // the full keyboard-drill pattern (Bug-8505/8047). Mirror it here.
           return (
             <TableCell
               key={`${keyBase}-${mi}`}
               align="right"
+              tabIndex={thisClickable ? 0 : undefined}
+              aria-label={thisClickable ? totalCellAriaLabel(dr, dc, text, m.display_name || m.name) : undefined}
               onClick={thisClickable && cell ? () => onCellClick && onCellClick(cell, m) : undefined}
+              onKeyDown={thisClickable && cell ? (event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onCellClick && onCellClick(cell, m);
+                }
+              } : undefined}
               title={thisClickable ? t("drill.drawerTitle", { name: m.display_name || m.name }) : undefined}
               sx={{
                 cursor: thisClickable ? "pointer" : "default",
@@ -787,6 +798,9 @@ export default function PivotGrid({
                 ...(bg && !isGradient && { bgcolor: bg }),
                 ...(bg && isGradient && { background: bg }),
                 "&:hover": thisClickable ? { bgcolor: "action.hover", textDecoration: "underline" } : undefined,
+                "&:focus-visible": thisClickable
+                  ? { outline: "2px solid", outlineColor: "primary.main", outlineOffset: -2 }
+                  : undefined,
               }}
             >
               {text}

@@ -31,25 +31,14 @@ import {
 import JoinPopulationBlockedNotice from "../Deploy/JoinPopulationBlockedNotice";
 import { useModel } from "../../api/hooks";
 import { isTenantAdmin } from "../../auth/currentUser";
+import { useCanAuthorModel } from "../../auth/useCanAuthorModel";
 import { useConfirm } from "../Confirm";
 import { useModelEditorStore } from "../../store/useModelEditorStore";
 import VersionDiffPanel from "./VersionDiffPanel";
 import PendingChangesPanel from "./PendingChangesPanel";
 import GitTimeline from "./GitTimeline";
 import { invalidateModelScopedCaches } from "./modelCacheInvalidation";
-
-// Bug-7616: surface the backend error instead of swallowing it. Mirrors the
-// panel-level extractError pattern used across the Panels dialogs.
-function extractError(e: unknown): string {
-  const err = e as {
-    response?: { data?: { detail?: string | { message?: string } } };
-    message?: string;
-  };
-  const detail = err?.response?.data?.detail;
-  if (typeof detail === "string") return detail;
-  if (detail && typeof detail === "object" && detail.message) return detail.message;
-  return err?.message ?? "";
-}
+import { extractApiError } from "../../utils/extractApiError";
 
 type Props = {
   open: boolean;
@@ -99,6 +88,11 @@ export default function VersionsDialog({
   // authoritative.
   const model = useModel(projectId, modelId);
   const canRevert = isTenantAdmin() || model.data?.caller_can_admin === true;
+  // Bug-9387: discard-unsaved POSTs /discard-draft (require_role("modeler"));
+  // gate it on the same authoring capability that gates Save — the builder
+  // store's readOnly flag, which ModelBuilder derives from the share-link
+  // parameter AND the server's per-model caller_can_author.
+  const canModel = useCanAuthorModel();
 
   const versions = useQuery({
     queryKey: ["versions", projectId, modelId],
@@ -131,7 +125,7 @@ export default function VersionsDialog({
       setActionRefusal(null);
       setActionError(
         t("versions.deployFailed", {
-          error: extractError(e) || t("errors.requestFailed"),
+          error: extractApiError(e, "") || t("errors.requestFailed"),
         }),
       );
     },
@@ -155,7 +149,7 @@ export default function VersionsDialog({
     onError: (e: unknown) =>
       setActionError(
         t("versions.revertFailed", {
-          error: extractError(e) || t("errors.requestFailed"),
+          error: extractApiError(e, "") || t("errors.requestFailed"),
         }),
       ),
   });
@@ -193,20 +187,13 @@ export default function VersionsDialog({
     if (ok) revertMut.mutate({ versionId, confirm: versionId });
   }
 
-  // The history table: sort so the version the gateway is currently serving
-  // is always first, then the rest by version_number descending. Deploy can
-  // point the runtime at ANY existing version (not only the newest), and the
-  // list itself is otherwise plain version_number-desc — without this, an
-  // older deployed version can be scrolled below newer, undeployed drafts,
-  // making "currently serving" easy to miss. Scoped to the history table only
-  // — the Diff tab keeps plain version_number order for its A/B defaults.
-  const sortedVersions = useMemo(() => {
-    const list = versions.data ?? [];
-    return [...list].sort((a, b) => {
-      if (a.is_deployed !== b.is_deployed) return a.is_deployed ? -1 : 1;
-      return b.version_number - a.version_number;
-    });
-  }, [versions.data]);
+  // Keep history in numeric version order, regardless of deployment status.
+  const sortedVersions = useMemo(
+    () => [...(versions.data ?? [])].sort(
+      (a, b) => b.version_number - a.version_number,
+    ),
+    [versions.data],
+  );
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
@@ -256,6 +243,7 @@ export default function VersionsDialog({
           <PendingChangesPanel
             projectId={projectId}
             modelId={modelId}
+            canModel={canModel}
             canRevert={canRevert}
           />
         )}
@@ -270,16 +258,36 @@ export default function VersionsDialog({
           <GitTimeline projectId={projectId} modelId={modelId} />
         )}
         {activeTab === "history" && sortedVersions.length > 0 && (
-          <TableContainer>
+          <TableContainer sx={{ overflowX: "auto" }}>
             <Table size="small">
               <TableHead>
                 <TableRow>
                   <TableCell>{t("versions.version")}</TableCell>
                   <TableCell>{t("versions.created")}</TableCell>
-                  <TableCell>{t("versions.by")}</TableCell>
+                  <TableCell sx={{ display: { xs: "none", md: "table-cell" } }}>
+                    {t("versions.by")}
+                  </TableCell>
                   <TableCell>{t("versions.summary")}</TableCell>
                   <TableCell>{t("versions.deployed")}</TableCell>
-                  <TableCell align="right">{t("versions.actions")}</TableCell>
+                  {/* Bug-10007: keep the action column inside the visible
+                      dialog while the descriptive columns scroll beneath it.
+                      Without this, long summaries pushed Deploy/Revert beyond
+                      the right edge at a normal demo viewport. */}
+                  <TableCell
+                    align="right"
+                    data-testid="version-actions-header"
+                    sx={{
+                      position: "sticky",
+                      right: 0,
+                      zIndex: 3,
+                      minWidth: 148,
+                      whiteSpace: "nowrap",
+                      bgcolor: "background.paper",
+                      boxShadow: "-8px 0 8px -8px rgba(0, 0, 0, 0.35)",
+                    }}
+                  >
+                    {t("versions.actions")}
+                  </TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
@@ -289,7 +297,7 @@ export default function VersionsDialog({
                       <strong>v{v.version_number}</strong>
                     </TableCell>
                     <TableCell>{new Date(v.created_at).toLocaleString()}</TableCell>
-                    <TableCell>
+                    <TableCell sx={{ display: { xs: "none", md: "table-cell" } }}>
                       <Typography variant="body2" sx={{ fontFamily: "monospace" }}>
                         {v.created_by}
                       </Typography>
@@ -314,7 +322,19 @@ export default function VersionsDialog({
                         />
                       )}
                     </TableCell>
-                    <TableCell align="right">
+                    <TableCell
+                      align="right"
+                      data-testid="version-actions-cell"
+                      sx={{
+                        position: "sticky",
+                        right: 0,
+                        zIndex: 2,
+                        minWidth: 148,
+                        whiteSpace: "nowrap",
+                        bgcolor: "background.paper",
+                        boxShadow: "-8px 0 8px -8px rgba(0, 0, 0, 0.35)",
+                      }}
+                    >
                       <Stack direction="row" spacing={1} justifyContent="flex-end">
                         {/* Bug-6295: an imported placeholder version has no
                             usable snapshot. It cannot be deployed or reverted to

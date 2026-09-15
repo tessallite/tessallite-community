@@ -1720,6 +1720,15 @@ async def _insert_data_sources_and_targets(
     already truncated and are reinserted from the snapshot below, so a ghost
     source carries no live dependant and deletes cleanly.
     """
+    # Bug-9285: import bypasses the DataSourceCreate / DataTargetCreate write
+    # schemas entirely, so the ``_validate_non_sensitive_config`` gate that keeps
+    # secrets out of these plaintext JSONB columns never runs on a bundle. A
+    # hand-crafted or legacy bundle could therefore reintroduce a plaintext
+    # secret that persists at rest and duplicates into every deployed snapshot.
+    # Same gate every other import config write already uses. Imported locally:
+    # project_rehydrator imports THIS module, so a top-level import would cycle.
+    from shared.model_snapshot.project_rehydrator import sanitise_imported_config
+
     async def _write(model_cls: type, row: dict[str, Any]) -> None:
         if not upsert:
             await db.execute(insert(model_cls).values(**row))
@@ -1763,11 +1772,16 @@ async def _insert_data_sources_and_targets(
             old_cid = str(row.get("project_connection_id", ""))
             if old_cid in connection_id_remap:
                 row["project_connection_id"] = UUID(connection_id_remap[old_cid])
+        # Bug-9285: secret-like keys never reach the plaintext JSONB column.
+        tconfig = sanitise_imported_config(
+            row.get("config"),
+            label="data target",
+            name=row.get("display_name"),
+        )
         # Bug-8790: strip the deprecated config.project_id from rehydrated
         # targets — the connection's project is authoritative.
-        tconfig = row.get("config", {})
-        if isinstance(tconfig, dict) and "project_id" in tconfig:
-            tconfig.pop("project_id")
+        tconfig.pop("project_id", None)
+        row["config"] = tconfig
         tid = row.get("id")
         if isinstance(tid, UUID):
             snapshot_target_ids.add(tid)
@@ -1778,6 +1792,12 @@ async def _insert_data_sources_and_targets(
         # Pre-RA-1 snapshots may carry the dropped column data_sources.calendar_table_id;
         # the column no longer exists on DataSource. Drop defensively.
         row.pop("calendar_table_id", None)
+        # Bug-9285: secret-like keys never reach the plaintext JSONB column.
+        row["config"] = sanitise_imported_config(
+            row.get("config"),
+            label="data source",
+            name=row.get("display_name"),
+        )
         if connection_id_remap:
             old_cid = str(row.get("project_connection_id", ""))
             if old_cid in connection_id_remap:
@@ -1886,6 +1906,36 @@ async def _reconcile_sources_and_targets(
 async def _insert_tables_and_columns(
     model_id: UUID, snap: dict[str, Any], db: AsyncSession
 ) -> None:
+    # Bug-9980: project/model exports contain the governed profiler rows in
+    # ``source_statistics`` as well as the denormalised estimates on tables and
+    # columns. Older bundles (including the canonical demo bundle) have the
+    # profiler rows populated but the denormalised fields unset. Rehydrating
+    # those fields verbatim discards information already present in the same
+    # snapshot, so every consumer reports cardinality as unknown after import.
+    # Fill only missing estimates: an explicit table/column estimate remains
+    # authoritative, while older exports recover their existing profiler data
+    # without querying the source during import.
+    table_estimates: dict[str, int] = {}
+    column_estimates: dict[str, int] = {}
+    for stats in snap.get("source_statistics", []) or []:
+        table_id = stats.get("model_table_id")
+        row_count = stats.get("row_count")
+        if (
+            table_id is not None
+            and isinstance(row_count, int)
+            and not isinstance(row_count, bool)
+        ):
+            table_estimates[str(table_id)] = row_count
+        for column_stats in stats.get("columns", []) or []:
+            column_id = column_stats.get("model_column_id")
+            distinct_count = column_stats.get("distinct_count")
+            if (
+                column_id is not None
+                and isinstance(distinct_count, int)
+                and not isinstance(distinct_count, bool)
+            ):
+                column_estimates[str(column_id)] = distinct_count
+
     # Bug-8932: ``model_tables.calendar_table_id`` is a tenant-schema-wide FK,
     # so a hand-edited or cross-project bundle can point it at another model's
     # calendar table and the DB FK constraint does not stop it — reinstating
@@ -1900,6 +1950,10 @@ async def _insert_tables_and_columns(
     for t in snap.get("tables", []):
         row = _strip_pk_and_uuids(t)
         row["model_id"] = model_id
+        if row.get("row_count_estimate") is None:
+            estimate = table_estimates.get(str(t.get("id")))
+            if estimate is not None:
+                row["row_count_estimate"] = estimate
         cal_id = row.get("calendar_table_id")
         if cal_id is not None and str(cal_id) not in valid_calendar_ids:
             logger.warning(
@@ -1912,6 +1966,10 @@ async def _insert_tables_and_columns(
         await db.execute(insert(ModelTable).values(**row))
     for c in snap.get("columns", []):
         row = _strip_pk_and_uuids(c)
+        if row.get("cardinality_estimate") is None:
+            estimate = column_estimates.get(str(c.get("id")))
+            if estimate is not None:
+                row["cardinality_estimate"] = estimate
         await db.execute(insert(ModelColumn).values(**row))
 
 

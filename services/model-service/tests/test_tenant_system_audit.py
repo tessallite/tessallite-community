@@ -78,6 +78,14 @@ def _session_recording_add():
 
 @pytest.mark.asyncio
 async def test_bug_9306_create_tenant_writes_system_audit_row(monkeypatch):
+    """Also the guard for Bug-9426, which reported the same gap independently.
+
+    Named here because a guard nobody can find from the issue is not a guard
+    for that issue: Bug-9426 read as unguarded until this file was traced by
+    hand. The audit call sits INSIDE create_tenant's try, so a create that
+    rolls back on IntegrityError leaves no event — an audit row for a tenant
+    that was never created would be worse than none.
+    """
     monkeypatch.setattr(tmod, "enforce_create_cap", AsyncMock())
     monkeypatch.setattr(tmod, "encrypt_str", lambda _u: b"enc")
     monkeypatch.setattr(
@@ -111,6 +119,9 @@ async def test_bug_9306_create_tenant_writes_system_audit_row(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_bug_9306_update_tenant_writes_system_audit_row(monkeypatch):
+    """Also the guard for Bug-9426. The event records WHICH fields changed
+    (``updates``), so an auditor can tell a display-name edit from a
+    deactivation without diffing two snapshots."""
     existing = SystemTenant(
         slug="acme",
         display_name="Old Name",

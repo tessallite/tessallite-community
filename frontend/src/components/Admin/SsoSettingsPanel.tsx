@@ -11,6 +11,7 @@ import {
 } from "@mui/material";
 import { useT } from "../../i18n";
 import { ssoApi } from "../../api/client";
+import HelpIconButton from "../HelpIconButton";
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
@@ -134,7 +135,15 @@ export default function SsoSettingsPanel() {
           size="small"
         />
 
-        <Alert severity="info">
+        <Alert
+          severity="info"
+          // Bug-9308: honest-label variant — the status line already states
+          // GCP IAM config is env-only (sso.gcpIamOn/Off); a help link
+          // clarifying that env-only configuration is the only thing this
+          // panel was missing (no audience/domain fields are added — that
+          // would need a backend config API, out of this lane's scope).
+          action={<HelpIconButton href="/help/admin/sso-configuration.html" />}
+        >
           {backendsQ.data?.gcp_iam_enabled ? t("sso.gcpIamOn") : t("sso.gcpIamOff")}
         </Alert>
         <Alert severity="info">

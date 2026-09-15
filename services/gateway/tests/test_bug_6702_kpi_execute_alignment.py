@@ -113,19 +113,17 @@ def test_old_synthetic_member_would_not_be_executable():
 
 def test_composite_kpi_advertises_no_value_member():
     """A composite expression has no single executable measure member, so the
-    catalogue advertises "" — never a member Execute cannot resolve."""
-    row = mdschema._rows_kpis(CATALOG, [COMPOSITE_KPI], MEASURES)[0]
-    assert row["KPI_VALUE"] == ""
-    assert row["KPI_STATUS"] == ""
+    native catalogue withholds the row — never a member Execute cannot resolve."""
+    assert mdschema._rows_kpis(CATALOG, [COMPOSITE_KPI], MEASURES) == []
 
 
 # ---------------------------------------------------------------------------
 # Codex R2 finding 2: hidden-backed KPIs must not diverge between surfaces.
-# The Discover path trims is_hidden measures before _rows_kpis (catalogue
-# advertises KPI_VALUE="" for a hidden-backed KPI on a non-technical catalog);
-# the Execute KPI member-function path must apply the SAME visibility rule so
-# KPIValue() fails loud exactly where the catalogue advertises no value member,
-# and a technical-view catalog keeps the KPI working on BOTH surfaces.
+# The Discover path trims is_hidden measures before _rows_kpis (the catalogue
+# withholds a hidden-backed KPI on a non-technical catalog); the Execute KPI
+# member-function path must apply the SAME visibility rule so KPIValue() fails
+# loud exactly where the catalogue withholds the row, and a technical-view
+# catalog keeps the KPI working on BOTH surfaces.
 # ---------------------------------------------------------------------------
 
 HIDDEN_MEASURES = [
@@ -151,8 +149,7 @@ def test_catalogue_advertises_no_value_for_hidden_backed_kpi():
     """Discover half: with the is_hidden trim applied (as _handle_discover does
     before _rows_kpis), a hidden-backed KPI advertises no value member."""
     visible = [m for m in HIDDEN_MEASURES if not m.get("is_hidden")]
-    row = mdschema._rows_kpis(CATALOG, [NET_REVENUE_KPI], visible)[0]
-    assert row["KPI_VALUE"] == ""
+    assert mdschema._rows_kpis(CATALOG, [NET_REVENUE_KPI], visible) == []
 
 
 async def test_execute_kpivalue_refuses_hidden_backed_kpi(monkeypatch):

@@ -42,22 +42,54 @@ from shared.config.bootstrap import (
     system_snapshot_get,
 )
 from shared.config.settings import get_settings
-from src.auth.base import validate_session_upstream, verify_jwt_token
+from src.auth.base import (
+    SessionValidationUnavailable,
+    validate_session_upstream,
+    verify_jwt_token,
+)
+from src.dax import credential_cache
 from src.jdbc.catalogue import CatalogueDB, CatalogueQueryError
 from src.jdbc import protocol as proto
 from src.jdbc.throttle import get_governor
 from src.router_client import (
     GatewayQueryRateLimitExceeded,
+    KpiLiveScorecardError,
     ModelMetadataUnavailable,
     QueryByteCeilingExceeded,
     QueryRouterError,
     execute_query,
     fetch_model_metadata,
+    kpi_live_scorecard_rows,
+    list_all_models_for_tenant,
     login_for_token,
+    tenant_listing_degraded,
 )
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+
+def _is_explicit_auth_rejection(exc: BaseException) -> bool:
+    """Return true only when the login authority explicitly rejected auth."""
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) in (401, 403)
+
+
+def _login_failure_sqlstate(exc: BaseException) -> str:
+    """Map a password-login failure without accusing valid credentials.
+
+    Only an explicit 401/403 from the login authority is a credential
+    rejection. A 429 is an upstream resource decision and uses the same
+    connection-resource SQLSTATE as the JDBC admission governor. Transport,
+    timeout, 5xx, malformed-success, and unknown internal failures all fail
+    closed as temporary connection faults.
+    """
+    if _is_explicit_auth_rejection(exc):
+        return "28000"
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) == 429:
+        return "53300"
+    return "08006"
 
 
 class SessionRevokedError(Exception):
@@ -70,6 +102,10 @@ class SessionRevokedError(Exception):
     this so ``handle_client`` closes the socket (fail-closed + connection close),
     mirroring how XMLA re-validates inside each SOAP request handler.
     """
+
+
+class SessionAuthorityUnavailableError(Exception):
+    """Raised when a long-lived JDBC session cannot be revalidated."""
 
 
 _ssl_context: ssl.SSLContext | None = None
@@ -643,6 +679,13 @@ class PGWireServer:
                 "JDBC connection closed on session revocation (pid=%d): %s",
                 self._pid, exc,
             )
+        except SessionAuthorityUnavailableError as exc:
+            logger.info(
+                "JDBC connection closed while session authority was unavailable "
+                "(pid=%d): %s",
+                self._pid,
+                exc,
+            )
         except proto.FrameTooLargeError as exc:
             logger.warning("JDBC oversize frame from %s (pid=%d): %s", peer, self._pid, exc)
         except Exception as exc:
@@ -657,6 +700,65 @@ class PGWireServer:
     # ------------------------------------------------------------------
     # Startup handshake
     # ------------------------------------------------------------------
+
+    async def _resolve_startup_model_hint(self) -> bool:
+        """Validate and normalize a named model before ReadyForQuery.
+
+        A full JDBC catalogue can require several protocol metadata families
+        and persona-specific Named Query checks. The startup contract needs
+        only enough information to reject an invalid model/project hint with
+        SQLSTATE 3D000. Keeping that cheap check before ReadyForQuery preserves
+        the useful connection error while the full catalogue loads after the
+        client's connection timer has stopped.
+        """
+        if not self._model_id:
+            return True
+        try:
+            models = await list_all_models_for_tenant(
+                self._tenant_slug,
+                self._jwt_token,
+            )
+        except ModelMetadataUnavailable:
+            raise
+        except Exception as exc:
+            raise ModelMetadataUnavailable(
+                f"Model listing for tenant {self._tenant_slug!r} is unavailable: {exc}"
+            ) from exc
+
+        missing_projects = tenant_listing_degraded(
+            self._tenant_slug,
+            self._jwt_token,
+        )
+        if missing_projects:
+            raise ModelMetadataUnavailable(
+                f"Model listing for tenant {self._tenant_slug!r} is incomplete "
+                f"({missing_projects} project(s) could not be listed)."
+            )
+
+        project_hint = str(getattr(self, "_project_hint", "") or "").lower()
+        scoped = [
+            model for model in models
+            if not project_hint
+            or str(model.get("project_slug") or "").lower() == project_hint
+        ]
+        hint = str(self._model_id)
+        exact_id = [model for model in scoped if str(model.get("id")) == hint]
+        matches = exact_id or [
+            model for model in scoped
+            if str(model.get("slug") or "").lower() == hint.lower()
+            or str(model.get("name") or "").lower() == hint.lower()
+        ]
+        if not matches:
+            return False
+
+        resolved_ids = {
+            str(model["id"])
+            for model in matches
+            if model.get("id") is not None
+        }
+        if len(resolved_ids) == 1:
+            self._model_id = next(iter(resolved_ids))
+        return True
 
     async def _run(
         self,
@@ -762,10 +864,55 @@ class PGWireServer:
         if not authenticated:
             return  # error already sent
 
-        # Fetch model metadata once at connection time (best-effort), BEFORE
-        # the startup confirmation so an invalid model/project hint can be
-        # rejected as a standard FATAL the client actually displays (an error
-        # sent after ReadyForQuery is lost when the connection closes).
+        # Validate a named model/project hint through the cheap deployed-model
+        # listing before ReadyForQuery. This preserves the clear startup error
+        # without putting the full catalogue fan-out under the client's fixed
+        # connection timeout.
+        try:
+            startup_model_valid = await self._resolve_startup_model_hint()
+        except ModelMetadataUnavailable as exc:
+            logger.error(
+                "JDBC startup refused (pid=%d): model listing unavailable "
+                "for tenant %s: %s", self._pid, self._tenant_slug, exc,
+            )
+            writer.write(
+                proto.error_response(
+                    "Model metadata is temporarily unavailable, so this "
+                    "connection cannot be given a catalogue. This is a "
+                    "service fault, not an empty or missing model — retry "
+                    "shortly.",
+                    severity="FATAL",
+                    code="08006",
+                )
+            )
+            await writer.drain()
+            return
+        if not startup_model_valid:
+            scope = (
+                f"project {self._project_hint!r}"
+                if getattr(self, "_project_hint", None)
+                else f"tenant {self._tenant_slug!r}"
+            )
+            writer.write(
+                proto.error_response(
+                    f"Unknown model {str(self._model_id)!r} in {scope}. "
+                    "Connect with dbname <tenant>, <tenant>/<model>, or "
+                    "<tenant>/<project>/<model> using the model's slug.",
+                    severity="FATAL",
+                    code="3D000",
+                )
+            )
+            await writer.drain()
+            return
+
+        # Complete the PostgreSQL startup handshake once authentication and a
+        # supplied model hint are valid. BI clients can now stop their connect
+        # timer; any first query waits in the socket while the catalogue below
+        # is assembled under the query/request budget.
+        writer.write(proto.startup_sequence(pid=self._pid, secret=self._cancel_secret))
+        await writer.drain()
+
+        # Fetch model metadata once at connection time after ReadyForQuery.
         # If no model_id was given, all enabled models for the tenant are loaded
         # so DBeaver can browse tables without specifying a model upfront.
         try:
@@ -843,9 +990,6 @@ class PGWireServer:
             if len(_resolved_ids) == 1 and str(self._model_id) not in _resolved_ids:
                 self._model_id = next(iter(_resolved_ids))
 
-        # Phase 2: send startup confirmation
-        writer.write(proto.startup_sequence(pid=self._pid, secret=self._cancel_secret))
-        await writer.drain()
         self._catalogue = CatalogueDB(
             model_names=self._model_names,
             table_columns=self._table_columns,
@@ -912,7 +1056,7 @@ class PGWireServer:
         if not self._model_id and model_hint:
             self._model_id = model_hint
         self._model_id = self._model_id or params.get("model_id") or None
-        email = params.get("user", "")
+        email = params.get("user", "").strip()
 
         # Always issue the cleartext challenge — this is what DBeaver and
         # every standard PostgreSQL client expects.
@@ -955,6 +1099,15 @@ class PGWireServer:
                 # token_version bumped) before accepting the connection.
                 try:
                     await validate_session_upstream(password)
+                except SessionValidationUnavailable as exc:
+                    logger.info(
+                        "JDBC direct-JWT session authority unavailable "
+                        "(pid=%d): %s",
+                        self._pid,
+                        exc,
+                    )
+                    await self._deny_session_unavailable(writer, exc)
+                    return False
                 except ValueError as exc:
                     logger.info(
                         "JDBC direct-JWT session revoked (pid=%d): %s",
@@ -989,23 +1142,48 @@ class PGWireServer:
                 return True
             # fall through to password exchange
 
-        # Exchange email + password for JWT via model-service. The exchange is
-        # scoped to the database (tenant_slug) param, so the returned JWT is
-        # inherently for that tenant; we still verify the claim defensively.
-        try:
-            self._jwt_token = await login_for_token(self._tenant_slug, email, password)
-        except Exception as exc:
-            # F-001-11: the upstream exception text can contain the internal
-            # model-service URL and status. Log it server-side only and send a
-            # fixed, topology-free message to the client.
-            logger.info("JDBC login failed (pid=%d): %s", self._pid, exc)
-            await self._deny_auth(writer, governor)
-            return False
+        # Reuse the existing bounded credential cache for password logins, but
+        # scope the entry by the requested tenant. A cache hit still runs JWT,
+        # tenant, and upstream-session validation below.
+        credential_scope = self._tenant_slug
+        cached_token = credential_cache.get(
+            email, password, scope=credential_scope,
+        )
+        self._jwt_token = cached_token or ""
+        if not self._jwt_token:
+            # Exchange email + password for JWT via model-service. The exchange
+            # is scoped to the database parameter, so the returned JWT is
+            # inherently for that tenant; we still verify the claim defensively.
+            try:
+                self._jwt_token = await login_for_token(
+                    self._tenant_slug, email, password,
+                )
+            except Exception as exc:
+                sqlstate = _login_failure_sqlstate(exc)
+                if sqlstate == "28000":
+                    credential_cache.invalidate(email, scope=credential_scope)
+                # F-001-11: the upstream exception text can contain the
+                # internal model-service URL and status. Log it server-side
+                # only and send a fixed, topology-free message to the client.
+                logger.info("JDBC login failed (pid=%d): %s", self._pid, exc)
+                if sqlstate == "28000":
+                    # Exactly one auth-failure count belongs to an explicit
+                    # credential rejection; operational failures must not
+                    # activate the password governor.
+                    await self._deny_auth(writer, governor)
+                else:
+                    await self._deny_login_failure(writer, sqlstate)
+                return False
 
         try:
             payload = verify_jwt_token(self._jwt_token)
         except Exception as exc:
-            logger.warning("JDBC issued-JWT validation failed (pid=%d): %s", self._pid, exc)
+            credential_cache.invalidate(email, scope=credential_scope)
+            logger.warning(
+                "JDBC issued-JWT validation failed (pid=%d): %s",
+                self._pid,
+                exc,
+            )
             await self._deny_auth(writer, governor)
             return False
         if not self._tenant_matches(payload.tenant_id, self._tenant_slug):
@@ -1015,6 +1193,7 @@ class PGWireServer:
                 "JDBC tenant mismatch after login (pid=%d): jwt tenant=%r database=%r — denied",
                 self._pid, payload.tenant_id, self._tenant_slug,
             )
+            credential_cache.invalidate(email, scope=credential_scope)
             self._jwt_token = ""
             await self._deny_auth(writer, governor)
             return False
@@ -1028,11 +1207,21 @@ class PGWireServer:
         # connect paths run the same fail-closed revocation check as XMLA.
         try:
             await validate_session_upstream(self._jwt_token)
+        except SessionValidationUnavailable as exc:
+            logger.info(
+                "JDBC issued-JWT session authority unavailable (pid=%d): %s",
+                self._pid,
+                exc,
+            )
+            self._jwt_token = ""
+            await self._deny_session_unavailable(writer, exc)
+            return False
         except ValueError as exc:
             logger.info(
                 "JDBC issued-JWT session revoked (pid=%d): %s",
                 self._pid, exc,
             )
+            credential_cache.invalidate(email, scope=credential_scope)
             self._jwt_token = ""
             await self._deny_auth(writer, governor)
             return False
@@ -1046,6 +1235,12 @@ class PGWireServer:
             )
             self._tenant_slug = payload.tenant_id
 
+        credential_cache.put(
+            email,
+            password,
+            self._jwt_token,
+            scope=credential_scope,
+        )
         governor.record_auth_success(self._peer_ip)
         return True
 
@@ -1096,6 +1291,43 @@ class PGWireServer:
         )
         await writer.drain()
 
+    async def _deny_login_failure(
+        self,
+        writer: asyncio.StreamWriter,
+        sqlstate: str,
+    ) -> None:
+        """Report a non-credential password-login failure.
+
+        The response is deliberately fixed and topology-free. The caller has
+        already classified 401/403 separately, so this path never invalidates
+        a credential cache entry or records a failed password attempt.
+        """
+        detail = (
+            "Authentication service is rate limiting this connection; retry "
+            "later."
+            if sqlstate == "53300"
+            else "Authentication service is temporarily unavailable; retry "
+            "the connection."
+        )
+        writer.write(proto.error_response(detail, severity="FATAL", code=sqlstate))
+        await writer.drain()
+
+    async def _deny_session_unavailable(
+        self,
+        writer: asyncio.StreamWriter,
+        exc: SessionValidationUnavailable,
+    ) -> None:
+        """Report a temporary authority failure without counting bad auth."""
+        writer.write(
+            proto.error_response(
+                "Session authority is temporarily unavailable; retry the "
+                f"connection in about {exc.retry_after_seconds} seconds.",
+                severity="FATAL",
+                code="08006",
+            )
+        )
+        await writer.drain()
+
     async def _revalidate_session(self) -> None:
         """G2 / grok F-001-01: re-check session revocation on a long-lived
         connection before dispatching a user query to the router.
@@ -1108,13 +1340,15 @@ class PGWireServer:
         ``validate_session_upstream`` keeps its own TTL cache
         (``_SESSION_CHECK_TTL_SECONDS``, default 30s), so calling it before each
         query costs at most one model-service round-trip per cadence window; a
-        fresh, still-valid session is served from cache. It fails CLOSED: an
-        unreachable model-service, a 401, or any non-200 raises ``ValueError``.
+        fresh, still-valid session is served from cache. An explicit rejection
+        is distinct from temporary authority unavailability.
 
         Raises:
             SessionRevokedError — the session is no longer valid. Callers must
                 emit a SQLSTATE 28000 ErrorResponse and let ``handle_client``
                 close the socket.
+            SessionAuthorityUnavailableError — the authority is temporarily
+                unavailable. Callers emit SQLSTATE 08006 and close the socket.
         """
         if not self._jwt_token:
             # No token: the caller's own ``if not self._jwt_token`` guard
@@ -1122,6 +1356,13 @@ class PGWireServer:
             return
         try:
             await validate_session_upstream(self._jwt_token)
+        except SessionValidationUnavailable as exc:
+            logger.info(
+                "JDBC session authority unavailable mid-connection (pid=%d): %s",
+                self._pid,
+                exc,
+            )
+            raise SessionAuthorityUnavailableError(str(exc)) from exc
         except ValueError as exc:
             logger.info(
                 "JDBC session revoked mid-connection (pid=%d): %s",
@@ -1399,6 +1640,14 @@ class PGWireServer:
 
                 try:
                     portal["cols"], portal["rows"], err = await self._execute_for_extended(portal["sql"])
+                except SessionAuthorityUnavailableError:
+                    writer.write(proto.error_response(
+                        "Session authority is temporarily unavailable; "
+                        "reconnect and retry.",
+                        severity="FATAL", code="08006",
+                    ))
+                    await writer.drain()
+                    raise
                 except SessionRevokedError:
                     # G2 / grok F-001-01: session revoked mid-connection. Fail
                     # closed — report 28000, then re-raise so handle_client
@@ -1466,6 +1715,14 @@ class PGWireServer:
                 if portal["rows"] is None and portal["sql"]:
                     try:
                         portal["cols"], portal["rows"], err = await self._execute_for_extended(portal["sql"])
+                    except SessionAuthorityUnavailableError:
+                        writer.write(proto.error_response(
+                            "Session authority is temporarily unavailable; "
+                            "reconnect and retry.",
+                            severity="FATAL", code="08006",
+                        ))
+                        await writer.drain()
+                        raise
                     except SessionRevokedError:
                         # G2 / grok F-001-01: fail closed on revoked session.
                         writer.write(proto.error_response(
@@ -2014,6 +2271,16 @@ class PGWireServer:
                 # this, the raw route — the path standard drivers take — skipped
                 # the shaper entirely.
                 if self._is_kpi_table_query(sql):
+                    # Bug-9894: when the pre-aggregated artifact could not
+                    # carry this persona's filters, recompute the scorecard
+                    # live on the persona path before shaping.
+                    columns_meta, rows_data, live_err = (
+                        await self._kpi_rows_for_persona(
+                            result, model_id, persona_id,
+                        )
+                    )
+                    if live_err is not None:
+                        return None, None, live_err
                     columns_meta, rows_data, kpi_err = self._shape_kpi_result(
                         sql, columns_meta, rows_data
                     )
@@ -2107,6 +2374,12 @@ class PGWireServer:
                 )
         # F-001-09: shape $KPIs results by the query's projection/filter/limit.
         if self._is_kpi_table_query(sql):
+            # Bug-9894: live persona recompute when the artifact was withheld.
+            columns_meta, rows_data, live_err = await self._kpi_rows_for_persona(
+                result, model_id, persona_id,
+            )
+            if live_err is not None:
+                return None, None, live_err
             columns_meta, rows_data, kpi_err = self._shape_kpi_result(sql, columns_meta, rows_data)
             if kpi_err is not None:
                 return None, None, (kpi_err, "42601")
@@ -2687,6 +2960,68 @@ class PGWireServer:
             # would get a generated name from the router; it won't match any
             # catalogue column in practice, but we skip it safely.
         return computed
+
+    async def _kpi_rows_for_persona(
+        self,
+        result: dict,
+        model_id: str,
+        persona_id: Optional[str],
+    ) -> tuple[list, list, Optional[tuple[str, str]]]:
+        """Return the ``$KPIs`` rows this caller is entitled to (Bug-9894).
+
+        Persona-layering rule 4, audit row A26. ``kpi_latest`` is one value per
+        KPI computed over ALL rows. The query-router proves whether that
+        artifact can carry the caller's own narrowing and, when it cannot,
+        serves NO artifact row and names the channel on
+        ``kpi_artifact_skip_reason`` (``rls_live`` when a row-security rule is
+        active without an authorised bypass, ``default_filters_live`` when the
+        persona carries mandatory default filters). This seam then recomputes
+        the scorecard LIVE on the persona path -- the identical governed
+        ``evaluate-batch`` call the XMLA KPI members already make -- so a
+        narrowed persona is served ITS OWN numbers instead of an empty
+        scorecard, and never the global ones.
+
+        Returns ``(columns_meta, rows_data, error)`` where *error* is the
+        ``(message, sqlstate)`` pair the seam writes back. When the router
+        served the artifact this is a pass-through and nothing extra is issued.
+        """
+        skip_reason = result.get("kpi_artifact_skip_reason")
+        columns_meta = result.get("columns", [])
+        rows_data = result.get("rows", [])
+        if not skip_reason:
+            return columns_meta, rows_data, None
+        logger.info(
+            "Bug-9894: $KPIs artifact withheld (%s) for pid=%d model=%s "
+            "persona=%s — recomputing the scorecard live on the persona path.",
+            skip_reason, self._pid, model_id, persona_id,
+        )
+        try:
+            columns, rows = await kpi_live_scorecard_rows(
+                model_id,
+                self._tenant_slug,
+                self._jwt_token,
+                persona_id=persona_id,
+            )
+        except KpiLiveScorecardError as exc:
+            # Fail closed and SAY SO. Returning the withheld (empty) artifact
+            # rowset here would render as "this model has no KPIs", which is a
+            # different answer from "your values could not be computed".
+            logger.error(
+                "Bug-9894: live $KPIs recompute failed (pid=%d model=%s): %s",
+                self._pid, model_id, exc,
+            )
+            return columns_meta, rows_data, (
+                (
+                    "The KPI scorecard could not be computed for your access "
+                    "scope. Your persona narrows the data, so the shared "
+                    "pre-computed scorecard does not apply to you and a live "
+                    f"evaluation was required: {exc}"
+                ),
+                # 58000 external system error: the request is well-formed and
+                # authorised; the live evaluation hop failed.
+                "58000",
+            )
+        return columns, rows, None
 
     def _is_kpi_table_query(self, sql: str) -> bool:
         """True when *sql* targets a ``<model>$KPIs`` virtual table."""
@@ -3313,6 +3648,12 @@ class PGWireServer:
         backed by ``modelx__payment_transaction``, the query router still
         resolves the deployed canonical model ``modelx``. Handles quoted and
         unquoted schema-qualified forms without altering string literals.
+
+        Bug-9186: a persona-variant Named Query relation (``@name_<persona>``)
+        folds back to the canonical ``@name`` the query-router intercepts. An
+        UNQUOTED ``FROM @name_analyst`` parses as an ``exp.Parameter``, not an
+        ``exp.Table``, so it needs its own pass — without it the variant
+        relation would be advertised and then be unresolvable.
         """
         replacements = {
             table_name.lower(): canonical
@@ -3337,6 +3678,23 @@ class PGWireServer:
                             canonical,
                             quoted=bool(table.this.args.get("quoted")),
                         ),
+                    )
+                    changed = True
+                for parameter in list(statement.find_all(exp.Parameter)):
+                    param_name = str(getattr(parameter, "name", "") or "")
+                    if not param_name:
+                        continue
+                    canonical = replacements.get(f"@{param_name}".lower())
+                    if canonical is None:
+                        continue
+                    # Replace the node with a QUOTED table, never rewrite the
+                    # Parameter in place: sqlglot renders a postgres Parameter
+                    # as ``$name``, so folding ``@nq_x_analyst`` into the
+                    # parameter would emit ``$nq_x`` and the query-router's
+                    # ``@name`` recogniser would never match it. The quoted
+                    # table form is what a BI client sends anyway.
+                    parameter.replace(
+                        exp.Table(this=exp.to_identifier(canonical, quoted=True))
                     )
                     changed = True
                 for column in statement.find_all(exp.Column):
@@ -3483,6 +3841,13 @@ class PGWireServer:
         # socket. Mirrors the XMLA per-request revalidation.
         try:
             await self._revalidate_session()
+        except SessionAuthorityUnavailableError:
+            writer.write(proto.error_response(
+                "Session authority is temporarily unavailable; reconnect and retry.",
+                severity="FATAL", code="08006",
+            ))
+            await writer.drain()
+            raise
         except SessionRevokedError:
             writer.write(proto.error_response(
                 "Session has been revoked; reconnect to continue.",
@@ -3668,6 +4033,15 @@ class PGWireServer:
                 )
         # F-001-09: shape $KPIs results by the query's projection/filter/limit.
         if self._is_kpi_table_query(sql):
+            # Bug-9894: live persona recompute when the artifact was withheld.
+            columns_meta, rows_data, live_err = await self._kpi_rows_for_persona(
+                result, model_id, persona_id,
+            )
+            if live_err is not None:
+                writer.write(proto.error_response(live_err[0], code=live_err[1]))
+                writer.write(proto.ready_for_query())
+                await writer.drain()
+                return
             columns_meta, rows_data, kpi_err = self._shape_kpi_result(sql, columns_meta, rows_data)
             if kpi_err is not None:
                 writer.write(proto.error_response(kpi_err, code="42601"))

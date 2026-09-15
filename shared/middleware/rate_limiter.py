@@ -12,6 +12,13 @@ Enforcement model (F-021-01):
   ``get_current_user``. Requests without a JWT fall back to client IP.
 * Login routes get a stricter, dedicated per-client bucket
   (``rate_limit.login_per_minute``) to slow password brute-force.
+* The client IP is the real caller, not the reverse proxy in front of the
+  service: ``X-Forwarded-For`` is read only on a placement that declares how
+  many reverse-proxy hops sit in front of it (``TRUSTED_PROXY_HOPS``; the
+  model-service behind the shipped nginx declares 1, the gateway whose ports
+  are published directly declares 0), optionally restricted to named proxy
+  addresses (``TRUSTED_PROXY_IPS``), so the header cannot be spoofed by a
+  direct caller (Bug-9164, F-R4-01).
 * Exceeding either limit returns HTTP 429 with a JSON body and a
   ``Retry-After`` header (``rate_limit.retry_after_seconds``).
 * All limit values are read from the system settings snapshot on every
@@ -40,6 +47,7 @@ Internal callers (httpx) add the bypass header:
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 
 from fastapi import FastAPI, Request, Response
@@ -76,9 +84,169 @@ LOGIN_PATH_SUFFIXES = (
 
 _parsed_limit_cache: dict[str, RateLimitItem] = {}
 
+# Parsed form of one TRUSTED_PROXY_IPS string. ``None`` means the operator named
+# no proxy address, so every peer of a placement that declares proxy hops is
+# accepted as its proxy; an empty tuple (the literal ``none``) accepts no peer.
+#
+# Runtime-state declaration: durable authority is the ``TRUSTED_PROXY_IPS``
+# setting (process environment); the key is that raw string, so a changed
+# setting parses afresh and never reads a stale list; it is deployment-wide
+# configuration, not tenant state, so there is nothing to isolate; it is bounded
+# at ``_TRUSTED_PROXY_CACHE_MAX`` entries and cleared wholesale on overflow
+# (a process sees one value, tests see a handful); it is per-process, rebuilt on
+# restart, and identical on every replica because the input is identical.
+_TRUSTED_PROXY_CACHE_MAX = 32
+_trusted_proxy_cache: dict[str, tuple[ipaddress._BaseNetwork, ...] | None] = {}
+
+_XFF_HEADER = "x-forwarded-for"
+
 
 def _is_internal_request(request: Request) -> bool:
     return is_internal_request_header(request.headers.get(INTERNAL_BYPASS_HEADER))
+
+
+def _parse_address(value: str) -> ipaddress._BaseAddress | None:
+    """Return the IP in ``value``, or ``None`` when it is not an address.
+
+    Accepts the bracketed IPv6 form a proxy may emit. Anything else — a
+    hostname, an obfuscated identifier, ``unknown``, a port suffix, junk — is
+    rejected, so an attacker-supplied header can never become a bucket key.
+    """
+    candidate = value.strip()
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    if not candidate:
+        return None
+    try:
+        return ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+
+
+def _trusted_proxy_hops() -> int:
+    """How many reverse-proxy hops this placement declares in front of it.
+
+    ``0`` (the default) means the peer IS the client and ``X-Forwarded-For`` is
+    never believed. A value that is not a non-negative integer is treated as
+    ``0``: a misconfiguration must never widen trust.
+    """
+    raw = getattr(get_settings(), "TRUSTED_PROXY_HOPS", 0)
+    try:
+        hops = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "TRUSTED_PROXY_HOPS value %r is not an integer — treating it as 0; "
+            "X-Forwarded-For will not be trusted",
+            raw,
+        )
+        return 0
+    return hops if hops > 0 else 0
+
+
+def _trusted_proxy_networks() -> tuple[ipaddress._BaseNetwork, ...] | None:
+    """Proxy addresses the operator named in ``TRUSTED_PROXY_IPS``.
+
+    Blank (the default) returns ``None``: no address restriction, the hop
+    count alone decides. The literal ``none`` returns an empty tuple: no peer
+    is a proxy. An unparsable entry is dropped with a warning rather than
+    widening or emptying the list silently.
+    """
+    raw = (get_settings().TRUSTED_PROXY_IPS or "").strip()
+    if raw in _trusted_proxy_cache:
+        return _trusted_proxy_cache[raw]
+
+    parsed: tuple[ipaddress._BaseNetwork, ...] | None
+    if not raw:
+        parsed = None
+    elif raw.lower() == "none":
+        parsed = ()
+    else:
+        networks: list[ipaddress._BaseNetwork] = []
+        for entry in (part.strip() for part in raw.split(",") if part.strip()):
+            try:
+                networks.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                logger.warning(
+                    "TRUSTED_PROXY_IPS entry %r is not an IP address or CIDR network "
+                    "— ignoring it; X-Forwarded-For from that hop will not be trusted",
+                    entry,
+                )
+        parsed = tuple(networks)
+    if len(_trusted_proxy_cache) >= _TRUSTED_PROXY_CACHE_MAX:
+        _trusted_proxy_cache.clear()
+    _trusted_proxy_cache[raw] = parsed
+    return parsed
+
+
+def _peer_is_declared_proxy(address: ipaddress._BaseAddress | None) -> bool:
+    """Is this peer one of the proxy hops the placement declares?
+
+    A clientless request (no peer address) is never a proxy. With no named
+    proxy addresses every real peer qualifies — the hop count is the trust
+    decision; with a named list only those addresses qualify.
+    """
+    if address is None:
+        return False
+    networks = _trusted_proxy_networks()
+    if networks is None:
+        return True
+    return any(address in network for network in networks)
+
+
+def client_address(request: Request) -> str:
+    """Return the address the rate-limit bucket should be keyed on.
+
+    Bug-9164: ``get_remote_address`` returns the IMMEDIATE PEER. Behind the
+    shipped nginx that peer is the proxy container, so every token-less request
+    from every real client collapsed into ONE bucket keyed on the proxy address
+    and a single client's login burst produced 429s for everybody.
+
+    ``X-Forwarded-For`` carries the client address, but it is client-supplied:
+    honoured unconditionally it lets a caller mint a fresh bucket per request
+    and evade the limit entirely. Trust is therefore a HOP COUNT the placement
+    declares (``TRUSTED_PROXY_HOPS``), not an address range: F-R4-01 showed
+    that a range default (loopback plus RFC1918) named exactly the ranges the
+    client population lives in, so office-LAN users behind nginx were skipped
+    as "proxies" and collapsed onto one bucket, while a LAN peer of a directly
+    published gateway port was itself "a proxy" and could choose its bucket.
+
+    nginx sets ``X-Forwarded-For: $proxy_add_x_forwarded_for``, which APPENDS
+    the address it saw to whatever the client sent — so a caller sending
+    ``X-Forwarded-For: 1.2.3.4`` arrives as ``1.2.3.4, <real client>``. With
+    ``N`` declared hops the ``N``-th entry from the RIGHT is the address the
+    outermost trusted proxy observed; everything left of it is client-supplied
+    and never read. Entries are never skipped by address range. When the
+    placement declares no hops, the peer is not a declared proxy address, the
+    chain is shorter than the hop count, or the chosen entry is not a valid
+    address, the peer address is used — never an attacker-chosen string.
+    """
+    # The bucket key keeps the previous value for every untrusted peer, including
+    # slowapi's synthetic "127.0.0.1" for a request that carries no client at
+    # all. The TRUST decision is made on the real peer only: a clientless request
+    # must not let its header pick the key.
+    peer = get_remote_address(request)
+    hops = _trusted_proxy_hops()
+    if hops == 0:
+        return peer
+    peer_address = _parse_address(
+        request.client.host if request.client and request.client.host else ""
+    )
+    if not _peer_is_declared_proxy(peer_address):
+        return peer
+
+    forwarded = request.headers.get(_XFF_HEADER)
+    if not forwarded:
+        return peer
+    entries = [part for part in forwarded.split(",") if part.strip()]
+    if len(entries) < hops:
+        # Fewer hops reported than declared: a proxy in the chain did not add
+        # itself, so the client cannot be identified from here.
+        return peer
+    candidate = _parse_address(entries[-hops])
+    if candidate is None:
+        # The trusted hop reported something that is not an address.
+        return peer
+    return str(candidate)
 
 
 def _extract_tenant_key(request: Request) -> str:
@@ -94,7 +262,8 @@ def _extract_tenant_key(request: Request) -> str:
 
     Real authentication still happens separately in ``get_current_user``;
     this verification exists solely to make the limiter key trustworthy.
-    Returns client IP as fallback when no usable token is present.
+    Returns the client address (:func:`client_address`, which resolves the real
+    client behind a trusted proxy) as fallback when no usable token is present.
     """
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
@@ -113,7 +282,7 @@ def _extract_tenant_key(request: Request) -> str:
             # Bad signature / expired / malformed — do NOT trust the claim.
             pass  # fall through to IP-based key
 
-    return get_remote_address(request) or "unknown"
+    return client_address(request)
 
 
 def build_limiter() -> Limiter:
@@ -207,7 +376,9 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
                         per_minute = int(system_snapshot_get("rate_limit.login_per_minute"))
                         scope = "login"
                         # Login requests carry no JWT — key by client address.
-                        key = get_remote_address(request) or "unknown"
+                        # Bug-9164: the real client behind a trusted proxy, so a
+                        # login burst from one user cannot throttle everyone.
+                        key = client_address(request)
                     elif self.login_only:
                         # login-only placement (model-service): the operational/
                         # metadata API is deliberately NOT request-rate throttled

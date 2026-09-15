@@ -196,6 +196,10 @@ async def test_looker_relation_collision_is_guarded(monkeypatch):
     _patch_models(monkeypatch, model_a, model_b, snapshot_a=snapshot_a)
 
     monkeypatch.setattr(router_client, "settings", _LookerOn(router_client.settings))
+    # Bug-9898: the adapter surface exists only on a privileged connection.
+    # This test is about the relation-name collision guard, so give it the
+    # connection the surface now requires.
+    monkeypatch.setattr(router_client, "_caller_is_privileged", lambda _t: True)
 
     result = await router_client.fetch_model_metadata(None, "acme", "jwt")
     model_names, table_model_id = result[0], result[2]
@@ -267,6 +271,10 @@ async def test_intra_model_semantic_table_collision_is_guarded(monkeypatch):
     _patch_models(monkeypatch, model_a, model_b, snapshot_a=snapshot_a)
     monkeypatch.setattr(router_client, "get_model_dimensions", _dimensions)
     monkeypatch.setattr(router_client, "settings", _LookerOn(router_client.settings))
+    # Bug-9898: the adapter surface exists only on a privileged connection.
+    # This test is about the relation-name collision guard, so give it the
+    # connection the surface now requires.
+    monkeypatch.setattr(router_client, "_caller_is_privileged", lambda _t: True)
 
     result = await router_client.fetch_model_metadata(None, "acme", "jwt")
     model_names, table_columns, table_model_id = result[0], result[1], result[2]

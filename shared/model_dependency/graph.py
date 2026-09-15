@@ -194,11 +194,23 @@ def _tarjan_scc(
     # Deterministic node order so SCC ids are stable across runs.
     ordered_nodes = sorted(node_keys, key=lambda k: k.sort_key)
 
-    def successors(node: NodeKey) -> list[NodeKey]:
-        return sorted(
-            (e.dependent for e in forward.get(node, [])),
-            key=lambda k: k.sort_key,
-        )
+    # A DFS frame is revisited once for every outgoing edge.  Keep the
+    # deterministic ordering stable for the whole traversal so a high-fanout
+    # node is sorted once instead of once per frame (which turns O(V + E) into
+    # quadratic work in the number of outgoing edges).
+    successor_cache: dict[NodeKey, tuple[NodeKey, ...]] = {}
+
+    def successors(node: NodeKey) -> tuple[NodeKey, ...]:
+        cached = successor_cache.get(node)
+        if cached is None:
+            cached = tuple(
+                sorted(
+                    (e.dependent for e in forward.get(node, [])),
+                    key=lambda k: k.sort_key,
+                )
+            )
+            successor_cache[node] = cached
+        return cached
 
     for root in ordered_nodes:
         if root in indices:

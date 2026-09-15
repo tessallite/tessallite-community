@@ -79,6 +79,7 @@ async def test_semantic_binding_error_logs_and_returns_empty():
     body = types.SimpleNamespace(
         model_id=model_id,
         dimension_name="nonexistent",
+        limit=None,  # Bug-9865: matches the real DiscoverMembersRequest
         persona_id=None,
     )
 
@@ -121,6 +122,7 @@ async def test_empty_resolved_dimensions_logs_and_returns_empty():
     body = types.SimpleNamespace(
         model_id=model_id,
         dimension_name="phantom",
+        limit=None,  # Bug-9865: matches the real DiscoverMembersRequest
         persona_id=None,
     )
 

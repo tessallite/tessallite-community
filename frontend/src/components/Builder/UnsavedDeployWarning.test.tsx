@@ -77,3 +77,15 @@ describe("StatusBar unsaved/undeployed indicator (Bug-5515)", () => {
     expect(screen.queryByTestId("statusbar-unsaved-label")).toBeNull();
   });
 });
+
+
+describe("models without a deployed version", () => {
+  it.each([null, 1])("explains the initial deployment when saved version is %s", (saved) => {
+    setEditor({ isDirty: false, lastSavedVersion: saved, deployedVersion: null });
+    renderWithI18n(<><UnsavedDeployWarning /><StatusBar tableCount={0} joinCount={0} dimCount={0} measCount={0} aggCount={0} /></>);
+    expect(screen.getByTestId("statusbar-unsaved-label")).toHaveTextContent(en["modelSync.notDeployed"]);
+    expect(screen.getByTestId("unsaved-deploy-warning")).toHaveTextContent(en["modelSync.notDeployed"]);
+    expect(screen.getByTestId("unsaved-deploy-warning")).toHaveClass("MuiAlert-standardInfo");
+    expect(screen.queryByText(en["modelSync.statusBarLabel"])).not.toBeInTheDocument();
+  });
+});

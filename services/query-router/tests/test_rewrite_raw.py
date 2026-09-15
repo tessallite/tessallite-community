@@ -19,6 +19,7 @@ import types
 from uuid import uuid4
 
 import pytest
+from result_fakes import ScalarResult
 import sqlglot
 
 from src.rewrite.raw_sql import RawRouteUnsupported, rewrite_for_raw
@@ -177,7 +178,7 @@ class _MockDB:
 
 class _EmptyResult:
     def scalars(self):
-        return self
+        return ScalarResult(())
 
     def all(self):
         return []
@@ -529,7 +530,7 @@ class _MeasureResult:
         self._measures = measures
 
     def scalars(self):
-        return self
+        return ScalarResult(self._measures)
 
     def all(self):
         return self._measures
@@ -614,7 +615,7 @@ class _UdaResult:
         self._udas = udas
 
     def scalars(self):
-        return self
+        return ScalarResult(self._udas)
 
     def all(self):
         return self._udas

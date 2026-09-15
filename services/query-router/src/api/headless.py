@@ -42,6 +42,7 @@ from src.api.filter_contract import (
 # F-027-07: the per-tenant rate limiter is now a shared module so the plugin
 # endpoint draws from the same buckets. ``_buckets`` / ``_check_rate_limit``
 # remain importable here for back-compat with existing tests.
+from src.api.measure_values import coerce_measure_values
 from src.api.rate_limit import _buckets, check_rate_limit as _check_rate_limit  # noqa: F401
 from src.api.routes import (
     _log_preexec_failure,
@@ -433,6 +434,20 @@ async def headless_query(
         has_more = len(rows) > effective_limit
         if has_more:
             rows = rows[:effective_limit]
+
+        # Bug-9917 / Bug-9876 [wrong numbers]: the executor returns ``Decimal``
+        # for every NUMERIC source column and pydantic's JSON mode renders a
+        # ``Decimal`` as a STRING -- and in scientific notation when the
+        # value's exponent says so (``"1.0E+5"``). A headless consumer summing
+        # ``rows`` in Python/JavaScript or loading them into a dataframe then
+        # gets a text column, not a number. Type the measure columns with the
+        # same serialiser ``/plugin/execute`` uses; the column names come from
+        # ``bound.resolved_measures``, the same authority
+        # ``_build_column_descriptors`` reads, so the typed set and the
+        # described set cannot drift.
+        rows = coerce_measure_values(
+            rows, [m.name for m in bound.resolved_measures],
+        )
 
         return HeadlessQueryResponse(
             columns=columns,

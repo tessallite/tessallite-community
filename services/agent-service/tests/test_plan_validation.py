@@ -14,7 +14,7 @@ from src.pipeline import (
     _repair_preview_named_set_ranking_call,
 )
 from src.planning.enums import AnalyticalShape
-from src.planning.intent import AnalyticalIntent
+from src.planning.intent import AnalyticalIntent, detect_analytical_intent
 from src.planning.measure_metadata import MeasureRoleMetadata
 from src.planning.validation import (
     apply_pre_validation_repairs,
@@ -66,7 +66,7 @@ def _profile(
     )
 
 
-def _bundle(profile=None, allow_ids=None):
+def _bundle(profile=None, allow_ids=None, previous_plan=None):
     profile = profile or _profile()
     return types.SimpleNamespace(
         system="system",
@@ -76,6 +76,7 @@ def _bundle(profile=None, allow_ids=None):
         model_profiles=[profile],
         persona_scopes=None,
         prior_questions=[],
+        previous_plan=previous_plan,
     )
 
 
@@ -318,6 +319,296 @@ def test_generated_month_alias_repairs_before_field_validation():
     assert call.dimension_refs[0].base_fields == ("business_date",)
     assert call.sort == [{"name": "business_date_month", "direction": "asc"}]
     assert validate_tool_call_against_bundle(call, _bundle()) == []
+
+
+def test_Bug_9739_cue_free_temporal_followup_preserves_previous_category_dimension():
+    profile = _profile(
+        measures=["base_amount"],
+        dimensions=["account_type", "business_date_year"],
+        filterable_where=["business_date"],
+        sortable=["account_type", "business_date_year", "base_amount"],
+        measure_metadata={"base_amount": MeasureRoleMetadata(name="base_amount")},
+    )
+    profile.dimensions = {
+        "account_type": {"kind": None, "is_time_dim": False},
+        "business_date_year": {"kind": "time", "is_time_dim": True},
+    }
+    previous_plan = {
+        "query": {
+            "model_id": str(MODEL_ID),
+            "measures": ["base_amount"],
+            "dimensions": ["account_type"],
+            "where": [],
+            "having": [],
+            "sort": [],
+        }
+    }
+    call = QueryToolCall(
+        model_id=str(MODEL_ID),
+        measures=["base_amount"],
+        dimensions=["business_date_year"],
+        where=[],
+        having=[],
+        sort=[],
+    )
+    intent = detect_analytical_intent(
+        "Break that down by year",
+        previous_plan=previous_plan,
+    )
+    bundle = _bundle(profile, previous_plan=previous_plan)
+
+    repaired = apply_pre_validation_repairs(call, intent, bundle)
+
+    assert repaired is True
+    assert call.dimensions == ["account_type", "business_date_year"]
+    assert [ref.alias for ref in call.dimension_refs or []] == [
+        "account_type",
+        "business_date_year",
+    ]
+    assert validate_tool_call_against_bundle(call, bundle) == []
+
+
+def _Bug_9968_followup_fixture(message: str):
+    profile = _profile(
+        measures=["base_amount"],
+        dimensions=["account_type", "business_date_year"],
+        filterable_where=["business_date"],
+        sortable=["account_type", "business_date_year", "base_amount"],
+        measure_metadata={"base_amount": MeasureRoleMetadata(name="base_amount")},
+    )
+    profile.dimensions = {
+        "account_type": {"kind": None, "is_time_dim": False},
+        "business_date_year": {"kind": "time", "is_time_dim": True},
+    }
+    previous_where = [{
+        "name": "business_date",
+        "op": "between",
+        "value": ["2026-01-01", "2026-09-10"],
+    }]
+    previous_plan = {
+        "query": {
+            "model_id": str(MODEL_ID),
+            "measures": ["base_amount"],
+            "dimensions": ["account_type"],
+            "where": previous_where,
+            "having": [],
+            "sort": [],
+        }
+    }
+    call = QueryToolCall(
+        model_id=str(MODEL_ID),
+        measures=["base_amount"],
+        dimensions=["business_date_year"],
+        where=[],
+        having=[],
+        sort=[],
+    )
+    intent = detect_analytical_intent(message, previous_plan=previous_plan)
+    return intent, call, _bundle(profile, previous_plan=previous_plan), previous_where
+
+
+def test_Bug_9968_temporal_breakdown_preserves_prior_where_and_dimensions():
+    intent, call, bundle, previous_where = _Bug_9968_followup_fixture(
+        "Break that down by year",
+    )
+
+    assert intent.preserve_previous_breakdown_dimensions is True
+    assert intent.preserve_previous_breakdown_where is True
+    repaired = apply_pre_validation_repairs(call, intent, bundle)
+
+    assert repaired is True
+    assert call.dimensions == ["account_type", "business_date_year"]
+    assert call.where == previous_where
+    assert call.where is not bundle.previous_plan["query"]["where"]
+    assert call.where[0] is not bundle.previous_plan["query"]["where"][0]
+    assert validate_tool_call_against_bundle(call, bundle) == []
+
+
+def test_Bug_9968_explicit_period_change_does_not_reuse_prior_where():
+    intent, call, bundle, _ = _Bug_9968_followup_fixture(
+        "Break that down by year for 2025",
+    )
+
+    assert intent.preserve_previous_breakdown_dimensions is True
+    assert intent.preserve_previous_breakdown_where is False
+    apply_pre_validation_repairs(call, intent, bundle)
+
+    assert call.dimensions == ["account_type", "business_date_year"]
+    assert call.where == []
+    assert validate_tool_call_against_bundle(call, bundle) == []
+
+
+def test_Bug_9968_dimension_replacement_keeps_prior_where():
+    intent, call, bundle, previous_where = _Bug_9968_followup_fixture(
+        "Break that down by year instead of account type",
+    )
+
+    assert intent.preserve_previous_breakdown_dimensions is False
+    assert intent.preserve_previous_breakdown_where is True
+    apply_pre_validation_repairs(call, intent, bundle)
+
+    assert call.dimensions == ["business_date_year"]
+    assert call.where == previous_where
+    assert validate_tool_call_against_bundle(call, bundle) == []
+
+
+def _Bug_9739_followup_fixture(
+    message: str,
+    *,
+    previous_dimension: str = "account_type",
+    previous_metadata: dict[str, object] | None = None,
+):
+    profile = _profile(
+        measures=["base_amount"],
+        dimensions=[previous_dimension, "business_date_year"],
+        filterable_where=["business_date"],
+        sortable=[previous_dimension, "business_date_year", "base_amount"],
+        measure_metadata={"base_amount": MeasureRoleMetadata(name="base_amount")},
+    )
+    profile.dimensions = {
+        "business_date_year": {"kind": "time", "is_time_dim": True},
+    }
+    if previous_metadata is not None:
+        profile.dimensions[previous_dimension] = previous_metadata
+    previous_plan = {
+        "query": {
+            "model_id": str(MODEL_ID),
+            "measures": ["base_amount"],
+            "dimensions": [previous_dimension],
+            "where": [],
+            "having": [],
+            "sort": [],
+        }
+    }
+    call = QueryToolCall(
+        model_id=str(MODEL_ID),
+        measures=["base_amount"],
+        dimensions=["business_date_year"],
+        where=[],
+        having=[],
+        sort=[],
+    )
+    intent = detect_analytical_intent(message, previous_plan=previous_plan)
+    return intent, call, _bundle(profile, previous_plan=previous_plan)
+
+
+def _assert_Bug_9739_replacement_followup_excludes_prior_category(message: str):
+    intent, call, bundle = _Bug_9739_followup_fixture(message)
+
+    assert intent.preserve_previous_breakdown_dimensions is False
+    repaired = apply_pre_validation_repairs(call, intent, bundle)
+
+    assert repaired is False
+    assert call.dimensions == ["business_date_year"]
+    assert validate_tool_call_against_bundle(call, bundle) == []
+
+
+def test_Bug_9739_validation_instead_cue_excludes_prior_category():
+    _assert_Bug_9739_replacement_followup_excludes_prior_category(
+        "Break that down by year instead",
+    )
+
+
+def test_Bug_9739_validation_instead_of_cue_excludes_prior_category():
+    _assert_Bug_9739_replacement_followup_excludes_prior_category(
+        "Break that down by year instead of account type",
+    )
+
+
+def test_Bug_9739_validation_rather_than_cue_excludes_prior_category():
+    _assert_Bug_9739_replacement_followup_excludes_prior_category(
+        "Break that down by year rather than account type",
+    )
+
+
+def test_Bug_9739_validation_replace_cue_excludes_prior_category():
+    _assert_Bug_9739_replacement_followup_excludes_prior_category(
+        "Break that down by year and replace account type",
+    )
+
+
+def test_Bug_9739_validation_not_by_cue_excludes_prior_category():
+    _assert_Bug_9739_replacement_followup_excludes_prior_category(
+        "Break that down by year, not by account type",
+    )
+
+
+def test_Bug_9739_validation_only_by_cue_excludes_prior_category():
+    _assert_Bug_9739_replacement_followup_excludes_prior_category(
+        "Break that down only by year",
+    )
+
+
+def test_Bug_9739_validation_drop_cue_excludes_prior_category():
+    _assert_Bug_9739_replacement_followup_excludes_prior_category(
+        "Break that down by year and drop account type",
+    )
+
+
+def test_Bug_9739_validation_remove_cue_excludes_prior_category():
+    _assert_Bug_9739_replacement_followup_excludes_prior_category(
+        "Break that down by year and remove account type",
+    )
+
+
+def _assert_Bug_9739_explicit_false_name_stays_categorical(dimension: str):
+    intent, call, bundle = _Bug_9739_followup_fixture(
+        "Break that down by year",
+        previous_dimension=dimension,
+        previous_metadata={"kind": "time", "is_time_dim": False},
+    )
+
+    assert intent.preserve_previous_breakdown_dimensions is True
+    repaired = apply_pre_validation_repairs(call, intent, bundle)
+
+    assert repaired is True
+    assert call.dimensions == [dimension, "business_date_year"]
+    assert validate_tool_call_against_bundle(call, bundle) == []
+
+
+def test_Bug_9739_explicit_false_period_name_stays_categorical():
+    _assert_Bug_9739_explicit_false_name_stays_categorical("period_code")
+
+
+def test_Bug_9739_explicit_false_day_name_stays_categorical():
+    _assert_Bug_9739_explicit_false_name_stays_categorical("day_label")
+
+
+def test_Bug_9739_explicit_false_month_name_stays_categorical():
+    _assert_Bug_9739_explicit_false_name_stays_categorical("month_name")
+
+
+def test_Bug_9739_explicit_false_year_name_stays_categorical():
+    _assert_Bug_9739_explicit_false_name_stays_categorical("year_label")
+
+
+def test_Bug_9739_name_heuristic_is_used_when_metadata_is_absent():
+    intent, call, bundle = _Bug_9739_followup_fixture(
+        "Break that down by year",
+        previous_dimension="period_code",
+    )
+
+    assert intent.preserve_previous_breakdown_dimensions is True
+    repaired = apply_pre_validation_repairs(call, intent, bundle)
+
+    assert repaired is False
+    assert call.dimensions == ["business_date_year"]
+    assert validate_tool_call_against_bundle(call, bundle) == []
+
+
+def test_Bug_9739_metadata_entry_blocks_name_heuristic_without_flag():
+    intent, call, bundle = _Bug_9739_followup_fixture(
+        "Break that down by year",
+        previous_dimension="month_name",
+        previous_metadata={"kind": None},
+    )
+
+    assert intent.preserve_previous_breakdown_dimensions is True
+    repaired = apply_pre_validation_repairs(call, intent, bundle)
+
+    assert repaired is True
+    assert call.dimensions == ["month_name", "business_date_year"]
+    assert validate_tool_call_against_bundle(call, bundle) == []
 
 
 def test_grained_month_ref_prefers_available_semantic_year_month_parts():

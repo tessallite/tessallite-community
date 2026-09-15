@@ -37,7 +37,19 @@ export type ExplorerAction =
   | "model.rename"
   | "model.delete"
   | "model.importExport"
-  | "model.deploy";
+  | "model.deploy"
+  // Raw source-table data preview — modeller and above. Bug-9896: the preview
+  // is a raw SELECT * on the PHYSICAL table (no persona, no CLS, no RLS), so
+  // it is a modelling surface. Mirrors model-service
+  // api/table_preview.py preview_table (require_role("modeler")) and the
+  // query-router /introspect route it calls.
+  | "table.previewData"
+  // Calendar coverage probe — modeller and above. Bug-9900: the probe runs
+  // raw MIN/MAX statements on the PHYSICAL calendar and fact tables (no
+  // persona, no CLS, no RLS) through the query-router /introspect/batch
+  // route. Mirrors model-service api/calendar.py check_calendar_coverage
+  // (require_role("modeler")) and that route.
+  | "calendar.checkCoverage";
 
 /** Actions reserved for tenant/system admins (tenant + structural project ops). */
 const TENANT_ADMIN_ACTIONS: ReadonlySet<ExplorerAction> = new Set<ExplorerAction>([
@@ -65,6 +77,8 @@ const MODELLER_ACTIONS: ReadonlySet<ExplorerAction> = new Set<ExplorerAction>([
   "model.delete",
   "model.importExport",
   "model.deploy",
+  "table.previewData",
+  "calendar.checkCoverage",
 ]);
 
 /**

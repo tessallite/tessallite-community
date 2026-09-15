@@ -163,6 +163,10 @@ import type {
   EventTypeOption,
   FieldCompatibilityResponse,
   QueryLogFilters,
+  SystemLogFilters,
+  SystemLogPage,
+  SystemLogPurgeResponse,
+  SystemLogSettings,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -511,7 +515,13 @@ export type EditionStatus = {
   // The UI must render this distinctly from both "activated" and the plain
   // "unactivated / nothing installed" state, so an invalid licence is not
   // mistaken for a normal one.
-  license_state?: string; // e.g. "invalid"
+  // Bug-9318: "manager_load_failed" is a third, distinct fail-closed state — the
+  // closed license-manager build itself could not load (a packaging/build
+  // fault), not a licence document being invalid/expired. error_code/load_error
+  // carry the machine token and (optional) raw detail for that case.
+  license_state?: string; // "invalid" | "expired" | "manager_load_failed"
+  error_code?: string;
+  load_error?: string | null;
 };
 
 export type EditionLimits = {
@@ -1914,6 +1924,33 @@ export const rowSecurityApi = {
 // Logs
 // ---------------------------------------------------------------------------
 
+export const systemLogsApi = {
+  settings: () =>
+    api
+      .get<SystemLogSettings>("/api/v1/admin/system-logs/settings")
+      .then((r) => r.data),
+  list: (filters: SystemLogFilters = {}) => {
+    const params = new URLSearchParams();
+    if (filters.q) params.set("q", filters.q);
+    if (filters.service) params.set("service", filters.service);
+    if (filters.level) params.set("level", filters.level);
+    if (filters.from_date) params.set("from_date", filters.from_date);
+    if (filters.to_date) params.set("to_date", filters.to_date);
+    if (filters.cursor) params.set("cursor", filters.cursor);
+    if (filters.limit !== undefined) params.set("limit", String(filters.limit));
+    const query = params.toString();
+    return api
+      .get<SystemLogPage>(
+        `/api/v1/admin/system-logs${query ? `?${query}` : ""}`,
+      )
+      .then((r) => r.data);
+  },
+  purge: () =>
+    api
+      .post<SystemLogPurgeResponse>("/api/v1/admin/system-logs/purge")
+      .then((r) => r.data),
+};
+
 export const logsApi = {
   queries: (
     projectId: string,
@@ -3117,10 +3154,15 @@ export const dataTagsApi = {
 export const namedSetsApi = {
   /** Bug-7949: effective member cap from the backend, updated on every list fetch. */
   _cachedMemberCap: 1000 as number,
-  list: (projectId: string, modelId: string) =>
+  // Bug-9091: deployed_only mirrors the same deploy-serving-authority contract
+  // useKpis already carries (F-017-05/F-103-03) — a viewer/scorecard surface
+  // must read the deployed snapshot's named sets, never a certified-but-
+  // undeployed live edit, matching what JDBC/XMLA actually serve.
+  list: (projectId: string, modelId: string, deployedOnly?: boolean) =>
     api
       .get<import("./types").NamedSet[]>(
         `/api/v1/projects/${projectId}/models/${modelId}/named-sets`,
+        deployedOnly ? { params: { deployed_only: true } } : undefined,
       )
       .then((r) => {
         // Bug-7949: extract the effective member cap from the response header.
@@ -3207,7 +3249,7 @@ export const namedSetsApi = {
       .then((r) => r.data),
   refresh: (projectId: string, modelId: string, id: string) =>
     api
-      .post<import("./types").NamedSet>(
+      .post<import("./types").NamedSetRefreshResponse>(
         `/api/v1/projects/${projectId}/models/${modelId}/named-sets/${id}/refresh`,
       )
       .then((r) => r.data),
@@ -3324,10 +3366,21 @@ export const kpisApi = {
       .then((r) => r.data),
   delete: (projectId: string, modelId: string, id: string) =>
     api.delete(`/api/v1/projects/${projectId}/models/${modelId}/kpis/${id}`),
-  evaluate: (projectId: string, modelId: string, id: string) =>
+  // Bug-9881: KPI evaluation is a consumption route. The server now defaults
+  // deployed_only to true, so a served number always comes from the deployed
+  // snapshot; the KPI authoring panel is the ONE caller that opts out, to
+  // preview the draft it is editing.
+  evaluate: (
+    projectId: string,
+    modelId: string,
+    id: string,
+    deployedOnly = true,
+  ) =>
     api
       .post<import("./types").KpiEvaluateResponse>(
         `/api/v1/projects/${projectId}/models/${modelId}/kpis/${id}/evaluate`,
+        undefined,
+        { params: { deployed_only: deployedOnly } },
       )
       .then((r) => r.data),
   versions: (projectId: string, modelId: string, id: string) =>
@@ -3412,10 +3465,15 @@ export const kpisApi = {
         data,
         // F-017-25: persona switcher on the scorecard re-evaluates under the
         // selected persona's measure scope (endpoint accepts persona_id query).
-        // The scorecard evaluates only the deployed KPI ids from the
-        // deployed_only list (F-017-05), and a deployed model pins each KPI to
-        // its snapshot definition server-side, so batch needs no separate flag.
-        personaId ? { params: { persona_id: personaId } } : undefined,
+        // Bug-9881: deployed_only is sent explicitly. "A deployed model pins
+        // each KPI server-side" was true only for a DEPLOYED model — on an
+        // undeployed one the batch fell back to live editor drafts, which is
+        // the wrong number for every consumption surface.
+        {
+          params: personaId
+            ? { persona_id: personaId, deployed_only: true }
+            : { deployed_only: true },
+        },
       )
       .then((r) => r.data),
 

@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import sys
 import threading
@@ -73,6 +74,12 @@ from typing import Any, Optional
 # Per-process random salt so a stored principal fingerprint reveals nothing and
 # cannot be correlated across processes (same rationale as credential_cache).
 _SALT = os.urandom(32)
+
+# Bug-9865: the only claims that differ between two tokens minted for the SAME
+# principal. None of them is an input to persona resolution or row-security
+# compilation, so excluding them from the cache fingerprint lets a rotated
+# token reuse its own principal's entries without ever widening their audience.
+_VOLATILE_CLAIMS = frozenset({"iat", "exp", "nbf", "jti"})
 
 
 def _int_from_env(var: str, default: int, *, minimum: int = 0) -> int:
@@ -205,15 +212,45 @@ def principal_fingerprint(jwt_token: str | None) -> str:
     the uncached path never had.
 
     The whole principal is derived from the caller's JWT, so a per-caller
-    fingerprint of the token fully separates security contexts. It is an HMAC
-    under a per-process salt -- the token (a credential) is never stored. Two
-    requests from the SAME identity within one Excel gesture reuse the SAME JWT
-    (Basic-auth via credential_cache, or a stable bearer token), so the burst
-    still de-duplicates; a rotated token merely misses (re-fetches), never leaks.
+    fingerprint of its SECURITY CLAIMS fully separates security contexts. It is
+    an HMAC under a per-process salt -- the token (a credential) is never
+    stored.
+
+    Bug-9865: the fingerprint used to hash the raw token BYTES, which made the
+    cache's real lifetime the JWT's, not its own. On the Basic-auth path Excel
+    actually uses, ``credential_cache`` re-mints a token every 30s, so every
+    rotation changed the fingerprint and invalidated every member and metadata
+    entry wholesale. Worse, an unrestricted MDSCHEMA_MEMBERS on a wide model
+    takes LONGER than that 30s window, so the next request always arrived with
+    a fresh token and the cache could never hit even once -- the burst
+    de-duplicator was dead in the exact case it was written for.
+
+    Hashing the claims MINUS the volatile time/identity fields (``iat``,
+    ``exp``, ``nbf``, ``jti``) is security-equivalent: those four are the only
+    parts that differ between two tokens minted for the same principal, and
+    none of them is an input to persona resolution or row-security compilation
+    (which read identity, tenant, roles, groups and email). Every claim that
+    CAN change a member list stays in the key, so a different security context
+    still gets a different entry. Anything undecodable falls back to hashing
+    the raw token -- the previous, strictly narrower behaviour -- so a
+    malformed or foreign token can never widen a cache entry's audience.
     """
     if not jwt_token:
         return ""
-    return hmac.new(_SALT, jwt_token.encode("utf-8"), hashlib.sha256).hexdigest()
+    try:
+        from shared.auth.jwt import decode_access_token
+
+        claims = decode_access_token(jwt_token)
+        material = json.dumps(
+            {k: v for k, v in claims.items() if k not in _VOLATILE_CLAIMS},
+            sort_keys=True,
+            default=str,
+        )
+    except Exception:
+        # Fail NARROW: an unverifiable token keys on its own bytes, so it
+        # shares an entry with nothing.
+        material = jwt_token
+    return hmac.new(_SALT, material.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def member_key(

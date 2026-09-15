@@ -215,3 +215,84 @@ def filter_kpis_for_persona(
             kpi_by_name, children_by_parent,
         )
     ]
+
+
+def filter_kpis_for_native_xmla(
+    kpis: list[dict[str, Any]],
+    measures: list[dict[str, Any]],
+    allowed_measure_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return KPI rows safe to advertise on native XMLA surfaces.
+
+    The caller supplies the deployed model snapshot's executable measure set.
+    A KPI is eligible only when its complete transitive lineage is resolved,
+    every lineage measure is in that set, and ``KPIValue`` resolves to the same
+    addressable MDX member the Execute path can use. This is deliberately
+    stricter than :func:`filter_kpis_for_persona`: governed ``KPIValue()`` can
+    evaluate composite expressions, but ``MDSCHEMA_KPIS.KPI_VALUE`` must name a
+    single executable member (Bug-9830).
+
+    The input KPI list is expected to come from ``get_model_kpis``, which
+    requests ``deployed_only=true``. Keeping that fetch boundary in the caller
+    prevents a draft KPI from being mistaken for a deployed catalogue row.
+    The order of the input list is preserved.
+    """
+    persona_kpis = filter_kpis_for_persona(
+        kpis, measures, allowed_measure_ids,
+    )
+    if not persona_kpis:
+        return []
+
+    measure_name_to_id = _measure_name_to_id(measures)
+    visible_measure_ids = {
+        str(m.get("id"))
+        for m in measures
+        if m.get("id") is not None and str(m.get("id")).strip()
+    }
+    kpi_by_name: dict[str, dict[str, Any]] = {}
+    children_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for kpi in kpis:
+        name = kpi.get("name")
+        if name:
+            kpi_by_name.setdefault(str(name), kpi)
+            kpi_by_name.setdefault(str(name).lower(), kpi)
+        parent = kpi.get("parent_kpi_id")
+        if parent is not None and str(parent).strip():
+            children_by_parent.setdefault(str(parent), []).append(kpi)
+
+    # Import lazily: mdx_execute resolves KPI goals through mdschema, while
+    # mdschema calls this helper when it builds MDSCHEMA_KPIS.
+    from src.dax.mdx_execute import resolve_kpi_property_expr
+
+    eligible: list[dict[str, Any]] = []
+    for kpi in persona_kpis:
+        lineage_ids, fully_resolved = _kpi_lineage_measure_ids(
+            kpi, kpi_by_name, measure_name_to_id, children_by_parent,
+        )
+        if (
+            not fully_resolved
+            or not lineage_ids
+            or not lineage_ids.issubset(visible_measure_ids)
+        ):
+            continue
+        try:
+            value_member = resolve_kpi_property_expr(
+                kpi, "KPIValue", measures,
+            )
+        except ValueError:
+            continue
+        if value_member:
+            eligible.append(kpi)
+
+    # A child row whose composite parent was withheld would leave
+    # KPI_PARENT_KPI_NAME dangling in MDSCHEMA_KPIS. Native clients treat that
+    # relationship as part of the catalogue contract, so expose a child only
+    # when its parent is itself an executable native row.
+    eligible_ids = {
+        str(k.get("id")) for k in eligible if k.get("id") is not None
+    }
+    return [
+        k for k in eligible
+        if not k.get("parent_kpi_id")
+        or str(k.get("parent_kpi_id")) in eligible_ids
+    ]

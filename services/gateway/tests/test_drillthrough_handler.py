@@ -1244,3 +1244,21 @@ async def test_execute_without_the_property_emits_no_cursor_element_bug8048(monk
     assert captured["cursor"] is None
     assert "DrillthroughCursor" not in body
     assert "<tns:ExecuteResponse><return><root/></return></tns:ExecuteResponse>" in body
+
+
+def test_slicer_measure_is_the_drilled_measure_for_excels_single_value_shape():
+    """Owner's ALEX session 2026-09-04 16:49: native Excel keeps its one value
+    member in the WHERE slicer, and the DRILLTHROUGH on a double-click keeps
+    that shape. The COLUMNS-only search faulted it."""
+    parsed = parse_mdx(
+        "DRILLTHROUGH SELECT NON EMPTY {[Geography Channel].[Geography Channel]"
+        ".[Country].&[DE]} ON COLUMNS FROM [modely] "
+        "WHERE ([Measures].[base_amount])"
+    )
+    assert _extract_measure_name(parsed) == "base_amount"
+    # COLUMNS still wins when both carry a measure reference.
+    both = parse_mdx(
+        "DRILLTHROUGH SELECT {[Measures].[amount]} ON COLUMNS FROM [modely] "
+        "WHERE ([Measures].[other])"
+    )
+    assert _extract_measure_name(both) == "amount"

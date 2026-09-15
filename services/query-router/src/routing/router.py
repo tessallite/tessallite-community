@@ -115,6 +115,17 @@ async def _record_rls_bypass_audit(
 
     Wrapped so an audit-write failure never blocks the query — the bypass
     decision and its authorization are unchanged.
+
+    Bug-8121: the write is FORCED past the tenant ``audit.log_level`` gate. That
+    gate suppresses by returning ``None``, not by raising, so a tenant setting of
+    ``off`` (everything) or ``critical`` (which outranks this WARN event, and any
+    level above ``info`` for the inert INFO event) silently deleted the only
+    durable record of a privileged row-security bypass — without an error and
+    without moving the evidence-gap counter below, because gating is not a write
+    failure. Whether a security control was skipped is not an operator
+    preference; this matches ``audit_required`` (F-022-07) and the Bug-8131
+    durable refusal evidence. Persistence failure stays fail-open here: the query
+    must not break for the personas whose record just went missing.
     """
     try:
         model = bound_query.model
@@ -148,6 +159,7 @@ async def _record_rls_bypass_audit(
                 or str(getattr(model, "id", ""))
             ),
             detail=detail,
+            force=True,  # Bug-8121: a tenant level must not delete this evidence
         )
     except Exception:
         logger.warning("Failed to persist RLS-bypass audit event", exc_info=True)
@@ -2038,16 +2050,34 @@ async def _route_with_row_security(
     _raw_downgrade_reason: str | None = None
     if _raw_ok:
         try:
-            rewritten = await rewrite_for_raw(bound_query, db, target_dialect=target_dialect)
+            # Bug-9914: hand the raw rewriter the same compiled owner metadata
+            # the source rewriter gets, so a security column owned by a joined
+            # dimension is kept in the raw plan and the predicate binds to it.
+            rewritten = await rewrite_for_raw(
+                bound_query,
+                db,
+                target_dialect=target_dialect,
+                security_column_owners=compiled.security_column_owners,
+            )
             route_type = "raw"
         except RawRouteUnsupported as _raw_exc:
             # Bug-5880: same fallback as the non-RLS raw branch — the source
             # rewrite preserves predicates the raw builder cannot render.
-            rewritten = await rewrite_for_source(bound_query, db, target_dialect=target_dialect)
+            rewritten = await rewrite_for_source(
+                bound_query,
+                db,
+                target_dialect=target_dialect,
+                security_column_owners=compiled.security_column_owners,
+            )
             route_type = "source"
             _raw_downgrade_reason = str(_raw_exc)
     else:
-        rewritten = await rewrite_for_source(bound_query, db, target_dialect=target_dialect)
+        rewritten = await rewrite_for_source(
+            bound_query,
+            db,
+            target_dialect=target_dialect,
+            security_column_owners=compiled.security_column_owners,
+        )
         route_type = "source"
         if _raw_requested:
             # Bug-7029: raw was forced but the shape (unresolvable WHERE / UNION
@@ -2415,12 +2445,14 @@ def _inject_security_where(
     # for Bug-7034 and the guard in
     # ``tests/test_bug_7034_rls_injection_must_not_fan_out.py``.
     #
-    # F-007-05 / Bug-8896: when ``CompiledPredicate.security_column_owners``
-    # names the owning physical table, qualify each security column with the
-    # FIRST scan alias of that table in this SELECT. That disambiguates a
-    # self-join (two scans of the owner) without fanning the predicate onto
-    # dimension relations. Empty owners keep the historic bare column so a
-    # fact-only star still works.
+    # F-007-05 / Bug-8896 / Bug-9373: when ``CompiledPredicate.security_column_
+    # owners`` names the owning physical table(s), emit one predicate copy per
+    # SCAN (owner table, alias) in this SELECT, each copy binding every column
+    # that owner carries to that one alias. That disambiguates a self-join (two
+    # scans of one owner) and constrains a join of two distinct owners, without
+    # ever fanning the predicate onto a relation the model does not name as an
+    # owner and without ever evaluating one rule across two rows (F-R2-01).
+    # Empty owners keep the historic bare column so a fact-only star still works.
     owners = tuple(getattr(compiled, "security_column_owners", ()) or ())
 
     def _qualify_for_select(select_node: exp.Select, pred: exp.Expression) -> exp.Expression:
@@ -2449,10 +2481,15 @@ def _inject_security_where(
             owners_for_col.setdefault((col_name or "").lower(), []).append(
                 (phys or "").lower()
             )
-        # Resolve each unqualified security column to the owner relation actually
-        # scanned in THIS select (first candidate present; owners is an ordered
-        # fallback list, never fanned out — Bug-7034).
-        col_to_owner: dict[str, str] = {}
+        # Resolve each unqualified security column to EVERY owner relation
+        # actually scanned in THIS select. ``owners`` is the model's proven
+        # owner list: it is never fanned onto a relation that does not own the
+        # column (Bug-7034), but every owning relation that IS scanned must be
+        # constrained. Bug-9373: taking only the FIRST present candidate left
+        # the second owner's scan row-UNSECURED, so ``FROM sales s JOIN
+        # employees e`` (both carrying region_code) constrained ``s`` only and
+        # a user selecting ``e.region_code`` saw every region.
+        col_to_owners: dict[str, list[str]] = {}
         referenced_tables: list[str] = []
         for col in qualified.find_all(exp.Column):
             if col.table:
@@ -2461,8 +2498,11 @@ def _inject_security_where(
             candidates = owners_for_col.get(cname)
             if not candidates:
                 continue  # not a security column -> leave bare (historic path)
-            winner = next((t for t in candidates if t in aliases_by_table), None)
-            if winner is None:
+            present: list[str] = []
+            for t in candidates:
+                if t in aliases_by_table and t not in present:
+                    present.append(t)
+            if not present:
                 # The model names this a security column but its owning relation
                 # is not scanned in this SELECT, so we cannot prove which scan it
                 # binds to. Leaving it bare could bind to an unrelated same-named
@@ -2475,30 +2515,68 @@ def _inject_security_where(
                     ),
                     force_route=force_route,
                 )
-            col_to_owner[cname] = winner
-            if winner not in referenced_tables:
-                referenced_tables.append(winner)
+            col_to_owners[cname] = present
+            for t in present:
+                if t not in referenced_tables:
+                    referenced_tables.append(t)
         if not referenced_tables:
             # No security column resolved to a scanned owner -> historic bare
             # inject (a fact-only star with empty/unmatched owners still works).
             return qualified
-        # Emit one qualified copy of the predicate per alias-combination of the
-        # referenced owner relations and AND them, so EVERY scan of EVERY owner
-        # is constrained. Self-join (one owner, aliases [e1, e2]) -> P[e1] AND
-        # P[e2]; a fact-only star (one owner, one alias) stays a single conjunct.
+        # A compiled predicate is a per-row condition on ONE relation row, so
+        # one predicate copy exists to constrain ONE scan (owner T, alias a) and
+        # binds EVERY security column T owns to that same alias. Columns T does
+        # not own bind to their own owners' scans, one alias per owner within
+        # the copy. Emit one copy per (owner, alias) scan and AND them:
+        #   self-join (employees e1, e2; both columns owned by employees)
+        #       -> P[e1] AND P[e2]
+        #   two co-owners (sales s, employees e both own both columns)
+        #       -> P[s] AND P[e]
+        #   two owners, one column (Bug-9373)   -> P[s] AND P[e]
+        #   mixed (region on s and e, dept on e) -> P(s.region, e.dept) AND
+        #                                          P(e.region, e.dept)
+        # F-R2-01 (1.1.7 review round 1): the previous cut ranged a product
+        # over COLUMNS independently and so also emitted copies that bound
+        # ``region_code`` to ``e1`` and ``dept`` to ``e2`` -- half a rule on
+        # one row, half on another. For an OR-composed predicate (two named
+        # role grants, F-007-03) those mixed copies excluded rows the pure
+        # per-scan copies admit. Never mix two scans of one owner in a copy.
         import itertools
 
-        alias_choice_lists = [aliases_by_table[t] for t in referenced_tables]
+        col_names = list(col_to_owners)
+        copies: list[tuple[tuple[str, str], ...]] = []
+        for anchor in referenced_tables:
+            anchored = [c for c in col_names if anchor in col_to_owners[c]]
+            others = [c for c in col_names if anchor not in col_to_owners[c]]
+            for anchor_alias in aliases_by_table[anchor]:
+                other_owner_choices = [col_to_owners[c] for c in others]
+                for owner_combo in itertools.product(*other_owner_choices):
+                    other_owners: list[str] = []
+                    for t in owner_combo:
+                        if t not in other_owners:
+                            other_owners.append(t)
+                    alias_choices = [aliases_by_table[t] for t in other_owners]
+                    for alias_combo in itertools.product(*alias_choices):
+                        alias_of_owner = dict(zip(other_owners, alias_combo))
+                        alias_of_owner[anchor] = anchor_alias
+                        owner_of_col = dict(zip(others, owner_combo))
+                        for c in anchored:
+                            owner_of_col[c] = anchor
+                        mapping = tuple(
+                            (c, alias_of_owner[owner_of_col[c]]) for c in col_names
+                        )
+                        if mapping not in copies:
+                            copies.append(mapping)
         combined: exp.Expression | None = None
-        for combo in itertools.product(*alias_choice_lists):
-            table_alias = dict(zip(referenced_tables, combo))
+        for mapping in copies:
+            alias_for_col = dict(mapping)
             one = pred.copy()
             for col in one.find_all(exp.Column):
                 if col.table:
                     continue
-                owner = col_to_owner.get((col.name or "").lower())
-                if owner is not None:
-                    col.set("table", exp.to_identifier(table_alias[owner]))
+                alias = alias_for_col.get((col.name or "").lower())
+                if alias is not None:
+                    col.set("table", exp.to_identifier(alias))
             combined = one if combined is None else exp.and_(combined, one)
         return combined
 
@@ -2673,6 +2751,7 @@ class _ClsClosure:
         "uda_restrictions_loaded",
         "measures_by_id",
         "measures_by_name",
+        "measure_universe_loaded",
         "restricted_physical_names",
         "known_physical_names",
         "table_identifiers",
@@ -2691,6 +2770,10 @@ class _ClsClosure:
         self.uda_restrictions_loaded: bool = False
         self.measures_by_id: dict = {}
         self.measures_by_name: dict = {}
+        # Consolidation: mirrors ``uda_restrictions_loaded``. The universe is
+        # loaded exactly when the bound query carries a dependency-bearing
+        # measure, so this is True whenever the closure could need it.
+        self.measure_universe_loaded: bool = False
         self.restricted_physical_names: set[str] | None = None
         # Bug-7607 (Codex R1 finding 1): the set of ALL model physical column
         # names (lowercased). Used by the calc-dimension gate to fail closed on
@@ -2717,10 +2800,47 @@ class _ClsClosure:
             restricted_uda_ids=self.restricted_uda_ids,
             measures_by_id=self.measures_by_id,
             measures_by_name=self.measures_by_name,
+            measure_universe_complete=self.measure_universe_loaded,
             restricted_physical_names=self.restricted_physical_names,
             known_physical_names=self.known_physical_names,
             table_identifiers=self.table_identifiers,
         )
+
+
+def _cls_authority_shape(bound_query: BoundQuery) -> Any:
+    """The pinned snapshot the CLS closure must read, or None when undeployed.
+
+    Bug-9490: the query is compiled from the DEPLOYED snapshot, but the closure
+    that decides whether an object reaches a restricted column used to walk LIVE
+    draft rows. A modeller editing a calculated measure's lineage in draft
+    therefore changed what the gate checked for an ALREADY-DEPLOYED model,
+    before redeployment — drop a restricted reference in draft and the deployed
+    measure was checked against the clean draft lineage and served, while the
+    deployed definition still read the restricted column.
+
+    There is no new failure mode here. The binder already resolves the shape and
+    REFUSES a deployed model whose snapshot is unavailable
+    (``DeployedSnapshotUnavailableError`` -> 503, binder.py), never falling back
+    to draft. So a bound query for a deployed model always carries one, and
+    ``None`` means the model is genuinely undeployed — the case where the live
+    tables ARE the authority, mirroring the binder's own discipline.
+    """
+    return getattr(bound_query, "deployed_shape", None)
+
+
+def _restricted_uda_ids_from_shape(shape: Any, restricted_col_ids: list) -> set[str]:
+    """UDA ids reaching a restricted column, from the PINNED refs (Bug-9490).
+
+    The persona -> data-tag -> column restriction stays LIVE security policy;
+    only the UDA lineage it is intersected with comes from the snapshot, so a
+    draft edit to a UDA's column references cannot change a deployed decision.
+    """
+    restricted = {str(c) for c in restricted_col_ids}
+    return {
+        str(row.get("attribute_id"))
+        for row in (getattr(shape, "uda_column_ref_rows", None) or [])
+        if str(row.get("column_id")) in restricted
+    }
 
 
 async def _build_cls_closure(
@@ -2749,24 +2869,41 @@ async def _build_cls_closure(
     )
 
     if needs_uda:
-        uda_rows = (
-            await db.execute(
-                select(UserDefinedAttributeColumnRef.attribute_id)
-                .where(UserDefinedAttributeColumnRef.column_id.in_(restricted_col_ids))
+        # Bug-9490: same authority as the measures above.
+        _uda_shape = _cls_authority_shape(bound_query)
+        if _uda_shape is not None:
+            ctx.restricted_uda_ids = _restricted_uda_ids_from_shape(
+                _uda_shape, restricted_col_ids,
             )
-        ).scalars().all()
-        ctx.restricted_uda_ids = {str(a) for a in uda_rows}
+        else:
+            uda_rows = (
+                await db.execute(
+                    select(UserDefinedAttributeColumnRef.attribute_id)
+                    .where(
+                        UserDefinedAttributeColumnRef.column_id.in_(restricted_col_ids)
+                    )
+                )
+            ).scalars().all()
+            ctx.restricted_uda_ids = {str(a) for a in uda_rows}
         ctx.uda_restrictions_loaded = True
 
     if needs_measures:
-        meas_rows = (
-            await db.execute(
-                select(Measure).where(Measure.model_id == bound_query.model.id)
-            )
-        ).scalars().all()
+        # Bug-9490: the measure universe is the DEPLOYED one for a deployed
+        # model. Reading live rows here checked a deployed measure's lineage
+        # against the draft.
+        _shape = _cls_authority_shape(bound_query)
+        if _shape is not None:
+            meas_rows = list(getattr(_shape, "measures", None) or [])
+        else:
+            meas_rows = (
+                await db.execute(
+                    select(Measure).where(Measure.model_id == bound_query.model.id)
+                )
+            ).scalars().all()
         for meas in meas_rows:
             ctx.measures_by_id[str(meas.id)] = meas
             ctx.measures_by_name[meas.name] = meas
+        ctx.measure_universe_loaded = True
 
     if needs_phys_names:
         await _ensure_cls_physical_lookups(ctx, bound_query, restricted_col_ids, db)
@@ -2843,6 +2980,17 @@ async def _ensure_restricted_uda_ids(
         return
     if not _bound_query_can_reach_uda(bound_query):
         return
+    # Bug-9490: the lazy filter/ORDER BY/HAVING path must read the SAME
+    # authority as the eager one, or the split simply moves to the clause that
+    # never projects its object.
+    _shape = _cls_authority_shape(bound_query)
+    if _shape is not None:
+        ctx.restricted_uda_ids = _restricted_uda_ids_from_shape(
+            _shape, restricted_col_ids,
+        )
+        ctx.uda_restrictions_loaded = True
+        return
+
     from shared.db.models import UserDefinedAttributeColumnRef
 
     uda_rows = (
@@ -3415,14 +3563,25 @@ async def _block_restricted_ref_names(
                 )
         still = [n for n in unresolved if n not in dims_by_name]
         if still:
-            meas_rows = (
-                await db.execute(
-                    select(_Measure).where(
-                        _Measure.model_id == model_id,
-                        _Measure.name.in_(still),
+            # Bug-9490: resolve order/having names against the DEPLOYED
+            # universe. A name that exists only in draft is not servable, so
+            # leaving it unresolved is correct — the closure then fails closed.
+            _shape = _cls_authority_shape(bound_query)
+            if _shape is not None:
+                _wanted = set(still)
+                meas_rows = [
+                    m for m in (getattr(_shape, "measures", None) or [])
+                    if getattr(m, "name", None) in _wanted
+                ]
+            else:
+                meas_rows = (
+                    await db.execute(
+                        select(_Measure).where(
+                            _Measure.model_id == model_id,
+                            _Measure.name.in_(still),
+                        )
                     )
-                )
-            ).scalars().all()
+                ).scalars().all()
             for m in meas_rows:
                 meas_by_name.setdefault(getattr(m, "name", None), m)
         # Complete the closure so an order/having-only calculated / variant /
@@ -3430,17 +3589,33 @@ async def _block_restricted_ref_names(
         # unparseable expression) rather than silently under-detected because ctx
         # was built only for the projected objects.
         if meas_by_name:
-            all_meas = (
-                await db.execute(select(_Measure).where(_Measure.model_id == model_id))
-            ).scalars().all()
+            # Bug-9490: the completion universe must be the same authority as
+            # every other measure read, or the transitive walk resolves deployed
+            # objects through draft definitions.
+            _shape_all = _cls_authority_shape(bound_query)
+            if _shape_all is not None:
+                all_meas = list(getattr(_shape_all, "measures", None) or [])
+            else:
+                all_meas = (
+                    await db.execute(
+                        select(_Measure).where(_Measure.model_id == model_id)
+                    )
+                ).scalars().all()
             for m in all_meas:
                 ctx.measures_by_id.setdefault(str(m.id), m)
                 ctx.measures_by_name.setdefault(m.name, m)
+            ctx.measure_universe_loaded = True
             # Bug-7812: gate on the load FLAG, not set-emptiness — the
             # _ensure_cls_physical_lookups call above already loads the UDA
             # restrictions idempotently (and a legitimately empty set is a valid
             # loaded state that must not trigger a re-query).
-            if not ctx.uda_restrictions_loaded:
+            if not ctx.uda_restrictions_loaded and _shape_all is not None:
+                # Bug-9490: pinned UDA lineage, live restriction policy.
+                ctx.restricted_uda_ids = _restricted_uda_ids_from_shape(
+                    _shape_all, list(restricted_col_rows),
+                )
+                ctx.uda_restrictions_loaded = True
+            elif not ctx.uda_restrictions_loaded:
                 uda_rows = (
                     await db.execute(
                         select(_UdaColRef.attribute_id)
@@ -3500,10 +3675,14 @@ async def _restricted_having_columns(
     lq = bound_query.logical_query
     having_raw = getattr(lq, "having_raw", None)
     having_columns = getattr(lq, "having_columns", None) or []
-    if not having_raw and not having_columns:
+    measure_predicate_names = [
+        predicate.measure_name
+        for predicate in getattr(bound_query, "resolved_measure_filters", None) or []
+    ]
+    if not having_raw and not having_columns and not measure_predicate_names:
         return []
 
-    ref_names: list[Any] = list(having_columns)
+    ref_names: list[Any] = list(having_columns) + measure_predicate_names
     if having_raw:
         import sqlglot
         from sqlglot import exp as _sg_exp
@@ -3523,6 +3702,7 @@ async def _restricted_having_columns(
         if having_node is None:
             return ["(unverifiable HAVING)"]
         ref_names = [c.name for c in having_node.find_all(_sg_exp.Column)]
+        ref_names.extend(measure_predicate_names)
 
     return await _block_restricted_ref_names(
         ref_names, bound_query, restricted_ids, ctx, restricted_col_rows, db,
@@ -3666,7 +3846,12 @@ async def _check_column_restrictions(
         bound_query, restricted_ids, ctx, list(restricted_col_rows), db,
     )
 
-    if getattr(lq, "select_star", False):
+    # Bug-9899 / audit row A13: narrow a SERVER-EXPANDED star (``star_expanded``,
+    # set by the Named Query live dispatch) exactly as a literal ``SELECT *``.
+    # The deny branch below is for a caller who NAMED a restricted column; an
+    # expansion names nothing. Keeping the two shapes apart is what forced the
+    # Named Query path to carry its own copy of this narrowing.
+    if getattr(lq, "select_star", False) or getattr(lq, "star_expanded", False):
         kept_measures = [
             m for m in bound_query.resolved_measures
             if not _touches_restricted_columns(m, restricted_ids, ctx)

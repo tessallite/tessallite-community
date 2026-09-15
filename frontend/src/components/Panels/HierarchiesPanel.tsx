@@ -134,6 +134,30 @@ function attributeSourceForSelection(isUserDefined: boolean) {
   return isUserDefined ? "user_defined_attribute" : "physical_column";
 }
 
+/**
+ * Bug-8314: map a server level row to the create payload the history replayer
+ * sends back. The producer (deleteHierarchy) snapshots levels into the undo
+ * record's `__levels` key; useCanvasHistory's hierarchy adapter re-creates
+ * them with hierarchiesApi.createLevel in ordinal order. Field names must
+ * match HierarchyLevelCreate end to end (producer/consumer contract).
+ */
+export function hierarchyLevelToCreate(level: HierarchyLevel): HierarchyLevelCreate {
+  return {
+    name: level.name,
+    ordinal: level.ordinal,
+    key_attribute_id: level.key_attribute.id,
+    key_attribute_source: level.key_attribute.source,
+    description: level.description ?? undefined,
+    time_unit: level.time_unit ?? null,
+    allowed_time_calcs: level.allowed_time_calcs ?? [],
+    attributes: (level.attributes ?? []).map((a) => ({
+      attribute_id: a.attribute.id,
+      attribute_source: a.attribute.source,
+      role: a.role,
+    })),
+  };
+}
+
 // F-016-17: error messages are translated (the caller passes `t`) instead of
 // the previous hardcoded English strings shown directly to users.
 function parsePositionalSegments(
@@ -394,13 +418,26 @@ export default function HierarchiesPanel() {
 
   const deleteHierarchy = useMutation({
     mutationFn: async (hierarchy: Hierarchy) => {
+      // Bug-8314: snapshot the drill levels BEFORE the delete so undo can
+      // re-create them. The list row carries only header fields (level_count /
+      // level_names), not the level definitions. FAIL CLOSED (B1 witness A):
+      // a failed snapshot blocks the delete — proceeding would record a
+      // header-only undo and make the drill levels permanently lost. The
+      // rejection propagates to the mutation error state and is surfaced.
+      const levels = await hierarchiesApi.listLevels(
+        projectId!,
+        modelId!,
+        hierarchy.id,
+      );
       await hierarchiesApi.delete(projectId!, modelId!, hierarchy.id);
-      return hierarchy;
+      return { hierarchy, levels };
     },
-    onSuccess: (hierarchy) => {
+    onSuccess: ({ hierarchy, levels }) => {
       // Bug-8227: undo re-creates the hierarchy header from its prior values.
-      // NOTE: the re-create restores the hierarchy header only, not its drill
-      // levels (separate rows) — tracked as a follow-up (see intake).
+      // Bug-8314: `__levels` carries the level snapshot as replay metadata
+      // (stripped before the wire call by the hierarchy adapter in
+      // useCanvasHistory), so undo restores the drill levels too, not only the
+      // header shell.
       recordDelete(
         "hierarchy",
         hierarchy.id,
@@ -411,6 +448,7 @@ export default function HierarchiesPanel() {
           description: hierarchy.description ?? undefined,
           calendar_type: hierarchy.calendar_type ?? null,
           fiscal_year_start_month: hierarchy.fiscal_year_start_month ?? null,
+          __levels: levels.map(hierarchyLevelToCreate),
         },
       );
       refreshHierarchyQueries();
@@ -752,6 +790,14 @@ export default function HierarchiesPanel() {
         <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
           {t("hierarchies.description")}
         </Typography>
+
+        {/* B1: a failed delete (e.g. the level snapshot failed) must be
+            surfaced — the delete is deliberately blocked, not silently skipped. */}
+        {deleteHierarchy.isError ? (
+          <Alert severity="error" sx={{ mb: 2 }}>
+            {extractApiError(deleteHierarchy.error, t("hierarchies.deleteFailed"))}
+          </Alert>
+        ) : null}
 
         {/* Single "New" button opens a menu */}
         <Box sx={{ mb: 1.5 }}>

@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Modelling</span> / <span>Use the AI Optimiser</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-08-20</span></div>
+    <div class="article-meta"><span class="audience-badge">modeller</span><span class="updated">Updated 2026-09-12</span></div>
     <h1>Use the AI Optimiser</h1>
 <figure class="screencap"><img class="screencap" src="../assets/screencaps/ai-optimiser-recommendations.png" alt="AI optimiser recommendations panel."></figure>
 <h2>What this covers</h2>
@@ -20,6 +20,8 @@
 <h2>How the Optimiser works</h2>
 <p>Every time a query reaches the Query Router and no suitable aggregate exists to answer it, the miss is recorded in the query miss log. The Optimiser reads this log, groups misses by grain (the combination of dimensions and measures requested), and scores each group by the estimated query time that could be saved if an aggregate existed for that grain. The result is a ranked list of candidates ordered from highest to lowest ROI.</p>
 <p>The Optimiser requires data in the query miss log before it can make recommendations. At least some queries must have run against the model after it was published. If no queries have run yet, the recommendation list will be empty.</p>
+<p>Automatic optimisation uses workload records from the selected model. A field used inside a one-off calculation is not automatically a saved measure. Such queries remain in the history but do not become summary-build candidates when their calculation cannot be represented. Older records that name measures absent from the deployed model are also excluded; valid records remain eligible.</p>
+<p>Only successful, valid report queries contribute to automatic optimisation demand. This includes reports from BI tools, Excel, applications, the Agent and scheduled KPI evaluations. Queries rejected for unknown or forbidden fields, and queries that fail during execution, remain in error history but do not count as demand. Hierarchy previews, metadata discovery, pocket refreshes and dry-runs, security simulations, and named-set previews and refreshes are maintenance work, not report demand. You can filter explicitly labelled maintenance calls in query history using the Maintenance origin. A service account alone does not make a report internal maintenance.</p>
 <h2>Opening the AI Optimiser</h2>
 <ol><li>Open your project in Model Builder.</li><li>In the Toolbelt on the right side of the screen, click <strong>Optimiser</strong>.</li><li>The AI Optimiser panel opens and displays the current recommendation list.</li></ol>
 <h2>Reading the recommendation list</h2>

@@ -7,6 +7,7 @@
  *          midpoint and side anchors for manual routing.
  */
 import { useEffect, useCallback, useMemo, useRef, useState } from "react";
+import { Alert } from "@mui/material";
 import { useT } from "../../i18n";
 import ReactFlow, {
   Background,
@@ -31,6 +32,9 @@ import AccountTreeIcon from "@mui/icons-material/AccountTree";
 import CameraAltIcon from "@mui/icons-material/CameraAlt";
 import LinkIcon from "@mui/icons-material/Link";
 import NoteIcon from "@mui/icons-material/StickyNote2Outlined";
+import MapIcon from "@mui/icons-material/Map";
+import CloseIcon from "@mui/icons-material/Close";
+import CableIcon from "@mui/icons-material/Cable";
 import SearchIcon from "@mui/icons-material/Search";
 import UndoIcon from "@mui/icons-material/Undo";
 import RedoIcon from "@mui/icons-material/Redo";
@@ -40,6 +44,23 @@ import { extractApiError } from "../../utils/extractApiError";
 import { useBuilderStore } from "../../store/builderStore";
 import { useModelEditorStore } from "../../store/useModelEditorStore";
 import { useConfirm } from "../Confirm/useConfirm";
+import { buildLayoutSnapshot } from "./layout/layoutSnapshot";
+import { useCanvasLayout, type LayoutRunContext } from "./layout/useCanvasLayout";
+import CanvasLayoutPanel, { type CanvasLayoutPreference } from "./layout/CanvasLayoutPanel";
+import { movableIdsFor } from "./layout/movableSet";
+// The same validator the worker applies to a snapshot's options, reused so a
+// persisted preference is read back under exactly one rule.
+import { defaultOptions } from "./layout/geometry";
+import { dispositionFor } from "./layout/failurePolicy";
+import { applyRouteLock } from "./layout/routeLock";
+import { baseRatioForDroppedPoint, parallelOffsetFor } from "./layout/docking";
+import { mergeEdgeEntry, mergeTableEntry } from "./layout/presentationEntries";
+import { styleForTableEntry } from "./layout/tablePresentation";
+import { displayedRouteFor, routePolyline } from "./layout/displayedRoutes";
+import { changedCards, lockedEndpointIds, lockedRouteIntrusions, type LockedRouteGeometry } from "./layout/lockedRoutes";
+import { type DisplayedRoute, isFreezableRoute } from "./edgeGeometry";
+import type { AnchorSide, Rect } from "./layout/types";
+import type { LayoutOperation, LayoutOptions as CanvasLayoutOptions, LayoutResult } from "./layout/types";
 import {
   useAggregates,
   useDimensions,
@@ -65,23 +86,16 @@ import {
   computeClsRestrictedObjectIds,
   summarizeDefaultFilters,
 } from "./personaOverlay";
-import { positionsFromNodes, useCanvasHistory, type NodePositions } from "./useCanvasHistory";
-import dagre from "@dagrejs/dagre";
-import {
-  forceSimulation, forceLink, forceManyBody, forceCollide,
-  forceRadial, forceX, forceY,
-  type SimulationNodeDatum,
-} from "d3-force";
-
-interface ForceNode extends SimulationNodeDatum {
-  id: string;
-  width: number;
-  height: number;
-  fact: boolean;
-}
+import { positionsFromNodes, useCanvasHistory, type EdgeLayouts, type NodePositions } from "./useCanvasHistory";
 
 // Minimap hides on narrow viewports (mobile/small tablet).
 const MINIMAP_MIN_VW = 900;
+
+// Bug-7401: the model-annotations notes field has no backend length
+// constraint (a plain Postgres TEXT column in the canvas layout blob) — this
+// is a client-side UX guard against an unbounded, ever-growing layout JSON,
+// not a mirror of a server-enforced limit.
+const NOTES_MAX_LENGTH = 2000;
 
 function minimapNodeColor(node: Node): string {
   const data = node.data as ERDNodeData | undefined;
@@ -97,22 +111,32 @@ function minimapNodeColor(node: Node): string {
 const NODE_TYPES = { erdTable: ERDTableNode };
 const EDGE_TYPES = { crowsFoot: CrowsFootEdge };
 
-// ---------------------------------------------------------------------------
-// Layout engine — d3-force (collision-aware radial) + dagre (hierarchical).
-// ---------------------------------------------------------------------------
-
-function nodeDim(n: Node): { w: number; h: number } {
-  return { w: (n as any).width || 260, h: (n as any).height || 200 };
+/**
+ * Bug-8762: remove an edge's waypoint fields copy-on-write.
+ *
+ * `layoutRef` aliases the React Query cache object, so the two deletion paths
+ * (handleResetEdge and onWaypointReset) must never delete keys from a cached
+ * nested entry in place — a failed persistence PATCH would then leave the
+ * client cache inconsistent with the server until reload. Both paths share
+ * this primitive so the invariant lives in one place; the input `edges` object
+ * and its entries are never mutated.
+ */
+export function clearEdgeWaypoints(
+  edges: EdgeLayouts | undefined,
+  joinId: string,
+): EdgeLayouts {
+  const next = { ...(edges ?? {}) };
+  const entry = next[joinId];
+  if (entry) {
+    next[joinId] = { ...entry };
+    delete next[joinId].waypoint;
+    delete next[joinId].waypoints;
+    if (Object.keys(next[joinId]).length === 0) delete next[joinId];
+  }
+  return next;
 }
 
-type AnchorSide = "left" | "right" | "top" | "bottom";
-
-interface LayoutAnchor {
-  sourceSide: AnchorSide;
-  targetSide: AnchorSide;
-  sourceRatio: number;
-  targetRatio: number;
-}
+// ---------------------------------------------------------------------------
 
 interface SideEndpoint {
   edgeId: string;
@@ -120,188 +144,17 @@ interface SideEndpoint {
   sortCoord: number;
 }
 
-function clampAnchorRatio(value: number): number {
-  return Math.max(0.08, Math.min(0.92, value));
-}
-
-function sideRatioToward(
-  pos: { x: number; y: number },
-  dim: { w: number; h: number },
-  side: AnchorSide,
-  towardCenter: { x: number; y: number },
-): number {
-  if (side === "left" || side === "right") {
-    return clampAnchorRatio((towardCenter.y - pos.y) / dim.h);
-  }
-  return clampAnchorRatio((towardCenter.x - pos.x) / dim.w);
-}
-
-function distributeLayoutAnchors(
-  edges: Edge[],
-  tableMap: Record<string, { x: number; y: number }>,
-  dims: Map<string, { w: number; h: number }>,
-): Map<string, LayoutAnchor> {
-  const anchors = new Map<string, LayoutAnchor>();
-  const sideGroups = new Map<string, SideEndpoint[]>();
-
-  const addEndpoint = (
-    edgeId: string,
-    endpoint: "source" | "target",
-    nodeId: string,
-    side: AnchorSide,
-    sortCoord: number,
-  ) => {
-    const key = `${nodeId}:${side}`;
-    const group = sideGroups.get(key) ?? [];
-    group.push({ edgeId, endpoint, sortCoord });
-    sideGroups.set(key, group);
-  };
-
-  for (const edge of edges) {
-    const srcPos = tableMap[edge.source];
-    const tgtPos = tableMap[edge.target];
-    const srcD = dims.get(edge.source);
-    const tgtD = dims.get(edge.target);
-    if (!srcPos || !tgtPos || !srcD || !tgtD) continue;
-
-    const scx = srcPos.x + srcD.w / 2;
-    const scy = srcPos.y + srcD.h / 2;
-    const tcx = tgtPos.x + tgtD.w / 2;
-    const tcy = tgtPos.y + tgtD.h / 2;
-    const dx = tcx - scx;
-    const dy = tcy - scy;
-
-    const sourceSide: AnchorSide = Math.abs(dx) >= Math.abs(dy)
-      ? (dx > 0 ? "right" : "left")
-      : (dy > 0 ? "bottom" : "top");
-    const targetSide: AnchorSide = Math.abs(dx) >= Math.abs(dy)
-      ? (dx < 0 ? "right" : "left")
-      : (dy < 0 ? "bottom" : "top");
-
-    anchors.set(edge.id, {
-      sourceSide,
-      targetSide,
-      sourceRatio: sideRatioToward(srcPos, srcD, sourceSide, { x: tcx, y: tcy }),
-      targetRatio: sideRatioToward(tgtPos, tgtD, targetSide, { x: scx, y: scy }),
-    });
-
-    const sourceSort = sourceSide === "left" || sourceSide === "right" ? tcy : tcx;
-    const targetSort = targetSide === "left" || targetSide === "right" ? scy : scx;
-    addEndpoint(edge.id, "source", edge.source, sourceSide, sourceSort);
-    addEndpoint(edge.id, "target", edge.target, targetSide, targetSort);
-  }
-
-  for (const group of sideGroups.values()) {
-    group.sort((a, b) => a.sortCoord - b.sortCoord || a.edgeId.localeCompare(b.edgeId));
-    const count = group.length;
-    group.forEach((endpoint, index) => {
-      const anchor = anchors.get(endpoint.edgeId);
-      if (!anchor) return;
-      const ratio = count === 1 ? 0.5 : (index + 1) / (count + 1);
-      if (endpoint.endpoint === "source") anchor.sourceRatio = ratio;
-      else anchor.targetRatio = ratio;
-    });
-  }
-
-  return anchors;
-}
+type LayoutPreset = "radial" | "hierarchical" | "compact";
 
 /**
- * d3-force radial layout: facts cluster in the centre, dims orbit around.
- *
- * `pinnedIds` (F-026-03): nodes that already have a user-placed / persisted
- * position are pinned with `fx`/`fy` so the simulation does not move them.
- * Only unpinned nodes (genuinely new / unpositioned tables) settle. When
- * `pinnedIds` is empty (first-ever layout of a model), every node settles as
- * before. This stops a hand-arranged diagram from being scrambled the moment
- * one new table is added.
+ * Initial placement of genuinely new tables waits for React Flow to measure the
+ * cards, because placing from placeholder sizes is exactly what the layout spec
+ * forbids. The wait is bounded: if measurement never arrives the tables stay
+ * where they are and the user can press an Arrange action, rather than the
+ * canvas inventing positions from placeholder geometry.
  */
-function layoutForceRadial(nodes: Node[], edges: Edge[], pinnedIds?: Set<string>): Node[] {
-  const factIds = new Set(
-    nodes.filter((n) => (n.data as ERDNodeData).table?.table_type === "fact").map((n) => n.id),
-  );
-  const isFact = (id: string) => factIds.has(id);
-  const pinned = pinnedIds ?? new Set<string>();
-
-  const fnodes: ForceNode[] = nodes.map((n) => {
-    const { w, h } = nodeDim(n);
-    const fnode: ForceNode = { id: n.id, width: w, height: h, fact: isFact(n.id), x: n.position.x, y: n.position.y };
-    if (pinned.has(n.id)) {
-      // Pin to the current position so existing tables stay put.
-      fnode.fx = n.position.x;
-      fnode.fy = n.position.y;
-    }
-    return fnode;
-  });
-
-  const links = edges.map((e) => ({
-    source: fnodes.find((f) => f.id === e.source)!,
-    target: fnodes.find((f) => f.id === e.target)!,
-  }));
-  const dimensionCount = fnodes.length - factIds.size;
-  const ringRadius = Math.max(320, (dimensionCount * 320) / (2 * Math.PI));
-
-  const sim = forceSimulation<ForceNode>(fnodes)
-    .force("link", forceLink<ForceNode, { source: ForceNode; target: ForceNode }>(links)
-      .distance(250)
-      .strength(0.4))
-    .force("charge", forceManyBody().strength(-1200))
-    .force("collide", forceCollide<ForceNode>()
-      .radius((d) => Math.max(d.width, d.height) / 2 + 30)
-      .strength(1))
-    .force("factX", forceX<ForceNode>(0).strength((d) => d.fact ? 0.25 : 0))
-    .force("factY", forceY<ForceNode>(0).strength((d) => d.fact ? 0.25 : 0))
-    .force("dimensionRing", forceRadial<ForceNode>(ringRadius, 0, 0)
-      .strength((d) => d.fact ? 0 : 0.2))
-    .stop();
-
-  for (let i = 0; i < 500; i++) sim.tick();
-
-  return nodes.map((n) => {
-    const f = fnodes.find((d) => d.id === n.id);
-    if (!f || f.x == null || f.y == null) return n;
-    return { ...n, position: { x: f.x, y: f.y } };
-  });
-}
-
-/** dagre hierarchical — rankdir TB, configurable spacing. */
-function dagreLayout(nodes: Node[], edges: Edge[], opts: { rankdir: string; nodesep: number; ranksep: number }): Node[] {
-  const g = new dagre.graphlib.Graph();
-  g.setDefaultEdgeLabel(() => ({}));
-  g.setGraph({ rankdir: opts.rankdir, nodesep: opts.nodesep, ranksep: opts.ranksep, marginx: 40, marginy: 40 });
-
-  for (const n of nodes) {
-    const { w, h } = nodeDim(n);
-    g.setNode(n.id, { width: w, height: h });
-  }
-  for (const e of edges) {
-    g.setEdge(e.source, e.target);
-  }
-
-  dagre.layout(g);
-
-  return nodes.map((n) => {
-    const pos = g.node(n.id);
-    if (!pos) return n;
-    return {
-      ...n,
-      position: {
-        x: pos.x - pos.width! / 2,
-        y: pos.y - pos.height! / 2,
-      },
-    };
-  });
-}
-
-function layoutHierarchical(nodes: Node[], edges: Edge[]): Node[] {
-  return dagreLayout(nodes, edges, { rankdir: "TB", nodesep: 100, ranksep: 120 });
-}
-
-function layoutCompact(nodes: Node[], edges: Edge[]): Node[] {
-  return dagreLayout(nodes, edges, { rankdir: "TB", nodesep: 60, ranksep: 80 });
-}
-
-type LayoutPreset = "radial" | "hierarchical" | "compact";
+const INITIAL_PLACEMENT_RETRY_MS = 150;
+const INITIAL_PLACEMENT_MAX_ATTEMPTS = 20;
 
 // ---------------------------------------------------------------------------
 // Props
@@ -358,6 +211,12 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
   useEffect(() => {
     liveNodesRef.current = nodes;
   }, [nodes]);
+  // The locked-route guard runs in a post-commit effect, after the gesture, so
+  // it reads the edges through a ref rather than closing over a render's copy.
+  const liveEdgesRef = useRef<Edge[]>([]);
+  useEffect(() => {
+    liveEdgesRef.current = edges;
+  }, [edges]);
 
   // Hold the publish callback in a ref so the "drop controls on unmount" effect
   // below is NOT keyed on the callback's identity. The parent passes an inline
@@ -383,6 +242,11 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
   );
 
   const isConnectingMode = useBuilderStore((s) => s.isConnectingMode);
+  const relationPathing = useBuilderStore((s) => s.relationPathing);
+  // Read reactively (not through getState) because the lock state is resolved
+  // during render: the marker extents decide where the frozen heels sit.
+  const relationNotation = useBuilderStore((s) => s.relationNotation);
+  const relationTerminalOverrides = useBuilderStore((s) => s.relationTerminalOverrides);
 
   // ---- 8.B.7 Persona preview overlay state --------------------------
   // Canvas-local selection — not persisted.  Picker auto-hides when no
@@ -401,6 +265,24 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
     window.addEventListener("resize", handle);
     return () => window.removeEventListener("resize", handle);
   }, []);
+
+  /**
+   * Two canvas view controls, both deliberately session-only.
+   *
+   * Neither is persisted and neither is seeded from the saved layout: opening a
+   * model always starts with the Joins drawer enabled and the minimap shown.
+   * They exist to get something out of the way for a minute, not to express a
+   * preference — a hidden setting that survived a reload would leave the
+   * modeller wondering why the canvas behaves differently from a colleague's.
+   */
+  const [joinsDrawerSuppressed, setJoinsDrawerSuppressed] = useState(false);
+  const [minimapDismissed, setMinimapDismissed] = useState(false);
+  // Every model change returns both to their defaults.
+  useEffect(() => {
+    setJoinsDrawerSuppressed(false);
+    setMinimapDismissed(false);
+  }, [projectId, modelId]);
+  const minimapVisible = showMinimap && !minimapDismissed;
   const selectObject      = useBuilderStore((s) => s.selectObject);
   const openPanel         = useBuilderStore((s) => s.openPanel);
   const closePanel        = useBuilderStore((s) => s.closePanel);
@@ -463,30 +345,104 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
    *   server hydrate / model-change reset  no guard — not a user edit
    *   applyMovePositions                   guarded
    *   applyEdgeLayouts                     guarded
+   *   applyTableLayouts                    guarded
+   *   restoreLayoutState                   guarded — the gesture rollback
+   *   handleRepairRoutes (keep-geometry)   guarded via handleRepairRoutes'
+   *     own read-only entry, taken when the engine never rendered a verdict
+   *   handleTogglePin                      guarded
+   *   toggleRouteLockFor                   guarded — takes the relationship
+   *     explicitly, so both the layout panel and the Joins panel reach one writer
+   *   persistLayoutPreferences             guarded
    *   handleRedrawLayout                   guarded
+   *   handleApplyLayout                    guarded — Reroute Links returns
+   *     overridden relationships to the model-wide Edge Pathing setting
    *   handleSaveNotes                      guarded
-   *   handleResetEdge                      guarded
-   *   handleTogglePathingAuto              guarded
+   *   commitRouteEdit                      guarded — the single lock-aware,
+   *     history-recording writer for every route-only edit: Reset Path and
+   *     Toggle Path Style from the Joins panel, and bend edit/reset from the
+   *     connector itself. Two of those four used to bypass the route lock
    *   handleNodeResize                     guarded (Bug-7636)
    *   handleNodesChange                    guarded
-   *   onWaypointsChange / onWaypointReset /
-   *     onSourceSideChange / onTargetSideChange   guarded
-   *   hydrate auto-placement of unplaced nodes    no guard — system-derived;
-   *     CAN ride a post-flip flush like any other orphaned write, accepted
-   *     because the value is a position for a table that had none and is
-   *     identical to what an editor session would compute. (R3: the earlier
-   *     "never flushed" wording here was false in exactly the flip scenario
-   *     the rest of this table exists for — a wrong justification column is
-   *     the same blind spot as a missing row, because the next reader stops
-   *     looking.)
+   *   commitAttachmentChange                   guarded — the single writer both
+   *     attachment-drag callbacks delegate to, so the effective-to-base ratio
+   *     conversion and the route repair happen once rather than in two copies
+   *   hydrate auto-placement of unplaced nodes — NO LONGER A WRITE SITE. The
+   *     canvas stopped computing initial placement on the render thread: the
+   *     spec requires it to wait for measured card geometry and to run off the
+   *     UI thread, so hydration only records which tables are new and the
+   *     positions are written by the guarded `handleRedrawLayout` writer below
+   *     when the worker batch is applied. The row is kept as a pointer because a
+   *     reader diffing this table against history would otherwise conclude the
+   *     site was lost rather than relocated.
    */
-  const persistLayout = useCallback((): Promise<void> => {
-    if (readOnlyRef.current) return Promise.resolve();
-    userDirtyRef.current = true;
+  /**
+   * A save may not carry geometry the engine has not accepted.
+   *
+   * A gesture writes its result into `layoutRef.current` immediately, because
+   * the canvas has to draw it. But that same object is what every save path
+   * sends to the server, so between the gesture and the end of route repair the
+   * canvas was one debounce away from persisting CANDIDATE tables next to the
+   * OLD routes — a saved diagram whose cards and connectors disagree. Not
+   * scheduling a new save is not the same as isolating an uncommitted edit: a
+   * debounce from the previous action, an explicit layout-only Save, or the
+   * unmount flush could all still fire.
+   *
+   * So a save that lands mid-transaction is DEFERRED, not downgraded. Sending
+   * the last accepted geometry instead would be safe but would quietly drop the
+   * user's newest edit; waiting sends the whole, coherent state a moment later.
+   * The wait is bounded because every exit from a repair settles the candidate,
+   * and the worker itself has a hard timeout.
+   *
+   * `candidateHeldRef` false means the live object is accepted and savable.
+   */
+  const candidateHeldRef = useRef(false);
+  const deferredSaveRef = useRef<Array<() => void>>([]);
+
+  const persistLayoutNow = useCallback((): Promise<void> => {
     return modelsApi
       .update(projectId, modelId, { canvas_layout: layoutRef.current })
       .then(() => {});
   }, [projectId, modelId]);
+  const persistLayoutNowRef = useRef(persistLayoutNow);
+  persistLayoutNowRef.current = persistLayoutNow;
+
+  /** Hold saves: the live geometry is a candidate the engine has not judged. */
+  const beginCandidateGeometry = useCallback(() => {
+    candidateHeldRef.current = true;
+  }, []);
+
+  /**
+   * The live geometry is accepted. Release any save that arrived while it was
+   * held, so a deferred Save Now is honoured rather than silently dropped.
+   *
+   * Called on EVERY exit from a repair transaction — committed, restored, kept
+   * because the engine never answered, abandoned, or refused before it started.
+   * An exit that forgets to settle would stop the canvas saving for the rest of
+   * the session, which is worse than the unsafe save this prevents.
+   */
+  const acceptGeometry = useCallback(() => {
+    candidateHeldRef.current = false;
+    const waiting = deferredSaveRef.current;
+    if (!waiting.length) return;
+    deferredSaveRef.current = [];
+    void persistLayoutNowRef.current()
+      .catch(() => {})
+      .finally(() => {
+        for (const resolve of waiting) resolve();
+      });
+  }, []);
+
+  const persistLayout = useCallback((): Promise<void> => {
+    if (readOnlyRef.current) return Promise.resolve();
+    userDirtyRef.current = true;
+    if (candidateHeldRef.current) {
+      // Wait for the transaction to settle, then save the complete state.
+      return new Promise<void>((resolve) => {
+        deferredSaveRef.current.push(resolve);
+      });
+    }
+    return persistLayoutNow();
+  }, [persistLayoutNow]);
 
   const flushLayout = useCallback(() => {
     // Read-only sessions also skip marking the layout dirty — a dirty flag
@@ -553,8 +509,7 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
       if (readOnlyRef.current) return;
       const tableMap = { ...(layoutRef.current.tables ?? {}) };
       for (const [id, p] of Object.entries(positions)) {
-        const prev = tableMap[id] ?? {};
-        tableMap[id] = { ...prev, x: p.x, y: p.y };
+        tableMap[id] = mergeTableEntry(tableMap[id], { x: p.x, y: p.y });
       }
       layoutRef.current = { ...layoutRef.current, tables: tableMap };
       flushLayout();
@@ -585,6 +540,12 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
               sourceRatio: entry?.sourceRatio,
               targetRatio: entry?.targetRatio,
               pathing: entry?.pathing,
+              routeMode: entry?.routeMode,
+              // The lock is part of the edge layout: an undo that restored the
+              // path but not the lock would leave a frozen route unfrozen, or
+              // freeze one the user had released.
+              locked: entry?.locked === true,
+              lockedParallelOffset: entry?.lockedParallelOffset,
             },
           };
         }),
@@ -593,7 +554,37 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
     [flushLayout, setEdges],
   );
 
-  const { beginMove, endMove, recordMove, undo, redo, canUndo, canRedo } =
+  /**
+   * Undo/redo of a change that alters a table's presentation without moving it
+   * — pinning — restores the full table-layout snapshot through here, so the
+   * pin comes back with the same persistence path a drag uses.
+   */
+  const applyTableLayouts = useCallback(
+    (tables: NonNullable<CanvasLayout["tables"]>) => {
+      if (readOnlyRef.current) return; // same undo/redo entry point as above
+      const next = JSON.parse(JSON.stringify(tables)) as NonNullable<CanvasLayout["tables"]>;
+      layoutRef.current = { ...layoutRef.current, tables: next };
+      flushLayout();
+      setNodes((ns) =>
+        ns.map((node) => {
+          const entry = next[node.id];
+          // Previously this compared the pin and returned the node UNCHANGED
+          // when the pin had not moved — so undoing a resize wrote the old
+          // height into the saved layout while the card stayed at its new size
+          // on screen, with the restored connectors drawn around the wrong
+          // rectangle. The card's geometry is part of the state being restored.
+          return {
+            ...node,
+            style: styleForTableEntry(node.style as Record<string, unknown> | undefined, entry),
+            data: { ...node.data, pinned: entry?.pinned === true },
+          };
+        }),
+      );
+    },
+    [flushLayout, setNodes],
+  );
+
+  const { recordMove, undo, redo, canUndo, canRedo } =
     useCanvasHistory(
       nodes,
       setNodes,
@@ -602,6 +593,7 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
       queryClient,
       applyMovePositions,
       applyEdgeLayouts,
+      applyTableLayouts,
       // F-026-19: an undo/redo whose join create/delete fails (network/4xx)
       // restores the action to its stack; surface the cause instead of letting
       // the rejection escape the onClick handler.
@@ -618,92 +610,1186 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
       readOnly,
     );
   const isDraggingRef = useRef(false);
+  /** One refusal message per gesture, not one per pointer-move frame (R06). */
+  const frozenMoveNoticeRef = useRef(false);
 
-  const handleRedrawLayout = useCallback((preset: LayoutPreset = "radial") => {
-    // R2 review: the preset BUTTON is hidden read-only, but the preset MENU
-    // renders on `layoutMenuOpen` alone, so a menu already open when the
-    // session flips survives with live entries. A redraw is destructive — it
-    // strips waypoint/waypoints from EVERY edge — so an unguarded click in a
-    // read-only session destroyed the editing user's manual edge routing, and
-    // the wipe then rode the next authorised flush.
-    if (readOnlyRef.current) return;
-    const beforePositions = positionsFromNodes(nodes);
-    // Snapshot the edge layout BEFORE the redraw clears waypoints, so undo can
-    // restore manual edge routing (review finding 2 / LOW-2). Deep-cloned so
-    // the history entry is immune to later mutation of layoutRef.
-    const beforeEdges = JSON.parse(
-      JSON.stringify(layoutRef.current.edges ?? {}),
-    ) as NonNullable<CanvasLayout["edges"]>;
-    let newNodes: Node[];
-    if (preset === "hierarchical") {
-      newNodes = layoutHierarchical(nodes, edges);
-    } else if (preset === "compact") {
-      newNodes = layoutCompact(nodes, edges);
-    } else {
-      newNodes = layoutForceRadial(nodes, edges);
+  // ---- Coordinated placement and routing (P1) ------------------------------
+  //
+  // Placement and coordinated orthogonal routing run in a module worker. The
+  // canvas only decides *when* to ask and whether a returned result is still
+  // current: `useCanvasLayout` refuses any result computed before a
+  // layout-relevant edit (drag, resize, join change, manual bend, undo, model
+  // switch) and refuses everything in a read-only session.
+  /**
+   * Everything one gesture or action owns, captured before it starts.
+   *
+   * `tables` is here as well as `positions` because a resize changes width and
+   * height, which a position map cannot carry: an undo that restored the old
+   * connector while leaving the new card size recreated the very attachment
+   * mismatch the repair had just fixed. Pins live in the same map, so they are
+   * restored by the same snapshot.
+   */
+  type LayoutTransactionState = {
+    positions: Record<string, { x: number; y: number }>;
+    /**
+     * Measured card rectangles at the start of the gesture.
+     *
+     * Positions alone cannot describe a resize: growing a card from its bottom
+     * or right edge leaves x and y untouched. The locked-route guard compared
+     * positions, so a card that grew straight across a frozen connector was not
+     * even considered a changed card — the one obstruction a locked route
+     * cannot route around, because it is not allowed to move.
+     */
+    rects: Map<string, Rect>;
+    tables: NonNullable<CanvasLayout["tables"]>;
+    edges: NonNullable<CanvasLayout["edges"]>;
+  };
+  const pendingLayoutBeforeRef = useRef<LayoutTransactionState | null>(null);
+  /**
+   * Pre/post-gesture state captured at drag start/end so the deferred repair
+   * can record ONE undo entry carrying the position change, the card sizes and
+   * the repaired routes together (F05). The repair itself runs in a post-commit
+   * effect because the synchronous gesture handler still holds pre-commit nodes.
+   *
+   * The transaction carries an IDENTITY. Without one, a gesture finishing after
+   * a newer gesture started would clear the newer one's captured state, and the
+   * newer gesture would then apply with no history record of its own. Only the
+   * transaction that is still live may commit, restore or clear.
+   */
+  const gestureSeqRef = useRef(0);
+  const liveGestureRef = useRef(0);
+
+  /**
+   * Ownership of an asynchronous canvas operation.
+   *
+   * A gesture counter alone is not ownership. The counter says "no newer
+   * gesture started"; it says nothing about WHICH MODEL is on the canvas. The
+   * builder renders Canvas without a model-specific key, so navigating to an
+   * already-cached model reuses this mount: a repair started on model A could
+   * finish after the shared refs had been refilled with model B, then write
+   * B's presentation to A's endpoint and push an A-before/B-after entry into
+   * B's history.
+   *
+   * So an operation owns the canvas only while all four still hold: the same
+   * project, the same model, the same mount (epoch), and the same gesture. An
+   * operation that has lost ownership must do NOTHING — not apply, not
+   * restore, not record history, not persist, not raise a message.
+   */
+  const epochRef = useRef(0);
+  const ownershipRef = useRef({ projectId, modelId });
+  if (ownershipRef.current.projectId !== projectId || ownershipRef.current.modelId !== modelId) {
+    ownershipRef.current = { projectId, modelId };
+    epochRef.current += 1;
+    // Any capture belonging to the previous model is now unreachable state.
+    liveGestureRef.current = ++gestureSeqRef.current;
+    // Including any candidate hold: it belongs to the previous model, and
+    // leaving it set would stop the NEW model saving at all.
+    candidateHeldRef.current = false;
+    deferredSaveRef.current = [];
+  }
+  useEffect(() => () => {
+    // Unmount retires every pending operation the same way a model change does.
+    epochRef.current += 1;
+  }, []);
+
+  type CanvasOperationToken = { projectId: string; modelId: string; epoch: number; gesture: number };
+  const claimCanvas = useCallback(
+    (): CanvasOperationToken => ({ projectId, modelId, epoch: epochRef.current, gesture: liveGestureRef.current }),
+    [projectId, modelId],
+  );
+  const stillOwnsCanvas = useCallback(
+    (token: CanvasOperationToken): boolean =>
+      token.projectId === ownershipRef.current.projectId &&
+      token.modelId === ownershipRef.current.modelId &&
+      token.epoch === epochRef.current &&
+      token.gesture === liveGestureRef.current,
+    [],
+  );
+  const pendingRepairBeforeRef = useRef<LayoutTransactionState | null>(null);
+  const pendingRepairAfterRef = useRef<Record<string, { x: number; y: number }> | null>(null);
+  const repairPendingRef = useRef(false);
+  const [repairTick, setRepairTick] = useState(0);
+  // `tableTypeMap` is derived later in this component. The snapshot builder only
+  // runs on an explicit layout action, so it reads the latest map through this
+  // ref instead of depending on a value declared further down.
+  const tableTypeMapRef = useRef<Map<string, string>>(new Map());
+  /** Tables hydration found genuinely new, awaiting a measured worker placement. */
+  /**
+   * Panel preferences, seeded from the saved layout (spec §5 `layoutOptions`).
+   *
+   * `defaultOptions` is the worker's own validator, reused rather than
+   * reimplemented: an absent field, an unknown preset from a newer build, or a
+   * hand-edited value all fall back to the same default the engine would apply,
+   * so the panel can never show a preference the engine would not honour.
+   */
+  const [layoutPreferences, setLayoutPreferences] = useState<CanvasLayoutPreference>(
+    () => defaultOptions(canvasLayout?.layoutOptions),
+  );
+  /**
+   * The user has chosen a preference in this session, so a late-arriving server
+   * payload must not overwrite it. Same hazard the notes text guards against:
+   * a background refetch resolving after the choice would otherwise revert it.
+   */
+  const layoutPreferencesDirtyRef = useRef(false);
+
+  useEffect(() => {
+    if (layoutPreferencesDirtyRef.current) return;
+    const saved = defaultOptions(canvasLayout?.layoutOptions);
+    // Bail out on an unchanged value rather than setting a fresh object every
+    // time the query cache hands back a new `canvasLayout` identity — this
+    // canvas has a history of render loops fed by exactly that (Bug-6373).
+    setLayoutPreferences((current) =>
+      current.preset === saved.preset &&
+      current.direction === saved.direction &&
+      current.spacing === saved.spacing
+        ? current
+        : saved,
+    );
+  }, [canvasLayout]);
+
+  /**
+   * Persist the preferences an arrangement actually succeeded with (spec §5:
+   * "last successfully applied panel options").
+   *
+   * Deliberately not called when a preference is merely chosen: a preset the
+   * engine refused, or a direction picked and never used, is not an applied
+   * option, and persisting it would make the next reload open with an
+   * arrangement that was never drawn.
+   */
+  const persistLayoutPreferences = useCallback(
+    (options: CanvasLayoutPreference) => {
+      if (readOnlyRef.current) return;
+      layoutRef.current = { ...layoutRef.current, layoutOptions: { ...options } };
+      flushLayout();
+    },
+    [flushLayout],
+  );
+  /**
+   * How many selected tables an `arrange-selected` batch would actually move.
+   *
+   * Resolved through the worker's own movable-table rule rather than by counting
+   * selected nodes, because a pinned table and the endpoints of a locked
+   * relationship are protected: counting the selection alone would enable the
+   * control for a batch the worker then refuses with "select at least one
+   * movable table".
+   */
+  const movableSelectedCount = useMemo(
+    () =>
+      movableIdsFor(
+        nodes.map((node) => ({
+          id: node.id,
+          pinned: (node.data as { pinned?: boolean } | undefined)?.pinned === true,
+          fixed: false,
+          selected: node.selected === true,
+        })),
+        edges.map((edge) => ({
+          source: edge.source,
+          target: edge.target,
+          locked: (edge.data as CrowsFootEdgeData | undefined)?.locked === true,
+        })),
+        "arrange-selected",
+      ).size,
+    [nodes, edges],
+  );
+  /**
+   * The selected relationship's route, and whether a lock could freeze it (R06).
+   *
+   * A lock persists the exact displayed polyline and stops anything from
+   * recomputing it, so it is only offered for a route that is actually
+   * drawable. The geometry comes from `resolveDisplayedRoute` — the same
+   * resolution the edge renderer uses — so what a lock freezes is what the user
+   * sees, not a second opinion about where the route ought to go.
+   */
+  const routeContext = useMemo(
+    () => ({
+      globalPathing: relationPathing,
+      notation: relationNotation,
+      terminalOverrides: relationTerminalOverrides,
+    }),
+    [relationPathing, relationNotation, relationTerminalOverrides],
+  );
+  const routeContextRef = useRef(routeContext);
+  routeContextRef.current = routeContext;
+
+  /**
+   * Live card rectangles: positions from the node state, sizes from React
+   * Flow's measurement. An unmeasured card is absent rather than guessed, the
+   * same split `buildWorkerSnapshot` uses.
+   */
+  const liveCardRects = useCallback((): Map<string, Rect> => {
+    const measured = new Map<string, { w: number; h: number }>();
+    for (const node of reactFlowInstance.current?.getNodes() ?? []) {
+      const w = typeof node.width === "number" ? node.width : undefined;
+      const h = typeof node.height === "number" ? node.height : undefined;
+      if (w !== undefined && h !== undefined && w > 0 && h > 0) measured.set(node.id, { w, h });
     }
-    setNodes(newNodes.map((n) => ({ ...n })));
-    const tableMap = { ...(layoutRef.current.tables ?? {}) };
-    newNodes.forEach((n) => {
-      tableMap[n.id] = { x: n.position.x, y: n.position.y };
+    const rects = new Map<string, Rect>();
+    for (const node of liveNodesRef.current) {
+      const size = measured.get(node.id);
+      if (!size) continue;
+      rects.set(node.id, { x: node.position.x, y: node.position.y, width: size.w, height: size.h });
+    }
+    return rects;
+  }, []);
+
+  /** Cards a locked relationship docks to. They must not move at all (R06). */
+  const lockedEndpoints = useMemo(
+    () =>
+      lockedEndpointIds(
+        edges.map((edge) => ({
+          id: edge.id,
+          source: edge.source,
+          target: edge.target,
+          locked: (edge.data as CrowsFootEdgeData | undefined)?.locked === true,
+        })),
+      ),
+    [edges],
+  );
+  const lockedEndpointsRef = useRef(lockedEndpoints);
+  lockedEndpointsRef.current = lockedEndpoints;
+
+  /** Both end cards of the selected relationship, highlighted together (R09). */
+  const joinHighlightIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const edge of edges) {
+      if (edge.selected !== true) continue;
+      ids.add(edge.source);
+      ids.add(edge.target);
+    }
+    return ids;
+  }, [edges]);
+
+  // Both per-card flags are written by one pass: whether a locked relationship
+  // is holding the card (so it withdraws its resize handles rather than resize
+  // and snap back), and whether it is an endpoint of the selected relationship.
+  // The updater returns the same array when nothing changed, so React Flow
+  // bails out and this cannot become a render loop (Bug-6373).
+  useEffect(() => {
+    setNodes((ns) => {
+      let changed = false;
+      const next = ns.map((node) => {
+        const frozen = lockedEndpoints.has(node.id);
+        const highlighted = joinHighlightIds.has(node.id);
+        const data = node.data as { lockedByRoute?: boolean; joinHighlighted?: boolean } | undefined;
+        if ((data?.lockedByRoute === true) === frozen && (data?.joinHighlighted === true) === highlighted) {
+          return node;
+        }
+        changed = true;
+        return { ...node, data: { ...node.data, lockedByRoute: frozen, joinHighlighted: highlighted } };
+      });
+      return changed ? next : ns;
     });
+  }, [lockedEndpoints, joinHighlightIds, setNodes]);
 
-    const dims = new Map<string, { w: number; h: number }>();
-    for (const n of newNodes) dims.set(n.id, nodeDim(n));
-    const anchors = distributeLayoutAnchors(edges, tableMap, dims);
+  type RouteLockInfo = {
+    id: string;
+    locked: boolean;
+    capture: DisplayedRoute | null;
+    routeMode: "auto" | "manual";
+    /** The path mode this relationship is currently DRAWN with. */
+    resolvedPathing: "orthogonal" | "straight";
+    /** The parallel fan-out it is currently drawn with. */
+    parallelOffset: number;
+  };
 
-    const next = { ...(layoutRef.current.edges ?? {}) };
-    for (const eid of Object.keys(next)) {
-      const entry = { ...next[eid] };
-      delete entry.waypoint;
-      delete entry.waypoints;
-      if (Object.keys(entry).length === 0) delete next[eid];
-      else next[eid] = entry;
-    }
+  /**
+   * Everything locking or unlocking one relationship needs to know.
+   *
+   * Taken for an explicit relationship rather than "whichever is selected", so
+   * the Joins panel can offer the same action. Selecting a relationship opens
+   * that drawer over the layout panel, which left Lock Route reachable only by
+   * pressing Escape first (Bug-10034).
+   */
+  const routeLockInfoFor = useCallback((edge: Edge): RouteLockInfo => {
+    const data = (edge.data ?? {}) as CrowsFootEdgeData;
 
-    for (const e of edges) {
-      const anchor = anchors.get(e.id);
-      if (!anchor) continue;
+    const live = liveCardRects();
+    const locked = data.locked === true;
 
-      const existing = next[e.id] ?? {};
-      next[e.id] = {
-        ...existing,
-        ...anchor,
+    // The fan-out this relationship is drawn with right now. Freezing it is
+    // what stops a relationship added later between the same two cards from
+    // moving a frozen attachment.
+    const parallelOffset =
+      data.lockedParallelOffset ?? parallelOffsetFor(data.offsetIndex ?? 0, data.totalEdges ?? 1);
+
+    const resolved = displayedRouteFor(edge, live, routeContext);
+    if (!resolved) {
+      return {
+        id: edge.id, locked, capture: null, routeMode: "auto",
+        resolvedPathing: data.pathing ?? routeContext.globalPathing, parallelOffset,
       };
     }
-    layoutRef.current = { ...layoutRef.current, tables: tableMap, edges: next };
-    // A layout redraw is one user action — record it as a single undo entry
-    // carrying BOTH table positions and the full before/after edge layout, so
-    // undo restores manual edge waypoints discarded by the redraw (LOW-2).
-    const afterEdges = JSON.parse(JSON.stringify(next)) as NonNullable<CanvasLayout["edges"]>;
-    recordMove(beforePositions, positionsFromNodes(newNodes), {
-      before: beforeEdges,
-      after: afterEdges,
+
+    return {
+      id: edge.id,
+      locked,
+      capture: isFreezableRoute(resolved.route, resolved.pathMode) ? resolved.route : null,
+      routeMode: resolved.routeMode,
+      // The RESOLVED mode, not the stored one: a route with no explicit
+      // `pathing` inherits the model setting, and that inherited mode is what
+      // the lock has to freeze — otherwise changing the model setting later
+      // discards the bends the lock just froze.
+      resolvedPathing: resolved.pathMode,
+      parallelOffset,
+    };
+  }, [liveCardRects, routeContext]);
+
+  const selectedRouteLock = useMemo((): RouteLockInfo | null => {
+    const selected = edges.filter((edge) => edge.selected === true);
+    // One relationship, or the lock state would be ambiguous.
+    if (selected.length !== 1) return null;
+    return routeLockInfoFor(selected[0]!);
+  }, [edges, nodes, routeLockInfoFor]);
+
+  const routeLockState: "none" | "invalid" | "locked" | "unlocked" =
+    !selectedRouteLock
+      ? "none"
+      : selectedRouteLock.locked
+        ? "locked"
+        : selectedRouteLock.capture
+          ? "unlocked"
+          : "invalid";
+
+  /**
+   * Freeze or release the selected relationship's route (R06).
+   *
+   * Locking writes the displayed geometry down — sides, base ratios and bends —
+   * because an automatic route has no stored path of its own: without the
+   * capture, reopening the model would recompute a different one and the lock
+   * would have frozen nothing. Provenance is preserved rather than rewritten:
+   * capturing an engine route does not make it the user's manual edit.
+   *
+   * Unlocking clears only the lock. It never discards the path (spec: no action
+   * discards a locked path) and never unpins a table — lock and pin are
+   * independent.
+   *
+   * Both directions are one undo entry carrying the complete before/after edge
+   * layout, the same entry shape a redraw records.
+   */
+  /**
+   * Lock or unlock ONE relationship's route.
+   *
+   * Takes the relationship explicitly. An earlier version made the argument
+   * optional and fell back to the selection — which quietly broke the panel
+   * button, because `onClick={handler}` hands React's MouseEvent to the first
+   * parameter. The event is truthy, so it was treated as the relationship, had
+   * no `capture`, and the handler returned without locking anything. Nothing
+   * failed; the button simply stopped working. An optional parameter on
+   * anything wired to an event handler is a trap.
+   */
+  const toggleRouteLockFor = useCallback((selection: RouteLockInfo | null) => {
+    if (readOnlyRef.current) return;
+    if (!selection) return;
+    const nextLocked = !selection.locked;
+    if (nextLocked && !selection.capture) return;
+
+    const before = JSON.parse(JSON.stringify(layoutRef.current.edges ?? {})) as NonNullable<CanvasLayout["edges"]>;
+    const entry = applyRouteLock({
+      current: layoutRef.current.edges?.[selection.id],
+      locked: nextLocked,
+      capture: selection.capture,
+      routeMode: selection.routeMode,
+      resolvedPathing: selection.resolvedPathing,
+      parallelOffset: selection.parallelOffset,
     });
-    setEdges((es) =>
-      es.map((e) => {
-        const edgeEntry = next[e.id];
-        return {
-          ...e,
-          data: {
-            ...e.data,
-            waypoint: undefined,
-            waypoints: undefined,
-            sourceSide: edgeEntry?.sourceSide,
-            targetSide: edgeEntry?.targetSide,
-            sourceRatio: edgeEntry?.sourceRatio,
-            targetRatio: edgeEntry?.targetRatio,
-            pathing: undefined,
-          },
-        };
-      }),
-    );
+    const nextEdges = { ...(layoutRef.current.edges ?? {}), [selection.id]: entry };
+    layoutRef.current = { ...layoutRef.current, edges: nextEdges };
     flushLayout();
-    setTimeout(() => {
-      reactFlowInstance.current?.fitView({ padding: 0.2, duration: 800 });
-    }, 50);
-    setLayoutMenuOpen(false);
-  }, [nodes, edges, setNodes, flushLayout, recordMove]);
+
+    setEdges((es) =>
+      es.map((edge) =>
+        edge.id === selection.id
+          ? {
+              ...edge,
+              data: {
+                ...edge.data,
+                // The rendered edge reads the same entry the layout persists,
+                // so the drawn route and the saved route cannot diverge.
+                locked: entry.locked === true,
+                sourceSide: entry.sourceSide,
+                targetSide: entry.targetSide,
+                sourceRatio: entry.sourceRatio,
+                targetRatio: entry.targetRatio,
+                waypoint: entry.waypoint,
+                waypoints: entry.waypoints,
+                routeMode: entry.routeMode,
+              },
+            }
+          : edge,
+      ),
+    );
+
+    const positions = positionsFromNodes(nodes);
+    recordMove(positions, positions, {
+      before,
+      after: JSON.parse(JSON.stringify(nextEdges)) as NonNullable<CanvasLayout["edges"]>,
+    });
+  }, [flushLayout, setEdges, recordMove, nodes]);
+
+  /** The layout panel's control, which acts on the selected relationship. */
+  const handleToggleRouteLock = useCallback(() => {
+    toggleRouteLockFor(selectedRouteLock);
+  }, [toggleRouteLockFor, selectedRouteLock]);
+
+  const toggleRouteLockForRef = useRef(toggleRouteLockFor);
+  toggleRouteLockForRef.current = toggleRouteLockFor;
+  const routeLockInfoForRef = useRef(routeLockInfoFor);
+  routeLockInfoForRef.current = routeLockInfoFor;
+
+  /**
+   * Pin state of the current table selection (R06).
+   *
+   * A pin protects a table from automatic placement, including the placement of
+   * newly added tables. It says nothing about the model — a pinned table is not
+   * semantically special — and it is independent of a route lock.
+   *
+   * The control acts on the whole selection, so the action is Unpin only when
+   * every selected table is already pinned; a mixed selection pins the rest,
+   * which is the outcome a user asking to "pin these" expects.
+   */
+  const selectedTablePins = useMemo(() => {
+    const selected = nodes.filter((node) => node.selected === true);
+    const pinnedCount = selected.filter(
+      (node) => (node.data as { pinned?: boolean } | undefined)?.pinned === true,
+    ).length;
+    return { ids: selected.map((node) => node.id), count: selected.length, pinnedCount };
+  }, [nodes]);
+
+  const pinState: "none" | "pinned" | "unpinned" =
+    selectedTablePins.count === 0
+      ? "none"
+      : selectedTablePins.pinnedCount === selectedTablePins.count
+        ? "pinned"
+        : "unpinned";
+
+  /**
+   * Pin or unpin every selected table, as one undo entry.
+   *
+   * The pin lives in the table layout rather than in the position map, so the
+   * history entry carries a table snapshot: a position diff cannot see it, and
+   * without the snapshot an undo would silently leave the pin behind.
+   */
+  const handleTogglePin = useCallback(() => {
+    if (readOnlyRef.current) return;
+    if (!selectedTablePins.ids.length) return;
+    const nextPinned = pinState !== "pinned";
+
+    const before = JSON.parse(JSON.stringify(layoutRef.current.tables ?? {})) as NonNullable<CanvasLayout["tables"]>;
+    const tableMap = { ...(layoutRef.current.tables ?? {}) };
+    for (const id of selectedTablePins.ids) {
+      const live = liveNodesRef.current.find((node) => node.id === id);
+      tableMap[id] = mergeTableEntry(
+        tableMap[id] ?? { x: live?.position.x ?? 0, y: live?.position.y ?? 0 },
+        { pinned: nextPinned },
+      );
+    }
+    layoutRef.current = { ...layoutRef.current, tables: tableMap };
+    flushLayout();
+
+    const pinnedIds = new Set(selectedTablePins.ids);
+    setNodes((ns) =>
+      ns.map((node) =>
+        pinnedIds.has(node.id) ? { ...node, data: { ...node.data, pinned: nextPinned } } : node,
+      ),
+    );
+
+    const positions = positionsFromNodes(nodes);
+    recordMove(positions, positions, undefined, {
+      before,
+      after: JSON.parse(JSON.stringify(tableMap)) as NonNullable<CanvasLayout["tables"]>,
+    });
+  }, [selectedTablePins, pinState, flushLayout, setNodes, recordMove, nodes]);
+
+  const initialPlacementRef = useRef<string[] | null>(null);
+  const initialPlacementAttemptsRef = useRef(0);
+  const [initialPlacementRetry, setInitialPlacementRetry] = useState(0);
+
+  const buildWorkerSnapshot = useCallback(
+    (revision: number, options: Partial<CanvasLayoutOptions>, context: LayoutRunContext) => {
+      // Measured card sizes supersede persisted ones: the engine must never
+      // place variable-height cards using identical placeholder dimensions.
+      const measured = new Map<string, { w: number; h: number }>();
+      for (const node of reactFlowInstance.current?.getNodes() ?? []) {
+        const w = typeof node.width === "number" ? node.width : undefined;
+        const h = typeof node.height === "number" ? node.height : undefined;
+        if (w !== undefined && h !== undefined && w > 0 && h > 0) measured.set(node.id, { w, h });
+      }
+      const persisted = layoutRef.current.tables ?? {};
+      const { relationTerminalOverrides, relationNotation, relationPathing } = useBuilderStore.getState();
+      return buildLayoutSnapshot({
+        projectId,
+        modelId,
+        revision,
+        globalPathing: relationPathing,
+        nodes: nodes.map((node) => ({
+          id: node.id,
+          position: { x: node.position.x, y: node.position.y },
+          measuredWidth: measured.get(node.id)?.w,
+          measuredHeight: measured.get(node.id)?.h,
+          provisionalWidth: persisted[node.id]?.w,
+          provisionalHeight: persisted[node.id]?.h,
+          tableType: tableTypeMapRef.current.get(node.id) ?? "",
+          // A transient movable set is expressed as "everything else is
+          // pinned", so initial placement moves only the new tables and no pin
+          // is persisted.
+          pinned: context.movableIds
+            ? !context.movableIds.has(node.id)
+            : (node.data as { pinned?: boolean } | undefined)?.pinned === true,
+          selected: node.selected === true,
+        })),
+        edges: edges.map((edge) => {
+          const data = (edge.data ?? {}) as CrowsFootEdgeData;
+          return {
+            id: edge.id,
+            source: edge.source,
+            target: edge.target,
+            sourceSide: data.sourceSide,
+            targetSide: data.targetSide,
+            sourceRatio: data.sourceRatio,
+            targetRatio: data.targetRatio,
+            offsetIndex: data.offsetIndex,
+            totalEdges: data.totalEdges,
+            pathing: data.pathing,
+            waypoint: data.waypoint,
+            waypoints: data.waypoints,
+            routeMode: data.routeMode,
+            locked: data.locked === true,
+            sourceIsFact: data.sourceIsFact === true,
+            targetIsFact: data.targetIsFact === true,
+            sourceIsDim: data.sourceIsDim === true,
+            targetIsDim: data.targetIsDim === true,
+            terminalOverride: relationTerminalOverrides?.[edge.id],
+            notation: relationNotation,
+          };
+        }),
+        options,
+      });
+    },
+    [projectId, modelId, nodes, edges],
+  );
+
+  /**
+   * Apply one coordinated layout result.
+   *
+   * Named `handleRedrawLayout` because it is the guarded writer the Canvas
+   * write-site enumeration and the Bug-8763 guard audit track for the layout
+   * redraw; it now applies a worker result instead of computing one locally.
+   *
+   * The read-only guard below is defence in depth for a *queued* worker result:
+   * the orchestrator already refuses to apply one in a read-only session, and
+   * this boundary refuses again rather than trusting that caller.
+   */
+  const handleRedrawLayout = useCallback(
+    (result: LayoutResult) => {
+      if (readOnlyRef.current) return;
+      const before = pendingLayoutBeforeRef.current;
+      pendingLayoutBeforeRef.current = null;
+
+      const tableMap = { ...(layoutRef.current.tables ?? {}) };
+      for (const [id, point] of Object.entries(result.positions)) {
+        tableMap[id] = mergeTableEntry(tableMap[id], { x: point.x, y: point.y });
+      }
+      const edgeMap = { ...(layoutRef.current.edges ?? {}) };
+      for (const route of Object.values(result.routes)) {
+        const previous = edgeMap[route.edgeId] ?? {};
+        // Preserve the explicit-vs-inherited distinction (F08): an edge with no
+        // stored `pathing` inherits the global preference, so the apply path
+        // must not write the resolved mode back as an explicit override — that
+        // would freeze the inherited mode and stop later global changes from
+        // applying to it.
+        const hadExplicitPathing = previous.pathing !== undefined;
+        edgeMap[route.edgeId] = mergeEdgeEntry(previous, {
+          // Named explicitly with `undefined`: the captured array supersedes the
+          // legacy single waypoint, and naming it is the only way a field is
+          // ever removed.
+          waypoint: undefined,
+          waypoints: route.waypoints.length ? route.waypoints : undefined,
+          sourceSide: route.sourceSide,
+          targetSide: route.targetSide,
+          sourceRatio: route.sourceRatio,
+          targetRatio: route.targetRatio,
+          pathing: hadExplicitPathing ? route.pathMode : undefined,
+          routeMode: route.routeMode,
+        });
+      }
+      layoutRef.current = { ...layoutRef.current, tables: tableMap, edges: edgeMap };
+
+      setNodes((current) =>
+        current.map((node) => {
+          const point = result.positions[node.id];
+          return point ? { ...node, position: { x: point.x, y: point.y } } : node;
+        }),
+      );
+      setEdges((current) =>
+        current.map((edge) => {
+          const route = result.routes[edge.id];
+          if (!route) return edge;
+          const data = (edge.data ?? {}) as CrowsFootEdgeData;
+          const hadExplicitPathing = data.pathing !== undefined;
+          return {
+            ...edge,
+            data: {
+              ...edge.data,
+              waypoint: undefined,
+              waypoints: route.waypoints.length ? route.waypoints : undefined,
+              sourceSide: route.sourceSide,
+              targetSide: route.targetSide,
+              sourceRatio: route.sourceRatio,
+              targetRatio: route.targetRatio,
+              pathing: hadExplicitPathing ? route.pathMode : undefined,
+              routeMode: route.routeMode,
+            },
+          };
+        }),
+      );
+      // One user action is one undo entry carrying the table positions, the
+      // table layout (sizes and pins) and the complete before/after edge layout,
+      // so undo restores the manual edge routing the redraw replaced
+      // (F-026-11 / LOW-2) AND the card geometry the gesture changed.
+      if (before) {
+        recordMove(
+          before.positions,
+          result.positions,
+          { before: before.edges, after: edgeMap },
+          { before: before.tables, after: JSON.parse(JSON.stringify(tableMap)) as NonNullable<CanvasLayout["tables"]> },
+        );
+      }
+      // The single flush for the whole transaction: geometry, history and
+      // persistence commit together, after the routes were repaired against
+      // the final geometry.
+      flushLayout();
+
+      // The engine arranges to the best reasonable effort rather than refusing
+      // to draw a dense diagram (Bug-10032). When it could not steer every
+      // relationship clear of every card, say so: an unannounced degrade is
+      // worse than the refusal it replaced, because the modeller cannot tell a
+      // crowded arrangement from a correct one.
+      if (result.metrics.throughNodeSegmentCount > 0) {
+        setGlobalMessage(
+          tRef.current("canvas.layoutCrowded", {
+            count: String(result.metrics.throughNodeSegmentCount),
+          }),
+          "info",
+        );
+      }
+    },
+    [flushLayout, recordMove, setNodes, setEdges, setGlobalMessage],
+  );
+
+  const layoutController = useCanvasLayout({
+    projectId,
+    modelId,
+    nodes,
+    edges,
+    relationPathing,
+    readOnly,
+    buildSnapshot: buildWorkerSnapshot,
+    applyResult: handleRedrawLayout,
+    onError: useCallback((message: string) => setGlobalMessage(message, "error"), [setGlobalMessage]),
+  });
+
+  /**
+   * Run one coordinated layout batch.
+   *
+   * `reroute-links` never changes a table coordinate; `arrange-all` and
+   * `arrange-selected` move only their movable set, leaving pinned cards and the
+   * endpoints of locked relationships in place.
+   */
+  const handleApplyLayout = useCallback(
+    async (
+      operation: LayoutOperation,
+      options: Partial<CanvasLayoutOptions> = {},
+      context: LayoutRunContext = {},
+    ): Promise<boolean> => {
+      if (readOnlyRef.current) return false;
+      // Captured before the batch starts so undo restores exactly this state.
+      const token = claimCanvas();
+      pendingLayoutBeforeRef.current = captureLayoutState();
+      setLayoutMenuOpen(false);
+
+      // Reroute Links returns every relationship to the model-wide Edge Pathing
+      // setting.
+      //
+      // A per-relationship `pathing` value overrides that setting, correctly —
+      // but an earlier build wrote one onto EVERY relationship each time the
+      // diagram was arranged, so whole models ended up with the setting
+      // silently overridden everywhere and changing it appeared to do nothing.
+      // Stopping that write fixes new models; it does nothing for the ones
+      // already carrying the overrides, and there was no action that cleared
+      // them. Reroute Links is that action: it is the command that already
+      // means "redraw every connector the way the model says".
+      //
+      // A LOCKED route keeps its override: the user froze that path, and its
+      // stored mode is part of what was frozen.
+      if (operation === "reroute-links") {
+        const edges = layoutRef.current.edges ?? {};
+        let cleared = false;
+        const next: NonNullable<CanvasLayout["edges"]> = {};
+        for (const [id, entry] of Object.entries(edges)) {
+          if (entry?.pathing !== undefined && entry.locked !== true) {
+            const { pathing: _dropped, ...rest } = entry;
+            next[id] = rest;
+            cleared = true;
+          } else {
+            next[id] = entry;
+          }
+        }
+        if (cleared) {
+          layoutRef.current = { ...layoutRef.current, edges: next };
+          setEdges((es) =>
+            es.map((e) =>
+              (e.data as CrowsFootEdgeData | undefined)?.locked === true
+                ? e
+                : { ...e, data: { ...e.data, pathing: undefined } },
+            ),
+          );
+        }
+      }
+      const outcome = await layoutController.run(operation, options, context);
+      // The batch may have outlived the model it was computed for. Clearing the
+      // pending capture or refitting the viewport now would act on whatever is
+      // on the canvas instead.
+      if (!stillOwnsCanvas(token)) return false;
+      if (!outcome.applied) {
+        pendingLayoutBeforeRef.current = null;
+        return false;
+      }
+      setTimeout(() => {
+        // Re-checked inside the timer too: 850ms is long enough for a model
+        // switch, and fitting the view is a visible action on the new model.
+        if (!stillOwnsCanvas(token)) return;
+        reactFlowInstance.current?.fitView({ padding: 0.2, duration: 800 });
+      }, 50);
+      return true;
+    },
+    [nodes, layoutController, claimCanvas, stillOwnsCanvas],
+  );
+
+  /** Snapshot everything a gesture can change, before it changes it. */
+  const captureLayoutState = useCallback((): LayoutTransactionState => {
+    const layout = layoutRef.current;
+    return {
+      positions: positionsFromNodes(liveNodesRef.current),
+      rects: new Map(liveCardRects()),
+      tables: JSON.parse(JSON.stringify(layout.tables ?? {})) as NonNullable<CanvasLayout["tables"]>,
+      edges: JSON.parse(JSON.stringify(layout.edges ?? {})) as NonNullable<CanvasLayout["edges"]>,
+    };
+  }, [liveCardRects]);
+
+  /**
+   * Put the canvas back exactly as the gesture found it.
+   *
+   * Used when a gesture's routes cannot be repaired: spec §4 requires the
+   * pre-gesture layout to be restored rather than a broken connector persisted.
+   * Only this transaction's owned state is restored — notes and viewport are
+   * deliberately untouched, because they are not part of the gesture.
+   */
+  const restoreLayoutState = useCallback(
+    (state: LayoutTransactionState) => {
+      if (readOnlyRef.current) return;
+      layoutRef.current = {
+        ...layoutRef.current,
+        tables: JSON.parse(JSON.stringify(state.tables)) as NonNullable<CanvasLayout["tables"]>,
+        edges: JSON.parse(JSON.stringify(state.edges)) as NonNullable<CanvasLayout["edges"]>,
+      };
+      flushLayout();
+      setNodes((ns) =>
+        ns.map((node) => {
+          const saved = state.tables[node.id];
+          const position = state.positions[node.id];
+          if (!saved && !position) return node;
+          return {
+            ...node,
+            position: position ? { x: position.x, y: position.y } : node.position,
+            style: styleForTableEntry(node.style as Record<string, unknown> | undefined, saved),
+            data: { ...node.data, pinned: saved?.pinned === true },
+          };
+        }),
+      );
+      setEdges((es) =>
+        es.map((edge) => {
+          const entry = state.edges[edge.id];
+          return {
+            ...edge,
+            data: {
+              ...edge.data,
+              waypoint: entry?.waypoint,
+              waypoints: entry?.waypoints,
+              sourceSide: entry?.sourceSide,
+              targetSide: entry?.targetSide,
+              sourceRatio: entry?.sourceRatio,
+              targetRatio: entry?.targetRatio,
+              pathing: entry?.pathing,
+              routeMode: entry?.routeMode,
+              locked: entry?.locked === true,
+              lockedParallelOffset: entry?.lockedParallelOffset,
+            },
+          };
+        }),
+      );
+    },
+    [flushLayout, setNodes, setEdges],
+  );
+
+  /**
+   * Locked relationships whose frozen path a card has been moved across.
+   *
+   * The frozen polyline is resolved from the same displayed-route rule the lock
+   * captured it with; its endpoint cards cannot move, so the path is stable and
+   * only the intruding card is new. `previous` bounds the check to cards this
+   * gesture actually moved — a card that was already sitting on a locked route
+   * when it was locked is not this gesture's doing and refusing it would make
+   * the canvas unusable.
+   */
+  const lockedRouteIntrusionsNow = useCallback(
+    (previous: Map<string, Rect>): string[] => {
+      const cards = liveCardRects();
+      const locked: LockedRouteGeometry[] = [];
+      for (const edge of liveEdgesRef.current) {
+        if ((edge.data as CrowsFootEdgeData | undefined)?.locked !== true) continue;
+        const resolved = displayedRouteFor(edge, cards, routeContextRef.current);
+        if (!resolved) continue;
+        locked.push({
+          id: edge.id,
+          source: edge.source,
+          target: edge.target,
+          points: routePolyline(resolved.route),
+        });
+      }
+      if (!locked.length) return [];
+
+      const moved = changedCards(previous, cards);
+      if (!moved.length) return [];
+
+      return lockedRouteIntrusions(locked, moved);
+    },
+    [liveCardRects],
+  );
+
+  /**
+   * The one boundary every route-only edit goes through.
+   *
+   * Two defects shared a cause: these edits were written inline, four times
+   * over, each copy responsible for remembering the rules.
+   *
+   * A locked route was not actually protected. Locking withdraws the edge's
+   * drag handles, but Reset Path and Toggle Path Style in the Joins panel stay
+   * available for any writable session, and their handlers checked read-only
+   * and nothing else. Reset deleted a frozen path's bends while leaving it
+   * marked locked — the lock was a label on geometry anyone could still change.
+   *
+   * And none of them recorded history, so Undo stepped straight past a manual
+   * connector edit to whatever happened before it, while the help page promises
+   * these edits are undoable.
+   *
+   * Returns false when the edit was refused, so the caller does not report
+   * success for something that did not happen.
+   */
+  const commitRouteEdit = useCallback(
+    (
+      edgeId: string,
+      nextEdgesFor: (edges: NonNullable<CanvasLayout["edges"]>) => NonNullable<CanvasLayout["edges"]>,
+      dataPatch: Record<string, unknown>,
+    ): boolean => {
+      if (readOnlyRef.current) return false;
+
+      if (layoutRef.current.edges?.[edgeId]?.locked === true) {
+        setGlobalMessage(tRef.current("canvas.lockedRouteEditRefused"), "info");
+        return false;
+      }
+
+      const beforeEdges = JSON.parse(
+        JSON.stringify(layoutRef.current.edges ?? {}),
+      ) as NonNullable<CanvasLayout["edges"]>;
+
+      const next = nextEdgesFor(layoutRef.current.edges ?? {});
+      layoutRef.current = { ...layoutRef.current, edges: next };
+      flushLayout();
+      setEdges((es) =>
+        es.map((e) => (e.id === edgeId ? { ...e, data: { ...e.data, ...dataPatch } } : e)),
+      );
+
+      // A route-only change moves no card, so the position maps are identical
+      // and the entry carries the edge snapshots alone. recordMove already
+      // accepts that shape; nothing here needs a second history stack.
+      const positions = positionsFromNodes(liveNodesRef.current);
+      recordMove(positions, positions, {
+        before: beforeEdges,
+        after: JSON.parse(JSON.stringify(next)) as NonNullable<CanvasLayout["edges"]>,
+      });
+      return true;
+    },
+    [flushLayout, recordMove, setEdges, setGlobalMessage],
+  );
+  // The Joins panel reaches the canvas through window events, whose listeners
+  // are registered once. They read the current committer through this ref
+  // rather than closing over a stale one.
+  const commitRouteEditRef = useRef(commitRouteEdit);
+  commitRouteEditRef.current = commitRouteEdit;
+
+  /**
+   * Commit an attachment the user dragged to a new point on a card.
+   *
+   * Three things were wrong with doing this inline in the edge callbacks.
+   *
+   * The pointer calculation produces an EFFECTIVE ratio — where on the border
+   * the heel sits — and it was stored as the BASE ratio, to which the renderer
+   * then adds this edge's parallel fan-out offset. The attachment landed beside
+   * where the user dropped it whenever the relationship had a parallel sibling.
+   *
+   * The existing bends were left untouched. Moving a right-side attachment on a
+   * 200-tall card from ratio .5 to .7 moves its heel from y=100 to y=140 while
+   * the first bend stays at y=100, so the first leg becomes DIAGONAL in a route
+   * the model says is orthogonal.
+   *
+   * And it wrote and flushed directly, so the edit never entered history and
+   * Undo stepped straight past it.
+   *
+   * All three are answered by committing through the same owned transaction a
+   * move or a resize uses: write the docking, then let the deferred repair fix
+   * the adjacent bends, validate the whole route, and record one history entry.
+   * A route that cannot be repaired is restored, exactly as a bad drag is.
+   */
+  const commitAttachmentChange = useCallback(
+    (
+      edgeId: string,
+      tableId: string,
+      end: "source" | "target",
+      side: string,
+      effectiveRatio: number,
+      offsetIndex: number,
+      totalEdges: number,
+    ) => {
+      if (readOnlyRef.current) return;
+      const rect = liveCardRects().get(tableId);
+      // Without a measured card there is no border to convert against, and
+      // storing the raw value is the defect this exists to prevent.
+      if (!rect) return;
+
+      const base = baseRatioForDroppedPoint(
+        rect,
+        side as AnchorSide,
+        effectiveRatio,
+        offsetIndex,
+        totalEdges,
+      );
+
+      const before = captureLayoutState();
+      const next = { ...(layoutRef.current.edges ?? {}) };
+      next[edgeId] = mergeEdgeEntry(next[edgeId], {
+        ...(end === "source"
+          ? { sourceSide: side, sourceRatio: base }
+          : { targetSide: side, targetRatio: base }),
+        routeMode: "manual",
+      });
+      layoutRef.current = { ...layoutRef.current, edges: next };
+      setEdges((es) =>
+        es.map((e) =>
+          e.id === edgeId
+            ? {
+                ...e,
+                data: {
+                  ...e.data,
+                  ...(end === "source"
+                    ? { sourceSide: side, sourceRatio: base }
+                    : { targetSide: side, targetRatio: base }),
+                  routeMode: "manual",
+                },
+              }
+            : e,
+        ),
+      );
+
+      // Not flushed here: the new docking is candidate geometry until the bends
+      // around it have been repaired and the route validated.
+      pendingRepairBeforeRef.current = before;
+      pendingRepairAfterRef.current = before.positions;
+      liveGestureRef.current = ++gestureSeqRef.current;
+      beginCandidateGeometry();
+      repairPendingRef.current = true;
+      setRepairTick((tick) => tick + 1);
+    },
+    [captureLayoutState, liveCardRects, setEdges, beginCandidateGeometry],
+  );
+
+  /**
+   * Repair engine-generated routes after a card move or resize (F05).
+   *
+   * Runs the worker `repair-routes` batch, which never moves a card and
+   * recomputes only `auto` routes; manual and locked geometry stays. It is the
+   * gesture's route-repair transaction, not a new placement action, so it does
+   * not close the panel or refit the viewport.
+   *
+   * Invoked from a post-commit effect (see below): the synchronous gesture
+   * handler still holds pre-commit `nodes`, so starting the batch there would
+   * build a snapshot of the old geometry that the stability guard then refuses
+   * — a silent no-op. The captured before/after state lets the apply path
+   * record ONE undo entry carrying positions and repaired routes together.
+   */
+  const handleRepairRoutes = useCallback(async () => {
+    // Every exit from here has to settle the candidate. A transaction that
+    // returns early without accepting leaves saves pinned to an old snapshot
+    // for the rest of the session, which is a silent stop-saving bug — worse
+    // than the unsafe save it was added to prevent.
+    if (readOnlyRef.current) {
+      acceptGeometry();
+      return;
+    }
+    const before = pendingRepairBeforeRef.current;
+    pendingRepairBeforeRef.current = null;
+    pendingRepairAfterRef.current = null;
+    if (!before) {
+      acceptGeometry();
+      return;
+    }
+
+    // R06: a card that the finished gesture has left lying across a locked
+    // relationship is refused here rather than up front, because most moves do
+    // not touch a locked path and refusing them all would make locking one
+    // relationship quietly freeze the whole diagram. The previous geometry is
+    // restored, so the canvas returns to a state where the frozen path is still
+    // the path drawn, and no undo entry is recorded — the gesture did not
+    // happen.
+    const intruded = lockedRouteIntrusionsNow(before.rects);
+    if (intruded.length) {
+      restoreLayoutState(before);
+      acceptGeometry(); // the restored geometry is the accepted geometry
+      setGlobalMessage(tRef.current("canvas.lockedRouteBlocked"), "warning");
+      return;
+    }
+
+    // This transaction's identity. A newer gesture starting while the repair is
+    // in flight makes this one stale, and a stale transaction may not commit,
+    // restore or clear — the newer gesture owns the canvas now.
+    const token = claimCanvas();
+    pendingLayoutBeforeRef.current = before;
+    const outcome = await layoutController.run("repair-routes", { preset: "hierarchical" });
+    if (outcome.applied) {
+      // handleRedrawLayout committed geometry, history and persistence together.
+      acceptGeometry();
+      return;
+    }
+
+    if (!stillOwnsCanvas(token)) {
+      // A newer gesture, a different model, or an unmount. The newer owner
+      // captured its own before-state and will commit or restore on its own;
+      // anything written here would land on top of it — or, after a model
+      // change, on a different model entirely.
+      //
+      // Releasing the candidate hold is not "writing": the newer owner has
+      // either set its own hold or owns accepted geometry already, and leaving
+      // this one set would block its saves.
+      acceptGeometry();
+      return;
+    }
+    pendingLayoutBeforeRef.current = null;
+
+    // What happens next is decided by ONE policy, in layout/failurePolicy.ts,
+    // rather than by a list of codes spelled out here. The previous list read
+    // "restore for geometry-invalid or no-route, otherwise keep" — and every
+    // untyped rejection reached the worker as `unknown`, so a genuine geometry
+    // rejection fell through to the keep-and-save branch.
+    const disposition = dispositionFor(outcome.failure ?? "unknown");
+
+    // A newer gesture or a different model owns the canvas now. Anything this
+    // continuation writes would be written over someone else's state.
+    if (disposition === "abandon") return;
+
+    // The engine judged this geometry undrawable: restore the pre-gesture
+    // layout rather than persist a broken connector, and record NO history
+    // entry, because the gesture did not happen.
+    if (disposition === "discard") {
+      restoreLayoutState(before);
+      acceptGeometry(); // the pre-gesture geometry is accepted again
+      setGlobalMessage(tRef.current("canvas.layoutRepairRestored"), "warning");
+      return;
+    }
+
+    // The engine never rendered a verdict — unavailable or timed out. There is
+    // no evidence the user's edit is bad, and discarding their work for an
+    // infrastructure failure would be worse than leaving the routes
+    // unrepaired. Keep the geometry, persist it, and record the gesture without
+    // the route repair.
+    layoutRef.current = {
+      ...layoutRef.current,
+      tables: { ...(layoutRef.current.tables ?? {}) },
+    };
+    // Deliberate: the engine never judged this geometry, and the product
+    // decision is to keep the user's edit rather than discard it for an
+    // infrastructure failure. Accepting it here is what makes it savable —
+    // leaving it as a candidate would silently stop persisting the canvas.
+    acceptGeometry();
+    flushLayout();
+    const after = positionsFromNodes(liveNodesRef.current);
+    recordMove(before.positions, after, undefined, {
+      before: before.tables,
+      after: JSON.parse(JSON.stringify(layoutRef.current.tables ?? {})) as NonNullable<CanvasLayout["tables"]>,
+    });
+  }, [
+    flushLayout,
+    recordMove,
+    layoutController,
+    lockedRouteIntrusionsNow,
+    restoreLayoutState,
+    setGlobalMessage,
+    acceptGeometry,
+    claimCanvas,
+    stillOwnsCanvas,
+  ]);
+  const handleRepairRoutesRef = useRef(handleRepairRoutes);
+  handleRepairRoutesRef.current = handleRepairRoutes;
+
+  // Run a pending repair after the gesture's geometry change has committed, so
+  // the snapshot and the stability signature both describe the final cards.
+  useEffect(() => {
+    if (!repairPendingRef.current) return;
+    repairPendingRef.current = false;
+    void handleRepairRoutesRef.current();
+  }, [repairTick, nodes, edges]);
+
+  // ---- Initial placement of genuinely new tables ---------------------------
+  useEffect(() => {
+    const pending = initialPlacementRef.current;
+    if (!pending || readOnly) return;
+
+    const measured = new Map<string, { width?: number | null; height?: number | null }>();
+    for (const node of reactFlowInstance.current?.getNodes() ?? []) {
+      measured.set(node.id, node);
+    }
+    const ready = pending.every((id) => {
+      const node = measured.get(id);
+      return (
+        !!node &&
+        typeof node.width === "number" && node.width > 0 &&
+        typeof node.height === "number" && node.height > 0
+      );
+    });
+
+    if (!ready) {
+      if (initialPlacementAttemptsRef.current >= INITIAL_PLACEMENT_MAX_ATTEMPTS) {
+        // Give up quietly: no placeholder-based positions are ever applied, and
+        // the user can still run an Arrange action explicitly.
+        initialPlacementRef.current = null;
+        initialPlacementAttemptsRef.current = 0;
+        return;
+      }
+      initialPlacementAttemptsRef.current += 1;
+      const timer = setTimeout(
+        () => setInitialPlacementRetry((tick) => tick + 1),
+        INITIAL_PLACEMENT_RETRY_MS,
+      );
+      return () => clearTimeout(timer);
+    }
+
+    // Claim the batch before starting so it cannot be started twice.
+    initialPlacementRef.current = null;
+    initialPlacementAttemptsRef.current = 0;
+    void handleApplyLayout(
+      "arrange-all",
+      { preset: "hierarchical" },
+      { movableIds: new Set(pending) },
+    );
+  }, [initialPlacementRetry, readOnly, nodes, handleApplyLayout]);
 
   // ---- Canvas export to PNG -----------------------------------------------
   const [searchOpen, setSearchOpen] = useState(false);
@@ -795,6 +1881,14 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
     }).catch(() => {});
   }, [setGlobalMessage]);
 
+  // Bug (user-reported 2026-08-24): the hidden-joins warning had no way to
+  // dismiss it and stayed on screen permanently, permanently covering canvas
+  // space even when the modeller had already seen it and chose not to add the
+  // missing tables. Track the count it was dismissed AT — if the situation
+  // changes (a different set of joins becomes hidden, or the count changes),
+  // the warning reappears, so a genuinely new problem is never silently
+  // suppressed by an old dismissal.
+  const [dismissedHiddenJoinsCount, setDismissedHiddenJoinsCount] = useState<number | null>(null);
   const [notesOpen, setNotesOpen] = useState(false);
   const [notesText, setNotesText] = useState<string>(() => {
     return canvasLayout?.notes ?? "";
@@ -870,6 +1964,11 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
       setNotesText(canvasLayout?.notes ?? "");
       notesDirtyRef.current = false;
       setNotesOpen(false);
+      // Same for the layout preferences: a choice made on model A is not a
+      // choice about model B, and leaving the dirty flag set would block model
+      // B's own saved options from seeding the panel.
+      layoutPreferencesDirtyRef.current = false;
+      setLayoutPreferences(defaultOptions(canvasLayout?.layoutOptions));
     }
   }, [modelId, canvasLayout]);
 
@@ -895,54 +1994,114 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
     // background model refetch granted authoring on the same Canvas mount.
     // Guard at the entry of each handler, exactly as the node-resize handler
     // already does, so read-only leaves no state behind at all.
+    // Reset Path, from the Joins panel. This is one of the two alternate
+    // writers that made a route lock a label rather than a guarantee: it stayed
+    // available for any writable session and deleted a frozen path's bends
+    // while leaving `locked: true` in place. It goes through the same boundary
+    // as the edge gestures now, so the lock refuses it and Undo can reverse it.
     const handleResetEdge = (e: Event) => {
-      if (readOnly) return;
       const joinId = (e as CustomEvent<string>).detail;
-      const next = { ...(layoutRef.current.edges ?? {}) };
-      if (next[joinId]) {
-        delete next[joinId].waypoint;
-        delete next[joinId].waypoints;
-        if (Object.keys(next[joinId]).length === 0) delete next[joinId];
-      }
-      layoutRef.current = { ...layoutRef.current, edges: next };
-      flushLayout();
-      setEdges((es) =>
-        es.map((edge) =>
-          edge.id === joinId
-            ? { ...edge, data: { ...edge.data, waypoint: undefined, waypoints: undefined } }
-            : edge,
-        ),
+      commitRouteEditRef.current(
+        joinId,
+        (edges: NonNullable<CanvasLayout["edges"]>) => {
+          // Bug-8762: copy-on-write via the shared primitive — never mutate the
+          // cached nested entry in place (layoutRef aliases the query cache).
+          const cleared = clearEdgeWaypoints(edges, joinId);
+          // Do not invent an entry for an edge that had none: absence plus no
+          // waypoints already resolves to "auto".
+          return cleared[joinId]
+            ? { ...cleared, [joinId]: { ...cleared[joinId], routeMode: undefined } }
+            : cleared;
+        },
+        {
+          waypoint: undefined,
+          waypoints: undefined,
+          // Bends cleared: the relationship is engine-routed again, so
+          // provenance must not keep claiming a manual edit.
+          routeMode: undefined,
+        },
       );
     };
 
-    const handleTogglePathingAuto = (e: Event) => {
-      if (readOnly) return;
+    // Lock/Unlock Route, from the Joins panel. Same action and same writer as
+    // the canvas control; only the way in is different.
+    const handleToggleEdgeRouteLock = (e: Event) => {
       const joinId = (e as CustomEvent<string>).detail;
-      const next = { ...(layoutRef.current.edges ?? {}) };
-      const current = next[joinId] ?? {};
-      const currentPathing = current.pathing ?? useBuilderStore.getState().relationPathing;
-      const newPathing: "orthogonal" | "straight" =
-        currentPathing === "straight" ? "orthogonal" : "straight";
-      next[joinId] = { ...current, pathing: newPathing, waypoint: undefined, waypoints: undefined };
-      layoutRef.current = { ...layoutRef.current, edges: next };
-      flushLayout();
-      setEdges((es) =>
-        es.map((edge) =>
-          edge.id === joinId
-            ? { ...edge, data: { ...edge.data, pathing: newPathing, waypoint: undefined, waypoints: undefined } }
-            : edge,
-        ),
+      const edge = liveEdgesRef.current.find((candidate) => candidate.id === joinId);
+      if (!edge) return;
+      toggleRouteLockForRef.current(routeLockInfoForRef.current(edge));
+    };
+
+    // Toggle Path Style, from the Joins panel: the other alternate writer, and
+    // the only thing in the product that creates a per-relationship `pathing`
+    // override. It cycles through THREE states rather than two, because an
+    // override that can be created but never removed makes the model-wide Edge
+    // Pathing setting look broken for that relationship forever:
+    //
+    //   inherit the model setting -> orthogonal -> straight -> inherit ...
+    const handleTogglePathingAuto = (e: Event) => {
+      const joinId = (e as CustomEvent<string>).detail;
+      const current = layoutRef.current.edges?.[joinId] ?? {};
+      const nextPathing: "orthogonal" | "straight" | undefined =
+        current.pathing === undefined
+          ? "orthogonal"
+          : current.pathing === "orthogonal"
+            ? "straight"
+            : undefined;
+
+      commitRouteEditRef.current(
+        joinId,
+        (edges: NonNullable<CanvasLayout["edges"]>) => ({
+          ...edges,
+          [joinId]: mergeEdgeEntry(edges[joinId], {
+            pathing: nextPathing,
+            waypoint: undefined,
+            waypoints: undefined,
+            routeMode: undefined,
+          }),
+        }),
+        {
+          pathing: nextPathing,
+          waypoint: undefined,
+          waypoints: undefined,
+          routeMode: undefined,
+        },
       );
     };
 
     const handleNodeResize = (e: Event) => {
       if (readOnly) return; // Bug-7636: do not persist resizes in read-only mode
       const { id, w, h } = (e as CustomEvent<{ id: string; w: number; h: number }>).detail;
+      // R06: resizing a locked route's endpoint moves its docked heels, which
+      // is the frozen geometry. The card withdraws its resize handles while
+      // locked; this refuses the event too, so the persisted size cannot change
+      // through any other caller of the same channel.
+      if (lockedEndpointsRef.current.has(id)) {
+        setGlobalMessage(tRef.current("canvas.lockedEndpointRefused"), "info");
+        return;
+      }
+      // Captured BEFORE the new size is written. Capturing afterwards recorded
+      // the NEW width and height as the "before" state, so an undo restored the
+      // old connector while leaving the card resized — the attachment mismatch
+      // the repair had just corrected.
+      const before = captureLayoutState();
       const tableMap = { ...(layoutRef.current.tables ?? {}) };
-      const prev = tableMap[id] ?? { x: 0, y: 0 };
-      tableMap[id] = { ...prev, w, h };
+      tableMap[id] = mergeTableEntry(tableMap[id], { w, h });
       layoutRef.current = { ...layoutRef.current, tables: tableMap };
-      flushLayout();
+      // Not flushed here: the new size is candidate geometry until the routes
+      // have been repaired against it. The commit or the restore does the flush.
+      // F05: a resized card changes the docked heels, so its automatic routes
+      // must be repaired against the new dimensions. Positions are unchanged by
+      // a resize, so the before/after position maps are identical and the undo
+      // entry carries the size change and the route repair.
+      pendingRepairBeforeRef.current = before;
+      pendingRepairAfterRef.current = before.positions;
+      liveGestureRef.current = ++gestureSeqRef.current;
+      // The new size is on the canvas but its routes have not been repaired
+      // yet, so no save may carry it until the repair settles.
+      beginCandidateGeometry();
+      repairPendingRef.current = true;
+      setRepairTick((tick) => tick + 1);
     };
 
     // Validation tray click-to-navigate: centre the canvas on a table node.
@@ -959,16 +2118,18 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
     };
 
     window.addEventListener("reset-edge-path", handleResetEdge);
+    window.addEventListener("toggle-edge-route-lock", handleToggleEdgeRouteLock);
     window.addEventListener("toggle-edge-pathing-auto", handleTogglePathingAuto);
     window.addEventListener("node-resize-end", handleNodeResize);
     window.addEventListener("canvas-center-node", handleCenterNode);
     return () => {
       window.removeEventListener("reset-edge-path", handleResetEdge);
+      window.removeEventListener("toggle-edge-route-lock", handleToggleEdgeRouteLock);
       window.removeEventListener("toggle-edge-pathing-auto", handleTogglePathingAuto);
       window.removeEventListener("node-resize-end", handleNodeResize);
       window.removeEventListener("canvas-center-node", handleCenterNode);
     };
-  }, [flushLayout, setEdges, readOnly]);
+  }, [flushLayout, setEdges, readOnly, setGlobalMessage]);
 
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -977,13 +2138,47 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
       // uniform across all eleven layout writers rather than true for the
       // subset that had a reported defect.
       if (readOnlyRef.current) return;
-      // Capture the pre-gesture positions at drag START — the live nodes
-      // have not received this batch of changes yet, so they still hold the
-      // positions the gesture began from.
+
+      // R06: a locked relationship freezes its path, so the cards it docks to
+      // must not move at all. The position change is dropped before React Flow
+      // ever sees it, so the card does not travel and snap back — it simply
+      // does not move — and the user is told which action would release it.
+      // Everything else in the same gesture still applies: selecting a locked
+      // endpoint, or dragging other cards alongside it, keeps working.
+      const frozen = lockedEndpointsRef.current;
+      let refusedFrozenMove = false;
+      if (frozen.size) {
+        const kept: NodeChange[] = [];
+        for (const ch of changes) {
+          if (ch.type === "position" && frozen.has(ch.id)) {
+            refusedFrozenMove = true;
+            continue;
+          }
+          kept.push(ch);
+        }
+        if (refusedFrozenMove) {
+          changes = kept;
+          // Announce once per gesture, not once per pointer-move frame.
+          if (!frozenMoveNoticeRef.current) {
+            frozenMoveNoticeRef.current = true;
+            setGlobalMessage(tRef.current("canvas.lockedEndpointRefused"), "info");
+          }
+        }
+      }
+      if (!refusedFrozenMove && !changes.some((ch) => ch.type === "position" && ch.dragging === true)) {
+        frozenMoveNoticeRef.current = false;
+      }
+      if (changes.length === 0) return;
+
+      // Capture the pre-gesture positions and edges at drag START — the live
+      // nodes have not received this batch of changes yet, so they still hold
+      // the state the gesture began from. The position change and the repaired
+      // routes are then recorded as ONE undo entry by the repair apply.
       for (const ch of changes) {
         if (ch.type === "position" && ch.dragging === true && !isDraggingRef.current) {
           isDraggingRef.current = true;
-          beginMove();
+          pendingRepairBeforeRef.current = captureLayoutState();
+          liveGestureRef.current = ++gestureSeqRef.current;
           break;
         }
       }
@@ -993,13 +2188,10 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
       for (const ch of changes) {
         if (ch.type === "position" && ch.position) {
           const tableMap = { ...(layoutRef.current.tables ?? {}) };
-          const prev = tableMap[ch.id] ?? { x: 0, y: 0 };
-          tableMap[ch.id] = {
+          tableMap[ch.id] = mergeTableEntry(tableMap[ch.id], {
             x: ch.position.x,
             y: ch.position.y,
-            ...(prev.w !== undefined ? { w: prev.w } : {}),
-            ...(prev.h !== undefined ? { h: prev.h } : {}),
-          };
+          });
           layoutRef.current = { ...layoutRef.current, tables: tableMap };
           dirty = true;
         }
@@ -1007,7 +2199,12 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
           dragEnded = true;
         }
       }
-      if (dirty) flushLayout();
+      // Deliberately NOT flushed per change. The dragged coordinates are
+      // candidate geometry until the routes have been repaired against them;
+      // persisting here wrote an unvalidated diagram, and on a drag longer than
+      // the debounce it also emitted a PATCH mid-gesture, which spec §5 forbids.
+      // The commit path flushes once, or the restore path flushes the rollback.
+      if (dirty && !isDraggingRef.current) flushLayout();
       // Commit the gesture at drag END — one drag = one undo entry
       // (F-026-02). layoutRef holds the authoritative final positions
       // (merged above), so the entry is exact even if the last change has
@@ -1022,10 +2219,18 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
               ? { x: saved.x, y: saved.y }
               : { x: n.position.x, y: n.position.y };
         }
-        endMove(after);
+        // F05: the stored automatic waypoints are absolute, so the moved
+        // cards' auto routes must be repaired against the final geometry. The
+        // position change and the repaired routes become one undo entry via
+        // the deferred repair's apply path.
+        pendingRepairAfterRef.current = after;
+        // Cards have moved but their routes still describe the old positions.
+        beginCandidateGeometry();
+        repairPendingRef.current = true;
+        setRepairTick((tick) => tick + 1);
       }
     },
-    [onNodesChange, flushLayout, beginMove, endMove],
+    [onNodesChange, flushLayout, setGlobalMessage, beginCandidateGeometry],
   );
 
   // Track the source node of an in-progress connection drag so that
@@ -1040,6 +2245,7 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
     for (const t of tables) m.set(t.id, t.table_type);
     return m;
   }, [tables]);
+  tableTypeMapRef.current = tableTypeMap;
 
   // ---- A1 fact-node column segmentation ---------------------------------
   const measures = useMeasures(projectId, modelId);
@@ -1359,7 +2565,7 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
     // An edge to a table that isn't drawn cannot be drawn either, so skip it.
     const nodeIds = new Set(rfNodes.map((n) => n.id));
     const { linked: linkedJoins, dropped } = partitionJoinsByEndpoints(joins, nodeIds);
-    if (dropped.length > 0) {
+    if (countDroppedJoins(dropped, nodeIds) > 0) {
       console.warn(
         `Canvas: skipped ${dropped.length} join(s) referencing tables not on the canvas:`,
         dropped.map((j) => j.id),
@@ -1398,10 +2604,18 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
         waypoint: savedEdge?.waypoint,
         waypoints: savedEdge?.waypoints,
         pathing: savedEdge?.pathing,
+        routeMode: savedEdge?.routeMode,
         sourceSide: savedEdge?.sourceSide,
         targetSide: savedEdge?.targetSide,
         sourceRatio: savedEdge?.sourceRatio,
         targetRatio: savedEdge?.targetRatio,
+        // Without this a locked relationship reopened unlocked: the flag was
+        // persisted and read by the worker, but never carried back into the
+        // edge the renderer and the panel read.
+        locked: savedEdge?.locked === true,
+        lockedParallelOffset: savedEdge?.lockedParallelOffset,
+        sourceColumn: j.left_column_name ?? null,
+        targetColumn: j.right_column_name ?? null,
         readOnly,
         // R1 review: the four edge-layout callbacks below are unreachable in a
         // read-only session today (`onEdgesChange` is undefined and
@@ -1412,65 +2626,33 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
         // "read-only leaves no state behind" should hold for every writer, not
         // for the two that happened to have a reported defect.
         onWaypointsChange: (wps) => {
-          if (readOnlyRef.current) return;
-          const next = { ...(layoutRef.current.edges ?? {}) };
-          next[j.id] = { ...next[j.id], waypoints: wps, waypoint: undefined };
-          layoutRef.current = { ...layoutRef.current, edges: next };
-          flushLayout();
-          setEdges((es) =>
-            es.map((e) =>
-              e.id === j.id
-                ? { ...e, data: { ...e.data, waypoints: wps, waypoint: undefined } }
-                : e,
-            ),
+          commitRouteEdit(
+            j.id,
+            (edges) => ({
+              ...edges,
+              [j.id]: mergeEdgeEntry(edges[j.id], {
+                waypoints: wps,
+                waypoint: undefined,
+                routeMode: "manual",
+              }),
+            }),
+            { waypoints: wps, waypoint: undefined, routeMode: "manual" },
           );
         },
         onWaypointReset: () => {
-          if (readOnlyRef.current) return;
-          const next = { ...(layoutRef.current.edges ?? {}) };
-          if (next[j.id]) {
-            delete next[j.id].waypoint;
-            delete next[j.id].waypoints;
-            if (Object.keys(next[j.id]).length === 0) delete next[j.id];
-          }
-          layoutRef.current = { ...layoutRef.current, edges: next };
-          flushLayout();
-          setEdges((es) =>
-            es.map((e) =>
-              e.id === j.id
-                ? { ...e, data: { ...e.data, waypoint: undefined, waypoints: undefined } }
-                : e,
-            ),
+          // Bug-8762: copy-on-write via the shared primitive — never mutate
+          // the cached nested entry in place (layoutRef aliases the query
+          // cache object, so in-place deletion survives a failed PATCH).
+          commitRouteEdit(
+            j.id,
+            (edges) => clearEdgeWaypoints(edges, j.id),
+            { waypoint: undefined, waypoints: undefined },
           );
         },
-        onSourceSideChange: (side, ratio) => {
-          if (readOnlyRef.current) return;
-          const next = { ...(layoutRef.current.edges ?? {}) };
-          next[j.id] = { ...next[j.id], sourceSide: side, sourceRatio: ratio };
-          layoutRef.current = { ...layoutRef.current, edges: next };
-          flushLayout();
-          setEdges((es) =>
-            es.map((e) =>
-              e.id === j.id
-                ? { ...e, data: { ...e.data, sourceSide: side, sourceRatio: ratio } }
-                : e,
-            ),
-          );
-        },
-        onTargetSideChange: (side, ratio) => {
-          if (readOnlyRef.current) return;
-          const next = { ...(layoutRef.current.edges ?? {}) };
-          next[j.id] = { ...next[j.id], targetSide: side, targetRatio: ratio };
-          layoutRef.current = { ...layoutRef.current, edges: next };
-          flushLayout();
-          setEdges((es) =>
-            es.map((e) =>
-              e.id === j.id
-                ? { ...e, data: { ...e.data, targetSide: side, targetRatio: ratio } }
-                : e,
-            ),
-          );
-        },
+        onSourceSideChange: (side, ratio) =>
+          commitAttachmentChange(j.id, j.left_table_id, "source", side, ratio, edgeOffsets.get(j.id) ?? 0, totalEdges),
+        onTargetSideChange: (side, ratio) =>
+          commitAttachmentChange(j.id, j.right_table_id, "target", side, ratio, edgeOffsets.get(j.id) ?? 0, totalEdges),
       };
 
       const dashed =
@@ -1510,17 +2692,19 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
         : hasLivePosition
           ? { x: live!.position.x, y: live!.position.y }
           : n.position;
-      const style: any = { ...(live?.style ?? n.style) };
-      if (saved) {
-        if (saved.w !== undefined && Number.isFinite(saved.w) && saved.w > 0) {
-          style.width = saved.w;
-        }
-        // Ignore artificially crushed heights from the earlier resizer bug.
-        if (saved.h !== undefined && Number.isFinite(saved.h) && saved.h > 160) {
-          style.height = saved.h;
-        }
-      }
-      return { ...n, position: pos, style };
+      // Without this a pinned table reopened movable: the flag was persisted
+      // and the worker's snapshot builder reads it from node data, which
+      // nothing ever wrote.
+      const pinned = saved?.pinned === true;
+      // The same rule as rollback and undo. The previous version ignored any
+      // saved height of 160 or less while the resizer's own minimum is 150, so
+      // a card the user was allowed to make 150 tall reopened at a different
+      // height and their edit looked lost.
+      const style = styleForTableEntry(
+        (live?.style ?? n.style) as Record<string, unknown> | undefined,
+        saved,
+      );
+      return { ...n, position: pos, style, data: { ...n.data, pinned } };
     });
     // A node "needs placement" when it has no persisted or live position — a
     // genuinely new table. Only those should be moved by auto-layout; every
@@ -1529,28 +2713,14 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
     const needsPlacement = (n: Node) =>
       n.position.x === 0 && n.position.y === 0 && !persisted[n.id] && !liveById.has(n.id);
     const unplaced = hydrated.filter(needsPlacement);
-    const needsLayout = unplaced.length > 0;
-    const pinnedIds = new Set(
-      hydrated.filter((n) => !needsPlacement(n)).map((n) => n.id),
-    );
-    const finalNodes = needsLayout
-      ? layoutForceRadial(hydrated, rfEdges, pinnedIds)
-      : hydrated;
-
-    if (needsLayout) {
-      const tableMap = { ...(layoutRef.current.tables ?? {}) };
-      for (const n of finalNodes) {
-        const prev = tableMap[n.id] ?? {};
-        tableMap[n.id] = {
-          ...prev,
-          x: n.position.x,
-          y: n.position.y,
-        };
-      }
-      layoutRef.current = { ...layoutRef.current, tables: tableMap };
+    // Placement itself is NOT computed here. Hydration only records which
+    // tables are genuinely new; the worker places them once React Flow has
+    // measured the cards, through the same path every Arrange action uses.
+    if (unplaced.length > 0) {
+      initialPlacementRef.current = unplaced.map((n) => n.id);
     }
 
-    setNodes(finalNodes);
+    setNodes(hydrated);
     setEdges(rfEdges);
   }, [
     projectId,
@@ -1566,6 +2736,8 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
     flushLayout,
     setNodes,
     setEdges,
+    selectObject,
+    openPanel,
   ]);
 
   const onEdgeClick: EdgeMouseHandler = useCallback(
@@ -1576,10 +2748,18 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
       ) {
         return;
       }
+      // The relationship is still SELECTED — that is what the layout panel acts
+      // on, and what draws the highlight. Only the drawer is withheld.
+      //
+      // Bug-10034: the Joins drawer opens over the layout panel, so selecting a
+      // relationship hid the Lock Route control the user had just gone looking
+      // for. Until the panels are rearranged properly, this lets them turn the
+      // drawer off for as long as they are working on routes.
       selectObject(edge.id, "join");
+      if (joinsDrawerSuppressed) return;
       openPanel("joins");
     },
-    [selectObject, openPanel, dimmedTableIds],
+    [selectObject, openPanel, dimmedTableIds, joinsDrawerSuppressed],
   );
 
   // Clicking empty canvas clears the current selection and retracts any open
@@ -1776,28 +2956,45 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
               <NoteIcon sx={{ fontSize: 16 }} />
             </ControlButton>
           )}
+          {/* Red while the drawer is being held back, so the canvas always says
+              which way the switch is set. A control that changes what a click
+              does must not look the same in both states. */}
+          <ControlButton
+            onClick={() => setJoinsDrawerSuppressed((on) => !on)}
+            title={joinsDrawerSuppressed ? t("canvas.joinsDrawerAllow") : t("canvas.joinsDrawerSuppress")}
+            aria-pressed={joinsDrawerSuppressed}
+            data-testid="toggle-joins-drawer"
+          >
+            <CableIcon sx={{ fontSize: 16, color: joinsDrawerSuppressed ? "#d32f2f" : undefined }} />
+          </ControlButton>
+          <ControlButton
+            onClick={() => setMinimapDismissed((hidden) => !hidden)}
+            title={minimapVisible ? t("canvas.minimapHide") : t("canvas.minimapShow")}
+            aria-pressed={minimapVisible}
+            data-testid="toggle-minimap"
+          >
+            <MapIcon sx={{ fontSize: 16, opacity: minimapVisible ? 1 : 0.45 }} />
+          </ControlButton>
         </Controls>
-        {(hiddenJoinCount > 0 || (notesOpen && !readOnly)) && (
+        {((hiddenJoinCount > 0 && hiddenJoinCount !== dismissedHiddenJoinsCount) || (notesOpen && !readOnly)) && (
           <Panel position="bottom-center">
             <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
-              {hiddenJoinCount > 0 && (
-                <div
-                  role="alert"
+              {hiddenJoinCount > 0 && hiddenJoinCount !== dismissedHiddenJoinsCount && (
+                // R3 (alert-mechanism audit, 2026-08-25): this was a hand-rolled
+                // <div> with hardcoded hex colors and a raw "&times;" dismiss
+                // button — the one message-like element in the app that didn't
+                // use MUI's Alert, unlike ValidationTray/every panel-local
+                // alert. Same severity vocabulary, same look, still placed
+                // inside ReactFlow's <Panel> for canvas-relative positioning.
+                <Alert
+                  severity="warning"
+                  variant="standard"
                   aria-live="polite"
-                  style={{
-                    maxWidth: 320,
-                    background: "#fff8e1",
-                    border: "1px solid #e0b84b",
-                    borderRadius: 4,
-                    padding: "6px 8px",
-                    color: "#5f4300",
-                    fontSize: 11,
-                    lineHeight: 1.35,
-                    boxShadow: "0 1px 2px rgba(0,0,0,0.08)",
-                  }}
+                  onClose={() => setDismissedHiddenJoinsCount(hiddenJoinCount)}
+                  sx={{ maxWidth: 320, fontSize: 11, py: 0.5 }}
                 >
                   {t("canvas.hiddenJoinsWarning", { count: String(hiddenJoinCount) })}
-                </div>
+                </Alert>
               )}
               {notesOpen && !readOnly && (
                 <div style={{ background: "#fff", border: "1px solid #cfd8dc", borderRadius: 4, padding: 8, width: 280 }}>
@@ -1807,11 +3004,17 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
                     onChange={(e) => { notesDirtyRef.current = true; setNotesText(e.target.value); }}
                     placeholder={t("canvas.annotationsPlaceholder")}
                     rows={5}
+                    maxLength={NOTES_MAX_LENGTH}
                     style={{ width: "100%", border: "1px solid #ccc", borderRadius: 3, padding: 4, fontSize: 12, resize: "vertical" }}
                   />
-                  <div style={{ display: "flex", justifyContent: "flex-end", gap: 4, marginTop: 4 }}>
-                    <button onClick={() => setNotesOpen(false)} style={{ fontSize: 11, cursor: "pointer" }}>{t("common.cancel")}</button>
-                    <button onClick={handleSaveNotes} style={{ fontSize: 11, cursor: "pointer", fontWeight: 600 }}>{t("canvas.saveButton")}</button>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 4, marginTop: 4 }}>
+                    <span style={{ fontSize: 10, color: "#78909c" }}>
+                      {t("canvas.annotationsCharCount", { count: String(notesText.length), max: String(NOTES_MAX_LENGTH) })}
+                    </span>
+                    <div style={{ display: "flex", gap: 4 }}>
+                      <button onClick={() => setNotesOpen(false)} style={{ fontSize: 11, cursor: "pointer" }}>{t("common.cancel")}</button>
+                      <button onClick={handleSaveNotes} style={{ fontSize: 11, cursor: "pointer", fontWeight: 600 }}>{t("canvas.saveButton")}</button>
+                    </div>
                   </div>
                 </div>
               )}
@@ -1820,18 +3023,46 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
         )}
         {layoutMenuOpen && !readOnly && (
           <Panel position="top-left">
-            <div style={{ background: "#fff", border: "1px solid #cfd8dc", borderRadius: 4, padding: 6, display: "flex", flexDirection: "column", gap: 2 }}>
-              {([["radial", t("canvas.layoutRadial")], ["hierarchical", t("canvas.layoutHierarchical")], ["compact", t("canvas.layoutCompact")]] as [LayoutPreset, string][]).map(([preset, label]) => (
-                <button
-                  key={preset}
-                  onClick={() => handleRedrawLayout(preset)}
-                  style={{ fontSize: 12, cursor: "pointer", padding: "4px 10px", textAlign: "left", border: "none", background: "transparent", borderRadius: 3 }}
-                  onMouseEnter={(e) => { (e.target as HTMLButtonElement).style.background = "#e3f2fd"; }}
-                  onMouseLeave={(e) => { (e.target as HTMLButtonElement).style.background = "transparent"; }}
-                >
-                  {label}
-                </button>
-              ))}
+            <CanvasLayoutPanel
+              preferences={layoutPreferences}
+              busy={layoutController.busy}
+              tableCount={nodes.length}
+              selectedTableCount={selectedTablePins.count}
+              movableSelectedCount={movableSelectedCount}
+              onPreferenceChange={(next) => {
+                // A choice is the user's, so stop seeding from the server copy;
+                // it is not persisted until an arrangement succeeds with it.
+                layoutPreferencesDirtyRef.current = true;
+                setLayoutPreferences((current) => ({ ...current, ...next }));
+              }}
+              onArrangeAll={(preset) => {
+                // Direction and spacing travel with the action, not with the
+                // engine default, so the controls actually steer the arrangement.
+                const applying = { ...layoutPreferences, preset };
+                layoutPreferencesDirtyRef.current = true;
+                setLayoutPreferences(applying);
+                void handleApplyLayout("arrange-all", applying).then((applied) => {
+                  if (applied) persistLayoutPreferences(applying);
+                });
+              }}
+              onArrangeSelected={() => {
+                void handleApplyLayout("arrange-selected", layoutPreferences).then((applied) => {
+                  if (applied) persistLayoutPreferences(layoutPreferences);
+                });
+              }}
+              onRerouteLinks={() => { void handleApplyLayout("reroute-links"); }}
+              routeLock={routeLockState}
+              onToggleRouteLock={handleToggleRouteLock}
+              tablePins={pinState}
+              onTogglePin={handleTogglePin}
+            />
+          </Panel>
+        )}
+        {layoutController.busy && (
+          <Panel position="top-center">
+            <div style={{ background: "#fff", border: "1px solid #cfd8dc", borderRadius: 4, padding: "4px 10px", display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+              <span>{t("canvas.layoutWorking")}</span>
+              <button onClick={() => layoutController.cancel()} style={{ fontSize: 11, cursor: "pointer" }}>{t("common.cancel")}</button>
             </div>
           </Panel>
         )}
@@ -1913,14 +3144,46 @@ export default function Canvas({ projectId, modelId, tenantSlug, projectSlug, mo
             </div>
           </Panel>
         )}
-        {showMinimap && (
-          <MiniMap
-            nodeColor={minimapNodeColor}
-            nodeStrokeWidth={2}
-            zoomable
-            pannable
-            ariaLabel={t("canvas.minimap")}
-          />
+        {minimapVisible && (
+          <>
+            <MiniMap
+              nodeColor={minimapNodeColor}
+              nodeStrokeWidth={2}
+              zoomable
+              pannable
+              ariaLabel={t("canvas.minimap")}
+            />
+            {/* Sits on the minimap's own corner. The toolbelt button brings it
+                back, so dismissing it is never a one-way door. */}
+            <button
+              type="button"
+              onClick={() => setMinimapDismissed(true)}
+              title={t("canvas.minimapClose")}
+              aria-label={t("canvas.minimapClose")}
+              data-testid="close-minimap"
+              style={{
+                position: "absolute",
+                right: 18,
+                bottom: 138,
+                zIndex: 6,
+                width: 18,
+                height: 18,
+                lineHeight: 1,
+                padding: 0,
+                cursor: "pointer",
+                background: "#ffffff",
+                border: "1px solid #cfd8dc",
+                borderRadius: 3,
+                color: "#455a64",
+                fontSize: 12,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+              }}
+            >
+              <CloseIcon sx={{ fontSize: 12 }} />
+            </button>
+          </>
         )}
         <Background gap={20} color={palette.canvasDot} />
       </ReactFlow>

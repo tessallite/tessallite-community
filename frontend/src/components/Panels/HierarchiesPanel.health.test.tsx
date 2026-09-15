@@ -33,6 +33,7 @@ vi.mock("../../api/hooks", () => ({
 vi.mock("../../api/client", () => ({
   hierarchiesApi: {
     health,
+    listLevels: vi.fn().mockResolvedValue([]),
     create: vi.fn(),
     update: vi.fn(),
     delete: vi.fn(),

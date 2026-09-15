@@ -32,7 +32,7 @@ export default function RefreshDetailsPanel({ rows }: { rows: RefreshDetailRow[]
   ];
 
   return (
-    <Box sx={{ px: 1.25, pb: 1.25 }}>
+    <Box sx={{ px: 1.25, py: 0.375, bgcolor: tokens.colorSubtleFill, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
       <Button
         size="small"
         variant="text"
@@ -41,7 +41,7 @@ export default function RefreshDetailsPanel({ rows }: { rows: RefreshDetailRow[]
         // Only reference the region while it EXISTS -- aria-controls pointing
         // at an absent id is an aria-valid-attr-value violation when collapsed.
         aria-controls={open ? DETAILS_REGION_ID : undefined}
-        sx={{ fontSize: 11, minWidth: 0, px: 0.5 }}
+        sx={{ fontSize: 11, minWidth: 0, px: 0.5, py: 0, minHeight: 20, color: tokens.colorPrimary }}
       >
         {open ? strings.tableRefresh.detailsHide : strings.tableRefresh.detailsShow}
       </Button>
@@ -51,28 +51,28 @@ export default function RefreshDetailsPanel({ rows }: { rows: RefreshDetailRow[]
           role="region"
           aria-label={strings.tableRefresh.detailsTitle}
           sx={{
-            mt: 0.5,
-            p: 1,
-            borderRadius: 1,
+            mt: 0.25,
+            p: 0.75,
+            borderRadius: 0.5,
             border: `1px solid ${tokens.colorBorder}`,
             bgcolor: tokens.colorSubtleFill,
           }}
         >
-          <Typography sx={{ fontSize: 11, fontWeight: 600, color: tokens.colorCharcoal, mb: 0.5 }}>
+          <Typography sx={{ fontSize: 11, fontWeight: 600, color: tokens.colorCharcoal, mb: 0.25 }}>
             {strings.tableRefresh.detailsTitle}
           </Typography>
           {groups.map(group => {
             const groupRows = rows.filter(r => r.kind === group.kind);
             if (groupRows.length === 0) return null;
             return (
-              <Box key={group.kind} sx={{ mb: 0.5 }}>
+              <Box key={group.kind} sx={{ mb: 0.25 }}>
                 <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, textTransform: 'uppercase' }}>
                   {group.label}
                 </Typography>
                 {groupRows.map(row => (
                   <Typography
                     key={`${row.kind}-${row.name}-${row.reason}`}
-                    sx={{ fontSize: 11, color: tokens.colorCharcoal, mt: 0.25 }}
+                    sx={{ fontSize: 10.5, color: tokens.colorCharcoal, mt: 0.125 }}
                   >
                     {templates.tableRefresh.skippedDetail(row.name, row.reason)}
                   </Typography>

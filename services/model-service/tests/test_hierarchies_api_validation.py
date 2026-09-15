@@ -208,7 +208,7 @@ async def test_preview_expand_level_without_parent_key_allowed(client):
         types.SimpleNamespace(ordinal=1, name="Country", key_attribute_id=uuid.uuid4(), key_attribute_source="physical_column"),
     ]
 
-    async def fake_resolve_sql(*args, **kwargs):
+    async def fake_resolve_attribute(*args, **kwargs):
         raise HTTPException(status_code=404, detail="not found")
 
     with (
@@ -218,8 +218,7 @@ async def test_preview_expand_level_without_parent_key_allowed(client):
             new=AsyncMock(return_value=types.SimpleNamespace(id=hierarchy_id, name="Geo")),
         ),
         patch("src.api.hierarchies._levels_for_hierarchy", new=AsyncMock(return_value=levels)),
-        patch("src.api.hierarchies._resolve_preview_connection", new=AsyncMock(return_value=(None, "postgresql", "No connection available"))),
-        patch("src.api.hierarchies._resolve_sql_attribute", new=fake_resolve_sql),
+        patch("src.api.hierarchies._resolve_attribute", new=fake_resolve_attribute),
     ):
         resp = await client.get(
             f"{PREFIX}/hierarchies/{hierarchy_id}/preview?sample_size=10&expand_level=1",
@@ -260,7 +259,7 @@ async def test_preview_returns_warning_when_hierarchy_references_missing_attribu
         ),
         patch("src.api.hierarchies._levels_for_hierarchy", new=AsyncMock(return_value=levels)),
         patch(
-            "src.api.hierarchies._resolve_sql_attribute",
+            "src.api.hierarchies._resolve_attribute",
             new=AsyncMock(side_effect=HTTPException(status_code=404, detail="Attribute not found")),
         ),
     ):
@@ -276,71 +275,38 @@ async def test_preview_returns_warning_when_hierarchy_references_missing_attribu
 
 
 @pytest.mark.asyncio
-async def test_preview_warns_for_cross_table_expansion(client):
-    mock_db = make_mock_db()
+async def test_preview_expands_across_tables_via_the_model_query(client):
+    """Bug-9895: a drill whose parent and child levels live in DIFFERENT tables
+    now works.
+
+    The physical-scan builder could only expand across tables when the model
+    happened to define a direct one-hop join, and otherwise returned
+    ``cross_table_preview_not_supported`` with no members. The preview is now a
+    projection over the persona model query, so the binder resolves the join
+    path and the parent bound is an ordinary equality on the parent level's
+    dimension. The warning is unreachable on this path and the members come
+    back.
+    """
+    from ._hierarchy_preview_harness import (
+        Routed, entered, get_preview, make_levels, make_persona, preview_patches,
+    )
+
     hierarchy_id = uuid.uuid4()
-
-    levels = [
-        types.SimpleNamespace(
-            ordinal=0,
-            name="Region",
-            key_attribute_id=uuid.uuid4(),
-            key_attribute_source="physical_column",
-        ),
-        types.SimpleNamespace(
-            ordinal=1,
-            name="Country",
-            key_attribute_id=uuid.uuid4(),
-            key_attribute_source="physical_column",
-        ),
-    ]
-
-    resolved_parent = types.SimpleNamespace(
-        resolved=types.SimpleNamespace(
-            table=types.SimpleNamespace(id=uuid.uuid4(), physical_name="dim_region", row_count_estimate=10),
-            ref=types.SimpleNamespace(name="region_code", data_type="varchar"),
-        ),
-        expression="region_code",
-        referenced_column_ids=[],
+    routed = Routed(rows_for=lambda sql: [{"country_code": "GB"}])
+    patches = preview_patches(
+        routed=routed,
+        persona=make_persona(),
+        levels=make_levels(2, names=["Region", "Country"]),
+        hierarchy_id=hierarchy_id,
+        level_dims=["region_code", "country_code"],
     )
-    resolved_child = types.SimpleNamespace(
-        resolved=types.SimpleNamespace(
-            table=types.SimpleNamespace(id=uuid.uuid4(), physical_name="dim_country", row_count_estimate=10),
-            ref=types.SimpleNamespace(name="country_code", data_type="varchar"),
-        ),
-        expression="country_code",
-        referenced_column_ids=[],
-    )
-
-    # _introspect_batch_via_router returns results for estimate queries but no
-    # sample — because cross-table expansion sets can_sample=False before the
-    # sample query is added to batch_queries.
-    introspect_mock = AsyncMock(return_value={
-        "est_0": ([{"c": 5}], ["c"], None),
-        "est_1": ([{"c": 10}], ["c"], None),
-    })
-
-    with (
-        patch("src.api.hierarchies.get_tenant_db", async_gen_from(mock_db)),
-        patch("src.api.hierarchies._ensure_model_in_project", new=AsyncMock(return_value=None)),
-        patch(
-            "src.api.hierarchies._load_hierarchy_or_404",
-            new=AsyncMock(return_value=types.SimpleNamespace(id=hierarchy_id, name="Geo")),
-        ),
-        patch("src.api.hierarchies._levels_for_hierarchy", new=AsyncMock(return_value=levels)),
-        patch(
-            "src.api.hierarchies._resolve_sql_attribute",
-            new=AsyncMock(side_effect=[resolved_parent, resolved_child]),
-        ),
-        patch("src.api.hierarchies._resolve_preview_connection", new=AsyncMock(return_value=(object(), "postgresql", None))),
-        patch("src.api.hierarchies._introspect_batch_via_router", introspect_mock),
-    ):
-        resp = await client.get(
-            f"{PREFIX}/hierarchies/{hierarchy_id}/preview?sample_size=10&expand_level=1&parent_key=EMEA",
-            headers={"Authorization": "Bearer test-token"},
+    with entered(patches):
+        resp = await get_preview(
+            client, hierarchy_id, "sample_size=10&expand_level=1&parent_key=EMEA",
         )
 
-    assert resp.status_code == 200
     body = resp.json()
-    assert any(w["type"] == "cross_table_preview_not_supported" for w in body["warnings"])
-    assert body["members"] == []
+    assert resp.status_code == 200
+    assert "cross_table_preview_not_supported" not in {w["type"] for w in body["warnings"]}
+    assert [m["key_value"] for m in body["members"]] == ["GB"]
+    assert "CAST(\"region_code\" AS VARCHAR) = 'EMEA'" in routed.sample_sql

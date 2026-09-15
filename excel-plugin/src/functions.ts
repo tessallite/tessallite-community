@@ -22,6 +22,8 @@
  *   TESSALLITE.KPISTATUS
  */
 
+import { CELL_MESSAGES, GENERIC_CELL_ERROR, isSafeCellMessage } from './utils/cellMessages';
+import { parseMeasureValue } from './utils/measureValues';
 import { rowSecurityDeniedAll } from './utils/rowSecurity';
 import { getJwt, getActiveProfile, getModelContext, getActivePersonaId, getCacheGeneration, bumpCacheGeneration } from './utils/storage';
 import { FunctionBatcher, computeResultKey, CollisionSafeResultMap, type BatchExecutor } from './utils/functionBatcher';
@@ -30,37 +32,119 @@ import { FunctionBatcher, computeResultKey, CollisionSafeResultMap, type BatchEx
 // Shared infrastructure
 // ---------------------------------------------------------------------------
 
+/**
+ * Reject `promise` with `timeout_<ms>ms` if it has not settled within `ms`.
+ * Used by `apiRequest` (Bug-9749) and `TESSALLITE.DIAG`.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timeout_${ms}ms`)), ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
+/**
+ * Bug-9749: wall-clock ceiling for ONE request issued by the custom-functions
+ * runtime.
+ *
+ * The functions runtime is a WWAHost AppContainer whose network stack can stall
+ * a request indefinitely — the documented localhost case is the missing
+ * loopback exemption, where "fetch hangs (timeout), zero requests reach the
+ * server" (`docs/architecture/architecture_excel-custom-functions-runtime.md`).
+ * `fetch()` has NO default timeout, so without a ceiling the returned promise
+ * never settles and the cell is stuck at `#GETTING_DATA` forever.
+ *
+ * This is the same class of defect Bug-6914 hardened `FunctionBatcher` against
+ * ("an unsettled promise is a cell stuck at #GETTING_DATA forever"), but the
+ * batcher can only settle the promises it OWNS: it awaits `this.execute`, and
+ * when that await never returns the batcher has nothing to settle. The ceiling
+ * therefore has to live here, at the one unbounded await in the chain.
+ */
+const REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * Apply the request ceiling, converting the raw `timeout_<ms>ms` marker into a
+ * user-readable, allow-listed cell message and cancelling the in-flight request
+ * so the socket is not leaked.
+ */
+async function withRequestTimeout<T>(promise: Promise<T>, onTimeout: () => void): Promise<T> {
+  try {
+    return await withTimeout(promise, REQUEST_TIMEOUT_MS);
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith('timeout_')) {
+      onTimeout();
+      throw new Error(CELL_MESSAGES.requestTimedOut);
+    }
+    throw e;
+  }
+}
+
 async function apiRequest<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
   const [jwt, profile] = await Promise.all([getJwt(), getActiveProfile()]);
-  if (!jwt) throw new Error('Not signed in. Open the Tessallite panel and sign in first.');
-  if (!profile) throw new Error('No active connection profile.');
+  if (!jwt) throw new Error(CELL_MESSAGES.notSignedIn);
+  if (!profile) throw new Error(CELL_MESSAGES.noProfile);
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${jwt}`,
   };
 
-  const res = await fetch(`${profile.serverUrl.replace(/\/$/, '')}${path}`, {
+  // Bug-9749: `AbortController` lets the timeout actually cancel the request.
+  // The functions runtime is an older engine, so degrade to a plain race rather
+  // than throwing when the constructor is absent — a missing API must never
+  // break every request.
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const init: RequestInit = {
     method,
     headers,
     credentials: 'omit',
     body: body ? JSON.stringify(body) : undefined,
-  });
+  };
+  if (controller) init.signal = controller.signal;
+
+  const res = await withRequestTimeout(
+    fetch(`${profile.serverUrl.replace(/\/$/, '')}${path}`, init),
+    () => controller?.abort(),
+  );
 
   if (!res.ok) {
-    if (res.status === 401) throw new Error('Session expired. Re-open the Tessallite panel and sign in.');
-    if (res.status === 403) throw new Error('Access denied.');
-    if (res.status === 404) throw new Error('Resource not found.');
+    if (res.status === 401) throw new Error(CELL_MESSAGES.sessionExpired);
+    if (res.status === 403) throw new Error(CELL_MESSAGES.accessDenied);
+    if (res.status === 404) throw new Error(CELL_MESSAGES.notFound);
     // Bug-8712: DEPLOYED_SNAPSHOT_INVALID. The published version of the model
     // cannot be read, so there is no definition this function is allowed to
     // serve. Fail closed with a plain message; never fall back to the live
     // draft, which is the leak this contract exists to close (Bug-8384).
-    if (res.status === 409) throw new Error('Published model unavailable. Deploy the model again from the model builder.');
-    if (res.status >= 500) throw new Error('Server error. Try again later.');
-    throw new Error('Request failed.');
+    if (res.status === 409) throw new Error(CELL_MESSAGES.publishedModelUnavailable);
+    if (res.status >= 500) throw new Error(CELL_MESSAGES.serverError);
+    // Bug-9759: a 422 can carry a deliberately-authored, safe, user-facing
+    // reason (e.g. SemanticBindingError's "Period-aware time variant requires
+    // a time dimension..." for a date-variant measure called with no date
+    // context) -- surfacing it, instead of the generic "Request failed.",
+    // tells the user WHY rather than just THAT it failed. Only reaches the
+    // cell when the exact text is allow-listed in SAFE_ERRORS below; any
+    // other 422 detail still falls back to the generic message.
+    if (res.status === 422) {
+      let detail: string | undefined;
+      try {
+        const errBody = (await withTimeout(res.json(), REQUEST_TIMEOUT_MS)) as { detail?: unknown };
+        if (typeof errBody?.detail === 'string' && errBody.detail) detail = errBody.detail;
+      } catch {
+        // Body unreadable, not JSON, or the read itself stalled -- fall
+        // through to the generic message below rather than hang or leak an
+        // unrelated parse/timeout error in its place.
+      }
+      if (detail) throw new Error(detail);
+    }
+    throw new Error(CELL_MESSAGES.requestFailed);
   }
 
-  return res.json() as Promise<T>;
+  // Bug-9749: headers can arrive while the body never does; the ceiling covers
+  // the body read too, so no path through this function can hang forever.
+  return withRequestTimeout(res.json() as Promise<T>, () => controller?.abort());
 }
 
 /**
@@ -151,10 +235,12 @@ export function clearFunctionCaches(): void {
  * recalc request has been submitted (or immediately if the Excel host is
  * unavailable), so callers can sequence it after cache invalidation.
  */
-function requestFullWorkbookRecalc(): Promise<void> {
+function requestFullWorkbookRecalc(isCurrent: () => boolean = () => true): Promise<void> {
+  if (!isCurrent()) return Promise.resolve();
   if (typeof Excel === 'undefined') return Promise.resolve();
   try {
     return Excel.run(async (context) => {
+      if (!isCurrent()) return;
       context.workbook.application.calculate(Excel.CalculationType.fullRebuild);
       await context.sync();
     }).catch(() => {
@@ -180,11 +266,40 @@ function requestFullWorkbookRecalc(): Promise<void> {
  *   3. requests a full workbook rebuild so already-inserted cells recompute
  *      under the new scope instead of retaining the previous persona's values.
  */
-export async function applyContextTransition(): Promise<void> {
-  clearLocalFunctionCaches();
-  // Await the generation bump so recalc happens strictly after invalidation.
-  await bumpCacheGeneration().catch(() => {});
-  await requestFullWorkbookRecalc();
+export interface ContextTransitionOptions {
+  /** The task-pane generation that owns this transition, when applicable. */
+  generation?: number;
+  /** False once a newer project/model transition supersedes this one. */
+  isCurrent?: () => boolean;
+  /** Persist the new governed scope before invalidating any cache. */
+  persist?: () => Promise<void>;
+}
+
+let contextTransitionQueue: Promise<void> = Promise.resolve();
+
+export function applyContextTransition(
+  options: ContextTransitionOptions = {},
+): Promise<void> {
+  const isCurrent = options.isCurrent ?? (() => true);
+  const transition = contextTransitionQueue.then(async () => {
+    if (!isCurrent()) return;
+    if (options.persist) {
+      await options.persist();
+      if (!isCurrent()) return;
+    }
+    if (!isCurrent()) return;
+    clearLocalFunctionCaches();
+    if (!isCurrent()) return;
+    // Await the generation bump so recalc happens strictly after invalidation.
+    await bumpCacheGeneration(options.generation).catch(() => {});
+    if (!isCurrent()) return;
+    await requestFullWorkbookRecalc(isCurrent);
+  });
+  contextTransitionQueue = transition.then(
+    () => undefined,
+    () => undefined,
+  );
+  return transition;
 }
 
 /**
@@ -193,9 +308,7 @@ export async function applyContextTransition(): Promise<void> {
  * Now awaitable so the caller can sequence UI feedback.
  */
 export async function refreshCustomFunctionValues(): Promise<void> {
-  clearLocalFunctionCaches();
-  await bumpCacheGeneration().catch(() => {});
-  await requestFullWorkbookRecalc();
+  await applyContextTransition();
 }
 
 interface FullContext {
@@ -229,8 +342,8 @@ async function requireFullContext(): Promise<FullContext> {
     getActivePersonaId(),
     getCacheGeneration(),
   ]);
-  if (!profile) throw new Error('No active connection profile.');
-  if (!ctx) throw new Error('No model selected. Open the Tessallite panel and select a project/model.');
+  if (!profile) throw new Error(CELL_MESSAGES.noProfile);
+  if (!ctx) throw new Error(CELL_MESSAGES.noModelSelected);
 
   // Bug-6912: if the generation token differs from the last value this runtime
   // saw, the pane signalled a cache invalidation (Refresh, persona switch,
@@ -265,7 +378,7 @@ function assertFormulaModelMatchesActiveContext(formulaModel: string, ctx: FullC
     .filter((value): value is string => Boolean(value))
     .map(normaliseModelKey);
   if (!accepted.includes(requested)) {
-    throw new Error('Formula model does not match the selected model. Open the Tessallite panel and select the model named in the formula.');
+    throw new Error(CELL_MESSAGES.formulaModelMismatch);
   }
 }
 
@@ -313,32 +426,26 @@ async function getKpiListCached(ctx: FullContext): Promise<{ id: string; name: s
   return data;
 }
 
-/** Return a safe error string for display in Excel cells. Never surfaces raw backend details. */
-const SAFE_ERRORS = [
-  'Session expired',
-  'Access denied',
-  'Resource not found',
-  'Server error',
-  'Request failed',
-  'Not signed in',
-  'No active connection profile',
-  'No model selected',
-  'Formula model does not match the selected model',
-  'Unknown measure',
-  'Unknown KPI',
-  'Batcher invalidated',
-  // Bug-8712: the fail-closed DEPLOYED_SNAPSHOT_INVALID message. It must be
-  // allow-listed here or the user sees the generic "check the panel" text and
-  // has no way to learn that the fix is to redeploy the model.
-  'Published model unavailable',
-];
-
+/**
+ * The one line a failed cell gets to say.
+ *
+ * Bug-9910. This used to match the message against a hand-maintained list of
+ * safe prefixes, and everything unmatched became the generic "check the panel"
+ * text — which the panel does not elaborate on either. The list was not
+ * extended five times running (Bug-8712, Bug-9749, Bug-9759, Bug-9880,
+ * Bug-9910), and each miss was found live as an unexplained cell, so the
+ * membership test no longer guesses from the text.
+ *
+ * A message is shown when the add-in AUTHORED it (an exact value of
+ * `CELL_MESSAGES`, which is what `functions.ts` constructs its errors from) or
+ * when it is a server detail this client is documented to pass through. Any
+ * other text — an unrecognised 422 body, a parse failure, a raw backend string
+ * — still falls back, because this runtime cannot judge a message it has never
+ * seen.
+ */
 function safeErrorMessage(e: unknown): string {
   const msg = (e instanceof Error) ? e.message : 'Unknown error';
-  for (const prefix of SAFE_ERRORS) {
-    if (msg.startsWith(prefix)) return msg;
-  }
-  return 'An error occurred. Check the Tessallite panel for details.';
+  return isSafeCellMessage(msg) ? msg : GENERIC_CELL_ERROR;
 }
 
 /**
@@ -467,11 +574,7 @@ const batchExecute: BatchExecutor = async (
   // message instead — the same convention the auth and transport failures above
   // use. Branch on the sentinel, never on data.length.
   if (rowSecurityDeniedAll(result)) {
-    throw new Error(
-      'Row-level security: your permissions grant you access to no rows for '
-      + 'this query. This is a permissions restriction, not a value of zero. '
-      + 'Contact your administrator if you believe you should have access.',
-    );
+    throw new Error(CELL_MESSAGES.rowSecurityDenyAll);
   }
 
   // Bug-7394 (adversarial R1): accumulate collision-safe. Two DISTINCT server
@@ -481,10 +584,13 @@ const batchExecute: BatchExecutor = async (
   // accumulator poisons such keys so they fan out to #N/A (safe) instead.
   const resultMap = new CollisionSafeResultMap();
 
-  const coerce = (val: unknown): number | string | null =>
-    (val === null || val === undefined)
-      ? null
-      : (typeof val === 'number' ? val : String(val));
+  // Bug-9876: the router emits measure values as numeric strings; hand Excel
+  // a number, never text. Non-numeric text (a string measure) stays text.
+  const coerce = (val: unknown): number | string | null => {
+    const parsed = parseMeasureValue(val);
+    if (parsed === null || parsed === undefined) return null;
+    return typeof parsed === 'number' ? parsed : String(parsed);
+  };
 
   if (!result.data || result.data.length === 0) return resultMap.finalize();
 
@@ -816,9 +922,12 @@ async function evalKpiCached(kpiId: string): Promise<KpiEvalResult> {
   const cached = kpiCache.get(key);
   if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.data;
 
-  const personaQuery = ctx.personaId ? `?persona_id=${encodeURIComponent(ctx.personaId)}` : '';
+  // Bug-9881: KPI evaluation is a CONSUMPTION read like every other. Without
+  // deployed_only the cell showed the number a modeller's unsaved draft
+  // produces, not the deployed one — a wrong number in a spreadsheet.
   const data = await apiRequest<KpiEvalResult>(
-    `/api/v1/projects/${ctx.projectId}/models/${ctx.modelId}/kpis/${kpiId}/evaluate${personaQuery}`,
+    `/api/v1/projects/${ctx.projectId}/models/${ctx.modelId}/kpis/${kpiId}/evaluate`
+    + consumptionQuery(ctx.personaId),
     'POST',
   );
 
@@ -897,16 +1006,6 @@ async function tessalliteDiag(): Promise<string> {
   }
 
   return parts.join(' | ');
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`timeout_${ms}ms`)), ms);
-    promise.then(
-      (val) => { clearTimeout(timer); resolve(val); },
-      (err) => { clearTimeout(timer); reject(err); },
-    );
-  });
 }
 
 // ---------------------------------------------------------------------------

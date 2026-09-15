@@ -41,6 +41,7 @@ from shared.schemas.pydantic_models import (
     EntityUsageResponse,
     NamedSetCreate,
     NamedSetPreviewResponse,
+    NamedSetRefreshResponse,
     NamedSetResponse,
     NamedSetUpdate,
     NamedSetValidateRequest,
@@ -52,7 +53,11 @@ from src.named_set_deploy_resolver import (
     NamedSetSnapshotInvalidError,
     resolve_served_named_sets,
 )
-from src.api._persona_scope import parse_allowed_ids, resolve_effective_persona
+from src.api._persona_scope import resolve_effective_persona
+from src.api.named_set_visibility import (
+    ModelSurface,
+    named_set_binds_for_persona,
+)
 from src.api._scope import ensure_model_in_project, purge_entity_soft_references
 from src.auth.middleware import CurrentUser, get_current_user
 from src.auth.rbac import caller_has_role, require_role
@@ -165,10 +170,18 @@ def _named_set_trust_meta(
 def _decorate_named_set_response(
     named_set: NamedSet,
     source_system: str | None,
+    persona_visible: bool | None = None,
 ) -> NamedSetResponse:
-    """Attach trust metadata without changing the persisted named-set shape."""
+    """Attach trust metadata without changing the persisted named-set shape.
+
+    Bug-9877: *persona_visible* carries the bind verdict for the effective
+    persona to a caller that asked for the hidden sets too (the XMLA Execute
+    path, which must REFUSE a hidden set rather than silently not inline it).
+    It is ``None`` on every response that already contains only visible sets.
+    """
     response = NamedSetResponse.model_validate(named_set)
     response.trust_meta = _named_set_trust_meta(named_set, source_system)
+    response.persona_visible = persona_visible
     return response
 
 
@@ -538,95 +551,89 @@ async def _check_parameter_namespace_collision(
         )
 
 
-# Bug-5963: mirrors ``_validate_expression``'s own bracket-token
-# extraction below -- member keys are written as ``&[key]`` and must be
-# stripped first, or arbitrary source values would be mistaken for
-# dimension-name references.
-_MEMBER_KEY_RE = re.compile(r"&\[[^\]]*\]")
-_BRACKET_REF_RE = re.compile(r"\[([^\]]+)\]")
-_NON_DIMENSION_REF_TOKENS = {"measures", "model", "members", "all"}
+# Bug-9877 (audit rows A18/A19/A20/A39): named-set persona visibility is no
+# longer a bracket-token regex over the stored MDX. It is an attempted BIND of
+# the set's definition over the persona's model query, performed by
+# ``src.api.named_set_visibility`` through the query-router's own persona path.
+# The old scan compared dimension names only, never looked at the ranking or
+# filter MEASURE inside ``TopCount(...)`` / ``Filter(...)``, and left any token
+# it could not resolve VISIBLE. See the module docstring for the call site.
 
 
-def _named_set_referenced_dimension_names(expression: str | None) -> set[str]:
-    """Extract candidate dimension-name references from an MDX expression."""
-    if not expression:
-        return set()
-    expr_without_keys = _MEMBER_KEY_RE.sub("", expression)
-    refs = _BRACKET_REF_RE.findall(expr_without_keys)
-    return {r for r in refs if r.lower() not in _NON_DIMENSION_REF_TOKENS}
-
-
-async def _named_set_visible_to_persona(
+async def _persona_visible_named_sets(
     db,
-    ns: NamedSet,
+    named_sets: list[NamedSet],
+    *,
     model_id: UUID,
-    allowed_dim_ids: list[UUID] | None,
-) -> bool:
-    """Return True if the named set's dimension is within the persona scope.
+    model_slug: str,
+    persona: Any | None,
+    bearer: str,
+) -> tuple[list[NamedSet], list[NamedSet]]:
+    """Split *named_sets* into (visible, hidden) for the effective persona.
 
-    Mirrors ``_kpi_visible_to_persona`` in ``kpis.py``. If
-    *allowed_dim_ids* is ``None`` the persona is unrestricted.
-
-    Unlike the KPI expression language (which only ever references known
-    measure names), an MDX set expression's bracket tokens also cover
-    hierarchy names, level names, and literal member captions that will
-    never match a dimension name -- exactly why
-    ``_validate_expression`` below only *warns* on an unmatched ref
-    instead of rejecting it. So this check only restricts on a positive,
-    confident match to a real model dimension that is outside the
-    persona's allow-list; an expression this extraction cannot
-    confidently resolve to any dimension is left visible rather than
-    silently hidden.
+    Visible iff the set's definition binds over the persona model query. The
+    model surface is loaded once for the whole list (the N+1 guard Bug-7255
+    added for the previous scan).
     """
-    if allowed_dim_ids is None:
-        return True
-    referenced = _named_set_referenced_dimension_names(ns.expression)
-    # Bug-6329: also include the authoritative persisted dimensions field
-    # (comma/semicolon-separated dimension names set by the builder).
-    # Mirrors agent-service ``_named_set_outside_persona_scope``.
-    raw_dims = getattr(ns, "dimensions", None)
-    if raw_dims:
-        for part in re.split(r"[;,]", str(raw_dims)):
-            token = part.strip()
-            if token:
-                referenced.add(token)
-    if not referenced:
-        return True
-    result = await db.execute(
-        select(Dimension.id, Dimension.name).where(Dimension.model_id == model_id)
+    if persona is None or not named_sets:
+        return list(named_sets), []
+    surface = await ModelSurface.load(db, model_id)
+    visible: list[NamedSet] = []
+    hidden: list[NamedSet] = []
+    for ns in named_sets:
+        if await named_set_binds_for_persona(
+            ns,
+            model_id=model_id,
+            model_slug=model_slug,
+            surface=surface,
+            persona=persona,
+            bearer=bearer,
+        ):
+            visible.append(ns)
+        else:
+            hidden.append(ns)
+    return visible, hidden
+
+
+def _definition_references_named_set(expression: str, name: str) -> bool:
+    """Match the bracketed and bare references accepted by XMLA inlining."""
+    if not expression or not name:
+        return False
+    bracketed = re.compile(
+        r"(?<![.&])\[" + re.escape(name) + r"\](?!\s*\.)",
+        re.IGNORECASE,
     )
-    name_to_id = {name.lower(): dim_id for dim_id, name in result.all()}
-    allowed_set = set(allowed_dim_ids)
-    for ref in referenced:
-        dim_id = name_to_id.get(ref.lower())
-        if dim_id is not None and dim_id not in allowed_set:
-            return False
-    return True
-
-
-def _named_set_visible_to_persona_fast(
-    ns: NamedSet,
-    dim_name_to_id: dict[str, UUID],
-    allowed_set: set[UUID],
-) -> bool:
-    """Bug-7255: synchronous persona-visibility check using a pre-built
-    dimension map. Identical logic to ``_named_set_visible_to_persona``
-    but avoids the N+1 dimension query by accepting the map as a parameter.
-    """
-    referenced = _named_set_referenced_dimension_names(ns.expression)
-    raw_dims = getattr(ns, "dimensions", None)
-    if raw_dims:
-        for part in re.split(r"[;,]", str(raw_dims)):
-            token = part.strip()
-            if token:
-                referenced.add(token)
-    if not referenced:
+    if bracketed.search(expression):
         return True
-    for ref in referenced:
-        dim_id = dim_name_to_id.get(ref.lower())
-        if dim_id is not None and dim_id not in allowed_set:
-            return False
-    return True
+    bare = re.compile(
+        r"(?<![.\[\w])" + re.escape(name) + r"(?![.\]\w])",
+        re.IGNORECASE,
+    )
+    return bare.search(expression) is not None
+
+
+def _referenced_named_set_closure(
+    named_sets: list[NamedSet], reference_names: list[str],
+) -> list[NamedSet]:
+    """Return exact requested sets and their nested saved-set dependencies."""
+    requested = {value.strip().casefold() for value in reference_names if value.strip()}
+    by_name = {
+        (ns.name or "").strip().casefold(): ns
+        for ns in named_sets
+        if (ns.name or "").strip()
+    }
+    selected = {name for name in requested if name in by_name}
+    pending = list(selected)
+    while pending:
+        current = by_name[pending.pop()]
+        expression = (current.expression or "").strip()
+        for candidate_name, candidate in by_name.items():
+            if candidate_name in selected:
+                continue
+            if _definition_references_named_set(expression, candidate.name or ""):
+                selected.add(candidate_name)
+                pending.append(candidate_name)
+    return [ns for ns in named_sets if (ns.name or "").strip().casefold() in selected]
 
 
 from fastapi import Response as FastAPIResponse  # noqa: E402
@@ -637,7 +644,27 @@ async def list_named_sets(
     project_id: UUID,
     model_id: UUID,
     response: FastAPIResponse,
+    request: Request,
     persona_id: UUID | None = Query(default=None),
+    reference_name: list[str] | None = Query(
+        default=None,
+        description=(
+            "Optional exact saved-set names referenced by an Execute request. "
+            "Matching and nested deployed sets are persona-checked; omitted "
+            "for the complete catalogue used by MDSCHEMA_SETS."
+        ),
+    ),
+    include_persona_hidden: bool = Query(
+        default=False,
+        description=(
+            "When true, also return the sets that do NOT bind for the "
+            "effective persona, each flagged with persona_visible=false. Only "
+            "the XMLA Execute path passes this: it must tell 'no such set' "
+            "apart from 'this set does not bind for your persona' so a "
+            "reference to a hidden set is refused with a clear fault instead "
+            "of silently producing an empty axis (Bug-9877)."
+        ),
+    ),
     deployed_only: bool = Query(
         default=False,
         description=(
@@ -704,34 +731,36 @@ async def list_named_sets(
                 )
             named_sets = [r.named_set for r in resolved]
 
-        # Bug-5963: named-set listing predates the Excel persona switcher
-        # and, unlike measures/dimensions/KPIs, was never scoped to the
-        # active persona -- filter out sets built on a dimension the
-        # persona cannot see.
-        # Bug-7255: hoist the dimension-name-to-id map outside the loop so
-        # it is built once per request, not once per named set (N+1 fix).
+        # Bug-9979: Execute supplies a conservative list of tokens found in the
+        # MDX. Resolve that list against exact SERVED names before the expensive
+        # persona bind checks. Include referenced saved-set dependencies so the
+        # existing fixed-point inliner still handles nested sets. Filtering is
+        # deliberately after deployed snapshot resolution: a draft rename must
+        # not hide the name that production BI clients can still execute.
+        if reference_name is not None:
+            named_sets = _referenced_named_set_closure(named_sets, reference_name)
+
+        # Bug-5963 / Bug-9877: scope the listing to the active persona. A set
+        # is served iff its definition BINDS over the persona model query --
+        # the query-router's own persona path decides, so this catalogue and
+        # the executor cannot disagree (SQL generation rule 4).
         persona = await resolve_effective_persona(
             db, current_user=current_user, model_id=model_id,
             requested_persona_id=persona_id,
         )
-        if persona:
-            allowed = parse_allowed_ids(persona.included_dimension_ids)
-            if allowed is not None:
-                # Single query: build name->id map once for the model
-                dim_result = await db.execute(
-                    select(Dimension.id, Dimension.name)
-                    .where(Dimension.model_id == model_id)
-                )
-                dim_name_to_id = {
-                    name.lower(): dim_id for dim_id, name in dim_result.all()
-                }
-                allowed_set = set(allowed)
-                named_sets = [
-                    ns for ns in named_sets
-                    if _named_set_visible_to_persona_fast(
-                        ns, dim_name_to_id, allowed_set,
-                    )
-                ]
+        bearer = request.headers.get("Authorization", "").replace("Bearer ", "")
+        visible, hidden = await _persona_visible_named_sets(
+            db, named_sets,
+            model_id=model_id, model_slug=model.slug,
+            persona=persona, bearer=bearer,
+        )
+        if hidden:
+            log.info(
+                "Named sets hidden from persona %s on model %s: %s do not bind "
+                "over the persona model query (Bug-9877).",
+                getattr(persona, "id", None), model_id,
+                [str(ns.id) for ns in hidden],
+            )
 
         # Bug-7949: expose the effective member cap to the frontend via a
         # response header, so it doesn't need to hardcode 1000.
@@ -740,7 +769,17 @@ async def list_named_sets(
             _settings.NAMED_LIST_MEMBER_CAP_CEILING,
         )
         response.headers["X-Named-List-Member-Cap"] = str(member_cap)
-        return [_decorate_named_set_response(ns, source_system) for ns in named_sets]
+        if include_persona_hidden and persona is not None:
+            # Order is preserved by re-walking the original list, so the
+            # Execute path sees the same ordering every other caller does.
+            hidden_ids = {ns.id for ns in hidden}
+            return [
+                _decorate_named_set_response(
+                    ns, source_system, persona_visible=ns.id not in hidden_ids,
+                )
+                for ns in named_sets
+            ]
+        return [_decorate_named_set_response(ns, source_system) for ns in visible]
     return []
 
 
@@ -749,12 +788,15 @@ async def get_named_set(
     project_id: UUID,
     model_id: UUID,
     named_set_id: UUID,
+    request: Request,
     persona_id: UUID | None = Query(default=None),
     current_user: CurrentUser = Depends(get_current_user),
     _: None = require_role("viewer"),
 ) -> NamedSetResponse:
     async for db in get_tenant_db(current_user.tenant_id):
-        await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
+        model = await ensure_model_in_project(
+            db, project_id=project_id, model_id=model_id,
+        )
         ns = await db.get(NamedSet, named_set_id)
         if ns is None or ns.model_id != model_id:
             raise HTTPException(status_code=404, detail="Named set not found")
@@ -771,20 +813,21 @@ async def get_named_set(
         if ns.certification_status == "draft" and not is_privileged:
             raise HTTPException(status_code=404, detail="Named set not found")
 
-        # Bug-6329: persona dimension scope gate -- mirrors get_kpi and
-        # list_named_sets.  A restricted persona must not fetch a named
-        # set whose dimension lineage falls outside their scope.
+        # Bug-6329 / Bug-9877: persona scope gate -- the same bind verdict
+        # list_named_sets uses, so a set a persona cannot see in the catalogue
+        # cannot be fetched by id either.
         persona = await resolve_effective_persona(
             db, current_user=current_user, model_id=model_id,
             requested_persona_id=persona_id,
         )
-        if persona:
-            allowed = parse_allowed_ids(
-                getattr(persona, "included_dimension_ids", None),
+        if persona is not None:
+            bearer = request.headers.get("Authorization", "").replace("Bearer ", "")
+            visible, _hidden = await _persona_visible_named_sets(
+                db, [ns],
+                model_id=model_id, model_slug=model.slug,
+                persona=persona, bearer=bearer,
             )
-            if allowed is not None and not await _named_set_visible_to_persona(
-                db, ns, model_id, allowed,
-            ):
+            if not visible:
                 raise HTTPException(status_code=404, detail="Named set not found")
 
         return _decorate_named_set_response(
@@ -1611,21 +1654,23 @@ async def preview_named_set(
                 raise HTTPException(status_code=404, detail="Named set not found")
             ns = resolved[0].named_set
 
-        # Bug-5963: same 404-on-out-of-scope gate KPI evaluation uses --
-        # a persona-scoped user cannot preview a named set built on a
-        # dimension outside their persona.
+        # Bug-5963 / Bug-9877 (audit row A39): same 404-on-out-of-scope gate
+        # the catalogue uses, and now on the same basis -- a persona previews a
+        # set only when the set binds over that persona's model query.
         persona = await resolve_effective_persona(
             db, current_user=current_user, model_id=model_id,
             requested_persona_id=persona_id,
         )
-        if persona:
-            allowed = parse_allowed_ids(persona.included_dimension_ids)
-            if allowed is not None and not await _named_set_visible_to_persona(
-                db, ns, model_id, allowed
-            ):
+        bearer = request.headers.get("Authorization", "").replace("Bearer ", "")
+        if persona is not None:
+            visible, _hidden = await _persona_visible_named_sets(
+                db, [ns],
+                model_id=model_id, model_slug=model.slug,
+                persona=persona, bearer=bearer,
+            )
+            if not visible:
                 raise HTTPException(status_code=404, detail="Named set not found")
 
-        bearer = request.headers.get("Authorization", "").replace("Bearer ", "")
         # Bug-5963: thread persona through the dynamic (topN/filter) preview
         # query so it runs under the same row-level security as KPI and
         # plugin execution instead of the unrestricted default context.
@@ -1762,7 +1807,7 @@ async def _build_refresh_sql(
 
 @router.post(
     "/{named_set_id}/refresh",
-    response_model=NamedSetResponse,
+    response_model=NamedSetRefreshResponse,
     dependencies=[require_role("modeler")],
 )
 async def refresh_named_list(
@@ -1771,12 +1816,13 @@ async def refresh_named_list(
     named_set_id: UUID,
     request: Request,
     current_user: CurrentUser = Depends(get_current_user),
-) -> NamedSetResponse:
+) -> NamedSetRefreshResponse:
     """Refresh a dynamic named list by executing its definition query.
 
     Computes members from the source data and stores them. Only valid for
     dynamic definition types (topN, filter, sql_query). Fixed-member lists
-    cannot be refreshed.
+    cannot be refreshed. Members remain draft-only until model Save + Deploy;
+    the response explicitly reports that publication is required.
     """
     async for db in get_tenant_db(current_user.tenant_id):
         model = await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
@@ -1815,8 +1861,26 @@ async def refresh_named_list(
             bd, model_id, model.slug, db, member_cap=member_cap,
         )
 
+        # Bug-9893 (audit row R6): the stored membership is only as narrow as
+        # the context that computed it, and it is then served to EVERY persona.
+        # Resolve the refreshing caller's effective persona EXPLICITLY rather
+        # than letting the router resolve it implicitly, so the context
+        # recorded beside the members is the context that actually produced
+        # them and the serve-time gate can decide whether a given persona may
+        # be served these members or must evaluate the list live.
+        refresh_persona = await resolve_effective_persona(
+            db, current_user=current_user, model_id=model_id,
+            requested_persona_id=None,
+        )
+        refresh_persona_id = (
+            str(refresh_persona.id) if refresh_persona is not None else None
+        )
+
         try:
-            result = await _execute_via_router(model_id, sql, bearer, timeout_s=60.0)
+            result = await _execute_via_router(
+                model_id, sql, bearer, timeout_s=60.0,
+                persona_id=refresh_persona_id,
+            )
         except RowSecurityDeniedError:
             # Bug-8453 [fail closed]: a deny-all returns HTTP 200 with zero
             # rows. Treating that as the refresh result would OVERWRITE a good
@@ -1996,15 +2060,34 @@ async def refresh_named_list(
         # pre-call copy, so nothing is silently overwritten.
         updated_bd = dict(current_bd)
         updated_bd["members"] = members
-        updated_bd["last_refreshed_at"] = datetime.now(timezone.utc).isoformat()
+        refreshed_at = datetime.now(timezone.utc).isoformat()
+        updated_bd["last_refreshed_at"] = refreshed_at
+        # Bug-9893: the refresh context travels WITH the membership. The
+        # snapshot serialiser copies ``builder_definition`` verbatim, so it
+        # reaches the deployed snapshot the resolver reads. ``principal_id`` is
+        # the identity the row-security compiler keys on
+        # (``Principal.user_identity``); ``probe_sql`` is the model query the
+        # members came from, which a persona that may NOT be served these
+        # members re-evaluates live over its own surface.
+        updated_bd["refresh_context"] = {
+            "principal_id": current_user.email or current_user.user_id,
+            "persona_id": refresh_persona_id,
+            "bypass_row_security": bool(
+                refresh_persona is not None
+                and getattr(refresh_persona, "bypass_row_security", False)
+            ),
+            "refreshed_at": refreshed_at,
+            "probe_sql": sql,
+        }
         ns.builder_definition = updated_bd
 
         await _create_version(db, ns, current_user.email, summary)
         await db.commit()
         await db.refresh(ns)
-        return _decorate_named_set_response(
+        response = _decorate_named_set_response(
             ns, await _model_source_system(db, model_id),
         )
+        return NamedSetRefreshResponse(**response.model_dump(), deploy_required=True)
     raise HTTPException(status_code=500, detail="DB session exhausted")
 
 
@@ -2338,6 +2421,7 @@ async def _execute_via_router(
         "model_id": str(model_id),
         "raw_query": query,
         "protocol": "jdbc",
+        "client_kind": "maintenance",
     }
     if persona_id is not None:
         body["persona_id"] = persona_id

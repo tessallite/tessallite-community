@@ -11,15 +11,18 @@ import dataclasses
 import logging
 import re
 import types
+from collections.abc import Mapping
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import Text, cast, func, literal, select
+from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from shared.db.models import (
     AggregateColumn,
     AggregateDefinition,
+    AggregateRefreshPolicy,
     Dimension,
     Measure,
     Model,
@@ -31,18 +34,18 @@ from shared.semantic.hierarchy_resolver import load_hierarchy_level_dimensions a
 from src.ir.logical_query import (
     BoundColumnRef,
     BoundDerivedExpression,
+    BoundMeasurePredicate,
     BoundQuery,
     DeployedSnapshotUnavailableError,
     ExpressionOccurrence,
     LogicalQuery,
     ModelNotDeployedError,
     SemanticBindingError,
+    UnsupportedMeasurePredicateError,
 )
 from src.semantic.snapshot_resolver import (
-    LiveMetadataBundle,
     hierarchy_level_dimensions_from_snapshot,
     resolve_deployed_shape,
-    resolve_live_metadata_bundle,  # noqa: F401 — kept for test-patch compatibility
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +58,109 @@ logger = logging.getLogger(__name__)
 # SemanticBindingError (previously they were only logged and silently bound to
 # base-model data, allowing fabricated names to return real data).
 _KNOWN_VARIANT_SUFFIXES = ("_technical",)
+
+_MEASURE_PREDICATE_AGGREGATIONS = frozenset({
+    "sum", "avg", "min", "max", "count", "count_distinct",
+})
+_MEASURE_PREDICATE_AGG_ALIASES = {"average": "avg"}
+
+
+def _measure_predicate_value_type(measure: Any, deployed_shape: Any) -> str | None:
+    """Resolve a predicate value type from the same deployed shape as the measure."""
+    source_column_id = getattr(measure, "source_column_id", None)
+    if deployed_shape is not None and source_column_id is not None:
+        snapshot_column = (
+            getattr(deployed_shape, "columns_by_id", {}) or {}
+        ).get(str(source_column_id))
+        if snapshot_column:
+            data_type = snapshot_column.get("data_type")
+            if data_type:
+                return str(data_type)
+    for attr in ("data_type", "source_data_type", "physical_type", "column_type"):
+        data_type = getattr(measure, attr, None)
+        if data_type:
+            return str(data_type)
+    return None
+
+
+def _bind_measure_predicates(
+    query: LogicalQuery,
+    measures: list[Any],
+    deployed_shape: Any,
+) -> list[BoundMeasurePredicate]:
+    """Bind structured measure predicates and reject unsafe measure families.
+
+    Measure predicates are an explicit identity contract: a display name or a
+    missing/duplicate id must never be guessed. The deployed measure supplies
+    the effective aggregation; the producer's carried value is informational.
+    """
+    if not getattr(query, "measure_filters", None):
+        return []
+
+    by_id: dict[str, list[Any]] = {}
+    for measure in measures:
+        measure_id = getattr(measure, "id", None)
+        if measure_id is not None:
+            by_id.setdefault(str(measure_id), []).append(measure)
+
+    bound: list[BoundMeasurePredicate] = []
+    for predicate in query.measure_filters:
+        measure_id = str(getattr(predicate, "measure_id", "") or "")
+        candidates = by_id.get(measure_id, [])
+        if len(candidates) != 1:
+            raise UnsupportedMeasurePredicateError(
+                f"Measure predicate {measure_id!r} is ambiguous or not present "
+                "in the deployed model; use a stable deployed measure id."
+            )
+        measure = candidates[0]
+        measure_name = str(getattr(measure, "name", "") or "")
+        measure_type = str(getattr(measure, "measure_type", "standard") or "").lower()
+        if measure_type != "standard":
+            raise UnsupportedMeasurePredicateError(
+                f"Measure predicate on {measure_name!r} is unsupported for "
+                f"measure_type={measure_type!r}; calculated and variant measures "
+                "cannot be safely rendered as grouped predicates."
+            )
+        semi_additive = getattr(measure, "semi_additive_behavior", None)
+        if semi_additive is not None and str(semi_additive).strip().lower() not in {"", "none"}:
+            raise UnsupportedMeasurePredicateError(
+                f"Measure predicate on {measure_name!r} is unsupported for "
+                f"semi_additive_behavior={semi_additive!r}."
+            )
+
+        effective_aggregation = str(
+            getattr(measure, "default_agg", "") or ""
+        ).strip().lower()
+        effective_aggregation = _MEASURE_PREDICATE_AGG_ALIASES.get(
+            effective_aggregation, effective_aggregation,
+        )
+        if effective_aggregation not in _MEASURE_PREDICATE_AGGREGATIONS:
+            raise UnsupportedMeasurePredicateError(
+                f"Measure predicate on {measure_name!r} cannot use deployed "
+                f"aggregation {effective_aggregation!r}; the aggregation is "
+                "unsupported or ambiguous."
+            )
+        if (
+            getattr(measure, "source_column_id", None) is None
+            and getattr(measure, "user_defined_attribute_id", None) is None
+        ):
+            raise UnsupportedMeasurePredicateError(
+                f"Measure predicate on {measure_name!r} has no deployed source "
+                "column or user-defined attribute identity."
+            )
+        bound.append(
+            BoundMeasurePredicate(
+                measure_id=measure_id,
+                measure_name=measure_name,
+                operator=predicate.operator,
+                value=predicate.value,
+                effective_aggregation=effective_aggregation,
+                value_type=_measure_predicate_value_type(measure, deployed_shape),
+                like_escape=getattr(predicate, "like_escape", None),
+                measure=measure,
+            )
+        )
+    return bound
 
 
 def _node_from_ast_json(ast_json: Any):
@@ -808,6 +914,7 @@ async def bind_query_to_model(
                     m = types.SimpleNamespace(
                         id=getattr(d, "id", None),
                         name=name,
+                        is_query_only=True,
                         default_agg="count_distinct",
                         is_additive=False,
                         source_column_id=getattr(d, "source_column_id", None),
@@ -826,6 +933,7 @@ async def bind_query_to_model(
                         m = types.SimpleNamespace(
                             id=getattr(_phys_d, "id", None),
                             name=_phys_d.name,
+                            is_query_only=True,
                             default_agg="count_distinct",
                             is_additive=False,
                             source_column_id=getattr(_phys_d, "source_column_id", None),
@@ -839,6 +947,32 @@ async def bind_query_to_model(
 
         resolved_dimensions = []
         seen_dims: set[str] = set()
+
+        # Bug-9740 (audit row A36 / SQL generation rule 4): a bare measure name
+        # projected by a GROUPED query means the measure AT ITS ``default_agg``
+        # over that grain — exactly what the ``SELECT *`` expansion above
+        # already does for the same measure. Resolving it as a raw value column
+        # instead emitted ``SELECT dim, <phys_col> ... GROUP BY dim``, which the
+        # source database rejects ("must appear in the GROUP BY clause or be
+        # used in an aggregate function") and which would be the wrong number
+        # even where a source tolerated it. The virtual-dimension shape stays
+        # for the UNGROUPED case, where a bare measure legitimately projects its
+        # raw value once per fact row — the shape drill-through leaf detail is
+        # built on (``drill/semantic_builder.py``, leaf mode emits no GROUP BY).
+        #
+        # ``ungrouped_bare_columns`` restricts this to TRULY bare select items
+        # not already in the grain, so a measure column referenced inside an
+        # arithmetic/CASE expression keeps its passthrough rendering, and
+        # ``GROUP BY <measure column>`` keeps grouping by the raw column.
+        _grouped_query = bool(getattr(query, "grain", None))
+        _bare_ungrouped = {
+            (c or "").lower()
+            for c in (getattr(query, "ungrouped_bare_columns", None) or [])
+        }
+
+        def _bare_measure_needs_aggregation(candidate: str) -> bool:
+            return _grouped_query and (candidate or "").lower() in _bare_ungrouped
+
         for name in query.requested_dimensions:
             if name in seen_dims:
                 continue
@@ -859,6 +993,9 @@ async def bind_query_to_model(
                     if (
                         getattr(m, "measure_type", None) == "calculated"
                         or getattr(m, "variant_kind", None) is not None
+                        # Bug-9740: a bare measure projected by a grouped query
+                        # is a measure at its default_agg, not a raw column.
+                        or _bare_measure_needs_aggregation(name)
                     ):
                         # Calculated measures and variant measures must go
                         # through the measure expansion path: calculated ones
@@ -884,6 +1021,8 @@ async def bind_query_to_model(
                         if (
                             getattr(_phys_m, "measure_type", None) == "calculated"
                             or getattr(_phys_m, "variant_kind", None) is not None
+                            # Bug-9740: same rule on the physical-name fallback.
+                            or _bare_measure_needs_aggregation(name)
                         ):
                             resolved_measures.append(_phys_m)
                             seen_dims.add(name)
@@ -971,6 +1110,13 @@ async def bind_query_to_model(
             raise SemanticBindingError(
                 f"Unknown filter column: {f.dimension_name!r} in model {model.slug!r}"
             )
+
+    # Bug-9824: bind measure predicates by stable identity and the deployed
+    # measure definition. They intentionally do not enter resolved_filters;
+    # source and aggregate renderers consume this separate list as HAVING.
+    resolved_measure_filters = _bind_measure_predicates(
+        query, all_measures_for_select, deployed_shape,
+    )
 
     # Bug-5488: collect model dimensions referenced ONLY inside an
     # unresolvable WHERE predicate (function-wrapped comparison, OR-compound,
@@ -1078,6 +1224,10 @@ async def bind_query_to_model(
     for m in resolved_measures:
         if bool(getattr(m, "is_invalid", False)):
             uses_invalid.append(("measure", m.name))
+    for predicate in resolved_measure_filters:
+        predicate_measure = predicate.measure
+        if bool(getattr(predicate_measure, "is_invalid", False)):
+            uses_invalid.append(("measure", predicate.measure_name))
 
     # Cross-model measure detection — same-project cross-model queries not yet resolved
     from src.ir.logical_query import CrossModelNotResolvedError
@@ -1094,6 +1244,18 @@ async def bind_query_to_model(
         if _cm_model is not None or _cm_measure is not None:
             raise CrossModelNotResolvedError(
                 measure_slug=m.name,
+                source_model_id=(
+                    str(_cm_model) if _cm_model is not None
+                    else f"(referenced measure {_cm_measure})"
+                ),
+            )
+    for predicate in resolved_measure_filters:
+        predicate_measure = predicate.measure
+        _cm_model = getattr(predicate_measure, "cross_model_source_model_id", None)
+        _cm_measure = getattr(predicate_measure, "cross_model_source_measure_id", None)
+        if _cm_model is not None or _cm_measure is not None:
+            raise CrossModelNotResolvedError(
+                measure_slug=predicate.measure_name,
                 source_model_id=(
                     str(_cm_model) if _cm_model is not None
                     else f"(referenced measure {_cm_measure})"
@@ -1269,6 +1431,7 @@ async def bind_query_to_model(
         resolved_measures=resolved_measures,
         resolved_dimensions=resolved_dimensions,
         resolved_filters=resolved_filters,
+        resolved_measure_filters=resolved_measure_filters,
         deployed_shape=deployed_shape,
         resolved_dimensions_by_name=dimension_map,
         dim_type_by_name=dim_type_by_name,
@@ -1492,28 +1655,404 @@ def _build_quantile_inventory(
     return requests
 
 
-async def load_active_aggregates(
+# ---------------------------------------------------------------------------
+# Bug-9885: per-model aggregate inventory, loaded once and reused
+# ---------------------------------------------------------------------------
+#
+# ``load_active_aggregates`` / ``load_inactive_aggregates`` return the model's
+# WHOLE aggregate inventory: every definition, every column, and the Measure
+# behind each column. On a mature model that is thousands of ORM rows, and the
+# router asks for it on EVERY query. An unrestricted ``MDSCHEMA_MEMBERS``
+# Discover issues one ``/discover/members`` request per dimension (~110 for
+# ``modely_technical``), so the same inventory was hydrated ~110 times for one
+# user action — measured at ~250 ms of pure Python per request, ~85% of the
+# request's CPU, which is what made a cold unrestricted Discover cost ~45 s.
+#
+# Aggregates are LIVE state, not deployed-snapshot state (see
+# ``snapshot_resolver``): a build, refresh, retirement or policy edit changes
+# what may serve, and serving a stale inventory is a wrong-numbers risk. So the
+# cache is NOT time-bounded. Every call re-reads a cheap identity — one round
+# trip that moves whenever an aggregate definition, aggregate column, refresh
+# policy or measure of the model changes, or the model is deployed or reverted
+# (see ``_aggregate_inventory_identity`` for exactly what it watches and the
+# one thing it deliberately does not) — and rehydrates when it differs. A hit
+# costs that one query instead of thousands of ORM instances.
+#
+# The cache is process-local and bounded per replica. It stores only immutable
+# value objects, never SQLAlchemy instances, so reuse across requests cannot
+# reintroduce Bug-9938's cross-session relationship failure.
+#
+# Runtime state declaration: the tenant metadata database is the durable
+# authority; the cache key is model id (already tenant-scoped); the bound is
+# _AGG_INVENTORY_MAX_MODELS per replica; there is no TTL because every load
+# probes the serving identity; full and model-local invalidation epochs reject
+# in-flight stale publications; and restart or replica loss discards the
+# process-local state safely.
+@dataclasses.dataclass(frozen=True, slots=True)
+class AggregateInventoryMeasure:
+    """The only Measure attribute read by aggregate serving: its name."""
+
+    name: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class AggregateInventoryColumn:
+    """Session-free aggregate-column data consumed by matcher/rewrite code."""
+
+    id: Any
+    physical_col_name: str
+    stat_type: str
+    measure: AggregateInventoryMeasure | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class AggregateInventoryRefreshPolicy:
+    """The refresh-policy fields needed by the serve-time overdue gate."""
+
+    cron_expression: str | None
+    is_enabled: bool
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class AggregateInventoryDefinition:
+    """Immutable, session-free projection of a serving aggregate.
+
+    Keep this projection aligned with the attributes read by the aggregate
+    matcher, rewriter and hit/miss bookkeeping. In particular, do not add an
+    ORM relationship here: the process-global cache must remain safe to share
+    across request sessions.
+    """
+
+    id: Any
+    model_id: Any | None
+    target_id: Any | None
+    physical_table_name: str
+    target_schema: str | None
+    status: str
+    grain: tuple[str, ...]
+    grain_physical_cols: tuple[str, ...] | None
+    grain_keys: tuple[Mapping[str, Any], ...] | None
+    attribute_edges: tuple[Mapping[str, Any], ...] | None
+    passenger_columns: tuple[Mapping[str, Any], ...] | None
+    active_refresh_run_id: Any | None
+    built_for_version_id: Any | None
+    built_for_epoch: int | None
+    is_stale: bool
+    invalid_reason: str | None
+    last_refreshed_at: Any | None
+    persona_id: Any | None
+    columns: tuple[AggregateInventoryColumn, ...]
+    refresh_policy: AggregateInventoryRefreshPolicy | None
+
+
+def _freeze_json_value(value: Any) -> Any:
+    """Copy JSONB serving metadata into recursively immutable values."""
+    if isinstance(value, Mapping):
+        return types.MappingProxyType(
+            {key: _freeze_json_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json_value(item) for item in value)
+    return value
+
+
+def _freeze_manifest(value: Any) -> tuple[Mapping[str, Any], ...] | None:
+    """Freeze one optional JSONB manifest while preserving a missing value."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(
+        _freeze_json_value(item)
+        for item in value
+        if isinstance(item, Mapping)
+    )
+
+
+def _freeze_aggregate_definition(
+    definition: AggregateDefinition,
+) -> AggregateInventoryDefinition:
+    """Project one eager-loaded ORM graph into immutable serving data."""
+    policy = getattr(definition, "refresh_policy", None)
+    return AggregateInventoryDefinition(
+        id=getattr(definition, "id", None),
+        model_id=getattr(definition, "model_id", None),
+        target_id=getattr(definition, "target_id", None),
+        physical_table_name=getattr(definition, "physical_table_name", "") or "",
+        target_schema=getattr(definition, "target_schema", None),
+        status=getattr(definition, "status", "") or "",
+        grain=tuple(getattr(definition, "grain", None) or ()),
+        grain_physical_cols=(
+            tuple(getattr(definition, "grain_physical_cols", None))
+            if getattr(definition, "grain_physical_cols", None) is not None
+            else None
+        ),
+        grain_keys=_freeze_manifest(getattr(definition, "grain_keys", None)),
+        attribute_edges=_freeze_manifest(
+            getattr(definition, "attribute_edges", None)
+        ),
+        passenger_columns=_freeze_manifest(
+            getattr(definition, "passenger_columns", None)
+        ),
+        active_refresh_run_id=getattr(definition, "active_refresh_run_id", None),
+        built_for_version_id=getattr(definition, "built_for_version_id", None),
+        built_for_epoch=getattr(definition, "built_for_epoch", None),
+        is_stale=bool(getattr(definition, "is_stale", False)),
+        invalid_reason=getattr(definition, "invalid_reason", None),
+        last_refreshed_at=getattr(definition, "last_refreshed_at", None),
+        persona_id=getattr(definition, "persona_id", None),
+        columns=tuple(
+            AggregateInventoryColumn(
+                id=getattr(column, "id", None),
+                physical_col_name=getattr(column, "physical_col_name", "") or "",
+                stat_type=getattr(column, "stat_type", "") or "",
+                measure=(
+                    AggregateInventoryMeasure(
+                        name=getattr(column.measure, "name", "") or "",
+                    )
+                    if getattr(column, "measure", None) is not None
+                    else None
+                ),
+            )
+            for column in (getattr(definition, "columns", None) or ())
+        ),
+        refresh_policy=(
+            AggregateInventoryRefreshPolicy(
+                cron_expression=getattr(policy, "cron_expression", None),
+                is_enabled=bool(getattr(policy, "is_enabled", False)),
+            )
+            if policy is not None
+            else None
+        ),
+    )
+
+
+_AGG_INVENTORY_CACHE: dict[
+    str,
+    tuple[
+        int,
+        tuple,
+        tuple[AggregateInventoryDefinition, ...],
+        tuple[AggregateInventoryDefinition, ...],
+    ],
+] = {}
+_AGG_INVENTORY_MAX_MODELS = 16
+_AGG_INVENTORY_INVALIDATION_EPOCH = 0
+_AGG_INVENTORY_MODEL_EPOCHS: dict[str, int] = {}
+_AGG_INVENTORY_NEXT_MODEL_EPOCH = 0
+
+
+def _advance_model_inventory_epoch(key: str) -> int:
+    """Advance a bounded model-local invalidation epoch and return it."""
+    global _AGG_INVENTORY_NEXT_MODEL_EPOCH
+    if key not in _AGG_INVENTORY_MODEL_EPOCHS:
+        while len(_AGG_INVENTORY_MODEL_EPOCHS) >= _AGG_INVENTORY_MAX_MODELS:
+            _AGG_INVENTORY_MODEL_EPOCHS.pop(
+                next(iter(_AGG_INVENTORY_MODEL_EPOCHS))
+            )
+    _AGG_INVENTORY_NEXT_MODEL_EPOCH += 1
+    epoch = _AGG_INVENTORY_NEXT_MODEL_EPOCH
+    _AGG_INVENTORY_MODEL_EPOCHS[key] = epoch
+    return epoch
+
+
+def invalidate_aggregate_inventory(model_id: object | None = None) -> None:
+    """Invalidate process-local aggregate inventory entries.
+
+    Correctness does not depend on this being called: the identity check below
+    already rehydrates whenever the inventory changed. It exists so deploy and
+    test boundaries can force a cold load without depending on process history.
+    A model-specific eviction preserves unrelated model entries and advances
+    that model's epoch so an in-flight load cannot republish its old result; a
+    no-argument invalidation clears the replica and advances the full-replica
+    epoch used by all in-flight loads.
+    """
+    global _AGG_INVENTORY_INVALIDATION_EPOCH
+    if model_id is None:
+        _AGG_INVENTORY_CACHE.clear()
+        _AGG_INVENTORY_MODEL_EPOCHS.clear()
+        _AGG_INVENTORY_INVALIDATION_EPOCH += 1
+    else:
+        key = str(model_id)
+        _advance_model_inventory_epoch(key)
+        _AGG_INVENTORY_CACHE.pop(key, None)
+
+
+# Bookkeeping columns on ``aggregate_definitions`` that the SERVING path itself
+# writes and that say nothing about whether an aggregate may serve: the hit /
+# miss EMA counters the router credits after a routed query, and ``updated_at``,
+# which those same writes bump. Including them would make the identity below
+# move on the router's own telemetry — measured at 16 spurious rehydrations
+# across one 123-dimension Discover. Every OTHER column is digested, so a
+# column added later is covered by default (more invalidation, never less).
+_AGG_BOOKKEEPING_COLUMNS = frozenset({
+    "updated_at", "hit_count", "estimated_hit_rate",
+})
+
+# ASCII unit/record separators: the column separator, and the stand-in for NULL
+# so that ``(a, NULL)`` and ``(NULL, a)`` cannot digest alike (``concat_ws``
+# drops NULLs rather than emitting a separator). Control characters rather than
+# printable punctuation so no stored value can imitate them; NOT ``\x00``,
+# which PostgreSQL rejects in ``text``.
+_DIGEST_FIELD_SEPARATOR = "\x1f"
+_DIGEST_NULL = "\x1e"
+
+
+def _rows_digest(table, where, *, exclude: frozenset[str] = frozenset()):
+    """An md5 over every row of ``table`` matching ``where``, column by column.
+
+    The system metadata database is PostgreSQL (this ORM is built on JSONB
+    throughout), so ``string_agg``/``md5`` are always available. Rows are
+    ordered by primary key so the digest is deterministic.
+    """
+    columns = [c for c in table.columns if c.name not in exclude]
+    row_text = func.concat_ws(
+        _DIGEST_FIELD_SEPARATOR,
+        *[func.coalesce(cast(c, Text), _DIGEST_NULL) for c in columns],
+    )
+    return (
+        select(func.md5(func.coalesce(
+            func.string_agg(
+                row_text,
+                aggregate_order_by(literal("\n"), *table.primary_key.columns),
+            ),
+            "",
+        )))
+        .select_from(table)
+        .where(where)
+        .scalar_subquery()
+    )
+
+
+async def _aggregate_inventory_identity(
     model_id: object, db: AsyncSession
-) -> list[AggregateDefinition]:
+) -> tuple:
+    """One round trip returning the model's aggregate-inventory identity.
+
+    It moves on any insert, update or delete of an aggregate definition (other
+    than the router's own hit/miss bookkeeping), an aggregate column, a refresh
+    policy, or a measure of this model — and on a deploy or a revert, which
+    moves the deployment pointer and/or the epoch.
     """
-    Load all active AggregateDefinitions for the model, with their columns
-    and the related Measure for each column (needed by the matcher).
-    """
-    result = await db.execute(
+    agg_ids = (
+        select(AggregateDefinition.id)
+        .where(AggregateDefinition.model_id == model_id)
+        .scalar_subquery()
+    )
+    ac_w = AggregateColumn.aggregate_definition_id.in_(agg_ids)
+    rp_w = AggregateRefreshPolicy.aggregate_definition_id.in_(agg_ids)
+    ms_w = Measure.model_id == model_id
+    stmt = select(
+        # The definitions carry everything that decides whether an aggregate
+        # may serve, and are the only rows the serving path writes, so they get
+        # the full column-by-column digest. 84 rows on the reference model,
+        # ~4 ms.
+        _rows_digest(
+            AggregateDefinition.__table__,
+            AggregateDefinition.model_id == model_id,
+            exclude=_AGG_BOOKKEEPING_COLUMNS,
+        ),
+        # The three CHILD families are counted and stamped instead of digested:
+        # digesting 6,681 aggregate columns costs ~20 ms per request, which on a
+        # 110-request Discover is most of what this cache saves. Counts plus the
+        # row timestamps catch every insert, delete and timestamped update, and
+        # their timestamps are safe to trust here because — unlike the
+        # definitions — nothing on the SERVING path writes these tables. The one
+        # untimestamped in-place child write in the product (the snapshot
+        # rehydrator re-pointing ``AggregateColumn.measure_id`` on an import or
+        # revert) rewrites the aggregate DEFINITIONS in the same transaction and
+        # moves the deploy epoch, both of which are watched below.
+        select(func.count()).select_from(AggregateColumn)
+        .where(ac_w).scalar_subquery(),
+        select(func.max(AggregateColumn.created_at))
+        .where(ac_w).scalar_subquery(),
+        select(func.count()).select_from(AggregateRefreshPolicy)
+        .where(rp_w).scalar_subquery(),
+        select(func.max(AggregateRefreshPolicy.updated_at))
+        .where(rp_w).scalar_subquery(),
+        # The matcher reads each aggregate column's Measure by NAME, so a
+        # renamed or re-pointed measure changes what an aggregate can serve.
+        select(func.count()).select_from(Measure).where(ms_w).scalar_subquery(),
+        select(func.max(Measure.updated_at)).where(ms_w).scalar_subquery(),
+        select(Model.deployed_version_id)
+        .where(Model.id == model_id).scalar_subquery(),
+        select(Model.deploy_epoch).where(Model.id == model_id).scalar_subquery(),
+    )
+    return tuple(str(v) for v in (await db.execute(stmt)).one())
+
+
+async def _load_aggregate_inventory(
+    model_id: object, db: AsyncSession
+) -> tuple[
+    tuple[AggregateInventoryDefinition, ...],
+    tuple[AggregateInventoryDefinition, ...],
+]:
+    """Return ``(active, inactive)`` for the model, hydrating only on change."""
+    key = str(model_id)
+    identity = await _aggregate_inventory_identity(model_id, db)
+    load_epoch = _AGG_INVENTORY_INVALIDATION_EPOCH
+    load_model_epoch = _AGG_INVENTORY_MODEL_EPOCHS.get(key)
+    if load_model_epoch is None:
+        load_model_epoch = _advance_model_inventory_epoch(key)
+    cached = _AGG_INVENTORY_CACHE.get(key)
+    if (
+        cached is not None
+        and cached[0] == load_epoch
+        and cached[1] == identity
+    ):
+        return cached[2], cached[3]
+
+    eager = (
+        selectinload(AggregateDefinition.columns)
+        .selectinload(AggregateColumn.measure),
+        # Bug-5148/Bug-8338: the serve-time overdue gate reads the aggregate's
+        # refresh cron (via its policy) to detect a missed scheduled refresh.
+        # Eager-load it so the matcher never issues a per-candidate query.
+        selectinload(AggregateDefinition.refresh_policy),
+    )
+    active_rows = list((await db.execute(
         select(AggregateDefinition)
         .where(
             AggregateDefinition.model_id == model_id,
             AggregateDefinition.status == "active",
         )
-        .options(
-            selectinload(AggregateDefinition.columns).selectinload(AggregateColumn.measure),
-            # Bug-5148/Bug-8338: the serve-time overdue gate reads the aggregate's
-            # refresh cron (via its policy) to detect a missed scheduled refresh.
-            # Eager-load it so the matcher never issues a per-candidate query.
-            selectinload(AggregateDefinition.refresh_policy),
+        .options(*eager)
+    )).scalars().all())
+    inactive_rows = list((await db.execute(
+        select(AggregateDefinition)
+        .where(
+            AggregateDefinition.model_id == model_id,
+            AggregateDefinition.status != "active",
         )
-    )
-    return list(result.scalars().all())
+        .options(*eager)
+    )).scalars().all())
+
+    active = tuple(_freeze_aggregate_definition(row) for row in active_rows)
+    inactive = tuple(_freeze_aggregate_definition(row) for row in inactive_rows)
+
+    # Do not publish a load that crossed a full-replica invalidation boundary.
+    # The caller still receives the data it requested, while the next call must
+    # perform a fresh identity check and hydration.
+    if (
+        _AGG_INVENTORY_INVALIDATION_EPOCH == load_epoch
+        and _AGG_INVENTORY_MODEL_EPOCHS.get(key, 0) == load_model_epoch
+    ):
+        if key not in _AGG_INVENTORY_CACHE:
+            while len(_AGG_INVENTORY_CACHE) >= _AGG_INVENTORY_MAX_MODELS:
+                _AGG_INVENTORY_CACHE.pop(next(iter(_AGG_INVENTORY_CACHE)))
+        _AGG_INVENTORY_CACHE[key] = (load_epoch, identity, active, inactive)
+    return active, inactive
+
+
+async def load_active_aggregates(
+    model_id: object, db: AsyncSession
+) -> list[AggregateInventoryDefinition]:
+    """
+    Load all active AggregateDefinitions for the model, with their columns
+    and the related Measure for each column (needed by the matcher).
+    """
+    active, _ = await _load_aggregate_inventory(model_id, db)
+    return list(active)
 
 
 async def load_quantile_coverage_by_column(
@@ -1568,19 +2107,10 @@ async def load_quantile_coverage_by_column(
 
 async def load_inactive_aggregates(
     model_id: object, db: AsyncSession
-) -> list[AggregateDefinition]:
+) -> list[AggregateInventoryDefinition]:
     """Load non-active aggregates for diagnostic skip-reason reporting."""
-    result = await db.execute(
-        select(AggregateDefinition)
-        .where(
-            AggregateDefinition.model_id == model_id,
-            AggregateDefinition.status != "active",
-        )
-        .options(
-            selectinload(AggregateDefinition.columns).selectinload(AggregateColumn.measure)
-        )
-    )
-    return list(result.scalars().all())
+    _, inactive = await _load_aggregate_inventory(model_id, db)
+    return list(inactive)
 
 
 # ---------------------------------------------------------------------------
@@ -2453,15 +2983,16 @@ async def _load_physical_column_ids(
     """Return a lowercase physical-column-name -> stable ModelColumn id map.
 
     Fallback loader for the binder's derived-expression leaf binding (§7.1) on the
-    no-deployed-shape / no-live-bundle path. Mirrors ``_load_physical_column_names``
-    but also selects the column id, so a derived-grain leaf can resolve its stable
-    id when neither the pinned snapshot nor the cached bundle is available. Keyed by
+    genuinely undeployed path. Mirrors ``_load_physical_column_names`` but also
+    selects the column id, so a derived-grain leaf can resolve its stable id when
+    no deployed snapshot is authoritative. A deployed model with an unusable
+    snapshot fails closed before this live-table fallback is eligible. Keyed by
     lowercase name to match the case-folded leaf compare (unquoted SQL identifiers
     case-fold in PostgreSQL). The id is stringified to match the manifest's
     ``input_column_ids`` vocabulary.
 
     Loads ALL columns (hidden included) so this path yields the SAME id vocabulary
-    as the deployed-snapshot and live-bundle builders (no cache-path-dependent bind;
+    as the deployed-snapshot and live-table loader (no cache-path-dependent bind;
     hidden ACCESS is enforced by CLS, not by this id map). An AMBIGUOUS name — one
     that resolves to more than one ModelColumn across tables — is POISONED (omitted)
     so its leaf binds ``column_id=""`` and the §7.3 cond. 2 lineage gate fails closed
@@ -2479,69 +3010,6 @@ async def _load_physical_column_ids(
         if name and col_id is not None:
             ids_by_name.setdefault(name.lower(), set()).add(str(col_id))
     return {n: next(iter(ids)) for n, ids in ids_by_name.items() if len(ids) == 1}
-
-
-async def _load_live_metadata_bundle(
-    model_id: object, db: AsyncSession
-) -> LiveMetadataBundle:
-    """Load the binder's full live-metadata bundle in one pass (F-003-14).
-
-    Loads measures, dimensions, hierarchy-level dimensions, hidden-column ids,
-    and BOTH physical-column sets (all / visible) so the cached bundle answers
-    every per-query flag combination without re-querying. The physical-column
-    sets are derived from a single name+is_hidden query, replacing the two
-    flag-specific ``_load_physical_column_names`` calls. Loading physical
-    columns unconditionally (even when the current query is not ``SELECT *``)
-    is extra work only on the first cache miss and yields identical results.
-    """
-    measures = await _load_measures(model_id, db)
-    dimensions = await _load_dimensions(model_id, db)
-    hierarchy_levels = await _load_hierarchy_level_dimensions(model_id, db)
-    hidden_column_ids = await _load_hidden_column_ids(model_id, db)
-
-    physical_columns_all: set[str] = set()
-    physical_columns_visible: set[str] = set()
-    _ids_by_name: dict[str, set[str]] = {}
-    try:
-        result = await db.execute(
-            select(ModelColumn.id, ModelColumn.column_name, ModelColumn.is_hidden)
-            .join(ModelTable, ModelColumn.model_table_id == ModelTable.id)
-            .where(ModelTable.model_id == model_id)
-        )
-        for col_id, name, is_hidden in result.all():
-            if not name:
-                continue
-            lname = name.lower()
-            physical_columns_all.add(lname)
-            if not is_hidden:
-                physical_columns_visible.add(lname)
-            # Stable column id for the derived-expression leaf binding (§7.1),
-            # keyed by lowercase name. Collect the id SET per name (across all
-            # tables, hidden included) and keep only unambiguous names below — a
-            # name that resolves to >1 ModelColumn (same name, different tables)
-            # cannot be disambiguated from an unqualified leaf, so it is poisoned
-            # rather than assigned an arbitrary id (would fake a §7.3 lineage match).
-            if col_id is not None:
-                _ids_by_name.setdefault(lname, set()).add(str(col_id))
-    except Exception:
-        # Match the prior fallback's tolerance: a physical-column load failure
-        # leaves the audit whitelist empty rather than failing the bind.
-        physical_columns_all = set()
-        physical_columns_visible = set()
-        _ids_by_name = {}
-    physical_column_ids: dict[str, str] = {
-        n: next(iter(ids)) for n, ids in _ids_by_name.items() if len(ids) == 1
-    }
-
-    return LiveMetadataBundle(
-        measures=measures,
-        dimensions=dimensions,
-        hierarchy_levels=hierarchy_levels,
-        hidden_column_ids=hidden_column_ids,
-        physical_columns_visible=physical_columns_visible,
-        physical_columns_all=physical_columns_all,
-        physical_column_ids=physical_column_ids,
-    )
 
 
 def _is_semantic_object_hidden(obj: object, hidden_column_ids: set) -> bool:

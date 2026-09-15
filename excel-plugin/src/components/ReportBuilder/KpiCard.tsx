@@ -1,11 +1,11 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import type { SvgIconComponent } from '@mui/icons-material';
-import { Box, Typography, Chip, CircularProgress, Collapse, IconButton } from '@mui/material';
+import { Box, Typography, Chip, CircularProgress, Collapse, IconButton, Menu, MenuItem, ListItemText } from '@mui/material';
 import {
   Add as AddIcon,
   Remove as RemoveIcon,
   Functions as FunctionsIcon,
-  ExpandMore as ExpandMoreIcon,
+  MoreHorizOutlined,
   InfoOutlined,
   KeyboardArrowUpOutlined,
   TrafficOutlined,
@@ -54,12 +54,6 @@ const graphicIcons: Record<string, SvgIconComponent> = {
   'Smiley Face': SentimentSatisfiedOutlined,
 };
 
-const statusColors: Record<number, string> = {
-  1: '#2e7d32',
-  0: '#ed6c02',
-  [-1]: '#d32f2f',
-};
-
 const INSERT_OPTIONS: { mode: KpiInsertMode; label: string; description: string }[] = [
   { mode: 'full_row', label: strings.kpiCard.insertFullRow, description: strings.kpiCard.insertFullRowDesc },
   { mode: 'value_only', label: strings.kpiCard.insertValueOnly, description: strings.kpiCard.insertValueOnlyDesc },
@@ -86,8 +80,9 @@ export default function KpiCard({
   const [evalData, setEvalData] = useState<KpiEvaluateResponse | null>(null);
   const [evalLoading, setEvalLoading] = useState(false);
   const [evalRequested, setEvalRequested] = useState(false);
-  const [insertOpen, setInsertOpen] = useState(false);
+  const [insertAnchorEl, setInsertAnchorEl] = useState<HTMLElement | null>(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const insertOpen = Boolean(insertAnchorEl);
 
   // Bug-6361 (R2-N1): a monotonic request id guards against out-of-order async
   // responses. Every evaluation captures the id current when it started; its
@@ -136,10 +131,6 @@ export default function KpiCard({
   const goalMeasure = measures.find(m => m.id === kpi.goal_measure_id);
   const GraphicIcon = graphicIcons[kpi.status_graphic] || AssessmentOutlined;
 
-  const statusColor = evalData?.status !== null && evalData?.status !== undefined
-    ? statusColors[evalData.status] ?? tokens.colorTextSecondary
-    : undefined;
-
   const detailRows = [
     kpi.description && { label: strings.kpiCard.detailDescription, value: kpi.description },
     valueMeasure && { label: strings.kpiCard.detailValue, value: valueMeasure.display_name },
@@ -156,9 +147,12 @@ export default function KpiCard({
 
   const handleInsertToggle = (e: React.MouseEvent) => {
     e.stopPropagation();
-    const willOpen = !insertOpen;
-    setInsertOpen(willOpen);
-    if (willOpen) fetchEvaluation();
+    if (insertOpen) {
+      setInsertAnchorEl(null);
+      return;
+    }
+    setInsertAnchorEl(e.currentTarget as HTMLElement);
+    fetchEvaluation();
   };
 
   return (
@@ -167,17 +161,17 @@ export default function KpiCard({
         onClick={() => (checked ? onToggle() : onAddToValues())}
         sx={{
           display: 'flex', alignItems: 'center', gap: 0.75,
-          px: 1.25, py: 0.5, minHeight: 36, cursor: 'pointer',
+          pl: '10px', pr: '4px', py: 0, height: 28, minHeight: 28, cursor: 'pointer',
           borderBottom: `1px solid ${tokens.colorBorderLight}`,
           bgcolor: checked ? tokens.colorPrimaryBg : 'transparent',
           '&:hover': { bgcolor: checked ? tokens.colorPrimaryBg : tokens.colorSubtleFill },
         }}
       >
-        <GraphicIcon sx={{ fontSize: 16, flexShrink: 0, color: tokens.colorTextSecondary }} />
-        <Box sx={{ flex: 1, overflow: 'hidden' }}>
+        <GraphicIcon sx={{ fontSize: 15, flexShrink: 0, color: tokens.colorTextSecondary }} />
+        <Box sx={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
           <Typography
             sx={{
-              fontSize: 13,
+              fontSize: 12,
               fontWeight: checked ? 600 : 400,
               color: kpi.certification_status === 'deprecated' ? tokens.colorTextSecondary : checked ? tokens.colorPrimary : tokens.colorCharcoal,
               textDecoration: kpi.certification_status === 'deprecated' ? 'line-through' : 'none',
@@ -186,37 +180,24 @@ export default function KpiCard({
           >
             {kpi.display_name || kpi.name}
           </Typography>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-            {valueMeasure && (
-              <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {goalMeasure ? templates.kpiCard.valueVsGoal(valueMeasure.display_name, goalMeasure.display_name) : valueMeasure.display_name}
-              </Typography>
-            )}
-            {evalLoading && <CircularProgress size={8} sx={{ ml: 0.5 }} />}
-            {!evalLoading && evalData?.status_label && (
-              <Typography sx={{ fontSize: 9, fontWeight: 600, color: statusColor, flexShrink: 0 }}>
-                {evalData.status_label}
-              </Typography>
-            )}
-          </Box>
         </Box>
         <Chip
           label={strings.kpiCard.chipKpi}
           size="small"
-          sx={{ fontSize: 9, height: 16, bgcolor: tokens.colorGoldBg, color: tokens.colorGoldDark, fontWeight: 600, flexShrink: 0 }}
+          sx={{ fontSize: 9, height: 14, bgcolor: tokens.colorGoldBg, color: tokens.colorGoldDark, fontWeight: 600, flexShrink: 0, borderRadius: '7px' }}
         />
         {kpi.certification_status === 'certified' && (
           <Chip
             label={strings.kpiCard.chipCertified}
             size="small"
-            sx={{ fontSize: 9, height: 16, bgcolor: 'rgba(46,125,50,0.08)', color: '#2e7d32', fontWeight: 600, flexShrink: 0 }}
+            sx={{ fontSize: 9, height: 14, bgcolor: 'rgba(46,125,50,0.08)', color: '#2e7d32', fontWeight: 600, flexShrink: 0, borderRadius: '7px' }}
           />
         )}
         {kpi.certification_status === 'deprecated' && (
           <Chip
             label={strings.kpiCard.chipDeprecated}
             size="small"
-            sx={{ fontSize: 9, height: 16, bgcolor: 'rgba(237,108,2,0.08)', color: '#ed6c02', fontWeight: 600, flexShrink: 0 }}
+            sx={{ fontSize: 9, height: 14, bgcolor: 'rgba(237,108,2,0.08)', color: '#ed6c02', fontWeight: 600, flexShrink: 0, borderRadius: '7px' }}
           />
         )}
         <IconButton
@@ -229,8 +210,8 @@ export default function KpiCard({
           title={detailsOpen ? strings.kpiCard.hideDetails : strings.kpiCard.showDetails}
           aria-label={templates.kpiCard.detailsAria(detailsOpen ? strings.kpiCard.hideDetails : strings.kpiCard.showDetails, kpi.display_name || kpi.name)}
           sx={{
-            width: 28,
-            height: 28,
+            width: 22,
+            height: 22,
             color: detailsOpen ? tokens.colorPrimary : tokens.colorTextSecondary,
             '&:hover': { bgcolor: tokens.colorSubtleFill },
           }}
@@ -253,17 +234,11 @@ export default function KpiCard({
                 aria-label={templates.kpiCard.insertOptionsAria(kpi.display_name || kpi.name)}
                 aria-expanded={insertOpen}
                 sx={{
-                  width: 28, height: 28, color: tokens.colorGoldDark,
+                  width: 22, height: 22, color: tokens.colorTextSecondary,
                   '&:hover': { bgcolor: tokens.colorGoldBg },
                 }}
               >
-                <ExpandMoreIcon
-                  sx={{
-                    fontSize: 14,
-                    transform: insertOpen ? 'rotate(180deg)' : 'none',
-                    transition: 'transform 0.2s',
-                  }}
-                />
+                <MoreHorizOutlined sx={{ fontSize: 16 }} />
               </IconButton>
             )}
             {onInsertAsFormulas && !onInsertKpi && (
@@ -273,7 +248,7 @@ export default function KpiCard({
                 title={strings.kpiCard.insertAsCubeFormulas}
                 aria-label={templates.kpiCard.insertAsCubeFormulasAria(kpi.display_name || kpi.name)}
                 sx={{
-                  width: 28, height: 28, color: tokens.colorGoldDark,
+                  width: 22, height: 22, color: tokens.colorTextSecondary,
                   '&:hover': { bgcolor: tokens.colorGoldBg },
                 }}
               >
@@ -286,7 +261,7 @@ export default function KpiCard({
               title={strings.kpiCard.addKpiToReport}
               aria-label={templates.kpiCard.addKpiToReportAria(kpi.display_name || kpi.name)}
               sx={{
-                width: 28, height: 28, color: tokens.colorPrimary,
+                width: 22, height: 22, color: tokens.colorPrimary,
                 '&:hover': { bgcolor: tokens.colorPrimaryBg },
               }}
             >
@@ -304,7 +279,7 @@ export default function KpiCard({
             title={strings.kpiCard.removeKpiFromReport}
             aria-label={templates.kpiCard.removeKpiFromReportAria(kpi.display_name || kpi.name)}
             sx={{
-              width: 28, height: 28, color: tokens.colorPrimary, flexShrink: 0,
+              width: 22, height: 22, color: tokens.colorPrimary, flexShrink: 0,
               '&:hover': { bgcolor: tokens.colorPrimaryBg },
             }}
           >
@@ -314,18 +289,18 @@ export default function KpiCard({
       </Box>
 
       <Collapse in={detailsOpen}>
-        <Box sx={{ px: 2, py: 1, bgcolor: tokens.colorSubtleFill, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
+        <Box sx={{ px: 1.25, py: 0.75, bgcolor: tokens.colorSubtleFill, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
           {evalLoading && (
             <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, mb: 0.75 }}>
               {strings.kpiCard.loadingStatus}
             </Typography>
           )}
           {detailRows.map(row => (
-            <Box key={row.label} sx={{ mb: 0.6 }}>
+            <Box key={row.label} sx={{ mb: 0.4 }}>
               <Typography sx={{ fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, textTransform: 'uppercase', lineHeight: 1.2 }}>
                 {row.label}
               </Typography>
-              <Typography sx={{ fontSize: 11.5, color: tokens.colorCharcoal, lineHeight: 1.35 }}>
+              <Typography sx={{ fontSize: 11, color: tokens.colorCharcoal, lineHeight: 1.3 }}>
                 {row.value}
               </Typography>
             </Box>
@@ -334,35 +309,36 @@ export default function KpiCard({
       </Collapse>
 
       {onInsertKpi && (
-        <Collapse in={insertOpen}>
-          <Box sx={{ px: 2, py: 0.5, bgcolor: tokens.colorSubtleFill, borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
-            <Typography sx={{ fontSize: 10, fontWeight: 600, color: tokens.colorTextSecondary, mb: 0.25, textTransform: 'uppercase' }}>
-              {strings.kpiCard.insertOptionsLabel}
-            </Typography>
-            {INSERT_OPTIONS.map(opt => (
-              <Box
-                key={opt.mode}
-                component="button"
-                onClick={(e: React.MouseEvent) => {
-                  e.stopPropagation();
-                  onInsertKpi(opt.mode);
-                  setInsertOpen(false);
-                }}
-                sx={{
-                  display: 'block', width: '100%', textAlign: 'left',
-                  fontSize: 11, px: 0.75, py: 0.375, mb: 0.25,
-                  borderRadius: 0.5, cursor: 'pointer',
-                  border: 'none', bgcolor: 'transparent',
-                  color: tokens.colorCharcoal,
-                  '&:hover': { bgcolor: tokens.colorPrimaryBg, color: tokens.colorPrimary },
-                }}
-              >
-                <Box sx={{ fontWeight: 500 }}>{opt.label}</Box>
-                <Box sx={{ fontSize: 9, color: tokens.colorTextSecondary }}>{opt.description}</Box>
-              </Box>
-            ))}
-          </Box>
-        </Collapse>
+        <Menu
+          anchorEl={insertAnchorEl}
+          open={insertOpen}
+          onClose={() => setInsertAnchorEl(null)}
+          anchorOrigin={{ vertical: 'top', horizontal: 'right' }}
+          transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+          MenuListProps={{ dense: true, 'aria-label': strings.kpiCard.insertOptionsLabel }}
+          PaperProps={{ sx: { minWidth: 210, border: `1px solid ${tokens.colorBorder}`, boxShadow: '0 4px 12px rgba(0,0,0,0.12)' } }}
+        >
+          <Typography sx={{ px: 1.5, pt: 0.5, pb: 0.75, fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, textTransform: 'uppercase', letterSpacing: '0.04em', borderBottom: `1px solid ${tokens.colorBorderLight}` }}>
+            {strings.kpiCard.insertOptionsLabel}
+          </Typography>
+          {INSERT_OPTIONS.map(opt => (
+            <MenuItem
+              key={opt.mode}
+              onClick={() => {
+                onInsertKpi(opt.mode);
+                setInsertAnchorEl(null);
+              }}
+              sx={{ px: 1.5, py: 0.5, alignItems: 'flex-start', whiteSpace: 'nowrap' }}
+            >
+              <ListItemText
+                primary={opt.label}
+                secondary={opt.description}
+                primaryTypographyProps={{ fontSize: 12, lineHeight: 1.2 }}
+                secondaryTypographyProps={{ fontSize: 10, lineHeight: 1.2 }}
+              />
+            </MenuItem>
+          ))}
+        </Menu>
       )}
     </>
   );

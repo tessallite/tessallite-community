@@ -47,6 +47,7 @@ class TestRouterNoPreExecutionCredit:
         agg = make_aggregate(["country"], [make_agg_col(m)])
         bq = make_bound_query([make_dimension("country")], [m])
         db = AsyncMock()
+        db.info = {}
         db.execute = AsyncMock(return_value=None)
         db.get = AsyncMock(return_value=None)
 
@@ -118,7 +119,8 @@ class TestExecuteWithObservationCreditsOnSuccess:
     """execute_with_observation must call record_aggregate_hit exactly once
     after a successful aggregate-routed execution."""
 
-    async def test_success_credits_hit_exactly_once(self):
+    @pytest.mark.parametrize("client_kind", [None, "hierarchy_preview"])
+    async def test_success_credits_only_eligible_origin(self, client_kind):
         """A successful aggregate execution must credit exactly once."""
         from src.api.routes import execute_with_observation
 
@@ -135,6 +137,7 @@ class TestExecuteWithObservationCreditsOnSuccess:
         )
 
         db = AsyncMock()
+        db.info = {}
         db.execute = AsyncMock(return_value=None)
         db.get = AsyncMock(return_value=None)
 
@@ -182,11 +185,15 @@ class TestExecuteWithObservationCreditsOnSuccess:
                     db=db,
                     user_identity="user@test.com",
                     tenant_id="test-tenant",
+                    client_kind=client_kind,
                 )
             )
 
         # Credited exactly once with the correct aggregate object
-        mock_credit.assert_awaited_once_with(agg, db)
+        if client_kind == "hierarchy_preview":
+            mock_credit.assert_not_awaited()
+        else:
+            mock_credit.assert_awaited_once_with(agg, db)
 
     async def test_source_route_does_not_credit(self):
         """A source-routed query (pending_hit_credit=None) must not credit."""
@@ -203,6 +210,7 @@ class TestExecuteWithObservationCreditsOnSuccess:
         )
 
         db = AsyncMock()
+        db.info = {}
         db.execute = AsyncMock(return_value=None)
         db.get = AsyncMock(return_value=None)
 
@@ -254,7 +262,8 @@ class TestExecuteWithObservationCreditsOnSuccess:
 class TestExecuteWithObservationNoCreditsOnFailure:
     """A failed execution must never credit hit_count."""
 
-    async def test_execution_failure_does_not_credit(self):
+    @pytest.mark.parametrize("route_type", ["source", "aggregate"])
+    async def test_execution_failure_does_not_credit(self, route_type):
         """When execute_routed_query raises, no hit credit must be issued."""
         from src.api.routes import execute_with_observation
 
@@ -263,7 +272,7 @@ class TestExecuteWithObservationNoCreditsOnFailure:
         bq = make_bound_query([make_dimension("country")], [m])
 
         decision = RouteDecision(
-            route_type="aggregate",
+            route_type=route_type,
             rewritten_query="SELECT SUM(revenue__sum) FROM agg_table",
             reason="Matched aggregate agg-1",
             aggregate_id="agg-1",
@@ -271,6 +280,7 @@ class TestExecuteWithObservationNoCreditsOnFailure:
         )
 
         db = AsyncMock()
+        db.info = {}
         db.execute = AsyncMock(return_value=None)
         db.get = AsyncMock(return_value=None)
 
@@ -294,6 +304,8 @@ class TestExecuteWithObservationNoCreditsOnFailure:
                 "src.api.routes.record_aggregate_hit",
                 new_callable=AsyncMock,
             ) as mock_credit,
+            patch("src.api.routes.record_query_success", new_callable=AsyncMock) as success,
+            patch("src.api.routes.log_query_miss", new_callable=AsyncMock) as miss,
         ):
             with pytest.raises(Exception):
                 await execute_with_observation(
@@ -306,6 +318,9 @@ class TestExecuteWithObservationNoCreditsOnFailure:
 
         # The execution failed — no hit credit must have been issued
         mock_credit.assert_not_awaited()
+
+        success.assert_not_awaited()
+        miss.assert_not_awaited()
 
     async def test_security_audit_failure_does_not_credit(self):
         """When audit_result_columns raises, no hit credit must be issued."""
@@ -325,6 +340,7 @@ class TestExecuteWithObservationNoCreditsOnFailure:
         )
 
         db = AsyncMock()
+        db.info = {}
         db.execute = AsyncMock(return_value=None)
         db.get = AsyncMock(return_value=None)
         db.commit = AsyncMock()
@@ -401,6 +417,7 @@ class TestNoDoubleCount:
         bq = make_bound_query([make_dimension("country")], [m])
 
         db = AsyncMock()
+        db.info = {}
         db.execute = AsyncMock(return_value=None)
         db.get = AsyncMock(return_value=None)
         db.commit = AsyncMock()
@@ -528,6 +545,7 @@ class TestCrossProjectConnectionMapping:
         )
 
         db = AsyncMock()
+        db.info = {}
         db.execute = AsyncMock(return_value=None)
         db.get = AsyncMock(return_value=None)
         db.commit = AsyncMock()

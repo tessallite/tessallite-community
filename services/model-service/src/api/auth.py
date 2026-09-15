@@ -32,6 +32,7 @@ from shared.config.bootstrap import system_snapshot_get
 from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
 from shared.db.models import LocalUser, SystemTenant, UserAccessBinding
 from shared.db.session import get_system_db, get_tenant_db
+from shared.db.tenant_readiness import TenantReadinessError
 from src.licensing_guard import enforce_create_cap
 from shared.schemas.pydantic_models import (
     LoginRequest,
@@ -193,7 +194,7 @@ async def system_login(body: SystemLoginRequest, request: Request) -> Response:
     """
     client_ip = request.client.host if request.client else None
     async for sys_db in get_system_db():
-        await assert_not_locked(sys_db, SYSTEM_SCOPE, body.email)
+        await assert_not_locked(sys_db, SYSTEM_SCOPE, body.email, lock_row=True)
         if not authenticate_system_admin(body.email, body.password):
             await record_login_failure(sys_db, SYSTEM_SCOPE, body.email)
             raise HTTPException(
@@ -242,9 +243,24 @@ async def login(body: LoginRequest, request: Request) -> Response:
             tenant_id=body.tenant_id, email=body.email, password=body.password,
         )
         if identity is None:
-            async for sys_db in get_system_db():
-                await record_login_failure(sys_db, body.tenant_id, body.email)
+            # Bug-9770: resolve the TENANT before recording a lockout failure.
+            # ``get_tenant_db`` raises ValueError for an unknown tenant, which
+            # the outer handler maps to a 401 WITHOUT touching the lockout
+            # counter. Recording first (the previous order) let a login against
+            # a non-existent tenant poison a lockout scope that protects no
+            # real account: the XMLA gateway attempts a tenant-scoped login
+            # using the SOAP Catalog, which for Excel server-endpoint
+            # connections is a MODEL slug (e.g. 'modely'), not a tenant. Every
+            # Excel connection therefore recorded a failure under scope
+            # 'modely'; five connections locked that scope for 15 minutes, and
+            # the resulting 429 was classified by the gateway as neither a
+            # credential failure nor an unknown tenant, so it stopped falling
+            # through to cross-tenant discovery and refused a VALID login.
+            # An unknown tenant has no account to protect, so counting it is
+            # both pointless and a denial-of-service lever.
             async for db in get_tenant_db(body.tenant_id):
+                async for sys_db in get_system_db():
+                    await record_login_failure(sys_db, body.tenant_id, body.email)
                 await audit(
                     db, action="auth.login_failure", severity="critical",
                     actor_email=body.email, ip_address=client_ip,
@@ -256,7 +272,17 @@ async def login(body: LoginRequest, request: Request) -> Response:
                 detail="Invalid credentials",
             )
         async for sys_db in get_system_db():
+            # Recheck while holding the lockout row through the counter reset.
+            # A concurrent fifth failure must serialize before or after this
+            # successful authentication decision, never between check/delete.
+            await assert_not_locked(
+                sys_db, body.tenant_id, body.email, lock_row=True
+            )
             await record_login_success(sys_db, body.tenant_id, body.email)
+            # ``record_login_success`` flushes the deletion but deliberately
+            # leaves transaction ownership to this caller. Commit the system
+            # lockout reset before issuing the tenant JWT.
+            await sys_db.commit()
         async for db in get_tenant_db(body.tenant_id):
             await require_external_identity_admitted(db, identity)
             local_user, role = await jit_adopt_user(db, identity, body.tenant_id)
@@ -404,6 +430,11 @@ async def login_discover(body: LoginRequest, request: Request) -> Response:
                     if user is None:
                         continue
                 matches.append((tenant.slug, identity))
+        except TenantReadinessError:
+            # Discovery cannot prove the selected tenant is usable. Preserve
+            # its typed 503 detail instead of collapsing the condition into a
+            # generic authentication-service error or trying another tenant.
+            raise
         except Exception as exc:
             # Operational failure for any active tenant means discovery cannot
             # prove uniqueness. Keep evaluating for logging, then fail closed
@@ -474,6 +505,7 @@ async def login_discover(body: LoginRequest, request: Request) -> Response:
             )
 
     matched_slug, matched_identity = matches[0]
+
     async for db in get_tenant_db(matched_slug):
         if is_external_identity(matched_identity):
             await require_external_identity_admitted(db, matched_identity)
@@ -500,7 +532,18 @@ async def login_discover(body: LoginRequest, request: Request) -> Response:
     # response timing does not reveal a hit.
     verify_password(body.password, _DISCOVER_DUMMY_HASH)
     async for sys_db in get_system_db():
+        # Bug-9799: make the selected-tenant lock decision and counter reset
+        # one serialized system transaction. A separate earlier check leaves
+        # a race where a concurrent direct-login failure can lock the account
+        # before discovery deletes the row and mints a token.
+        await assert_not_locked(sys_db, matched_slug, email, lock_row=True)
         await record_login_success(sys_db, DISCOVER_SCOPE, email)
+        # A successful discovery login also clears a stale direct-login
+        # counter for the tenant that was actually selected. Do this only
+        # after the selected-tenant lock check above; a locked account must
+        # never be reset as a side effect of discovery.
+        await record_login_success(sys_db, matched_slug, email)
+        await sys_db.commit()
 
     matched_token = create_access_token(
         sub=matched_user.email,

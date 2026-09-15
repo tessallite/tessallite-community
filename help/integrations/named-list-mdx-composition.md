@@ -2,7 +2,7 @@
 title: "Named List MDX Composition"
 audience: analyst
 area: Integrations
-updated: 2026-05-23
+updated: 2026-09-10
 ---
 
 ## What this covers
@@ -154,6 +154,14 @@ The engine validates the MDX expression when you save a named list:
 - **Evaluation:** A preview query runs the expression and returns the first 100 members so you can confirm the result before saving.
 
 If validation fails, the error message identifies the problematic portion of the expression.
+
+---
+
+## Who can see a named list
+
+A named list is offered to a user only when every dimension and measure its expression references is inside that user's perspective. A Top N list ranked by a measure a perspective does not include is therefore not listed for that perspective, and a query that names it is refused with a message saying so rather than returning an empty result.
+
+When Excel runs a query, Tessallite matches names in that query to exact deployed named-list names before it checks access. Normal field names and Excel functions do not make it check unrelated lists. If one named list uses another, Tessallite checks both. If access cannot be checked, the query stops with a readable server error instead of returning empty or misleading data.
 
 ---
 

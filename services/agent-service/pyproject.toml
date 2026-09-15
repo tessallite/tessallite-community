@@ -41,4 +41,5 @@ markers = [
     "unit: Unit tests",
     "integration: Integration tests requiring mocked DB",
     "e2e: End-to-end tests requiring running services",
+    "executor_surface_real: exercise the real Bug-9897 executor-surface narrowing instead of the conftest passthrough",
 ]
