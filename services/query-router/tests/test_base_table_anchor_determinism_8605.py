@@ -29,6 +29,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from result_fakes import ScalarResult
 
 pytestmark = pytest.mark.unit
 
@@ -44,7 +45,7 @@ class _ScalarResult:
         self._items = list(items)
 
     def scalars(self):
-        return self
+        return ScalarResult(self._items)
 
     def all(self):
         return list(self._items)

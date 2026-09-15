@@ -135,10 +135,9 @@ _ALLOW_NO_LOCK: dict[str, tuple[str, str]] = {
     # Bug-8740 REMOVED: clear_violations also resets
     # DataQualityRule.last_violation_count, and data_quality_rules IS
     # snapshot-owned. It is a lock holder now, not an exemption.
-    # --- glossary: operational share tokens (entries CRUD + bootstrap are locked) ---
-    "issue_share_token": (OPERATIONAL_ARTIFACT, "GlossaryShareToken operational credential, not snapshot-owned"),
-    "regenerate_share_token": (OPERATIONAL_ARTIFACT, "GlossaryShareToken operational credential, not snapshot-owned"),
-    "revoke_share_tokens": (OPERATIONAL_ARTIFACT, "GlossaryShareToken operational credential, not snapshot-owned"),
+    # Bug-9602: share-token rows are operational credentials, but issue,
+    # revoke, and regenerate still mutate the same model-scoped lifecycle.
+    # They therefore take the model lock instead of relying on an exemption.
     # --- external-integration config + sync (external I/O; MUST NOT hold the lock; ---
     # --- integration config tables are not part of the model definition snapshot) ---
     "create_collibra_config": (EXTERNAL_IO, "integration config (external metadata catalogue), not snapshot-owned"),

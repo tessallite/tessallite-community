@@ -484,3 +484,36 @@ async def test_estimated_savings_excludes_cache_reserves_bug6426(client):
     data = resp.json()
     # Value sanity: (500 - 20) * 10 = 4800, with real executions only.
     assert data["time_saved_ms"] == 4800
+
+
+@pytest.mark.asyncio
+async def test_routing_breakdown_executes_exclusive_categories():
+    """Execute the endpoint's grouping SQL, including cached raw/aggregate rows."""
+    from sqlalchemy import create_engine
+    from src.api.analytics import routing_breakdown
+    engine = create_engine("sqlite://")
+    with engine.connect() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE query_logs (model_id VARCHAR(32), created_at DATETIME, "
+            "status TEXT, route_type TEXT, cache_status TEXT, protocol TEXT)"
+        )
+        rows = [
+            ("source", None), ("raw", None), ("aggregate", None), ("pocket", None),
+            ("source", "cache_hit"), ("aggregate", "cache_hit"), ("raw", "cache_hit"),
+            ("kpi_metadata", None), ("introspect", None),
+        ]
+        for route, cache in rows:
+            conn.exec_driver_sql(
+                "INSERT INTO query_logs VALUES (?, ?, 'success', ?, ?, 'sql')",
+                (MODEL_ID.hex, datetime.now(timezone.utc).isoformat(" "), route, cache),
+            )
+        db = types.SimpleNamespace(execute=AsyncMock(side_effect=conn.execute))
+        with patch("src.api.analytics.get_tenant_db", lambda _: _yield(db)), patch(
+            "src.api.analytics.ensure_model_in_project", new=AsyncMock()
+        ):
+            result = await routing_breakdown(PROJECT_ID, MODEL_ID, days=30, current_user=_user())
+        counts = {r.route_type: r.count for r in result}
+        assert counts == {"source": 2, "aggregate": 2, "cache": 3}
+        assert sum(counts.values()) == 7
+        assert sum(r.pct for r in result) == pytest.approx(100, abs=0.2)
+    engine.dispose()

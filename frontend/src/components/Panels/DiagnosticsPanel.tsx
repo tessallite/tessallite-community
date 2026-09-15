@@ -26,6 +26,7 @@ import {
   TableCell,
   TableContainer,
   TableHead,
+  TableSortLabel,
   TableRow,
   Tabs,
   TextField,
@@ -44,6 +45,7 @@ import { logsApi } from "../../api/client";
 import type { QueryLog, AIOptimizerRun, OptimizerRunEntry } from "../../api/types";
 import { ui, statusColor } from "../../theme/tokens";
 import { runStatusLabel } from "../../utils/runStatus";
+import { localizeBackendError } from "./diagnosticsErrorLabels";
 
 type OptimisationRow =
   | { kind: "ai"; at: number; ai: AIOptimizerRun }
@@ -112,7 +114,7 @@ function AIRunRow({
                 {r.completed_at && <Typography component="span" variant="caption" sx={{ px: 0.5, py: 0.125, borderRadius: 0.5, bgcolor: ui.mutedBg, color: ui.muted, fontSize: 11 }}>{t("diagnostics.completedLabel")}: {new Date(r.completed_at).toLocaleString()}</Typography>}
               </Box>
               {detail.isLoading && <CircularProgress size={16} />}
-              {r.error_message && <Alert severity="error" sx={{ mb: 1 }}>{r.error_message}</Alert>}
+              {r.error_message && <Alert severity="error" sx={{ mb: 1 }}>{localizeBackendError(r.error_message, t)}</Alert>}
               {r.analysis_notes && (
                 <Box mb={1}>
                   <Typography variant="caption" fontWeight={600} display="block" mb={0.5}>{t("diagnostics.analysisNotesLabel")}</Typography>
@@ -389,6 +391,8 @@ export default function DiagnosticsPanel() {
                 <MenuItem value="agent">{t("diagnostics.clientAgent")}</MenuItem>
                 <MenuItem value="mcp">{t("diagnostics.clientMcp")}</MenuItem>
                 <MenuItem value="kpi">{t("diagnostics.clientKpi")}</MenuItem>
+                <MenuItem value="hierarchy_preview">{t("diagnostics.clientHierarchyPreview")}</MenuItem>
+                <MenuItem value="maintenance">{t("diagnostics.clientMaintenance")}</MenuItem>
               </Select>
             </FormControl>
             <FormControlLabel
@@ -581,7 +585,7 @@ export default function DiagnosticsPanel() {
                       <>
                         <Typography variant="caption" color="text.secondary" display="block" mb={0.5} mt={1}>{t("diagnostics.errorDetailLabel")}</Typography>
                         <Paper variant="outlined" sx={{ p: 1.5, mb: 2, fontFamily: "monospace", fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-word", bgcolor: ui.redBg, maxHeight: 200, overflow: "auto" }}>
-                          {selectedLog.error_detail}
+                          {localizeBackendError(selectedLog.error_detail, t)}
                         </Paper>
                       </>
                     )}
@@ -731,7 +735,7 @@ export default function DiagnosticsPanel() {
               <Table size="small">
                 <TableHead>
                   <TableRow sx={{ bgcolor: ui.tableHeaderBg }}>
-                    <TableCell>{t("diagnostics.startedHeader")}</TableCell>
+                    <TableCell sortDirection="desc"><TableSortLabel active direction="desc" hideSortIcon={false}>{t("diagnostics.startedHeader")}</TableSortLabel></TableCell>
                     <TableCell>{t("diagnostics.aggregateHeader")}</TableCell>
                     <TableCell>{t("diagnostics.statusHeader")}</TableCell>
                     <TableCell>{t("diagnostics.modeHeader")}</TableCell>
@@ -743,6 +747,8 @@ export default function DiagnosticsPanel() {
                 </TableHead>
                 <TableBody>
                   {refreshRuns.data?.map((r) => {
+                    const originKey = `diagnostics.refreshOrigin.${r.triggered_by}`;
+                    const originLabel = t(originKey);
                     const isFailed = r.status === "failed";
                     const isRunning = r.status === "running";
                     const rowsText =
@@ -756,7 +762,7 @@ export default function DiagnosticsPanel() {
                         ? "…"
                         : "--";
                     const detailText = isFailed
-                      ? r.error_message ?? t("diagnostics.failedNoError")
+                      ? localizeBackendError(r.error_message, t) ?? t("diagnostics.failedNoError")
                       : r.status === "completed"
                       ? r.rows_written === 1
                         ? t("diagnostics.rowsWrittenSingular", { rows: rowsText })
@@ -789,7 +795,7 @@ export default function DiagnosticsPanel() {
                         <TableCell>{r.refresh_mode}</TableCell>
                         <TableCell align="right">{rowsText}</TableCell>
                         <TableCell align="right">{durationText}</TableCell>
-                        <TableCell>{r.triggered_by}</TableCell>
+                        <TableCell>{originLabel === originKey ? r.triggered_by : originLabel}</TableCell>
                         <TableCell
                           sx={{
                             maxWidth: 360,

@@ -47,10 +47,11 @@ vi.mock("../../api/hooks", () => ({
 }));
 
 const deleteMock = vi.fn();
+const getMetricsMock = vi.fn().mockResolvedValue({ total_pockets: 0, top_pockets: [] });
 vi.mock("../../api/client", () => ({
   pocketsApi: {
     delete: (...args: unknown[]) => deleteMock(...args),
-    getMetrics: vi.fn().mockResolvedValue({ total_pockets: 0, top_pockets: [] }),
+    getMetrics: (...args: unknown[]) => getMetricsMock(...args),
   },
   dataQualityApi: {
     pocketViolationSummary: vi.fn().mockResolvedValue({}),
@@ -131,5 +132,27 @@ describe("PocketTablesPanel delete gating (Bug-6999)", () => {
       expect(screen.getByText(/could not delete pocket table/i)).toBeInTheDocument(),
     );
     expect(screen.getByText(/pocket in use/i)).toBeInTheDocument();
+  });
+
+  // Bug-8391: NOT_RLS_SAFE must resolve through the en catalogue, never the
+  // raw humanized token "Not rls safe".
+  it("labels the NOT_RLS_SAFE skip reason through i18n (Bug-8391)", async () => {
+    setRole("tenant_admin");
+    getMetricsMock.mockResolvedValue({
+      total_pockets: 1,
+      top_pockets: [],
+      pocket_hit_rate: 0,
+      pocket_time_saved_ms: 0,
+      pocket_storage_bytes: 0,
+      pocket_evictions_24h: 0,
+      zero_match_fresh_pockets: 1,
+      top_skip_reason: "not_rls_safe",
+      top_skip_count: 3,
+    });
+    renderPanel();
+    expect(
+      await screen.findByText(/Pocket cannot be filtered by the active row-security rules/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Not rls safe/i)).toBeNull();
   });
 });

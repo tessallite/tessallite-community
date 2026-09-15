@@ -75,6 +75,10 @@ from src.retrieval.glossary import (
     score_cards,
     term_index_from_cards,
 )
+from src.exec.model_surface import (
+    ExecutorModelSurface,
+    load_executor_surfaces,
+)
 from src.exec.query import PersonaFieldScope
 from src.planning.measure_metadata import MeasureRoleMetadata
 from src.tools.spec import make_tool_spec
@@ -125,17 +129,21 @@ period, category, condition, or threshold.
 the same grouped/aggregated condition.
 7. Keep previous sort only if the follow-up still refers to the same \
 ranking, such as "those top merchants" or "the highest ones".
-8. Replace dimensions only if the user says "instead", "rather than", \
-or clearly asks for a different breakdown.
-9. Do not remove a date filter unless the user explicitly changes the period.
-10. If the follow-up depends on previous result values that are not \
+8. For a cue-free temporal follow-up such as "Break that down by year", \
+keep previous non-temporal dimensions and add the requested time grain; only \
+an earlier temporal grain may be replaced automatically.
+9. Replace or exclude previous dimensions only if the user explicitly says \
+"instead of", "rather than", "replace", "not by", "only by", "drop", or \
+"remove", or clearly asks for a different breakdown.
+10. Do not remove a date filter unless the user explicitly changes the period.
+11. If the follow-up depends on previous result values that are not \
 provided, use "clarify".
-11. If the PREVIOUS QUERY PLAN contains a "dimension_exprs" field, the \
+12. If the PREVIOUS QUERY PLAN contains a "dimension_exprs" field, the \
 breakdown uses a function grain (e.g. a monthly DATE_TRUNC bucket). To keep \
 that grain, copy the "dimension_exprs" entries into your new query's \
 "dimensions" field verbatim — do NOT replace them with the flattened alias \
 strings shown in the plan's "dimensions" field, which would drop the grain.
-12. If the user's response to a clarify question is still ambiguous or \
+13. If the user's response to a clarify question is still ambiguous or \
 off-topic, re-ask with a more specific clarify question or fall back \
 to the most likely interpretation and use "query".
 
@@ -2013,6 +2021,108 @@ def _apply_embed_model_scope(
     return [mid for mid in allow_ids if str(mid).lower() in permitted]
 
 
+def _narrow_profile(
+    p: _ModelProfile,
+    measure_names: set[str],
+    dimension_names: set[str],
+) -> _ModelProfile:
+    """Return a COPY of *p* restricted to exactly these field names.
+
+    The one narrowing implementation every scope in this module goes through.
+    Both sets are AUTHORITATIVE: a name absent from them is absent from the
+    returned profile, and an empty set narrows to nothing. Callers that mean
+    "this scope places no restriction" pass the profile's own full lists, so
+    the widening decision is made where the scope's semantics are known and can
+    never be inherited by accident here.
+
+    Bug-7935 — the narrowing must NOT mutate the source ``_ModelProfile`` in
+    place. Profiles are loaded once and may be shared/reused across concurrent
+    requests; mutating ``measure_names``/``dimension_names``/``dimensions`` on
+    the shared object would leak one persona's field scope into another
+    request's prompt (field suppression or, worse, exposure). Every narrowed
+    value here is built as a NEW list/dict and applied to a COPY of the profile
+    (``dataclasses.replace``), so the input objects are never touched. The copy
+    preserves all other fields — including Lane F's ``context_available`` and
+    the R3 description maps — verbatim.
+
+    ``measure_metadata`` is narrowed by the SAME measure scope. Cross-model
+    reference measures live only in ``measure_metadata`` (never in the
+    executable ``measure_names``), so leaving metadata unfiltered leaked
+    scope-excluded cross-model measure NAMES through the model layer's "not
+    directly queryable" disclosure line.
+    """
+    kept_measures = [m for m in p.measure_names if m in measure_names]
+    kept_dimensions = [d for d in p.dimension_names if d in dimension_names]
+    kept_measure_metadata = {
+        name: meta
+        for name, meta in p.measure_metadata.items()
+        if name in measure_names
+    }
+    kept_dimension_meta = {
+        name: meta
+        for name, meta in p.dimensions.items()
+        if name in dimension_names
+    }
+    visible = set(kept_measures) | set(kept_dimensions)
+    return replace(
+        p,
+        measure_names=kept_measures,
+        dimension_names=kept_dimensions,
+        dimensions=kept_dimension_meta,
+        measure_metadata=kept_measure_metadata,
+        filterable_where_names=[
+            n for n in p.filterable_where_names if n in visible
+        ],
+        sortable_names=[n for n in p.sortable_names if n in visible],
+    )
+
+
+def _apply_executor_surface(
+    profiles: list[_ModelProfile],
+    surfaces: dict[UUID, ExecutorModelSurface],
+) -> list[_ModelProfile]:
+    """Narrow the grounding catalogue to what the EXECUTOR will accept.
+
+    Bug-9897 / persona-layering rule 4, audit row A45. The agent's catalogue
+    and the agent's executor must be the same surface for the same identity.
+    ``surfaces`` is the query-router's own verdict for this caller (model
+    persona allow-list + column-level-security closure over the deployed
+    shape), obtained through ``exec/model_surface.load_executor_surfaces``.
+
+    This runs BEFORE the ``ProjectPersona`` field scope, which may then only
+    narrow further — owner decision 4.6(a). Fail closed twice: a model with no
+    verdict is dropped, and so is one the executor accepts no measure for,
+    because a model the caller cannot measure is not a model they can be
+    grounded on.
+    """
+    kept: list[_ModelProfile] = []
+    for p in profiles:
+        surface = surfaces.get(p.id)
+        if surface is None:
+            continue
+        if not surface.measure_names:
+            logger.info(
+                "Bug-9897: the query-router accepts no measure on model %s for "
+                "this caller; dropping it from the grounding catalogue.", p.id,
+            )
+            continue
+        # Cross-model REFERENCE measures live only in ``measure_metadata``,
+        # never in this model's executable ``measure_names``; the model layer
+        # discloses them as "not directly queryable". The router's verdict is
+        # about what THIS model's executor accepts, so it says nothing about
+        # them either way — carry them through unchanged and let the
+        # ProjectPersona scope below narrow them, exactly as it does today.
+        _metadata_only = set(p.measure_metadata) - set(p.measure_names)
+        kept.append(
+            _narrow_profile(
+                p,
+                set(surface.measure_names) | _metadata_only,
+                set(surface.dimension_names),
+            )
+        )
+    return kept
+
+
 def _apply_persona_filter(
     profiles: list[_ModelProfile],
     scopes: dict[UUID, _PersonaScope],
@@ -2033,63 +2143,30 @@ def _apply_persona_filter(
     measure scope. Cross-model reference measures live only in
     ``measure_metadata`` (never in the executable ``measure_names``), so leaving
     metadata unfiltered leaked persona-excluded cross-model measure NAMES
-    through the model layer's "not directly queryable" disclosure line. The
-    narrowed copy keeps every entry the retained ``measure_names`` needs
-    (``measure_names`` is a subset of ``scope.measure_names``), so no other
-    ``measure_metadata`` consumer loses data.
+    through the model layer's "not directly queryable" disclosure line.
+
+    Both invariants now live in ``_narrow_profile``, the one narrowing
+    implementation this module has (Bug-9897). This function contributes the
+    ProjectPersona-specific semantics on top of it: a model with no scope row
+    is dropped, and an EMPTY include list in a scope row means "no restriction
+    on this axis", which is expressed here by passing the profile's own full
+    list rather than by teaching the narrowing to widen.
     """
     filtered: list[_ModelProfile] = []
     for p in profiles:
         scope = scopes.get(p.id)
         if scope is None:
             continue
-
-        measure_names = list(p.measure_names)
-        dimension_names = list(p.dimension_names)
-        dimensions = dict(p.dimensions)
-        # Copy-on-write of measure_metadata so persona narrowing never mutates
-        # the shared profile (Bug-7935 invariant, mirrored here).
-        measure_metadata = dict(p.measure_metadata)
-        if scope.measure_names:
-            measure_names = [m for m in measure_names if m in scope.measure_names]
-            # Persona-scope invariant (integration fix): narrow measure_metadata
-            # by the SAME persona measure scope. Cross-model reference measures
-            # live only in measure_metadata (never in the executable
-            # measure_names), so without this a persona-excluded cross-model
-            # measure NAME would still leak through the "not directly queryable"
-            # disclosure line. Every entry the retained measure_names needs is
-            # kept (measure_names is a subset of scope.measure_names), so all
-            # other measure_metadata consumers are unaffected.
-            measure_metadata = {
-                name: meta
-                for name, meta in measure_metadata.items()
-                if name in scope.measure_names
-            }
-        if scope.dimension_names:
-            dimension_names = [
-                d for d in dimension_names if d in scope.dimension_names
-            ]
-            dimensions = {
-                name: meta
-                for name, meta in dimensions.items()
-                if name in scope.dimension_names
-            }
-
-        visible = set(measure_names) | set(dimension_names)
-        filterable_where_names = [
-            n for n in p.filterable_where_names if n in visible
-        ]
-        sortable_names = [n for n in p.sortable_names if n in visible]
-
         filtered.append(
-            replace(
+            _narrow_profile(
                 p,
-                measure_names=measure_names,
-                dimension_names=dimension_names,
-                dimensions=dimensions,
-                measure_metadata=measure_metadata,
-                filterable_where_names=filterable_where_names,
-                sortable_names=sortable_names,
+                set(scope.measure_names) if scope.measure_names
+                # "No restriction on this axis" is the profile's own full
+                # surface, INCLUDING the metadata-only cross-model reference
+                # names, which is what the pre-Bug-9897 code kept here.
+                else set(p.measure_names) | set(p.measure_metadata),
+                set(scope.dimension_names) if scope.dimension_names
+                else set(p.dimension_names) | set(p.dimensions),
             )
         )
     return filtered
@@ -2178,6 +2255,7 @@ async def assemble_prompt(
     pinned_model_id: UUID | None = None,
     exclude_turn_id: UUID | None = None,
     embed_model_ids: list[str] | None = None,
+    jwt_token: str | None = None,
 ) -> PromptBundle:
     # Deterministic base order for the allow-list (cache-prefix byte-stability):
     # an unordered SELECT can return rows in a different order between calls,
@@ -2201,7 +2279,21 @@ async def assemble_prompt(
 
     profiles = await _load_model_profiles(db, cfg.project_id, allow_ids)
 
-    persona_field_scopes: dict[UUID, PersonaFieldScope] | None = None
+    # Bug-9897 / persona-layering rule 4, audit row A45 — the grounding
+    # catalogue is the EXECUTOR's own answer, not a parallel list. Every query
+    # the agent issues is enforced by the query-router against the model
+    # ``Persona`` it resolves from this caller's JWT; ask that same authority
+    # what it will accept and ground on exactly that. The ProjectPersona field
+    # scope below may then only narrow further (owner decision 4.6(a)).
+    # Fail closed: a model whose verdict cannot be obtained is dropped.
+    executor_surfaces = await load_executor_surfaces(list(allow_ids), jwt_token)
+    profiles = _apply_executor_surface(profiles, executor_surfaces)
+    allow_ids = [p.id for p in profiles]
+    # The prompt and the execution chokepoint now carry the SAME surface, for
+    # every caller — not only for one holding a ProjectPersona.
+    persona_field_scopes: dict[UUID, PersonaFieldScope] | None = (
+        _persona_field_scopes(profiles)
+    )
     if persona_id is not None:
         persona_scopes = await _load_persona_scopes(db, persona_id)
         profiles = _apply_persona_filter(profiles, persona_scopes)
@@ -2371,6 +2463,7 @@ async def load_selectable_models(
     allow_list_ids: list[UUID],
     persona_id: UUID | None = None,
     embed_model_ids: list[str] | None = None,
+    jwt_token: str | None = None,
 ) -> list[SelectableModelInfo]:
     """Return models from the allow-list, optionally narrowed by persona and by
     the embed token's model_ids allow-list.
@@ -2379,9 +2472,18 @@ async def load_selectable_models(
     metadata for excluded models), so the in-chat model picker can only offer
     models the embed caller is actually entitled to query, matching what
     ``assemble_prompt`` puts in front of the LLM.
+
+    Bug-9897 — that "matching" is now load-bearing rather than incidental: the
+    picker runs the SAME executor-surface resolution the assembler runs, so it
+    cannot offer a model the agent would then drop from its grounding
+    catalogue. The two lists are built from one authority in one order.
     """
     allow_list_ids = _apply_embed_model_scope(allow_list_ids, embed_model_ids)
     profiles = await _load_model_profiles(db, project_id, allow_list_ids)
+    executor_surfaces = await load_executor_surfaces(
+        [p.id for p in profiles], jwt_token,
+    )
+    profiles = _apply_executor_surface(profiles, executor_surfaces)
     if persona_id is not None:
         scopes = await _load_persona_scopes(db, persona_id)
         profiles = _apply_persona_filter(profiles, scopes)

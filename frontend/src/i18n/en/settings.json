@@ -387,6 +387,8 @@
   "webhooks.retryTooltip": "Retry",
   "webhooks.revealSecret": "Reveal secret",
   "webhooks.revealSecretTooltip": "Reveal secret",
+  "webhooks.rotateSecretConfirmTitle": "Rotate signing secret?",
+  "webhooks.rotateSecretConfirmMessage": "The old secret stops working immediately and cannot be recovered. Any receiver still verifying signatures with it will start rejecting deliveries until you update it with the new secret.",
   "webhooks.rotateSecretTooltip": "Rotate signing secret",
   "webhooks.save": "Save",
   "webhooks.secretDialogTitle": "New Signing Secret",
@@ -395,6 +397,10 @@
   "webhooks.selectEvents": "Select events",
   "webhooks.tabDlq": "Dead Letter Queue",
   "webhooks.tabEndpoints": "Endpoints",
+  "webhooks.testDeliveryFailedShort": "Failed",
+  "webhooks.testDeliveryFailed": "Test delivery failed.",
+  "webhooks.testDeliverySuccessShort": "Delivered",
+  "webhooks.testDeliverySuccess": "Test delivery succeeded ({{code}}).",
   "webhooks.testDeliveryTooltip": "Test delivery",
   "webhooks.testTooltip": "Send test event",
   "webhooks.title": "Webhooks",
@@ -414,5 +420,6 @@
   "git.testSuccess": "Connection successful.",
   "git.testFailed": "Connection failed: {{error}}",
   "git.tokenSaved": "A token is already saved.",
-  "git.save": "Save"
+  "git.save": "Save",
+  "git.saveFailed": "Save failed."
 }

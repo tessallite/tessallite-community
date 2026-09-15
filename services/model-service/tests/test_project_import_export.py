@@ -12,6 +12,7 @@ Spec Section 12 — required test coverage:
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -107,6 +108,180 @@ async def test_project_export_denies_signed_in_non_admin_zero_binding_tenant():
 
     assert without_creds.status_code == 403, without_creds.text
     assert with_creds.status_code == 403, with_creds.text
+
+
+@pytest.mark.asyncio
+async def test_bug_8480_project_admin_can_export_credentials():
+    """Bug-8480: an explicit project admin retains credentialed export access."""
+    admin = CurrentUser(
+        user_id="project-admin@test.com",
+        tenant_id=TEST_TENANT,
+        email="project-admin@test.com",
+        role="member",
+    )
+    project_id = uuid.uuid4()
+    binding = SimpleNamespace(role="admin", model_id=None, project_id=project_id)
+
+    rbac_result = MagicMock()
+    rbac_result.scalar_one_or_none.return_value = binding
+    rbac_db = AsyncMock()
+    rbac_db.execute = AsyncMock(return_value=rbac_result)
+
+    export_db = AsyncMock()
+
+    @asynccontextmanager
+    async def _read_session(_tenant_id):
+        yield export_db
+
+    exported = {"credentials_included": True, "credentials_envelope": None}
+    export_call = AsyncMock(return_value=exported)
+    audit_call = AsyncMock()
+
+    app.dependency_overrides[get_current_user] = lambda: admin
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as ac:
+            with (
+                patch("src.auth.rbac.get_tenant_db", async_gen_from(rbac_db)),
+                patch(
+                    "src.api.project_import_export.consistent_read_session",
+                    _read_session,
+                ),
+                patch(
+                    "src.api.project_import_export.get_credential_fernet",
+                    return_value=object(),
+                ),
+                patch(
+                    "src.api.project_import_export.build_envelope",
+                    return_value=(object(), {"method": "passphrase-fernet"}),
+                ),
+                patch("src.api.project_import_export.export_project", export_call),
+                patch("src.api.project_import_export.audit_required", audit_call),
+            ):
+                response = await ac.post(
+                    f"{PREFIX}/{project_id}/export",
+                    json={
+                        "include_credentials": True,
+                        "passphrase": "correct-horse-battery",
+                    },
+                )
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == 200, response.text
+    assert export_call.await_args.kwargs["include_credentials"] is True
+    assert audit_call.await_args.kwargs["severity"] == "critical"
+    export_db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bug_9344_locked_demo_rejects_credential_export_before_side_effects(
+    client_admin, monkeypatch
+):
+    """Bug-9344: a locked demo cannot export credentials, and rejection
+    precedes key loading, project reads, serialisation, envelope creation, and
+    audit persistence.
+    """
+    project_id = uuid.uuid4()
+    monkeypatch.setenv("DEMO_SOURCE_LOCKED_TENANTS", TEST_TENANT)
+
+    export_db = AsyncMock()
+
+    @asynccontextmanager
+    async def _read_session(_tenant_id):
+        yield export_db
+
+    credential_key_call = MagicMock(return_value=object())
+    envelope_call = MagicMock(
+        return_value=(object(), {"method": "passphrase-fernet"})
+    )
+    read_session_call = MagicMock(side_effect=_read_session)
+    export_call = AsyncMock(return_value={"credentials_included": True})
+    audit_call = AsyncMock()
+
+    with (
+        patch(
+            "src.api.project_import_export.get_credential_fernet",
+            credential_key_call,
+        ),
+        patch(
+            "src.api.project_import_export.build_envelope",
+            envelope_call,
+        ),
+        patch(
+            "src.api.project_import_export.consistent_read_session",
+            read_session_call,
+        ),
+        patch("src.api.project_import_export.export_project", export_call),
+        patch("src.api.project_import_export.audit_required", audit_call),
+    ):
+        response = await client_admin.post(
+            f"{PREFIX}/{project_id}/export",
+            json={
+                "include_credentials": True,
+                "passphrase": "correct-horse-battery",
+            },
+        )
+
+    assert response.status_code == 403, response.text
+    assert "fixed and read-only" in response.json()["detail"]
+    credential_key_call.assert_not_called()
+    envelope_call.assert_not_called()
+    read_session_call.assert_not_called()
+    export_call.assert_not_awaited()
+    audit_call.assert_not_awaited()
+    export_db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bug_9344_locked_demo_metadata_only_export_retains_existing_path(
+    client_admin, monkeypatch
+):
+    """Bug-9344: the demo lock applies only to credential-bearing exports."""
+    project_id = uuid.uuid4()
+    monkeypatch.setenv("DEMO_SOURCE_LOCKED_TENANTS", TEST_TENANT)
+
+    export_db = AsyncMock()
+
+    @asynccontextmanager
+    async def _read_session(_tenant_id):
+        yield export_db
+
+    read_session_call = MagicMock(side_effect=_read_session)
+    export_call = AsyncMock(return_value={"credentials_included": False})
+    audit_call = AsyncMock()
+
+    with (
+        patch(
+            "src.api.project_import_export.consistent_read_session",
+            read_session_call,
+        ),
+        patch(
+            "src.api.project_import_export.get_credential_fernet",
+            return_value=object(),
+        ),
+        patch(
+            "src.api.project_import_export.build_envelope",
+            side_effect=AssertionError(
+                "metadata-only export must not build a credential envelope"
+            ),
+        ),
+        patch("src.api.project_import_export.export_project", export_call),
+        patch("src.api.project_import_export.audit_required", audit_call),
+    ):
+        response = await client_admin.post(
+            f"{PREFIX}/{project_id}/export",
+            json={"include_credentials": False},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["credentials_included"] is False
+    read_session_call.assert_called_once_with(TEST_TENANT)
+    export_call.assert_awaited_once()
+    assert export_call.await_args.kwargs["include_credentials"] is False
+    assert audit_call.await_args.kwargs["severity"] == "warn"
+    export_db.commit.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

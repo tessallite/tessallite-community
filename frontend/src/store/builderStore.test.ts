@@ -301,6 +301,57 @@ describe("builderStore", () => {
       expect(ps.measureId).toBe("m1");
       expect(ps.rowDimIds).toEqual([]);
     });
+
+    // Bug-7284 (GPT Phase 4 review P4-R1-001): MeasureQueryPanel seeds its
+    // "is this result stale" ref from `pivotState.executedDimsKey` on mount —
+    // a field updated ONLY on a successful execute, deliberately SEPARATE
+    // from `rowDimIds`/`colDimIds`, which the panel's persistence effect
+    // rewrites on every dimension edit regardless of whether a new execute
+    // ran. This test exercises the real store (not the component) through
+    // the exact call sequence a dimension edit followed by a remount makes,
+    // proving the shallow-merge contract the fix depends on: a partial
+    // update to rowDimIds/colDimIds must NOT silently carry executedDimsKey
+    // forward as if it now matched the new dims.
+    it("keeps executedDimsKey independent of rowDimIds/colDimIds — a dims-only update does not touch it", () => {
+      act(() =>
+        useBuilderStore.getState().setPivotState({
+          rowDimIds: ["dim-a"],
+          colDimIds: [],
+          executeResult: { rows: [], columns: [] },
+          executedDimsKey: "[\"dim-a\"]|[]",
+        }),
+      );
+      expect(useBuilderStore.getState().pivotState.executedDimsKey).toBe("[\"dim-a\"]|[]");
+
+      // Simulate a dimension edit: the panel's persistence effect rewrites
+      // rowDimIds/colDimIds (and re-sends the STILL-STALE executeResult,
+      // matching index.tsx's actual persistence effect) but says nothing
+      // about executedDimsKey.
+      act(() =>
+        useBuilderStore.getState().setPivotState({
+          rowDimIds: ["dim-b"],
+          colDimIds: [],
+        }),
+      );
+
+      const ps = useBuilderStore.getState().pivotState;
+      // The dims changed...
+      expect(ps.rowDimIds).toEqual(["dim-b"]);
+      // ...but executedDimsKey must NOT have followed them — it still names
+      // the dims the carried-over executeResult actually answers. A fresh
+      // mount seeding its ref from this field (not from rowDimIds/colDimIds)
+      // will therefore correctly detect the mismatch and gate the pivot.
+      expect(ps.executedDimsKey).toBe("[\"dim-a\"]|[]");
+      expect(ps.executedDimsKey).not.toBe(`${JSON.stringify(ps.rowDimIds)}|${JSON.stringify(ps.colDimIds)}`);
+
+      // A subsequent successful execute against the NEW dims updates it —
+      // and only an explicit execute does this, matching handleRun's own
+      // setPivotState({ executedDimsKey }) call.
+      act(() =>
+        useBuilderStore.getState().setPivotState({ executedDimsKey: "[\"dim-b\"]|[]" }),
+      );
+      expect(useBuilderStore.getState().pivotState.executedDimsKey).toBe("[\"dim-b\"]|[]");
+    });
   });
 
   describe("reset", () => {

@@ -118,7 +118,7 @@ async def test_cancel_actually_cancels_the_in_flight_query_for_the_same_session(
     execute_response = await asyncio.wait_for(execute_task, timeout=2)
     execute_body = execute_response.body.decode("utf-8")
     assert execute_response.status_code == 200
-    assert "<soap11env:Fault>" in execute_body
+    assert "<soap11env:Fault" in execute_body
     assert "cancelled" in execute_body.lower()
 
 

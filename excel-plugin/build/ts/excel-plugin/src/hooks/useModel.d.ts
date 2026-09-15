@@ -1,0 +1,12 @@
+export declare function useProjects(): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").Project[], Error>;
+export declare function useModels(projectId: string | null): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").Model[], Error>;
+export declare function useModel(projectId: string | null, modelId: string | null): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").Model, Error>;
+export declare function useMeasures(projectId: string | null, modelId: string | null, personaId?: string | null): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").Measure[], Error>;
+export declare function useDimensions(projectId: string | null, modelId: string | null, personaId?: string | null): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").Dimension[], Error>;
+export declare function useHierarchies(projectId: string | null, modelId: string | null, personaId?: string | null): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").Hierarchy[], Error>;
+export declare function useKpis(projectId: string | null, modelId: string | null, personaId?: string | null): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").Kpi[], Error>;
+export declare function useNamedSets(projectId: string | null, modelId: string | null, personaId?: string | null): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").NamedSet[], Error>;
+export declare function usePersonas(projectId: string | null, modelId: string | null): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").Persona[], Error>;
+export declare function useGlossary(projectId: string | null, modelId: string | null, personaId?: string | null): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").GlossaryEntry[], Error>;
+export declare function useAliasMap(projectId: string | null, modelId: string | null, personaId?: string | null): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").AliasMapEntry[], Error>;
+export declare function useFieldCompatibility(projectId: string | null, modelId: string | null, personaId?: string | null, measureIds?: string[], dimensionIds?: string[]): import("@tanstack/react-query").UseQueryResult<import("../types/tessallite").FieldCompatibilityResponse, Error>;

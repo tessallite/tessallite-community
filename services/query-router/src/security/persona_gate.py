@@ -186,7 +186,15 @@ def enforce_persona(
     persona carries any allow list or default filter, the query is
     rejected instead of executed unrestricted.
     """
-    is_star = bound.logical_query.select_star
+    # Bug-9899 / audit row A13: a projection the SERVER expanded from a
+    # ``SELECT *`` narrows here exactly as a star does. The DENY branches below
+    # exist for a caller who named a field they may not see; nobody named these.
+    # Before this, the Named Query serve path mirrored this whole narrowing a
+    # SECOND time over snapshot rows, to keep an expanded star from hitting a
+    # deny branch -- one gate re-implemented, and free to drift from it.
+    is_star = bound.logical_query.select_star or getattr(
+        bound.logical_query, "star_expanded", False,
+    )
 
     measure_allow = _ids_as_strings(persona.included_measure_ids)
     dimension_allow = _ids_as_strings(persona.included_dimension_ids)
@@ -243,6 +251,23 @@ def enforce_persona(
                         persona=persona,
                         reason="measure_not_included",
                     )
+
+        # Bug-9824: a measure predicate is a threshold oracle even when the
+        # measure is not projected. It must be checked against the same
+        # allow-list as selected measures; it cannot be narrowed away.
+        for predicate in getattr(bound, "resolved_measure_filters", None) or []:
+            predicate_measure = getattr(predicate, "measure", None)
+            if (
+                predicate_measure is None
+                or getattr(predicate_measure, "id", None) is None
+                or str(predicate_measure.id) not in measure_allow
+            ):
+                raise _persona_denied(
+                    object_kind="measure",
+                    object_name=getattr(predicate, "measure_name", None),
+                    persona=persona,
+                    reason="measure_predicate_not_included",
+                )
 
         # F-008-01: the binder wraps a non-aggregated measure as a virtual
         # dimension (``is_measure_as_dimension``). That path never hits
@@ -341,6 +366,34 @@ def enforce_persona(
                         persona=persona,
                         reason="hierarchy_not_included",
                     )
+
+    # Bug-9899 (M-2 parity): star narrowing that removes EVERY field must
+    # refuse, not hand the pipeline an empty projection. The column-level
+    # security gate has had this guard since Bug-809 (router.py, the
+    # star-fully-restricted shape); the allow-list gate did not, and the Named
+    # Query serve path compensated with its own copy of the narrowing plus its
+    # own 403. With the narrowing consolidated here, the refusal belongs here
+    # too — same typed, non-disclosing shape as the CLS one.
+    if (
+        is_star
+        and getattr(bound, "persona_narrowed_star", False)
+        and not bound.resolved_measures
+        and not bound.resolved_dimensions
+    ):
+        logger.info(
+            "[PERSONA_DENY] reason=star_narrowed_to_nothing persona_id=%s",
+            str(persona.id),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error_code": _PERSONA_DENY_ERROR_CODE,
+                "message": (
+                    "No columns are available to return for this query "
+                    "with your current access."
+                ),
+            },
+        )
 
 
 async def _get_excluded_measure_backing(
@@ -482,7 +535,14 @@ def merge_default_filters(persona: Persona, bound: BoundQuery) -> list[str]:
             continue
         operator, value = _coerce_filter(raw)
         if operator is None:
-            continue
+            # Bug-9261 [FAIL CLOSED]: a default filter the gate cannot read
+            # is a security predicate that would NOT be applied. Skipping it
+            # served the persona MORE rows than its definition allows. The
+            # API validates operators at save time, but a legacy row or a
+            # bundle that bypassed that check still reaches this merge, so
+            # the merge itself is the last line: refuse the query and name
+            # the persona and the filter so an operator can repair it.
+            raise PersonaDefaultFilterInvalid(persona, dim_name, raw)
         # F-008-01: append unconditionally (mandatory AND). A user filter on the
         # same dimension is NOT allowed to suppress the persona's default — the
         # two AND together at render time, so the persona scope is inescapable.
@@ -493,10 +553,55 @@ def merge_default_filters(persona: Persona, bound: BoundQuery) -> list[str]:
     return merged
 
 
+class PersonaDefaultFilterInvalid(HTTPException):
+    """Bug-9261: a persona default filter the gate cannot apply.
+
+    Raised at merge time instead of dropping the filter. A dropped default
+    filter is a silently widened row scope; a refusal is loud and names the
+    persona and the offending filter key so the persona can be repaired.
+    """
+
+    error_code = "PERSONA_DEFAULT_FILTER_INVALID"
+
+    def __init__(self, persona: Persona, dim_name: str, raw: Any) -> None:
+        self.persona_id = str(getattr(persona, "id", ""))
+        self.persona_slug = getattr(persona, "slug", None) or getattr(
+            persona, "name", None,
+        )
+        self.dim_name = dim_name
+        logger.warning(
+            "[PERSONA_DENY] reason=default_filter_invalid persona_id=%s "
+            "persona=%r filter=%r value=%r supported=%s",
+            self.persona_id, self.persona_slug, dim_name, raw,
+            sorted(_SUPPORTED_OPERATORS),
+        )
+        super().__init__(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error_code": self.error_code,
+                "message": (
+                    f"Persona {self.persona_slug!r} has a default filter on "
+                    f"{dim_name!r} whose operator or shape is not supported; "
+                    "the query is refused rather than served without that "
+                    "filter. Repair the persona's default filters "
+                    f"(supported operators: {', '.join(sorted(_SUPPORTED_OPERATORS))})."
+                ),
+            },
+        )
+
+
 def _coerce_filter(raw: Any) -> tuple[Optional[str], Any]:
-    """Translate a default_filters value into (operator, value)."""
+    """Translate a default_filters value into (operator, value).
+
+    Returns ``(None, None)`` when the value cannot be read as a filter: an
+    empty dict, a dict with more than one key, or an operator outside the
+    canonical set. ``merge_default_filters`` refuses the query on that
+    result (Bug-9261); it never drops the filter.
+    """
     if isinstance(raw, dict):
-        if not raw:
+        if len(raw) != 1:
+            # Bug-9261: an empty dict has no operator; a multi-key dict is
+            # ambiguous (the API rejects both; see persona_filter_value_is_valid).
             return None, None
         op, val = next(iter(raw.items()))
         if op not in _SUPPORTED_OPERATORS:
@@ -508,6 +613,7 @@ def _coerce_filter(raw: Any) -> tuple[Optional[str], Any]:
 
 
 __all__ = [
+    "PersonaDefaultFilterInvalid",
     "apply_persona_gate",
     "enforce_persona",
     "enforce_persona_gate",

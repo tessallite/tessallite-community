@@ -12,7 +12,7 @@
     <nav class="breadcrumb"><a href="../index.html">Home</a> / <span>Agent</span> / <span>Agent Stop Button</span></nav>
   </header>
   <main class="article">
-    <div class="article-meta"><span class="audience-badge">all</span><span class="updated">Updated 2026-05-24</span></div>
+    <div class="article-meta"><span class="audience-badge">all</span><span class="updated">Updated 2026-09-01</span></div>
 <h1>Agent Stop Button</h1>
 
 <h2>What this covers</h2>
@@ -24,7 +24,8 @@
 <h2>What happens when you click Stop</h2>
 <ol>
 <li>The frontend fires an <strong>AbortController</strong> signal, which terminates the active <code>fetch()</code> request.</li>
-<li>The SSE stream closes immediately. Whatever tokens have already arrived remain visible in the chat.</li>
+<li>The active stream reader is cancelled, whether you stop before response headers, before the first event, or after partial text has arrived.</li>
+<li>Whatever tokens have already arrived remain visible in the chat. Late events from the stopped request are ignored and cannot alter a newer response.</li>
 <li>The conversation is left in a consistent state. You can send a new message or export the conversation as-is.</li>
 </ol>
 

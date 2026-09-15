@@ -2,7 +2,7 @@
 title: "Agent Chat"
 audience: analyst
 area: agent
-updated: 2026-06-21
+updated: 2026-09-11
 ---
 
 ![Live Agent Chat workspace for the acme-demo project.](../assets/screencaps/agent-chat.png)
@@ -27,6 +27,19 @@ The agent works at project level. A project can contain multiple models, but onl
 ## Writing effective questions
 
 Ask in business terms first: "What changed in April margin for EMEA?" is better than starting with table names. If the answer is ambiguous, add grain and filters: region, date range, merchant category, fiscal period, or persona. The agent can plan multi-step answers, but it is still governed by the semantic model; undefined measures need to be created in Model Builder first.
+
+## Reading time ranges and comparisons
+
+A row grouped by year can add up many days. The year label is not the date range. Check the filters in the answer's trace to see which days were included.
+
+When you ask for category totals and a comparison with their average, the totals stay visible. The comparison uses the complete set of totals. If the result is incomplete, the answer explains that it cannot establish the comparison from those rows.
+
+If you ask for a fixed baseline divided by each category total, the answer keeps
+that ratio. If you ask how many average-sized rows make up a total, it keeps
+that meaning too. Tessallite only replaces an unsafe average-across-categories
+plan when both sides cover the same dates, filters, and people or records. If
+they do not match, it refuses the substitution instead of answering a different
+question.
 
 ## When to switch to Model Builder
 

@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { useT } from "../i18n";
 import { safeLocalGet } from "../utils/safeLocalStorage";
 import { Navigate } from "react-router-dom";
-import { Box, CircularProgress, Snackbar, Alert, Typography } from "@mui/material";
+import { Box, CircularProgress, Typography } from "@mui/material";
 import { authApi, systemSettingsApi } from "../api/client";
 import { refreshSystemDefaults } from "../api/systemDefaults";
+import { useBuilderStore } from "../store/builderStore";
 import {
   isSessionExpired,
   isSessionExpiringSoon,
@@ -48,7 +49,10 @@ export default function RequireAuth({
 }) {
   const hasCookie = hasCsrfCookie();
   const t = useT();
-  const [expiryWarning, setExpiryWarning] = useState(false);
+  // Bug-9559: the expiry warning used its own local Snackbar; it now shares
+  // the one app-wide toast (mounted in App.tsx) with every other transient
+  // notification.
+  const setGlobalMessage = useBuilderStore((s) => s.setGlobalMessage);
   const warningShownRef = useRef(false);
   const refreshingRef = useRef(false);
   const role = safeLocalGet("user_role", "");
@@ -115,7 +119,7 @@ export default function RequireAuth({
           .catch(() => {
             if (!warningShownRef.current) {
               warningShownRef.current = true;
-              setExpiryWarning(true);
+              setGlobalMessage(t("session.expiringSoon"), "warning");
             }
           })
           .finally(() => {
@@ -150,19 +154,5 @@ export default function RequireAuth({
     );
   }
 
-  return (
-    <>
-      {children}
-      <Snackbar
-        open={expiryWarning}
-        autoHideDuration={10_000}
-        onClose={() => setExpiryWarning(false)}
-        anchorOrigin={{ vertical: "top", horizontal: "center" }}
-      >
-        <Alert severity="warning" onClose={() => setExpiryWarning(false)}>
-          {t("session.expiringSoon")}
-        </Alert>
-      </Snackbar>
-    </>
-  );
+  return <>{children}</>;
 }

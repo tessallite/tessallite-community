@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from fastapi.routing import APIRoute, APIWebSocketRoute
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.routing import Route, WebSocketRoute
 
 from src.main import app
@@ -171,6 +172,99 @@ def _collect_routes():
 
 
 # ── Mock DB session ──────────────────────────────────────────────────────
+#
+# Every read API of ``AsyncSession`` has to be stubbed with the RESULT SHAPE it
+# really returns, because the default is worse than useless: an un-stubbed
+# ``AsyncMock`` attribute is a coroutine function whose awaited value is ANOTHER
+# ``AsyncMock``, so ``(await db.scalars(q)).all()`` hands back a coroutine and
+# ``list(...)`` raises ``TypeError``. The route is correct against PostgreSQL;
+# only the double is wrong — and this suite then reports it as a 5xx.
+#
+# That is not hypothetical. ``execute`` was the only read API stubbed, which
+# covered every route until the admin system-log routes (``GET
+# /admin/system-logs``, ``POST /admin/system-logs/purge``) used ``scalars``.
+# The two shapes are genuinely different — ``execute`` returns a ``Result``
+# (rows via ``.scalars().all()``), ``scalars`` a ``ScalarResult`` (rows via
+# ``.all()``) — so one stub could never have covered both.
+#
+# The shapes below are therefore DISCOVERED from ``AsyncSession``'s own return
+# annotations rather than remembered, and the guard at the bottom of this file
+# fails closed if the class grows a read API this double does not model.
+# Listing them by hand is what let the last one through.
+
+
+def _sync_result_double() -> MagicMock:
+    """``Result``: rows through ``.scalars()``, or directly off the result."""
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = None
+    result.scalar.return_value = None
+    result.scalars.return_value = _sync_scalar_result_double()
+    result.all.return_value = []
+    result.first.return_value = None
+    result.one_or_none.return_value = None
+    return result
+
+
+def _sync_scalar_result_double() -> MagicMock:
+    """``ScalarResult``: already projected, so rows come straight off it."""
+    scalars = MagicMock()
+    scalars.all.return_value = []
+    scalars.first.return_value = None
+    scalars.one_or_none.return_value = None
+    scalars.unique.return_value = scalars
+    return scalars
+
+
+def _async_result_double() -> MagicMock:
+    """``AsyncResult``: same shape, but the row accessors are awaitable."""
+    result = MagicMock()
+    result.scalars.return_value = _async_scalar_result_double()
+    result.all = AsyncMock(return_value=[])
+    result.first = AsyncMock(return_value=None)
+    result.one_or_none = AsyncMock(return_value=None)
+    return result
+
+
+def _async_scalar_result_double() -> MagicMock:
+    scalars = MagicMock()
+    scalars.all = AsyncMock(return_value=[])
+    scalars.first = AsyncMock(return_value=None)
+    scalars.one_or_none = AsyncMock(return_value=None)
+    scalars.unique.return_value = scalars
+    return scalars
+
+
+# Keyed on the result class ``AsyncSession`` declares it returns, so a new or
+# renamed read API is matched by SHAPE rather than by a remembered method name.
+_RESULT_DOUBLES = {
+    "Result": _sync_result_double,
+    "ScalarResult": _sync_scalar_result_double,
+    "AsyncResult": _async_result_double,
+    "AsyncScalarResult": _async_scalar_result_double,
+}
+
+
+def _result_returning_session_apis() -> dict[str, str]:
+    """``AsyncSession``'s coroutine read APIs, mapped to their result class.
+
+    SQLAlchemy uses ``from __future__ import annotations``, so a return
+    annotation arrives as the SOURCE TEXT (``'ScalarResult[Any]'``), the same
+    way ``_discover_session_entry_points`` above sees ``'async_sessionmaker'``.
+    Take the leading identifier and drop any subscript.
+    """
+    found: dict[str, str] = {}
+    for name, function in vars(AsyncSession).items():
+        if name.startswith("_") or not inspect.iscoroutinefunction(function):
+            continue
+        annotation = getattr(function, "__annotations__", {}).get("return")
+        if not isinstance(annotation, str):
+            annotation = getattr(annotation, "__name__", "")
+        result_cls = annotation.split("[")[0].strip()
+        if result_cls in _RESULT_DOUBLES:
+            found[name] = result_cls
+    return found
+
+
 def _make_mock_session() -> AsyncMock:
     s = AsyncMock()
     s.add = MagicMock()
@@ -179,14 +273,13 @@ def _make_mock_session() -> AsyncMock:
     s.delete = AsyncMock()
     s.rollback = AsyncMock()
 
-    result = MagicMock()
-    result.scalar_one_or_none.return_value = None
-    result.scalar.return_value = None
-    result.scalars.return_value.all.return_value = []
-    result.scalars.return_value.first.return_value = None
-    result.all.return_value = []
-    result.first.return_value = None
-    s.execute = AsyncMock(return_value=result)
+    for name, result_cls in _result_returning_session_apis().items():
+        setattr(s, name, AsyncMock(return_value=_RESULT_DOUBLES[result_cls]()))
+
+    # ``scalar`` and ``get`` return a VALUE, not a result object, so they are
+    # annotated ``Any`` / ``Optional[_O]`` and the discovery above cannot type
+    # them. An empty database answers both with None.
+    s.scalar = AsyncMock(return_value=None)
     s.get = AsyncMock(return_value=None)
     return s
 
@@ -440,3 +533,41 @@ def test_walk_fails_closed_on_unknown_shape():
 
     with pytest.raises(_UnknownRouteShape):
         list(_walk(_FakeApp()))
+
+
+@pytest.mark.asyncio
+async def test_every_result_returning_session_api_is_modelled(_mock_handler_db):
+    """The mock session must answer every read API ``AsyncSession`` offers.
+
+    ``execute`` was the only one stubbed. A route that read through ``scalars``
+    instead got the ``AsyncMock`` default — a coroutine where a ``ScalarResult``
+    belongs — so ``list(...)`` raised ``TypeError`` and this suite reported a
+    5xx against a route that is correct against PostgreSQL. Two admin
+    system-log routes did exactly that.
+
+    Assert the property rather than the two routes: every coroutine on
+    ``AsyncSession`` that returns a ``Result``/``ScalarResult`` is stubbed, and
+    what it returns hands back real rows instead of a coroutine. Discovery is
+    off the class itself, so a read API added by a SQLAlchemy upgrade fails here
+    instead of surfacing later as an unexplained 500 on one route.
+
+    Test escape: the double modelled one read API and the rest defaulted to a
+    coroutine. Guard: this test. Tier: T1.
+    """
+    apis = _result_returning_session_apis()
+    assert {"execute", "scalars"} <= set(apis), (
+        f"discovery stopped seeing AsyncSession's read APIs: {sorted(apis)}"
+    )
+
+    for name, result_cls in apis.items():
+        result = await getattr(_mock_handler_db, name)("statement")
+        assert not inspect.iscoroutine(result), f"{name} was not stubbed"
+        rows = result.all()
+        if result_cls.startswith("Async"):
+            rows = await rows
+        assert rows == [], f"{name} -> {result_cls}.all() did not return rows"
+
+    # ``Result`` projects through ``.scalars()``; ``ScalarResult`` is already
+    # projected. Conflating the two is what a single shared stub would do.
+    assert (await _mock_handler_db.execute("statement")).scalars().all() == []
+    assert (await _mock_handler_db.scalars("statement")).all() == []

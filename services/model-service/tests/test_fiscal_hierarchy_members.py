@@ -19,11 +19,14 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+import sqlglot
+from sqlglot import exp
 
 from src.api.hierarchies import (
     CALENDAR_HIERARCHY_TEMPLATES,
     _calendar_component_expression,
     _date_component_expression,
+    _transpile_uda_expression,
 )
 
 COL = "order_date"
@@ -176,6 +179,26 @@ class TestIsoYearBoundary:
         assert _calendar_component_expression(COL, "week", "iso_week", None) == (
             f"EXTRACT(WEEK FROM {BASE})"
         )
+
+    def test_iso_week_uses_shared_target_dialect_expression(self) -> None:
+        # The canonical expression is PostgreSQL WEEK, but BigQuery's WEEK is
+        # Sunday-based. The model-service producer must use the shared
+        # calendar dialect helper at the target transpile boundary so this
+        # hierarchy keeps ISO buckets on BigQuery.
+        canonical = _calendar_component_expression(COL, "week", "iso_week", None)
+        rendered = _transpile_uda_expression(
+            canonical, "bigquery", table_alias="t",
+        )
+        assert "ISOWEEK" in rendered.upper()
+        assert "EXTRACT(WEEK" not in rendered.upper().replace(" ", "")
+        tree = sqlglot.parse_one(rendered, read="bigquery")
+        extract = tree.find(exp.Extract)
+        assert extract is not None
+        operand = extract.expression
+        column = operand.find(exp.Column)
+        assert column is not None
+        assert column.table == "t"
+        assert operand.find(exp.Literal) is None
 
     def test_legacy_iso_token_normalised(self) -> None:
         # The pre-H9 "iso" spelling normalises to iso_week and keeps ISOYEAR.

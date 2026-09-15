@@ -79,8 +79,12 @@ export function isTotalableMeasure(measure: Measure): boolean {
   if (measure.measure_type !== "standard") return false;
   if (!measure.is_additive) return false;
   // When the measure carries a chosen aggregate function, only summable
-  // functions can be totalled client-side.
-  const agg = (measure as { _agg?: string })._agg;
+  // functions can be totalled client-side. Bug-8548: fall back to the
+  // measure's own default_agg (mirrors subtotalRequery.ts's needsServerSubtotals)
+  // so a non-SUM/COUNT default is still caught when no column-level _agg
+  // override is present — this is defence-in-depth, no live wrong-numbers path
+  // was found (the pivot column builder already sets _agg from default_agg).
+  const agg = (measure as { _agg?: string })._agg || measure.default_agg;
   if (agg && !SUMMABLE_AGGS.has(agg.toUpperCase())) return false;
   return true;
 }

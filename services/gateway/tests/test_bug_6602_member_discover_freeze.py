@@ -49,6 +49,7 @@ _DIMS = [
 def _patch_flat_members(monkeypatch, calls, *, count=1):
     async def fake_get_dimension_members(
         model_id, dimension_name, tenant_slug, jwt_token, *, persona_id=None,
+        limit=None,
     ):
         calls.append((dimension_name, persona_id))
         return {
@@ -78,7 +79,7 @@ class TestNarrowing:
             dimensions=_DIMS,
             tenant_slug="acme",
             jwt_token="tok",
-            restrictions={"MEMBER_UNIQUE_NAME": ["[Region].[Region].[West]"]},
+            restrictions={"MEMBER_UNIQUE_NAME": ["[Dimensions].[Region].[West]"]},
         )
 
         fetched = [c[0] for c in calls]
@@ -99,7 +100,7 @@ class TestNarrowing:
             dimensions=_DIMS,
             tenant_slug="acme",
             jwt_token="tok",
-            restrictions={"LEVEL_UNIQUE_NAME": ["[Product].[Product].[Product]"]},
+            restrictions={"LEVEL_UNIQUE_NAME": ["[Dimensions].[Product].[Product]"]},
         )
 
         fetched = [c[0] for c in calls]
@@ -231,7 +232,7 @@ class TestMemberCache:
         calls: list[tuple[str, str | None]] = []
         _patch_flat_members(monkeypatch, calls)
 
-        restrictions = {"MEMBER_UNIQUE_NAME": ["[Region].[Region].[West]"]}
+        restrictions = {"MEMBER_UNIQUE_NAME": ["[Dimensions].[Region].[West]"]}
         kw = dict(
             model_id="m1", project_id="p1", dimensions=_DIMS,
             tenant_slug="acme", jwt_token="tok", restrictions=restrictions,
@@ -251,7 +252,7 @@ class TestMemberCache:
         calls: list[tuple[str, str | None]] = []
         _patch_flat_members(monkeypatch, calls)
 
-        restrictions = {"MEMBER_UNIQUE_NAME": ["[Region].[Region].[West]"]}
+        restrictions = {"MEMBER_UNIQUE_NAME": ["[Dimensions].[Region].[West]"]}
         base = dict(
             model_id="m1", project_id="p1", dimensions=_DIMS,
             tenant_slug="acme", jwt_token="tok", restrictions=restrictions,
@@ -278,6 +279,7 @@ class TestMemberCache:
 
         async def fake_get_dimension_members(
             model_id, dimension_name, tenant_slug, jwt_token, *, persona_id=None,
+            limit=None,
         ):
             # Return identity-specific members to make a leak observable.
             fetches.append(jwt_token)
@@ -290,7 +292,7 @@ class TestMemberCache:
             xmla_server, "get_dimension_members", fake_get_dimension_members,
         )
 
-        restrictions = {"MEMBER_UNIQUE_NAME": ["[Region].[Region].[West]"]}
+        restrictions = {"MEMBER_UNIQUE_NAME": ["[Dimensions].[Region].[West]"]}
         base = dict(
             model_id="m1", project_id="p1", dimensions=_DIMS,
             tenant_slug="acme", restrictions=restrictions, persona_id=None,
@@ -355,7 +357,7 @@ class TestBoundedEnumeration:
             dimensions=_DIMS,
             tenant_slug="acme",
             jwt_token="tok",
-            restrictions={"MEMBER_UNIQUE_NAME": ["[Region].[Region].[West]"]},
+            restrictions={"MEMBER_UNIQUE_NAME": ["[Dimensions].[Region].[West]"]},
         )
 
         members = result["Region"]["members"]
@@ -492,7 +494,7 @@ class TestMetadataCache:
 
         # Bug-6603: MDSCHEMA_DIMENSIONS now collapses standalone attribute dims into
         # one [Dimensions] group node, so the per-dimension trim is asserted against
-        # MDSCHEMA_HIERARCHIES instead — each attribute keeps its own [Name].[Name]
+        # MDSCHEMA_HIERARCHIES instead — each attribute keeps its own [Dimensions].[Name]
         # hierarchy, and the SAME persona-trimmed cube list drives both rowsets, so
         # this is the same raw-before-trim guard.
 
@@ -504,7 +506,7 @@ class TestMetadataCache:
             xs._find_method(root), tenant_slug="acme", jwt_token="tok",
         )
         body_r = resp_r.body.decode()
-        assert "[Region].[Region]" in body_r
+        assert "[Dimensions].[Region]" in body_r
         assert "[Product]" not in body_r, "restricted persona must not see Product"
 
         # 2) Business-base Discover second -- must see the FULL catalogue, proving
@@ -515,12 +517,12 @@ class TestMetadataCache:
             xs._find_method(root), tenant_slug="acme", jwt_token="tok",
         )
         body_b = resp_b.body.decode()
-        assert "[Region].[Region]" in body_b
-        assert "[Product].[Product]" in body_b, (
+        assert "[Dimensions].[Region]" in body_b
+        assert "[Dimensions].[Product]" in body_b, (
             "business base must see all dimensions; a persona-trimmed list "
             "leaked through the metadata cache (raw-before-trim violated)"
         )
-        assert "[Customer].[Customer]" in body_b
+        assert "[Dimensions].[Customer]" in body_b
         # Bug-6628: persona_id is now part of the cache key, so the
         # restricted persona catalog (persona_id='persona-restricted') and
         # the business base catalog (persona_id=None) are separate cache
@@ -575,7 +577,9 @@ class TestMetadataCache:
         # this probes a key that is never written and passes vacuously.
         meta_key = member_cache.metadata_key(
             tenant_slug="acme", model_id="mm-1",
-            principal_key=member_cache.principal_fingerprint("tok"),
+            principal_key=(
+                member_cache.principal_fingerprint("tok") + "\x01\x01"
+            ),
         )
         assert member_cache.get_metadata(meta_key) is None
 
@@ -740,7 +744,7 @@ class TestHierarchyLevelSkew:
             dimension=dict(self._DIM),
             tenant_slug="acme",
             jwt_token="tok",
-            restrictions={"LEVEL_UNIQUE_NAME": ["[Calendar].[Calendar].[Quarter]"]},
+            restrictions={"LEVEL_UNIQUE_NAME": ["[Hierarchies].[Calendar].[Quarter]"]},
             persona_id="persona-x",
         )
 
@@ -774,7 +778,7 @@ class TestHierarchyLevelSkew:
             dimension=dict(self._DIM),
             tenant_slug="acme",
             jwt_token="tok",
-            restrictions={"LEVEL_UNIQUE_NAME": ["[Calendar].[Calendar].[Quarter]"]},
+            restrictions={"LEVEL_UNIQUE_NAME": ["[Hierarchies].[Calendar].[Quarter]"]},
             persona_id=None,
         )
         by_level = result["members_by_level"]

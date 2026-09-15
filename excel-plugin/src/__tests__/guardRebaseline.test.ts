@@ -16,14 +16,18 @@
  *   Guard that repeated Local Pivot insertion succeeds with UNIQUE names.
  *   Coordinates with the InsertTracker/insertGuard work (Phase A).
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { renderHook } from '@testing-library/react';
 import useExcelSource from '../hooks/useExcel.ts?raw';
 import { templates, strings } from '../i18n/strings';
 import { describeTableInsertResult } from '../utils/measureFormulaInsert';
 import { buildScorecardPayload, buildScorecardKpi } from '../utils/kpiScorecard';
 import { InsertTracker, rangesOverlap } from '../utils/insertGuard';
+import { apiClient } from '../api/client';
+import { evaluateKpiBatch, getKpis, getNamedSets } from '../api/modelService';
 import type { Kpi, Measure } from '../types/tessallite';
+
+afterEach(() => vi.restoreAllMocks());
 
 // ---------------------------------------------------------------------------
 // Bug-6741: full-result and truncation-signal guards
@@ -139,28 +143,30 @@ describe('Bug-6742 -- persona-scoped KPI parity guards', () => {
     expect(result.valueMeasureName).toBe('fee_amount');
   });
 
-  it('getKpis API function accepts personaId for persona-scoped queries', async () => {
-    // Bug-5962/5963: the actual boundary that matters is that the API function
-    // threads personaId into the request URL. Verify the function signature
-    // accepts the optional personaId parameter (3rd argument).
-    const { getKpis } = await import('../api/modelService');
-    expect(typeof getKpis).toBe('function');
-    // Function must accept (projectId, modelId, personaId?) -- at least 2 required params.
-    expect(getKpis.length).toBeGreaterThanOrEqual(2);
+  it('Bug-9816: getKpis threads personaId into the request URL', async () => {
+    const get = vi.spyOn(apiClient, 'get').mockResolvedValue([]);
+    await getKpis('project-1', 'model-1', 'persona-1');
+    expect(get).toHaveBeenCalledWith(
+      '/api/v1/projects/project-1/models/model-1/kpis?deployed_only=true&persona_id=persona-1',
+    );
   });
 
-  it('getNamedSets API function accepts personaId for persona-scoped queries', async () => {
-    const { getNamedSets } = await import('../api/modelService');
-    expect(typeof getNamedSets).toBe('function');
-    expect(getNamedSets.length).toBeGreaterThanOrEqual(2);
+  it('getNamedSets threads personaId into the request URL', async () => {
+    const get = vi.spyOn(apiClient, 'get').mockResolvedValue([]);
+    await getNamedSets('project-1', 'model-1', 'persona-1');
+    expect(get).toHaveBeenCalledWith(
+      '/api/v1/projects/project-1/models/model-1/named-sets?deployed_only=true&persona_id=persona-1',
+    );
   });
 
-  it('evaluateKpiBatch API function accepts personaId for persona-scoped evaluation', async () => {
-    // Bug-6361: KPI batch evaluation must pass personaId so values match
-    // the persona view, not the default.
-    const { evaluateKpiBatch } = await import('../api/modelService');
-    expect(typeof evaluateKpiBatch).toBe('function');
-    expect(evaluateKpiBatch.length).toBeGreaterThanOrEqual(3);
+  it('evaluateKpiBatch threads personaId into the evaluation request', async () => {
+    const post = vi.spyOn(apiClient, 'post').mockResolvedValue({ results: [], evaluation_ms: 0 });
+    await evaluateKpiBatch('project-1', 'model-1', ['kpi-1'], 'persona-1');
+    expect(post).toHaveBeenCalledWith(
+      // Bug-9881: and deployed_only, so the batch serves deployed definitions.
+      '/api/v1/projects/project-1/models/model-1/kpis/evaluate-batch?deployed_only=true&persona_id=persona-1',
+      { kpi_ids: ['kpi-1'] },
+    );
   });
 
   it('KPI panel search and filter use the central strings table', () => {

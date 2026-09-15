@@ -22,6 +22,7 @@ import {
 } from "@mui/material";
 import { useQuery } from "@tanstack/react-query";
 import { calendarApi } from "../../api/client";
+import { canPerform } from "../../auth/explorerPrivileges";
 import type { CalendarCoverageResponse, CalendarTable } from "../../api/types";
 
 const HIERARCHY_PRESETS_RAW: Record<string, string[]> = {
@@ -185,7 +186,11 @@ export default function DimensionCalendarAssociation({
                 />
               )}
 
-              {factTable && factDateColumn && (
+              {/* Bug-9900: the coverage probe is a modeller-tier modelling
+                  surface (raw MIN/MAX on the physical tables). Hide the
+                  affordance from viewers rather than showing a button that
+                  the backend answers with 403. */}
+              {factTable && factDateColumn && canPerform("calendar.checkCoverage") && (
                 <Box sx={{ mt: 1 }}>
                   <Button
                     size="small"

@@ -4219,6 +4219,17 @@ async def evaluate_kpi(
     kpi_id: UUID,
     request: Request,
     persona_id: UUID | None = Query(default=None),
+    deployed_only: bool = Query(
+        default=True,
+        description=(
+            "Evaluate the DEPLOYED definition only (Bug-9881). Default true: "
+            "KPI evaluation is a consumption route like every other BI-facing "
+            "read, so a served number always comes from the deployed model "
+            "snapshot and an undeployed model is withheld rather than "
+            "evaluated from the live editor draft. Only the SPA's KPI "
+            "authoring panel passes false, to preview a draft it is editing."
+        ),
+    ),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> KPIEvaluateResponse:
     async for db in get_tenant_db(current_user.tenant_id):
@@ -4264,7 +4275,17 @@ async def evaluate_kpi(
             # The KPI id is not part of the deployed model version — it has not
             # been deployed through model Save + Deploy, so it is not served.
             raise HTTPException(status_code=404, detail="KPI not found")
-        # else Undeployed: keep the live draft for builder evaluation.
+        elif deployed_only:
+            # Bug-9881: Undeployed model on a CONSUMPTION call. There is no
+            # serving authority at all, so the live editor draft must not be
+            # served — mirror the withheld outcome instead of falling back.
+            raise HTTPException(
+                status_code=404,
+                detail="KPI not found: the model has no deployed version",
+            )
+        # else Undeployed + deployed_only=false: the authoring panel is
+        # previewing its own draft, which is builder-only and never gateway
+        # traffic.
 
         # Persona-based measure + dimension filtering (Section 13.1, Bug-6329)
         persona = await resolve_effective_persona(
@@ -5551,6 +5572,16 @@ async def evaluate_batch(
     body: KPIBatchRequest,
     request: Request,
     persona_id: UUID | None = Query(default=None),
+    deployed_only: bool = Query(
+        default=True,
+        description=(
+            "Evaluate DEPLOYED definitions only (Bug-9881). Default true, for "
+            "the same reason as the single-KPI route: every batch consumer "
+            "(Excel pane, SPA scorecard, gateway, snapshot sweep) serves "
+            "numbers, so an undeployed model yields withheld results rather "
+            "than live editor drafts."
+        ),
+    ),
     current_user: CurrentUser = Depends(
         require_capability_or_service_scope("query", SCOPE_KPI_EVALUATE)
     ),
@@ -5677,10 +5708,12 @@ async def evaluate_batch(
 
             For a deployed model, the snapshot-pinned definition (or None when
             the KPI id is absent from the deployed version — withheld). For an
-            undeployed model, the live draft unchanged.
+            undeployed model there is no serving authority: a consumption call
+            (``deployed_only``, the default) withholds it (Bug-9881); only the
+            builder, which opts out, gets the live draft.
             """
             if not _batch_deployed:
-                return live_kpi
+                return None if deployed_only else live_kpi
             return _served_by_id.get(live_kpi.id)
 
         bearer = (

@@ -1,16 +1,8 @@
 import { useState, useCallback, useEffect, useRef, useMemo, createContext, useContext } from 'react';
 import {
   ThemeProvider, CssBaseline, Box, Typography,
-  IconButton, CircularProgress,
-  Menu, MenuItem, ListItemText, Select,
+  CircularProgress,
 } from '@mui/material';
-import {
-  MenuBookOutlined, Settings as SettingsIcon,
-  FilterAltOutlined,
-  AnalyticsOutlined,
-  AutoAwesomeOutlined,
-  SpeedOutlined,
-} from '@mui/icons-material';
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query';
 import { theme, tokens } from './theme';
 import { useAuth } from './hooks/useAuth';
@@ -18,6 +10,7 @@ import type { LoginFormData } from './hooks/useAuth';
 import { useExcel } from './hooks/useExcel';
 import { usePersonaFiltered } from './hooks/usePersona';
 import { useToast } from './components/Toast/ToastProvider';
+import { ConfirmProvider, useConfirm } from './components/Confirm/ConfirmProvider';
 import { healthCheck } from './api/gateway';
 import { setLastMode, getLastMode, setModelContext, clearModelContext, setActivePersonaId as persistActivePersonaId } from './utils/storage';
 import { getAgentConfig } from './api/agentService';
@@ -33,21 +26,29 @@ import { ToastProvider } from './components/Toast/ToastProvider';
 import ReportBuilder from './components/ReportBuilder/ReportBuilder';
 import { KpiPanel } from './components/KpiPanel';
 import GlossaryModal from './components/Glossary/GlossaryModal';
-import PersonaDropdown from './components/PersonaSwitcher/PersonaDropdown';
-import ProfileSwitcher from './components/ProfileSwitcher/ProfileSwitcher';
+import { AppHeader, ModeTabs, OfflineBanner, AppFooter } from './components/Shell';
+import type { AppMode } from './components/Shell';
 import DrillPanel from './components/DrillThrough/DrillPanel';
 import DiagnosticsPanel from './components/Settings/DiagnosticsPanel';
 import { strings, templates } from './i18n/strings';
-import StatusBadge from './components/common/StatusBadge';
 import { buildDrillRequestContext, resolveCellContext, type MeasureLookup } from './utils/cellContext';
 import { TESSALLITE_CONNECTION_NAME } from './utils/excelFormulas';
 import type { Persona } from './types/tessallite';
-import { mapAgentChartType, type ChartTypeRecommendation } from './utils/excelCharts';
+import {
+  buildAnnotationFromCitations,
+  buildChartRowsFromRecords,
+  mapAgentChartType,
+  type ChartTypeRecommendation,
+} from './utils/excelCharts';
 import { describeChartInsertResult, describeTableInsertResult } from './utils/measureFormulaInsert';
 import { executeQuery } from './api/queryRouter';
 import { normalizeAgentSemanticQuery } from './utils/semanticQueryNormalizer';
+import { createContextTransitionCoordinator } from './utils/contextTransition';
+// TEST PROFILE build only. Constant `false` / identity helpers in every
+// ordinary build, so nothing below changes shipping behaviour.
+import { preferredProject, preferredModel } from './testProfile';
 
-export type AppMode = 'ask' | 'report-builder' | 'kpi';
+export type { AppMode };
 
 function createAppQueryClient(): QueryClient {
   return new QueryClient({
@@ -85,9 +86,14 @@ function AppInner() {
   const resetSession = useConversationStore((s: ConversationState) => s.resetSession);
   const setPendingPersonaId = useConversationStore((s: ConversationState) => s.setPendingPersonaId);
   const modelIdRef = useRef<string | null>(null);
+  const contextTransitionsRef = useRef<ReturnType<typeof createContextTransitionCoordinator> | null>(null);
+  if (!contextTransitionsRef.current) {
+    contextTransitionsRef.current = createContextTransitionCoordinator();
+  }
+  const contextTransitions = contextTransitionsRef.current;
+  useEffect(() => () => contextTransitions.cancel(), [contextTransitions]);
   // Bug-5965: refs to the tab elements so keyboard navigation can move focus
   // (roving tabindex) as the user arrows across the tab strip.
-  const tabRefs = useRef<(HTMLDivElement | null)[]>([]);
 
   const [mode, setMode] = useState<AppMode>('report-builder');
   const [loginError, setLoginError] = useState<string | null>(null);
@@ -99,10 +105,14 @@ function AppInner() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [modelId, setModelId] = useState<string | null>(null);
   modelIdRef.current = modelId;
+  // R3 (alert-mechanism audit, 2026-08-25): a styled confirm dialog instead
+  // of useExcel's native window.confirm() fallback, matching every other
+  // "are you sure?" in the app.
+  const confirm = useConfirm();
   // F-025-16 / Bug-6363: pass the active modelId so scorecard/entity inserts
   // scope their manifest entries to this model (no cross-model "Deleted from
   // source" false positives). Declared here because useExcel needs modelId.
-  const { insertTable: excelInsertTable, insertChart: excelInsertChart, insertLocalPivot: excelInsertLocalPivot, insertKpiScorecard: excelInsertKpiScorecard, readCellValue } = useExcel(undefined, handleBusy, modelId || undefined);
+  const { insertTable: excelInsertTable, insertChart: excelInsertChart, insertLocalPivot: excelInsertLocalPivot, insertKpiScorecard: excelInsertKpiScorecard, readCellValue } = useExcel(confirm, handleBusy, modelId || undefined);
   const excelAdapter = useMemo(
     () => createExcelAdapter(() => modelIdRef.current),
     [],
@@ -120,7 +130,6 @@ function AppInner() {
   const personaData = usePersonaFiltered(projectId, modelId, activePersonaId);
   const { data: glossaryEntries } = useGlossary(projectId, modelId, activePersonaId);
 
-  const [settingsAnchorEl, setSettingsAnchorEl] = useState<HTMLElement | null>(null);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
 
   const [drillOpen, setDrillOpen] = useState(false);
@@ -128,62 +137,105 @@ function AppInner() {
   const [drillMeasureName, setDrillMeasureName] = useState('');
   const [drillContext, setDrillContext] = useState<Record<string, unknown>>({});
 
-  const handleProjectChange = useCallback(async (newProjectId: string) => {
+  const handleProjectChange = useCallback((newProjectId: string) => {
+    const transition = contextTransitions.begin();
+    if (!transition.isCurrent()) return;
+
+    // Commit the visible scope immediately under this generation. All later
+    // async continuations must pass the same guard before touching state.
     setProjectId(newProjectId);
     setModelId(null);
     setModelsList([]);
     setProjectsError(null);
     startNewConversation();
     setActivePersonaId(null);
-    await clearModelContext().catch(() => {});
-    // F-025-03: a project switch changes the governed catalogue (and resets the
-    // persona) exactly like a model switch, so it carries the same stale-value
-    // risk. Persist the resolved model context and cleared persona into storage
-    // FIRST, then run the single awaited transition so the separate functions
-    // runtime invalidates and the workbook rebuilds under the new project.
-    await persistActivePersonaId(null).catch(() => {});
-    try {
-      const models = await getModels(newProjectId);
-      setModelsList(models);
-      if (models.length > 0) {
-        const firstModel = models[0];
-        setModelId(firstModel.id);
-        await setModelContext(newProjectId, firstModel.id, firstModel.slug, firstModel.name).catch(() => {});
-      } else {
-        // Bug-6370: an empty model list is a real, user-visible state — record it
-        // rather than leaving the panes blank with no explanation.
-        setProjectsError(strings.projects.noModels);
+
+    void contextTransitions.run(transition, async (current) => {
+      if (!current.isCurrent()) return;
+      await clearModelContext().catch(() => {});
+      if (!current.isCurrent()) return;
+      await persistActivePersonaId(null).catch(() => {});
+      if (!current.isCurrent()) return;
+
+      try {
+        const models = await getModels(newProjectId, current.signal);
+        if (!current.isCurrent()) return;
+        setModelsList(models);
+        if (models.length > 0) {
+          const firstModel = models[0];
+          if (!current.isCurrent()) return;
+          setModelId(firstModel.id);
+          await applyContextTransition({
+            generation: current.generation,
+            isCurrent: current.isCurrent,
+            persist: async () => {
+              if (!current.isCurrent()) return;
+              await setModelContext(
+                newProjectId,
+                firstModel.id,
+                firstModel.slug,
+                firstModel.name,
+              ).catch(() => {});
+              if (!current.isCurrent()) return;
+              await persistActivePersonaId(null).catch(() => {});
+            },
+          });
+        } else {
+          // Bug-6370: an empty model list is a real, user-visible state — record
+          // it rather than leaving the panes blank with no explanation.
+          if (!current.isCurrent()) return;
+          setProjectsError(strings.projects.noModels);
+          await applyContextTransition({
+            generation: current.generation,
+            isCurrent: current.isCurrent,
+          });
+        }
+      } catch {
+        if (!current.isCurrent()) return;
+        // Bug-6370: a failed model fetch on project change was silently
+        // swallowed, leaving the panes empty. Surface it so the user knows to
+        // retry, while an obsolete fetch remains completely silent.
+        setProjectsError(strings.projects.loadFailed);
+        showToast(strings.projects.loadFailed, 'error');
+        await applyContextTransition({
+          generation: current.generation,
+          isCurrent: current.isCurrent,
+        });
       }
-    } catch {
-      // Bug-6370: a failed model fetch on project change was silently swallowed,
-      // leaving the panes empty. Surface it so the user knows to retry.
-      setProjectsError(strings.projects.loadFailed);
-      showToast(strings.projects.loadFailed, 'error');
-    }
-    // Invalidate + rebuild after the new governed scope is persisted (or after
-    // a failed load, where the cleared context must still invalidate stale cells).
-    await applyContextTransition();
-  }, [startNewConversation, showToast]);
+    });
+  }, [contextTransitions, startNewConversation, showToast]);
 
   const handleModelChange = useCallback((newModelId: string) => {
+    const transition = contextTransitions.begin();
+    if (!transition.isCurrent()) return;
     setModelId(newModelId);
     startNewConversation();
     setActivePersonaId(null);
-    // F-025-03: a model switch changes the governed catalogue (and resets the
-    // persona to the model default). Persist the new model context AND the
-    // cleared persona into OfficeRuntime.storage FIRST, then invalidate the
-    // functions runtime and rebuild the workbook via the single awaited
-    // transition. Without this, cells authored against the previous model
-    // could keep resolving old measure/KPI IDs under a stale generation.
-    (async () => {
-      if (projectId) {
-        const selectedModel = modelsList.find(m => m.id === newModelId);
-        await setModelContext(projectId, newModelId, selectedModel?.slug, selectedModel?.name).catch(() => {});
-      }
-      await persistActivePersonaId(null).catch(() => {});
-      await applyContextTransition();
-    })();
-  }, [startNewConversation, projectId, modelsList]);
+
+    // F-025-03 / Bug-9826: persist, invalidate, and recalculate are one queued
+    // lifecycle. A newer generation aborts this transition and prevents its
+    // continuations from publishing stale state or storage.
+    void contextTransitions.run(transition, async (current) => {
+      await applyContextTransition({
+        generation: current.generation,
+        isCurrent: current.isCurrent,
+        persist: async () => {
+          if (!current.isCurrent()) return;
+          if (projectId) {
+            const selectedModel = modelsList.find(m => m.id === newModelId);
+            await setModelContext(
+              projectId,
+              newModelId,
+              selectedModel?.slug,
+              selectedModel?.name,
+            ).catch(() => {});
+          }
+          if (!current.isCurrent()) return;
+          await persistActivePersonaId(null).catch(() => {});
+        },
+      });
+    });
+  }, [contextTransitions, startNewConversation, projectId, modelsList]);
 
   const handleLogin = useCallback(async (data: LoginFormData, remember: boolean) => {
     setLoginLoading(true);
@@ -202,42 +254,10 @@ function AppInner() {
     setLastMode(newMode);
   }, []);
 
-  // Bug-5965: the tab strip order, driving keyboard navigation. Keep in sync
-  // with the rendered tab order below.
-  const tabOrder: AppMode[] = ['report-builder', 'kpi', 'ask'];
-  const handleTabKeyDown = useCallback((e: React.KeyboardEvent, index: number) => {
-    const count = tabOrder.length;
-    let next: number | null = null;
-    switch (e.key) {
-      case 'ArrowRight':
-      case 'ArrowDown':
-        next = (index + 1) % count;
-        break;
-      case 'ArrowLeft':
-      case 'ArrowUp':
-        next = (index - 1 + count) % count;
-        break;
-      case 'Home':
-        next = 0;
-        break;
-      case 'End':
-        next = count - 1;
-        break;
-      case 'Enter':
-      case ' ':
-        e.preventDefault();
-        handleModeChange(tabOrder[index]);
-        return;
-      default:
-        return;
-    }
-    e.preventDefault();
-    handleModeChange(tabOrder[next]);
-    tabRefs.current[next]?.focus();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [handleModeChange]);
 
   const clearSessionState = useCallback(() => {
+    const transition = contextTransitions.begin();
+    if (!transition.isCurrent()) return transition;
     // Bug-7735: use resetSession (not startNewConversation) for session
     // teardown so pendingModelId/pendingPersonaId are cleared immediately,
     // preventing stale scope from leaking across sessions.
@@ -248,19 +268,20 @@ function AppInner() {
     setProjectsLoading(false);
     setProjectsError(null);
     setAgentConfig({ configured: false, config: null });
-  }, [resetSession]);
+    return transition;
+  }, [contextTransitions, resetSession]);
 
   const handleLogout = useCallback(async () => {
-    clearSessionState();
+    const transition = clearSessionState();
     queryCache.cancelQueries();
     queryCache.clear();
-    clearFunctionCaches();
+    if (transition?.isCurrent()) clearFunctionCaches();
     resetQueryClient();
     await logout();
   }, [logout, queryCache, clearSessionState, resetQueryClient]);
 
   const handleSwitchProfile = useCallback(async (profileId: string) => {
-    clearSessionState();
+    const transition = clearSessionState();
     queryCache.cancelQueries();
     queryCache.clear();
     resetQueryClient();
@@ -272,7 +293,12 @@ function AppInner() {
     // then running the single awaited transition removes that window and forces
     // a full workbook rebuild so no cell keeps the prior profile's values.
     await switchProfile(profileId);
-    await applyContextTransition();
+    if (transition?.isCurrent()) {
+      await applyContextTransition({
+        generation: transition.generation,
+        isCurrent: transition.isCurrent,
+      });
+    }
   }, [switchProfile, queryCache, clearSessionState, resetQueryClient]);
 
   const handleRemoveProfile = useCallback(async (profileId: string) => {
@@ -342,55 +368,80 @@ function AppInner() {
     });
   }, []);
 
-  // F-025-17: mirror the active persona into OfficeRuntime.storage so the
-  // separate custom-functions runtime evaluates TESS.* KPIs under the same
-  // persona the pane is viewing as.
-  useEffect(() => {
-    persistActivePersonaId(activePersonaId).catch(() => {});
-  }, [activePersonaId]);
-
   useEffect(() => {
     if (authState !== 'authenticated' || projectId) return;
 
-    let cancelled = false;
+    const transition = contextTransitions.begin();
+    if (!transition.isCurrent()) return;
     setProjectsLoading(true);
     setProjectsError(null);
 
-    (async () => {
+    void contextTransitions.run(transition, async (current) => {
       try {
-        const projects = await getProjects();
-        if (cancelled) return;
+        const projects = await getProjects(current.signal);
+        if (!current.isCurrent()) return;
         setProjectsList(projects);
         if (projects.length === 0) {
           setProjectsLoading(false);
           setProjectsError(strings.projects.none);
           return;
         }
-        const pid = projects[0].id;
+        // Outside a test build this is `projects[0]`, unchanged.
+        const pid = preferredProject(projects, projects[0]).id;
         let models: { id: string; name: string; slug?: string }[] = [];
         try {
-          models = await getModels(pid);
-        } catch { /* models fetch failed, still show project */ }
-        if (cancelled) return;
+          models = await getModels(pid, current.signal);
+        } catch {
+          if (!current.isCurrent()) return;
+          // Models are optional for the initial project render; retain the
+          // existing behaviour of showing the project while exposing the empty
+          // model state below.
+        }
+        if (!current.isCurrent()) return;
         setModelsList(models);
         setProjectId(pid);
         if (models.length > 0) {
-          const firstModel = models[0];
+          // Outside a test build this is `models[0]`, unchanged.
+          const firstModel = preferredModel(models, models[0]);
+          if (!current.isCurrent()) return;
           setModelId(firstModel.id);
-          setModelContext(pid, firstModel.id, firstModel.slug, firstModel.name).catch(() => {});
+          await applyContextTransition({
+            generation: current.generation,
+            isCurrent: current.isCurrent,
+            persist: async () => {
+              if (!current.isCurrent()) return;
+              await setModelContext(
+                pid,
+                firstModel.id,
+                firstModel.slug,
+                firstModel.name,
+              ).catch(() => {});
+              if (!current.isCurrent()) return;
+              await persistActivePersonaId(null).catch(() => {});
+            },
+          });
         } else {
+          if (!current.isCurrent()) return;
           setProjectsError(strings.projects.noModels);
+          await applyContextTransition({
+            generation: current.generation,
+            isCurrent: current.isCurrent,
+            persist: async () => {
+              if (!current.isCurrent()) return;
+              await clearModelContext().catch(() => {});
+              if (!current.isCurrent()) return;
+              await persistActivePersonaId(null).catch(() => {});
+            },
+          });
         }
-        setProjectsLoading(false);
+        if (current.isCurrent()) setProjectsLoading(false);
       } catch (e) {
-        if (cancelled) return;
+        if (!current.isCurrent()) return;
         setProjectsLoading(false);
         setProjectsError((e as Error).message || strings.projects.loadFailed);
       }
-    })();
-
-    return () => { cancelled = true; };
-  }, [authState, projectId]);
+    });
+  }, [authState, projectId, contextTransitions]);
 
   useEffect(() => {
     if (!projectId) {
@@ -398,8 +449,9 @@ function AppInner() {
       return;
     }
     let cancelled = false;
+    const controller = new AbortController();
 
-    getAgentConfig(projectId)
+    getAgentConfig(projectId, controller.signal)
       .then(config => {
         if (cancelled) return;
         setAgentConfig({
@@ -419,7 +471,10 @@ function AppInner() {
         setAgentConfig({ configured: false, config: null });
       });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [projectId]);
 
   // Bug-6357: resolve the full result set for an agent chat turn.
@@ -446,13 +501,15 @@ function AppInner() {
     const sample = turn.query_result_sample;
     if (!sample || sample.length === 0) return { status: 'empty' };
 
+    const annotation = buildAnnotationFromCitations(turn.citations);
+
     const totalRows = turn.query_result_rows ?? sample.length;
     const isTruncated = totalRows > sample.length;
 
     if (!isTruncated) {
       // Sample IS the full result -- safe to use directly
       const headers = Object.keys(sample[0]);
-      const rows = sample.map(r => headers.map(h => r[h] as string | number));
+      const rows = buildChartRowsFromRecords(headers, sample, annotation);
       return { status: 'ok', headers, rows };
     }
 
@@ -479,9 +536,7 @@ function AppInner() {
       });
       if (response.data && response.data.length > 0) {
         const headers = Object.keys(response.data[0]);
-        const rows = response.data.map(
-          r => headers.map(h => r[h] as string | number),
-        );
+        const rows = buildChartRowsFromRecords(headers, response.data, annotation);
         return { status: 'ok', headers, rows };
       }
     } catch {
@@ -575,10 +630,13 @@ function AppInner() {
     // Bug-5800: use the agent-mapped chart type first, then fall back to the
     // heuristic recommendation passed from ExcelChatShell.
     const effectiveType = agentMapped ?? chartType ?? undefined;
+    // Bug-9737: use the cited measure/dimension roles instead of guessing
+    // from values (numeric-looking dimension identifiers must remain labels).
+    const annotation = buildAnnotationFromCitations(turn.citations);
     // R1 Finding 4: use the centralized describeChartInsertResult helper
     // (same pattern as ReportBuilder) instead of hand-rolling the branch.
     try {
-      const chartResult = await excelInsertChart(headers, rows, effectiveType);
+      const chartResult = await excelInsertChart(headers, rows, effectiveType, annotation);
       const toastCall = describeChartInsertResult(chartResult.address !== null, chartResult.postStepWarning);
       if (toastCall) showToast(toastCall.message, toastCall.severity);
     } catch {
@@ -597,8 +655,12 @@ function AppInner() {
       return;
     }
     const { headers, rows } = resolved;
+    // Bug-9737: same missing-annotation gap as handleInsertChart -- without
+    // it, buildDefaultFieldMapping falls back to positional heuristics
+    // instead of the real measure/dimension classification.
+    const annotation = buildAnnotationFromCitations(turn.citations);
     try {
-      await excelInsertLocalPivot(headers, rows);
+      await excelInsertLocalPivot(headers, rows, undefined, annotation);
       showToast(strings.toasts.pivotCreated, 'success');
     } catch {
       showToast(strings.toasts.pivotInsertFailed, 'error');
@@ -676,6 +738,8 @@ function AppInner() {
   }, [excelInsertTable, showToast]);
 
   const handlePersonaSelect = useCallback((persona: Persona | null) => {
+    const transition = contextTransitions.begin();
+    if (!transition.isCurrent()) return;
     const newPersonaId = persona?.id || null;
     setActivePersonaId(newPersonaId);
     // Bug-7735: synchronously update the zustand store so handleSend sees
@@ -690,30 +754,33 @@ function AppInner() {
     // then-bump makes that race impossible, and the transition also requests a
     // full workbook rebuild so already-inserted cells recompute under the new
     // persona instead of retaining the previous persona's values for up to 60s.
-    (async () => {
-      await persistActivePersonaId(newPersonaId).catch(() => {});
-      await applyContextTransition();
-    })();
     startNewConversation();
-    if (persona) {
+    void contextTransitions.run(transition, async (current) => {
+      await applyContextTransition({
+        generation: current.generation,
+        isCurrent: current.isCurrent,
+        persist: async () => {
+          if (!current.isCurrent()) return;
+          await persistActivePersonaId(newPersonaId).catch(() => {});
+        },
+      });
+    });
+    if (persona && transition.isCurrent()) {
       showToast(templates.toasts.switchedPersona(persona.name), 'info');
     }
-  }, [showToast, startNewConversation, setPendingPersonaId]);
+  }, [contextTransitions, showToast, startNewConversation, setPendingPersonaId]);
 
   const providerModel = agentConfig.configured && agentConfig.provider && agentConfig.model
     ? `${agentConfig.provider} ${agentConfig.model}`
     : (projectId ? strings.app.loadingProviderInfo : undefined);
-  const activeProjectName = projectsList.find(p => p.id === projectId)?.name;
   const activeModelName = modelsList.find(m => m.id === modelId)?.name;
-  const askTabLabel = agentConfig.displayName?.trim()
-    ? templates.app.askAgent(agentConfig.displayName.trim())
-    : strings.app.askTessallite;
+  const askTabLabel = strings.app.ask;
 
   if (authState === 'loading') {
     return (
       <ThemeProvider theme={theme}>
         <CssBaseline />
-        <Box sx={{ width: '100vw', minWidth: 320, maxWidth: 420, height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <Box sx={{ width: '100vw', minWidth: 320, height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <CircularProgress size={24} sx={{ color: tokens.colorPrimary }} />
         </Box>
       </ThemeProvider>
@@ -724,7 +791,7 @@ function AppInner() {
     return (
       <ThemeProvider theme={theme}>
         <CssBaseline />
-        <Box sx={{ width: '100vw', minWidth: 320, maxWidth: 420, height: '100vh', display: 'flex', flexDirection: 'column' }}>
+        <Box sx={{ width: '100vw', minWidth: 320, height: '100vh', display: 'flex', flexDirection: 'column' }}>
           <LoginScreen
             onLogin={handleLogin}
             loading={loginLoading}
@@ -738,207 +805,35 @@ function AppInner() {
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
-      <Box sx={{ width: '100vw', minWidth: 320, maxWidth: 420, height: '100vh', display: 'flex', flexDirection: 'column', overflow: 'hidden', bgcolor: tokens.colorWhite }}>
-        <Box
-          component="header"
-          role="banner"
-          sx={{
-            minHeight: 48, display: 'flex', alignItems: 'center', px: 1.5, pr: 5.5,
-            borderBottom: `1px solid ${tokens.colorBorderLight}`, bgcolor: tokens.colorWhite,
-            gap: 1,
-          }}
-        >
-          <svg width="18" height="16" viewBox="0 0 32 28" fill="none" aria-hidden="true" style={{ flexShrink: 0 }}>
-            <polygon points="0,7 8,0 16,7 8,14" fill="#185a33" />
-            <polygon points="16,7 24,0 32,7 24,14" fill="#c9a520" />
-            <polygon points="0,21 8,14 16,21 8,28" fill="#217346" />
-            <polygon points="16,21 24,14 32,21 24,28" fill="#185a33" />
-          </svg>
-          <Box sx={{ minWidth: 0, flexShrink: 0 }}>
-            <Typography sx={{ fontSize: 14, fontWeight: 700, color: tokens.colorCharcoal, lineHeight: 1.15 }}>
-              {strings.app.title}
-            </Typography>
-            <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary, lineHeight: 1.15 }}>
-              {strings.app.subtitle}
-            </Typography>
-          </Box>
-          <Box sx={{ mr: 'auto' }} />
-          <IconButton size="small" title={strings.app.drillThrough} aria-label={strings.app.drillThroughCell} onClick={handleOpenDrill}>
-            <FilterAltOutlined sx={{ fontSize: 20, color: tokens.colorTextSecondary }} />
-          </IconButton>
-          <IconButton size="small" title={strings.app.glossary} aria-label={strings.app.glossaryAria} onClick={() => setGlossaryOpen(true)}>
-            <MenuBookOutlined sx={{ fontSize: 20, color: tokens.colorTextSecondary }} />
-          </IconButton>
-          {profiles.length > 0 && (
-            <ProfileSwitcher
-              profiles={profiles}
-              activeProfile={activeProfile}
-              onSwitch={handleSwitchProfile}
-              onRemove={handleRemoveProfile}
-              onLogout={handleLogout}
-            />
-          )}
-          <IconButton
-            size="small"
-            title={strings.app.settings}
-            aria-label={strings.app.settingsAria}
-            onClick={e => setSettingsAnchorEl(e.currentTarget)}
-          >
-            <SettingsIcon sx={{ fontSize: 20, color: tokens.colorTextSecondary }} />
-          </IconButton>
-        </Box>
+      <Box sx={{ width: '100vw', minWidth: 320, height: '100vh', display: 'flex', flexDirection: 'column', overflow: 'hidden', bgcolor: tokens.colorWhite }}>
+        <AppHeader
+          profiles={profiles}
+          activeProfile={activeProfile}
+          projects={projectsList}
+          projectId={projectId}
+          models={modelsList}
+          modelId={modelId}
+          personas={personaData.personas}
+          activePersonaId={activePersonaId}
+          onProjectChange={handleProjectChange}
+          onModelChange={handleModelChange}
+          onPersonaSelect={handlePersonaSelect}
+          onOpenDrill={handleOpenDrill}
+          onOpenGlossary={() => setGlossaryOpen(true)}
+          onOpenDiagnostics={() => setDiagnosticsOpen(true)}
+          onSwitchProfile={handleSwitchProfile}
+          onRemoveProfile={handleRemoveProfile}
+          onLogout={handleLogout}
+        />
 
-        <Box
-          sx={{
-            px: 1.5,
-            py: 0.75,
-            borderBottom: `1px solid ${tokens.colorBorderLight}`,
-            bgcolor: tokens.colorWhite,
-          }}
-        >
-          <Box sx={{ minWidth: 0 }}>
-            <Typography sx={{ fontSize: 9, fontWeight: 700, color: tokens.colorTextSecondary, textTransform: 'uppercase', mb: 0.25 }}>
-              {strings.app.projectLabel}
-            </Typography>
-            {projectsList.length > 1 && projectId ? (
-              <Select
-                aria-label={strings.app.projectSelectorAria}
-                size="small"
-                value={projectId}
-                onChange={e => handleProjectChange(e.target.value as string)}
-                sx={{ fontSize: 11, minWidth: 0, width: '100%', '& .MuiSelect-select': { py: 0.5, px: 1 } }}
-              >
-                {projectsList.map(p => (
-                  <MenuItem key={p.id} value={p.id} sx={{ fontSize: 11 }}>{p.name}</MenuItem>
-                ))}
-              </Select>
-            ) : (
-              <Typography sx={{ fontSize: 11, color: activeProjectName ? tokens.colorCharcoal : tokens.colorTextSecondary, px: 1, py: 0.75, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', bgcolor: tokens.colorSubtleFill, borderRadius: 1 }}>
-                {activeProjectName || strings.status.loading}
-              </Typography>
-            )}
-          </Box>
-        </Box>
+        <ModeTabs mode={mode} onModeChange={handleModeChange} askLabel={askTabLabel} />
 
-        <Menu
-          anchorEl={settingsAnchorEl}
-          open={Boolean(settingsAnchorEl)}
-          onClose={() => setSettingsAnchorEl(null)}
-        >
-          <MenuItem onClick={() => { setSettingsAnchorEl(null); setDiagnosticsOpen(true); }}>
-            <ListItemText
-              primary={strings.app.diagnosticsMenuItem}
-              primaryTypographyProps={{ fontSize: 13 }}
-            />
-          </MenuItem>
-          <MenuItem onClick={() => { setSettingsAnchorEl(null); handleLogout(); }}>
-            <ListItemText
-              primary={strings.app.signOut}
-              primaryTypographyProps={{ fontSize: 13, color: tokens.colorRed }}
-            />
-          </MenuItem>
-        </Menu>
+        {offlineBanner && <OfflineBanner onRetry={handleRetryConnection} />}
 
-        <Box
-          component="nav"
-          role="tablist"
-          aria-label={strings.app.sectionsAria}
-          sx={{
-            height: 44, display: 'grid', gridTemplateColumns: '1fr 1fr 1fr',
-            borderBottom: `1px solid ${tokens.colorBorderLight}`,
-            bgcolor: tokens.colorSubtleFill,
-          }}
-        >
-          {([
-            { id: 'report-builder' as const, label: strings.app.tabAnalyse, icon: AnalyticsOutlined },
-            { id: 'kpi' as const, label: strings.app.tabKpis, icon: SpeedOutlined },
-            { id: 'ask' as const, label: askTabLabel, icon: AutoAwesomeOutlined },
-          ]).map((tab, index) => {
-            const active = mode === tab.id;
-            const Icon = tab.icon;
-            return (
-              <Box
-                key={tab.id}
-                ref={(el: HTMLDivElement | null) => { tabRefs.current[index] = el; }}
-                role="tab"
-                id={`tab-${tab.id}`}
-                aria-controls={`tabpanel-${tab.id}`}
-                aria-selected={active}
-                aria-current={active ? 'page' : undefined}
-                // Bug-5965: roving tabindex — only the active tab is in the tab
-                // order; arrow keys move between tabs, Enter/Space activate.
-                tabIndex={active ? 0 : -1}
-                onKeyDown={(e) => handleTabKeyDown(e, index)}
-                onClick={() => handleModeChange(tab.id)}
-                sx={{
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  gap: 0.5,
-                  minWidth: 0,
-                  px: 0.5,
-                  cursor: 'pointer',
-                  fontSize: 12, fontWeight: 700,
-                  color: active ? tokens.colorPrimary : tokens.colorTextSecondary,
-                  bgcolor: active ? tokens.colorWhite : 'transparent',
-                  borderBottom: active ? `2px solid ${tokens.colorPrimary}` : '2px solid transparent',
-                  '&:hover': {
-                    bgcolor: tokens.colorWhite,
-                    color: active ? tokens.colorPrimary : tokens.colorCharcoal,
-                  },
-                  '&:focus-visible': {
-                    outline: `2px solid ${tokens.colorPrimary}`,
-                    outlineOffset: '-2px',
-                  },
-                }}
-              >
-                <Icon sx={{ fontSize: 17, flexShrink: 0 }} />
-                <Typography sx={{ fontSize: 12, fontWeight: 700, color: 'inherit', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {tab.label}
-                </Typography>
-              </Box>
-            );
-          })}
-        </Box>
-
-        {offlineBanner && (
-          <Box sx={{
-            px: 1.5, py: 0.75, bgcolor: tokens.colorRedBg,
-            borderLeft: `3px solid ${tokens.colorRed}`,
-            display: 'flex', alignItems: 'center', gap: 1,
-          }}>
-            <Typography sx={{ fontSize: 11, color: tokens.colorRed, flex: 1 }}>
-              {strings.connection.lost}
-            </Typography>
-            <Box
-              component="button"
-              onClick={handleRetryConnection}
-              sx={{
-                fontSize: 10, px: 1, py: 0.25, borderRadius: 1, cursor: 'pointer',
-                border: `1px solid ${tokens.colorRed}`, color: tokens.colorRed,
-                bgcolor: 'transparent', textTransform: 'none',
-              }}
-            >
-              {strings.app.retry}
-            </Box>
-          </Box>
-        )}
-
-        {activePersonaId && personaData.activePersona && (
-          <Box sx={{
-            px: 2, py: 0.5, bgcolor: tokens.colorSubtleFill,
-            borderBottom: `1px solid ${tokens.colorBorderLight}`,
-          }}>
-            <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>
-              {templates.app.viewingAsPersona(personaData.activePersona.name)}{' '}
-              <Box component="span" sx={{ color: tokens.colorPrimary, cursor: 'pointer' }} onClick={() => handlePersonaSelect(null)}>
-                {strings.app.resetToDefault}
-              </Box>
-            </Typography>
-          </Box>
-        )}
 
         <Box
           component="main"
-          sx={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
+          sx={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
         >
           {mode === 'ask' && (
             <Box
@@ -1002,7 +897,6 @@ function AppInner() {
                   personaId={activePersonaId}
                   personaSlug={personaData.activePersona?.slug || null}
                   modelsList={modelsList}
-                  onModelChange={handleModelChange}
                 />
               ) : projectsLoading ? (
                 <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -1081,29 +975,12 @@ function AppInner() {
           )}
         </Box>
 
-        <Box
-          component="footer"
-          sx={{
-            height: 28, display: 'flex', alignItems: 'center', px: 2,
-            bgcolor: tokens.colorSubtleFill, borderTop: `1px solid ${tokens.colorBorderLight}`,
-            gap: 1,
-          }}
-        >
-          <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, mr: 'auto' }}>
-            {activeProfile ? `${activeProfile.email}` : ''}
-          </Typography>
-          {personaData.personas.length > 0 && (
-            <PersonaDropdown
-              personas={personaData.personas}
-              activePersonaId={activePersonaId}
-              onSelect={handlePersonaSelect}
-            />
-          )}
-          <StatusBadge
-            status={offlineBanner ? 'reconnecting' : connected ? 'connected' : 'disconnected'}
-            label={offlineBanner ? strings.status.reconnecting : connected ? strings.status.connected : strings.status.disconnected}
-          />
-        </Box>
+        <AppFooter
+          personas={personaData.personas}
+          activePersonaId={activePersonaId}
+          connected={connected}
+          reconnecting={offlineBanner}
+        />
       </Box>
 
       <GlossaryModal
@@ -1142,7 +1019,9 @@ export default function App() {
     <QueryClientProvider client={queryClient}>
       <ResetQueryClientContext.Provider value={handleResetQueryClient}>
         <ToastProvider>
-          <AppInner />
+          <ConfirmProvider>
+            <AppInner />
+          </ConfirmProvider>
         </ToastProvider>
       </ResetQueryClientContext.Provider>
     </QueryClientProvider>

@@ -237,7 +237,7 @@
 
 <h2>JDBC and XMLA exposure</h2>
 <ul>
-  <li><strong>XMLA</strong> &mdash; MDSCHEMA_KPIS rowset returns KPI metadata including expression, target, status, and trend. Composite parent/child relationships and weights are included.</li>
+  <li><strong>XMLA</strong> &mdash; MDSCHEMA_KPIS returns only deployed KPI rows with a non-empty executable <code>KPI_VALUE</code> and complete measure lineage visible to the connected persona. The <code>KPI_VALUE</code> member is the same member the Execute path resolves; composite parent/child relationships and weights are included when the tree is natively executable without dangling rows.</li>
   <li><strong>JDBC</strong> &mdash; A virtual <code>$KPIs</code> table is registered for each model (e.g. <code>Sales$KPIs</code>). BI clients can query it like a regular table:
     <pre><code>SELECT * FROM "Sales$KPIs"</code></pre>
     <p>The table returns one row per KPI with columns: <code>kpi_name</code>, <code>value</code>, <code>target</code>, <code>status</code>, <code>status_label</code>, <code>trend_pct</code>, <code>formatted_value</code>, <code>evaluated_at</code>. Values are refreshed automatically by the scheduler snapshot sweep and by on-demand batch evaluations.</p>

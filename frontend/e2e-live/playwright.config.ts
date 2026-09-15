@@ -37,7 +37,10 @@ export default defineConfig({
     ignoreHTTPSErrors: true,
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
-    viewport: { width: 1280, height: 720 },
+    // The canvas specs click model geometry, and a relationship's midpoint can
+    // sit below a 720px fold — the click then lands on nothing at all. Canvas
+    // work needs room.
+    viewport: { width: 1600, height: 1000 },
     // All specs get the admin's authenticated state by default.
     // Specs that need a different user override this in their own config.
     storageState: STORAGE_STATE_PATH,

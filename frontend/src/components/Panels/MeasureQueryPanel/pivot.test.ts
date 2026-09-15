@@ -1,7 +1,29 @@
 import { describe, it, expect } from "vitest";
 import type { Dimension, ExecuteResponse, FieldCompatibilityResponse, Measure } from "../../../api/types";
-import { cellLookupKey, computePivot, evaluatePivotCompatibility } from "./pivot";
+import { cellLookupKey, computePivot, evaluatePivotCompatibility, pivotDimsKey } from "./pivot";
 import { NOT_ADDITIVE, computeTotals } from "./totals";
+
+// Bug-7284: MeasureQueryPanel gates the pivot on `pivotDimsKey(rowDimIds,
+// colDimIds)` matching the dims the last executeResult was actually fetched
+// for — a mismatch means a dimension was added/removed/reordered (or a
+// different saved view loaded) and Run has not caught up yet. Without this
+// gate the pivot re-renders the STALE executeResult against the NEW dims,
+// showing every new dimension member as "(null)".
+describe("pivotDimsKey (Bug-7284 staleness gate)", () => {
+  it("is stable for the same ordered dims", () => {
+    expect(pivotDimsKey(["region", "city"], ["year"])).toBe(pivotDimsKey(["region", "city"], ["year"]));
+  });
+
+  it("changes when a dimension is added or removed", () => {
+    const base = pivotDimsKey(["region"], ["year"]);
+    expect(pivotDimsKey(["region", "city"], ["year"])).not.toBe(base);
+    expect(pivotDimsKey([], ["year"])).not.toBe(base);
+  });
+
+  it("changes when the same dims are reordered", () => {
+    expect(pivotDimsKey(["region", "city"], [])).not.toBe(pivotDimsKey(["city", "region"], []));
+  });
+});
 
 function dim(name: string): Dimension {
   return {

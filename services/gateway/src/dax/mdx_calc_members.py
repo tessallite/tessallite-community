@@ -31,7 +31,7 @@ from datetime import datetime
 from typing import Any
 
 from shared.connector_qualify import quote_identifier, quote_literal
-from src.dax.member_uname import KEY_PATH, parse_member_keys
+from src.dax.member_uname import KEY_PATH, parse_member_keys, parse_member_uname
 
 logger = logging.getLogger(__name__)
 
@@ -692,6 +692,40 @@ def _extract_dim_member_name(full_name: str) -> tuple[str, str]:
     return "", full_name
 
 
+# Bug-8719: one whole member reference — a leading bracket then any number of
+# ``.[body]`` or ``.&[body]`` segments. Matching the segments too is what lets a
+# key-form member be read as one reference instead of two.
+_AGGREGATE_MEMBER_REF_RE = re.compile(
+    rf'\[{_CM_BRACKET_BODY}+\](?:\.&?\[{_CM_BRACKET_BODY}+\])*'
+)
+
+
+def _aggregate_set_member_name(ref: str) -> str | None:
+    """The member name an ``Aggregate({...})`` reference denotes, or None.
+
+    Delegates to ``parse_member_uname`` — the same grammar the rest of the XMLA
+    surface resolves members with — so a dimension or hierarchy name can never
+    be mistaken for a member value. It already unescapes ``]]``, so the caller
+    must not do it again.
+
+    Shapes the canonical grammar does not recognise (a bare ``[Member]``, a
+    multi-key path) fall back to the deepest bracket body, which is what this
+    code did for every shape before. That keeps the previously-correct readings
+    unchanged while removing the key-form defect.
+    """
+    _hier, _level, grammar, keys = parse_member_uname(ref)
+    if grammar in ("key", "caption") and keys:
+        return keys[-1]
+    if grammar == "all":
+        # The hierarchy total named inside a custom group. Preserved as the
+        # literal token the previous parser produced rather than dropped here —
+        # whether an All member belongs in an Aggregate set is a separate
+        # question from how its name is read.
+        return "All"
+    bodies = re.findall(rf'\[({_CM_BRACKET_BODY}+)\]', ref)
+    return bodies[-1].replace("]]", "]") if bodies else None
+
+
 def _classify_dim_expression(calc: CalcMember) -> None:
     """Classify a dimension-level WITH MEMBER expression."""
     expr = calc.expression.strip()
@@ -701,17 +735,25 @@ def _classify_dim_expression(calc: CalcMember) -> None:
     )
     if agg_match:
         member_list = agg_match.group(1)
-        # Bug-6746: escape-aware bracket bodies; unescape ]] on the captured
-        # member name before it becomes an aggregate-set match key.
-        members = re.findall(
-            rf'\[({_CM_BRACKET_BODY}+)\](?:\.\[({_CM_BRACKET_BODY}+)\])*',
-            member_list,
-        )
+        # Bug-8719: match each member REFERENCE whole, then read its member name
+        # through the canonical member-path parser.
+        #
+        # The previous pattern collected bracket bodies and kept the deepest one,
+        # which could not cross the ``&`` of a key-form member: given
+        # ``[Product].[Product].&[Widget]`` it matched only ``[Product].[Product]``
+        # and contributed "Product" — the HIERARCHY name — as a group member,
+        # then picked up ``[Widget]`` on the next pass. A source member that
+        # happens to be named like its own dimension was therefore absorbed into
+        # every custom group built from key-form members.
+        #
+        # That shape is no longer rare: the canonical member producer emits the
+        # key form for any reserved value (Bug-8970 / Bug-9789), so Excel sends
+        # ``&[...]`` routinely.
         parsed: list[str] = []
-        for m in members:
-            last_non_empty = [p for p in m if p]
-            if last_non_empty:
-                parsed.append(last_non_empty[-1].replace("]]", "]"))
+        for ref in _AGGREGATE_MEMBER_REF_RE.findall(member_list):
+            name = _aggregate_set_member_name(ref)
+            if name is not None:
+                parsed.append(name)
         calc.calc_type = "aggregate_set"
         calc.aggregate_members = parsed
         return

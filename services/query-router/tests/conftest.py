@@ -7,9 +7,11 @@ sys.path is configured via [tool.pytest.ini_options] pythonpath in pyproject.tom
 """
 from __future__ import annotations
 import contextlib
+import sys
 import types
 from contextlib import ExitStack as _ExitStack
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -17,6 +19,18 @@ from shared.config.fastapi_drift import check_fastapi_version_drift
 from src.semantic.snapshot_resolver import DeployedShape as _DeployedShape
 
 check_fastapi_version_drift()
+
+# Share the same reporting/backstop plugin as the e2e and live suites. Do not
+# preflight the whole mixed suite: an absent gateway must not skip unit tests.
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from suite_gate import SuiteGate  # noqa: E402
+
+
+def pytest_configure(config):
+    config.pluginmanager.register(
+        SuiteGate("query-router", Path(__file__).resolve().parent),
+        "tessallite-query-router-suite-gate",
+    )
 
 
 _SYNTHETIC_BASE_TABLE_ID = "t-synthetic-base"
@@ -471,18 +485,15 @@ def _patch_inactive_aggregates(request):
     # stale column references from polluting subsequent test runs.
     from src.rewrite.query_rewriter import invalidate_join_graph_cache
     invalidate_join_graph_cache()
-    # F-003-14: clear the versioned deployed-shape and live-metadata caches so a
-    # prior test's mocked metadata (same (model_id, deployed_version_id) key)
-    # cannot leak into the next. These caches are keyed by the deploy version, so
-    # in production they self-invalidate on re-deploy; only tests reuse a key with
-    # different fixture data, so the clear is a test-isolation concern only.
+    # Clear the versioned deployed-shape cache so a prior test's mocked metadata
+    # cannot leak into the next. The cache is keyed by the deploy version, so in
+    # production it self-invalidates on re-deploy; tests still reuse keys with
+    # different fixture data.
     from src.semantic.snapshot_resolver import (
         invalidate as _invalidate_snapshot_cache,
-        invalidate_live_metadata as _invalidate_live_metadata_cache,
         reset_request_pins as _reset_request_pins,
     )
     _invalidate_snapshot_cache()
-    _invalidate_live_metadata_cache()
     # Bug-7981: drop any request-scoped deployment pin. Production gets a fresh
     # contextvar context per HTTP request; tests must get one per test.
     _reset_request_pins()

@@ -111,6 +111,10 @@ class ShapeNarrationFacts:
     series_coverage: dict[str, dict[str, Any]] = field(default_factory=dict)
     ranking: dict[str, Any] | None = None
     breakdown: dict[str, Any] | None = None
+    # An optional deterministic comparison for a requested benchmark. This is
+    # populated only when the grouped result is complete; a missing value means
+    # the narrator must not infer the comparison from a partial result.
+    average_comparison: dict[str, Any] | None = None
     composition: dict[str, Any] | None = None
     matrix: dict[str, Any] | None = None
     table: dict[str, Any] | None = None
@@ -134,6 +138,7 @@ class ShapeNarrationFacts:
             "series_coverage": self.series_coverage,
             "ranking": self.ranking,
             "breakdown": self.breakdown,
+            "average_comparison": self.average_comparison,
             "composition": self.composition,
             "matrix": self.matrix,
             "table": self.table,

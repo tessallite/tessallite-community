@@ -370,13 +370,12 @@ async def routing_breakdown(
     since = _date_range(days)
     async for db in get_tenant_db(current_user.tenant_id):
         await ensure_model_in_project(db, project_id=project_id, model_id=model_id)
-        # Bug-6426: a cache re-serve keeps its original route_type on the row,
-        # but grouping it under "aggregate"/"pocket" overstates real acceleration
-        # in the routing breakdown. Relabel cache_hit rows to a distinct "cache"
-        # bucket so the breakdown honestly separates cache-serve from execution.
+        # Exclusive execution categories: cache hits never count again under
+        # their original route. Raw detail reads are source executions.
         effective_route = case(
             (QueryLog.cache_status == _CACHE_HIT_STATUS, "cache"),
-            else_=QueryLog.route_type,
+            (QueryLog.route_type.in_(("aggregate", "pocket")), "aggregate"),
+            else_="source",
         ).label("route_type")
         stmt = (
             select(
@@ -387,6 +386,7 @@ async def routing_breakdown(
                 QueryLog.model_id == model_id,
                 QueryLog.created_at >= since,
                 QueryLog.status == "success",
+                QueryLog.route_type.in_(("source", "raw", "aggregate", "pocket")),
             )
             .group_by(effective_route)
             .order_by(text("cnt DESC"))

@@ -10,13 +10,14 @@ from __future__ import annotations
 import asyncio
 import types
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
 import src.api.auth as auth_mod
+from shared.auth import lockout as lockout_module
 from shared.auth.backend import AuthChain, AuthOutcome, UserIdentity
 from src.main import app
 from src.auth.local_backend import decode_access_token
@@ -102,6 +103,31 @@ def _install_system_tenants(monkeypatch, tenants: list):
         yield _SysDB()
 
     monkeypatch.setattr("src.api.auth.get_system_db", lambda: _gen())
+
+
+def _install_recording_system_db(monkeypatch, tenants: list):
+    """Install one reusable system DB so lock/counter calls are observable."""
+    class _Result:
+        def scalars(self):
+            class _S:
+                def all(self_inner):
+                    return tenants
+            return _S()
+
+        def scalar_one_or_none(self):
+            return None
+
+    sys_db = AsyncMock()
+    sys_db.execute = AsyncMock(return_value=_Result())
+    sys_db.delete = AsyncMock()
+    sys_db.commit = AsyncMock()
+    sys_db.flush = AsyncMock()
+
+    async def _gen():
+        yield sys_db
+
+    monkeypatch.setattr("src.api.auth.get_system_db", lambda: _gen())
+    return sys_db
 
 
 def _install_tenant_lookup(monkeypatch, user_for_slug):
@@ -429,6 +455,103 @@ async def test_login_discover_no_match_returns_401(anon_client, monkeypatch):
         )
     assert resp.status_code == 401
     assert vp.call_count == 1, "exactly one bcrypt verify even on no match (F-021-07)"
+
+
+@pytest.mark.asyncio
+async def test_bug9799_locked_selected_tenant_blocks_discovery_before_reset_or_jwt(
+    anon_client, monkeypatch
+):
+    # Bug-10060: the account lock now defaults to OFF and short-circuits before
+    # any query, so this test must switch it on to reach the locked path it
+    # is guarding. The behaviour under test is unchanged.
+    monkeypatch.setattr(lockout_module, "_MAX_FAILURES", 5)
+    """A tenant lock remains effective after discovery finds valid credentials."""
+    tenants = [_make_tenant("acme"), _make_tenant("beta")]
+    _install_system_tenants(monkeypatch, tenants)
+    _install_tenant_lookup(
+        monkeypatch,
+        lambda slug: _make_user("u@example.com", role="member") if slug == "beta" else None,
+    )
+    lock = types.SimpleNamespace(
+        failed_count=5,
+        locked_until=datetime.now(timezone.utc) + timedelta(minutes=10)
+    )
+    seen_scopes = []
+
+    async def _fake_get(_db, scope_key, email, *, for_update=False):
+        seen_scopes.append((scope_key, email, for_update))
+        if scope_key == "beta":
+            return lock
+
+    reset_mock = AsyncMock()
+    mint_mock = MagicMock()
+    monkeypatch.setattr("shared.auth.lockout._get", _fake_get)
+    monkeypatch.setattr("src.api.auth.record_login_success", reset_mock)
+    monkeypatch.setattr("src.api.auth.create_access_token", mint_mock)
+
+    resp = await anon_client.post(
+        "/api/v1/auth/login/discover",
+        json={"tenant_id": "beta", "email": "u@example.com", "password": "pw"},
+    )
+
+    assert resp.status_code == 429
+    assert seen_scopes == [
+        ("__discover__", "u@example.com", False),
+        ("beta", "u@example.com", True),
+    ]
+    reset_mock.assert_not_awaited()
+    mint_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bug9799_discovery_success_resets_only_discovery_and_selected_tenant_counters(
+    anon_client, monkeypatch
+):
+    """A successful hinted match clears both relevant lockout scopes."""
+    tenants = [_make_tenant("acme"), _make_tenant("beta")]
+    sys_db = _install_recording_system_db(monkeypatch, tenants)
+    _install_tenant_lookup(
+        monkeypatch,
+        lambda slug: _make_user("u@example.com", role="member"),
+    )
+    reset_mock = AsyncMock()
+    monkeypatch.setattr("src.api.auth.record_login_success", reset_mock)
+    monkeypatch.setattr("src.api.auth.audit_required", AsyncMock())
+
+    with patch("src.api.auth.verify_password", return_value=True):
+        resp = await anon_client.post(
+            "/api/v1/auth/login/discover",
+            json={"tenant_id": "beta", "email": "u@example.com", "password": "pw"},
+        )
+
+    assert resp.status_code == 200
+    assert [call.args[1:] for call in reset_mock.await_args_list] == [
+        ("__discover__", "u@example.com"),
+        ("beta", "u@example.com"),
+    ]
+    sys_db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bug9799_failed_discovery_increments_only_discovery_counter(
+    anon_client, monkeypatch
+):
+    """A no-match attempt cannot poison a tenant-specific lockout scope."""
+    tenants = [_make_tenant("acme"), _make_tenant("beta")]
+    _install_system_tenants(monkeypatch, tenants)
+    _install_tenant_lookup(monkeypatch, lambda slug: None)
+    failure_mock = AsyncMock()
+    monkeypatch.setattr("src.api.auth.record_login_failure", failure_mock)
+
+    with patch("src.api.auth.verify_password", return_value=True):
+        resp = await anon_client.post(
+            "/api/v1/auth/login/discover",
+            json={"tenant_id": "_discover", "email": "u@example.com", "password": "pw"},
+        )
+
+    assert resp.status_code == 401
+    failure_mock.assert_awaited_once()
+    assert failure_mock.await_args.args[1:] == ("__discover__", "u@example.com")
 
 
 @pytest.mark.asyncio

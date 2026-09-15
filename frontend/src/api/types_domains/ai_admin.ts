@@ -306,6 +306,12 @@ export interface RowSecuritySimulateResponse {
   columns?: string[] | null;
   rows?: unknown[][] | null;
   row_count?: number | null;
+  // Bug-8987: the one F-007-02 field the frontend type was still missing.
+  // Backend shape is itself a loosely-typed `list[dict]`
+  // (aggregates_security.py's RowSecuritySimulateResponse.applied_rules,
+  // populated from `dict(r) for r in compiled.applied_rules`) — mirrored here
+  // as `Record<string, unknown>[]`, not invented per-key structure.
+  applied_rules?: Record<string, unknown>[] | null;
 }
 
 export interface SecurityAuditEntry {

@@ -383,8 +383,8 @@ const ALLOWED: Record<string, string> = {
     'insertLocalPivot: table OBJECT over the new sheet it just wrote',
   'hooks/useExcel.ts::insertLocalPivot::sheets.add(pivotName)':
     'insertLocalPivot: adds its own pivot worksheet',
-  'hooks/useExcel.ts::insertLocalPivot::pivotSheet.pivotTables.add( pivotTableName, qualifiedAddr, pivotRange, )':
-    'insertLocalPivot: PivotTable object on the sheet it just created',
+  'hooks/useExcel.ts::insertLocalPivot::pivotSheet.pivotTables.add( pivotTableName, table, pivotRange, )':
+    'insertLocalPivot: PivotTable object on the sheet it just created; Bug-9909: sourced from the TABLE, not a fixed range',
   'hooks/useExcel.ts::insertLocalPivot::pivotTable.rowHierarchies.add(hier)':
     'PivotTable field wiring; no cell write',
   'hooks/useExcel.ts::insertLocalPivot::pivotTable.dataHierarchies.add(hier)':
@@ -1995,7 +1995,11 @@ describe('Bug-7397 R12 — cell-write contract (typed AST structural guard)', ()
       }
     };
     sweep(SRC);
-    const scanned = new Set(filesUnderContract());
+    const files = filesUnderContract();
+    // `projectFiles` filters unresolved SourceFiles; parity makes that filter
+    // fail closed instead of silently shrinking scanner participation.
+    expect(projectFiles().map(({ rel }) => rel).sort()).toEqual([...files].sort());
+    const scanned = new Set(files);
     expect(
       // The one top-level suite directory is the only sanctioned exemption.
       truth.filter(f => !scanned.has(f) && !f.startsWith('__tests__/')),
@@ -2121,12 +2125,11 @@ describe('Bug-8690 — the policy guards actually fire on the shapes they forbid
     }
   });
 
-  it('both scanners cover the SAME file set the rest of the contract inspects', () => {
-    // A policy that silently stopped scanning would also pass forever. Pin the
-    // scope to `filesUnderContract()` so a narrowing is a visible test change.
+  it('the contract file set has the expected production scope', () => {
+    // Keep the contract's production scope explicit: a narrowing is a visible
+    // test change, and the top-level suite remains outside the scanned set.
     const files = filesUnderContract();
     expect(files.length).toBeGreaterThan(20);
-    expect(projectFiles().map(f => f.rel).sort()).toEqual([...files].sort());
     expect(files.some(f => f.startsWith('__tests__/'))).toBe(false);
   });
 });

@@ -12,7 +12,7 @@ import {
   Button,
   Skeleton,
 } from "@mui/material";
-import { Add, History, DeleteOutline, SmartToy } from "@mui/icons-material";
+import { Add, AutoAwesomeOutlined, History, DeleteOutline } from "@mui/icons-material";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChatProvider,
@@ -24,10 +24,22 @@ import {
   type ConversationResponse,
   type ConversationState,
 } from "@tessallite/shared-ui";
+import {
+  buildPopoutPayload,
+  isChartPopoutSupported,
+  openChartPopout,
+  resolveVisualActionData,
+  turnHasPopoutChart,
+} from "../../utils/chartPopout";
 import InsertActions from "./InsertActions";
 import EmptyState from "../common/EmptyState";
 import { tokens } from "../../theme";
-import { recommendChartType, type ChartTypeRecommendation } from "../../utils/excelCharts";
+import {
+  buildAnnotationFromCitations,
+  buildChartRowsFromRecords,
+  recommendChartType,
+  type ChartTypeRecommendation,
+} from "../../utils/excelCharts";
 import { strings, templates } from "../../i18n/strings";
 import { useToast } from "../Toast/ToastProvider";
 // Bug-6520: inline the charts-css stylesheet TEXT so agent HTML artifacts render
@@ -71,26 +83,72 @@ function ConversationHeader({
 }) {
   const [historyAnchor, setHistoryAnchor] = useState<HTMLElement | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const activeConversationTitle =
+    conversations.find((conversation) => conversation.id === activeConversationId)?.title ||
+    strings.chatShell.newConversation;
 
   return (
     <>
       <Box
         sx={{
-          px: 1.5,
-          py: 0.5,
+          height: 30,
+          px: 1.25,
           display: "flex",
           gap: 0.5,
           alignItems: "center",
           borderBottom: `1px solid ${tokens.colorBorderLight}`,
+          minWidth: 0,
+          flexShrink: 0,
         }}
       >
+        <Button
+          size="small"
+          variant="text"
+          disabled={conversations.length === 0}
+          onClick={(e) => setHistoryAnchor(e.currentTarget)}
+          title={strings.chatShell.conversationHistory}
+          aria-label={strings.chatShell.conversationHistory}
+          sx={{
+            minWidth: 0,
+            flex: 1,
+            justifyContent: "flex-start",
+            gap: 0.5,
+            px: 0,
+            py: 0,
+            color: tokens.colorCharcoal,
+            overflow: "hidden",
+            "& .MuiButton-startIcon": { mr: 0, flexShrink: 0 },
+          }}
+          startIcon={<History sx={{ fontSize: 15, color: tokens.colorTextSecondary }} />}
+        >
+          <Typography
+            component="span"
+            sx={{
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              fontSize: 12,
+              fontWeight: 600,
+              color: "inherit",
+            }}
+          >
+            {activeConversationTitle}
+          </Typography>
+          <Typography component="span" sx={{ fontSize: 11, color: tokens.colorTextSecondary }}>
+            ▾
+          </Typography>
+        </Button>
         {providerModel && (
           <Typography
             sx={{
-              fontSize: 11,
+              maxWidth: "30%",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              fontSize: 10,
               color: tokens.colorTextSecondary,
-              fontWeight: 600,
-              flex: 1,
+              flexShrink: 0,
             }}
           >
             {providerModel}
@@ -101,21 +159,10 @@ function ConversationHeader({
           onClick={onNewConversation}
           title={strings.chatShell.newConversation}
           aria-label={strings.chatShell.newConversation}
-          sx={{ p: 0.25 }}
+          sx={{ width: 24, height: 24, p: 0, border: 1, borderColor: tokens.colorBorder, borderRadius: 0.5 }}
         >
-          <Add sx={{ fontSize: 16, color: tokens.colorPrimary }} />
+          <Add sx={{ fontSize: 15, color: tokens.colorPrimary }} />
         </IconButton>
-        {conversations.length > 0 && (
-          <IconButton
-            size="small"
-            onClick={(e) => setHistoryAnchor(e.currentTarget)}
-            title={strings.chatShell.conversationHistory}
-            aria-label={strings.chatShell.conversationHistory}
-            sx={{ p: 0.25 }}
-          >
-            <History sx={{ fontSize: 16, color: tokens.colorTextSecondary }} />
-          </IconButton>
-        )}
       </Box>
 
       <Menu
@@ -136,7 +183,15 @@ function ConversationHeader({
               setHistoryAnchor(null);
               onSelectConversation(c.id);
             }}
-            sx={{ display: "flex", justifyContent: "space-between" }}
+            sx={{
+              display: "flex",
+              justifyContent: "space-between",
+              minHeight: 28,
+              fontSize: 12,
+              ...(c.id === activeConversationId
+                ? { bgcolor: tokens.colorPrimaryBg }
+                : {}),
+            }}
           >
             <Box sx={{ flex: 1 }}>
               <Typography sx={{ fontSize: 11 }}>
@@ -259,13 +314,45 @@ export default function ExcelChatShell({
     [adapter, projectId, activeConversationId, startNewConversation, queryClient],
   );
 
+  /**
+   * Open a turn in the pop-out window. Shared by the two controls that lead
+   * there — the action rail's pop-out button and the Visual panel's maximise —
+   * so both send the same payload and pick the same kind.
+   *
+   * A turn that renders a chart pops out as a chart; anything else with rows
+   * pops out as its table, which is what makes results with no chart worth
+   * enlarging at all.
+   */
+  const openTurnPopout = useCallback(
+    (turn: TurnResponse, resultRows?: Record<string, unknown>[]) => {
+      const { artifact, rows } = resolveVisualActionData(
+        turn.rendered_output,
+        resultRows,
+      );
+      if (rows.length === 0) return;
+      openChartPopout(
+        buildPopoutPayload({
+          kind: turnHasPopoutChart(artifact, rows) ? "chart" : "table",
+          artifact,
+          rows,
+          title: turn.user_message,
+        }),
+        (reason) => showToast(reason, "info"),
+      );
+    },
+    [showToast],
+  );
+
   const renderTurnActions = useCallback(
     (turn: TurnResponse, resultRows?: Record<string, unknown>[]) => {
-      if (!resultRows || resultRows.length === 0) return null;
-      const headers = Object.keys(resultRows[0]);
-      const rows = resultRows.map((r) =>
-        headers.map((h) => r[h] as string | number),
+      const { rows: actionRows } = resolveVisualActionData(
+        turn.rendered_output,
+        resultRows,
       );
+      if (actionRows.length === 0) return null;
+      const headers = Object.keys(actionRows[0]);
+      const annotation = buildAnnotationFromCitations(turn.citations);
+      const rows = buildChartRowsFromRecords(headers, actionRows, annotation);
 
       let recommendedAction: "table" | "chart" | "pivot" | "cube" | undefined;
       let chartRec: ChartTypeRecommendation | undefined;
@@ -274,7 +361,9 @@ export default function ExcelChatShell({
       } else if (turn.chart_type && turn.chart_type !== "kpi") {
         recommendedAction = "chart";
       } else {
-        const rec = recommendChartType(headers, rows);
+        // Bug-9737: pass the citation-derived annotation so measure columns
+        // (returned by the API as numeric strings) are classified correctly.
+        const rec = recommendChartType(headers, rows, annotation);
         chartRec = rec.chartType;
         if (
           rec.confidence === "high" &&
@@ -286,20 +375,32 @@ export default function ExcelChatShell({
         }
       }
 
+      // The shared in-pane maximise can only ever fill the task pane. When the
+      // host supports Office dialogs, offer a real window as well.
+      //
+      // Bug-9922: offered for every turn that has rows, not only charted ones.
+      // A table is exactly the result a few hundred pixels of task pane serve
+      // worst, and the pop-out is where Save and Copy live. `turnHasPopoutChart`
+      // now only decides which of the two the window shows — it is deliberately
+      // NOT the sheet-insert recommendation (`recommendChartType`), which
+      // answers a different question and disagrees on ordinary data.
+      const canPopOut = isChartPopoutSupported();
+
       return (
-        <Box sx={{ px: 1, mb: 1 }}>
-          <InsertActions
-            data={resultRows}
-            headers={headers}
-            onInsertTable={onInsertTable ? () => onInsertTable(turn) : undefined}
-            onInsertChart={onInsertChart ? () => onInsertChart(turn, chartRec) : undefined}
-            onLocalPivot={onInsertLocalPivot ? () => onInsertLocalPivot(turn) : undefined}
-            recommendedAction={recommendedAction}
-          />
-        </Box>
+        <InsertActions
+          data={actionRows}
+          headers={headers}
+          onInsertTable={onInsertTable ? () => onInsertTable(turn) : undefined}
+          onInsertChart={onInsertChart ? () => onInsertChart(turn, chartRec) : undefined}
+          onLocalPivot={onInsertLocalPivot ? () => onInsertLocalPivot(turn) : undefined}
+          onPopout={canPopOut ? () => openTurnPopout(turn, resultRows) : undefined}
+          popoutTitle={strings.chartPopout.tooltip}
+          compact
+          recommendedAction={recommendedAction}
+        />
       );
     },
-    [onInsertTable, onInsertChart, onInsertLocalPivot],
+    [onInsertTable, onInsertChart, onInsertLocalPivot, openTurnPopout],
   );
 
   if (loading) {
@@ -345,7 +446,7 @@ export default function ExcelChatShell({
     return (
       <Box sx={{ flex: 1 }}>
         <EmptyState
-          icon={<SmartToy sx={{ fontSize: 48, color: tokens.colorGoldDark }} />}
+          icon={<AutoAwesomeOutlined sx={{ fontSize: 48, color: tokens.colorGoldDark }} />}
           title={strings.chatShell.unavailableTitle}
           description={strings.chatShell.unavailableDescription}
         />
@@ -390,7 +491,9 @@ export default function ExcelChatShell({
           feedbackEnabled={Boolean(config?.feedback_enabled)}
           chartsCss={chartsCssText}
           renderTurnActions={renderTurnActions}
+          onMaximizeVisual={isChartPopoutSupported() ? openTurnPopout : undefined}
           composerPlaceholder={strings.chatShell.composerPlaceholder}
+          compact
         />
       </ChatProvider>
     </>

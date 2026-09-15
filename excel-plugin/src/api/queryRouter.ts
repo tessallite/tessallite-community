@@ -29,6 +29,12 @@ export async function executeQuery(
       operator: f.operator,
       values: f.values,
     })),
+    measure_filters: query.measureFilters?.map(f => ({
+      measure_id: f.measureId,
+      operator: f.operator,
+      values: f.values,
+      effective_aggregation: f.effectiveAggregation,
+    })),
     limit: query.limit,
     offset: query.offset,
     // F-025-27: the backend accepts order_by ([{field, direction}]) and offset

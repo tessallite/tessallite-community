@@ -412,8 +412,19 @@ def _run_query_jdbc(sql: str, label: str, dbname: str = "") -> QueryResult:
                                row_count=len(rows))
         return QueryResult(label=label, columns=[], rows=[], row_count=0)
     except Exception as e:
+        # Bug-9088: connect-time failures are not the only transport class. A
+        # session can also die MID-QUERY — the gateway restarts, the accept loop
+        # is recycled by its own watchdog, a proxy times out — and psycopg2
+        # reports that in the same place a server-side refusal arrives.
+        #
+        # ``conn.closed`` is the discriminator, and it is the exact question the
+        # verdict needs answered: a product refusal is delivered OVER AN
+        # ESTABLISHED SESSION and leaves it usable, while a transport failure
+        # takes the session with it. Judging on the message text instead would
+        # mean guessing at driver wording; this asks the protocol.
         return QueryResult(label=label, columns=[], rows=[], row_count=0,
-                           error=str(e).strip())
+                           error=str(e).strip(),
+                           transport_error=bool(conn.closed))
     finally:
         conn.close()
 
@@ -441,9 +452,19 @@ def _run_query_direct(sql: str, label: str) -> QueryResult:
                                row_count=len(rows))
         return QueryResult(label=label, columns=[], rows=[], row_count=0)
     except Exception as e:
-        conn.rollback()
+        # Bug-9088: see the gateway runner above — a session that did not
+        # survive the error carried no product answer.
+        broken = bool(conn.closed)
+        if not broken:
+            try:
+                conn.rollback()
+            except Exception:
+                # The rollback itself proves the session is gone. Unguarded, it
+                # raised out of this handler and killed the whole scenario with
+                # an unhandled exception instead of returning a judgeable result.
+                broken = True
         return QueryResult(label=label, columns=[], rows=[], row_count=0,
-                           error=str(e).strip())
+                           error=str(e).strip(), transport_error=broken)
     finally:
         conn.close()
 

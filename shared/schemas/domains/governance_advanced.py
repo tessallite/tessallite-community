@@ -1125,6 +1125,13 @@ class NamedSetResponse(OrmBase):
     # last_refreshed_at is the vintage of the stored members in this response
     # (live draft for the model builder, deployed snapshot for BI callers).
     trust_meta: Optional[dict[str, Any]] = None
+    # Bug-9877: the persona BIND verdict for this set, present only when the
+    # caller asked for persona-hidden sets too (``include_persona_hidden``).
+    # ``None`` means "not asked" -- every set in such a response is visible.
+    # ``False`` means the set exists on the model but does not bind over the
+    # effective persona's model query, so the XMLA Execute path must refuse a
+    # reference to it instead of leaving it un-inlined.
+    persona_visible: Optional[bool] = None
     created_at: datetime
     updated_at: datetime
 
@@ -1132,6 +1139,12 @@ class NamedSetResponse(OrmBase):
     @classmethod
     def _read_cert_status(cls, v):
         return _coerce_certification_status_for_read(v)
+
+
+class NamedSetRefreshResponse(NamedSetResponse):
+    """Computed members are draft-only until the model is saved and deployed."""
+
+    deploy_required: Literal[True] = True
 
 
 # ---------------------------------------------------------------------------

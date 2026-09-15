@@ -1,17 +1,21 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ConfirmProvider } from "./Confirm";
 
 // The card reads license state and installs an uploaded signed document via the
 // admin API. Mock both calls so the test exercises the upload flow (parse →
 // install → success/error) without a backend.
 const licenseStatus = vi.fn();
 const installLicense = vi.fn();
+const uninstallLicense = vi.fn();
 
 vi.mock("../api/client", () => ({
   adminApi: {
     licenseStatus: (...a: unknown[]) => licenseStatus(...a),
     installLicense: (...a: unknown[]) => installLicense(...a),
+    uninstallLicense: (...a: unknown[]) => uninstallLicense(...a),
   },
 }));
 
@@ -21,7 +25,9 @@ function renderCard() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <LicenseManagerCard />
+      <ConfirmProvider>
+        <LicenseManagerCard />
+      </ConfirmProvider>
     </QueryClientProvider>,
   );
 }
@@ -43,6 +49,7 @@ describe("LicenseManagerCard", () => {
   beforeEach(() => {
     licenseStatus.mockReset();
     installLicense.mockReset();
+    uninstallLicense.mockReset();
   });
 
   it("renders the current license/edition status", async () => {
@@ -167,6 +174,43 @@ describe("LicenseManagerCard", () => {
     licenseStatus.mockResolvedValue(STATUS);
     fireEvent.click(screen.getByText("Retry"));
     expect(await screen.findByText("community")).toBeInTheDocument();
+  });
+
+  // Bug-9559: the uninstall button used a raw window.confirm() instead of the
+  // app's canonical useConfirm() dialog — the one destructive action in this
+  // card that did not match every other confirmation in the frontend.
+  describe("uninstall uses the canonical confirm dialog (Bug-9559)", () => {
+    const LICENSED_STATUS = { edition: "enterprise", enforcement_enabled: true, has_license: true };
+
+    it("does not call the API until the confirm dialog is accepted", async () => {
+      licenseStatus.mockResolvedValue(LICENSED_STATUS);
+      uninstallLicense.mockResolvedValue({});
+      renderCard();
+      const user = userEvent.setup();
+      await screen.findByText("enterprise");
+
+      await user.click(screen.getByText("Uninstall license"));
+      expect(await screen.findByText("Uninstall license?")).toBeInTheDocument();
+      expect(uninstallLicense).not.toHaveBeenCalled();
+
+      await user.click(screen.getByTestId("confirm-action-button"));
+      await waitFor(() => expect(uninstallLicense).toHaveBeenCalledTimes(1));
+      expect(await screen.findByText("License uninstalled.")).toBeInTheDocument();
+    });
+
+    it("does not call the API when the confirm dialog is cancelled", async () => {
+      licenseStatus.mockResolvedValue(LICENSED_STATUS);
+      renderCard();
+      const user = userEvent.setup();
+      await screen.findByText("enterprise");
+
+      await user.click(screen.getByText("Uninstall license"));
+      await screen.findByText("Uninstall license?");
+      await user.click(screen.getByText("Cancel"));
+
+      await waitFor(() => expect(screen.queryByText("Uninstall license?")).not.toBeInTheDocument());
+      expect(uninstallLicense).not.toHaveBeenCalled();
+    });
   });
 
   it("rejects an invalid (non-JSON) file without calling the API", async () => {

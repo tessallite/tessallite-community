@@ -4,14 +4,14 @@ Integration test for Excel XMLA flow.
 Simulates Excel's first four calls against the server endpoint (/xmla/):
 1. DISCOVER_PROPERTIES → server capabilities
 2. DISCOVER_DATASOURCES → single server datasource
-3. MDSCHEMA_CATALOGS → list of tenants as databases
+3. MDSCHEMA_CATALOGS → list of qualified model/persona catalogs
 4. BeginSession → session establishment
 
 This test guards the Excel compatibility behavior long-term.
 
 Requires a running gateway on localhost:8080 with the acme-demo tenant
-seeded (admin@acme-demo.com / acme-demo). Skipped otherwise — the suite
-is an integration smoke-test, not a unit test.
+with credentials supplied through DEMO_ADMIN_EMAIL and DEMO_ADMIN_PASSWORD.
+Skipped when the gateway or protected environment is unavailable.
 """
 import base64
 import os
@@ -24,7 +24,13 @@ from xml.etree.ElementTree import Element
 from httpx import AsyncClient
 
 
-_BASIC_CREDS = base64.b64encode(b"admin@acme-demo.com:acme-demo").decode()
+_DEMO_ADMIN_EMAIL = os.environ.get("DEMO_ADMIN_EMAIL", "").strip()
+_DEMO_ADMIN_PASSWORD = os.environ.get("DEMO_ADMIN_PASSWORD", "")
+_BASIC_CREDS = (
+    base64.b64encode(f"{_DEMO_ADMIN_EMAIL}:{_DEMO_ADMIN_PASSWORD}".encode()).decode()
+    if _DEMO_ADMIN_EMAIL and _DEMO_ADMIN_PASSWORD
+    else None
+)
 _XMLA_TLS_ENABLED = os.environ.get(
     "GATEWAY_XMLA_TLS_ENABLED", "true"
 ).strip().lower() in {"true", "1", "yes"}
@@ -42,6 +48,8 @@ def _gateway_accepts_seeded_creds() -> bool:
     Returning False for connection errors OR a 401 keeps the suite from
     blowing up on workstations that aren't running the gateway or that
     have a different seed set."""
+    if _BASIC_CREDS is None:
+        return False
     body = (
         b'<?xml version="1.0"?><soap:Envelope '
         b'xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
@@ -73,15 +81,15 @@ def _gateway_accepts_seeded_creds() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _gateway_accepts_seeded_creds(),
-    reason="gateway not running or acme-demo tenant not provisioned",
+    reason="gateway or protected acme-demo credentials are unavailable",
 )
 
 
 @pytest.fixture
 def auth_headers():
     """Basic auth headers for the acme-demo tenant credentials."""
-    credentials = base64.b64encode(b"admin@acme-demo.com:acme-demo").decode()
-    return {"Authorization": f"Basic {credentials}"}
+    assert _BASIC_CREDS is not None
+    return {"Authorization": f"Basic {_BASIC_CREDS}"}
 
 
 @pytest.fixture
@@ -219,10 +227,11 @@ async def test_excel_step2_discover_datasources(xmla_headers: dict):
 @pytest.mark.asyncio
 async def test_excel_step3_mdschema_catalogs(xmla_headers: dict):
     """
-    Step 3: MDSCHEMA_CATALOGS - List databases (tenants).
+    Step 3: MDSCHEMA_CATALOGS - List qualified model/persona catalogs.
 
-    Excel expects a list of all catalogs/databases the user can access.
-    Each catalog corresponds to a tenant in Tessallite.
+    Excel expects a list of all catalogs the user can access. Tessallite catalog
+    identity includes tenant, project, model, and optional persona so models with
+    the same slug in different projects remain distinct (Bug-9825, Bug-9918).
     """
     async with AsyncClient(base_url=_XMLA_BASE_URL, timeout=30.0, verify=_VERIFY_TLS) as client:
         body = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -253,11 +262,13 @@ async def test_excel_step3_mdschema_catalogs(xmla_headers: dict):
                 f"CATALOG_NAME should be non-empty, got {row.get('CATALOG_NAME')!r}"
 
         catalog_names = {r.get("CATALOG_NAME") for r in rows}
-        assert "modely" in catalog_names, (
-            f"Expected 'modely' catalog for acme-demo tenant, got {sorted(catalog_names)!r}"
+        assert "acme-demo__project1__modely" in catalog_names, (
+            "Expected qualified modely catalog for acme-demo tenant, "
+            f"got {sorted(catalog_names)!r}"
         )
-        assert "modely_technical" in catalog_names, (
-            f"Expected 'modely_technical' variant to be emitted alongside the business view, "
+        assert "acme-demo__project1__modely__technical" in catalog_names, (
+            "Expected qualified modely technical variant to be emitted alongside "
+            "the business view, "
             f"got {sorted(catalog_names)!r}"
         )
 

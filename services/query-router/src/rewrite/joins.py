@@ -13,6 +13,7 @@ from typing import Any, Sequence
 from shared.connector_qualify import coerce_join_types, quote_identifier, quote_table_ref
 from shared.semantic.graph_order import canonical_join_order
 from shared.semantic.join_keyword import join_keyword as _join_keyword
+from shared.semantic.join_planner import plan_join_tree
 
 
 
@@ -58,11 +59,6 @@ def _build_joined_from_clause(
     # unobtainable here regardless of who calls it, which a static
     # "did the caller remember?" guard demonstrably cannot.
     joins = canonical_join_order(joins)
-
-    adjacency: dict[Any, list[Any]] = defaultdict(list)
-    for join in joins:
-        adjacency[join.left_table_id].append(join)
-        adjacency[join.right_table_id].append(join)
 
     def _qid(name: str) -> str:
         return quote_identifier(connector, name)
@@ -145,70 +141,51 @@ def _build_joined_from_clause(
             return None
         from_clause, joined_table_ids, pending_table_ids = forced
 
-    # All table IDs known to the join graph — candidates for intermediate hops.
-    all_joinable_ids = set()
-    for join in joins:
-        all_joinable_ids.add(join.left_table_id)
-        all_joinable_ids.add(join.right_table_id)
-
-    def _try_join_to(target_set: set) -> bool:
-        """Try to join from any already-joined table to a table in target_set.
-        Returns True if a join was added."""
-        for table_id in list(joined_table_ids):
-            for join in adjacency.get(table_id, []):
-                next_table_id = None
-                if join.left_table_id == table_id and join.right_table_id in target_set:
-                    next_table_id = join.right_table_id
-                elif join.right_table_id == table_id and join.left_table_id in target_set:
-                    next_table_id = join.left_table_id
-                if next_table_id is None:
-                    continue
-
-                next_table = tables_by_id.get(next_table_id)
-                if not next_table:
-                    continue
-
-                if next_table_id not in alias_by_table_id:
-                    alias_by_table_id[next_table_id] = next_table.alias or f"t_{len(alias_by_table_id)}"
-
-                current_col_id = join.left_column_id if join.left_table_id == table_id else join.right_column_id
-                next_col_id = join.right_column_id if join.left_table_id == table_id else join.left_column_id
-                current_col = columns_by_id.get(current_col_id)
-                next_col = columns_by_id.get(next_col_id)
-                if not current_col or not next_col:
-                    continue
-
-                nonlocal from_clause
-                # Bug-7775: flip LEFT<->RIGHT when the already-joined table is
-                # the modeler's RIGHT table (see _append_preferred above).
-                flipped = table_id == join.right_table_id
-                join_keyword = _join_keyword(join.join_type, flipped=flipped)
-                lhs_expr = _qcol(alias_by_table_id[table_id], current_col.column_name)
-                rhs_expr = _qcol(alias_by_table_id[next_table_id], next_col.column_name)
-                lhs_expr, rhs_expr = _coerce_join_pair(
-                    lhs_expr, getattr(current_col, "data_type", None),
-                    rhs_expr, getattr(next_col, "data_type", None),
-                )
-                from_clause += (
-                    f" {join_keyword} {_qtbl(next_table.physical_name)} AS {_qid(alias_by_table_id[next_table_id])}"
-                    f" ON {lhs_expr} = {rhs_expr}"
-                )
-                joined_table_ids.add(next_table_id)
-                pending_table_ids.discard(next_table_id)
-                return True
-        return False
-
-    while pending_table_ids:
-        # First: try to join directly to a required table.
-        if _try_join_to(pending_table_ids):
-            continue
-        # Second: try any reachable intermediate table as a stepping stone.
-        intermediates = all_joinable_ids - joined_table_ids
-        if intermediates and _try_join_to(intermediates):
-            continue
-        # No progress possible — graph is disconnected.
+    # Bug-8637: the spanning tree is planned by the ONE shared planner every
+    # FROM builder uses (``shared.semantic.join_planner``); this function only
+    # renders its steps. A join whose column rows are unknown fails the plan
+    # closed instead of being silently routed around.
+    plan = plan_join_tree(
+        base_table_id, pending_table_ids | joined_table_ids, joins,
+        table_ids=set(tables_by_id),
+    )
+    if plan is None:
         return None
+    for step in plan:
+        if step.to_table_id in joined_table_ids:
+            continue  # already attached by the preferred path above
+        table_id, join, next_table_id = step.from_table_id, step.join, step.to_table_id
+        if table_id not in joined_table_ids:
+            return None
+        next_table = tables_by_id.get(next_table_id)
+        if not next_table:
+            return None
+        if next_table_id not in alias_by_table_id:
+            alias_by_table_id[next_table_id] = next_table.alias or f"t_{len(alias_by_table_id)}"
+        current_col_id = join.left_column_id if join.left_table_id == table_id else join.right_column_id
+        next_col_id = join.right_column_id if join.left_table_id == table_id else join.left_column_id
+        current_col = columns_by_id.get(current_col_id)
+        next_col = columns_by_id.get(next_col_id)
+        if not current_col or not next_col:
+            return None
+        # Bug-7775: flip LEFT<->RIGHT when the already-joined table is the
+        # modeler's RIGHT table (see _append_preferred above).
+        join_keyword = _join_keyword(join.join_type, flipped=step.flipped)
+        lhs_expr = _qcol(alias_by_table_id[table_id], current_col.column_name)
+        rhs_expr = _qcol(alias_by_table_id[next_table_id], next_col.column_name)
+        lhs_expr, rhs_expr = _coerce_join_pair(
+            lhs_expr, getattr(current_col, "data_type", None),
+            rhs_expr, getattr(next_col, "data_type", None),
+        )
+        from_clause += (
+            f" {join_keyword} {_qtbl(next_table.physical_name)} AS {_qid(alias_by_table_id[next_table_id])}"
+            f" ON {lhs_expr} = {rhs_expr}"
+        )
+        joined_table_ids.add(next_table_id)
+        pending_table_ids.discard(next_table_id)
 
+    if pending_table_ids:
+        return None
     return from_clause
 
 

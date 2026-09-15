@@ -19,12 +19,16 @@ import logging
 from collections.abc import Collection
 
 from fastapi import Depends, HTTPException, Request, status
+import asyncio
+
+from sqlalchemy import exc as sa_exc
 from sqlalchemy import func, select
 
 from shared.auth.jwt import decode_access_token
 from shared.auth.service_principal import SERVICE_AUDIENCE, validate_service_payload
 from shared.db.models import LocalUser
 from shared.db.session import get_tenant_db
+from shared.db.tenant_readiness import TenantReadinessError
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +307,83 @@ async def get_current_user(request: Request) -> CurrentUser:
     return user
 
 
+# Bug-9744 item 2: how long to tell a caller to wait when the session could not
+# be VERIFIED. The observed cause is tenant-pool contention (QueuePool limit of
+# size 2, 30s checkout timeout) during a deploy side effect, which clears in
+# seconds — unlike a cold service, this is contention rather than a cold start.
+_SESSION_CHECK_RETRY_AFTER_SECONDS = 5
+
+
+# SQLSTATE classes that mean "the server could not serve this right now":
+# 08 connection exception, 53 insufficient resources, 57 operator intervention
+# (including shutdown), 58 system error. Everything else — 42 syntax/access,
+# 22 data, 23 integrity — is a permanent fault that must not look retryable.
+_TRANSIENT_SQLSTATE_CLASSES = frozenset({"08", "53", "57", "58"})
+
+
+def _is_backend_unavailable(exc: BaseException) -> bool:
+    """True when the account-state lookup could not RUN, as opposed to running
+    and rejecting the session.
+
+    The live reproduction was ``sqlalchemy.exc.TimeoutError: QueuePool limit of
+    size 2 overflow 0 reached`` — the tenant pool exhausted by a deploy's
+    predictive cold-start side effect plus an in-process sweep, competing with
+    live user traffic on the same two connections.
+    """
+    # Narrow on purpose. The first version named DBAPIError and OSError, which
+    # are BASE classes: DBAPIError covers ProgrammingError, IntegrityError and
+    # DataError, and OSError covers FileNotFoundError and PermissionError. A
+    # malformed statement, a missing migration, a constraint violation or an
+    # unreadable file would each have been answered "503, retry shortly",
+    # inviting clients to retry a permanent defect forever and hiding the real
+    # fault behind a transient-looking status.
+    if isinstance(exc, sa_exc.TimeoutError):
+        return True                      # pool checkout exhausted — the live case
+    if isinstance(exc, (sa_exc.OperationalError, sa_exc.InterfaceError)):
+        # These two families straddle the line: a dropped connection is
+        # transient, a bad DSN is not. Trust the driver's own verdict —
+        # ``connection_invalidated`` is set when SQLAlchemy discarded the
+        # connection — then the SQLSTATE connection class (08) and the
+        # resource/shutdown classes.
+        if getattr(exc, "connection_invalidated", False):
+            return True
+        sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None) or \
+            getattr(getattr(exc, "orig", None), "pgcode", None)
+        if isinstance(sqlstate, str) and len(sqlstate) >= 2:
+            return sqlstate[:2] in _TRANSIENT_SQLSTATE_CLASSES
+        return False
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    # ConnectionError covers refused/reset/aborted. Bare OSError does NOT —
+    # a missing file or a permission denial is permanent and must not be
+    # advertised as retryable.
+    return isinstance(exc, ConnectionError)
+
+
+def _session_unverifiable() -> HTTPException:
+    """Refuse, but say the true reason.
+
+    The refusal is NOT relaxed: a session whose account state cannot be read is
+    still denied, exactly as before. What changes is the story told about it. A
+    401 "Invalid or expired token" sends the user to the login screen and the
+    operator to the identity provider, when the real remedy is to retry — and
+    it carries ``WWW-Authenticate``, which prompts for credentials that were
+    never the problem. This says "could not verify, retry" instead, which is
+    both true and actionable.
+
+    The precedent is already in this file: the embed-revocation guard fails
+    closed with a 403 naming the unverifiable check rather than pretending the
+    token is bad. This applies the same honesty to the two lookups that did not
+    have it.
+    """
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Session could not be verified because a backend check was "
+               "unavailable. This is not a credential problem — retry shortly.",
+        headers={"Retry-After": str(_SESSION_CHECK_RETRY_AFTER_SECONDS)},
+    )
+
+
 async def _validate_regular_session(
     user: CurrentUser,
     payload: dict,
@@ -351,15 +432,42 @@ async def _validate_regular_session(
                 if token_version != local_version:
                     raise auth_exc
             return
+    except TenantReadinessError:
+        # The shared database boundary already produced a safe typed 503. Do
+        # not turn an unavailable tenant into an invalid-token response.
+        raise
     except HTTPException:
         raise
-    except Exception:
+    except Exception as validation_exc:
+        if _is_backend_unavailable(validation_exc):
+            logger.warning(
+                "Regular session validation could not reach tenant state "
+                "(%s: %s) — refusing as unavailable, not as an invalid token "
+                "(Bug-9744)",
+                type(validation_exc).__name__, validation_exc,
+            )
+            raise _session_unverifiable() from validation_exc
         logger.warning("Regular session validation failed; rejecting token")
         raise auth_exc
     raise auth_exc
 
 
 SYSTEM_ADMIN_TOKEN_VERSION_KEY = "system_admin.token_version"
+
+
+class SystemAdminTokenVersionCorrupt(RuntimeError):
+    """The persisted system-admin token version exists but is unreadable.
+
+    Distinct from "absent", which is legitimately version 0. Treating corrupt
+    as 0 would silently undo every revocation recorded since the first bump.
+    """
+
+
+def _require_non_negative_version(value: object) -> int:
+    parsed = int(value)  # type: ignore[arg-type]
+    if parsed < 0:
+        raise ValueError(f"negative token version: {parsed}")
+    return parsed
 
 
 async def get_system_admin_token_version() -> int:
@@ -393,15 +501,25 @@ async def get_system_admin_token_version() -> int:
             return 0
         if isinstance(raw, int):
             return int(raw)
+        # Bug-5534 review, adjacent security correction: a MALFORMED existing
+        # value must NOT degrade to 0. A missing row or a pre-migration table is
+        # legitimately version 0 above, but a corrupted stored value returning 0
+        # is a silent revocation ROLLBACK — a token minted at version 0 would
+        # then compare equal even though the persisted version had been bumped
+        # to retire it. Unknown is not zero; fail closed.
         if isinstance(raw, dict) and "value" in raw:
             try:
-                return int(raw["value"])
-            except (TypeError, ValueError):
-                return 0
+                return _require_non_negative_version(raw["value"])
+            except (TypeError, ValueError) as exc:
+                raise SystemAdminTokenVersionCorrupt(
+                    "system-admin token version is stored malformed"
+                ) from exc
         try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return 0
+            return _require_non_negative_version(raw)
+        except (TypeError, ValueError) as exc:
+            raise SystemAdminTokenVersionCorrupt(
+                "system-admin token version is stored malformed"
+            ) from exc
     return 0
 
 
@@ -438,7 +556,33 @@ async def _validate_system_admin_token_version(
 ) -> None:
     try:
         local_version = await get_system_admin_token_version()
-    except Exception:
+    except SystemAdminTokenVersionCorrupt as corrupt_exc:
+        # Fail closed, and honestly. This is neither a bad token nor a transient
+        # outage: the server's own revocation state is unreadable and retrying
+        # will not change that. 401 would blame the caller's credentials and 503
+        # would invite a retry loop, so neither tells the truth.
+        logger.error(
+            "System-admin token version is stored malformed — refusing every "
+            "system-admin token until it is repaired (Bug-5534 review): %s",
+            corrupt_exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server-side authentication state is unreadable. This is "
+                   "not a credential problem; it requires an administrator.",
+        ) from corrupt_exc
+    except Exception as lookup_exc:
+        # Same defect, same file: this lookup masked an outage as a bad token
+        # too. Found by enumerating the blanket handlers rather than fixing only
+        # the one the live trace named.
+        if _is_backend_unavailable(lookup_exc):
+            logger.warning(
+                "System-admin token_version lookup could not reach its store "
+                "(%s: %s) — refusing as unavailable, not as an invalid token "
+                "(Bug-9744)",
+                type(lookup_exc).__name__, lookup_exc,
+            )
+            raise _session_unverifiable() from lookup_exc
         logger.warning("System-admin token_version lookup failed; rejecting token")
         raise auth_exc
     raw_token_version = payload.get("token_version")

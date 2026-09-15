@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from src.ir.logical_query import LogicalFilter
 from src.security.persona_gate import (
+    PersonaDefaultFilterInvalid,
     apply_persona_gate,
     enforce_persona,
     enforce_persona_gate,
@@ -271,8 +272,12 @@ async def test_apply_returns_persona_on_pass():
 
 @pytest.mark.asyncio
 async def test_f008_01_backing_lookup_failure_refuses_query():
-    """Bug-9260: when the excluded-measure backing lookup raises, the
-    query is refused rather than served with the F-008-01 guard disabled.
+    """Bug-9260/Bug-9262: a failed backing lookup cannot disable F-008-01.
+
+    When the excluded-measure backing lookup raises, the query is refused
+    rather than served with the guard disabled.  This exercises the producer
+    path through ``enforce_persona_gate`` instead of passing the exclusion
+    sets directly to ``enforce_persona``.
     """
     measure = make_measure("revenue")
     dim = make_dimension("fee_amount")
@@ -284,6 +289,45 @@ async def test_f008_01_backing_lookup_failure_refuses_query():
         await enforce_persona_gate(
             db, persona=p, model_id="model-1", bound=bound,
         )
+    assert exc.value.status_code == 403
+    assert exc.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_bug_9262_gate_wires_excluded_measure_physical_names():
+    """Bug-9262: the physical-name producer reaches the real gate.
+
+    A real dimension sharing an excluded measure's physical column must be
+    rejected when the backing lookup returns the physical name.  If
+    ``enforce_persona_gate`` stops forwarding ``excluded_measure_phys_names``
+    or the lookup stops collecting it, this test would incorrectly pass.
+    """
+    allowed = make_measure("revenue")
+    excluded = make_measure("fee_amount")
+    excluded.source_column_id = "column-fee"
+    dimension = make_dimension("fee_amount")
+    dimension.physical_column = "fee_amount"
+    bound = make_bound_query(
+        dimensions=[dimension], measures=[], select_star=False,
+    )
+    persona = _persona(measure_ids=[str(allowed.id)])
+
+    class _PhysicalNameDB(_FakeDB):
+        async def execute(self, stmt):  # noqa: ARG002
+            class _Result:
+                def all(self):
+                    return [(excluded.id, excluded.source_column_id, "fee_amount")]
+
+            return _Result()
+
+    with pytest.raises(HTTPException) as exc:
+        await enforce_persona_gate(
+            _PhysicalNameDB(persona),
+            persona=persona,
+            model_id="model-1",
+            bound=bound,
+        )
+
     assert exc.value.status_code == 403
     assert exc.value.detail["error_code"] == "OBJECT_NOT_AVAILABLE"
 
@@ -352,14 +396,51 @@ def test_merge_supports_dict_operator_form():
     assert bound.resolved_filters[0].value == 100
 
 
-def test_merge_ignores_unknown_operator():
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"bogus_op": 1},          # operator outside the canonical set
+        {},                       # no operator at all
+        {"eq": 1, "neq": 2},      # ambiguous multi-key dict
+    ],
+    ids=["unknown_operator", "empty_dict", "multi_key_dict"],
+)
+def test_bug_9261_merge_refuses_uncoercible_default_filter(raw):
+    """Bug-9261 [FAIL CLOSED]: a default filter the gate cannot read is a
+    security predicate that would not be applied. The merge used to ``continue``
+    past it, so the persona saw MORE rows than its definition allows. It must
+    now refuse the query with a typed error naming the persona and the filter,
+    and must not have appended any partial filter set."""
     bound = make_bound_query(dimensions=[], measures=[])
-    p = _persona(default_filters={"x": {"bogus_op": 1}})
+    p = _persona(default_filters={"region": "EMEA", "x": raw}, name="Sales")
 
-    merged = merge_default_filters(p, bound)
+    with pytest.raises(PersonaDefaultFilterInvalid) as exc:
+        merge_default_filters(p, bound)
 
-    assert merged == []
-    assert bound.resolved_filters == []
+    detail = exc.value.detail
+    assert exc.value.status_code == 403
+    assert detail["error_code"] == "PERSONA_DEFAULT_FILTER_INVALID"
+    assert "'Sales'" in detail["message"]
+    assert "'x'" in detail["message"]
+    assert exc.value.dim_name == "x"
+    assert isinstance(exc.value, HTTPException)
+
+
+def test_bug_9261_valid_operators_still_merge():
+    """Every operator the API accepts is still merged (the refusal is only for
+    values the shared validator would also reject)."""
+    from shared.schemas.domains.aggregates_security import (
+        PERSONA_FILTER_OPERATORS,
+        persona_filter_value_is_valid,
+    )
+
+    for op in sorted(PERSONA_FILTER_OPERATORS):
+        value = [1, 2] if op == "between" else 1
+        assert persona_filter_value_is_valid({op: value})
+        bound = make_bound_query(dimensions=[], measures=[])
+        p = _persona(default_filters={"x": {op: value}})
+        assert merge_default_filters(p, bound) == ["x"]
+        assert bound.resolved_filters[0].operator == op
 
 
 def test_merge_noop_when_default_filters_empty():

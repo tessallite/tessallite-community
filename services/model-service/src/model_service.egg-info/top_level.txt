@@ -27,3 +27,4 @@ named_set_deploy_resolver
 solidatus_client
 solidatus_mapper
 solidatus_sync
+startup_migrations

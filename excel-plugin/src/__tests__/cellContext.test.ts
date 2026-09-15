@@ -168,4 +168,44 @@ describe('cellContext', () => {
     });
   });
 
+  describe('Bug-9886: drill-through on a cell of a table the add-in just inserted', () => {
+    // Deliberately does NOT mock getTableMetadata. Bug-9886's root cause was
+    // never in this real read path (setTableMetadata -> getTableMetadata's
+    // named-item read -> resolvePluginTableContext) -- every other test in
+    // this file mocks getTableMetadata and hands `_tableStart` in directly,
+    // which is exactly the test escape the bug called out: it never exercises
+    // the real named-item write/read a live insert depends on. This guard
+    // runs the real recording Office.js shim end to end instead.
+    it('resolves a measureId for a mid-table cell using the real named-item read path', async () => {
+      const { installExcelShim } = await import('../../tests-harness/lib/excelShim');
+      const { setTableMetadata, invalidateMetadataCache } = await import('../utils/workbookMetadata');
+
+      const shim = installExcelShim(['Sheet1']);
+      try {
+        invalidateMetadataCache();
+        // Mirrors the Bug-9886 repro exactly: a Report Builder table at
+        // Sheet1!A1:B8 with a dimension column and a measure column.
+        await setTableMetadata('Sheet1!A1:B8', {
+          projectId: 'proj-1',
+          modelId: 'model-1',
+          columnHeaders: JSON.stringify(['card entry mode name', 'transaction amount']),
+          measureColumns: JSON.stringify({ 'transaction amount': '06151172-4d41-44a3-aca8-44f819a0ce14' }),
+          dimensionColumns: JSON.stringify({ 'card entry mode name': 'card_entry_mode_name' }),
+          pluginVersion: '1.0.0',
+          timestamp: '2026-07-27T00:00:00Z',
+        } as unknown as workbookMetadata.TableMetadata);
+        invalidateMetadataCache();
+
+        // B2: the measure column, first data row -- not the table's start
+        // cell, so this exercises the slow (range-containment) read path.
+        const ctx = await resolveCellContext('Sheet1!B2', 123, '');
+        expect(ctx.type).toBe('plugin-table');
+        expect(ctx.measureName).toBe('transaction amount');
+        expect(ctx.measureId).toBe('06151172-4d41-44a3-aca8-44f819a0ce14');
+      } finally {
+        shim.restore();
+      }
+    });
+  });
+
 });

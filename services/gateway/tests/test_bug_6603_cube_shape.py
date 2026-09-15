@@ -286,11 +286,14 @@ class TestBuildersConsumeCubeShape:
         rows = _rows_hierarchies("demo", dims)
         acc = next(r for r in rows if r["HIERARCHY_NAME"] == "account_type")
         assert acc["HIERARCHY_ORIGIN"] == "2"
-        # Bug-6603 grouping: standalone attribute dims share the [Dimensions] group
-        # node (DIMENSION_UNIQUE_NAME column), but the HIERARCHY_UNIQUE_NAME grammar
-        # stays [attr].[attr] so member discovery / Execute are unaffected.
+        # Bug-6603 grouping: standalone attribute dims share the [Dimensions]
+        # group node. Bug-9771 SUPERSEDES the original "hierarchy grammar stays
+        # [attr].[attr]" half of that decision: a hierarchy unique name MUST be
+        # prefixed by its owning dimension's unique name, or Excel cannot resolve
+        # the owner and labels the field "(All)". The two columns are now
+        # consistent by construction.
         assert acc["DIMENSION_UNIQUE_NAME"] == "[Dimensions]"
-        assert acc["HIERARCHY_UNIQUE_NAME"] == "[account_type].[account_type]"
+        assert acc["HIERARCHY_UNIQUE_NAME"] == "[Dimensions].[account_type]"
 
     def test_user_hierarchy_origin_1_multilevel(self):
         dims = cube_model.build_cube_dimensions([], [_user_hierarchy_def()])
@@ -298,7 +301,7 @@ class TestBuildersConsumeCubeShape:
         geo = next(r for r in hrows if r["HIERARCHY_NAME"] == "Geography")
         assert geo["HIERARCHY_ORIGIN"] == "1"
         lrows = _rows_levels("demo", dims, {})
-        geo_levels = [r for r in lrows if r["HIERARCHY_UNIQUE_NAME"] == "[Geography].[Geography]"]
+        geo_levels = [r for r in lrows if r["HIERARCHY_UNIQUE_NAME"] == "[Hierarchies].[Geography]"]
         assert [r["LEVEL_NAME"] for r in geo_levels] == ["(All)", "Region", "Country", "City"]
         assert [r["LEVEL_NUMBER"] for r in geo_levels] == ["0", "1", "2", "3"]
 
@@ -307,8 +310,10 @@ class TestBuildersConsumeCubeShape:
         # Bug-6891: the calendar joins the [Hierarchies] group node; time typing
         # is asserted on the hierarchy ROW (DIMENSION_TYPE) and on LEVEL_TYPE.
         drows = _rows_dimensions("demo", dims, {})
-        group = next(r for r in drows if r["DIMENSION_UNIQUE_NAME"] == "[Hierarchies]")
-        assert group["DIMENSION_NAME"] == "Hierarchies"
+        # Bug-9878: a calendar hierarchy lives under the time-typed [Time] node.
+        group = next(r for r in drows if r["DIMENSION_UNIQUE_NAME"] == "[Time]")
+        assert group["DIMENSION_NAME"] == "Time"
+        assert group["DIMENSION_TYPE"] == "1"
         hrows = _rows_hierarchies("demo", dims)
         cal_h = next(r for r in hrows if r["HIERARCHY_NAME"] == "Order Calendar")
         assert cal_h["DIMENSION_TYPE"] == "1"
@@ -317,7 +322,7 @@ class TestBuildersConsumeCubeShape:
         by_level = {
             r["LEVEL_NAME"]: r
             for r in lrows
-            if r["HIERARCHY_UNIQUE_NAME"] == "[Order Calendar].[Order Calendar]"
+            if r["HIERARCHY_UNIQUE_NAME"] == "[Time].[Order Calendar]"
         }
         assert by_level["Year"]["LEVEL_TYPE"] == "20"
         assert by_level["Quarter"]["LEVEL_TYPE"] == "68"
@@ -337,7 +342,7 @@ class TestBuildersConsumeCubeShape:
         by_level = {
             r["LEVEL_NAME"]: r
             for r in lrows
-            if r["HIERARCHY_UNIQUE_NAME"] == "[Order Calendar].[Order Calendar]"
+            if r["HIERARCHY_UNIQUE_NAME"] == "[Time].[Order Calendar]"
         }
         assert by_level["FY"]["LEVEL_TYPE"] == "20"
         assert by_level["Per"]["LEVEL_TYPE"] == "132"
@@ -358,8 +363,13 @@ def _second_flat_dimension():
 
 class TestFieldListGrouping:
     """Standalone dims -> one [Dimensions] group; hierarchies keep own nodes;
-    KPIs are a native group. Grouping is on the DIMENSION_UNIQUE_NAME column only —
-    hierarchy/level/member unique names stay [Name].[Name] (Execute-safe)."""
+    KPIs are a native group.
+
+    Bug-9771: grouping is NOT confined to the DIMENSION_UNIQUE_NAME column. The
+    hierarchy unique name is prefixed by the dimension that owns it, levels nest
+    under the hierarchy, and member unique names are built from the hierarchy —
+    so a grouped attribute publishes [Dimensions].[Attr], not [Attr].[Attr].
+    Execute and member discovery consume those same prefixed names."""
 
     def test_group_unique_name_helper(self):
         flat = cube_model.build_cube_dimensions([_flat_dimension()], [])[0]
@@ -407,12 +417,13 @@ class TestFieldListGrouping:
         for attr in ("account_type", "region"):
             row = next(r for r in hrows if r["HIERARCHY_NAME"] == attr)
             assert row["DIMENSION_UNIQUE_NAME"] == "[Dimensions]"
-            assert row["HIERARCHY_UNIQUE_NAME"] == f"[{attr}].[{attr}]"
+            assert row["HIERARCHY_UNIQUE_NAME"] == f"[Dimensions].[{attr}]"
             assert row["HIERARCHY_ORIGIN"] == "2"
         geo = next(r for r in hrows if r["HIERARCHY_NAME"] == "Geography")
-        # Bug-6891: group key column; the hierarchy grammar is unchanged.
+        # Bug-6891 group key column; Bug-9771 makes the hierarchy name agree
+        # with it instead of naming a dimension that does not exist.
         assert geo["DIMENSION_UNIQUE_NAME"] == "[Hierarchies]"
-        assert geo["HIERARCHY_UNIQUE_NAME"] == "[Geography].[Geography]"
+        assert geo["HIERARCHY_UNIQUE_NAME"] == "[Hierarchies].[Geography]"
 
     def test_members_rowset_uses_group_column_but_hier_grammar(self):
         dims = cube_model.build_cube_dimensions([_flat_dimension()], [])
@@ -428,8 +439,8 @@ class TestFieldListGrouping:
         mrows = _rows_members("demo", [], dims, {}, member_data)
         checking = next(r for r in mrows if r.get("MEMBER_NAME") == "Checking")
         assert checking["DIMENSION_UNIQUE_NAME"] == "[Dimensions]"
-        assert checking["HIERARCHY_UNIQUE_NAME"] == "[account_type].[account_type]"
-        assert checking["MEMBER_UNIQUE_NAME"] == "[account_type].[account_type].[Checking]"
+        assert checking["HIERARCHY_UNIQUE_NAME"] == "[Dimensions].[account_type]"
+        assert checking["MEMBER_UNIQUE_NAME"] == "[Dimensions].[account_type].[Checking]"
 
     def test_measuregroup_dimensions_emits_group_node_once(self):
         # Guard for the round-1 dedup fix: N collapsed standalone attrs must yield
@@ -468,7 +479,7 @@ class TestFieldListGrouping:
         # The hidden dim's own bracket must appear nowhere.
         assert "[secret]" not in str(other_rows)
 
-    def test_flat_time_dim_keeps_own_time_typed_node(self):
+    def test_flat_time_dim_lives_under_the_time_node(self):
         # A flat is_time_dim dimension must NOT join the [Dimensions] group — the
         # group node is DIMENSION_TYPE 3 but a time dim emits type 1 on its
         # hierarchy row, so grouping it would make DIMENSIONS and HIERARCHIES
@@ -480,12 +491,14 @@ class TestFieldListGrouping:
             [time_dim, _second_flat_dimension()], [],
         )
         drows = _rows_dimensions("demo", dims, {})
-        od = next(r for r in drows if r["DIMENSION_NAME"] == "order_date")
-        assert od["DIMENSION_UNIQUE_NAME"] == "[order_date]"
+        # Bug-9878: the flat time attribute joins the [Time] node (type 1)
+        # instead of keeping a stray top-level node of its own.
+        assert not any(r["DIMENSION_NAME"] == "order_date" for r in drows)
+        od = next(r for r in drows if r["DIMENSION_UNIQUE_NAME"] == "[Time]")
         assert od["DIMENSION_TYPE"] == "1"
         hrows = _rows_hierarchies("demo", dims)
         od_h = next(r for r in hrows if r["HIERARCHY_NAME"] == "order_date")
-        assert od_h["DIMENSION_UNIQUE_NAME"] == "[order_date]"
+        assert od_h["DIMENSION_UNIQUE_NAME"] == "[Time]"
         assert od_h["DIMENSION_TYPE"] == "1"
         # the sibling flat non-time dim still groups under [Dimensions]
         region = next(r for r in hrows if r["HIERARCHY_NAME"] == "region")

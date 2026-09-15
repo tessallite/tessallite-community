@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import inspect
 import re
-from typing import Any
+from typing import Any, NamedTuple, Sequence
 
 import sqlglot
 from sqlglot import exp
@@ -39,12 +39,14 @@ from shared.semantic.time_variants_sql import (
     resolve_effective_variant_anchor,
     select_finest_time_dimension,
 )
+from shared.config.bootstrap import system_snapshot_get
 from shared.semantic.join_population_serving import augment_required_table_ids
 
 from src.ir.logical_query import (
     BoundQuery,
     DeployedSnapshotUnavailableError,
     SemanticBindingError,
+    UnsupportedSQL,
 )
 from src.rewrite.calendar_support import (
     _SA_GRAIN_RANK,
@@ -354,7 +356,215 @@ def _resolve_variant_date_anchor(
     )
 
 
-async def rewrite_for_source(bound_query: BoundQuery, db: Any = None, *, target_dialect: str | None = None) -> str:
+def _edge_preserves_rows_from(
+    join: Any,
+    from_table_id: Any,
+    tables_by_id: dict[Any, Any],
+    columns_by_id: dict[Any, Any] | None = None,
+) -> bool:
+    """Does traversing ``join`` away from ``from_table_id`` keep every row of
+    the ``from`` side at most once (a to-one step)?
+
+    Evidence is read in this order and the first that decides wins:
+
+    1. Declared cardinality through :func:`edge_cardinality`, the one place
+       that also coerces a legacy ``many_to_one`` token parked in ``join_type``
+       (architecture_join-orientation-and-cardinality.md invariant 4): a legacy
+       row is classified, never rejected.  ``one_to_one`` preserves either way;
+       ``many_to_one`` preserves left->right; ``one_to_many`` preserves
+       right->left; ``many_to_many`` preserves neither.
+    2. Key metadata (invariant 5): a far-side join column that is a primary
+       key proves to-one; a near-side primary key joined to a non-key far
+       column proves the far side is the many side.
+    3. Otherwise the step is undeclared.  It is accepted unless the far table
+       is the model's fact table: a fact-to-dimension edge is the star-schema
+       to-one step every governed model has relied on and deployed models
+       carry many such edges with neither cardinality nor keys declared, while
+       an undeclared edge INTO the anchor fact from a non-anchor relation is
+       structurally the many side (Bug-9930).  An undeclared edge into a
+       measure-bearing non-fact relation is not provable here; declaring its
+       cardinality or keys makes rule 1 or 2 decide it.
+    """
+    from shared.semantic.graph_order import is_fact_table
+    from shared.semantic.join_keyword import edge_cardinality
+
+    left_id = getattr(join, "left_table_id", None)
+    right_id = getattr(join, "right_table_id", None)
+    if from_table_id == left_id:
+        far_id, forward = right_id, True
+        near_col_id = getattr(join, "left_column_id", None)
+        far_col_id = getattr(join, "right_column_id", None)
+    elif from_table_id == right_id:
+        far_id, forward = left_id, False
+        near_col_id = getattr(join, "right_column_id", None)
+        far_col_id = getattr(join, "left_column_id", None)
+    else:
+        return False
+    cardinality = edge_cardinality(join)
+    if cardinality == "one_to_one":
+        return True
+    if cardinality == "many_to_one":
+        return forward
+    if cardinality == "one_to_many":
+        return not forward
+    if cardinality == "many_to_many":
+        return False
+    if columns_by_id:
+        far_col = columns_by_id.get(far_col_id)
+        near_col = columns_by_id.get(near_col_id)
+        if far_col is not None and getattr(far_col, "is_primary_key", False):
+            return True
+        if near_col is not None and getattr(near_col, "is_primary_key", False):
+            return False
+    far = tables_by_id.get(far_id)
+    return far is not None and not is_fact_table(far)
+
+
+def _row_preserving_reachable(
+    base_table_id: Any,
+    joins: Sequence[Any],
+    tables_by_id: dict[Any, Any],
+    columns_by_id: dict[Any, Any] | None = None,
+) -> set[Any]:
+    """Tables reachable from ``base_table_id`` over to-one steps only, i.e.
+    relations that can be joined without multiplying the base's rows."""
+    reachable: set[Any] = {base_table_id}
+    queue: list[Any] = [base_table_id]
+    while queue:
+        current = queue.pop(0)
+        for join in joins:
+            if current not in (
+                getattr(join, "left_table_id", None),
+                getattr(join, "right_table_id", None),
+            ):
+                continue
+            if not _edge_preserves_rows_from(join, current, tables_by_id, columns_by_id):
+                continue
+            nxt = (
+                join.right_table_id
+                if join.left_table_id == current
+                else join.left_table_id
+            )
+            if nxt not in reachable:
+                reachable.add(nxt)
+                queue.append(nxt)
+    return reachable
+
+
+def _resolve_security_owner_table_ids(
+    security_column_owners: Sequence[tuple[str, str]] | None,
+    tables_by_id: dict[Any, Any],
+    *,
+    joins: Sequence[Any] | None = None,
+    base_table_id: Any = None,
+    columns_by_id: dict[Any, Any] | None = None,
+) -> set[Any]:
+    """Resolve compiled RLS owners to the deployed model graph.
+
+    ``CompiledPredicate.security_column_owners`` stores the same unqualified
+    physical table token that ``_inject_security_where`` matches against a
+    SQL AST table scan.  Entries for each security column are ordered
+    candidates.  The first candidate that maps uniquely into this graph is
+    the owner to require; absent candidates are skipped because the injector
+    applies the same ordered-fallback rule to aliases that are actually
+    scanned.  A candidate that maps to multiple graph tables is unsafe to
+    choose.
+
+    An owner token must resolve to exactly one model-graph table.  Returning a
+    best-effort table, or silently choosing between duplicate physical tokens,
+    would let the injector qualify the predicate against a different relation
+    from the one the security compiler proved.  Callers therefore receive a
+    typed error and fail closed when the mapping is not unique.
+
+    Bug-9930 / F-R2-02: when ``joins`` and ``base_table_id`` are supplied, a
+    candidate is usable only if the base can reach it over to-one steps
+    (:func:`_row_preserving_reachable`).  Joining an owner that is reachable
+    only across a many side -- another fact through a conformed dimension --
+    repeats every base row once per owner row before aggregation, so a fully
+    admitted principal receives an inflated total.  Such a candidate is skipped
+    in favour of the next ordered owner; when none remains the query fails
+    closed with the same typed refusal as an absent owner.  Both routes
+    (source and raw) call this resolver, so they refuse the same shapes.
+    """
+    if not security_column_owners:
+        return set()
+
+    preserving: set[Any] | None = None
+    if joins is not None and base_table_id is not None:
+        preserving = _row_preserving_reachable(
+            base_table_id, joins, tables_by_id, columns_by_id,
+        )
+
+    candidates_by_column: dict[str, list[str]] = {}
+    for owner in security_column_owners:
+        if not isinstance(owner, (tuple, list)) or len(owner) != 2:
+            raise SemanticBindingError(
+                "Cannot resolve RLS security owner: owner metadata is malformed."
+            )
+        column_name, physical_name = owner
+        column_token = str(column_name or "").strip()
+        physical_token = str(physical_name or "").strip()
+        if not column_token or not physical_token:
+            raise SemanticBindingError(
+                "Cannot resolve RLS security owner: owner metadata is incomplete."
+            )
+        candidates_by_column.setdefault(column_token.casefold(), []).append(
+            physical_token.casefold()
+        )
+
+    def _physical_table_token(physical_name: Any) -> str:
+        token = str(physical_name or "").strip().strip('"').strip("`")
+        if "." in token:
+            token = token.rsplit(".", 1)[-1]
+        return token.casefold()
+
+    table_ids_by_token: dict[str, list[Any]] = {}
+    for table_id, table in tables_by_id.items():
+        token = _physical_table_token(getattr(table, "physical_name", None))
+        if token:
+            table_ids_by_token.setdefault(token, []).append(table_id)
+
+    required_table_ids: set[Any] = set()
+    for column_token, owner_tokens in candidates_by_column.items():
+        selected_table_id = None
+        multiplying_seen = False
+        for owner_token in owner_tokens:
+            matches = table_ids_by_token.get(owner_token, [])
+            if len(matches) > 1:
+                raise SemanticBindingError(
+                    "Cannot resolve RLS security owner: a physical owner table "
+                    "is ambiguous in the model graph."
+                )
+            if len(matches) == 1:
+                if preserving is not None and matches[0] not in preserving:
+                    # Present, but joinable only across a many side: the owner
+                    # would multiply the base's rows. Try the next candidate.
+                    multiplying_seen = True
+                    continue
+                selected_table_id = matches[0]
+                break
+        if selected_table_id is None:
+            if multiplying_seen:
+                raise SemanticBindingError(
+                    "Cannot resolve RLS security owner: the relation that owns "
+                    "the row-security column is reachable from the query base "
+                    "only through a join that would multiply its rows."
+                )
+            raise SemanticBindingError(
+                "Cannot resolve RLS security owner: no ordered owner candidate "
+                "is present in the model graph."
+            )
+        required_table_ids.add(selected_table_id)
+    return required_table_ids
+
+
+async def rewrite_for_source(
+    bound_query: BoundQuery,
+    db: Any = None,
+    *,
+    target_dialect: str | None = None,
+    security_column_owners: Sequence[tuple[str, str]] | None = None,
+) -> str:
     """
     Build a SQL query against the source table.
 
@@ -379,6 +589,16 @@ async def rewrite_for_source(bound_query: BoundQuery, db: Any = None, *, target_
     _connector = _dialect_to_connector(_target_dialect)
 
     if getattr(bound_query, "has_passthrough_expressions", False):
+        if security_column_owners:
+            # Arbitrary passthrough SQL has no semantic join plan into which
+            # a compiled owner can be added.  Do not silently ignore owner
+            # metadata and rely on a bare predicate; the caller must receive
+            # a fail-closed rewrite error instead.
+            raise SemanticBindingError(
+                "Cannot rewrite RLS source SQL through a passthrough shape: "
+                "the security owner relation cannot be proven in the source "
+                "join plan."
+            )
         # Passthrough: raw SQL kept as-is, but substitute semantic table
         # names with physical names so the query can execute against the DB.
         rewritten = await _substitute_table_names(bound_query, db, _connector)
@@ -392,12 +612,24 @@ async def rewrite_for_source(bound_query: BoundQuery, db: Any = None, *, target_
         )
     if bound_query.logical_query.select_star:
         if getattr(bound_query, "persona_narrowed_star", False) and db is not None:
-            return await _build_persona_star_sql(bound_query, db, _connector, _target_dialect)
+            return await _build_persona_star_sql(
+                bound_query, db, _connector, _target_dialect,
+                security_column_owners=security_column_owners,
+            )
         rewritten = await _substitute_table_names(
-            bound_query, db, _connector, include_population=True,
+            bound_query,
+            db,
+            _connector,
+            include_population=True,
+            security_column_owners=security_column_owners,
         )
         if rewritten:
             return rewritten
+        if security_column_owners:
+            raise SemanticBindingError(
+                "Cannot rewrite RLS SELECT * source SQL: the security owner "
+                "relation could not be proven in the source join plan."
+            )
         # Bug-904: apply dialect translation so SELECT * fallback SQL is not
         # returned in PostgreSQL syntax when the target is a different connector.
         return _translate_raw_sql(
@@ -406,11 +638,21 @@ async def rewrite_for_source(bound_query: BoundQuery, db: Any = None, *, target_
         )
     from_tables = getattr(bound_query.logical_query, "from_tables", [])
     if db is not None and (bound_query.resolved_measures or bound_query.resolved_dimensions or from_tables):
-        return await _build_source_sql(bound_query, db, target_dialect=_target_dialect)
+        return await _build_source_sql(
+            bound_query,
+            db,
+            target_dialect=_target_dialect,
+            security_column_owners=security_column_owners,
+        )
     # Final fallback: still try table name substitution before returning raw.
     rewritten = await _substitute_table_names(bound_query, db, _connector)
     if rewritten:
         return rewritten
+    if security_column_owners:
+        raise SemanticBindingError(
+            "Cannot rewrite RLS source SQL: no owner-aware source join plan "
+            "could be built."
+        )
     # Bug-904: apply dialect translation so the final raw-query fallback is not
     # returned in PostgreSQL syntax when the target is a different connector.
     return _translate_raw_sql(
@@ -419,7 +661,14 @@ async def rewrite_for_source(bound_query: BoundQuery, db: Any = None, *, target_
         )
 
 
-async def _build_persona_star_sql(bound_query: BoundQuery, db: Any, connector: str = "postgresql", target_dialect: str = "postgres") -> str:
+async def _build_persona_star_sql(
+    bound_query: BoundQuery,
+    db: Any,
+    connector: str = "postgresql",
+    target_dialect: str = "postgres",
+    *,
+    security_column_owners: Sequence[tuple[str, str]] | None = None,
+) -> str:
     """Expand a persona/CLS-narrowed ``SELECT *`` to explicit allowed columns.
 
     Called when a persona allow-list (``persona_gate``) or CLS tag narrowing
@@ -579,7 +828,12 @@ async def _build_persona_star_sql(bound_query: BoundQuery, db: Any, connector: s
     seen: set[str] = set()
     select_parts: list[str] = []
     # Tables (besides base) that the projection / clauses require a JOIN to.
-    required_table_ids: set = {base_table.id}
+    security_owner_table_ids = _resolve_security_owner_table_ids(
+        security_column_owners, tables_by_id,
+        joins=joins, base_table_id=base_table.id,
+        columns_by_id=all_columns_by_id,
+    )
+    required_table_ids: set = {base_table.id} | security_owner_table_ids
     # semantic name (lower) → qualified physical reference ("alias"."col" or
     # a UDA expression). Spans base + joined relations.
     name_to_physical: dict[str, str] = {}
@@ -846,6 +1100,7 @@ async def _population_star_from_clause(
     connector: str,
     *,
     source_alias: str | None = None,
+    security_column_owners: Sequence[tuple[str, str]] | None = None,
 ) -> tuple[str, str | None] | None:
     """Build a deployed SELECT-* FROM clause and return its base alias.
 
@@ -865,8 +1120,15 @@ async def _population_star_from_clause(
     base_table = pick_anchor_table(tables_by_id.values())
     if base_table is None:
         return None
+    security_owner_table_ids = _resolve_security_owner_table_ids(
+        security_column_owners, tables_by_id,
+        joins=joins, base_table_id=base_table.id,
+        columns_by_id=columns_by_id,
+    )
     required_table_ids = augment_required_table_ids(
-        {base_table.id}, joins, table_ids=tables_by_id,
+        {base_table.id} | security_owner_table_ids,
+        joins,
+        table_ids=tables_by_id,
     )
     if required_table_ids is None:
         raise SemanticBindingError(
@@ -904,6 +1166,11 @@ async def _population_star_from_clause(
         alias_by_table_id=aliases,
         connector=connector,
     )
+    if from_clause is None and security_owner_table_ids:
+        raise SemanticBindingError(
+            "Cannot rewrite RLS SELECT * source SQL: a security owner "
+            "table is absent or unreachable from the query base table."
+        )
     if from_clause is None:
         return None
     return from_clause, aliases[base_table.id]
@@ -915,6 +1182,7 @@ async def _substitute_table_names(
     connector: str = "postgresql",
     *,
     include_population: bool = False,
+    security_column_owners: Sequence[tuple[str, str]] | None = None,
 ) -> str | None:
     """Replace semantic table names with physical table names in raw SQL.
     Used for SELECT * queries where we keep the star but fix the FROM clause.
@@ -1059,6 +1327,7 @@ async def _substitute_table_names(
                     db,
                     connector,
                     source_alias=source_alias,
+                    security_column_owners=security_column_owners,
                 )
                 if population_result is None:
                     raise SemanticBindingError(
@@ -1139,7 +1408,11 @@ async def _substitute_table_names(
 
 
 async def _build_no_columns_sql(
-    bound_query: BoundQuery, db: Any, target_dialect: str,
+    bound_query: BoundQuery,
+    db: Any,
+    target_dialect: str,
+    *,
+    security_column_owners: Sequence[tuple[str, str]] | None = None,
 ) -> str:
     """Build SQL for a query that resolves to no physical columns/UDAs.
 
@@ -1214,8 +1487,15 @@ async def _build_no_columns_sql(
                         "Cannot rewrite no-column source SQL: base table is "
                         "absent from the deployed graph."
                     )
+                security_owner_table_ids = _resolve_security_owner_table_ids(
+                    security_column_owners, tables_by_id,
+                    joins=joins, base_table_id=graph_base.id,
+                    columns_by_id=columns_by_id,
+                )
                 required = augment_required_table_ids(
-                    {graph_base.id}, joins, table_ids=tables_by_id,
+                    {graph_base.id} | security_owner_table_ids,
+                    joins,
+                    table_ids=tables_by_id,
                 )
                 if required is None:
                     raise SemanticBindingError(
@@ -1245,6 +1525,12 @@ async def _build_no_columns_sql(
                     alias_by_table_id=aliases,
                     connector="postgresql",
                 )
+                if not from_clause and security_owner_table_ids:
+                    raise SemanticBindingError(
+                        "Cannot rewrite RLS no-column source SQL: a security "
+                        "owner table is absent or unreachable from the query "
+                        "base table."
+                    )
                 if not from_clause:
                     raise SemanticBindingError(
                         "Cannot rewrite no-column source SQL: population "
@@ -1276,8 +1562,18 @@ async def _build_no_columns_sql(
             # Use the same mandatory-edge closure as COUNT(*) instead of
             # substituting only the fact table.
             if not from_tables:
+                if security_column_owners:
+                    raise SemanticBindingError(
+                        "Cannot rewrite RLS no-column source SQL: the query has "
+                        "no proven source relation for the security predicate."
+                    )
                 return _final_transpile(bound_query.logical_query.raw_query)
             if not getattr(bound_query.logical_query, "raw_query", None):
+                if security_column_owners:
+                    raise SemanticBindingError(
+                        "Cannot rewrite RLS no-column source SQL: the query has "
+                        "no proven source relation for the security predicate."
+                    )
                 return _final_transpile(bound_query.logical_query.raw_query)
             try:
                 _constant_from = await _population_from_clause()
@@ -1322,6 +1618,11 @@ async def _build_no_columns_sql(
                     return _final_transpile(tree.transform(_replace_table).sql(dialect="postgres"))
                 except Exception:
                     pass
+    if security_column_owners:
+        raise SemanticBindingError(
+            "Cannot rewrite RLS no-column source SQL: the owner-aware source "
+            "join plan could not be built."
+        )
     return _final_transpile(bound_query.logical_query.raw_query)
 
 
@@ -2805,8 +3106,160 @@ def _build_where_clause(
     return sql
 
 
+# Bug-9864: the marker column projected for grain column ``d`` so the caller can
+# tell "aggregated away -- this is the All row" from "grouped, and the member's
+# value happens to be NULL". Kept identical to ``api.routes.GROUPING_MARKER_PREFIX``
+# and to the gateway's ``subtotal_engine`` reader; a divergence here would make
+# every All row indistinguishable from a NULL member.
+GROUPING_MARKER_PREFIX = "_grouping__"
+
+
+def grouping_sets_dialects() -> frozenset[str]:
+    """Sqlglot dialects configured to serve a rollup lattice (Bug-9864).
+
+    Fails CLOSED on a missing or unreadable setting: an empty allow-list means
+    no dialect serves the lattice and every caller keeps the per-grain path,
+    which returns the same numbers.
+    """
+    try:
+        raw = system_snapshot_get("query_router.grouping_sets_dialects")
+    except Exception:
+        return frozenset()
+    if not raw:
+        return frozenset()
+    return frozenset(
+        part.strip().lower() for part in str(raw).split(",") if part.strip()
+    )
+
+
+class _GroupingSetsRender(NamedTuple):
+    """Rendered pieces for a rollup-lattice request (Bug-9864)."""
+
+    marker_pieces: list[str]   # extra SELECT items, one GROUPING() per grain col
+    group_by_clause: str       # the full "GROUP BY GROUPING SETS (...)" text
+
+
+def _build_grouping_sets_render(
+    bound_query: BoundQuery,
+    *,
+    dim_group_expr_by_name: dict[str, str],
+    variant_extra_group_by: list[str],
+    target_dialect: str | None,
+    qid,
+) -> "_GroupingSetsRender | None":
+    """Render ``GROUP BY GROUPING SETS`` plus its markers, or None.
+
+    Returns None for every ordinary query, so the plain GROUP BY path is
+    byte-identical when no lattice was requested.
+
+    The lattice arrives as ``LogicalQuery.grouping_sets`` -- semantic dimension
+    names already proven to be a subset of the bound grain by the execute
+    handler, which means each one survived binding, CLS and the persona allow
+    list as an ordinary grain column. This function only turns them into SQL, so
+    the persona model query underneath is exactly the one the equivalent
+    per-grain queries would have run against.
+
+    Everything it cannot render EXACTLY it refuses, because each failure mode is
+    a silent wrong-numbers bug in a pivot:
+
+    * a set naming a grain column with no physical expression -- the set would
+      silently group at a coarser grain than asked for;
+    * duplicate sets -- PostgreSQL happily returns the group twice, and the
+      caller, which maps rows back to grains by their grouping-marker vector,
+      would count it twice;
+    * a period-variant extra GROUP BY expression -- those are appended to the
+      grain unconditionally, so they are in every set, which is not the lattice
+      anyone asked for;
+    * a marker name colliding with a projected output name.
+    """
+    lq = bound_query.logical_query
+    sets = getattr(lq, "grouping_sets", None)
+    if not sets:
+        return None
+
+    allowed = grouping_sets_dialects()
+    if (target_dialect or "postgres").lower() not in allowed:
+        # Not an error in the request -- the caller simply cannot be served the
+        # lattice against this source. ``UnsupportedSQL`` is the typed 422 the
+        # XMLA gateway catches to fall back to one query per grain.
+        raise UnsupportedSQL(
+            f"Rollup lattices (GROUP BY GROUPING SETS) are not enabled for "
+            f"source dialect {target_dialect!r}."
+        )
+
+    if variant_extra_group_by:
+        raise SemanticBindingError(
+            "Cannot serve a rollup lattice for a query that also needs "
+            "period-variant grouping expressions: the variant expression "
+            "would be added to every grouping set, which is not the "
+            "requested lattice."
+        )
+
+    grain_names = set(lq.grain or [])
+    ordered_grain = [
+        dim.name for dim in bound_query.resolved_dimensions
+        if dim.name in grain_names and dim.name in dim_group_expr_by_name
+    ]
+    _seen: set[str] = set()
+    ordered_grain = [
+        n for n in ordered_grain if not (n in _seen or _seen.add(n))
+    ]
+
+    # Names that must never be shadowed by a marker alias.
+    _reserved = {n.lower() for n in ordered_grain}
+    _reserved |= {n.lower() for n in (lq.requested_dimensions or [])}
+    _reserved |= {n.lower() for n in (lq.requested_measures or [])}
+    for _se in getattr(lq, "select_expressions", []) or []:
+        if getattr(_se, "alias", None):
+            _reserved.add(str(_se.alias).lower())
+
+    marker_pieces: list[str] = []
+    for name in ordered_grain:
+        marker = f"{GROUPING_MARKER_PREFIX}{name}"
+        if marker.lower() in _reserved:
+            raise SemanticBindingError(
+                f"Cannot serve a rollup lattice: the grouping marker for "
+                f"{name!r} would collide with the projected column "
+                f"{marker!r}."
+            )
+        marker_pieces.append(
+            f"GROUPING({dim_group_expr_by_name[name]}) AS {qid(marker)}"
+        )
+
+    rendered_sets: list[str] = []
+    seen_sets: set[tuple[str, ...]] = set()
+    for gs in sets:
+        exprs: list[str] = []
+        for name in gs:
+            expr = dim_group_expr_by_name.get(name)
+            if expr is None:
+                raise SemanticBindingError(
+                    f"Cannot serve a rollup lattice: grouping set names "
+                    f"{name!r}, which has no physical column in this query."
+                )
+            exprs.append(expr)
+        key = tuple(sorted(exprs))
+        if key in seen_sets:
+            raise SemanticBindingError(
+                "Cannot serve a rollup lattice: two grouping sets group by "
+                "the same columns, so their rows could not be told apart."
+            )
+        seen_sets.add(key)
+        rendered_sets.append(f"({', '.join(exprs)})")
+
+    return _GroupingSetsRender(
+        marker_pieces=marker_pieces,
+        group_by_clause=" GROUP BY GROUPING SETS "
+                        f"({', '.join(rendered_sets)})",
+    )
+
+
 async def _build_source_sql(
-    bound_query: BoundQuery, db: Any, *, target_dialect: str | None = None,
+    bound_query: BoundQuery,
+    db: Any,
+    *,
+    target_dialect: str | None = None,
+    security_column_owners: Sequence[tuple[str, str]] | None = None,
 ) -> str:
     """Build SQL using physical table/column names from the semantic model."""
     # Resolve the target dialect so _final_transpile knows where to send the SQL.
@@ -2863,6 +3316,23 @@ async def _build_source_sql(
     if not dimensions_by_name:
         dimensions_by_name = {dim.name: dim for dim in bound_query.resolved_dimensions}
     filter_dim_names = {f.dimension_name for f in bound_query.resolved_filters}
+    predicate_measures: list[Any] = []
+    for predicate in getattr(bound_query, "resolved_measure_filters", None) or []:
+        predicate_measure = getattr(predicate, "measure", None)
+        if predicate_measure is None:
+            predicate_measure = next(
+                (
+                    measure for measure in bound_query.resolved_measures
+                    if measure.name == predicate.measure_name
+                ),
+                None,
+            )
+        if predicate_measure is None:
+            raise SemanticBindingError(
+                f"Cannot resolve measure predicate {predicate.measure_name!r} "
+                "to a deployed physical measure."
+            )
+        predicate_measures.append(predicate_measure)
     # Bug-5488: dimensions referenced ONLY inside an unresolvable WHERE
     # predicate (function-wrapped or OR-compound) never produce a LogicalFilter,
     # so they are absent from ``resolved_filters``. The binder collected them by
@@ -2968,6 +3438,13 @@ async def _build_source_sql(
             uda_ids.add(uda_id)
         if getattr(meas, "variant_of_measure_id", None):
             _variant_base_ids_to_load.add(str(meas.variant_of_measure_id))
+    for meas in predicate_measures:
+        source_col_id = getattr(meas, "source_column_id", None)
+        if source_col_id:
+            col_ids.add(source_col_id)
+        uda_id = getattr(meas, "user_defined_attribute_id", None)
+        if uda_id:
+            uda_ids.add(uda_id)
 
     if _variant_base_ids_to_load and db is not None:
         # F-013-01 residual (Lane A2): a time-variant measure's BASE measure
@@ -3134,7 +3611,12 @@ async def _build_source_sql(
                 col_ids.add(_ftd_col)
 
     if not col_ids and not uda_ids:
-        return await _build_no_columns_sql(bound_query, db, target_dialect)
+        return await _build_no_columns_sql(
+            bound_query,
+            db,
+            target_dialect,
+            security_column_owners=security_column_owners,
+        )
 
     # Load model graph + resolve required/base tables (extracted to
     # table_resolution.py — Phase 3 internal decomposition).
@@ -3142,6 +3624,32 @@ async def _build_source_sql(
         bound_query, db, uda_ids
     )
 
+    # Bug-9978: a dimension-only secured query defines the visible member set
+    # from rows admitted by the security-owning relation. Starting at the
+    # selected dimension makes that owner look like a one-to-many fan-out and
+    # correctly trips the aggregate safety guard below, even though this query
+    # has no measure to inflate. Resolve the owner first so a dimension-only
+    # GROUP BY can start there when every selected relation is reachable over
+    # to-one joins. If no owner has that safe outward path, keep the ordinary
+    # base and let the existing resolver fail closed.
+    dimension_only = not (
+        bound_query.resolved_measures
+        or calc_ref_measures_by_name
+        or predicate_measures
+        or _order_measures
+    )
+    unresolved_security_owner_ids = (
+        _resolve_security_owner_table_ids(security_column_owners, tables_by_id)
+        if dimension_only
+        else set()
+    )
+
+    # Bug-9837: a grouped subtotal may roll a security dimension out of the
+    # projection and GROUP BY while its compiled RLS predicate still belongs
+    # to that dimension's physical relation.  Keep the proven owner relation
+    # in the source join plan without projecting its security column.  The
+    # existing injector then qualifies the predicate against the owner alias
+    # and places it before aggregation.
     required_table_ids, base_table = _resolve_required_and_base_tables(
         bound_query,
         columns_by_id,
@@ -3154,8 +3662,35 @@ async def _build_source_sql(
         calc_ref_measures_by_name,
         _sa_finest_time_col_id,
         _sa_has_time_in_grain,
+        measure_predicate_measures=predicate_measures,
         joins=joins,
     )
+    if dimension_only and unresolved_security_owner_ids:
+        for owner_table_id in sorted(unresolved_security_owner_ids, key=str):
+            preserving = _row_preserving_reachable(
+                owner_table_id, joins, tables_by_id, columns_by_id,
+            )
+            if required_table_ids.issubset(preserving):
+                base_table = tables_by_id[owner_table_id]
+                break
+    # Bug-9930: the owner is resolved AFTER the base is chosen so the resolver
+    # can refuse an owner the base reaches only across a many side.
+    security_owner_table_ids = _resolve_security_owner_table_ids(
+        security_column_owners, tables_by_id,
+        joins=joins, base_table_id=base_table.id,
+        columns_by_id=columns_by_id,
+    )
+    if security_owner_table_ids:
+        required_table_ids = augment_required_table_ids(
+            required_table_ids | security_owner_table_ids,
+            joins,
+            table_ids=tables_by_id,
+        )
+        if required_table_ids is None:
+            raise SemanticBindingError(
+                "Cannot resolve source SQL: malformed join graph for an "
+                "RLS security owner."
+            )
 
     alias_by_table_id = {
         table_id: (tables_by_id[table_id].alias or f"t_{idx}")
@@ -3176,6 +3711,11 @@ async def _build_source_sql(
     )
 
     if not from_clause:
+        if security_owner_table_ids:
+            raise SemanticBindingError(
+                "Cannot rewrite source SQL: an RLS security owner table is "
+                "absent or unreachable from the query base table."
+            )
         if len(required_table_ids) > 1:
             raise ValueError(
                 _missing_join_error_message(
@@ -3242,7 +3782,7 @@ async def _build_source_sql(
                 # Bug-917: the UDA's table is not in the FROM clause, so its
                 # expression was never built. Treat as unresolved (fall through)
                 # rather than emitting the literal string "(None)".
-        for m in list(bound_query.resolved_measures) + _order_measures:
+        for m in list(bound_query.resolved_measures) + predicate_measures + _order_measures:
             if m.name == semantic_name:
                 mc = columns_by_id.get(getattr(m, "source_column_id", None))
                 if mc:
@@ -3333,7 +3873,7 @@ async def _build_source_sql(
             uda = uda_by_id.get(uda_id) if uda_id else None
             if uda is not None and getattr(uda, "output_data_type", None):
                 return uda.output_data_type
-        for m in list(bound_query.resolved_measures) + _order_measures:
+        for m in list(bound_query.resolved_measures) + predicate_measures + _order_measures:
             if m.name == name:
                 mc = columns_by_id.get(getattr(m, "source_column_id", None))
                 if mc is not None and getattr(mc, "data_type", None):
@@ -3657,6 +4197,19 @@ async def _build_source_sql(
     select_pieces.sort(key=lambda p: p[0])
     select_parts: list[str] = [sql for _, sql in select_pieces]
 
+    # Bug-9864: a rollup-lattice request projects one GROUPING() marker per
+    # grain column alongside the ordinary SELECT list, and replaces the plain
+    # GROUP BY below. None for every other query.
+    _grouping_sets_render = _build_grouping_sets_render(
+        bound_query,
+        dim_group_expr_by_name=dim_group_expr_by_name,
+        variant_extra_group_by=_variant_extra_group_by,
+        target_dialect=target_dialect,
+        qid=_qid,
+    )
+    if _grouping_sets_render is not None:
+        select_parts.extend(_grouping_sets_render.marker_pieces)
+
     if not select_parts:
         # Phase 2 fail-loud (Finding 3): nothing could be rendered into the
         # SELECT list despite a resolved FROM clause — refuse to fall back
@@ -3747,7 +4300,14 @@ async def _build_source_sql(
             or not getattr(bound_query.logical_query, "has_distinct", False)
         )
         if grain_group_exprs and _needs_group_by:
-            sql += f" GROUP BY {', '.join(grain_group_exprs)}"
+            # Bug-9864: the lattice replaces the plain GROUP BY. The grain, the
+            # FROM, the WHERE (persona default filters, CLS, RLS) and every
+            # projection above are unchanged -- only the grouping clause differs
+            # from the per-grain query this one source operation replaces.
+            if _grouping_sets_render is not None:
+                sql += _grouping_sets_render.group_by_clause
+            else:
+                sql += f" GROUP BY {', '.join(grain_group_exprs)}"
 
     # Build SELECT alias map so HAVING and ORDER BY can reference aliases like
     # "total_amount" from "SUM(transaction_amount) AS total_amount".
@@ -3854,6 +4414,42 @@ async def _build_source_sql(
             # user gets a clear diagnostic instead of a confusing source-DB
             # "column does not exist" error.
             sql += " " + having_raw
+
+    # Bug-9824: render structured measure predicates after grouping. Keeping
+    # these out of ``resolved_filters`` is the root-cause guard against turning
+    # a grouped-value condition into a row-level WHERE predicate.
+    structured_having_parts: list[str] = []
+    for predicate in getattr(bound_query, "resolved_measure_filters", None) or []:
+        measure_expr = _get_phys_expr(predicate.measure_name)
+        if not measure_expr:
+            raise SemanticBindingError(
+                f"Cannot resolve measure predicate {predicate.measure_name!r} "
+                "to a source expression."
+            )
+        aggregation = (predicate.effective_aggregation or "").lower()
+        if aggregation == "count_distinct":
+            aggregate_expr = f"COUNT(DISTINCT {measure_expr})"
+        elif aggregation == "count":
+            aggregate_expr = f"COUNT({measure_expr})"
+        else:
+            aggregate_expr = f"{aggregation.upper()}({measure_expr})"
+        structured_having_parts.append(
+            _render_condition(
+                aggregate_expr,
+                predicate.operator,
+                predicate.value,
+                predicate.value_type or _get_col_type(predicate.measure_name),
+                like_escape=predicate.like_escape,
+                connector="postgresql",
+                source_connector=_dialect_to_connector(target_dialect),
+            )
+        )
+    if structured_having_parts:
+        structured_having = " AND ".join(structured_having_parts)
+        if having_raw:
+            sql += f" AND {structured_having}"
+        else:
+            sql += f" HAVING {structured_having}"
 
     # F-003-01: the parser only extracts ORDER BY items that are faithfully
     # representable as ``(bare_column, direction)``. When the ORDER BY contains

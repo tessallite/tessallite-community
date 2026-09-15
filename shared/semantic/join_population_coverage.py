@@ -39,6 +39,7 @@ _CALL_SYMBOLS = frozenset({
     "_build_joined_from_clause",
     "_resolve_required_and_base_tables",
     "_population_star_from_clause",
+    "compile_aggregate_model_query",
     "bind_query_to_model",
     "_full_refresh_aggregate_locked",
     "_incremental_refresh_aggregate_locked",
@@ -132,8 +133,8 @@ CONSUMER_INVENTORY: tuple[ConsumerSpec, ...] = (
     ConsumerSpec(
         "services/scheduler/src/jobs/full_refresh.py",
         "_full_refresh_aggregate_locked",
-        ("_build_from_clause",),
-        "scheduler full materialization delegates to shared builder",
+        ("compile_aggregate_model_query",),
+        "scheduler full materialization uses the router model compile",
     ),
     ConsumerSpec(
         "services/scheduler/src/jobs/incremental_refresh.py",
@@ -144,8 +145,8 @@ CONSUMER_INVENTORY: tuple[ConsumerSpec, ...] = (
     ConsumerSpec(
         "services/scheduler/src/jobs/incremental_refresh.py",
         "_incremental_refresh_aggregate_locked",
-        ("_build_from_clause",),
-        "scheduler incremental materialization delegates to shared builder",
+        ("compile_aggregate_model_query",),
+        "scheduler incremental materialization uses the router model compile",
     ),
     ConsumerSpec(
         "services/query-router/src/routing/aggregate_population.py",
@@ -188,6 +189,18 @@ CONSUMER_INVENTORY: tuple[ConsumerSpec, ...] = (
         "_get_rewritten_sql",
         ("NQ_CANONICAL_FORCE_ROUTE",),
         "NQ refresh wrapper routes through /explain source compile",
+    ),
+    ConsumerSpec(
+        "shared/semantic/aggregate_model_query.py",
+        "compile_aggregate_model_query",
+        ("_get_rewritten_sql",),
+        "aggregate build uses the router-backed model compile",
+    ),
+    ConsumerSpec(
+        "shared/semantic/aggregate_model_query.py",
+        "_get_rewritten_sql",
+        ("compile_sql",),
+        "aggregate build reuses the Named Query /explain source seam",
     ),
     ConsumerSpec(
         "services/query-router/src/routing/named_query_generation_guard.py",
@@ -342,6 +355,7 @@ _SEMANTIC_SINK_CALLS = frozenset({
     "_build_from_clause",
     "_build_joined_from_clause",
     "_resolve_required_and_base_tables",
+    "plan_join_tree",
     "_try_join",
     "postgres_ddl.build_pg_ctas",
     "build_pg_ctas",
@@ -356,6 +370,10 @@ _SEMANTIC_TRANSFORM_CALLS = frozenset({
     "population_defining_join_rows",
     "population_defining_table_ids",
     "_population_star_from_clause",
+    # The compiler returns a structured SQL artifact. Its governed use is the
+    # artifact's SQL/output metadata reaching the materialisation plan, not a
+    # second FROM-builder call in the caller.
+    "compile_aggregate_model_query",
 })
 
 
@@ -466,9 +484,47 @@ def _ordered_value_reaches_sink(
                 )
                 if _node_position(parent) == after or has_source_name:
                     continue
+                if isinstance(value, ast.Call):
+                    value_name = _qualified_name(value.func)
+                    value_terminal = value_name.rsplit(".", 1)[-1] if value_name else None
+                    if value_terminal in (_SEMANTIC_TRANSFORM_CALLS | {"augment_required_table_ids"}):
+                        targets = _target_names(parent)
+                        return any(
+                            _ordered_value_has_governed_use(
+                                function_node,
+                                parents,
+                                target,
+                                _node_position(parent),
+                                seen=set(),
+                            )
+                            for target in targets
+                        )
             return False  # the contract value was killed before consumption
         if _is_validation_only_use(event, parents):
             continue
+        if isinstance(parent, ast.Call):
+            # ``set(contract_value)`` is the bounded representation change used
+            # by the shared FROM builder before it passes the closure to the
+            # join planner. A discarded ``tuple(contract_value)`` remains a
+            # non-sink observation and is intentionally not accepted here.
+            raw_name = _qualified_name(parent.func)
+            terminal = raw_name.rsplit(".", 1)[-1] if raw_name else None
+            if terminal in {"set", "frozenset"}:
+                assignment = parents.get(parent)
+                while isinstance(assignment, (ast.IfExp, ast.BoolOp, ast.UnaryOp)):
+                    assignment = parents.get(assignment)
+                if isinstance(assignment, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                    targets = _target_names(assignment)
+                    return any(
+                        _ordered_value_reaches_sink(
+                            function_node,
+                            parents,
+                            target,
+                            _node_position(assignment),
+                            seen=seen,
+                        )
+                        for target in targets
+                    )
         if isinstance(parent, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
             targets = _target_names(parent)
             if targets:

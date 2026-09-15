@@ -90,6 +90,9 @@ BUILDER_MODULES = [
     # LEFT JOIN chain decides the CTAS's row membership. Its reads shape the
     # CTAS as directly as any renderer's.
     "tessallite/shared/semantic/graph_order.py",
+    # Bug-8637: the build-side semantic projection reads the model slug and
+    # defines the exact model-query envelope sent to the source compiler.
+    "tessallite/shared/semantic/aggregate_model_query.py",
 ]
 
 #: Modules reachable from a writer that read ORM entities but do NOT shape the
@@ -128,6 +131,24 @@ NON_BUILDER_MODULES = {
     ),
     "tessallite/shared/semantic/model_validator.py": (
         "validates an artifact against the model; produces no SQL"
+    ),
+    "tessallite/shared/named_query/refresh.py": (
+        "aggregate_model_query reuses only its service-token and /explain helpers; "
+        "the Named Query artifact reads are not aggregate build inputs"
+    ),
+    "tessallite/shared/named_query/refresh_guard.py": (
+        "Named Query artifact refresh guard; no aggregate SQL or model shape"
+    ),
+    "tessallite/shared/pocket/incremental.py": (
+        "pocket incremental refresh support reached by shared refresh imports; "
+        "not part of aggregate SQL or model shape"
+    ),
+    "tessallite/shared/pocket/refresh.py": (
+        "pocket refresh support reached by shared refresh imports; not part of "
+        "aggregate SQL or model shape"
+    ),
+    "tessallite/shared/pocket/refresh_guard.py": (
+        "pocket artifact refresh guard; no aggregate SQL or model shape"
     ),
     "tessallite/shared/semantic/attribute_relationship_deploy_verify.py": (
         "runs AFTER the build to record verification evidence on the artifact "

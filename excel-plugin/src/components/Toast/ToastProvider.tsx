@@ -83,7 +83,18 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={{ showToast }}>
       {children}
+      {/*
+        Bug-9884: the toast stack is the ONLY place several actions report
+        their outcome — including the local-PivotTable refusal, which is the
+        difference between "nothing happened" and "Excel would have
+        re-aggregated this measure wrongly". Without a live region a screen
+        reader announces none of it. `aria-live` sits on the CONTAINER, which
+        exists from first render, because a live region added to the DOM at the
+        same moment as its content is not reliably announced.
+      */}
       <Box
+        aria-live="polite"
+        aria-atomic="false"
         sx={{
           position: 'fixed',
           bottom: 36,
@@ -100,6 +111,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           return (
             <Box
               key={toast.id}
+              role={toast.severity === 'error' ? 'alert' : 'status'}
               sx={{
                 display: 'flex',
                 alignItems: 'center',

@@ -28,6 +28,13 @@ function keyJoin(parts: string[]): string {
   return JSON.stringify(parts);
 }
 
+// Bug-7284: identifies the exact (ordered) row/col dimension selection an
+// executeResult answers. Reordering counts as a different key, since a
+// reorder changes row/col key semantics just as much as an add/remove.
+export function pivotDimsKey(rowDimIds: string[], colDimIds: string[]): string {
+  return `${rowDimIds.join(",")}|${colDimIds.join(",")}`;
+}
+
 // F-019-13: numeric-aware tuple ordering. The default order is over rendered
 // strings, which sorts numeric members as 1, 10, 11, 2, … . When the raw
 // values for a position are both numbers, compare them numerically so months,

@@ -5,9 +5,10 @@ import { Box } from "@mui/material";
 
 interface MarkdownAnswerProps {
   content: string;
+  compact?: boolean;
 }
 
-export function MarkdownAnswer({ content }: MarkdownAnswerProps) {
+export function MarkdownAnswer({ content, compact = false }: MarkdownAnswerProps) {
   const displayContent = useMemo(() => normalizePlainNarration(content), [content]);
   const components = useMemo(
     () => ({
@@ -95,13 +96,14 @@ export function MarkdownAnswer({ content }: MarkdownAnswerProps) {
   return (
     <Box
       sx={{
-        fontSize: 15,
-        lineHeight: 1.6,
+        ...(compact ? { px: 1, py: 0.5 } : {}),
+        fontSize: compact ? 12 : 15,
+        lineHeight: compact ? 1.4 : 1.6,
         minWidth: 0,
         maxWidth: "100%",
         overflowWrap: "anywhere",
         wordBreak: "break-word",
-        "& h1, & h2, & h3, & h4, & h5, & h6": { mt: 1.5, mb: 0.5 },
+        "& h1, & h2, & h3, & h4, & h5, & h6": { mt: compact ? 0.75 : 1.5, mb: 0.5 },
         "& p": { my: 0.5 },
         "& ul, & ol": { my: 0.5, pl: 2 },
         "& li": { my: 0.25 },

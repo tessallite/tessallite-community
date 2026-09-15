@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 
 from fastapi import APIRouter, Body, Depends, HTTPException, status
@@ -27,6 +28,7 @@ from shared.db.models import (
     WebhookEndpoint,
 )
 from shared.db.session import get_system_db, get_tenant_db, normalize_tenant_db_url
+from shared.db.tenant_readiness import raise_tenant_readiness_error
 from shared.licensing.errors import LicenseError
 from shared.licensing.loader import build_registry
 from shared.licensing.verify import verify_license
@@ -45,6 +47,45 @@ from src.licensing_guard import (
 
 settings = get_settings()
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_system_admin)])
+logger = logging.getLogger(__name__)
+
+# Alembic and SQLAlchemy include the connection URL in some driver failures.
+# Keep the diagnostic while replacing the complete database URL token. Database
+# user, host, port, database name, query parameters, and password are all
+# sensitive and are not needed to identify the failing migration.
+_DSN_PATTERN = re.compile(
+    r"\b(?:postgres(?:ql)?|mysql|mariadb|mssql|oracle|redshift|snowflake|sqlite)"
+    r"(?:\+[a-z0-9_.-]+)?://[^\s\"'<>]+",
+    re.IGNORECASE,
+)
+_REDACTED_DSN = "<redacted-dsn>"
+
+
+def _redact_dsn(text: str) -> str:
+    """Replace database DSN tokens in operator-facing text."""
+    return _DSN_PATTERN.sub(_REDACTED_DSN, text)
+
+
+class AlembicMigrationError(RuntimeError):
+    """A failed Alembic subprocess with safe diagnostics for callers."""
+
+    def __init__(
+        self,
+        *,
+        phase: str,
+        tenant_slug: str,
+        target_revision: str,
+        stderr: str,
+    ) -> None:
+        self.phase = phase
+        self.tenant_slug = tenant_slug or "<system>"
+        self.target_revision = target_revision
+        self.redacted_stderr = _redact_dsn(stderr.strip()) or "<empty>"
+        super().__init__(
+            f"Alembic migration failed phase={self.phase} "
+            f"tenant={self.tenant_slug} target={self.target_revision} "
+            f"stderr={self.redacted_stderr}"
+        )
 
 # Cloud Run uses tessallite/shared/, local dev uses shared/
 ALEMBIC_INI_CANDIDATES = [
@@ -85,10 +126,20 @@ def _run_alembic(mode: str, tenant_slug: str = "", database_url: str = "") -> di
     )
 
     if result.returncode != 0:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Migration failed: {result.stderr.strip()}",
+        error = AlembicMigrationError(
+            phase=mode,
+            tenant_slug=tenant_slug,
+            target_revision=target,
+            stderr=result.stderr,
         )
+        logger.error(
+            "Alembic migration failed phase=%s tenant=%s target=%s stderr=%s",
+            error.phase,
+            error.tenant_slug,
+            error.target_revision,
+            error.redacted_stderr,
+        )
+        raise error
 
     return {"status": "ok", "mode": mode, "output": result.stdout.strip()}
 
@@ -96,7 +147,13 @@ def _run_alembic(mode: str, tenant_slug: str = "", database_url: str = "") -> di
 @router.post("/migrate/system")
 async def migrate_system() -> dict:
     """Run Alembic migrations for the system schema (tess_system)."""
-    return _run_alembic("system")
+    try:
+        return _run_alembic("system")
+    except AlembicMigrationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Migration failed: {exc.redacted_stderr}",
+        ) from exc
 
 
 @router.post("/migrate/tenant/{tenant_slug}")
@@ -112,16 +169,27 @@ async def migrate_tenant(
     if tenant is None:
         raise HTTPException(status_code=404, detail=f"Tenant '{tenant_slug}' not found")
 
-    db_url = normalize_tenant_db_url(
-        decrypt_str(tenant.encrypted_db_url),
-        tenant.slug,
-    )
-
-    return _run_alembic("tenant", tenant_slug, database_url=db_url)
-
-
-logger = logging.getLogger(__name__)
-
+    try:
+        try:
+            db_url = normalize_tenant_db_url(
+                decrypt_str(tenant.encrypted_db_url),
+                tenant.slug,
+            )
+        except Exception as exc:  # noqa: BLE001 - report an actionable 503
+            raise_tenant_readiness_error(
+                tenant_slug=tenant.slug,
+                operation="system-admin tenant migration",
+                cause=(
+                    "stored DB credentials cannot be decrypted with configured keys"
+                ),
+                original=exc,
+            )
+        return _run_alembic("tenant", tenant_slug, database_url=db_url)
+    except AlembicMigrationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Migration failed: {exc.redacted_stderr}",
+        ) from exc
 
 async def _rotate_model_blobs(
     db: AsyncSession,

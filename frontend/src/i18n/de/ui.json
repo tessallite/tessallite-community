@@ -161,6 +161,8 @@
   "projectNav.demoTenant": "Demo-Mandant",
   "projectNav.setup": "Einrichtung",
   "projectNav.ssoMappings": "SSO-Mappings",
+  "projectNav.ssoIdp": "Identitätsanbieter",
+  "projectNav.embedTokens": "Einbettungs-Tokens",
   "projectNav.usersAccess": "Benutzer & Zugriff",
   "projectNav.webhooks": "Webhooks",
   "ui.aServiceRestartIsRequiredForThisChangeTo": "Ein Neustart des Dienstes ist erforderlich, damit diese Änderung wirksam wird",

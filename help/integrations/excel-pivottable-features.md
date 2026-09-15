@@ -2,7 +2,7 @@
 title: "Excel PivotTable Features"
 audience: analyst
 area: Integrations
-updated: 2026-06-14
+updated: 2026-09-10
 ---
 
 ## What this covers
@@ -77,7 +77,35 @@ Reference a single PivotTable value from elsewhere in the workbook with `GETPIVO
 
 ## Hierarchies and subtotals
 
-Date, geography, and entity hierarchies appear in the field list with working expand/collapse. When you place more than one hierarchy on an axis, Tessallite computes the cross-product of subtotal levels so each subtotal and grand total is correct for additive measures. Non-additive measures (such as a ratio) show a dash in the total row instead of a misleading sum.
+The field list is grouped so you can find things quickly: **Measures**, **KPIs**, **Dimensions** (single-level attributes such as account type), **Time** (every date field together with its calendar hierarchy — Year, Quarter, Month, Day — so a date is one place to look, and Excel's Timeline filter works on it) and **Hierarchies** (the other multi-level hierarchies, such as Country > City > Channel). Date, geography, and entity hierarchies appear with working expand/collapse. When you place more than one hierarchy on an axis, Tessallite computes the cross-product of subtotal levels so each subtotal and grand total is correct for additive measures. Non-additive measures (such as a ratio) show a dash in the total row instead of a misleading sum.
+
+Tessallite uses the same stable member identity in the field-list metadata and in plain, subtotal, and grand-total query results. Captions can stay business-friendly without changing that identity, so Excel can match refreshed members to the PivotCache stored in the workbook.
+
+Row security applies while Excel is building the member list, before you add a
+measure. If you may read Web transactions but not Store transactions, a
+channel-only list contains Web and leaves out Store. A flat date field also
+behaves like any other PivotTable field when it is combined with another field:
+the requested field totals and grand total are calculated from the rows you may
+see.
+
+### Subtotals: one switch per level
+
+**What a hierarchy is in a PivotTable.** A hierarchy is a ladder of levels, from the widest to the narrowest: Country, then City, then Channel. In the Rows pane the whole ladder appears as one box. Underneath that box, Excel keeps one field for each rung. Each rung has its own settings, and one of those settings is whether it shows a total row.
+
+**What a total row is for.** When you expand a country to see its cities, the country's own number moves off its own line and onto a line called `GB Total`, below its cities. The same happens one rung down: expand London to see its channels and London's number moves to `London Total`. A member you have not expanded keeps its number on its own line. This is how every OLAP PivotTable works, in Excel and in Analysis Services.
+
+**Why a level can look empty.** If a rung's total switch is off, an expanded member on that rung has nowhere to put its number, so its line stays blank. Nothing is missing; the number is simply not shown. Turn the switch on for that rung and the total line appears with the number on it.
+
+**Why one switch is not enough.** The Field Settings dialog only ever changes the rung it was opened for. Open it from the box in the Rows pane, or from a country cell, and it changes Country alone. That gives you `GB Total` but not `London Total`, and London's line stays blank while Manchester, which is not expanded, shows its number. This surprises many people the first time.
+
+**How to turn totals on.**
+
+- **Every rung at once, the simple way:** on the PivotTable **Design** tab choose **Subtotals**, then **Show all Subtotals at Bottom of Group** (or at Top of Group). Every rung of every hierarchy on the axis gets its total row.
+- **One rung at a time:** right-click a cell that sits on that rung, for example the London cell, and choose **Field Settings**. The dialog names the rung you are changing next to *Source Name* (here `City`). Choose **Automatic** under Subtotals. Repeat for any other rung.
+
+**How to check it is right.** Each total is one figure calculated by Tessallite, not a number Excel adds up on screen. A country total is exactly the sum of its cities, and a city total is exactly the sum of its channels. If you add the lines yourself you will get the same figure to the last penny.
+
+**Tip.** Set the subtotal choice once, on the Design tab, before you start expanding. Then every member you open later already has its total line, and the table reads the same way at every depth.
 
 ---
 
@@ -91,7 +119,7 @@ A worked example: drop the "Net Revenue" KPI's Value and Status onto a pivot. Va
 
 A few rules keep the number honest:
 
-- **Status is evaluated for the whole model, not per slice.** You cannot break Status down by a dimension (for example, Status by Region) or put a dimension on the report filter next to it. If you try, Tessallite returns a clear message asking you to remove the breakdown, rather than repeating one model-wide verdict against every region as if it were sliced. To compare regions, use the underlying measure and the model owner's regional KPIs instead.
+- **Goal and Status are one figure for the whole model, not per slice.** Only the KPI Value can be broken down by a dimension. You cannot break Goal or Status down by a dimension (for example, Status by Region) or put a dimension on the report filter next to Status. If you try, Tessallite returns a clear message asking you to remove the breakdown, rather than repeating one model-wide target or verdict against every region as if it were sliced. Build the KPI table on its own (Value, Goal, Status with no row or column field), and use the underlying measure and the model owner's regional KPIs to compare regions. The same rule applies to the model information measures (Last Refreshed, Source System, Owner): they are one value for the whole model and are refused with a dimension breakdown.
 - **Value and Goal can sit on a pivot with dimensions** in the normal way — they are ordinary numbers.
 - Each KPI must have a unique name. If two KPIs share the same caption, Tessallite asks the model owner to rename them rather than guess which verdict you meant.
 

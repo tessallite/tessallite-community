@@ -349,3 +349,61 @@ describe("DimensionsPanel surfaces the server's calendar rejection reason", () =
     expect(screen.queryByText(SERVER_MESSAGE)).toBeNull();
   });
 });
+
+describe("DimensionsPanel surfaces the server's save-failure reason (Bug-8938)", () => {
+  // The calendar-association PATCH (above) already surfaced its server reason;
+  // the main create/update save path still rendered a fixed
+  // "Failed to create/update dimension." string regardless of why the server
+  // refused (e.g. a duplicate name, a body-FK violation on the dimension
+  // itself). extractApiError now backs both alerts.
+  const SERVER_MESSAGE = "A dimension named \"customer\" already exists on this table.";
+
+  beforeEach(() => {
+    createDimMock.mockReset();
+    updateDimMock.mockReset();
+    deleteDimMock.mockReset().mockResolvedValue({});
+    updateTableMock.mockReset();
+    useDimensionsMock.mockReset();
+  });
+
+  async function openCreateDialog(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByText("Add"));
+    await waitFor(() => expect(screen.getByText("Source Column")).toBeTruthy());
+    await user.type(screen.getByLabelText(/^Name/), "customer");
+    await selectOption(user, "Table", /customer \(customer\)/);
+    await selectOption(user, "Attribute", "customer_key");
+  }
+
+  it("renders the server's 422 message on a failed create, not the generic sentence", async () => {
+    useDimensionsMock.mockReturnValue({ data: [], isLoading: false });
+    createDimMock.mockRejectedValue({
+      response: { status: 422, data: { detail: SERVER_MESSAGE } },
+    });
+    renderPanel();
+    const user = userEvent.setup();
+
+    await openCreateDialog(user);
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: /^Add$/ }),
+    );
+
+    await waitFor(() => expect(createDimMock).toHaveBeenCalled());
+    expect(await screen.findByText(SERVER_MESSAGE)).toBeTruthy();
+    expect(screen.queryByText("Failed to create dimension.")).toBeNull();
+  });
+
+  it("falls back to the generic sentence when the failure carries no server detail", async () => {
+    useDimensionsMock.mockReturnValue({ data: [], isLoading: false });
+    createDimMock.mockRejectedValue({ message: "Network Error" });
+    renderPanel();
+    const user = userEvent.setup();
+
+    await openCreateDialog(user);
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: /^Add$/ }),
+    );
+
+    await waitFor(() => expect(createDimMock).toHaveBeenCalled());
+    expect(await screen.findByText("Failed to create dimension.")).toBeTruthy();
+  });
+});

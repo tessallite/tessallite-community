@@ -2,7 +2,7 @@
 title: "Agent Stop Button"
 audience: all
 area: agent
-updated: 2026-05-24
+updated: 2026-09-01
 ---
 
 ## What this covers
@@ -20,8 +20,9 @@ The Stop button replaces the Send button whenever a server-sent events (SSE) str
 ## What happens when you click Stop
 
 1. The frontend fires an **AbortController** signal, which terminates the active `fetch()` request.
-2. The SSE stream closes immediately. Whatever tokens have already arrived remain visible in the chat.
-3. The conversation is left in a consistent state. You can send a new message or export the conversation as-is.
+2. The active stream reader is cancelled, whether you stop before response headers, before the first event, or after partial text has arrived.
+3. Whatever tokens have already arrived remain visible in the chat. Late events from the stopped request are ignored and cannot alter a newer response.
+4. The conversation is left in a consistent state. You can send a new message or export the conversation as-is.
 
 ---
 

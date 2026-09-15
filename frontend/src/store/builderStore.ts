@@ -82,10 +82,17 @@ export interface ValidationIssue {
 export type MessageSeverity = "info" | "success" | "warning" | "error";
 
 export interface GlobalMessage {
+  id: number;
   text: string;
   severity: MessageSeverity;
   at: number;
 }
+
+// User-requested notification bell (2026-08-25): the toast Snackbar
+// auto-hides after 6s, so a message the user was away for was gone for
+// good. History keeps the last N messages so the bell can show them.
+const MESSAGE_HISTORY_LIMIT = 30;
+let messageIdCounter = 0;
 
 // ---------------------------------------------------------------------------
 // State
@@ -123,6 +130,11 @@ interface BuilderState {
   /* Latest global status message shown in the bottom bar */
   globalMessage: GlobalMessage | null;
 
+  /* Rolling history of global messages (newest first), for the notification
+     bell — the toast itself auto-hides after 6s. */
+  messageHistory: GlobalMessage[];
+  unreadMessageCount: number;
+
   /* Relation layout settings */
   relationNotation: RelationNotation;
   relationPathing: RelationPathing;
@@ -151,6 +163,17 @@ interface BuilderState {
     colDimIds: string[];
     executeResult: unknown | null;
     error: string | null;
+    /**
+     * Bug-7284 (GPT review P4-R1-001): the dims `executeResult` was actually
+     * executed against, captured ONLY on a successful run — never rewritten
+     * merely because rowDimIds/colDimIds changed. Without this as its OWN
+     * persisted field, a remount (e.g. Pivot -> Freeform -> Pivot) re-seeded
+     * the "executed dims" ref from the CURRENT rowDimIds/colDimIds, which by
+     * then already reflect the post-change dims — falsely marking the STALE
+     * carried-over executeResult as fresh and reopening the exact "(null)"
+     * re-pivot bug the staleness gate exists to prevent.
+     */
+    executedDimsKey: string | null;
   };
 
   /* Active display locale for i18n translations (null = default English) */
@@ -185,6 +208,8 @@ interface BuilderState {
   clearFocusedTable: () => void;
   setGlobalMessage: (text: string, severity?: MessageSeverity) => void;
   clearGlobalMessage: () => void;
+  markMessagesRead: () => void;
+  clearMessageHistory: () => void;
   setRelationNotation: (notation: RelationNotation) => void;
   setRelationPathing: (pathing: RelationPathing) => void;
   setRelationTerminalOverride: (joinId: string, override: { source: string; target: string }) => void;
@@ -279,6 +304,8 @@ const initialState = {
   focusedTableId: null as string | null,
   focusedSourceId: null as string | null,
   globalMessage: null as GlobalMessage | null,
+  messageHistory: [] as GlobalMessage[],
+  unreadMessageCount: 0,
   relationNotation: loadRelationNotation(),
   relationPathing: loadRelationPathing(),
   relationTerminalOverrides: loadTerminalOverrides(),
@@ -292,6 +319,7 @@ const initialState = {
     colDimIds: [] as string[],
     executeResult: null as unknown | null,
     error: null as string | null,
+    executedDimsKey: null as string | null,
   },
   displayLocale: loadDisplayLocale() as string | null,
   pendingSql: null as string | null,
@@ -331,8 +359,33 @@ export const useBuilderStore = create<BuilderState>()((set, get) => ({
     set({ focusedTableId: null, focusedSourceId: null }),
 
   setGlobalMessage: (text, severity = "info") =>
-    set({ globalMessage: { text, severity, at: Date.now() } }),
+    set((s) => {
+      const message: GlobalMessage = {
+        id: ++messageIdCounter,
+        text,
+        severity,
+        at: Date.now(),
+      };
+      // User-requested (2026-08-25): the notification bell's rolling history
+      // is for persistent-worthy outcomes (a save/deploy/export/publish
+      // succeeded or failed) — not transient "info"-severity UI
+      // acknowledgments (e.g. "read-only, action refused", "link copied"),
+      // which stay as a toast only and are never worth reviewing later.
+      // Confirmation dialogs never reach this store at all (they go through
+      // useConfirm(), a separate mechanism), so there is nothing to filter
+      // there.
+      if (severity === "info") {
+        return { globalMessage: message };
+      }
+      return {
+        globalMessage: message,
+        messageHistory: [message, ...s.messageHistory].slice(0, MESSAGE_HISTORY_LIMIT),
+        unreadMessageCount: s.unreadMessageCount + 1,
+      };
+    }),
   clearGlobalMessage: () => set({ globalMessage: null }),
+  markMessagesRead: () => set({ unreadMessageCount: 0 }),
+  clearMessageHistory: () => set({ messageHistory: [], unreadMessageCount: 0 }),
 
   setRelationNotation: (notation) => {
     persist(LS_NOTATION, notation);

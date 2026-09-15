@@ -13,6 +13,7 @@ import {
 import UploadFileIcon from "@mui/icons-material/UploadFile";
 import { adminApi, type LicenseStatusDetail } from "../api/client";
 import { useT } from "../i18n";
+import { useConfirm } from "./Confirm";
 
 /**
  * System-admin License Manager: shows install state and lets an admin install or
@@ -22,6 +23,7 @@ import { useT } from "../i18n";
  */
 export default function LicenseManagerCard() {
   const t = useT();
+  const confirm = useConfirm();
   const qc = useQueryClient();
   const fileRef = useRef<HTMLInputElement | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -171,8 +173,16 @@ export default function LicenseManagerCard() {
               size="small"
               color="warning"
               disabled={uninstall.isPending || !data.has_license}
-              onClick={() => {
-                if (!window.confirm(t("license.manager.uninstallConfirm"))) return;
+              onClick={async () => {
+                // Bug-9559: use the app's canonical confirmation dialog
+                // instead of a raw window.confirm(), matching every other
+                // destructive-action confirmation in the frontend.
+                const ok = await confirm({
+                  title: t("license.manager.uninstallConfirmTitle"),
+                  message: t("license.manager.uninstallConfirm"),
+                  confirmLabel: t("license.manager.uninstallButton"),
+                });
+                if (!ok) return;
                 uninstall.mutate();
               }}
             >

@@ -11,15 +11,16 @@
  */
 import { Alert } from "@mui/material";
 import { useT } from "../../i18n";
-import { useModelNeedsSaveOrDeploy } from "../../store/useModelEditorStore";
+import { useModelEditorStore, useModelNeedsSaveOrDeploy } from "../../store/useModelEditorStore";
 
 export default function UnsavedDeployWarning() {
   const t = useT();
   const needsSaveOrDeploy = useModelNeedsSaveOrDeploy();
+  const hasDeployment = useModelEditorStore((s) => s.deployedVersion !== null);
   if (!needsSaveOrDeploy) return null;
   return (
-    <Alert severity="warning" data-testid="unsaved-deploy-warning" sx={{ py: 0.25 }}>
-      {t("modelSync.queryPanelWarning")}
+    <Alert severity={hasDeployment ? "warning" : "info"} data-testid="unsaved-deploy-warning" sx={{ py: 0.25 }}>
+      {t(hasDeployment ? "modelSync.queryPanelWarning" : "modelSync.notDeployed")}
     </Alert>
   );
 }

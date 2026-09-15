@@ -11,6 +11,7 @@ import {
   invalidateMetadataCache, withTableLocksKeys, blockKeysForAddress,
   type EntityManifest, type StaleEntity,
 } from '../utils/workbookMetadata';
+import { refreshTables } from '../utils/tableRefresh';
 
 const mockStorage = new Map<string, string>();
 
@@ -1674,7 +1675,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R9: a concurrent same-table insert that commits during the refresh\'s (unlocked) execute phase causes the refresh to SKIP under the block lock, never overwriting the newer data with a stale result', async () => {
     await setupRefreshMocks();
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     mockTables = [{ name: 'Table1', rangeAddress: 'Sheet1!A1:B2' }];
     await setTableMetadata('Sheet1!A1:B2', {
@@ -1721,7 +1721,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('a concurrent insert to a spatially DISTANT table does NOT block during the refresh\'s (slow, unlocked) execute phase', async () => {
     await setupRefreshMocks();
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     mockTables = [{ name: 'Table1', rangeAddress: 'Sheet1!A1:B2' }];
     await setTableMetadata('Sheet1!A1:B2', {
@@ -1783,7 +1782,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('Bug-7397 R6 MEDIUM: a failed provenance write-back is surfaced as a warning, not silently reported as a clean success', async () => {
     await setupRefreshMocks();
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     mockTables = [{ name: 'Table1', rangeAddress: 'Sheet1!A1:B2' }];
     await setTableMetadata('Sheet1!A1:B2', {
@@ -1811,7 +1809,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('two-table refresh: both tables get their metadata write-back (no false-positive from self-writes)', async () => {
     await setupRefreshMocks();
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     mockTables = [
       { name: 'Table1', rangeAddress: 'Sheet1!A1:B2' },
@@ -1844,7 +1841,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R9: a growing refresh (more rows than the table currently has) refreshes cleanly under block locks', async () => {
     await setupRefreshMocks();
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     mockTables = [{ name: 'Table1', rangeAddress: 'Sheet1!A1:B2' }];
     // 20 result rows -> the table grows well beyond its current 2-row extent.
@@ -1867,7 +1863,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R10-2: a concurrent re-insert of the SAME query (new timestamp/data) during the execute phase still causes a SKIP', async () => {
     await setupRefreshMocks();
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     mockTables = [{ name: 'Table1', rangeAddress: 'Sheet1!A1:B2' }];
     await setTableMetadata('Sheet1!A1:B2', {
@@ -1934,7 +1929,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
     // D5:E15 -> header row 4, body rows 5..14, footer row 15. 25 result rows
     // -> body rows 5..29, footer row 30.
     await seedOffsetTable(10, 25);
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     const result = await refreshTables('activeSheet');
     expect(result.refreshed).toContain('Table1');
@@ -1950,7 +1944,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R12-2 at a NON-ZERO origin: a shrinking refresh moves the footer up and clears the old row completely', async () => {
     await seedOffsetTable(10, 3);
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     const result = await refreshTables('activeSheet');
     expect(result.refreshed).toContain('Table1');
@@ -1962,7 +1955,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('Bug-8340 at a NON-ZERO origin: the growth probe covers the table\'s own columns and rows, not column A / row 0', async () => {
     await seedOffsetTable(10, 25);
-    const { refreshTables } = await import('../utils/tableRefresh');
     const { strings } = await import('../i18n/strings');
 
     // A user cell inside the growth zone, in the table's SECOND column (E) --
@@ -1980,7 +1972,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
     // A probe starting one row too early would false-positive on every refresh.
     await seedOffsetTable(10, 25);
     sheetCells.set('14,3', 'old body value');
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     const result = await refreshTables('activeSheet');
     expect(result.refreshed).toContain('Table1');
@@ -1989,7 +1980,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R12-R4-2: a batch sync failure AFTER the resize/values applied is NOT reported as an untouched Skip (Office.run is not transactional)', async () => {
     await seedOffsetTable(10, 3);
-    const { refreshTables } = await import('../utils/tableRefresh');
     const { strings } = await import('../i18n/strings');
     failRewriteSync = true;
 
@@ -2015,7 +2005,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
     // with warnings" for a table that was never refreshed. Round 5 proved a
     // mutant setting the flag unconditionally survived the entire suite.
     await seedOffsetTable(10, 3);
-    const { refreshTables } = await import('../utils/tableRefresh');
     const { strings } = await import('../i18n/strings');
     failRewriteSyncBeforeMutation = true;
 
@@ -2034,7 +2023,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R11-1: when the LIVE table grew past the declared (locked) extent, the refresh SKIPS and mutates NOTHING (no clear past held blocks, no data loss)', async () => {
     await setupRefreshMocks();
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     // Enumerated as a small 2-row table, but the live body has grown to 200 rows
     // (e.g. the user typed below it, auto-expanding it). The query returns 20.
@@ -2091,7 +2079,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
     // rows. Pre-fix the new body overwrote A12 and NO new footer was written
     // (A202 stayed null) -- reported as a clean "refreshed" success.
     await seedFooterTable(10, 200);
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     const result = await refreshTables('activeSheet');
     expect(result.refreshed).toContain('Table1');
@@ -2109,7 +2096,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R12-2: a SHRINKING refresh moves the footer UP and clears its old cell instead of orphaning it below blank rows', async () => {
     await seedFooterTable(10, 2);
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     const result = await refreshTables('activeSheet');
     expect(result.refreshed).toContain('Table1');
@@ -2123,7 +2109,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
   it('R12-2: content below the table that is NOT our footer is left untouched (the refresh never manufactures a footer over user content)', async () => {
     await seedFooterTable(10, 2);
     sheetCells.set('11,0', 'Grand total');
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     const result = await refreshTables('activeSheet');
     expect(result.refreshed).toContain('Table1');
@@ -2134,7 +2119,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R12-F4: a GROWING refresh reverts the vacated footer row\'s grey/italic styling (no accumulating grey rows inside the table body)', async () => {
     await seedFooterTable(10, 200);
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     const result = await refreshTables('activeSheet');
     expect(result.refreshed).toContain('Table1');
@@ -2154,7 +2138,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R12-F4: a SHRINKING refresh clears the vacated footer row COMPLETELY (formats too), not just its contents', async () => {
     await seedFooterTable(10, 2);
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     const result = await refreshTables('activeSheet');
     expect(result.refreshed).toContain('Table1');
@@ -2171,7 +2154,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('Bug-8340: a growing refresh whose growth zone holds the USER\'s content SKIPS honestly and mutates nothing', async () => {
     await seedFooterTable(10, 200);
-    const { refreshTables } = await import('../utils/tableRefresh');
     const { strings } = await import('../i18n/strings');
 
     // The user typed a subtotal two rows below the table -- inside the region
@@ -2193,7 +2175,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('Bug-8340 (round-2 finding 2): a user FORMULA rendering as "" still counts as occupied (a values-only probe would destroy it)', async () => {
     await seedFooterTable(10, 200);
-    const { refreshTables } = await import('../utils/tableRefresh');
     const { strings } = await import('../i18n/strings');
 
     // `=IF(A1>0,A1,"")` currently evaluates to '' -- invisible to a values-only
@@ -2209,7 +2190,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('Bug-8340: an EMPTY growth zone still refreshes (the probe does not block ordinary growth)', async () => {
     await seedFooterTable(10, 200);
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     const result = await refreshTables('activeSheet');
     expect(result.refreshed).toContain('Table1');
@@ -2218,7 +2198,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('Bug-8340: a SHRINKING refresh is never blocked by content below the table (it claims no new ground)', async () => {
     await seedFooterTable(10, 2);
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     // Content well below the table: a shrink never touches it, so it must not
     // cause a skip (the probe applies to growth only).
@@ -2235,7 +2214,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R12-4: the under-lock re-validation forces a host read, so a host-side provenance change with no cache invalidation is still caught', async () => {
     await setupRefreshMocks();
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     mockTables = [{ name: 'Table1', rangeAddress: 'Sheet1!A1:B2' }];
     await setTableMetadata('Sheet1!A1:B2', {
@@ -2274,7 +2252,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R12-LOW-3: a concurrent write that changes ONLY the stored columnHeaders causes a SKIP (the positional write is no longer authorised)', async () => {
     await setupRefreshMocks();
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     mockTables = [{ name: 'Table1', rangeAddress: 'Sheet1!A1:B2' }];
     const BASE = {
@@ -2310,7 +2287,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R12-3: when the covering blocks stay held past the deadline the table is SKIPPED with a retry reason, and nothing is mutated', async () => {
     await setupRefreshMocks();
-    const { refreshTables } = await import('../utils/tableRefresh');
     const { strings } = await import('../i18n/strings');
 
     mockTables = [{ name: 'Table1', rangeAddress: 'Sheet1!A1:B2' }];
@@ -2344,7 +2320,6 @@ describe('Bug-7397 R6 — refreshTables per-table lock integration (real refresh
 
   it('R10-1: rewriteTableBody resizes IN PLACE and never uses a shifting body delete/add (footprint == declared rectangle)', async () => {
     await setupRefreshMocks();
-    const { refreshTables } = await import('../utils/tableRefresh');
 
     mockTables = [{ name: 'Table1', rangeAddress: 'Sheet1!A1:B2' }];
     mockQueryResult = Array.from({ length: 8 }, (_, i) => ({ region: `R${i}`, revenue: i }));

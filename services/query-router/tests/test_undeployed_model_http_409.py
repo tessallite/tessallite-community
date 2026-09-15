@@ -13,9 +13,9 @@ Three things tested here:
   2. ``_handle_execute`` maps ModelNotDeployedError → 409.
   3. ``_handle_explain`` maps ModelNotDeployedError → 409.
 
-``_handle_validate`` intentionally keeps the existing behaviour — it
-returns a 200 with errors in the body — because its contract is ok/errors
-pairs, not HTTP status codes.
+``_handle_validate`` keeps HTTP 200 with errors in the body. Bug-8530 adds one
+machine-readable discriminator when the deployed snapshot is unavailable so
+the Query Panel can direct the user to redeploy without parsing error prose.
 """
 from __future__ import annotations
 
@@ -50,6 +50,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from src.ir.logical_query import (
+    DeployedSnapshotUnavailableError,
     LogicalQuery,
     ModelNotDeployedError,
     SemanticBindingError,
@@ -185,3 +186,56 @@ async def test_execute_still_returns_422_for_other_binding_errors():
 
     assert exc.value.status_code == 422
     assert "Unknown column" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_bug_8530_validate_types_snapshot_unavailable_without_changing_200_contract():
+    """Bug-8530: deployment repair is distinct from an invalid query body."""
+    import src.api.routes as routes
+
+    error = DeployedSnapshotUnavailableError(
+        "The deployed snapshot is unavailable; redeploy the model."
+    )
+    logical = _logical_query()
+    with (
+        patch.object(routes, "_bind_query_parameters", new=AsyncMock()),
+        patch.object(routes, "_parse", return_value=logical),
+        patch.object(
+            routes, "bind_query_to_model", new=AsyncMock(side_effect=error)
+        ),
+    ):
+        response = await routes._handle_validate(_make_request(), AsyncMock())
+
+    assert response.ok is False
+    assert response.error_type == "deployed_snapshot_unavailable"
+    assert response.errors == [str(error)]
+    payload = response.model_dump()
+    assert payload["ok"] is False
+    assert payload["error_type"] == "deployed_snapshot_unavailable"
+    assert payload["errors"] == [str(error)]
+    validate_route = next(
+        route for route in routes.router.routes if route.path == "/validate"
+    )
+    assert validate_route.status_code in (None, 200)
+    assert validate_route.response_model is routes.ValidateResponse
+
+
+@pytest.mark.asyncio
+async def test_bug_8530_validate_leaves_plain_binding_errors_untyped():
+    """Bug-8530 adds one discriminator, not a general error taxonomy."""
+    import src.api.routes as routes
+
+    error = SemanticBindingError("Unknown column: foo")
+    with (
+        patch.object(routes, "_bind_query_parameters", new=AsyncMock()),
+        patch.object(routes, "_parse", return_value=_logical_query()),
+        patch.object(
+            routes, "bind_query_to_model", new=AsyncMock(side_effect=error)
+        ),
+    ):
+        response = await routes._handle_validate(_make_request(), AsyncMock())
+
+    assert response.ok is False
+    assert response.error_type is None
+    assert response.errors == [str(error)]
+    assert response.model_dump()["error_type"] is None

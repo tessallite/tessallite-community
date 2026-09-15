@@ -76,25 +76,17 @@ async def test_expired_entry_refetches(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cache_hit_reports_the_listing_as_degraded_too(monkeypatch):
-    """Bug-9218: the degraded count must travel WITH the cached entry.
-
-    A partial listing that is cached and then re-served must still report
-    itself as partial. If the count were recomputed only on a cache MISS, the
-    second connection inside the TTL window would read a partial list and
-    believe it was complete — and a model living in the dropped project would
-    be reported to the BI client as ``Unknown model`` rather than as a service
-    fault.
-    """
+async def test_degraded_listing_is_retried_and_remains_degraded(monkeypatch):
+    """Bug-9913: a partial listing is never promoted to the completed cache."""
     calls = _patch_uncached(monkeypatch, degraded=1)
 
     await router_client.list_all_models_for_tenant("acme", "jwt-1")
     assert router_client.tenant_listing_degraded("acme", "jwt-1") == 1
 
-    # Second call is a cache HIT (the stub is not re-entered) and must still
-    # report the listing as incomplete.
+    # A second call retries the incomplete authority response and still reports
+    # the listing as partial.
     await router_client.list_all_models_for_tenant("acme", "jwt-1")
-    assert calls["n"] == 1, "expected a cache hit"
+    assert calls["n"] == 2, "a degraded listing was cached"
     assert router_client.tenant_listing_degraded("acme", "jwt-1") == 1
 
 

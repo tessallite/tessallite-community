@@ -114,6 +114,11 @@ The scoped forms are useful when a workspace has many models and you only need o
 
 Tessallite uses the PostgreSQL wire protocol. Use the standard `org.postgresql.Driver` (JDBC) or `psycopg2` (Python). No special driver is required.
 
+For PostgreSQL and Redshift sources, a valid query that returns no rows still
+returns its declared result columns to the JDBC gateway. Empty and non-empty
+results therefore have the same column shape. Use explicit SQL aliases when a
+portable result name is important across source engines.
+
 ---
 
 ## Troubleshooting

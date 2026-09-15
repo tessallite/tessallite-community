@@ -290,10 +290,10 @@ describe("i18n en.json coverage", () => {
     // Canonical source: tessallite/shared/query_log_client_kinds.py
     // (QUERY_LOG_CLIENT_KINDS). Keep this list in step with it — the frontend
     // cannot import the Python tuple, so this test is the parity guard.
-    for (const ck of ["looker_studio", "looker_cloud", "plugin", "drill", "headless", "agent", "mcp", "kpi"])
+    for (const ck of ["looker_studio", "looker_cloud", "plugin", "drill", "headless", "agent", "mcp", "kpi", "hierarchy_preview", "maintenance"])
       add(`diagnostics.clientKindLabel.${ck}`);
     // The client filter dropdown's own labels (DiagnosticsPanel MenuItems).
-    for (const k of ["All", "LookerStudio", "LookerCloud", "Plugin", "Drill", "Headless", "Agent", "Mcp", "Kpi"])
+    for (const k of ["All", "LookerStudio", "LookerCloud", "Plugin", "Drill", "Headless", "Agent", "Mcp", "Kpi", "HierarchyPreview"])
       add(`diagnostics.client${k}`);
 
     // --- kpiBusiness.${shareType} (KpiBusinessBuilderDialog / KpiCard) ---
@@ -410,6 +410,84 @@ describe("Bug-7543: cross-namespace duplicate key collision guard", () => {
       collisions,
       `Cross-namespace duplicate keys (Object.assign overwrites silently):\n${collisions.join("\n")}`,
     ).toEqual([]);
+  });
+});
+
+describe("Phase-2 i18n sweep (FRONTEND-GUI-OPEN-20260823)", () => {
+  // The lane brief contract: every key added by the phase-2 code sweep exists
+  // in en AND all 7 locales, and the keys the phase removed are gone from
+  // every locale (parity stays at 0 missing / 0 orphan).
+  const PHASE2_NEW_KEYS = [
+    // Bug-7106 (diagnostics backend error mapping)
+    "diagnostics.backendError.llmEmptyResponse",
+    "diagnostics.backendError.modelNotDeployed",
+    "diagnostics.backendError.noDataTarget",
+    // Bug-8391 (NOT_RLS_SAFE skip reason)
+    "pocketTables.skipReason.not_rls_safe",
+    // Bug-7222 (KPI business summary tokens)
+    "kpiBusiness.summaryYoyValue",
+    "kpiBusiness.summaryYoyGrowthPct",
+    "kpiBusiness.twLast60Days",
+    // Bug-7232 (fail-loud status labels)
+    "kpiScorecard.statusRowSecurityRestricted",
+    "kpiScorecard.modelNotDeployed",
+    "kpiScorecard.tiNeedsTimeDimension",
+    "kpiScorecard.compositeCycle",
+    "kpiScorecard.compositeDepthExceeded",
+    "kpiScorecard.evaluationFailedGeneric",
+    "kpiScorecard.targetQueryFailed",
+    "kpiScorecard.noExpression",
+    "kpiScorecard.allChildrenErrored",
+    // Bug-9317 (git save failure)
+    "git.saveFailed",
+    // Bug-9324 (embed token revoke failure)
+    "embedTokens.revokeFailed",
+  ];
+
+  it("provides every phase-2 key in en and all 7 locales", async () => {
+    const missing: string[] = [];
+    for (const loc of ["en", ...PARKED_LOCALES]) {
+      const bundle = getMessages(loc) as Record<string, string>;
+      for (const key of PHASE2_NEW_KEYS) {
+        if (bundle[key] === undefined) missing.push(`${loc}.${key}`);
+      }
+    }
+    expect(missing, `Phase-2 keys missing from a locale bundle:\n${missing.join("\n")}`).toEqual([]);
+  });
+
+  it("removed the dead evict family and passwordTooShort from every locale (Bug-7086/9057)", () => {
+    const removed = [
+      "predictiveControls.evict.lru",
+      "predictiveControls.evict.neverEvict",
+      "predictiveControls.evict.predictedFirst",
+      "predictiveControls.evict.validatedSurvives",
+      "errors.form.passwordTooShort",
+    ];
+    const leftovers: string[] = [];
+    for (const loc of ["en", ...PARKED_LOCALES]) {
+      const bundle = getMessages(loc) as Record<string, string>;
+      for (const key of removed) {
+        if (bundle[key] !== undefined) leftovers.push(`${loc}.${key}`);
+      }
+    }
+    expect(leftovers).toEqual([]);
+  });
+
+  it("homes drillThrough.* in builder.json and wizard.* in wizard.json (Bug-7272/7438)", () => {
+    for (const loc of ["en", ...PARKED_LOCALES]) {
+      const explorer = readDomainMessages(loc, "explorer.json");
+      const builder = readDomainMessages(loc, "builder.json");
+      const importExport = readDomainMessages(loc, "importExport.json");
+      const wizard = readDomainMessages(loc, "wizard.json");
+      const dtExplorer = Object.keys(explorer).filter((k) => k.startsWith("drillThrough."));
+      const dtBuilder = Object.keys(builder).filter((k) => k.startsWith("drillThrough."));
+      const wizImportExport = Object.keys(importExport).filter((k) => k.startsWith("wizard"));
+      const wizWizard = Object.keys(wizard).filter((k) => k.startsWith("wizard"));
+      expect(dtExplorer, `${loc}: drillThrough.* still in explorer.json`).toEqual([]);
+      expect(dtBuilder.length, `${loc}: drillThrough.* missing from builder.json`).toBe(23);
+      expect(wizImportExport, `${loc}: wizard* still in importExport.json`).toEqual([]);
+      expect(wizWizard.length, `${loc}: wizard* missing from wizard.json`).toBe(70);
+    }
   });
 });
 

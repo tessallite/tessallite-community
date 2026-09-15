@@ -36,10 +36,14 @@ const {
     setPolicy: vi.fn(async () => ({ id: "policy-id" })),
     updateCompound: vi.fn(async () => ({ id: "pocket-id" })),
   });
+  const hierarchiesApiMock = makeEntityMock();
+  // Bug-8314: the hierarchy command adapter replays drill levels after a
+  // header re-create through hierarchiesApi.createLevel.
+  hierarchiesApiMock.createLevel = vi.fn(async () => ({ id: "level-new" }));
   return {
     measuresApiMock: makeEntityMock(),
     dimensionsApiMock: makeEntityMock(),
-    hierarchiesApiMock: makeEntityMock(),
+    hierarchiesApiMock,
     personasApiMock: makeEntityMock(),
     kpisApiMock: makeEntityMock(),
     namedSetsApiMock: makeEntityMock(),
@@ -103,7 +107,12 @@ function positions(nodes: Node[]): NodePositions {
   return out;
 }
 
-function setup(onApplyMove = vi.fn(), onApplyEdges = vi.fn()) {
+function setup(
+  onApplyMove = vi.fn(),
+  onApplyEdges = vi.fn(),
+  onError = vi.fn(),
+  onApplyTables = vi.fn(),
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = renderHook(() => {
     const [nodes, setNodes] = useState<Node[]>(makeNodes());
@@ -115,10 +124,12 @@ function setup(onApplyMove = vi.fn(), onApplyEdges = vi.fn()) {
       qc,
       onApplyMove,
       onApplyEdges,
+      onApplyTables,
+      onError,
     );
     return { nodes, setNodes, history };
   });
-  return { view, onApplyMove, onApplyEdges };
+  return { view, onApplyMove, onApplyEdges, onApplyTables, onError, qc };
 }
 
 /** Simulate one complete drag gesture: capture, move, commit. */
@@ -284,6 +295,46 @@ describe("useCanvasHistory — redraw restores edge routing (F-026-11 / LOW-2)",
       );
     });
     expect(view.result.current.history.canUndo).toBe(true);
+  });
+
+  it("undo of a pin restores the table layout, which a position map cannot carry", async () => {
+    // A pin changes no coordinate, so without the table snapshot the entry
+    // would either not be recorded at all or would undo nothing.
+    const onApplyTables = vi.fn();
+    const { view } = setup(vi.fn(), vi.fn(), vi.fn(), onApplyTables);
+    const beforeTables = { A: { x: 0, y: 0 } };
+    const afterTables = { A: { x: 0, y: 0, pinned: true } };
+
+    act(() => {
+      view.result.current.history.recordMove(
+        { A: { x: 0, y: 0 } },
+        { A: { x: 0, y: 0 } },
+        undefined,
+        { before: beforeTables, after: afterTables },
+      );
+    });
+    expect(view.result.current.history.canUndo).toBe(true);
+
+    await act(async () => {
+      await view.result.current.history.undo();
+    });
+    expect(onApplyTables).toHaveBeenCalledWith(beforeTables);
+
+    onApplyTables.mockClear();
+    await act(async () => {
+      await view.result.current.history.redo();
+    });
+    expect(onApplyTables).toHaveBeenCalledWith(afterTables);
+  });
+
+  it("a plain drag with no table snapshot never invokes the table-restore path", async () => {
+    const onApplyTables = vi.fn();
+    const { view } = setup(vi.fn(), vi.fn(), vi.fn(), onApplyTables);
+    drag(view, "A", { x: 9, y: 9 });
+    await act(async () => {
+      await view.result.current.history.undo();
+    });
+    expect(onApplyTables).not.toHaveBeenCalled();
   });
 
   it("a plain drag with no edge snapshot never invokes the edge-restore path", async () => {
@@ -882,9 +933,230 @@ describe("useCanvasHistory — drawer-edit commands (Bug-8227)", () => {
     expect(dimensionsApiMock.delete).toHaveBeenCalledWith("p1", "m1", "dim-created");
     // redo re-creates (server returns { id: "new-id" }); undo op must rebind.
     await act(async () => { await view.result.current.history.redo(); });
-    expect(dimensionsApiMock.create).toHaveBeenCalledWith("p1", "m1", { name: "d" });
+    expect(dimensionsApiMock.create).toHaveBeenCalledWith("p1", "m1", { name: "d" }, expect.any(Function));
     await act(async () => { await view.result.current.history.undo(); });
     expect(dimensionsApiMock.delete).toHaveBeenLastCalledWith("p1", "m1", "new-id");
+  });
+
+  // Bug-8314: undoing a hierarchy delete used to restore the header only; the
+  // drill levels (separate rows) were lost. The delete record now carries a
+  // level snapshot under __levels (non-wire) and the hierarchy adapter replays
+  // the level creates in ordinal order after the header create.
+  it("undoing a hierarchy delete re-creates the header AND its drill levels in ordinal order", async () => {
+    const { view } = setup();
+    act(() => useModelEditorStore.getState().markDirty());
+    emitCommand({
+      type: "command",
+      entity: "hierarchy",
+      redo: { kind: "delete", id: "h-1", data: { name: "Calendar", type: "date_embedded" } },
+      undo: {
+        kind: "create",
+        data: {
+          name: "Calendar",
+          type: "date_embedded",
+          dimension_kind: "time",
+          // Deliberately out of ordinal order — replay must sort.
+          __levels: [
+            {
+              name: "Month",
+              ordinal: 1,
+              key_attribute_id: "attr-month",
+              key_attribute_source: "physical_column",
+              time_unit: "month",
+              allowed_time_calcs: [],
+              attributes: [],
+            },
+            {
+              name: "Year",
+              ordinal: 0,
+              key_attribute_id: "attr-year",
+              key_attribute_source: "physical_column",
+              time_unit: "year",
+              allowed_time_calcs: [],
+              attributes: [
+                { attribute_id: "attr-name", attribute_source: "physical_column", role: "display" },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    await act(async () => { await view.result.current.history.undo(); });
+    // Header re-created without the __levels metadata leaking onto the wire.
+    expect(hierarchiesApiMock.create).toHaveBeenCalledWith("p1", "m1", {
+      name: "Calendar",
+      type: "date_embedded",
+      dimension_kind: "time",
+    });
+    // Levels replayed under the fresh id, ordered by ordinal.
+    expect(hierarchiesApiMock.createLevel).toHaveBeenCalledTimes(2);
+    expect(hierarchiesApiMock.createLevel).toHaveBeenNthCalledWith(1, "p1", "m1", "new-id", {
+      name: "Year",
+      ordinal: 0,
+      key_attribute_id: "attr-year",
+      key_attribute_source: "physical_column",
+      time_unit: "year",
+      allowed_time_calcs: [],
+      attributes: [{ attribute_id: "attr-name", attribute_source: "physical_column", role: "display" }],
+    });
+    expect(hierarchiesApiMock.createLevel).toHaveBeenNthCalledWith(2, "p1", "m1", "new-id", {
+      name: "Month",
+      ordinal: 1,
+      key_attribute_id: "attr-month",
+      key_attribute_source: "physical_column",
+      time_unit: "month",
+      allowed_time_calcs: [],
+      attributes: [],
+    });
+    // The redo (delete again) is rebound to the re-created id.
+    await act(async () => { await view.result.current.history.redo(); });
+    expect(hierarchiesApiMock.delete).toHaveBeenCalledWith("p1", "m1", "new-id");
+  });
+
+  // B1 witness B: a partial level replay must not leave a half-built
+  // hierarchy server-side. The adapter compensates by deleting the freshly
+  // created header, invalidates the hierarchy query family, and rethrows so
+  // the generic catch restores the action to the stack (retryable).
+  it("compensates and restores the action when a level replay fails (first level)", async () => {
+    const onError = vi.fn();
+    const { view, qc } = setup(vi.fn(), vi.fn(), onError);
+    vi.mocked(hierarchiesApiMock.createLevel).mockReset();
+    vi.mocked(hierarchiesApiMock.delete).mockReset();
+    // B1-R2-001: mockReset() turns the delete mock into an undefined-returning
+    // stub — restore the PROMISE-shaped implementation so the production
+    // .catch() path (compensation then onReplayFailure then rethrow) really runs.
+    vi.mocked(hierarchiesApiMock.delete).mockResolvedValue({});
+    const createSpy = vi.mocked(hierarchiesApiMock.create).mockResolvedValue({ id: "new-id" });
+    const createLevelSpy = vi
+      .mocked(hierarchiesApiMock.createLevel)
+      .mockRejectedValueOnce(new Error("level create failed"));
+    const deleteSpy = vi.mocked(hierarchiesApiMock.delete);
+    const invSpy = vi.spyOn(qc, "invalidateQueries");
+    act(() => useModelEditorStore.getState().markDirty());
+    emitCommand({
+      type: "command",
+      entity: "hierarchy",
+      redo: { kind: "delete", id: "h-1" },
+      undo: {
+        kind: "create",
+        data: {
+          name: "Calendar",
+          type: "date_embedded",
+          __levels: [
+            { name: "Month", ordinal: 0, key_attribute_id: "attr-month", time_unit: "month", allowed_time_calcs: [], attributes: [] },
+            { name: "Year", ordinal: 1, key_attribute_id: "attr-year", time_unit: "year", allowed_time_calcs: [], attributes: [] },
+          ],
+        },
+      },
+    });
+
+    await act(async () => { await view.result.current.history.undo(); });
+
+    expect(createSpy).toHaveBeenCalled();
+    expect(createLevelSpy).toHaveBeenCalled();
+    // Compensation: the freshly created header is deleted exactly once.
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    expect(deleteSpy).toHaveBeenCalledWith("p1", "m1", "new-id");
+    // The hierarchy query family was invalidated (onReplayFailure ran).
+    expect(invSpy).toHaveBeenCalledWith({ queryKey: ["hierarchies", "p1", "m1"] });
+    // The ORIGINAL level error was surfaced, not a compensation artefact.
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect((onError.mock.calls[0][0] as Error).message).toBe("level create failed");
+    // The action was restored to the undo stack (retryable, not dropped).
+    expect(view.result.current.history.canUndo).toBe(true);
+  });
+
+  it("compensates and restores the action when a LATER level replay fails", async () => {
+    const onError = vi.fn();
+    const { view, qc } = setup(vi.fn(), vi.fn(), onError);
+    vi.mocked(hierarchiesApiMock.createLevel).mockReset();
+    vi.mocked(hierarchiesApiMock.delete).mockReset();
+    vi.mocked(hierarchiesApiMock.delete).mockResolvedValue({});
+    vi.mocked(hierarchiesApiMock.create).mockResolvedValue({ id: "new-id" });
+    const createLevelSpy = vi
+      .mocked(hierarchiesApiMock.createLevel)
+      .mockResolvedValueOnce({ id: "level-1" })
+      .mockRejectedValueOnce(new Error("second level failed"));
+    const deleteSpy = vi.mocked(hierarchiesApiMock.delete);
+    const invSpy = vi.spyOn(qc, "invalidateQueries");
+    act(() => useModelEditorStore.getState().markDirty());
+    emitCommand({
+      type: "command",
+      entity: "hierarchy",
+      redo: { kind: "delete", id: "h-1" },
+      undo: {
+        kind: "create",
+        data: {
+          name: "Calendar",
+          type: "date_embedded",
+          __levels: [
+            { name: "Month", ordinal: 0, key_attribute_id: "attr-month", time_unit: "month", allowed_time_calcs: [], attributes: [] },
+            { name: "Year", ordinal: 1, key_attribute_id: "attr-year", time_unit: "year", allowed_time_calcs: [], attributes: [] },
+          ],
+        },
+      },
+    });
+
+    await act(async () => { await view.result.current.history.undo(); });
+
+    // Both levels were attempted.
+    expect(createLevelSpy).toHaveBeenCalledTimes(2);
+    // The partial hierarchy (header + first level) is compensated away.
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    expect(deleteSpy).toHaveBeenCalledWith("p1", "m1", "new-id");
+    // Invalidation ran (onReplayFailure) and the ORIGINAL error was surfaced.
+    expect(invSpy).toHaveBeenCalledWith({ queryKey: ["hierarchies", "p1", "m1"] });
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect((onError.mock.calls[0][0] as Error).message).toBe("second level failed");
+    expect(view.result.current.history.canUndo).toBe(true);
+  });
+
+  // Bug-8320: undo id-writeback repointed only the paired op. An earlier
+  // update entry for the same row still carried the old (now-deleted) id, so
+  // the next undo 404ed and blocked the whole stack. The writeback now repairs
+  // every sibling command entry for the entity across both stacks.
+  it("undoing a delete repoints sibling entries carrying the deleted row id", async () => {
+    const { view } = setup();
+    act(() => useModelEditorStore.getState().markDirty());
+    emitCommand({
+      type: "command",
+      entity: "measure",
+      redo: { kind: "update", id: "meas-1", data: { expression: "SUM(b)" } },
+      undo: { kind: "update", id: "meas-1", data: { expression: "SUM(a)" } },
+    });
+    act(() => useModelEditorStore.getState().markDirty());
+    emitCommand({
+      type: "command",
+      entity: "measure",
+      redo: { kind: "delete", id: "meas-1", data: { expression: "SUM(b)" } },
+      undo: { kind: "create", data: { name: "Total", expression: "SUM(b)" } },
+    });
+
+    // Undo the delete: the row is re-created under a fresh server id.
+    await act(async () => { await view.result.current.history.undo(); });
+    expect(measuresApiMock.create).toHaveBeenCalledWith("p1", "m1", {
+      name: "Total",
+      expression: "SUM(b)",
+    }, expect.any(Function));
+
+    // The next undo is the pre-delete UPDATE. It must target the re-created
+    // row, not the deleted id, or it 404s and the stack stays stuck.
+    await act(async () => { await view.result.current.history.undo(); });
+    expect(measuresApiMock.update).toHaveBeenCalledWith("p1", "m1", "new-id", {
+      expression: "SUM(a)",
+    });
+
+    // Redo of that update also targets the live row.
+    await act(async () => { await view.result.current.history.redo(); });
+    expect(measuresApiMock.update).toHaveBeenLastCalledWith("p1", "m1", "new-id", {
+      expression: "SUM(b)",
+    });
+    // And the final redo (delete again) targets the live row too.
+    await act(async () => { await view.result.current.history.redo(); });
+    expect(measuresApiMock.delete).toHaveBeenLastCalledWith("p1", "m1", "new-id", {
+      expression: "SUM(b)",
+    });
   });
 });
 
@@ -994,8 +1266,9 @@ describe("useCanvasHistory — read-only gating (F-026-04)", () => {
           "m1",
           qc,
           onApplyMove,
-          undefined,
-          undefined,
+          undefined, // onApplyEdges
+          undefined, // onApplyTables
+          undefined, // onError
           readOnly,
         );
         return { nodes, setNodes, history };

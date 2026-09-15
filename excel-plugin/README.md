@@ -19,9 +19,47 @@ npm install
 npm run dev        # Start Vite dev server on port 3001
 npm run build      # TypeScript check + production build
 npm run preview    # Preview production build on HTTPS port 3443
-npm test           # Run unit tests
+npm test           # Run unit tests (offline, mocked network)
 npm run test:watch # Run tests in watch mode
 ```
+
+### Live harnesses (need a running Tessallite server)
+
+```bash
+npm run harness:functions        # the BUILT functions bundle, headless in Node, against a real server
+npm run harness:pane             # real pane code over a recording Office.js shim (jsdom)
+npm run harness:pane:playwright  # the real pane in headless Chromium, driven by its accessible names
+npm run harness:typecheck        # type-check the harness sources
+```
+
+### The test-profile build (no login)
+
+```bash
+npm run build:test-profile   # VITE_TESSALLITE_TEST_PROFILE=1: a bundle that signs ITSELF in
+```
+
+A copy of the add-in with the login removed, used only as a build step for the
+headless functions harness and the Playwright pane harness above -- it is never
+sideloaded into native Excel. It bakes a preset profile (server URL, tenant,
+credentials, project, model) from the same `TESS_HARNESS_*` environment the
+harnesses use, and stamps a visible `TEST BUILD` marker in the pane header and
+in the bundle.
+
+It CANNOT be produced from a release target: `scripts/testProfileGuard.mjs`
+refuses the build when the flag meets a release marker or a non-local
+`PLUGIN_BASE_URL`, fails closed on a base URL it cannot parse, and is called by
+`vite.config.ts` and CI alike. An ordinary `npm run build` contains no marker
+and no credentials.
+
+The native-Excel harness (`tessallite/tests/excel-xmla`) runs in attach mode
+against the PRODUCTION add-in instead; see that harness's README.
+
+These are deliberately excluded from `npm test`, which must stay offline and
+deterministic. They exist because the unit suite mocks the network and therefore
+cannot see a defect that lives in the SHAPE of the real server response — which
+is what Bug-9876 was. Setup, environment variables and the full check list are in
+`tests-harness/README.md`; the design and the capability inventory are in
+`docs/architecture/architecture_excel-plugin-test-harness.md`.
 
 ### Sideloading in Excel
 
@@ -85,13 +123,19 @@ Script URL pointing at the classic-script `functions.iife.js` bundle:
 perpetual Office ignores a V1_1 CustomFunctions extension point for
 sideloaded add-ins, and an ES module crashes the JS-only runtime.
 `manifestCustomFunctions.test.ts` pins this structure.
+That guard recursively scans every Vitest/Vite JavaScript and TypeScript source
+extension, including `.js`, `.jsx`, `.mts`, and `.cts`, when checking raw imports.
 
 ## Architecture
 
 The task pane has three tabs: **Analyse** (Report Builder), **KPIs**, and **Ask** (conversational agent).
 
+The compact pane keeps its header, tabs and connection/persona footer visible. Click the project/model title to select the project, model or persona. The brand mark opens plugin information; the gear menu contains profile switching, Diagnostics and sign-out. Analyse uses compact zone rows and an icon toolbar; hover or focus an icon for its action label. Search, Certified and sorting controls sit above the field sections. KPI status pills filter the list. In Ask, the conversation selector and composer stay fixed while the message log scrolls.
+
 The default Excel insert paths are connectionless:
 
+- Ask chart inserts classify columns using the turn's citations and convert numeric measure strings before insertion. Numeric-looking dimension identifiers retain their text. Without citations, chart classification checks the actual values, including numeric strings.
+- When citations are present, returned columns not cited as measures are categories. Without citations, decimal numeric strings remain measure series even with display zeros; identifier-headed or fixed-width integer text such as year and postal-code values remains categories, and an all-numeric result uses only its first column as the category axis.
 - Single-value measure and KPI inserts use `TESSALLITE.VALUE`, `TESSALLITE.KPI`, and `TESSALLITE.MEMBERVALUE` custom functions that run through the add-in session.
 - Local PivotTable inserts query Tessallite through the plugin API, write a flat grouped result to a hidden backing worksheet, create a namespaced `_tsl_data_*` Excel Table, and build a native range-backed PivotTable over it using the Report Builder Rows, Columns, Filters, and Values zones.
 - Local PivotTable inserts fail closed when Excel cannot resolve any requested row, column, value, or filter field. The add-in aborts the insert, names the unresolved fields by zone, and removes the created backing sheet/table instead of reporting success for an incomplete layout.
@@ -113,7 +157,7 @@ The default Excel insert paths are connectionless:
 
 ## Refresh and Cache Invalidation
 
-The Report Builder header provides two refresh actions:
+The Report Builder toolbar's Refresh menu provides two refresh actions:
 
 - **Refresh** — clears the custom functions runtime caches (KPI eval, KPI list,
   named-set preview) and triggers a workbook full recalculation. This ensures
@@ -215,10 +259,63 @@ number:
   `#N/A No data for measure "..."` behaviour so the user sees the same
   signal regardless of mode.
 
-The toggle is visible as a Live/Static chip row in the Report Builder
-footer. Existing explicit "Insert as CUBE formulas" actions always insert
+The **Live** checkbox is in the Report Builder toolbar: checked means live formulas;
+unchecked means static values. Existing explicit "Insert as CUBE formulas" actions always insert
 formulas regardless of the mode — the insert-mode setting only applies to
 the default single-value insert paths.
+
+## Answer pop-out
+
+Any answer with rows shows a **Pop out** action, which opens it in an Office
+dialog window sized to the screen. The shared chat UI's own maximise control can
+only ever fill the task pane — Office exposes no API to widen a task pane — so
+the dialog is the only way to get a result big enough to present from. In the
+task pane the Visual panel's maximise is routed to the same window; the web app
+keeps the in-pane overlay, where a browser window is available to grow into.
+
+The payload carries `kind: "chart" | "table"`: a turn that renders a chart pops
+out as a chart, anything else as its table. `buildPopoutPayload()` in
+`utils/chartPopout.ts` assembles it, so both entry points always agree.
+
+A dialog cannot read add-in storage or call the API; Office allows it only
+`messageParent`/`addHandlerAsync`. So `chart-dialog.html` announces itself once it
+is listening and the task pane posts the payload back over that channel. Nothing
+is persisted and no data goes in the URL.
+
+This needs DialogApi 1.2 (for `messageChild`), which is not declared in the
+manifest on purpose — a manifest requirement would stop the whole add-in loading
+on a host that lacks it. `isChartPopoutSupported()` feature-detects instead, and
+the action is hidden when the host cannot deliver the payload.
+
+### Save, Copy and Close
+
+The pop-out window carries a thin toolbar. **Save** is a menu whose contents
+follow the kind — table: Excel, CSV, TSV; chart: SVG, PNG — and every table
+export carries its column headers. **Copy** writes a table to the clipboard as
+both `text/html` (a `<table>`, so Excel pastes a grid with headers) and
+`text/plain` TSV, and a chart as `image/png`. **Close** asks the task pane to
+close the dialog, which is how Office closes one.
+
+These live in the pop-out and not in the pane because the pop-out is a real
+browser window: `<a download>` and image clipboard writes are unreliable inside
+the task-pane iframe. Every clipboard and download call reports its outcome in
+the window, so a refusal is visible rather than a click that did nothing.
+
+**Save as Excel adds no dependency.** `utils/xlsxWriter.ts` builds a
+single-sheet .xlsx in the browser — a STORE-only ZIP (hand-computed CRC-32, no
+DEFLATE) of the five required OOXML parts, with text cells as inline strings so
+there is no shared-strings part and numbers written bare so Excel stores them as
+numbers. The dialog posts the base64 to the task pane, which calls
+`Excel.createWorkbook` (ExcelApi 1.8): the result opens as a new workbook in the
+user's own Excel with no download and no file dialog, and they keep it with
+Excel's own Save. Hosts below ExcelApi 1.8, and results past a conservative
+message size, download the same bytes instead. The pane posts the outcome back
+so a failed open is visible in the window.
+
+**PNG is rasterised, not exported.** Charts use the ECharts SVG renderer, whose
+toolbox cannot emit PNG. `utils/popoutExport.ts` serialises the live `<svg>`,
+loads it as an image and draws it onto a canvas at `devicePixelRatio`; the same
+blob serves Copy and Save as PNG.
 
 ## Storage
 
@@ -239,4 +336,17 @@ Tokens in `src/theme.ts` mirror the main Tessallite frontend (`frontend/src/them
 
 ## Testing
 
-Unit tests cover utility functions (formula generation, storage). Excel integration tests require a running Excel host.
+Three tiers, with one home per behaviour:
+
+- `npm test` — the offline unit suite. Mocks the network, so it cannot see a
+  defect that lives in the SHAPE of a real server response.
+- the harnesses above — real client, real server, nothing mocked between the
+  add-in's own code and the network. They assert the JS TYPE of every value that
+  reaches a cell.
+- native Excel on a Windows host — the only place real recalculation, real
+  dynamic-array spill and real PivotTable aggregation can be observed. Designed,
+  not built; see the architecture document.
+
+CI runs the unit suite, the type checks and the build on every push, and the
+harnesses whenever a Tessallite server is configured through the
+`TESS_HARNESS_*` secrets.

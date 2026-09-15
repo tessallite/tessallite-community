@@ -68,7 +68,7 @@ import DrillThroughPanel, {
 import CalcDrillThroughDrawer from "./drawer/CalcDrillThroughDrawer";
 import ExportMenu from "./export/ExportMenu";
 import { buildPivotSql } from "./sql";
-import { computePivot, evaluatePivotCompatibility } from "./pivot";
+import { computePivot, evaluatePivotCompatibility, pivotDimsKey } from "./pivot";
 import { routeBadgeLabel } from "./routeLabels";
 import { computeTotals } from "./totals";
 import type { TotalsModel } from "./totals";
@@ -306,6 +306,17 @@ export default function MeasureQueryPanel() {
   // matches how the sibling QueryPanel already does it.
   const rowSecurityDenied = rowSecurityDeniedAll(executeResult);
   const abortRef = useRef<AbortController | null>(null);
+  // Bug-7284 (GPT Phase 4 review P4-R1-001): the dims (in order)
+  // `executeResult` was actually executed against — a SEPARATE persisted
+  // field (`pivotState.executedDimsKey`) from the live-editable
+  // rowDimIds/colDimIds, updated ONLY on a successful execute (never merely
+  // because dims changed). The original fix seeded this ref from
+  // `pivotState.rowDimIds`/`colDimIds` — the CURRENT dims — which the
+  // persistence effect below already rewrites to the NEW dims the instant
+  // they change, so a remount (e.g. Pivot -> Freeform -> Pivot) reconstructed
+  // a ref that falsely matched the new dims and re-enabled the stale
+  // "(null)" re-pivot the staleness gate exists to prevent.
+  const executedDimsKeyRef = useRef<string | null>(pivotState.executedDimsKey);
   // F-019-02 (Bug-8046): server-computed non-additive subtotals, keyed by
   // measure name. Populated by the supplementary-grain effect below; merged into
   // allTotals so AVG/MIN/MAX/COUNT DISTINCT/calculated measures show real
@@ -923,6 +934,15 @@ export default function MeasureQueryPanel() {
         // derived from the stored result (see rowSecurityDenied above), so it
         // survives panel navigation with it.
         setExecuteResult(result);
+        // Bug-7284 (GPT Phase 4 review P4-R1-001): record the dims this
+        // result actually answers, in the ref (fast in-render reads this
+        // mount) AND in pivotState's own dedicated field (survives an
+        // unmount/remount — see the ref's seed comment above). Zustand's
+        // setPivotState shallow-merges, so this survives the unrelated
+        // persistence effect below regardless of firing order.
+        const newExecutedDimsKey = pivotDimsKey(rowDimIds, colDimIds);
+        executedDimsKeyRef.current = newExecutedDimsKey;
+        setPivotState({ executedDimsKey: newExecutedDimsKey });
         setSetupExpanded(false);
       }
     } catch (err) {
@@ -941,11 +961,20 @@ export default function MeasureQueryPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drillRunToken]);
 
+  // Bug-7284: the dims currently selected, vs. the dims the last executeResult
+  // actually answers. A mismatch means Run has not caught up with a dimension
+  // add/remove/reorder (or a different saved view load) yet.
+  const currentDimsKey = useMemo(() => pivotDimsKey(rowDimIds, colDimIds), [rowDimIds, colDimIds]);
+  const resultStale = Boolean(executeResult) && executedDimsKeyRef.current !== currentDimsKey;
+
   const pivot = useMemo(() => {
     if (!executeResult || !selectedMeasure) return null;
+    // Gate until Run re-executes rather than re-pivoting the STALE result
+    // against the new dims (every new member rendered as "(null)").
+    if (resultStale) return null;
     // F-019-16: localized "(null)" label for null dimension members.
     return computePivot(executeResult, selectedMeasure, rowDims, colDims, extraMeasures, t("pivot.nullValue"));
-  }, [executeResult, selectedMeasure, rowDims, colDims, extraMeasures, t]);
+  }, [executeResult, selectedMeasure, rowDims, colDims, resultStale, extraMeasures, t]);
 
   const allTotals = useMemo<Map<string, import("./totals").TotalsModel | null>>(() => {
     const result = new Map<string, import("./totals").TotalsModel | null>();
@@ -1724,7 +1753,7 @@ export default function MeasureQueryPanel() {
         </Stack>
       )}
 
-      {!executeResult && !executing && (
+      {(!executeResult || resultStale) && !executing && (
         <Paper
           variant="outlined"
           sx={{
@@ -1743,7 +1772,9 @@ export default function MeasureQueryPanel() {
           <Stack spacing={0.75} alignItems="center">
             <TableViewIcon color="action" />
             <Typography variant="subtitle2" fontWeight={700}>
-              {t("pivot.noResultYet")}
+              {/* Bug-7284: dims changed after the last run get their own message
+                  rather than the never-run "no result yet" placeholder. */}
+              {t(resultStale ? "pivot.resultStaleRerun" : "pivot.noResultYet")}
             </Typography>
           </Stack>
         </Paper>

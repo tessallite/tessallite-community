@@ -814,6 +814,7 @@ async def _run_probe_as_principal(
         "model_id": str(model_id),
         "raw_query": probe_query,
         "protocol": "jdbc",
+        "client_kind": "maintenance",
     }
     if persona_id is not None:
         payload["persona_id"] = str(persona_id)

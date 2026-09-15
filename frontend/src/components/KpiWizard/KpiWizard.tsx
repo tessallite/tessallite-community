@@ -20,6 +20,7 @@ import {
 } from "@mui/material";
 import { useT } from "../../i18n";
 import { kpisApi } from "../../api/client";
+import { extractApiError } from "../../utils/extractApiError";
 import { recordCreate, recordUpdate } from "../Builder/emitDrawerHistory";
 import type {
   Dimension,
@@ -348,9 +349,12 @@ export default function KpiWizard({
       }
       onSaved();
       onClose();
-    } catch (err: any) {
-      const detail = err?.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : JSON.stringify(detail) ?? t("kpis.saveFailed"));
+    } catch (err: unknown) {
+      // Bug-8937/R2-B01: route through the canonical extractor instead of
+      // JSON.stringify-ing the raw {error_code,field,ids,message} dict — the
+      // server's actual reason (e.g. which id/field was wrong) now surfaces
+      // instead of a raw JSON blob.
+      setError(extractApiError(err, t("kpis.saveFailed")));
     } finally {
       setSaving(false);
     }

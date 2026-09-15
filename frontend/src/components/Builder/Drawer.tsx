@@ -52,7 +52,10 @@ const PANEL_TITLE_KEYS: Partial<Record<PanelId, string>> = {
   "model-docs": "panels.modelDocs",
 };
 
-const PANEL_HELP_LINKS: Partial<Record<PanelId, string>> = {
+// Exported so a test can assert every href resolves to a real help page
+// (Bug-9091 code review turned up "named-sets": "/help/modelling/named-queries.html",
+// a file that never existed — see Drawer.helpLinksExist.test.ts).
+export const PANEL_HELP_LINKS: Partial<Record<PanelId, string>> = {
   connections: "/help/modelling/manage-connections.html",
   sources: "/help/modelling/add-tables-to-a-model.html",
   joins: "/help/modelling/define-joins.html",
@@ -81,7 +84,7 @@ const PANEL_HELP_LINKS: Partial<Record<PanelId, string>> = {
   impact: "/help/modelling/usage-downstream-assets.html",
   "impact-analysis": "/help/concepts/query-routing.html",
   "schema-changes": "/help/modelling/schema-changes.html",
-  "named-sets": "/help/modelling/named-sets.html",
+  "named-sets": "/help/modelling/named-queries.html",
   "saved-queries": "/help/modelling/query-panel.html",
   scratchpad: "/help/modelling/query-panel.html",
   alerts: "/help/admin/alert-configuration.html",

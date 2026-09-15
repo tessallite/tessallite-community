@@ -16,6 +16,7 @@ import types
 import uuid
 
 import pytest
+from result_fakes import ScalarResult
 
 
 def _col_id() -> str:
@@ -70,7 +71,7 @@ class _SequencedDB:
                 self._vals = vals
 
             def scalars(self):
-                return self
+                return ScalarResult(self._vals)
 
             def all(self):
                 return self._vals

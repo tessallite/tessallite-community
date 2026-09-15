@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 const mockStorage: Record<string, string> = {};
 
@@ -22,7 +22,14 @@ beforeEach(() => {
   stubOfficeRuntime();
 });
 
-import { apiClient, configureApiClient, ApiError, formatApiError } from '../api/client';
+import {
+  apiClient,
+  configureApiClient,
+  ApiError,
+  formatApiError,
+  streamRequest,
+} from '../api/client';
+import { StreamError } from '@tessallite/shared-ui';
 
 describe('apiClient', () => {
   beforeEach(() => {
@@ -155,5 +162,140 @@ describe('formatApiError', () => {
 
   it('falls back to the generic message for a 502 with no detail', () => {
     expect(formatApiError(new ApiError(502, {}))).toContain('server error');
+  });
+});
+
+// -----------------------------------------------------------------------
+// Bug-9755: request timeout ceiling (shared-primitive hardening for Bug-9749,
+// the same unbounded `fetch` exposure in the task-pane client, not just the
+// custom-functions runtime).
+// -----------------------------------------------------------------------
+describe('apiClient request timeout ceiling (Bug-9755)', () => {
+  beforeEach(() => {
+    configureApiClient('https://test.example.com');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('rejects with a readable error when fetch never responds', async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+      signals.push((init as RequestInit | undefined)?.signal ?? undefined);
+      return new Promise<Response>(() => { /* never settles */ });
+    });
+
+    vi.useFakeTimers();
+    const pending = apiClient.get('/test');
+    const assertion = expect(pending).rejects.toThrow('Request timed out');
+    await vi.advanceTimersByTimeAsync(31_000);
+    await assertion;
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
+  it('rejects with a readable error when the response headers arrive but the body never does', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () => new Promise(() => { /* body never arrives */ }),
+    } as Response);
+
+    vi.useFakeTimers();
+    const pending = apiClient.get('/test');
+    const assertion = expect(pending).rejects.toThrow('Request timed out');
+    await vi.advanceTimersByTimeAsync(31_000);
+    await assertion;
+  });
+});
+
+describe('streamRequest header deadline (Bug-9805)', () => {
+  beforeEach(() => {
+    configureApiClient('https://test.example.com');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('rejects a never-resolving fetch with a typed timeout and aborts transport', async () => {
+    let transportSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+      transportSignal = (init as RequestInit | undefined)?.signal;
+      return new Promise<Response>(() => { /* never settles */ });
+    });
+
+    vi.useFakeTimers();
+    const pending = streamRequest('/stream', { text: 'hello' });
+    const assertion = expect(pending).rejects.toBeInstanceOf(StreamError);
+    await vi.advanceTimersByTimeAsync(30_001);
+    await assertion;
+
+    await expect(pending).rejects.toMatchObject({ code: 'timeout' });
+    expect(transportSignal?.aborted).toBe(true);
+  });
+
+  it('links caller cancellation without converting it into a timeout or retryable error', async () => {
+    let transportSignal: AbortSignal | undefined;
+    let fetchStarted!: () => void;
+    const fetchStartedPromise = new Promise<void>(resolve => {
+      fetchStarted = resolve;
+    });
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+      transportSignal = (init as RequestInit | undefined)?.signal;
+      fetchStarted();
+      return new Promise<Response>(() => { /* transport observes signal externally */ });
+    });
+
+    const caller = new AbortController();
+    const pending = streamRequest('/stream', { text: 'hello' }, caller.signal);
+    await fetchStartedPromise;
+    caller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(transportSignal).not.toBe(caller.signal);
+    expect(transportSignal?.aborted).toBe(true);
+  });
+
+  it('returns a successful response and does not abort it after the deadline is cleared', async () => {
+    let transportSignal: AbortSignal | undefined;
+    const response = new Response('data: ok\n\n', { status: 200 });
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+      transportSignal = (init as RequestInit | undefined)?.signal;
+      return Promise.resolve(response);
+    });
+
+    vi.useFakeTimers();
+    await expect(streamRequest('/stream', { text: 'hello' })).resolves.toBe(response);
+    await vi.advanceTimersByTimeAsync(30_001);
+
+    expect(transportSignal?.aborted).toBe(false);
+  });
+
+  it('Bug-9805 keeps caller cancellation linked after headers resolve for the response body', async () => {
+    const caller = new AbortController();
+    let transportSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+      transportSignal = (init as RequestInit | undefined)?.signal;
+      return Promise.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull() {
+              // Leave body consumption pending until the caller aborts.
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+    });
+
+    const response = await streamRequest('/stream', { text: 'hello' }, caller.signal);
+    expect(response.ok).toBe(true);
+    expect(transportSignal?.aborted).toBe(false);
+
+    caller.abort();
+
+    expect(transportSignal).not.toBe(caller.signal);
+    expect(transportSignal?.aborted).toBe(true);
   });
 });

@@ -14,8 +14,14 @@ import {
 import { CanvasRenderer } from "echarts/renderers";
 import type { EChartsCoreOption } from "echarts/core";
 import { ErrorBoundary } from "./ErrorBoundary";
-import { buildAutoChartSpec } from "../utils/chartSpec";
+import {
+  buildAutoChartSpec,
+  ROW_DIMENSION,
+  MEASURES_DIMENSION,
+  VALUE_SERIES_NAME,
+} from "../utils/chartSpec";
 import { resolveEchartsThemeName } from "../utils/echartsTheme";
+import { useCompactChartHeight } from "../utils/chartLayout";
 import { useChatContext } from "../providers/ChatProvider";
 
 echarts.use([
@@ -37,9 +43,21 @@ const THEME_PRIMARY = "#4ea397";
 interface ChartBlockProps {
   rows: Record<string, unknown>[];
   echartsTheme?: Record<string, unknown>;
+  compact?: boolean;
+  /**
+   * Replaces the computed canvas height. Used by the maximised view, which
+   * needs the chart to fill the dialog rather than sit at its inline size.
+   * The existing ResizeObserver re-lays the chart out when this changes.
+   */
+  heightOverride?: number | string;
 }
 
-export function ChartBlock({ rows, echartsTheme }: ChartBlockProps) {
+export function ChartBlock({
+  rows,
+  echartsTheme,
+  heightOverride,
+  compact = false,
+}: ChartBlockProps) {
   const { t } = useChatContext();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
@@ -50,8 +68,22 @@ export function ChartBlock({ rows, echartsTheme }: ChartBlockProps) {
   // never leak the registry. See utils/echartsTheme.ts.
   const themeName = resolveEchartsThemeName(echartsTheme);
 
+  // Bug-9921 — the compact chart height is derived from the pane's visible
+  // height (see utils/chartLayout.ts), not a literal, so it adapts as the
+  // Excel task pane is resized. No-op when not compact.
+  const compactHeight = useCompactChartHeight(compact);
+
   const option = useMemo<EChartsCoreOption | null>(() => {
     if (!spec || spec.kind === "metric") return null;
+
+    // Bug-7385: labels/series-name sentinels from the i18n-free spec builder
+    // are localized here, at the one place that has `t()`.
+    const displayLabels =
+      spec.dimension === ROW_DIMENSION
+        ? spec.labels.map((n) => t("chart.rowLabel", { n }))
+        : spec.labels;
+    const displaySeriesName = (name: string | undefined) =>
+      name === VALUE_SERIES_NAME ? t("chart.valueSeriesName") : name;
 
     const base = {
       animationDuration: 650,
@@ -78,13 +110,13 @@ export function ChartBlock({ rows, echartsTheme }: ChartBlockProps) {
         series: [
           {
             type: "pie",
-            name: series?.name,
+            name: displaySeriesName(series?.name),
             radius: ["42%", "72%"],
             center: ["50%", "56%"],
             avoidLabelOverlap: true,
             itemStyle: { borderRadius: 4, borderWidth: 2 },
             label: { formatter: "{b}" },
-            data: spec.labels.map((label, index) => ({
+            data: displayLabels.map((label, index) => ({
               name: label,
               value: series?.values[index] ?? 0,
             })),
@@ -105,14 +137,14 @@ export function ChartBlock({ rows, echartsTheme }: ChartBlockProps) {
         },
         yAxis: {
           type: "category",
-          data: [...spec.labels].reverse(),
+          data: [...displayLabels].reverse(),
           axisLabel: { fontSize: 11, width: 140, overflow: "truncate" },
           axisTick: { alignWithLabel: true },
         },
         xAxis: { type: "value" },
         series: spec.series.map((s) => ({
           type: "bar",
-          name: s.name,
+          name: displaySeriesName(s.name),
           data: [...s.values].reverse(),
           barMaxWidth: 28,
           emphasis: { focus: "series" },
@@ -126,12 +158,14 @@ export function ChartBlock({ rows, echartsTheme }: ChartBlockProps) {
         top: 52,
         left: 16,
         right: 24,
-        bottom: spec.labels.length > 8 ? 72 : 40,
+        // Bug-9921: compact drops the visible dataZoom slider (below), so it
+        // does not need the extra bottom margin reserved for that slider.
+        bottom: spec.labels.length > 8 ? (compact ? 48 : 72) : 40,
         containLabel: true,
       },
       xAxis: {
         type: "category",
-        data: spec.labels,
+        data: displayLabels,
         axisLabel: {
           rotate: spec.labels.length > 8 ? 35 : 0,
           interval: spec.labels.length > 30 ? "auto" : 0,
@@ -139,16 +173,23 @@ export function ChartBlock({ rows, echartsTheme }: ChartBlockProps) {
         axisTick: { alignWithLabel: true },
       },
       yAxis: { type: "value" },
+      // Bug-9921: the compact task pane is short on vertical room and the
+      // owner flagged the slider as consuming a large share of a small
+      // chart, so compact keeps the "inside" (wheel/pinch/drag) zoom but
+      // drops the visible slider strip via ECharts' own dataZoom config
+      // rather than shrinking it after the fact.
       dataZoom:
         spec.labels.length > 8
-          ? [
-              { type: "slider", height: 18, bottom: 12 },
-              { type: "inside" },
-            ]
+          ? compact
+            ? [{ type: "inside" }]
+            : [
+                { type: "slider", height: 18, bottom: 12 },
+                { type: "inside" },
+              ]
           : [],
       series: spec.series.map((s) => ({
         type: spec.kind,
-        name: s.name,
+        name: displaySeriesName(s.name),
         data: s.values,
         smooth: spec.kind === "line",
         showSymbol: spec.labels.length <= 24,
@@ -161,7 +202,7 @@ export function ChartBlock({ rows, echartsTheme }: ChartBlockProps) {
         emphasis: { focus: "series" },
       })),
     };
-  }, [spec, t]);
+  }, [spec, t, compact]);
 
   useEffect(() => {
     if (!containerRef.current || !option) return;
@@ -193,11 +234,11 @@ export function ChartBlock({ rows, echartsTheme }: ChartBlockProps) {
       <ErrorBoundary>
         <Box
           sx={{
-            mt: 1.5,
-            p: 2,
-            border: 1,
+            mt: compact ? 0 : 1.5,
+            p: compact ? 1 : 2,
+            border: compact ? 0 : 1,
             borderColor: "divider",
-            borderRadius: 1,
+            borderRadius: compact ? 0 : 1,
             bgcolor: "background.paper",
             backgroundImage: `linear-gradient(135deg, ${THEME_PRIMARY}22, transparent 54%)`,
             minWidth: 0,
@@ -214,7 +255,7 @@ export function ChartBlock({ rows, echartsTheme }: ChartBlockProps) {
           <Typography
             sx={{
               mt: 0.5,
-              fontSize: { xs: 30, sm: 38 },
+              fontSize: compact ? 24 : { xs: 30, sm: 38 },
               lineHeight: 1.05,
               fontWeight: 750,
               color: "text.primary",
@@ -234,44 +275,58 @@ export function ChartBlock({ rows, echartsTheme }: ChartBlockProps) {
     <ErrorBoundary>
       <Box
         sx={{
-          mt: 1.5,
-          border: 1,
+          mt: compact ? 0 : 1.5,
+          border: compact ? 0 : 1,
           borderColor: "divider",
-          borderRadius: 1,
+          borderRadius: compact ? 0 : 1,
           bgcolor: "background.paper",
         }}
       >
-        <Box
-          sx={{
-            px: 1.5,
-            pt: 1.25,
-            pb: 0.25,
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "baseline",
-            gap: 1,
-          }}
-        >
-          <Typography
-            variant="caption"
-            color="text.secondary"
-            fontWeight={600}
+        {!compact && (
+          <Box
+            sx={{
+              px: 1.5,
+              pt: 1.25,
+              pb: 0.25,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "baseline",
+              gap: 1,
+            }}
           >
-            {spec.kind === "pie"
-              ? t("chart.distribution")
-              : spec.kind === "line"
-                ? t("chart.trend")
-                : prettifyDimension(spec.dimension)}
-          </Typography>
-          {spec.truncated && (
-            <Typography variant="caption" color="text.disabled">
-              {t("chart.truncated", {
-                count: String(spec.truncated.shown),
-                total: String(spec.truncated.total),
-              })}
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              fontWeight={600}
+            >
+              {spec.kind === "pie"
+                ? t("chart.distribution")
+                : spec.kind === "line"
+                  ? t("chart.trend")
+                  : spec.dimension === MEASURES_DIMENSION
+                    ? t("chart.measuresDimension")
+                    : spec.dimension === ROW_DIMENSION
+                      ? t("chart.rowsDimension")
+                      : prettifyDimension(spec.dimension)}
             </Typography>
-          )}
-        </Box>
+            {spec.truncated && (
+              <Typography variant="caption" color="text.disabled">
+                {t("chart.truncated", {
+                  count: String(spec.truncated.shown),
+                  total: String(spec.truncated.total),
+                })}
+              </Typography>
+            )}
+          </Box>
+        )}
+        {compact && spec.truncated && (
+          <Typography sx={{ px: 1, pt: 0.25, fontSize: 9, color: "text.disabled" }}>
+            {t("chart.truncated", {
+              count: String(spec.truncated.shown),
+              total: String(spec.truncated.total),
+            })}
+          </Typography>
+        )}
         <Box
           ref={containerRef}
           role="img"
@@ -281,16 +336,26 @@ export function ChartBlock({ rows, echartsTheme }: ChartBlockProps) {
                 ? t("chart.distribution")
                 : spec.kind === "line"
                   ? t("chart.trend")
-                  : prettifyDimension(spec.dimension),
+                  : spec.dimension === MEASURES_DIMENSION
+                    ? t("chart.measuresDimension")
+                    : spec.dimension === ROW_DIMENSION
+                      ? t("chart.rowsDimension")
+                      : prettifyDimension(spec.dimension),
           })}
           sx={{
             height:
-              spec.kind === "hbar"
+              heightOverride ??
+              (spec.kind === "hbar"
                 ? Math.min(
                     600,
-                    Math.max(200, spec.labels.length * 32 + 48),
+                    Math.max(
+                      compact ? compactHeight : 200,
+                      spec.labels.length * 32 + 48,
+                    ),
                   )
-                : { xs: 300, sm: 360 },
+                : compact
+                  ? compactHeight
+                  : { xs: 300, sm: 360 }),
             width: "100%",
             minWidth: 0,
           }}

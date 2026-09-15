@@ -1,4 +1,11 @@
-"""Query-defined projection names must resolve BEFORE model-column validation.
+"""Bug-9039 — query-defined projection names must resolve BEFORE model-column
+validation.
+
+This file is Bug-9039's regression guard. It carries the issue number because a
+guard nobody can find from the issue is not a guard: the tests below already
+covered the defect and cited its nine failing e2e queries by their Q-numbers,
+but named Bug-9059, Bug-9045 and Bug-9458 only, so a search for Bug-9039 found
+nothing and the issue read as unguarded.
 
 The complex-SQL path validated every identifier against the DEPLOYED MODEL's
 physical columns without first considering the names the QUERY ITSELF defines.
@@ -35,7 +42,9 @@ Test escape: the e2e suite that would have caught this was reporting
 failures read as green; no unit test drove an ORDER BY over a query-defined
 alias at all.
 Guard: this file — three positive alias sources through the real bind + audit
-path, and the negative cases that keep containment fail-closed.
+path, and the negative cases that keep containment fail-closed. Both directions
+are mutation-proven: removing the ORDER BY exemption fails the positive tests,
+and widening it to every column position fails the fail-closed ones.
 Tier: T1 (producer/consumer contract: binder publishes the projection scope,
 the result audit consumes it).
 

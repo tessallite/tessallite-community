@@ -22,6 +22,7 @@ dependencies = [
     # System-settings resolver pulls per-service tuning knobs from the system DB.
     "sqlalchemy>=2.0.30",
     "asyncpg>=0.29.0",
+    "alembic>=1.13.0",
     "prometheus-client>=0.20.0",
     # Tree-sitter parser for DAX/MDX (Phase 2 block A)
     "tree-sitter>=0.21,<0.22",

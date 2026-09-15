@@ -161,6 +161,8 @@
   "projectNav.demoTenant": "المستأجر التجريبي",
   "projectNav.setup": "الإعداد",
   "projectNav.ssoMappings": "تعيينات SSO",
+  "projectNav.ssoIdp": "موفّر الهوية",
+  "projectNav.embedTokens": "رموز التضمين",
   "projectNav.usersAccess": "المستخدمون والصلاحيات",
   "projectNav.webhooks": "الويب هوكس",
   "ui.aServiceRestartIsRequiredForThisChangeTo": "يلزم إعادة تشغيل الخدمة لتفعيل هذا التغيير",

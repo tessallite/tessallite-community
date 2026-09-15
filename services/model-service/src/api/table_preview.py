@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 
+from shared.auth.roles import PROJECT_MODELER_ROLE
 from shared.config.settings import get_settings
 from shared.connector_qualify import quote_table_ref, transpile_preview_sql
 from shared.db.models import DataSource, ModelTable
@@ -37,6 +38,9 @@ router = APIRouter(
 )
 
 PAGE_SIZE_MAX = 200
+
+# Bug-9896: minimum project role for the raw source-table preview.
+PREVIEW_MIN_ROLE = PROJECT_MODELER_ROLE
 
 
 class TablePreviewResponse(BaseModel):
@@ -133,7 +137,12 @@ async def _introspect_via_router(
 @router.get(
     "/{table_id}/preview",
     response_model=TablePreviewResponse,
-    dependencies=[require_role("viewer")],
+    # Bug-9896 (audit row A38, decision 4.4c): the table preview is a raw
+    # ``SELECT *`` on the PHYSICAL source table — no persona, no CLS, no RLS.
+    # It is a MODELLING surface, so it is gated at modeller-or-above rather
+    # than viewer. The persona-filtered path for data is the model query.
+    # ``forbid_embed_user`` stays: an embed token is never a modeller.
+    dependencies=[require_role(PREVIEW_MIN_ROLE)],
 )
 async def preview_table(
     request: Request,

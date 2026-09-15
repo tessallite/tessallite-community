@@ -47,6 +47,7 @@ import types
 from pathlib import Path
 
 import pytest
+from result_fakes import ScalarResult
 import sqlglot
 
 from src.ir.logical_query import (
@@ -92,7 +93,7 @@ class _Result:
         self._rows = list(rows)
 
     def scalars(self):
-        return self
+        return ScalarResult(self._rows)
 
     def all(self):
         return list(self._rows)

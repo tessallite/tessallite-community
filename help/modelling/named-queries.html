@@ -24,6 +24,12 @@
 <p>Open a model in Model Builder and open the <strong>Named Queries</strong> panel. The kind selector at the top chooses which kind you are looking at; the list below shows the existing objects of that kind as cards. Each card shows the object's name, a kind chip and a channel badge, its status or health, its display folder, and a plain-language description, plus <strong>Edit</strong> and <strong>Delete</strong> actions gated by your role (a modeller authors and edits; deploy follows the model's deploy permission). <strong>Add</strong> opens the editor for the selected kind.</p>
 <p>All three kinds are <strong>governed model content</strong>: they travel in the model's deployed snapshot, follow the same certification lifecycle, and only reach users after the model is deployed (see *Certification and governance* and *Deploy semantics* below).</p>
 <hr>
+<h2>Deployed vs. Define: two views of the same MDX Named Sets</h2>
+<p>The panel that opens MDX Named Sets from the toolbelt shows two tabs: <strong>Deployed</strong> and <strong>Define</strong>.</p>
+<ul><li><strong>Define</strong> is the authoring surface described in the rest of this page — the live list you edit, backed by whatever is currently saved to the model's draft, whether or not it has been deployed yet.</li><li><strong>Deployed</strong> is a read-only viewer of exactly what BI tools currently see: only sets that belong to the <strong>last deployed</strong> model version, grouped by folder, with a certification filter. It exists so a modeller can check what Excel and Power BI actually query right now without leaving Model Builder, opening a separate BI client, or guessing whether an edit has gone live.</li></ul>
+<p>This split matters because editing a definition never changes what BI tools see until you deploy (see <em>Deploy semantics</em> below) — a set you just created or renamed only appears under <strong>Deployed</strong> after that deploy completes. If you edit a set and it still looks unchanged in Excel, check <strong>Deployed</strong> first: if the edit is not there either, the model has not been redeployed since you made it.</p>
+<p>The KPI Scorecard panel uses the identical Deployed/Define split for the same reason: separating "what I am authoring" from "what is actually live" for any governed model object.</p>
+<hr>
 <h2>MDX Named Sets</h2>
 <p>An MDX Named Set is a reusable collection of dimension members expressed in MDX. It resolves inside the XMLA engine at query time, so it is the right kind for Excel PivotTables and Power BI.</p>
 <h3>Types</h3>

@@ -356,7 +356,7 @@ async def test_composite_indicators_agree_single_vs_batch(client):
               side_effect=_fake_single_for(values)),
         patch("src.api.kpis._build_measure_provider", return_value=MagicMock()),
     ):
-        single_resp = await client.post(f"{PREFIX}/{parent.id}/evaluate")
+        single_resp = await client.post(f"{PREFIX}/{parent.id}/evaluate?deployed_only=false")
     assert single_resp.status_code == 200
     single = single_resp.json()
 
@@ -391,7 +391,7 @@ async def test_composite_indicators_agree_single_vs_batch(client):
         # skips the publish — covered by test_evaluate_batch_user_render_does_not_publish).
         with _service_publish_user():
             batch_resp = await client.post(
-                f"{PREFIX}/evaluate-batch",
+                f"{PREFIX}/evaluate-batch?deployed_only=false",
                 json={"kpi_ids": [str(parent.id)]},
                 headers=internal_request_headers(),
             )
@@ -457,7 +457,7 @@ async def test_nested_composite_scores_recursively_both_endpoints(client):
               side_effect=_fake_single_for(values)),
         patch("src.api.kpis._build_measure_provider", return_value=MagicMock()),
     ):
-        single_resp = await client.post(f"{PREFIX}/{grandparent.id}/evaluate")
+        single_resp = await client.post(f"{PREFIX}/{grandparent.id}/evaluate?deployed_only=false")
     assert single_resp.status_code == 200
     assert single_resp.json()["value"] == pytest.approx(80.0)
 
@@ -474,7 +474,7 @@ async def test_nested_composite_scores_recursively_both_endpoints(client):
         patch("src.api.kpis._upsert_kpi_latest_batch", AsyncMock()),
     ):
         batch_resp = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(grandparent.id)]},
         )
     assert batch_resp.status_code == 200
@@ -507,7 +507,7 @@ async def test_batch_composite_cycle_fails_loud(client):
         patch("src.api.kpis._upsert_kpi_latest_batch", AsyncMock()),
     ):
         resp = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(comp_a.id), str(comp_b.id)]},
         )
     assert resp.status_code == 200
@@ -543,7 +543,7 @@ async def test_batch_composite_depth_limit_fails_loud(client):
         patch("src.api.kpis._upsert_kpi_latest_batch", AsyncMock()),
     ):
         resp = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(c.id) for c in chain]},
         )
     assert resp.status_code == 200
@@ -591,7 +591,7 @@ async def test_evaluate_batch_service_context_publishes_kpi_latest(client):
     ):
         with _service_publish_user():
             resp = await client.post(
-                f"{PREFIX}/evaluate-batch",
+                f"{PREFIX}/evaluate-batch?deployed_only=false",
                 json={"kpi_ids": [str(kpi.id)]},
                 headers=internal_request_headers(),
             )
@@ -625,7 +625,7 @@ async def test_bug_9524_human_with_internal_marker_cannot_publish_kpi_latest(cli
         # The client fixture supplies an ordinary CurrentUser.  The valid
         # internal marker is intentionally present to prove it is not enough.
         resp = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(kpi.id)]},
             headers=internal_request_headers(),
         )
@@ -692,7 +692,7 @@ async def test_bug_9524_filtered_service_evaluation_cannot_publish_kpi_latest(cl
                 patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
             ):
                 resp = await client.post(
-                    f"{PREFIX}/evaluate-batch",
+                    f"{PREFIX}/evaluate-batch?deployed_only=false",
                     json=body,
                     headers=headers,
                 )
@@ -733,7 +733,7 @@ async def test_evaluate_batch_clamps_future_marker_and_preserves_earlier_marker(
                 patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
             ):
                 resp = await client.post(
-                    f"{PREFIX}/evaluate-batch",
+                    f"{PREFIX}/evaluate-batch?deployed_only=false",
                     json={"kpi_ids": [str(kpi.id)], "eval_started_at": marker_iso},
                     headers=internal_request_headers(),
                 )
@@ -773,7 +773,7 @@ async def test_evaluate_batch_user_render_does_not_publish(client):
         patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
     ):
         resp = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(kpi.id)]},
         )
     assert resp.status_code == 200
@@ -806,7 +806,7 @@ async def test_evaluate_batch_persona_scope_does_not_publish(client):
         patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
     ):
         resp = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(kpi.id)]},
             headers=internal_request_headers(),
         )
@@ -861,7 +861,7 @@ async def test_evaluate_batch_captures_epoch_before_evaluation_not_after(client)
             patch("src.api.kpis._upsert_kpi_latest_batch", upsert_mock),
         ):
             resp = await client.post(
-                f"{PREFIX}/evaluate-batch",
+                f"{PREFIX}/evaluate-batch?deployed_only=false",
                 json={"kpi_ids": [str(kpi.id)]},
                 headers=internal_request_headers(),
             )

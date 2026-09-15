@@ -32,7 +32,6 @@ from shared.semantic.fiscal_year_labels import (
     FISCAL_YEAR_LABEL_FORMATS,
 )
 from shared.security.credential_crypto import decrypt_str, encrypt_str
-from shared.webhooks.dispatcher import emit_webhook_logged as emit_webhook
 from src.auth.middleware import (
     CurrentUser,
     require_human_user,
@@ -404,7 +403,6 @@ async def delete_tenant(
         ip_address=client_ip,
         detail={"display_name": tenant.display_name},
     )
-    await emit_webhook(tenant.slug, "tenant.deleted", {"slug": tenant.slug})
     await sys_db.commit()
 
     db_url = normalize_tenant_db_url(decrypt_str(tenant.encrypted_db_url), tenant.slug)

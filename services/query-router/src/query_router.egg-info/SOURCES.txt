@@ -9,6 +9,7 @@ src/api/drill_routes.py
 src/api/filter_contract.py
 src/api/headless.py
 src/api/introspect.py
+src/api/measure_values.py
 src/api/plugin.py
 src/api/rate_limit.py
 src/api/routes.py
@@ -74,6 +75,7 @@ src/routing/quantile_proof.py
 src/routing/router.py
 src/security/__init__.py
 src/security/cls_metadata.py
+src/security/named_query_visibility.py
 src/security/persona_gate.py
 src/security/query_audit.py
 src/semantic/__init__.py
@@ -92,8 +94,20 @@ tests/test_binder_query_defined_alias_scope.py
 tests/test_binder_visibility_cascade.py
 tests/test_bug8285_caption_augmentation.py
 tests/test_bug8285_caption_source_render.py
+tests/test_bug8529_discover_members_preexec.py
 tests/test_bug8615_g3_join_population_serving.py
+tests/test_bug8637_join_traversal_divergence.py
 tests/test_bug9172_named_query_attribution.py
+tests/test_bug9179_star_nq_bigquery_semantic_ctas.py
+tests/test_bug9208_hidden_field_contract.py
+tests/test_bug9490_cls_snapshot_authority.py
+tests/test_bug9745_rls_column_disclosure.py
+tests/test_bug9864_grouping_sets_contract.py
+tests/test_bug9885_aggregate_inventory_cache.py
+tests/test_bug9893_named_list_refresh_context.py
+tests/test_bug9894_kpi_artifact_persona_surface.py
+tests/test_bug9896_introspect_modeller_gate.py
+tests/test_bug9900_introspect_batch_modeller_gate.py
 tests/test_bug_5173_dialect_fragment_boundary.py
 tests/test_bug_5192_5193_5195_5196_5197_5336.py
 tests/test_bug_5547_count_distinct_aggregate_quoting.py
@@ -111,6 +125,7 @@ tests/test_bug_7023_7024_7015_7016_7017_7008.py
 tests/test_bug_7034_rls_injection_must_not_fan_out.py
 tests/test_bug_7044_cls_bypass_aggregate.py
 tests/test_bug_7412_headless_cls_metadata.py
+tests/test_bug_7558_tpcds_pocket_population.py
 tests/test_bug_7765_single_agg_scalar_wrapper.py
 tests/test_bug_7775_outer_join_types.py
 tests/test_bug_7784_calc_expansion_snapshot_authority.py
@@ -122,6 +137,7 @@ tests/test_bug_8302_8306_8303_snapshot_authority.py
 tests/test_bug_8363_drill_simulate_persona.py
 tests/test_bug_8392_pocket_generation_guard.py
 tests/test_bug_8455_8457_admission_generation_binding.py
+tests/test_bug_8560_drill_options_simulate_agreement.py
 tests/test_bug_8580_pocket_join_population.py
 tests/test_bug_8602_serve_time_source_binding_db.py
 tests/test_bug_8613_service_principal_capability_composition.py
@@ -131,6 +147,13 @@ tests/test_bug_8664_derived_exact_population.py
 tests/test_bug_8789_split_population_codes.py
 tests/test_bug_8809_row_security_error_disclosure.py
 tests/test_bug_9020_execute_compile_error_is_422.py
+tests/test_bug_9238_aggregate_where_transpile_refusal.py
+tests/test_bug_9373_rls_every_owner_constrained.py
+tests/test_bug_9740_bare_measure_group_by.py
+tests/test_bug_9824_measure_predicates.py
+tests/test_bug_9837_rls_owner_join.py
+tests/test_bug_9914_raw_route_security_owner_join.py
+tests/test_bug_9983_retired_aggregate_compatibility_load.py
 tests/test_cache_hit_observability.py
 tests/test_cache_hit_pocket_no_double_count.py
 tests/test_calc_aggregate_routing.py
@@ -228,6 +251,9 @@ tests/test_render_boundary_static.py
 tests/test_render_golden.py
 tests/test_resolved_date_col_id.py
 tests/test_result_cache.py
+tests/test_review_1_1_7_r1_rls_owner_binding.py
+tests/test_review_1_1_7_rc_aggregate_inventory_cross_request.py
+tests/test_review_1_1_7_rc_aggregate_inventory_serving_fields.py
 tests/test_rewrite_raw.py
 tests/test_rewriter_physical_grain.py
 tests/test_rls_cache_key.py

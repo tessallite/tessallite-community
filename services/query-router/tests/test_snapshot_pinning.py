@@ -11,6 +11,7 @@ from a snapshot dict.
 """
 from __future__ import annotations
 
+import inspect
 import sys
 import types
 import uuid
@@ -32,10 +33,8 @@ from src.ir.logical_query import LogicalQuery
 from src.semantic import snapshot_resolver
 from src.semantic.snapshot_resolver import (
     DeployedShape,
-    LiveMetadataBundle,
     hierarchy_level_dimensions_from_snapshot,
     resolve_deployed_shape,
-    resolve_live_metadata_bundle,
 )
 
 
@@ -52,6 +51,20 @@ def _lq(measures=None, dims=None) -> LogicalQuery:
         limit=None,
         offset=None,
         query_fingerprint="fp",
+    )
+
+
+def test_bug_8517_dead_live_metadata_cache_surface_is_removed():
+    """Bug-8517: deployed serving has no unreachable live-metadata fallback."""
+    from src.api import routes
+    from src.semantic import binder
+
+    assert not hasattr(snapshot_resolver, "LiveMetadataBundle")
+    assert not hasattr(snapshot_resolver, "resolve_live_metadata_bundle")
+    assert not hasattr(snapshot_resolver, "invalidate_live_metadata")
+    assert not hasattr(binder, "_load_live_metadata_bundle")
+    assert "invalidate_live_metadata" not in inspect.getsource(
+        routes.evict_model_cache
     )
 
 
@@ -178,44 +191,6 @@ async def test_deploy_epoch_bump_invalidates_deployed_shape_cache():
 
 
 @pytest.mark.asyncio
-async def test_deploy_epoch_bump_invalidates_live_metadata_cache():
-    """Bug-7140: a deploy_epoch bump must also invalidate the live-metadata
-    bundle cache (the fallback path for models with empty snapshots)."""
-    snapshot_resolver.invalidate_live_metadata()
-    model_id = uuid.uuid4()
-    version_id = uuid.uuid4()
-    model = types.SimpleNamespace(
-        id=model_id, deployed_version_id=version_id, deploy_epoch=1,
-    )
-    db = AsyncMock()
-    db.expunge = lambda obj: None
-
-    calls = {"n": 0}
-
-    async def _loader():
-        calls["n"] += 1
-        return LiveMetadataBundle(
-            measures=[], dimensions=[], hierarchy_levels=[],
-            hidden_column_ids=set(),
-            physical_columns_visible={"a"}, physical_columns_all={"a", "b"},
-        )
-
-    first = await resolve_live_metadata_bundle(model, db, loader=_loader)
-    assert calls["n"] == 1
-
-    # Same epoch -> cache hit.
-    second = await resolve_live_metadata_bundle(model, db, loader=_loader)
-    assert second is first
-    assert calls["n"] == 1
-
-    # Bump epoch -> cache miss, fresh load.
-    model.deploy_epoch = 2
-    third = await resolve_live_metadata_bundle(model, db, loader=_loader)
-    assert third is not first
-    assert calls["n"] == 2
-
-
-@pytest.mark.asyncio
 async def test_deploy_epoch_missing_defaults_to_zero():
     """Models without the deploy_epoch attribute (pre-migration rows) must
     still cache correctly, defaulting epoch to 0."""
@@ -286,53 +261,6 @@ async def test_resolve_deployed_shape_accepts_hierarchy_only_snapshot():
     levels = hierarchy_level_dimensions_from_snapshot(shape)
     assert {level.name for level in levels} == {"Geo.Country", "Country"}
     assert levels[0].source_column_id == key_column_id
-
-
-@pytest.mark.asyncio
-async def test_resolve_live_metadata_bundle_caches_per_version():
-    # F-003-14: the live-load fallback bundle is loaded once per
-    # (model_id, deployed_version_id) and self-invalidates on re-deploy.
-    snapshot_resolver.invalidate_live_metadata()
-    model_id = uuid.uuid4()
-    version_id = uuid.uuid4()
-    model = types.SimpleNamespace(id=model_id, deployed_version_id=version_id, deploy_epoch=1)
-    db = AsyncMock()
-    db.expunge = lambda obj: None  # sync no-op (real AsyncSession.expunge is sync)
-
-    calls = {"n": 0}
-
-    async def _loader():
-        calls["n"] += 1
-        return LiveMetadataBundle(
-            measures=[], dimensions=[], hierarchy_levels=[],
-            hidden_column_ids=set(),
-            physical_columns_visible={"a"}, physical_columns_all={"a", "b"},
-        )
-
-    first = await resolve_live_metadata_bundle(model, db, loader=_loader)
-    second = await resolve_live_metadata_bundle(model, db, loader=_loader)
-    assert first is second              # cache hit: same object
-    assert calls["n"] == 1              # loader ran only once
-    assert first.physical_columns_visible == {"a"}
-    assert first.physical_columns_all == {"a", "b"}
-
-    # Re-deploy -> new version id -> fresh load (no stale bundle).
-    model.deployed_version_id = uuid.uuid4()
-    await resolve_live_metadata_bundle(model, db, loader=_loader)
-    assert calls["n"] == 2
-
-
-@pytest.mark.asyncio
-async def test_resolve_live_metadata_bundle_none_without_deploy_pointer():
-    # No deploy pointer → not cached (binder gate normally precludes this,
-    # but the function must not key a cache on a None version).
-    snapshot_resolver.invalidate_live_metadata()
-    model = types.SimpleNamespace(id=uuid.uuid4(), deployed_version_id=None, deploy_epoch=0)
-
-    async def _loader():  # pragma: no cover - must not be called
-        raise AssertionError("loader must not run without a deploy pointer")
-
-    assert await resolve_live_metadata_bundle(model, AsyncMock(), loader=_loader) is None
 
 
 def test_hierarchy_levels_from_snapshot():

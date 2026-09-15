@@ -1,0 +1,94 @@
+{
+  "defaultPreset": "hierarchical",
+  "defaultDirection": "DOWN",
+  "defaultSpacing": "normal",
+  "presets": {
+    "hierarchical": {
+      "normal": {
+        "nodeSpacing": 88,
+        "layerSpacing": 128
+      },
+      "dense": {
+        "nodeSpacing": 64,
+        "layerSpacing": 96
+      }
+    },
+    "compact": {
+      "normal": {
+        "nodeSpacing": 48,
+        "layerSpacing": 76
+      },
+      "dense": {
+        "nodeSpacing": 36,
+        "layerSpacing": 60
+      }
+    },
+    "radial": {
+      "normal": {
+        "nodeSpacing": 64,
+        "layerSpacing": 96
+      },
+      "dense": {
+        "nodeSpacing": 48,
+        "layerSpacing": 72
+      }
+    }
+  },
+  "routing": {
+    "shapeBufferDistance": 0,
+    "idealNudgingDistance": 4,
+    "segmentPenalty": 1,
+    "anglePenalty": 8,
+    "crossingPenalty": 10,
+    "sharedPathPenalty": 80,
+    "maxCandidateDistance": 2400,
+    "nodeGap": 24,
+    "endpointDriftLimitPx": 24
+  },
+  "worker": {
+    "timeoutMs": 15000,
+    "maxPendingRequests": 1
+  },
+  "qualityFixtures": {
+    "largeNodeCount": 100,
+    "largeJoinCount": 180,
+    "maxElapsedMs": 15000,
+    "fixtures": {
+      "shared-dimensions": {
+        "maxEdgeCrossings": 6,
+        "maxTotalBends": 24,
+        "maxThroughNodeSegments": 0
+      },
+      "variable-sizes": {
+        "maxEdgeCrossings": 2,
+        "maxTotalBends": 10,
+        "maxThroughNodeSegments": 0
+      },
+      "parallel-joins": {
+        "maxEdgeCrossings": 2,
+        "maxTotalBends": 10,
+        "maxThroughNodeSegments": 0
+      },
+      "pinned-fixed": {
+        "maxEdgeCrossings": 2,
+        "maxTotalBends": 10,
+        "maxThroughNodeSegments": 0
+      },
+      "connected-shared": {
+        "maxEdgeCrossings": 50,
+        "maxTotalBends": 120,
+        "maxThroughNodeSegments": 0
+      },
+      "large-model": {
+        "maxEdgeCrossings": 220,
+        "maxTotalBends": 400,
+        "maxThroughNodeSegments": 0
+      },
+      "connected-dense": {
+        "maxEdgeCrossings": 170,
+        "maxTotalBends": 260,
+        "maxThroughNodeSegments": 1
+      }
+    }
+  }
+}

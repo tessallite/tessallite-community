@@ -16,6 +16,7 @@ import types
 from uuid import uuid4
 
 import pytest
+from result_fakes import ScalarResult
 
 from src.ir.logical_query import LogicalQuery, BoundQuery
 from src.rewrite.query_rewriter import _build_source_sql
@@ -42,7 +43,7 @@ class _Result:
         self._rows = list(rows)
 
     def scalars(self):
-        return self
+        return ScalarResult(self._rows)
 
     def all(self):
         return list(self._rows)

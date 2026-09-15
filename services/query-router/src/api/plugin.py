@@ -29,14 +29,17 @@ from src.api._sql_disclosure import (
 )
 from src.api.filter_contract import (
     SemanticFilter,
+    SemanticMeasureFilter,
     StrictModel,
     build_logical_filters,
+    build_logical_measure_filters,
     canonical_raw_query,
     normalize_order_by,
     project_ids_match,
     semantic_fingerprint,
     validate_uuid_id,
 )
+from src.api.measure_values import coerce_measure_values
 # F-027-07: the plugin endpoint shares the per-tenant rate limiter with the
 # headless API (previously it had none, despite being internet-facing
 # through nginx). Both draw from the same per-tenant buckets.
@@ -73,6 +76,7 @@ _MAX_LIMIT = 50_000
 # and validation live in src.api.filter_contract — shared verbatim with
 # the headless API so the two surfaces can never drift again.
 PluginFilter = SemanticFilter
+PluginMeasureFilter = SemanticMeasureFilter
 
 
 class PluginOrderBy(StrictModel):
@@ -89,6 +93,7 @@ class PluginExecuteRequest(StrictModel):
     measures: list[str] = Field(default_factory=list)
     dimensions: list[str] = Field(default_factory=list)
     filters: list[PluginFilter] = Field(default_factory=list)
+    measure_filters: list[PluginMeasureFilter] = Field(default_factory=list)
     limit: Optional[int] = Field(default=None, ge=1)
     offset: Optional[int] = Field(default=None, ge=0)
     order_by: list[PluginOrderBy] = Field(default_factory=list)
@@ -175,6 +180,7 @@ def _compute_fingerprint(body: PluginExecuteRequest) -> str:
         measures=body.measures,
         dimensions=body.dimensions,
         filters=body.filters,
+        measure_filters=body.measure_filters,
     )
 
 
@@ -303,6 +309,7 @@ async def plugin_execute(
         )
 
     filters = _build_filters(body.filters)
+    measure_filters = build_logical_measure_filters(body.measure_filters)
     # F-027-17: shared order-by direction validation (invalid -> 422).
     order_by = normalize_order_by(body.order_by)
     fingerprint = _compute_fingerprint(body)
@@ -323,6 +330,7 @@ async def plugin_execute(
             measures=body.measures,
             dimensions=body.dimensions,
             filters=body.filters,
+            measure_filters=body.measure_filters,
             order_by=order_by,
             limit=body.limit,
             offset=body.offset,
@@ -330,6 +338,7 @@ async def plugin_execute(
         requested_measures=body.measures,
         requested_dimensions=body.dimensions,
         filters=filters,
+        measure_filters=measure_filters,
         grain=list(body.dimensions),
         order_by=order_by,
         limit=probe_limit,
@@ -467,6 +476,18 @@ async def plugin_execute(
         if has_more:
             rows = rows[:effective_limit]
 
+        # Bug-9876 / Bug-9910 [wrong numbers]: type the measure columns before
+        # they are serialised. The executor returns ``Decimal`` for every
+        # NUMERIC source column and pydantic's JSON mode renders a ``Decimal``
+        # as a STRING, so the add-in wrote TEXT into cells and a PivotTable over
+        # the result counted instead of summing -- with no error anywhere. The
+        # column names come from ``bound.resolved_measures``, the same authority
+        # ``_build_annotation`` uses below, so the annotated measure set and the
+        # typed column set cannot drift.
+        rows = coerce_measure_values(
+            rows, [m.name for m in bound.resolved_measures],
+        )
+
         _trace_sql, _trace_sql_redacted = await redact_physical_sql(
             decision.rewritten_query,
             db,
@@ -479,6 +500,15 @@ async def plugin_execute(
         query_echo = {
             "measures": body.measures,
             "dimensions": body.dimensions,
+            "measure_filters": [
+                {
+                    "measure_id": f.measure_id,
+                    "operator": f.operator,
+                    "value": f.value,
+                    "effective_aggregation": f.effective_aggregation,
+                }
+                for f in body.measure_filters
+            ],
             "limit": effective_limit,
             "offset": effective_offset,
         }

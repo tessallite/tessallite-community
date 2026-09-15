@@ -61,3 +61,12 @@ describe("partitionJoinsByEndpoints", () => {
     expect(countDroppedJoins([join("j1", "t1", "t2"), join("j2", "t2", "calendar")], nodeIds)).toBe(1);
   });
 });
+
+
+it("does not warn for known hidden calendars but still excludes their edges", () => {
+  const calendarJoin = { ...join("calendar", "t1", "cal"), hidden_calendar_table_ids: ["cal"] };
+  const nodes = new Set(["t1"]);
+  expect(countDroppedJoins([calendarJoin], nodes)).toBe(0);
+  expect(partitionJoinsByEndpoints([calendarJoin], nodes).linked).toEqual([]);
+  expect(countDroppedJoins([{ ...calendarJoin, left_table_id: "deleted" }], nodes)).toBe(1);
+});

@@ -58,6 +58,15 @@ def normalise_id_set(ids: Iterable[Any] | None) -> set[str]:
     return {str(i) for i in ids if i is not None}
 
 
+class IncompleteClosureContext(RuntimeError):
+    """Raised when a closure decision is impossible with the context supplied.
+
+    Not a security verdict. The object may or may not touch a restricted
+    column; the point is that this context cannot establish which, so the
+    caller must supply a complete one rather than receive a guess.
+    """
+
+
 @dataclass
 class ClosureContext:
     """Shared lookup bundle for the closure algorithm.
@@ -86,6 +95,20 @@ class ClosureContext:
     restricted_uda_ids: set[str] = field(default_factory=set)
     measures_by_id: dict[str, Any] = field(default_factory=dict)
     measures_by_name: dict[str, Any] = field(default_factory=dict)
+    # Whether ``measures_by_id`` / ``measures_by_name`` hold the WHOLE model.
+    #
+    # Consolidation after the Bug-9265 regression: an empty measure map means
+    # two different things — "this model has no measures" and "the caller did
+    # not load them". The closure cannot tell them apart, so it answered
+    # "restricted" for every dependency-bearing object whose base it could not
+    # find, and a deliberately partial context turned into hidden clean
+    # variants across the measures API.
+    #
+    # Callers that hold the whole universe say so. Callers that do not are
+    # REFUSED an authoritative answer for a dependency-bearing object rather
+    # than being handed a plausible one — a caller bug now surfaces where it is
+    # written instead of as a product defect somewhere downstream.
+    measure_universe_complete: bool = False
     restricted_physical_names: Optional[set[str]] = None
     known_physical_names: Optional[set[str]] = None
     table_identifiers: Optional[set[str]] = None
@@ -115,6 +138,12 @@ def object_touches_restricted(
     ``restricted_ids`` are stable ``ModelColumn`` ids as strings. ``obj`` is a
     duck-typed measure/dimension. See the module docstring for the closure
     rules. Fail-closed on any unverifiable branch.
+
+    Raises ``IncompleteClosureContext`` when the object carries a dependency —
+    a variant base or a calculated expression — and the context does not hold
+    the whole measure universe. That is a CALLER error, not a security verdict:
+    the honest answer is "cannot decide", and returning a boolean anyway is
+    what turned a deliberately partial context into hidden clean variants.
     """
     src = getattr(obj, "source_column_id", None)
     if src is not None and str(src) in restricted_ids:
@@ -142,14 +171,32 @@ def object_touches_restricted(
     # Variant measure — the base measure's closure.
     base_id = getattr(obj, "variant_of_measure_id", None)
     if base_id is not None:
+        if not ctx.measure_universe_complete:
+            raise IncompleteClosureContext(
+                "a variant measure cannot be judged without the model's measure "
+                "universe; supply a complete ClosureContext"
+            )
         base = ctx.measures_by_id.get(str(base_id))
-        if base is not None and str(base_id) not in _visited:
+        if base is None:
+            # Bug-9265: an unresolved variant BASE cannot be proven clean, for
+            # exactly the reasons the calculated-measure branch below already
+            # fails closed on an unresolved ``measure("name")`` — a filtered
+            # list, a rename, or draft/deploy skew. Falling through treated the
+            # variant as unrestricted, which contradicted this module's stated
+            # fail-closed invariant and hid the base's restricted lineage.
+            return True
+        if str(base_id) not in _visited:
             _visited.add(str(base_id))
             if object_touches_restricted(base, restricted_ids, ctx, _visited):
                 return True
 
     # Calculated measure — every ``measure("name")`` reference's closure.
     if getattr(obj, "measure_type", None) == "calculated":
+        if not ctx.measure_universe_complete:
+            raise IncompleteClosureContext(
+                "a calculated measure cannot be judged without the model's "
+                "measure universe; supply a complete ClosureContext"
+            )
         try:
             ref_names = _parse_measure_reference_names(
                 getattr(obj, "expression", None)

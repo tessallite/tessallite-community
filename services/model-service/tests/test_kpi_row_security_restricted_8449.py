@@ -778,7 +778,7 @@ async def test_single_target_expression_restriction_redacts_the_kpi(client):
             side_effect=_security_only_on_target,
         ),
     ):
-        response = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        response = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
 
     assert response.status_code == 200
     data = response.json()
@@ -836,7 +836,7 @@ async def test_single_target_measure_restriction_redacts_the_kpi(client):
             side_effect=_restricted_target,
         ),
     ):
-        response = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        response = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
 
     assert response.status_code == 200
     data = response.json()
@@ -960,7 +960,7 @@ async def test_batch_fresh_restricted_composite_reference_is_restricted(client):
         ),
     ):
         response = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(k.id) for k in all_kpis]},
         )
 
@@ -1009,11 +1009,11 @@ async def test_batch_cached_restricted_composite_reference_is_restricted(client)
         ),
     ):
         warm = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(parent.id)]},
         )
         response = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(parent.id), str(consumer.id)]},
         )
 
@@ -1101,7 +1101,7 @@ async def test_batch_composite_restricted_target_with_visible_child_is_restricte
         ),
     ):
         response = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(composite.id), str(child.id)]},
         )
 
@@ -1173,7 +1173,7 @@ async def test_single_nested_composite_merges_target_restriction_with_visible_si
             ),
         ),
     ):
-        response = await client.post(f"{PREFIX}/{grandparent.id}/evaluate")
+        response = await client.post(f"{PREFIX}/{grandparent.id}/evaluate?deployed_only=false")
 
     assert response.status_code == 200
     data = response.json()
@@ -1213,7 +1213,7 @@ async def test_batch_fresh_target_restricted_composite_restricts_kpi_consumer(cl
         ),
     ):
         response = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(k.id) for k in all_kpis]},
         )
 
@@ -1259,11 +1259,11 @@ async def test_batch_cached_target_restricted_composite_restricts_kpi_consumer(c
         ),
     ):
         warm = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(composite.id)]},
         )
         response = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(composite.id), str(consumer.id)]},
         )
 
@@ -1304,7 +1304,7 @@ async def test_single_kpi_reference_to_target_restricted_composite_is_redacted(c
             ),
         ),
     ):
-        response = await client.post(f"{PREFIX}/{consumer.id}/evaluate")
+        response = await client.post(f"{PREFIX}/{consumer.id}/evaluate?deployed_only=false")
 
     assert response.status_code == 200
     result = response.json()
@@ -1391,7 +1391,7 @@ async def test_single_composite_compiler_fallback_restricts_count_child(client):
             side_effect=_deny_all_count_router,
         ),
     ):
-        response = await client.post(f"{PREFIX}/{parent.id}/evaluate")
+        response = await client.post(f"{PREFIX}/{parent.id}/evaluate?deployed_only=false")
 
     assert response.status_code == 200
     data = response.json()
@@ -1489,7 +1489,7 @@ async def test_single_composite_child_target_kpi_denial_redacts_parent_and_consu
             side_effect=_child_target_kpi_evaluator(kpis_mod._COMPILER_UNSUPPORTED),
         ),
     ):
-        response = await client.post(f"{PREFIX}/{requested.id}/evaluate")
+        response = await client.post(f"{PREFIX}/{requested.id}/evaluate?deployed_only=false")
 
     assert response.status_code == 200
     result = response.json()
@@ -1543,7 +1543,7 @@ async def test_batch_prefetch_preserves_restriction_and_literal_sibling(client):
         ),
     ):
         response = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(k.id) for k in all_kpis]},
         )
 
@@ -1657,7 +1657,7 @@ async def test_single_kpi_target_reference_uses_python_fallback(client):
             side_effect=_target_reference_sql(kpis_mod._COMPILER_UNSUPPORTED),
         ),
     ):
-        response = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        response = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
 
     assert response.status_code == 200
     assert response.json()["value"] == 50.0
@@ -1763,7 +1763,7 @@ async def test_single_nested_target_dependency_propagates_row_security(client):
             side_effect=_nested_target_governance_sql(kpis_mod._COMPILER_UNSUPPORTED),
         ),
     ):
-        response = await client.post(f"{PREFIX}/{consumer.id}/evaluate")
+        response = await client.post(f"{PREFIX}/{consumer.id}/evaluate?deployed_only=false")
 
     assert response.status_code == 200
     data = response.json()
@@ -1844,7 +1844,7 @@ async def test_batch_auto_loads_and_orders_target_only_kpi_dependency(client):
         ),
     ):
         response = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(consumer.id)]},
         )
 
@@ -1880,7 +1880,7 @@ async def test_batch_target_kpi_restriction_reaches_consumer(client):
         ),
     ):
         response = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(consumer.id)]},
         )
 
@@ -1918,11 +1918,11 @@ async def test_batch_cached_target_dependency_resolves_for_later_consumer(client
         ),
     ):
         warm = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(target.id)]},
         )
         response = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(consumer.id)]},
         )
 

@@ -24,6 +24,71 @@ const DEMO_TENANT_SLUG = DEMO_ENABLED ? (import.meta.env.VITE_DEMO_TENANT_SLUG ?
 const DEMO_EMAIL = DEMO_ENABLED ? (import.meta.env.VITE_DEMO_EMAIL ?? "") : "";
 const DEMO_PASSWORD = DEMO_ENABLED ? (import.meta.env.VITE_DEMO_PASSWORD ?? "") : "";
 
+// Bug-9558: about line (version / deployment type / build commit). All three
+// come from the build environment via `define` in vite.config.ts. Missing
+// values degrade gracefully: each portion (including the version) is omitted
+// entirely rather than rendering a malformed placeholder like "vunknown" —
+// see Bug-9558's DR-02 closeout for why a bare "unknown" version used to
+// render as "Tessallite vunknown" (the template's own literal " v" prefix
+// had no space before an already-substituted word).
+const BUILD_VERSION = import.meta.env.VITE_TESSALLITE_VERSION;
+const DEPLOYMENT_TYPE = import.meta.env.VITE_DEPLOYMENT_TYPE;
+const BUILD_COMMIT_HASH = import.meta.env.VITE_BUILD_COMMIT_HASH;
+
+// Bug-9558 R2-07: a Docker image build-time label cannot express a runtime
+// license fact — the same Community-release image is deployed with either a
+// Community or an Enterprise licence, decided at INSTALL time and changeable
+// afterward by uploading a new licence (see credentials-and-env.md's Licence
+// Manager). `deploymentTypeOverride` carries the edition read from the
+// deploy-time-generated `/edition.json` static artifact (see the fetch in the
+// component below), taking precedence over the Docker build-arg default
+// (VITE_DEPLOYMENT_TYPE) when present. VITE_DEPLOYMENT_TYPE alone remains
+// correct for the two cases that ARE genuinely build/deploy-topology-fixed
+// facts and never license-flip: "Dev Stack" and "Cloud Edition".
+function aboutLine(
+  t: (key: string, vars?: Record<string, string | number>) => string,
+  deploymentTypeOverride?: string | null,
+): string {
+  const version = BUILD_VERSION?.trim();
+  const deploymentType = (deploymentTypeOverride ?? DEPLOYMENT_TYPE)?.trim();
+  // The about line shows the FIRST 13 characters of the commit hash
+  // (the operator's example format [9138721837AH5] is 13 chars).
+  const commitHash = BUILD_COMMIT_HASH?.trim().slice(0, 13);
+  // The single login.about template carries the whole line; every portion is
+  // folded into its placeholder value (leading space / "v" prefix / brackets
+  // included) so an unset variable omits its portion cleanly instead of
+  // leaving a stray literal character behind.
+  return t("login.about", {
+    deploymentType: deploymentType ? ` ${deploymentType}` : "",
+    version: version ? ` v${version}` : "",
+    commitHash: commitHash ? ` [${commitHash}]` : "",
+  });
+}
+
+// Bug-9558 R2-07: format the /edition.json artifact's raw `edition` string
+// (e.g. "community", "enterprise") into the same "<Name> Edition" form the
+// build-time VITE_DEPLOYMENT_TYPE label already uses.
+// Bug-9578 (R3-06, round-2 recheck): the previous version blindly title-cased
+// whatever "edition" string /api/v1/edition returned, so an internal license
+// state like "internal-unlimited" or "unactivated" rendered as an internal
+// implementation detail ("Internal-unlimited Edition"). Known values are the
+// finite domain the backend actually reports: shared/licensing/schema.py's
+// KNOWN_EDITIONS (community, enterprise — the only values a real signed
+// license carries) plus internal-unlimited (the dev/internal-unlimited
+// manager, licensing_guard.py's _UnlimitedManager). Anything unrecognised
+// gets no override — the build-time label stays in place rather than
+// leaking a raw internal string to the login page.
+const EDITION_LABELS: Record<string, string> = {
+  community: "Community Edition",
+  enterprise: "Enterprise Edition",
+  "internal-unlimited": "Internal Edition",
+};
+
+function formatEditionLabel(edition: unknown): string | null {
+  if (typeof edition !== "string") return null;
+  return EDITION_LABELS[edition.trim().toLowerCase()] ?? null;
+}
+
 export default function Login() {
   const t = useT();
   const navigate = useNavigate();
@@ -37,12 +102,39 @@ export default function Login() {
     saml: boolean;
     oidc: boolean;
   }>({ saml: false, oidc: false });
+  // Bug-9558 R2-07: /edition.json is a plain static file (same-origin, no
+  // auth) written by the deploy/install process — see
+  // deploy/community/install.sh. It overrides the build-time
+  // VITE_DEPLOYMENT_TYPE label for self-hosted installs where the same image
+  // can carry either a Community or an Enterprise licence, decided at install
+  // time and changeable afterward. Absent on Dev Stack / Cloud Edition builds
+  // (nothing ever writes the file there), so this stays null and aboutLine()
+  // falls back to the build-time label — never a broken or blank line.
+  const [deploymentTypeOverride, setDeploymentTypeOverride] = useState<string | null>(null);
 
   useEffect(() => {
     ssoApi.getBackends(tenantId || undefined).then((data) => {
       setSsoEnabled({ saml: data.saml_enabled, oidc: data.oidc_enabled });
     }).catch((e) => console.warn("SSO backend check failed:", e));
   }, [tenantId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/edition.json")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (cancelled || !data) return;
+        setDeploymentTypeOverride(formatEditionLabel(data.edition));
+      })
+      .catch(() => {
+        // Not present on this deployment (Dev Stack / Cloud Edition never
+        // write it, and a fresh community install may not have run yet) —
+        // stay on the build-time VITE_DEPLOYMENT_TYPE label.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function signInTenant(slug: string, emailAddr: string, pw: string) {
     const result = await authApi.login({ tenant_id: slug, email: emailAddr, password: pw });
@@ -244,6 +336,16 @@ export default function Login() {
                 ? t("login.backToTenantLogin")
                 : t("login.systemAdminLogin")}
             </Link>
+          </Box>
+
+          <Box mt={3} textAlign="center">
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              data-testid="login-about"
+            >
+              {aboutLine(t, deploymentTypeOverride)}
+            </Typography>
           </Box>
         </CardContent>
       </Card>

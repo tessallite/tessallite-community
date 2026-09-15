@@ -157,6 +157,43 @@ describe('buildZoneQuery', () => {
       { dimension: 'business_date_month', operator: 'in', values: ['1', '2'] },
     ]);
   });
+
+  // Bug-9824: dimension filters remain row predicates while measure filters
+  // carry stable identity and effective aggregation for server-side HAVING.
+  it('Bug-9824: separates dimension WHERE filters from typed measure predicates', () => {
+    const items: ZoneItem[] = [
+      { id: 'm1', name: 'fee amount', zone: 'values' },
+      { id: 'd1', name: 'account type', zone: 'rows' },
+      { id: 'd1', name: 'account type', zone: 'filters', operator: 'eq', values: ['CREDIT'] },
+      // A measure dropped onto the filters zone with a gt operator and numeric value,
+      // exactly as the UI would configure for Bug-9824.
+      { id: 'm1', name: 'fee amount', zone: 'filters', operator: 'gt', values: ['10000'] },
+    ];
+    const q = buildZoneQuery(items, lists);
+    expect(q).not.toBeNull();
+    expect(q!.measures).toEqual(['fee_amount']);
+    expect(q!.dimensions).toEqual(['account_type']);
+    expect(q!.filters).toEqual([
+      { dimension: 'account_type', operator: 'eq', values: ['CREDIT'] },
+    ]);
+    expect(q!.measureFilters).toEqual([
+      { measureId: 'm1', operator: 'gt', values: ['10000'], effectiveAggregation: 'sum' },
+    ]);
+  });
+
+  it('omits a measure filter chip without operator/values, same as dimension (Bug-5289 parity)', () => {
+    const items: ZoneItem[] = [
+      { id: 'm1', name: 'fee amount', zone: 'values' },
+      { id: 'd1', name: 'account type', zone: 'rows' },
+      // Dropped onto filters but user never configured operator/values.
+      { id: 'm1', name: 'fee amount', zone: 'filters' },
+    ];
+    const q = buildZoneQuery(items, lists);
+    expect(q).not.toBeNull();
+    // The unconfigured measure filter chip is omitted, same as Bug-5289 for dimensions.
+    expect(q!.filters).toBeUndefined();
+    expect(q!.measureFilters).toBeUndefined();
+  });
 });
 
 /**
@@ -402,6 +439,27 @@ describe('Bug-6730 local PivotTable zone mapping and additive safety', () => {
     expect(isMeasureSafeForLocalPivot(localLists.measures[2])).toBe(false);
   });
 
+  // Bug-9882. The producer emits a time variant as measure_type 'standard'
+  // with `variant_of_measure_id` set — there is no 'variant' measure_type, so
+  // the three tests above ALL passed for a CAGR / lag / moving-average measure
+  // and Excel was free to SUM a growth rate across rows. Real fixtures from
+  // `modely`: base_amount_cagr, base_amount_moving_avg_n, base_amount_lag.
+  it('refuses a time-variant measure, which the producer marks with variant_of_measure_id', () => {
+    const variant = {
+      id: 'm-cagr', name: 'base_amount_cagr', display_name: 'Base amount cagr',
+      default_agg: 'sum', measure_type: 'standard', variant_of_measure_id: 'm-base', variant_kind: 'cagr',
+    } as Measure;
+    expect(isMeasureSafeForLocalPivot(variant)).toBe(false);
+
+    const base = { ...variant, id: 'm-base', variant_of_measure_id: undefined, variant_kind: undefined } as Measure;
+    expect(isMeasureSafeForLocalPivot(base)).toBe(true);
+
+    expect(unsafeLocalPivotMeasures(
+      [{ id: 'm-cagr', name: 'Base amount cagr', zone: 'values' }],
+      [variant],
+    ).map(m => m.id)).toEqual(['m-cagr']);
+  });
+
   it('reports unsafe staged value measures before local PivotTable insertion', () => {
     const items: ZoneItem[] = [
       { id: 'm-revenue', name: 'Revenue', zone: 'values' },
@@ -414,6 +472,107 @@ describe('Bug-6730 local PivotTable zone mapping and additive safety', () => {
       'margin_rate',
       'ending_inventory',
     ]);
+  });
+});
+
+/**
+ * Investigation: investor-demo live Excel add-in verification reported
+ * "transposed table with merged headers" for a zone assignment of
+ * Rows=account_type, Columns=year_no+month+channel, Values=base_amount.
+ * This test exercises the exact reported configuration through the flat
+ * cross-tab ("Insert Table") path to confirm no swap or merge occurs.
+ */
+describe('Investor-demo transpose/merge investigation -- Insert Table path', () => {
+  const investorLists = {
+    measures: [
+      { id: 'm-ba', name: 'base_amount', display_name: 'Base Amount', default_agg: 'sum', measure_type: 'standard' } as Measure,
+    ],
+    dimensions: [
+      { id: 'd-at', name: 'account_type', display_name: 'Account Type', data_type: 'character varying', source_type: 'dim' } as Dimension,
+      { id: 'd-yr', name: 'year_no', display_name: 'Year', data_type: 'integer', source_type: 'dim' } as Dimension,
+      { id: 'd-mo', name: 'business_date_calendar_month', display_name: 'Month', data_type: 'integer', source_type: 'dim' } as Dimension,
+      { id: 'd-ch', name: 'channel_name', display_name: 'Channel', data_type: 'character varying', source_type: 'dim' } as Dimension,
+    ],
+  };
+
+  const zoneItems: ZoneItem[] = [
+    { id: 'm-ba', name: 'Base Amount', zone: 'values' },
+    { id: 'd-at', name: 'Account Type', zone: 'rows' },
+    { id: 'd-yr', name: 'Year', zone: 'columns' },
+    { id: 'd-mo', name: 'Month', zone: 'columns' },
+    { id: 'd-ch', name: 'Channel', zone: 'columns' },
+  ];
+
+  it('resolveZoneAxes places account_type on rows, year/month/channel on columns', () => {
+    const axes = resolveZoneAxes(zoneItems, investorLists);
+    expect(axes.rowDimNames).toEqual(['account_type']);
+    expect(axes.colDimNames).toEqual(['year_no', 'business_date_calendar_month', 'channel_name']);
+  });
+
+  it('pivotZoneResult produces account_type as the leftmost row key with column combos as headers', () => {
+    // Synthetic data: 3 account types x 2 years x 2 months x 2 channels.
+    const data: Record<string, unknown>[] = [];
+    const types = ['CREDIT', 'DEBIT', 'WALLET'];
+    const years = [2025, 2026];
+    const months = [1, 2];
+    const channels = ['Direct', 'Online'];
+    let v = 100;
+    for (const at of types) {
+      for (const yr of years) {
+        for (const mo of months) {
+          for (const ch of channels) {
+            data.push({
+              account_type: at,
+              year_no: yr,
+              business_date_calendar_month: mo,
+              channel_name: ch,
+              base_amount: v++,
+            });
+          }
+        }
+      }
+    }
+    // 3 * 2 * 2 * 2 = 24 rows
+    expect(data).toHaveLength(24);
+
+    const titles: Record<string, string> = {
+      account_type: 'Account Type',
+      year_no: 'Year',
+      business_date_calendar_month: 'Month',
+      channel_name: 'Channel',
+      base_amount: 'Base Amount',
+    };
+    const pivoted = pivotZoneResult(
+      data,
+      ['account_type'],
+      ['year_no', 'business_date_calendar_month', 'channel_name'],
+      ['base_amount'],
+      titles,
+    );
+
+    // Header structure: first column is 'Account Type' (row key),
+    // then one column per unique (year, month, channel) combo.
+    expect(pivoted.headers[0]).toBe('Account Type');
+    // With 2 years x 2 months x 2 channels = 8 column combos, plus 1 row-key column = 9 headers.
+    expect(pivoted.headers).toHaveLength(9);
+
+    // Each combo header should be joined with ' / ', single measure so no measure suffix.
+    expect(pivoted.headers).toContain('2025 / 1 / Direct');
+    expect(pivoted.headers).toContain('2026 / 2 / Online');
+
+    // 3 rows (one per account type).
+    expect(pivoted.rows).toHaveLength(3);
+
+    // Row keys are in the leftmost position -- NOT transposed.
+    const rowKeys = pivoted.rows.map(r => r[0]);
+    expect(rowKeys).toEqual(['CREDIT', 'DEBIT', 'WALLET']);
+
+    // Every cell should be a number (no empty strings -- we have full cartesian data).
+    for (const row of pivoted.rows) {
+      for (let i = 1; i < row.length; i++) {
+        expect(typeof row[i]).toBe('number');
+      }
+    }
   });
 });
 

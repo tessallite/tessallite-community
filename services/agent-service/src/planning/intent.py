@@ -21,6 +21,8 @@ class AnalyticalIntent:
     wants_composition: bool = False
     wants_separate_series: bool = False
     wants_scatter: bool = False
+    preserve_previous_breakdown_dimensions: bool = False
+    preserve_previous_breakdown_where: bool = False
     requested_grain: str | None = None
     requested_period_may_cross_year: bool = False
     ranking_direction: str | None = None
@@ -40,6 +42,10 @@ class AnalyticalIntent:
             "wants_composition": self.wants_composition,
             "wants_separate_series": self.wants_separate_series,
             "wants_scatter": self.wants_scatter,
+            "preserve_previous_breakdown_dimensions": (
+                self.preserve_previous_breakdown_dimensions
+            ),
+            "preserve_previous_breakdown_where": self.preserve_previous_breakdown_where,
             "requested_grain": self.requested_grain,
             "requested_period_may_cross_year": self.requested_period_may_cross_year,
             "ranking_direction": self.ranking_direction,
@@ -60,7 +66,11 @@ _COMPARISON_RE = re.compile(
     re.I,
 )
 _RANKING_RE = re.compile(
-    r"\b(top|bottom|highest|lowest|best|worst|largest|smallest|rank|ranking)\b",
+    # ``most`` is a supported superlative for a descending ranking. Keep the
+    # negative lookahead so composition wording such as ``most of the total``
+    # does not accidentally become a Top-N request.
+    r"\b(top|bottom|highest|lowest|best|worst|largest|smallest|"
+    r"rank|ranking|most(?!\s+of\b))\b",
     re.I,
 )
 _BREAKDOWN_RE = re.compile(r"\b(by|split by|group(?:ed)? by|per|across)\b", re.I)
@@ -93,6 +103,46 @@ _SEPARATE_SERIES_RE = re.compile(
     r"split .* into lines?)\b",
     re.I,
 )
+_TEMPORAL_BREAKDOWN_FOLLOW_UP_RE = re.compile(
+    r"\b(?:break|split)\s+(?:that|it|those|these|them|this)\s+down\b",
+    re.I,
+)
+_BREAKDOWN_REPLACEMENT_OR_EXCLUSION_RE = re.compile(
+    r"\b(?:instead(?:\s+of)?|rather\s+than|replace|not\s+by|only\s+by|drop|remove)\b",
+    re.I,
+)
+_BREAKDOWN_WHERE_CHANGE_RE = re.compile(
+    r"\b(?:where|filter(?:ed|ing)?|excluding|except|without|"
+    r"ignore(?:d|ing)?|condition|threshold)\b",
+    re.I,
+)
+_BREAKDOWN_PERIOD_CHANGE_RE = re.compile(
+    r"\b(?:for|from|between|during|since|until|before|after|in|on|over)\s+"
+    r"(?:the\s+)?(?:"
+    r"(?:19|20)\d{2}\b|"
+    r"\d{4}[-/]\d{1,2}(?:[-/]\d{1,2})?\b|"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+    r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|"
+    r"nov(?:ember)?|dec(?:ember)?)\b|"
+    r"q[1-4]\b|"
+    r"(?:this|current|previous|prior|next|last)\s+"
+    r"(?:period|year|quarter|month|week|day|"
+    r"\d+\s+(?:days?|weeks?|months?|quarters?|years?))\b|"
+    r"(?:different|new|another)\s+period\b"
+    r")",
+    re.I,
+)
+_BREAKDOWN_PERIOD_WINDOW_RE = re.compile(
+    r"\b(?:last|past|next|previous|prior)\s+\d+\s+"
+    r"(?:days?|weeks?|months?|quarters?|years?)\b",
+    re.I,
+)
+_TEMPORAL_BREAKDOWN_AXIS_RE = re.compile(
+    r"\b(?:break|split)\s+(?:that|it|those|these|them|this)\s+down\s+"
+    r"(?:by|per)\s+(?:month|monthly|week|weekly|quarter|quarterly|"
+    r"year|yearly|annual|annually|day|daily|hour|hourly)\b",
+    re.I,
+)
 _GRAIN_PATTERNS = (
     ("month", re.compile(r"\b(month|monthly|by month|last \d+ months?)\b", re.I)),
     ("week", re.compile(r"\b(week|weekly|by week|last \d+ weeks?)\b", re.I)),
@@ -123,6 +173,18 @@ def detect_analytical_intent(
     ranking_direction = _detect_ranking_direction(text)
     requested_limit = _detect_requested_limit(text)
     requested_period_may_cross_year = _period_may_cross_year(text, previous_plan)
+    preserve_previous_breakdown_dimensions = bool(
+        previous_plan
+        and requested_grain
+        and _TEMPORAL_BREAKDOWN_FOLLOW_UP_RE.search(text)
+        and not _BREAKDOWN_REPLACEMENT_OR_EXCLUSION_RE.search(text)
+    )
+    preserve_previous_breakdown_where = bool(
+        previous_plan
+        and requested_grain
+        and _TEMPORAL_BREAKDOWN_FOLLOW_UP_RE.search(text)
+        and not _breakdown_changes_period_or_filter(text)
+    )
 
     if _looks_like_follow_up(text):
         prev_shape = _previous_shape(previous_plan)
@@ -132,6 +194,11 @@ def detect_analytical_intent(
         if prev_shape == AnalyticalShape.MULTI_SERIES_TIME:
             wants_separate_series = True
             notes.append("inherited_separate_series_from_previous_shape")
+
+    if preserve_previous_breakdown_dimensions:
+        notes.append("preserve_previous_breakdown_dimensions")
+    if preserve_previous_breakdown_where:
+        notes.append("preserve_previous_breakdown_where")
 
     if wants_separate_series:
         wants_trend = True
@@ -172,12 +239,52 @@ def detect_analytical_intent(
         wants_composition=wants_composition,
         wants_separate_series=wants_separate_series,
         wants_scatter=wants_scatter,
+        preserve_previous_breakdown_dimensions=preserve_previous_breakdown_dimensions,
+        preserve_previous_breakdown_where=preserve_previous_breakdown_where,
         requested_grain=requested_grain,
         requested_period_may_cross_year=requested_period_may_cross_year,
         ranking_direction=ranking_direction,
         requested_limit=requested_limit,
         confidence=confidence,
         notes=notes,
+    )
+
+
+def _breakdown_changes_period_or_filter(text: str) -> bool:
+    """Detect an explicit period/filter change on a temporal breakdown follow-up.
+
+    Dimension replacement is intentionally not included here. A request such as
+    ``"Break that down by year instead of account type"`` changes the grouping
+    axis while retaining the prior date restriction. The ``where`` repair only
+    stops when the user supplies a new period or a row-filter condition.
+    """
+    if _BREAKDOWN_WHERE_CHANGE_RE.search(text):
+        return True
+    if _BREAKDOWN_PERIOD_CHANGE_RE.search(text):
+        return True
+    if _BREAKDOWN_PERIOD_WINDOW_RE.search(text):
+        return True
+
+    axis_match = _TEMPORAL_BREAKDOWN_AXIS_RE.search(text)
+    if not axis_match:
+        return False
+    tail = text[axis_match.end():]
+    # ``for London`` / ``in EMEA`` are ordinary user wording for a new
+    # category filter. Keep the useful additive forms ``for each ...`` and
+    # ``in every ...`` as dimension wording, and keep an explicit reaffirmation
+    # such as ``for the same period`` on the preservation path.
+    if re.search(
+        r"\b(?:for|in)\s+(?!each\b|every\b|same\b|the\s+same\b)\S+",
+        tail,
+        re.I,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:with|using)\s+[^,.!?]*(?:=|\b(?:is|equals|between|in)\b)",
+            tail,
+            re.I,
+        )
     )
 
 
@@ -191,19 +298,25 @@ def _detect_requested_grain(text: str) -> str | None:
 def _detect_ranking_direction(text: str) -> str | None:
     if re.search(r"\b(bottom|lowest|worst|smallest)\b", text):
         return "asc"
-    if re.search(r"\b(top|highest|best|largest)\b", text):
+    if re.search(r"\b(top|highest|best|largest|most(?!\s+of\b))\b", text):
         return "desc"
     return None
 
 
 def _detect_requested_limit(text: str) -> int | None:
     match = re.search(r"\b(?:top|bottom|first|last)\s+(\d{1,4})\b", text)
-    if not match:
-        return None
-    value = int(match.group(1))
-    if value < 1 or value > 1000:
-        return None
-    return value
+    if match:
+        value = int(match.group(1))
+        if value < 1 or value > 1000:
+            return None
+        return value
+    # An unqualified ``most`` asks for the single maximum. The planner's
+    # normal ranking repair then supplies the explicit descending limit, and
+    # shape narration can distinguish that requested boundary from a safety
+    # truncation. ``most of`` is deliberately excluded by _RANKING_RE above.
+    if re.search(r"\bmost(?!\s+of\b)\b", text):
+        return 1
+    return None
 
 
 def _detect_detail_intent(text: str) -> bool:

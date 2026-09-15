@@ -28,6 +28,7 @@ from shared.config.shutdown_budget import (
 )
 from shared.metrics import PrometheusMiddleware, metrics_response
 from shared.middleware.rate_limiter import attach_limiter, build_limiter
+from shared.service_readiness import probe_metadata_database
 from src.api import (
     access,
     admin,
@@ -99,6 +100,8 @@ from src.api import (
     sources,
     sso,
     system_settings,
+    system_logs,
+    system_log_ingest,
     webhooks,
     table_attributes,
     table_preview,
@@ -146,6 +149,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # (sink key missing) only logs a WARNING inside the validator and returns.
     from shared.licensing.beacon import beacon_startup_validate
     beacon_startup_validate()
+    # Bug-9225: fail-FAST on an SSO deployment with no public origin. A
+    # redirect-based backend in AUTH_BACKENDS must publish an absolute callback
+    # address to the identity provider, which comes from PUBLIC_BASE_URL and is
+    # never derived from a request header. Deliberately NOT caught: an install
+    # that names saml/oidc without it is not finished, and the operator should
+    # learn that here rather than from a failed sign-in weeks later.
+    from src.api.sso import sso_startup_validate
+    sso_startup_validate()
     try:
         from src.beacon_runtime import build_beacon_emitter
         beacon = build_beacon_emitter()
@@ -263,6 +274,8 @@ def create_app() -> FastAPI:
     PREFIX = "/api/v1"
 
     app.include_router(admin.router, prefix=PREFIX)
+    app.include_router(system_logs.router, prefix=PREFIX)
+    app.include_router(system_log_ingest.router, prefix=PREFIX)
     app.include_router(analytics.router, prefix=PREFIX)
     app.include_router(audit.router, prefix=PREFIX)
     app.include_router(auth.router, prefix=PREFIX)
@@ -355,20 +368,26 @@ def create_app() -> FastAPI:
 
     async def _metadata_db_ready() -> tuple[bool, str]:
         """Cheap serving-readiness ping (F-030-01). Process liveness is ``/liveness``."""
-        from sqlalchemy import text
-
-        from shared.db.session import SystemSessionLocal
-
-        try:
-            async with SystemSessionLocal() as session:
-                await session.execute(text("SELECT 1"))
-            return True, "ok"
-        except Exception as exc:  # noqa: BLE001 — health must never raise
-            return False, str(exc)
+        return await probe_metadata_database()
 
     @app.get("/liveness")
     async def liveness() -> dict:
         return {"status": "ok", "service": "model-service"}
+
+    @app.get("/readiness")
+    async def readiness(response: Response) -> dict:
+        """Bounded metadata-database readiness without changing ``/health``."""
+        body: dict = {"status": "ok", "service": "model-service"}
+        ready, detail = await _metadata_db_ready()
+        if not ready:
+            body["status"] = "degraded"
+            body["detail"] = "metadata database unreachable"
+            response.status_code = 503
+            logging.getLogger(__name__).error(
+                "model-service /readiness DEGRADED — metadata DB unavailable: %s",
+                detail,
+            )
+        return body
 
     @app.get("/health")
     async def health(response: Response) -> dict:

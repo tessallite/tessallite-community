@@ -91,8 +91,8 @@ async def test_xmla_cls_denial_is_client_fault_403(monkeypatch):
         tenant_slug="demo", jwt_token="tok", session_id="sid-cls",
     )
     body = resp.body.decode("utf-8") if isinstance(resp.body, bytes) else str(resp.body)
-    assert "<soap11env:Fault>" in body
-    assert "soap11env:Client" in body, body  # access-denied is a CLIENT fault
+    assert "<soap11env:Fault" in body
+    assert xs.XMLA_CLIENT_FAULT_CODE in body, body  # access-denied is a CLIENT fault
     assert "not permitted" in body
     assert resp.status_code == 403
 
@@ -106,4 +106,4 @@ async def test_xmla_non_403_router_error_is_server_fault(monkeypatch):
         tenant_slug="demo", jwt_token="tok", session_id="sid-500",
     )
     body = resp.body.decode("utf-8") if isinstance(resp.body, bytes) else str(resp.body)
-    assert "soap11env:Server" in body, body
+    assert xs.XMLA_SERVER_FAULT_CODE in body, body

@@ -286,7 +286,11 @@ def _db_for(kpi, model):
 
 def _start_interval_months(query: str) -> int | None:
     """Months offset in the period start bound of a decomposed period query."""
-    m = re.search(r">= CURRENT_DATE - INTERVAL '(\d+) months?'", query)
+    m = re.search(
+        r">=\s+CURRENT_DATE\s+\+\s+INTERVAL\s+'1 day'\s+"
+        r"-\s+INTERVAL\s+'(\d+) months?'",
+        query,
+    )
     return int(m.group(1)) if m else None
 
 
@@ -310,7 +314,7 @@ async def test_growth_rate_kpi_evaluates_correct_growth(client):
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     data = resp.json()
     assert data["value"] == pytest.approx(0.10)
@@ -330,17 +334,25 @@ async def test_moving_window_kpi_evaluates_correct_average(client):
     )
     db = _db_for(kpi, _model())
     per_period = {1: 300.0, 2: 200.0, 3: 100.0}
+    executed: list[str] = []
 
     async def mock_execute(model_id, query, bearer, timeout_s=30.0, **kwargs):
+        executed.append(query)
         months = _start_interval_months(query)
         assert months in per_period, f"Unexpected period query: {query}"
         return {"rows": [{"value": per_period[months]}]}
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     assert resp.json()["value"] == pytest.approx(200.0)
+    assert len(executed) == 3
+    assert {_start_interval_months(query) for query in executed} == {1, 2, 3}
+    for query in executed:
+        # Bug-9478: both half-open bounds include the current day before
+        # shifting to the requested historical period.
+        assert query.count("CURRENT_DATE + INTERVAL '1 day'") == 2
 
 
 @pytest.mark.asyncio
@@ -361,7 +373,7 @@ async def test_moving_window_quarter_grain_emits_valid_intervals(client):
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     assert resp.json()["value"] == pytest.approx(50.0)
     assert executed, "decomposed period queries must have been issued"
@@ -386,7 +398,7 @@ async def test_nested_ti_expression_evaluates_via_python_hook(client):
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     assert resp.json()["value"] == pytest.approx(10.0)
 
@@ -403,7 +415,7 @@ async def test_ti_kpi_without_time_dimension_gives_clear_error(client):
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router",
                AsyncMock(side_effect=AssertionError("must not execute SQL"))):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     data = resp.json()
     assert data["value"] is None
@@ -429,7 +441,7 @@ async def test_prior_period_target_expression_evaluates(client):
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     data = resp.json()
     assert data["value"] == pytest.approx(1100.0)
@@ -542,7 +554,7 @@ async def test_derived_ti_failure_fails_loud_with_cause(client):
 
     with patch("src.api.kpis.get_tenant_db", async_gen_from(db)), \
          patch("src.api.kpis._execute_via_router", side_effect=mock_execute):
-        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        resp = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
     assert resp.status_code == 200
     data = resp.json()
     assert data["value"] is None

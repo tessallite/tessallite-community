@@ -69,18 +69,21 @@ export default function KpiLibrary({
     <>
       <Box
         sx={{
-          display: 'flex', alignItems: 'center', px: 1.5, py: 0.75,
+          display: 'flex', alignItems: 'center', px: 1.25, height: 24,
           cursor: kpis.length > 0 || loading ? 'pointer' : 'default',
           borderTop: `1px solid ${tokens.colorBorderLight}`,
+          borderBottom: `1px solid ${tokens.colorBorderLight}`,
+          bgcolor: tokens.colorSubtleFill,
           opacity: kpis.length > 0 || loading ? 1 : 0.68,
         }}
         onClick={() => {
           if (kpis.length > 0 || loading || searchQuery) onToggleExpanded();
         }}
       >
-        <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-          {templates.kpiLibrary.kpiCount(kpis.length)}
+        <Typography sx={{ fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, flex: 1, textTransform: 'uppercase', letterSpacing: '0.03em' }}>
+          {strings.library.kpisSection}
         </Typography>
+        <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>{kpis.length}</Typography>
         {/* Bug-6708: was a clickable span with no role/tabIndex/key handling;
             a real IconButton makes the scorecard insert keyboard-reachable. */}
         {onInsertScorecard && kpis.length > 0 && (
@@ -90,7 +93,7 @@ export default function KpiLibrary({
             title={strings.kpiLibrary.insertScorecard}
             aria-label={strings.kpiLibrary.insertScorecard}
             sx={{
-              width: 28, height: 28, mr: 0.5, color: tokens.colorGoldDark,
+              width: 22, height: 22, mr: 0.25, color: tokens.colorPrimary,
               '&:hover': { bgcolor: tokens.colorGoldBg },
             }}
           >
@@ -106,7 +109,7 @@ export default function KpiLibrary({
             onClick={(e) => { e.stopPropagation(); onToggleExpanded(); }}
             aria-expanded={expanded}
             aria-label={templates.library.toggleSectionAria(expanded, strings.library.kpisSection)}
-            sx={{ width: 24, height: 24, color: tokens.colorTextSecondary }}
+            sx={{ width: 22, height: 22, color: tokens.colorTextSecondary }}
           >
             {expanded ? <ExpandLess sx={{ fontSize: 16 }} /> : <ExpandMore sx={{ fontSize: 16 }} />}
           </IconButton>
@@ -114,9 +117,9 @@ export default function KpiLibrary({
       </Box>
       <Collapse in={expanded}>
         {loading ? (
-          <Box sx={{ p: 1 }}>
-            <Skeleton variant="rectangular" height={48} sx={{ mb: 0.5, borderRadius: 1 }} />
-            <Skeleton variant="rectangular" height={48} sx={{ mb: 0.5, borderRadius: 1 }} />
+          <Box sx={{ p: 0.5 }}>
+            <Skeleton variant="rectangular" height={30} sx={{ mb: 0.25, borderRadius: 0.5 }} />
+            <Skeleton variant="rectangular" height={30} sx={{ mb: 0.25, borderRadius: 0.5 }} />
           </Box>
         ) : kpis.length === 0 ? (
           <Typography sx={{ fontSize: 11, color: tokens.colorTextSecondary, px: 1.5, py: 1 }}>
@@ -128,7 +131,7 @@ export default function KpiLibrary({
               {group.folder && (
                 <Typography sx={{
                   fontSize: 10, fontWeight: 600, color: tokens.colorTextSecondary,
-                  px: 1.5, py: 0.5, textTransform: 'uppercase', bgcolor: tokens.colorSubtleFill,
+                  px: 1.25, py: 0.25, minHeight: 20, textTransform: 'uppercase', bgcolor: tokens.colorSubtleFill,
                 }}>
                   {group.folder}
                 </Typography>

@@ -25,6 +25,7 @@ from shared.auth.middleware import (
     enforce_model_scope,
     require_capability_or_service_scope,
 )
+from shared.auth.roles import PROJECT_MODELER_ROLE
 from shared.auth.service_principal import SCOPE_DATA_QUALITY
 from shared.auth.project_access import load_authorized_model
 from shared.connection_scope import (
@@ -212,6 +213,16 @@ async def introspect_query(
         require_capability_or_service_scope("explore", SCOPE_DATA_QUALITY)
     ),
 ) -> IntrospectResponse:
+    """Run one raw read-only statement against the model's source.
+
+    Bug-9896 (audit row A38, decision 4.4c): this is a RAW physical read —
+    it applies no persona, no CLS and no RLS, by design. It is therefore a
+    MODELLING surface, not a data surface, and is gated at modeller-or-above
+    rather than viewer. Embed tokens are refused by the same gate
+    (``ensure_project_model_access`` rejects an embed token for any
+    above-viewer ``min_role``). Do NOT lower this back to ``viewer``: the
+    persona-filtered path for data is the model query, not ``/introspect``.
+    """
     enforce_model_scope(current_user, body.model_id)
     _assert_read_only(body.raw_sql)
 
@@ -220,7 +231,7 @@ async def introspect_query(
             db,
             current_user,
             model_id=body.model_id,
-            min_role="viewer",
+            min_role=PROJECT_MODELER_ROLE,  # Bug-9896: modelling surface, not a data surface
             service_scope_verified=True,  # Bug-8613: scope verified by require_capability_or_service_scope
         )
         conn_obj, err = await _resolve_model_connection(
@@ -291,6 +302,29 @@ async def introspect_batch(
         require_capability_or_service_scope("explore", SCOPE_DATA_QUALITY)
     ),
 ) -> IntrospectBatchResponse:
+    """Run up to 20 raw read-only statements against the model's source.
+
+    Bug-9900 (rule-4 wave 0b): same reasoning as ``/introspect`` under
+    Bug-9896 — this is a RAW physical read that applies no persona, no CLS
+    and no RLS, so it is a MODELLING surface and is gated at
+    modeller-or-above. Embed tokens are refused by the same gate.
+
+    Caller set at the time of the change (all in model-service):
+    ``calendar.py::check_calendar_coverage`` (now modeller-gated, Bug-9900),
+    ``calendar.py::_calendar_has_year_label`` (only caller ``bind_calendar``,
+    already ``require_role("modeler")``), and
+    ``hierarchies.py::preview_hierarchy`` (audit row A37). ``preview_hierarchy``
+    is still declared ``require_role("viewer")``; under decision 4.4c it is a
+    DATA surface that must be re-expressed over the persona model query
+    (``/discover/members``) in the later rule-4 wave, at which point it stops
+    using this route entirely. Until then it fails CLOSED for a viewer here —
+    a viewer-reachable raw physical scan with an RLS predicate spliced in is
+    exactly what this gate exists to refuse. The same narrowing reaches XMLA:
+    ``gateway/src/router_client.py::get_hierarchy_preview`` forwards the
+    CALLER'S JWT, so hierarchy-backed MDSCHEMA member discovery is
+    modeller-or-above until Bug-9895 lands. Do NOT lower this back to
+    ``viewer``.
+    """
     enforce_model_scope(current_user, body.model_id)
     if len(body.queries) > 20:
         raise HTTPException(
@@ -305,7 +339,7 @@ async def introspect_batch(
             db,
             current_user,
             model_id=body.model_id,
-            min_role="viewer",
+            min_role=PROJECT_MODELER_ROLE,  # Bug-9900: modelling surface, not a data surface
             service_scope_verified=True,  # Bug-8613: scope verified by require_capability_or_service_scope
         )
         conn_obj, err = await _resolve_model_connection(

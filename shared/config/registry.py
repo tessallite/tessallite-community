@@ -741,6 +741,50 @@ _SYSTEM_SETTINGS: list[SettingDef] = [
         ),
         surfaced=False,
     ),
+    SettingDef(
+        key="gateway.subtotal_grain_max_queries",
+        level="system", type="int", default=64,
+        section="Gateway timeouts",
+        description=(
+            "Hard budget on the number of rollup grain SQL queries one XMLA "
+            "Execute may plan. A native-All PivotTable with N flat fields on one "
+            "axis requests the full CrossJoin lattice, 2^N - 1 rollup grains "
+            "(Bug-9845); beyond this budget the Execute is refused with a clear "
+            "fault instead of fanning out unboundedly (deep-review F4)."
+        ),
+        validator=_validate_positive_int,
+        label="XMLA subtotal query budget",
+        ui_group=_GRP_NETWORK, ui_control="number", unit="queries",
+        ui_help=(
+            "Maximum rollup grain queries a single PivotTable request may plan. "
+            "64 admits six one-level fields on one axis; raise it only with "
+            "source capacity to match."
+        ),
+        surfaced=False,
+    ),
+    SettingDef(
+        key="query_router.grouping_sets_dialects",
+        level="system", type="str", default="postgres,bigquery",
+        section="Gateway timeouts",
+        description=(
+            "Comma-separated sqlglot dialects allowed to serve a rollup lattice "
+            "with GROUP BY GROUPING SETS in one source operation (Bug-9864). A "
+            "model whose source dialect is not listed is refused the lattice, "
+            "and the XMLA gateway falls back to the bounded one-query-per-grain "
+            "path -- same numbers, more queries. Only the listed dialects are "
+            "verified to render and execute the clause and its GROUPING() "
+            "markers identically to the per-grain queries; widen the list only "
+            "with evidence for the added dialect."
+        ),
+        label="Rollup lattice dialects",
+        ui_group=_GRP_NETWORK, ui_control="text",
+        ui_help=(
+            "Source dialects that serve a PivotTable's whole subtotal lattice "
+            "in one query instead of one query per subtotal grain. Unlisted "
+            "dialects keep the slower per-grain path."
+        ),
+        surfaced=False,
+    ),
     # Bug-7043: CLS catalogue staleness TTL. After CLS configuration changes
     # a JDBC connection's cached catalogue may list columns the persona no
     # longer has access to (or omit newly-allowed columns). This TTL controls

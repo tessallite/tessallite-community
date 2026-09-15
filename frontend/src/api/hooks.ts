@@ -799,10 +799,13 @@ export function useColumnUsage(projectId: string, modelId: string) {
 // Named Sets
 // ---------------------------------------------------------------------------
 
-export function useNamedSets(projectId: string, modelId: string) {
+export function useNamedSets(projectId: string, modelId: string, deployedOnly = false) {
   return useQuery({
-    queryKey: ["namedSets", projectId, modelId],
-    queryFn: () => namedSetsApi.list(projectId, modelId),
+    // Bug-9091: deployedOnly is part of the key so the builder (live) and a
+    // deployed-only consumer never alias the same cache entry, mirroring
+    // useKpis's identical deploy-serving-authority contract.
+    queryKey: ["namedSets", projectId, modelId, deployedOnly],
+    queryFn: () => namedSetsApi.list(projectId, modelId, deployedOnly),
     enabled: !!projectId && !!modelId,
   });
 }

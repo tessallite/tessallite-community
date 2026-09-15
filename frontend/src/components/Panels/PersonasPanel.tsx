@@ -47,6 +47,7 @@ import type {
 } from "../../api/types";
 import { useConfirm } from "../Confirm";
 import { useCanAuthorModel } from "../../auth/useCanAuthorModel";
+import { extractApiError } from "../../utils/extractApiError";
 import { recordCreate, recordUpdate, recordDelete } from "../Builder/emitDrawerHistory";
 
 /** Map a persisted persona to a create-shaped body for undo/redo restore
@@ -418,7 +419,7 @@ export default function PersonasPanel() {
       setEditor(EMPTY_EDITOR);
       setError(null);
     },
-    onError: (e: any) => setError(extractError(e) || t("errors.requestFailed")),
+    onError: (e: any) => setError(extractApiError(e, "") || t("errors.requestFailed")),
   });
 
   const deleteMutation = useMutation({
@@ -445,7 +446,7 @@ export default function PersonasPanel() {
       );
       refresh();
     },
-    onError: (e: any) => setError(extractError(e) || t("errors.requestFailed")),
+    onError: (e: any) => setError(extractApiError(e, "") || t("errors.requestFailed")),
   });
 
   function openCreate() {
@@ -1203,6 +1204,14 @@ export default function PersonasPanel() {
                 </Typography>
               </label>
             </Stack>
+            {/* Bug-9208: this toggle widens what the persona SEES; it is not an
+                access grant. Say so where the decision is made. */}
+            <Typography
+              variant="caption"
+              sx={{ display: "block", mt: 0.5, color: "text.secondary" }}
+            >
+              {t("personas.hiddenColumnsHelp")}
+            </Typography>
           </Paper>
 
           <Stack direction="row" spacing={1} justifyContent="flex-end">
@@ -1275,14 +1284,3 @@ function ObjectMultiSelect({
   );
 }
 
-// F-008-12: return only server-supplied text; the hardcoded English
-// fallbacks moved out so callers route the empty case through
-// t("errors.requestFailed").
-function extractError(e: any): string {
-  if (!e) return "";
-  const detail = e?.response?.data?.detail;
-  if (typeof detail === "string") return detail;
-  if (detail?.message) return detail.message;
-  if (detail?.error_code) return `${detail.error_code}: ${detail.message ?? ""}`;
-  return e?.message ?? "";
-}

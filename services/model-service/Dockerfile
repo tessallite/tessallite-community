@@ -17,11 +17,6 @@ RUN pip install uv --no-cache-dir
 
 COPY services/model-service/pyproject.toml /app/pyproject.toml
 COPY services/model-service/uv.lock /app/uv.lock
-COPY shared/ /app/shared/
-COPY scripts/__init__.py /app/scripts/__init__.py
-COPY scripts/lookml_export/ /app/scripts/lookml_export/
-COPY services/model-service/src/ /app/src/
-
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
@@ -33,10 +28,24 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /app/.venv/bin/python "hijri-converter==2.3.1"
 
+# Bug-10014: source edits must reuse the installed dependency layer.
+COPY shared/ /app/shared/
+COPY scripts/__init__.py /app/scripts/__init__.py
+COPY scripts/lookml_export/ /app/scripts/lookml_export/
+COPY services/model-service/src/ /app/src/
+COPY services/model-service/entrypoint.sh /app/entrypoint.sh
+RUN chmod 755 /app/entrypoint.sh
+
 # Source-only export: closed modules removed; native compilation is not required.
 
 # ── runtime stage ──
 FROM python:3.13-slim
+
+# Security: the python:3.x-slim base lags Debian security updates (it still ships
+# perl-base 5.40.1-6 while trixie carries 5.40.1-6+deb13u1). Nothing here installs
+# perl, so a rebuild alone never picks the fix up. Apply the available upgrades in
+# the runtime stage so inherited base-layer CVEs do not reach a release artifact.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsasl2-2 unixodbc curl gnupg git && \
@@ -55,6 +64,7 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/shared /app/shared
 COPY --from=builder /app/scripts /app/scripts
 COPY --from=builder /app/src /app/src
+COPY --from=builder /app/entrypoint.sh /app/entrypoint.sh
 
 # Bug-6441: remove private license-issuer source (PRIVATE_REMOVE_PATHS)
 RUN rm -rf /app/shared/licensing/issuer
@@ -84,5 +94,8 @@ LABEL org.opencontainers.image.revision=$GIT_REVISION
 # The value is DERIVED from the single shutdown-budget source of truth
 # (shared/config/shutdown_budget.py) so this flag, the compose/Cloud-Run
 # stop grace and SOURCE_POOL_SHUTDOWN_GRACE_SECONDS cannot drift apart.
+# The entrypoint runs the system and every persisted tenant migration before
+# this command, so direct container refreshes cannot expose stale schemas.
 # `exec` keeps uvicorn as PID 1 so it still receives SIGTERM directly.
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["sh", "-c", "python -m shared.config.shutdown_budget --check; exec uvicorn src.main:app --host 0.0.0.0 --port 8001 --timeout-graceful-shutdown \"$(python -m shared.config.shutdown_budget request_drain_seconds 2>/dev/null || echo 6)\""]

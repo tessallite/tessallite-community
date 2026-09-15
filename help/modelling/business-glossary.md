@@ -2,7 +2,7 @@
 title: "Business Glossary"
 audience: modeller
 area: modelling
-updated: 2026-05-15
+updated: 2026-08-26
 ---
 
 ## What this covers
@@ -30,6 +30,20 @@ You do not have to wait for the bootstrap action to fill the glossary. Three but
 - **Add term** opens a small form where you type the term, its definition, optional context notes, and synonyms. The entry is saved as **approved** straight away, so it is live for everyone the moment you save. Use this for the occasional one-off.
 - **Import CSV** takes a pasted spreadsheet. Use a header row of exactly `term,description`, then one row per term; every row becomes an **approved** entry. This is the fastest way to seed a glossary from a list someone already keeps in Excel. If a few rows are malformed, the good ones still import and the panel tells you how many rows had errors.
 - **Revoke link** turns off *every* active public share link for this glossary at once. Anyone holding an old link gets a "not found" page, and no replacement link is created. Reach for it the moment a shared glossary should stop being reachable — for example if a link was forwarded too widely.
+
+## Deployment share link
+
+An operator or modeller can create a deployment-specific public glossary link
+through the existing authenticated share/regenerate action. The acme-demo
+reseed flow runs this action after model deployment and before aggregate refresh;
+regenerating the link revokes the previous link first. The URL is a bearer
+credential, so store or output it only outside Git, preferably through an
+explicit protected file path in the deployment environment.
+
+The public page contains approved glossary content only. It does not expose
+internal model or attachment identifiers, and ordinary viewers cannot mint or
+read the current token. Use the existing modeller/operator path again when the
+link must be rotated.
 
 ## Approving every pending entry at once
 

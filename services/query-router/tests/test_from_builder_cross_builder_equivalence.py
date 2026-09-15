@@ -38,6 +38,7 @@ import asyncio
 import uuid
 
 import pytest
+from result_fakes import ScalarResult
 
 from shared.db.models import Join, ModelColumn, ModelTable
 from shared.semantic import sql_builder
@@ -77,7 +78,7 @@ class _Res:
         self._rows = list(rows)
 
     def scalars(self):
-        return self
+        return ScalarResult(self._rows)
 
     def all(self):
         return list(self._rows)
@@ -169,20 +170,9 @@ def _ctas_from_clause(tables, joins, columns) -> str:
     return from_sql
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Open defect (filed from the Bug-8605 round-4 review): "
-        "joins._build_joined_from_clause picks its next hop by iterating a SET "
-        "of joined table ids while sql_builder.build_from_clause sweeps the "
-        "canonically ordered join list, so the two emit different spanning "
-        "trees on a cyclic graph -- 192/300 measured, and an aggregate-routed "
-        "query then serves a different row population than the source route. "
-        "PRE-EXISTING (209/300 before Bug-8605). Remove this marker when both "
-        "routes share one traversal, or when the aggregate route gains the "
-        "row-population gate the pocket route already has."
-    ),
-)
+# Bug-8637 (2026-09-05): both routes render ONE shared planner
+# (``shared.semantic.join_planner.plan_join_tree``), so this is the regression
+# guard the module docstring promised, no longer an xfail.
 def test_source_route_and_ctas_expand_the_same_join_graph():
     tables, joins, columns = _diamond()
     source_from = _source_route_from_clause(tables, joins, columns)

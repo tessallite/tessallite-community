@@ -326,6 +326,7 @@ def _resolve_required_and_base_tables(
     _sa_finest_time_col_id: Any,
     _sa_has_time_in_grain: bool,
     joins: Iterable[Any] = (),
+    measure_predicate_measures: Iterable[Any] = (),
 ) -> tuple:
     """Resolve the required physical tables and the base table.
 
@@ -366,6 +367,13 @@ def _resolve_required_and_base_tables(
         if tbl:
             required_table_ids.add(tbl.id)
     for meas in bound_query.resolved_measures:
+        tbl = _table_for_measure(meas)
+        if tbl:
+            required_table_ids.add(tbl.id)
+    # Bug-9824: a measure used only by a grouped predicate still contributes
+    # its source table/column to the source route. It is not in the SELECT
+    # measure list, but its aggregate expression must be rendered in HAVING.
+    for meas in measure_predicate_measures:
         tbl = _table_for_measure(meas)
         if tbl:
             required_table_ids.add(tbl.id)
@@ -445,6 +453,11 @@ def _resolve_required_and_base_tables(
     if base_table is None:
         for ref_meas in calc_ref_measures_by_name.values():
             base_table = _table_for_measure(ref_meas)
+            if base_table:
+                break
+    if base_table is None:
+        for meas in measure_predicate_measures:
+            base_table = _table_for_measure(meas)
             if base_table:
                 break
     # __row_count has no source_column_id so the measure loop yields nothing.

@@ -18,6 +18,7 @@ on every single BI request.
 from __future__ import annotations
 
 import base64
+import asyncio
 import logging
 import os
 import threading
@@ -30,6 +31,7 @@ from jose import JWTError, jwt
 
 from shared.config.settings import get_settings
 from shared.middleware.internal_bypass import internal_request_headers
+from src.async_singleflight import run_singleflight
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +58,31 @@ _SESSION_CHECK_TTL_SECONDS = min(
 )
 _session_check_lock = threading.Lock()
 _session_check_cache: dict[str, float] = {}
+_session_validation_inflight: dict[str, asyncio.Task[None]] = {}
 
 # Hard cap on cache entries.  Each entry is one JWT string (~1 KB) + a float
 # timestamp, so 10 000 entries ≈ 10 MB worst case.  When the cap is reached,
 # evict the oldest entry (simple sweep, not LRU — the cache is a burst
 # de-duplicator, not a hot-path data structure).
 _SESSION_CHECK_MAX_ENTRIES = 10_000
+_SESSION_VALIDATION_RETRY_AFTER_DEFAULT = 15
+_SESSION_VALIDATION_RETRY_AFTER_MAX = 60
+
+
+class SessionValidationUnavailable(ValueError):
+    """The session authority could not answer whether a token is still live."""
+
+    def __init__(
+        self,
+        retry_after_seconds: int = _SESSION_VALIDATION_RETRY_AFTER_DEFAULT,
+        message: str = "Session validation unavailable",
+    ) -> None:
+        self.retry_after_seconds = max(
+            1,
+            min(int(retry_after_seconds), _SESSION_VALIDATION_RETRY_AFTER_MAX),
+        )
+        self.retry_after = self.retry_after_seconds
+        super().__init__(message)
 
 
 def _session_check_ok(token: str) -> bool:
@@ -108,9 +129,10 @@ def _session_check_evict(token: str) -> None:
 
 
 def _session_check_reset_for_tests() -> None:
-    """Clear the validation cache (test isolation)."""
+    """Clear validation cache and in-flight work (test isolation)."""
     with _session_check_lock:
         _session_check_cache.clear()
+    _session_validation_inflight.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -228,28 +250,25 @@ def verify_jwt_token(token: str) -> TokenPayload:
 # Upstream session-revocation check (Bug-7322)
 # ---------------------------------------------------------------------------
 
-async def validate_session_upstream(token: str) -> None:
+def _session_retry_after(resp: httpx.Response) -> int:
+    """Return a bounded numeric retry hint from the authority response."""
+    try:
+        raw = resp.headers.get("Retry-After", "")
+        return max(1, min(int(raw), _SESSION_VALIDATION_RETRY_AFTER_MAX))
+    except (AttributeError, TypeError, ValueError):
+        return _SESSION_VALIDATION_RETRY_AFTER_DEFAULT
+
+
+async def _validate_session_uncached(token: str) -> None:
     """Confirm that the JWT session is still valid by calling model-service.
 
     Calls ``GET /api/v1/auth/users/me`` with the token.  Model-service runs
     ``_validate_regular_session`` (checks is_active, role, token_version)
     before returning.  A 401 response means the session has been revoked.
 
-    Results are cached for ``_SESSION_CHECK_TTL_SECONDS`` seconds so the
-    gateway does not hit model-service on every BI request.
-
-    System-admin tokens (``tenant_id == "__system__"``) are validated but
-    tolerate a model-service outage: the system-admin validation path does
-    not require a tenant DB lookup, but we still attempt the call for
-    defence-in-depth.
-
-    Raises:
-        ValueError — session revoked, user deactivated/demoted, or
-            token_version stale.
+    Only an explicit 200 response proves the session is live.  Authentication
+    rejection and temporary authority unavailability remain separate outcomes.
     """
-    if _session_check_ok(token):
-        return
-
     url = f"{settings.MODEL_SERVICE_URL}/api/v1/auth/users/me"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -259,25 +278,43 @@ async def validate_session_upstream(token: str) -> None:
         async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
             resp = await client.get(url, headers=headers)
     except Exception as exc:
-        # Fail-closed: if model-service is unreachable, reject the token.
-        # A freshly issued token (within the TTL window) will have been
-        # cached and served from cache above, so a brief model-service
-        # blip only affects tokens that have not been validated recently.
         logger.warning(
-            "Session validation unavailable (model-service unreachable): %s", exc,
+            "Session validation unavailable (model-service unreachable): %s",
+            type(exc).__name__,
         )
         _session_check_evict(token)
-        raise ValueError("Session validation unavailable") from exc
+        raise SessionValidationUnavailable() from exc
 
     if resp.status_code == 401:
         logger.info("Session revoked by model-service (401)")
         _session_check_evict(token)
         raise ValueError("Session has been revoked")
 
+    if resp.status_code == 403:
+        logger.info("Session rejected by model-service (403)")
+        _session_check_evict(token)
+        raise ValueError("Session has been rejected")
+
+    if (
+        resp.status_code == 429
+        or 300 <= resp.status_code < 400
+        or resp.status_code == 404
+        or resp.status_code >= 500
+    ):
+        logger.warning(
+            "Session validation authority unavailable (HTTP %d)",
+            resp.status_code,
+        )
+        _session_check_evict(token)
+        raise SessionValidationUnavailable(
+            _session_retry_after(resp),
+            message=(
+                f"Session validation failed (HTTP {resp.status_code}); "
+                "authority unavailable"
+            ),
+        )
+
     if resp.status_code != 200:
-        # Fail-closed on EVERY non-200 response: 3xx redirects (proxy
-        # misconfiguration), 403 (embed token), 404 (deleted user), 5xx.
-        # Only an explicit 200 from model-service proves the session is live.
         logger.warning(
             "Session validation returned HTTP %d; rejecting token", resp.status_code,
         )
@@ -286,21 +323,19 @@ async def validate_session_upstream(token: str) -> None:
 
     # Success: cache the validation result.
     _session_check_record(token)
-    logger.debug("Session validated upstream for %s", _safe_sub(token))
+    logger.debug("Session validated upstream")
 
 
-def _safe_sub(token: str) -> str:
-    """Extract 'sub' from a JWT for logging without re-raising on error."""
-    try:
-        payload = jwt.decode(
-            token,
-            settings.JWT_SECRET_KEY,
-            algorithms=[settings.JWT_ALGORITHM],
-            options={"verify_exp": False},
-        )
-        return payload.get("sub", "<unknown>")
-    except Exception:
-        return "<invalid>"
+async def validate_session_upstream(token: str) -> None:
+    """Validate a session with exact-token success caching and single-flight."""
+    if _session_check_ok(token):
+        return
+    await run_singleflight(
+        _session_validation_inflight,
+        token,
+        lambda: _validate_session_uncached(token),
+        max_entries=_SESSION_CHECK_MAX_ENTRIES,
+    )
 
 
 # ---------------------------------------------------------------------------

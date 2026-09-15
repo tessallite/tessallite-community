@@ -82,7 +82,25 @@ function verifyPair(crtPath, keyPath, label) {
   log(`${label} issuer  : ${issuer}`);
   log(`${label} expires : ${cert.validTo}`);
   log(`${label} pair    : MATCH ✓`);
-  return { ok: true, officeTrusted, notAfter };
+  const missingDomains = uncoveredDomains(cert);
+  if (missingDomains.length) log(`${label} SAN     : missing ${missingDomains.join(', ')}`);
+  return { ok: true, officeTrusted, notAfter, missingDomains };
+}
+
+// Which of CERT_DOMAINS the certificate does NOT name. `subjectAltName` is
+// "DNS:localhost, IP Address:127.0.0.1"; a sideload for a LAN address adds
+// that address to CERT_DOMAINS, and a cert that is trusted and fresh but only
+// names localhost must still be regenerated or Office rejects the origin.
+function uncoveredDomains(cert) {
+  const named = new Set(
+    (cert.subjectAltName || '')
+      .split(',')
+      .map((e) => e.trim().replace(/^(DNS|IP Address):/i, '').toLowerCase())
+      .filter(Boolean),
+  );
+  return CERT_DOMAINS.split(',')
+    .map((d) => d.trim().toLowerCase())
+    .filter((d) => d && !named.has(d));
 }
 
 function expiresSoon(notAfter) {
@@ -97,12 +115,15 @@ function expiresSoon(notAfter) {
 fs.mkdirSync(CERTS_DIR, { recursive: true });
 
 const existing = verifyPair(DEST_CRT, DEST_KEY, 'on-disk');
-if (existing.ok && existing.officeTrusted && !expiresSoon(existing.notAfter)) {
-  log('Existing certs are Office-trusted, a matching pair, and not expiring soon — skipping regeneration.');
+if (existing.ok && existing.officeTrusted && !expiresSoon(existing.notAfter)
+    && existing.missingDomains.length === 0) {
+  log('Existing certs are Office-trusted, a matching pair, cover every requested domain, and are not expiring soon — skipping regeneration.');
   process.exit(0);
 }
 if (existing.ok && !existing.officeTrusted) {
   log('Existing cert is NOT Office-trusted (self-signed?) — regenerating.');
+} else if (existing.ok && existing.missingDomains.length) {
+  log(`Existing cert does not name ${existing.missingDomains.join(', ')} — regenerating.`);
 } else if (existing.ok && expiresSoon(existing.notAfter)) {
   log(`Existing cert expires within ${RENEW_WINDOW_DAYS} days — regenerating.`);
 } else {
@@ -113,6 +134,18 @@ if (existing.ok && !existing.officeTrusted) {
 // Step 2 — generate + trust the Office CA and a localhost leaf cert.
 // On first run this may pop a UAC / keychain trust prompt; that is expected.
 // ---------------------------------------------------------------------------
+// office-addin-dev-certs reuses its own leaf whenever it is valid and trusted,
+// without looking at --domains (lib/install.js: verifyCertificates() takes no
+// domain list). When the reason to regenerate is a missing domain, its leaf
+// files have to go first, or the "regeneration" silently republishes the old
+// localhost-only certificate.
+if (existing.ok && existing.missingDomains.length) {
+  for (const f of [SRC_CRT, SRC_KEY]) {
+    if (fs.existsSync(f)) fs.rmSync(f);
+  }
+  log(`Removed ${SRC_DIR} leaf so office-addin-dev-certs regenerates for ${CERT_DOMAINS}`);
+}
+
 log(`Running: office-addin-dev-certs install --days ${CERT_DAYS} --domains ${CERT_DOMAINS}`);
 const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 const res = spawnSync(

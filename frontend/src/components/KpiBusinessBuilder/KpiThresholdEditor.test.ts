@@ -101,9 +101,20 @@ describe("createDefaultPresentationMeta", () => {
     expect(meta.bands![2].max).toBeNull();
   });
 
-  it("forced absolute_value with no target falls back to 100 scale", () => {
+  it("forced absolute_value/absolute_variance with no target falls back to a 1x scale, matching the backend (Bug-9401)", () => {
+    // Bug-9401: the frontend used to fall back to a 100x scale at target=0/null
+    // while the backend's own default-bands fallback (kpi_threshold.py, absolute_variance:
+    // `abs(target) if target not in (None, 0) else 1.0`) uses 1.0 — the two
+    // disagreed on how a target-less KPI classifies. Aligning to 1.0 here.
     const meta = createDefaultPresentationMeta(null, "higher_is_better", "absolute_value");
-    expect(meta.bands![1].max).toBe(100);
+    expect(meta.bands![0].max).toBeCloseTo(0.8);
+    expect(meta.bands![1].max).toBe(1);
+
+    // BANDS_VARIANCE_DIRECTIONAL's only non-zero boundary is -0.20; at the old
+    // 100x fallback this was -20, at the correct 1x fallback it stays -0.20.
+    const varianceMeta = createDefaultPresentationMeta(0, "higher_is_better", "absolute_variance");
+    expect(varianceMeta.evaluation_type).toBe("absolute_variance");
+    expect(varianceMeta.bands![0].max).toBeCloseTo(-0.2);
   });
 
   it("forceEvaluationType=absolute_value with closer_is_better produces target-scaled bands (BUG-R168-M001)", () => {

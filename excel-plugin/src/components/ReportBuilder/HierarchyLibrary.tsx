@@ -24,16 +24,19 @@ export default function HierarchyLibrary({
     <>
       <Box
         sx={{
-          display: 'flex', alignItems: 'center', px: 1.5, py: 0.75,
+          display: 'flex', alignItems: 'center', px: 1.25, height: 24,
           cursor: hasItems ? 'pointer' : 'default',
           borderTop: `1px solid ${tokens.colorBorderLight}`,
+          borderBottom: `1px solid ${tokens.colorBorderLight}`,
+          bgcolor: tokens.colorSubtleFill,
           opacity: hasItems ? 1 : 0.68,
         }}
         onClick={() => { if (hasItems) onToggle(); }}
       >
-        <Typography sx={{ fontSize: 12, fontWeight: 700, color: tokens.colorCharcoal, flex: 1 }}>
-          {templates.library.hierarchiesHeader(hierarchies?.length ?? 0)}
+        <Typography sx={{ fontSize: 10, fontWeight: 700, color: tokens.colorTextSecondary, flex: 1, textTransform: 'uppercase', letterSpacing: '0.03em' }}>
+          {strings.library.hierarchiesSection}
         </Typography>
+        <Typography sx={{ fontSize: 10, color: tokens.colorTextSecondary }}>{hierarchies?.length ?? 0}</Typography>
         {/* Bug-6710: keyboard path to expand/collapse (header Box is mouse-only). */}
         {hasItems && (
           <IconButton
@@ -41,7 +44,7 @@ export default function HierarchyLibrary({
             onClick={(e) => { e.stopPropagation(); onToggle(); }}
             aria-expanded={expanded}
             aria-label={templates.library.toggleSectionAria(expanded, strings.library.hierarchiesSection)}
-            sx={{ width: 24, height: 24, color: tokens.colorTextSecondary }}
+            sx={{ width: 22, height: 22, color: tokens.colorTextSecondary }}
           >
             {expanded ? <ExpandLess sx={{ fontSize: 16 }} /> : <ExpandMore sx={{ fontSize: 16 }} />}
           </IconButton>

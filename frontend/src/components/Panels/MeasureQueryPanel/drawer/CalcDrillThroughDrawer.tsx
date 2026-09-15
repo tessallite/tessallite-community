@@ -84,11 +84,12 @@ export default function CalcDrillThroughDrawer({
 
         {context && calcMeasure && (context.coord.rowKey.length > 0 || context.coord.colKey.length > 0) && (
           <Stack direction="row" spacing={0.5} sx={{ flexWrap: "wrap" }}>
+            {/* Bug-7282: use business display names, matching the DrillThroughPanel fix (Bug-6285). */}
             {rowDims.slice(0, context.coord.rowKey.length).map((d, i) => (
-              <Chip key={`r-${d.id}`} size="small" label={`${d.name} = ${context.coord.rowKey[i]}`} />
+              <Chip key={`r-${d.id}`} size="small" label={`${d.display_name || d.name} = ${context.coord.rowKey[i]}`} />
             ))}
             {colDims.slice(0, context.coord.colKey.length).map((d, i) => (
-              <Chip key={`c-${d.id}`} size="small" label={`${d.name} = ${context.coord.colKey[i]}`} />
+              <Chip key={`c-${d.id}`} size="small" label={`${d.display_name || d.name} = ${context.coord.colKey[i]}`} />
             ))}
           </Stack>
         )}

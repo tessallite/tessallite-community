@@ -18,10 +18,12 @@ These tests pin the catalogue seam that makes ``@name`` discoverable:
   * a 409 DEPLOYED_SNAPSHOT_INVALID faults the discovery instead of rendering
     a deceptive empty table list (Bug-8384 parity: discovery and Execute
     must agree);
-  * persona-variant catalogues keep the Named Query table (parity with the
-    JDBC base-surface registration — Named Query definitions carry no
-    persona allow-list); persona allow-lists / RLS / CLS on the Named
-    Query's DATA are enforced by the query-router at query time, unchanged.
+  * a persona-variant catalogue advertises a Named Query if and only if its
+    deployed definition BINDS over that persona's model query (Bug-9186,
+    rule 4) — the verdict comes from the query-router, the same authority
+    its executor applies, and it fails CLOSED when it cannot be obtained.
+    Persona allow-lists / RLS / CLS on the Named Query's DATA are enforced
+    by the query-router at query time, unchanged.
 
 Test escape: no test asserted the XMLA table rowsets for a reference surface
 that names no model table, so the JDBC-only registration never surfaced the
@@ -36,7 +38,10 @@ from defusedxml import ElementTree as ET
 
 from src.dax import mdschema
 from src.dax import xmla_server as xs
-from src.router_client import get_deployed_named_queries
+from src.router_client import (
+    get_deployed_named_queries,
+    persona_visible_named_queries as _REAL_PERSONA_VISIBLE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +113,16 @@ def _patched(monkeypatch):
     monkeypatch.setattr(xs, "get_model_version_snapshot", fake_version_snapshot)
     monkeypatch.setattr(xs, "list_all_models_for_tenant", fake_list_all)
     monkeypatch.setattr(xs, "get_deployed_named_queries", fake_deployed_nqs)
+
+    # Bug-9186: every catalogue build asks the query-router which Named
+    # Queries bind here, including the base surface. Default the verdict to
+    # "the fixture's Named Query binds"; the persona cells override it.
+    import src.router_client as rc
+
+    async def fake_visible(model_id, jwt_token, persona_id):
+        return {"top_cities"}
+
+    monkeypatch.setattr(rc, "persona_visible_named_queries", fake_visible)
 
 
 async def _discover(request_type: str, catalog: str = "model_1"):
@@ -291,81 +306,145 @@ async def test_named_queries_fetched_only_for_table_rowsets(
     assert fetched == ["v-1"]
 
 
-@pytest.mark.asyncio
-async def test_persona_that_hides_no_dimensions_keeps_named_query_table(
-    monkeypatch, _patched,
-):
-    """Bug-9178 persona remediation: a persona that narrows NO dimensions is a
-    full-visibility surface, so Named Queries are still advertised (it can see
-    every underlying dimension anyway). Here the persona's
-    ``included_dimension_ids`` names the only model dimension (``d1``), so the
-    dimension filter drops nothing and the relation is kept. The SUPPRESSION
-    path (persona hides at least one dimension) is covered by
-    ``test_named_queries_suppressed_when_persona_narrows_dimensions``."""
-    async def persona_resolve(catalog, tenant_slug, jwt_token):
+def _persona_resolve(slug: str):
+    async def resolve(catalog, tenant_slug, jwt_token):
         return "model-1", "proj-1", {
-            "id": "p-1", "slug": "business",
+            "id": "p-1", "slug": slug,
             "included_measure_ids": ["m1"], "included_dimension_ids": ["d1"],
         }, "v-1"
+    return resolve
 
-    monkeypatch.setattr(xs, "_resolve_model_id", persona_resolve)
+
+def _router_verdict(monkeypatch, visible: set[str] | None):
+    """Stand in for the query-router's bind verdict (Bug-9186)."""
+    import src.router_client as rc
+
+    calls: list[tuple[str, str | None]] = []
+
+    async def fake_visible(model_id, jwt_token, persona_id):
+        calls.append((model_id, persona_id))
+        return visible
+
+    monkeypatch.setattr(rc, "persona_visible_named_queries", fake_visible)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_named_query_that_binds_for_the_persona_is_advertised(
+    monkeypatch, _patched,
+):
+    """Bug-9186 / rule 4: visible iff it BINDS over the persona's model query.
+
+    The verdict comes from the query-router — the same authority its executor
+    applies — so a Named Query the persona can run is advertised on the
+    persona-variant catalogue, and the router is asked for THAT persona.
+    """
+    monkeypatch.setattr(xs, "_resolve_model_id", _persona_resolve("business"))
+    calls = _router_verdict(monkeypatch, {"top_cities"})
 
     resp = await _discover("DBSCHEMA_TABLES", catalog="sales_business")
     body = resp.body.decode()
     assert "<TABLE_NAME>@top_cities</TABLE_NAME>" in body
     assert "<TABLE_NAME>sales_business</TABLE_NAME>" in body
+    assert calls == [("model-1", "p-1")]
 
 
 @pytest.mark.asyncio
-async def test_named_queries_suppressed_when_persona_narrows_dimensions(
+async def test_named_query_that_does_not_bind_is_suppressed(
     monkeypatch, _patched,
 ):
-    """Bug-9178 persona remediation (the leak this closes): on a catalogue
-    surface where the persona hides at least one dimension, Named Queries are
-    suppressed. A deployed NQ records no dimension provenance, so the catalogue
-    cannot prove it stays within the restricted persona's dimension scope
-    (unlike named sets, Bug-5963); advertising it would let a restricted
-    persona enumerate an NQ — and its column list — that may project a hidden
-    dimension, defeating the persona dimension-scope boundary every sibling BI
-    surface enforces. Data-level RLS/CLS is unchanged; this closes the
-    CATALOGUE structure leak. The fetch is skipped entirely on a restricted
-    surface (no wasted snapshot call)."""
-    async def two_dims(model_id, tenant_slug, jwt_token, **kw):
-        return [
-            {"id": "d1", "name": "Region", "source": "column"},
-            {"id": "d2", "name": "Product", "source": "column"},
-        ]
+    """The catalogue must not advertise a Named Query the executor refuses.
 
-    async def persona_resolve(catalog, tenant_slug, jwt_token):
-        return "model-1", "proj-1", {
-            "id": "p-1", "slug": "regiononly",
-            "included_measure_ids": ["m1"], "included_dimension_ids": ["d1"],
-        }, "v-1"
-
-    fetched: list[tuple] = []
-
-    async def nq_fetch(*args, **kwargs):
-        fetched.append(args)
-        return [_NQ_DEPLOYED]
-
-    monkeypatch.setattr(xs, "get_model_dimensions", two_dims)
-    monkeypatch.setattr(xs, "_resolve_model_id", persona_resolve)
-    monkeypatch.setattr(xs, "get_deployed_named_queries", nq_fetch)
+    This is the leak Bug-9178 closed bluntly (hide ALL Named Queries on any
+    narrowed surface) and Bug-9186 now closes per object: neither the table
+    row nor its column rows may appear for a persona the definition does not
+    bind for — a restricted MEASURE, a CLS tag or a persona default filter
+    all reach this verdict, none of which the old identifier scan could see.
+    """
+    monkeypatch.setattr(xs, "_resolve_model_id", _persona_resolve("regiononly"))
+    _router_verdict(monkeypatch, set())
 
     for rowset in ("DBSCHEMA_TABLES", "DBSCHEMA_COLUMNS"):
         resp = await _discover(rowset, catalog="sales_regiononly")
         body = resp.body.decode()
         assert "@top_cities" not in body, (
-            f"{rowset}: restricted persona (Product hidden) must NOT see the "
-            f"Named Query relation"
+            f"{rowset}: a Named Query that does not bind for this persona must "
+            f"NOT be advertised"
         )
-        # The persona-visible sibling dimension is still advertised; the hidden
-        # one is not — proving the surface really is persona-narrowed.
-        assert "<TABLE_NAME>Region</TABLE_NAME>" in body or \
-            "<COLUMN_NAME>Region</COLUMN_NAME>" in body
-        assert "Product" not in body
-    # The deployed-snapshot fetch is skipped entirely on a restricted surface.
-    assert fetched == []
+        assert "city_name" not in body, (
+            f"{rowset}: its column list must not leak either"
+        )
+        # The rest of the persona surface is still advertised, proving the
+        # suppression is per-object and not a blanket failure.
+        assert "sales_regiononly" in body
+
+
+@pytest.mark.asyncio
+async def test_unreachable_router_hides_every_named_query(
+    monkeypatch, _patched,
+):
+    """Fail CLOSED: a verdict that cannot be obtained is not granted.
+
+    ``persona_visible_named_queries`` returns an empty set when the router
+    cannot be reached, so the catalogue advertises no Named Query relation
+    rather than one the executor may refuse.
+    """
+    import src.router_client as rc
+
+    monkeypatch.setattr(xs, "_resolve_model_id", _persona_resolve("business"))
+
+    class _DeadClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, *a, **kw):
+            raise httpx.ConnectError("connection refused")
+
+    # Undo the fixture's stub: this cell must drive the REAL helper, whose
+    # fail-closed branch is what it exists to prove.
+    monkeypatch.setattr(
+        rc, "persona_visible_named_queries", _REAL_PERSONA_VISIBLE,
+    )
+    monkeypatch.setattr(rc.httpx, "AsyncClient", _DeadClient)
+
+    resp = await _discover("DBSCHEMA_TABLES", catalog="sales_business")
+    body = resp.body.decode()
+    assert "@top_cities" not in body
+    assert "<TABLE_NAME>sales_business</TABLE_NAME>" in body
+
+
+@pytest.mark.asyncio
+async def test_base_catalogue_asks_the_router_with_no_persona_id(
+    monkeypatch, _patched,
+):
+    """The BASE catalogue is asked too, with no ``persona_id``.
+
+    A viewer connects to the base catalogue, not to a persona-variant one, so
+    the gateway holds no persona object for it. Skipping the verdict on that
+    basis would have left every base-surface catalogue unfiltered. The router
+    resolves the CALLER'S OWN effective persona from the bearer instead — the
+    same resolution ``/execute`` performs — and a privileged caller genuinely
+    has none, so it gets everything back.
+    """
+    calls = _router_verdict(monkeypatch, {"top_cities"})
+
+    resp = await _discover("DBSCHEMA_TABLES", catalog="sales")
+    assert "<TABLE_NAME>@top_cities</TABLE_NAME>" in resp.body.decode()
+    assert calls == [("model-1", None)]
+
+    calls.clear()
+    _router_verdict(monkeypatch, set())
+    resp = await _discover("DBSCHEMA_TABLES", catalog="sales")
+    assert "@top_cities" not in resp.body.decode(), (
+        "a base-surface caller whose own persona does not bind the Named "
+        "Query must not be shown it"
+    )
 
 
 @pytest.mark.asyncio

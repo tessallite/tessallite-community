@@ -938,7 +938,11 @@ async def list_selectable_models(
             embed_model_ids = current_user.model_ids
 
         models = await load_selectable_models(
-            db, project_id, allow_ids, persona_id, embed_model_ids
+            db, project_id, allow_ids, persona_id, embed_model_ids,
+            # Bug-9897: resolve the picker's list through the query-router
+            # under the caller's own bearer, so it offers exactly the models
+            # the agent can ground on and the executor will serve.
+            jwt_token=current_user.raw_token,
         )
         return [SelectableModel(id=m.id, name=m.display_name) for m in models]
     raise HTTPException(status_code=500, detail="DB session exhausted")

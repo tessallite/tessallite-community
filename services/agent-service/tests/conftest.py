@@ -90,3 +90,28 @@ async def client(auth):
         transport=httpx.ASGITransport(app=app), base_url="http://testserver"
     ) as ac:
         yield ac
+
+
+@pytest.fixture(autouse=True)
+def executor_surface_passthrough(request):
+    """Neutralise the Bug-9897 query-router grounding hop for unrelated tests.
+
+    ``assemble_prompt`` / ``load_selectable_models`` narrow the grounding
+    catalogue to the field surface the query-router says it will accept for the
+    caller (``_apply_executor_surface``). That hop is an EXTERNAL dependency of
+    every prompt-rendering test in this suite, and those tests are about what
+    the prompt renders, not about the router verdict — without this they would
+    all ground on nothing, because a test that supplies no bearer correctly
+    gets no verdict (fail closed).
+
+    Tests that are ABOUT the verdict mark themselves ``executor_surface_real``
+    and exercise the production narrowing.
+    """
+    if request.node.get_closest_marker("executor_surface_real"):
+        yield
+        return
+    with patch(
+        "src.prompt.assembler._apply_executor_surface",
+        side_effect=lambda profiles, surfaces: profiles,
+    ):
+        yield

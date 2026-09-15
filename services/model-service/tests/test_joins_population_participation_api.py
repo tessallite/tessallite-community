@@ -372,3 +372,23 @@ async def test_auto_unhide_reveals_the_dimension_side_once_unreferenced() -> Non
 
     assert right_col.is_hidden is False
     assert right_col.hidden_reason is None
+
+
+@pytest.mark.asyncio
+async def test_list_identifies_only_intentionally_hidden_calendar_endpoints(client):
+    from .result_fakes import FakeResult
+    db, join = _fixture()
+    db.execute = AsyncMock(side_effect=[FakeResult([join]), FakeResult([_RIGHT_TABLE])])
+    with patch("src.api.joins.get_tenant_db", async_gen_from(db)), patch(
+        "src.api.joins.ensure_model_in_project", AsyncMock()
+    ):
+        response = await client.get(_URL.rsplit("/", 1)[0])
+    assert response.status_code == 200, response.text
+    row = response.json()[0]
+    assert row["left_table_id"] == str(_LEFT_TABLE)
+    assert row["right_table_id"] == str(_RIGHT_TABLE)
+    assert row["hidden_calendar_table_ids"] == [str(_RIGHT_TABLE)]
+    sql = str(db.execute.call_args_list[1].args[0])
+    assert "calendar_tables.autocreated IS true" in sql
+    assert "model_tables.model_id" in sql
+    db.commit.assert_not_called()

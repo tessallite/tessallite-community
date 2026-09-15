@@ -2,12 +2,12 @@
 title: "Monitoring Stack (Prometheus & Grafana)"
 audience: system-admin
 area: system-admin
-updated: 2026-05-23
+updated: 2026-09-10
 ---
 
 ## What this covers
 
-How to deploy, configure, and extend the optional Prometheus + Grafana monitoring stack that provides real-time observability into every Tessallite service. This page explains the architecture, what data is collected, how the dashboard is organised, and how to add your own metrics and panels.
+How to deploy, configure, and extend the optional Prometheus + Grafana monitoring stack that provides real-time observability into every Tessallite service. This page explains the architecture, what data is collected, how the dashboard is organised, and how to add your own metrics and panels. It also explains the separate host collector for raw runtime logs.
 
 ---
 
@@ -20,7 +20,7 @@ The stack consists of three containers:
 | Container | Image | Purpose |
 |---|---|---|
 | **prometheus** | `prom/prometheus:v2.51.0` | Scrapes `/metrics` from every service every 15 seconds, stores time-series data for up to 15 days |
-| **grafana** | `grafana/grafana:10.4.0` | Visualises metrics through a pre-built dashboard with 21 panels across three sections |
+| **grafana** | `grafana/grafana:10.4.0` | Visualises metrics through a pre-built dashboard with 24 panels across three sections and three raw-log panels |
 | **nginx-exporter** | `nginx/nginx-prometheus-exporter:1.1` | Translates the frontend's nginx `stub_status` into Prometheus-format metrics |
 
 All three containers live in the `monitoring/` directory at the workspace root, separate from the main `tessallite/infra/` Docker Compose stack.
@@ -147,11 +147,43 @@ The nginx-exporter translates nginx's `stub_status` into standard metrics:
 | `nginx_connections_handled` | Counter | Total handled connections |
 | `nginx_http_requests_total` | Counter | Total HTTP requests served |
 
+### Raw runtime logs
+
+The optional host collector reads Docker output for the selected Compose project
+and sends bounded, redacted batches through the existing system-admin API. It
+covers stdout and stderr for the eight configured services:
+
+`model-service`, `query-router`, `gateway`, `scheduler`, `optimizer`,
+`agent-service`, `frontend` (nginx), and `postgres`.
+
+This is a Docker Compose host process. It includes container startup and
+subprocess output, does not collect browser developer-console messages, and does
+not claim a Kubernetes collector. It uses the existing system-admin login and
+does not add an application Docker-socket mount or a new credential scheme. See
+the [raw runtime log collector runbook](../../../deploy/system-logs/README.md)
+for protected environment, Linux systemd and Windows Scheduled Task setup.
+The standard Helm chart keeps `systemLogs.enabled=false` because it does not
+provide a Kubernetes collector; Docker Compose keeps the host collector enabled.
+
+Raw records are stored in `tess_system.system_logs` and are visible only to
+system administrators. The UI provides server-side message/logger/instance
+search, service/severity/time filters, stable **Load older** paging, live
+five-second polling with pause, row details and a confirmed expired-record
+purge.
+
+The raw-log metrics have bounded labels and expose accepted events by service
+and level, write failures, truncated reads, collector heartbeat age, enablement,
+latest error timestamp and purged rows. The scheduler independently measures
+relation bytes and estimated rows every 60 seconds and after each hourly purge;
+the storage panel and alert use that scheduler target. A stale or missing
+measurement is shown as no current value. No message, user identity or event
+UUID is a metric label.
+
 ---
 
 ## Dashboard sections
 
-The Grafana dashboard is organised into three collapsible sections with four filter variables at the top: **Service**, **Tenant**, **Project**, and **Model**. Selecting a tenant narrows the project dropdown, and selecting a project narrows the model dropdown.
+The Grafana dashboard is organised into three collapsible sections with four filter variables at the top: **Service**, **Tenant**, **Project**, and **Model**. Selecting a tenant narrows the project dropdown, and selecting a project narrows the model dropdown. Three raw runtime-log panels sit alongside those sections.
 
 ### Service Health
 
@@ -185,6 +217,35 @@ The Grafana dashboard is organised into three collapsible sections with four fil
 | Model Query Errors | Failed query rate per model by error type |
 | Data Scanned per Model | Bytes processed rate per model |
 | Rows Returned per Model | Result volume rate per model |
+
+### Raw runtime logs
+
+| Panel | What it shows |
+|---|---|
+| Runtime logs by service and level | Accepted raw-log event rate grouped by bounded service and severity labels |
+| Runtime log storage | Current PostgreSQL relation size for `tess_system.system_logs` from the scheduler observer; no value when stale or missing |
+| Seconds since log collector reported | Age of the collector heartbeat |
+
+---
+
+## Raw runtime log retention
+
+`SYSTEM_LOG_RETENTION_DAYS` is the application `.env` setting. It defaults to
+30 days; `0` disables expiry. The scheduler runs the shared purge hourly in
+5,000-row batches, up to 100,000 rows per run. **System Admin → System logs →
+Purge expired** uses the same cutoff, removes only rows older than it, shows the
+cutoff and asks for confirmation. Deleting rows lets PostgreSQL reuse space; it
+does not promise an immediate reduction in database file size.
+
+Only `tess_system.system_logs` is covered. `tess_system.system_audit_events`,
+tenant `audit_events` and tenant `query_logs` have separate meanings and are
+not removed by this operation.
+
+The raw-log alert rules cover a recent error, storage above 512 MiB for ten
+minutes, a stale or missing scheduler storage measurement (even when collection is disabled), a missing collector
+heartbeat and truncated or failed collection. They are Prometheus rules only;
+this repository has no Alertmanager route or contact point, so a firing rule
+does not prove external notification delivery.
 
 ---
 

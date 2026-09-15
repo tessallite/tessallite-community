@@ -154,8 +154,13 @@ describe("businessDefinition helpers", () => {
     expect(types).toContain("cagr");
   });
 
-  it("time window presets total 21", () => {
-    expect(TIME_WINDOW_PRESETS).toHaveLength(21);
+  it("time window presets cover the full backend domain (22)", () => {
+    // P2-R1-001: last_60_days was missing from the selectable-options array
+    // while the backend's authoritative TIME_WINDOW_PRESETS set (and the
+    // frontend TimeWindowPreset union) accepts it, so summaries rendered the
+    // raw token. The array must match the backend's 22-member domain.
+    expect(TIME_WINDOW_PRESETS).toHaveLength(22);
+    expect(TIME_WINDOW_PRESETS.map((o) => o.preset)).toContain("last_60_days");
   });
 });
 

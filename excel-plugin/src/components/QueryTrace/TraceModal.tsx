@@ -9,8 +9,10 @@ interface TraceModalProps {
   query: SemanticQuery | null;
   // F-025-20: the server's route decision for the last run, when available.
   route?: PluginRouteTrace | null;
-  modelId: string;
-  personaId?: string | null;
+  // Bug-7396: resolved display names, never raw UUIDs — the caller looks
+  // these up from its already-loaded model/persona lists.
+  modelName: string | null;
+  personaName?: string | null;
 }
 
 const ROUTE_LABELS: Record<string, string> = {
@@ -19,7 +21,7 @@ const ROUTE_LABELS: Record<string, string> = {
   source: strings.trace.routeSource,
 };
 
-export default function TraceModal({ open, onClose, query, route, modelId, personaId }: TraceModalProps) {
+export default function TraceModal({ open, onClose, query, route, modelName, personaName }: TraceModalProps) {
   return (
     <ThemeProvider theme={theme}>
     <Dialog open={open} onClose={onClose} maxWidth={false} sx={{ '& .MuiDialog-paper': { width: 380, borderRadius: 2 } }}>
@@ -28,7 +30,7 @@ export default function TraceModal({ open, onClose, query, route, modelId, perso
         {query ? (
           <Box>
             <Typography sx={{ fontSize: 11, fontWeight: 600, color: tokens.colorTextSecondary, mb: 0.5 }}>
-              {templates.trace.modelPersona(modelId, personaId)}
+              {templates.trace.modelPersona(modelName, personaName)}
             </Typography>
 
             {/* F-025-20: show the route the report actually took. */}

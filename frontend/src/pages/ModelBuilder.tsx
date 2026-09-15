@@ -4,10 +4,11 @@ import PanelErrorBoundary from "../components/Builder/PanelErrorBoundary";
 import { useT } from "../i18n";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Alert, Box, Button, Chip, CircularProgress, FormControlLabel, IconButton, Snackbar, Switch, Tab, Tabs, Tooltip, Typography } from "@mui/material";
+import { Alert, Box, Button, Chip, CircularProgress, FormControlLabel, IconButton, Switch, Tab, Tabs, Tooltip, Typography } from "@mui/material";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import SettingsIcon from "@mui/icons-material/Settings";
 import HelpIconButton from "../components/HelpIconButton";
+import NotificationBell from "../components/Builder/NotificationBell";
 import {
   useModel,
   useProject,
@@ -67,6 +68,9 @@ const UsageAnalyticsTab = lazy(
 );
 const KpiScorecardTab = lazy(
   () => import("../components/ModelHealth/KpiScorecardTab"),
+);
+const NamedSetsScorecardTab = lazy(
+  () => import("../components/ModelHealth/NamedSetsScorecardTab"),
 );
 const AggregatesPanel = lazy(() => import("../components/Panels/AggregatesPanel"));
 const PocketTablesPanel = lazy(() => import("../components/Panels/PocketTablesPanel"));
@@ -206,6 +210,52 @@ function KpisTabContent({
         ) : (
           <Suspense fallback={<PanelFallback />}>
             <KpisPanel />
+          </Suspense>
+        )}
+      </Box>
+    </Box>
+  );
+}
+
+// Bug-9091 (R2-B02): the named-sets drawer panel was authoring-only, so
+// deployed_only never reached a viewer surface once it was threaded through
+// the API. Mirrors KpisTabContent's dashboard/define split exactly — Define
+// (NamedSetsPanel) stays the live authoring preview per the 2026-08-17
+// F-026-20/F-026-07 decision.
+function NamedSetsTabContent({
+  projectId,
+  modelId,
+}: {
+  projectId: string;
+  modelId: string;
+}) {
+  const t = useT();
+  const [sub, setSub] = useState<"dashboard" | "define">("dashboard");
+
+  return (
+    <Box sx={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <Tabs
+        value={sub}
+        onChange={(_, v) => setSub(v)}
+        sx={{
+          minHeight: 36,
+          px: 2,
+          borderBottom: 1,
+          borderColor: "divider",
+          "& .MuiTab-root": { minHeight: 36, py: 0, textTransform: "none" },
+        }}
+      >
+        <Tab value="dashboard" label={t("builder.namedSetsDashboard")} />
+        <Tab value="define" label={t("builder.namedSetsDefine")} />
+      </Tabs>
+      <Box sx={{ flex: 1, overflow: "auto" }}>
+        {sub === "dashboard" ? (
+          <Suspense fallback={<PanelFallback />}>
+            <NamedSetsScorecardTab projectId={projectId} modelId={modelId} />
+          </Suspense>
+        ) : (
+          <Suspense fallback={<PanelFallback />}>
+            <NamedSetsPanel />
           </Suspense>
         )}
       </Box>
@@ -388,8 +438,6 @@ export default function ModelBuilder() {
     },
     [],
   );
-  const globalMessage = useBuilderStore((s) => s.globalMessage);
-  const clearGlobalMessage = useBuilderStore((s) => s.clearGlobalMessage);
   const setGlobalMessage = useBuilderStore((s) => s.setGlobalMessage);
   useGlobalShortcuts({
     openShortcutHelp: () => setShortcutHelpOpen(true),
@@ -534,6 +582,7 @@ export default function ModelBuilder() {
           lastDeployedAt={model.data?.last_deployed_at as string | null | undefined}
           readOnly={isReadOnly}
         />
+        <NotificationBell />
         <HelpIconButton
           href="/help/modelling/model-canvas-tour.html"
           title={t("builder.helpTitle")}
@@ -656,7 +705,9 @@ export default function ModelBuilder() {
           {activePanel === "measure-query" && <MeasureQueryPanel />}
           {activePanel === "saved-queries" && <SavedQueriesPanel />}
           {activePanel === "glossary" && <GlossaryPanel />}
-          {activePanel === "named-sets" && <NamedSetsPanel />}
+          {activePanel === "named-sets" && (
+            <NamedSetsTabContent projectId={projectId!} modelId={modelId!} />
+          )}
           {activePanel === "scheduler" && <SchedulerPanel projectId={projectId!} modelId={modelId!} tenantId={resolvedTenantId} />}
           {activePanel === "schema-changes" && <SchemaChangesPanel />}
           {activePanel === "scratchpad" && <ScratchpadPanel />}
@@ -679,22 +730,6 @@ export default function ModelBuilder() {
           onClose={() => setSettingsDrawerOpen(false)}
         />
       </Suspense>
-
-      <Snackbar
-        open={!!globalMessage}
-        autoHideDuration={6000}
-        onClose={clearGlobalMessage}
-        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
-      >
-        <Alert
-          severity={globalMessage?.severity ?? "info"}
-          onClose={clearGlobalMessage}
-          variant="filled"
-          sx={{ width: "100%" }}
-        >
-          {globalMessage?.text}
-        </Alert>
-      </Snackbar>
     </Box>
   );
 }

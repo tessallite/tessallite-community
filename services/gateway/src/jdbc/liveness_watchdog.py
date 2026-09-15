@@ -63,15 +63,23 @@ is never mistaken for a crash.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-from typing import Awaitable, Callable
+import time
+from typing import Any, Awaitable, Callable
 
 from shared.gateway_liveness import probe_jdbc_accept_loop_async
+from shared.metrics import JDBC_PROBE_FAILURES, JDBC_WATCHDOG_EXITS
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["WATCHDOG_EXIT_CODE", "run_jdbc_liveness_watchdog"]
+__all__ = [
+    "WATCHDOG_EXIT_CODE",
+    "run_jdbc_liveness_watchdog",
+    "seed_exit_counter_from_disk",
+    "watchdog_state_path",
+]
 
 # Deliberately a constant, not a setting. The interval and the strike limit are
 # operational tunables; this is a diagnostic contract. It is what tells an
@@ -82,6 +90,125 @@ __all__ = ["WATCHDOG_EXIT_CODE", "run_jdbc_liveness_watchdog"]
 WATCHDOG_EXIT_CODE = 3
 
 ProbeFn = Callable[..., Awaitable[tuple[bool, str]]]
+
+
+def _open_file_descriptors() -> int | None:
+    """Count this process's open file descriptors, or None when unavailable.
+
+    Bug-9834: a wedged accept loop that is actually descriptor exhaustion looks
+    identical, from the outside, to one that is not — and the exit erases the
+    evidence. Best-effort by design: this runs on the path that is about to
+    terminate the process, so it must never be the reason the exit does not
+    happen.
+    """
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except Exception:  # pragma: no cover - not Linux, or /proc unavailable
+        return None
+
+
+def _active_jdbc_sessions() -> int | None:
+    """Admitted JDBC connections held at this moment, or None if unknown.
+
+    Read from the connection governor, which already maintains the count to
+    enforce the per-IP cap. Best-effort for the same reason as above.
+    """
+    try:
+        from src.jdbc.throttle import get_governor
+
+        return get_governor().active_connection_total()
+    except Exception:  # pragma: no cover - governor unavailable
+        return None
+
+
+# Bug-9834 (review F3): where the exit tally is kept so it OUTLIVES the process
+# that records it.
+#
+# The in-process counter cannot carry recurrence on its own. The watchdog
+# increments it and exits immediately; with a 15s scrape interval Prometheus
+# almost never observes the incremented value, and the replacement process
+# starts at zero. ``increase()`` over such a series can stay flat through any
+# number of wedges — the alert that depended on it would simply never fire.
+#
+# The tally is therefore written to a file before the exit and read back at
+# start-up to SEED the counter, so the series steps 0 -> 1 -> 2 across restarts
+# instead of resetting. Prometheus sees the step on its next scrape, whenever
+# that lands.
+#
+# No new dependency and no scrape-wait: the exit is never delayed for a metric.
+# The file is best-effort — losing it degrades to the previous behaviour, it
+# never blocks recovery. Set TESSALLITE_JDBC_WATCHDOG_STATE to place it on a
+# volume that survives container RECREATION; the default survives a restart.
+_STATE_ENV = "TESSALLITE_JDBC_WATCHDOG_STATE"
+_DEFAULT_STATE_PATH = "/tmp/tessallite-jdbc-watchdog-exits"
+
+
+def watchdog_state_path() -> str:
+    return os.environ.get(_STATE_ENV) or _DEFAULT_STATE_PATH
+
+
+def read_persisted_exit_count() -> int:
+    """The exit tally recorded by previous incarnations of this process."""
+    try:
+        with open(watchdog_state_path(), encoding="utf-8") as fh:
+            return max(0, int(fh.read().strip() or "0"))
+    except Exception:
+        return 0
+
+
+def record_persisted_exit() -> int:
+    """Increment the durable tally and return the new value.
+
+    Written and flushed to disk before the process exits, because after the
+    exit there is nothing left to ask.
+    """
+    total = read_persisted_exit_count() + 1
+    try:
+        with open(watchdog_state_path(), "w", encoding="utf-8") as fh:
+            fh.write(str(total))
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception:  # pragma: no cover - must never block the exit
+        logger.warning(
+            "could not persist the JDBC watchdog exit tally to %s; recurrence "
+            "detection will under-report until it is writable",
+            watchdog_state_path(), exc_info=True,
+        )
+    return total
+
+
+def seed_exit_counter_from_disk() -> int:
+    """Carry the previous tally into this process's counter, at start-up.
+
+    This is what makes the Prometheus series monotonic across a watchdog
+    restart rather than sawtoothing back to zero.
+    """
+    total = read_persisted_exit_count()
+    if total:
+        try:
+            JDBC_WATCHDOG_EXITS.inc(total)
+        except Exception:  # pragma: no cover
+            pass
+    return total
+
+
+def _emit_watchdog_exit_event(payload: dict[str, Any]) -> None:
+    """Emit the machine-readable record of a watchdog kill.
+
+    This is the DURABLE signal, and the reason it is a log line rather than a
+    metric: the in-process counter cannot survive the exit it is recording. A
+    log-based or orchestration-level counter built on this event is what lets an
+    operator distinguish "the wedge never came back" from "the wedge now happens
+    every hour and the restart hides it" — the failure mode that made
+    'investigate only on recurrence' unsafe until now.
+
+    Serialised as one JSON object on a single line so a log pipeline can match
+    and count it without parsing prose. Never raises: the exit must happen.
+    """
+    try:
+        logger.critical("jdbc_watchdog_exit %s", json.dumps(payload, default=str))
+    except Exception:  # pragma: no cover - logging must not block the exit
+        pass
 
 
 def _hard_exit(code: int) -> None:
@@ -124,6 +251,7 @@ async def run_jdbc_liveness_watchdog(
     """
     observed_alive = False
     consecutive_failures = 0
+    started_monotonic = time.monotonic()
 
     while True:
         await asyncio.sleep(interval_seconds)
@@ -174,6 +302,10 @@ async def run_jdbc_liveness_watchdog(
             continue
 
         consecutive_failures += 1
+        try:
+            JDBC_PROBE_FAILURES.inc()
+        except Exception:  # pragma: no cover - metrics must never break recovery
+            pass
         logger.warning(
             "JDBC accept loop on port %d did not answer the liveness probe "
             "(strike %d of %d, %ss apart): %s",
@@ -187,5 +319,40 @@ async def run_jdbc_liveness_watchdog(
                 "restart policy recycles this gateway. Last probe result: %s",
                 port, consecutive_failures, WATCHDOG_EXIT_CODE, detail,
             )
+            _exit_total = record_persisted_exit()
+            try:
+                JDBC_WATCHDOG_EXITS.inc()
+            except Exception:  # pragma: no cover
+                pass
+            # Bug-9834: the machine-readable record, emitted BEFORE the exit
+            # and carrying the state the exit is about to destroy. ``_hard_exit``
+            # flushes the handlers, so this reaches the log even though the
+            # process does not unwind.
+            try:
+                _emit_watchdog_exit_event({
+                    "event": "jdbc_watchdog_exit",
+                    "exit_code": WATCHDOG_EXIT_CODE,
+                    "port": port,
+                    "consecutive_failures": consecutive_failures,
+                    "failure_limit": failure_limit,
+                    "probe_interval_seconds": interval_seconds,
+                    "last_probe_error": detail,
+                    "process_uptime_seconds": round(
+                        time.monotonic() - started_monotonic, 3
+                    ),
+                    "active_jdbc_sessions": _active_jdbc_sessions(),
+                    "open_file_descriptors": _open_file_descriptors(),
+                    "watchdog_exits_total": _exit_total,
+                })
+            except Exception:  # pragma: no cover
+                # Collecting the diagnostics must never become the reason a
+                # wedged gateway is NOT recycled. Losing the record is bad;
+                # losing the recovery is worse. The individual collectors guard
+                # themselves too — this is the backstop for a future one that
+                # forgets, which is the failure this file exists to prevent
+                # elsewhere.
+                logger.exception(
+                    "could not emit the jdbc_watchdog_exit record; exiting anyway"
+                )
             on_exit(WATCHDOG_EXIT_CODE)
             return

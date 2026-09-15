@@ -1,4 +1,4 @@
-"""Bug-9192 — retained system and tenant engines have bounded pools.
+"""Bug-9192/Bug-9608 — retained engines have bounded pools.
 
 RFGPT-002: the per-engine pool_size bound is necessary but not sufficient —
 the process must also bound how many tenant engines it retains.
@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import ast
 import inspect
+from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import ValidationError
 
 import shared.db.session as db_session
+from shared.config.settings import Settings
 
 
 def test_bug9192_all_session_engines_are_bounded_or_null_pool() -> None:
@@ -45,11 +48,47 @@ def test_bug9192_all_session_engines_are_bounded_or_null_pool() -> None:
             continue
 
         pooled_calls += 1
-        assert ast.literal_eval(keywords["pool_size"]) == 2
+        pool_size = keywords["pool_size"]
+        if isinstance(pool_size, ast.Attribute):
+            assert isinstance(pool_size.value, ast.Name)
+            assert pool_size.value.id == "settings"
+            assert pool_size.attr in {
+                "SYSTEM_DB_POOL_SIZE",
+                "TENANT_DB_POOL_SIZE",
+            }
+        else:
+            assert ast.literal_eval(pool_size) == 2
         assert ast.literal_eval(keywords["max_overflow"]) == 0
 
     assert pooled_calls == 2
-    assert db_session._system_engine.pool.size() == 2
+    assert db_session._system_engine.pool.size() == db_session.settings.SYSTEM_DB_POOL_SIZE
+
+
+def test_bug9613_retained_tenant_connection_product_is_bounded() -> None:
+    selected = Settings(
+        TENANT_DB_POOL_SIZE=4,
+        TENANT_ENGINE_CACHE_MAX=8,
+    )
+    assert selected.TENANT_DB_POOL_SIZE * selected.TENANT_ENGINE_CACHE_MAX == 32
+
+    with pytest.raises(
+        ValidationError,
+        match=r"TENANT_DB_POOL_SIZE \* TENANT_ENGINE_CACHE_MAX must be <= 32",
+    ):
+        Settings(
+            TENANT_DB_POOL_SIZE=4,
+            TENANT_ENGINE_CACHE_MAX=9,
+        )
+
+
+def test_bug9646_optimizer_values_reuse_the_shared_d20_resource_contract() -> None:
+    selected = Settings(
+        TENANT_DB_POOL_SIZE=4,
+        TENANT_ENGINE_CACHE_MAX=8,
+    )
+    assert selected.TENANT_DB_POOL_SIZE == 4
+    assert selected.TENANT_ENGINE_CACHE_MAX == 8
+    assert selected.TENANT_DB_POOL_SIZE * selected.TENANT_ENGINE_CACHE_MAX == 32
 
 
 @pytest.mark.asyncio
@@ -69,10 +108,15 @@ async def test_bug9192_tenant_engine_cache_is_lru_bounded_and_disposes(monkeypat
         return "postgresql+asyncpg://u:p@localhost/db", f'"{tenant_id}_meta"'
 
     def _create_engine(*_a, **_k):
+        assert _k["pool_size"] == db_session.settings.TENANT_DB_POOL_SIZE
+        assert _k["max_overflow"] == 0
         return _FakeEngine()
 
     monkeypatch.setattr(db_session, "_resolve_tenant_dsn", _resolve)
     monkeypatch.setattr(db_session, "create_async_engine", _create_engine)
+    monkeypatch.setattr(
+        db_session, "ensure_tenant_schema_ready", AsyncMock()
+    )
     monkeypatch.setattr(
         db_session, "async_sessionmaker", lambda *_a, **_k: object()
     )
@@ -97,3 +141,39 @@ async def test_bug9192_tenant_engine_cache_is_lru_bounded_and_disposes(monkeypat
 
     db_session._tenant_engines.clear()
     db_session._tenant_snapshot_engines.clear()
+
+
+@pytest.mark.parametrize("size", [0, 1, 4, 64])
+def test_system_pool_accepts_unlimited_or_explicit_positive_size(size):
+    assert Settings(SYSTEM_DB_POOL_SIZE=size).SYSTEM_DB_POOL_SIZE == size
+
+
+def test_system_pool_rejects_negative_size():
+    with pytest.raises(ValidationError):
+        Settings(SYSTEM_DB_POOL_SIZE=-1)
+
+
+@pytest.mark.parametrize("size,count", [(0, 40), (4, 4)])
+def test_system_pool_checkout_respects_configured_limit(size, count):
+    """Exercise SQLAlchemy pool semantics with real connections held together."""
+    import sqlite3
+    from sqlalchemy.pool import QueuePool
+    from sqlalchemy.exc import TimeoutError
+
+    pool = QueuePool(
+        lambda: sqlite3.connect(":memory:"),
+        pool_size=Settings(SYSTEM_DB_POOL_SIZE=size).SYSTEM_DB_POOL_SIZE,
+        max_overflow=0, timeout=0.01,
+    )
+    connections = []
+    try:
+        for _ in range(count):
+            connections.append(pool.connect())
+        assert len(connections) == count
+        if size:
+            with pytest.raises(TimeoutError):
+                pool.connect()
+    finally:
+        for connection in connections:
+            connection.close()
+        pool.dispose()

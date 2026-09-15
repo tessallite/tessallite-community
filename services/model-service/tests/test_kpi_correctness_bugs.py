@@ -309,7 +309,7 @@ async def test_saved_fallback_surfaces_model_not_deployed(client):
         patch("src.api.kpis._evaluate_expression_via_sql", new_callable=AsyncMock, return_value=kpis_mod._COMPILER_UNSUPPORTED),
         patch("src.api.kpis._batch_get_measure_values", new_callable=AsyncMock, side_effect=kpis_mod._ModelNotDeployedError()),
     ):
-        response = await client.post(f"{PREFIX}/{kpi.id}/evaluate")
+        response = await client.post(f"{PREFIX}/{kpi.id}/evaluate?deployed_only=false")
 
     assert response.status_code == 200
     assert response.json()["status_label"] == kpis_mod._MODEL_NOT_DEPLOYED_LABEL
@@ -354,7 +354,7 @@ async def test_batch_fallback_surfaces_model_not_deployed(client):
         patch("src.api.kpis._batch_get_measure_values", new_callable=AsyncMock, side_effect=kpis_mod._ModelNotDeployedError()),
     ):
         response = await client.post(
-            f"{PREFIX}/evaluate-batch",
+            f"{PREFIX}/evaluate-batch?deployed_only=false",
             json={"kpi_ids": [str(kpi.id)]},
         )
 

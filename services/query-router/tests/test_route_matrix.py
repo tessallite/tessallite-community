@@ -36,6 +36,9 @@ _INFRA_ROUTES: set[str] = {
     # it returns no model data — a non-client, non-data-path infrastructure route,
     # classified here exactly like /health and /metrics.
     "GET /liveness",
+    # Bug-9625 / D1: dependency readiness is an orchestrator-facing status
+    # endpoint. It returns no model rows and is not a client data path.
+    "GET /readiness",
     "GET /metrics",
     "GET /openapi.json",
     "GET /docs",
@@ -186,6 +189,12 @@ def test_every_client_route_is_classified():
         "family and whether it is on the row-security-enforced data path, then "
         "ensure a deployed-session LIVE-SECURITY-* probe covers the data paths."
     )
+
+
+def test_bug9625_readiness_is_classified_as_infrastructure():
+    """D1 readiness must not be mistaken for a row-returning client route."""
+    assert "GET /readiness" in _INFRA_ROUTES
+    assert "GET /readiness" not in _client_facing_routes()
 
 
 def test_matrix_has_no_stale_entries():

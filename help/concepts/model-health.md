@@ -7,6 +7,12 @@ updated: 2026-08-02
 
 ![Model Builder — Health tab.](../assets/screencaps/model-health-tab.png)
 
+## Reviewing schema changes
+
+In Model Health, select individual unacknowledged schema changes or use Select all unacknowledged, then Acknowledge selected. Already acknowledged entries are excluded. Failed requests remain selected for retry. Acknowledgement records review; it does not repair source data or change the model. Adding a hierarchy level or user-defined attribute alone is a model edit, not source-schema drift.
+
+When the same source table is used more than once in a model, schema checks update the recorded columns for each use separately. Once those records are updated, unchanged columns are not reported again. Earlier drift entries remain in the history and can be reviewed and acknowledged.
+
 ## What this covers
 
 This article explains the Model Builder's Health tab: what it checks, the three severity levels, each specific issue and how to resolve it, and when health checks run.

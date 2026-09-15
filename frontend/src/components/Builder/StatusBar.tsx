@@ -7,7 +7,7 @@ import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import CheckCircleOutlineIcon from "@mui/icons-material/CheckCircleOutline";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { useBuilderStore } from "../../store/builderStore";
-import { useModelNeedsSaveOrDeploy } from "../../store/useModelEditorStore";
+import { useModelEditorStore, useModelNeedsSaveOrDeploy } from "../../store/useModelEditorStore";
 
 interface Props {
   tableCount: number;
@@ -35,10 +35,11 @@ export default function StatusBar({
   selectedName,
 }: Props) {
   const t = useT();
-  // Bug-5515: single shared rule — the bar turns red/white whenever the model
-  // has unsaved or undeployed changes, because query results then reflect the
-  // last deployed version, not the draft the user sees.
+  // A deployment mismatch needs a warning. A model with no deployment yet
+  // needs setup guidance, without claiming that a deployed version is serving.
   const needsSaveOrDeploy = useModelNeedsSaveOrDeploy();
+  const hasDeployment = useModelEditorStore((s) => s.deployedVersion !== null);
+  const deployedMismatch = needsSaveOrDeploy && hasDeployment;
   const issues = useBuilderStore((s) => s.validationIssues);
   const expanded = useBuilderStore((s) => s.validationExpanded);
   const toggle = useBuilderStore((s) => s.toggleValidationExpanded);
@@ -78,18 +79,18 @@ export default function StatusBar({
         height: 26,
         minHeight: 26,
         borderTop: 1,
-        borderColor: needsSaveOrDeploy ? "error.main" : "divider",
-        bgcolor: needsSaveOrDeploy ? "error.main" : "grey.50",
-        color: needsSaveOrDeploy ? "common.white" : "text.secondary",
+        borderColor: deployedMismatch ? "error.main" : "divider",
+        bgcolor: deployedMismatch ? "error.main" : "grey.50",
+        color: deployedMismatch ? "common.white" : "text.secondary",
       }}
     >
       {needsSaveOrDeploy ? (
         <Typography
           data-testid="statusbar-unsaved-label"
           variant="caption"
-          sx={{ lineHeight: 1.3, fontWeight: 700, whiteSpace: "nowrap", color: "common.white" }}
+          sx={{ lineHeight: 1.3, fontWeight: 700, whiteSpace: "nowrap", color: "inherit" }}
         >
-          {t("modelSync.statusBarLabel")}
+          {t(hasDeployment ? "modelSync.statusBarLabel" : "modelSync.notDeployed")}
         </Typography>
       ) : null}
       <Tooltip title={tooltipLines} placement="top-start">

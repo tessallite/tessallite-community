@@ -159,7 +159,9 @@ server {
         deny all;
     }
 
-    # Process liveness (nginx is up). Serving readiness is location = /health.
+    # Process liveness (nginx is up). Serving readiness is available at both
+    # /health (the established frontend contract) and /readiness (the
+    # explicit deployment contract).
     location = /liveness {
         default_type application/json;
         return 200 '{"status":"ok","service":"frontend"}';
@@ -173,6 +175,14 @@ server {
     location = /health {
         # Bug-9365: complete checked set is model-service, query-router, gateway.
         js_content health_and.servingHealth;
+    }
+
+    location = /readiness {
+        # The local fan-out keeps each dependency one hop deep: model and
+        # query-router use /readiness, while the gateway probe uses /health.
+        # The sibling model/query-router checks already cover the gateway's
+        # direct peers, so this does not nest gateway /readiness recursively.
+        js_content health_and.servingReadiness;
     }
 
     location = /__health/model {
@@ -211,6 +221,45 @@ server {
         proxy_pass $upstream_gateway/health;
     }
 
+    location = /__readiness/model {
+        internal;
+        set $upstream_model ${MODEL_SERVICE_URL};
+        proxy_set_header Host ${MODEL_SERVICE_HOST};
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 2s;
+        proxy_send_timeout 2s;
+        proxy_pass $upstream_model/readiness;
+    }
+
+    location = /__readiness/query-router {
+        internal;
+        set $upstream_router ${QUERY_ROUTER_URL};
+        proxy_set_header Host ${QUERY_ROUTER_HOST};
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 2s;
+        proxy_send_timeout 2s;
+        proxy_pass $upstream_router/readiness;
+    }
+
+    location = /__readiness/gateway {
+        internal;
+        set $upstream_gateway ${GATEWAY_URL};
+        proxy_set_header Host ${GATEWAY_HOST};
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 2s;
+        proxy_send_timeout 2s;
+        # Bug-9054: use the gateway's self-contained JDBC liveness contract
+        # here. The sibling model/query-router readiness probes above provide
+        # the frontend's direct peer checks without a nested fan-out.
+        proxy_pass $upstream_gateway/health;
+    }
+
     # Excel plugin SPA
     location /excel-plugin/ {
         try_files $uri $uri/ /excel-plugin/index.html;
@@ -230,13 +279,28 @@ server {
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     }
 
-    location ~* \.(js|css|png|jpg|svg|ico|woff2?)$ {
+    location ~* ^/(?!api(?:/|$)).*\.(js|css|png|jpg|svg|ico|woff2?)$ {
         expires 1y;
         add_header Cache-Control "public, immutable";
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     }
 
     location = /index.html {
+        add_header Cache-Control "no-store";
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    }
+
+    # Bug-9584/9589 (R4 external review): Login.tsx's runtime edition-label
+    # override is served from a path OUTSIDE the built SPA tree so it can be
+    # populated by a whole-directory volume mount (Compose bind-write / Helm
+    # ConfigMap) without ever shadowing /usr/share/nginx/html. A subPath-style
+    # single-file mount at this same path would work for Compose but silently
+    # stops receiving Kubernetes ConfigMap updates in Helm (subPath mounts do
+    # not hot-reload); a plain directory mount does. 404 (file absent) is the
+    # deliberate "no override" signal Login.tsx already treats as build-time
+    # label.
+    location = /edition.json {
+        alias /var/run/tessallite-edition/edition.json;
         add_header Cache-Control "no-store";
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     }

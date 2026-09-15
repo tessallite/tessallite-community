@@ -2,7 +2,7 @@
 title: "Define Hierarchies"
 audience: modeller
 area: modelling
-updated: 2026-05-15
+updated: 2026-09-10
 ---
 
 ## What this covers
@@ -10,6 +10,21 @@ updated: 2026-05-15
 The **Hierarchies** panel defines ordered drill paths such as Year > Quarter > Month, Country > Region > Store, or Segment > Category > Product. Hierarchies give Tessallite enough structure to generate time variants, guide drill-through, and expose business navigation paths to downstream consumers.
 
 This is different from the Dimensions panel. Dimensions expose individual attributes; hierarchies declare how attributes roll up.
+
+## Levels and members
+
+A hierarchy has the standard **(All)** summary item used by BI tools, followed
+by only the levels you declare. Country > City > Channel has three data levels.
+Tessallite does not add a fourth raw-data level beneath Channel.
+
+A member is one distinct value at a level. For example, `London` is one member
+of the City level even if thousands of source rows contain London. When Excel
+expands a hierarchy, Tessallite returns the distinct members needed for that
+level and applies the signed-in person's security rules.
+
+Low-cardinality fields from a fact table, such as status or channel, can be
+useful flat dimensions. They do not become a hierarchy unless a modeller creates
+a declared drill path from them.
 
 ---
 

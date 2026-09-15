@@ -1,0 +1,17 @@
+{
+  "_comment": "Non-secret harness fixture names. Credentials NEVER live here - they come from the environment (see tests-harness/README.md). Every name is resolved to an id against the live server at run time, so a renamed id does not break the harness.",
+  "project": "project1",
+  "model": "modely",
+  "measures": {
+    "primary": "transaction_amount",
+    "secondary": "transaction_count"
+  },
+  "dimension": {
+    "column": "card_entry_mode_name",
+    "member": "Chip"
+  },
+  "kpi": "Average Transaction Value",
+  "persona": "Technical",
+  "namedSet": "TopRegionsByValue",
+  "wrongModel": "modelx"
+}

@@ -17,6 +17,7 @@ export interface ChatComposerProps {
   initialText?: string;
   maxChars?: number;
   placeholder?: string;
+  compact?: boolean;
 }
 
 export function ChatComposer({
@@ -27,6 +28,7 @@ export function ChatComposer({
   initialText = "",
   maxChars = 4000,
   placeholder: placeholderProp,
+  compact = false,
 }: ChatComposerProps) {
   const theme = useTheme();
   const { t } = useChatContext();
@@ -43,9 +45,9 @@ export function ChatComposer({
     onSend(trimmed);
     setText("");
     if (textareaRef.current) {
-      textareaRef.current.style.height = "48px";
+      textareaRef.current.style.height = compact ? "30px" : "48px";
     }
-  }, [trimmed, isOverMax, isStreaming, disabled, onSend]);
+  }, [trimmed, isOverMax, isStreaming, disabled, onSend, compact]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -94,23 +96,24 @@ export function ChatComposer({
   const handleInput = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
-    el.style.height = "48px";
+    el.style.height = compact ? "30px" : "48px";
     el.style.height = Math.min(el.scrollHeight, 144) + "px";
-  }, []);
+  }, [compact]);
 
   return (
     <Box
       sx={{
-        px: 2,
-        py: 1.5,
+        px: compact ? 1.25 : 2,
+        py: compact ? 0.75 : 1.5,
         borderTop: 1,
         borderColor: "divider",
         bgcolor: "background.paper",
         display: "flex",
         alignItems: "flex-end",
-        gap: 1,
-        maxWidth: 960,
-        mx: "auto",
+        gap: compact ? 0.75 : 1,
+        flexShrink: compact ? 0 : undefined,
+        maxWidth: compact ? "none" : 960,
+        mx: compact ? 0 : "auto",
         width: "100%",
       }}
     >
@@ -123,22 +126,23 @@ export function ChatComposer({
           onPaste={handlePaste}
           onInput={handleInput}
           placeholder={placeholder}
+          rows={compact ? 1 : undefined}
           disabled={disabled || isStreaming}
           aria-label={t("composer.messageInputAria")}
           style={{
             width: "100%",
-            minHeight: 48,
+            minHeight: compact ? 30 : 48,
             maxHeight: 144,
-            padding: "12px 14px",
-            borderRadius: 12,
+            padding: compact ? "6px 8px" : "12px 14px",
+            borderRadius: compact ? 2 : 12,
             border: "1px solid",
             borderColor: isOverMax
               ? theme.palette.error.main
               : theme.palette.divider,
             resize: "none",
             fontFamily: "inherit",
-            fontSize: 15,
-            lineHeight: 1.5,
+            fontSize: compact ? 12 : 15,
+            lineHeight: compact ? 1.4 : 1.5,
             outline: "none",
             background: "transparent",
             color: "inherit",
@@ -175,12 +179,12 @@ export function ChatComposer({
               bgcolor: "error.main",
               color: "white",
               "&:hover": { bgcolor: "error.dark" },
-              width: 40,
-              height: 40,
-              borderRadius: 2,
+              width: compact ? 30 : 40,
+              height: compact ? 30 : 40,
+              borderRadius: compact ? 0.5 : 2,
             }}
           >
-            <Stop fontSize="small" />
+            <Stop fontSize="small" sx={{ fontSize: compact ? 14 : undefined }} />
           </IconButton>
         </Tooltip>
       ) : (
@@ -199,12 +203,12 @@ export function ChatComposer({
                   bgcolor: "action.disabledBackground",
                   color: "action.disabled",
                 },
-                width: 40,
-                height: 40,
-                borderRadius: 2,
+                width: compact ? 30 : 40,
+                height: compact ? 30 : 40,
+                borderRadius: compact ? 0.5 : 2,
               }}
             >
-              <Send fontSize="small" />
+              <Send fontSize="small" sx={{ fontSize: compact ? 15 : undefined }} />
             </IconButton>
           </span>
         </Tooltip>

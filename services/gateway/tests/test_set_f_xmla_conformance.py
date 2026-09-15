@@ -713,7 +713,7 @@ def test_flat_dim_distinct_display_attribute_separates_key_and_caption():
     assert r["MEMBER_NAME"] == "Widget"
     assert r["MEMBER_KEY"] != r["MEMBER_CAPTION"]
     # Member is still identified by its KEY in the unique name.
-    assert r["MEMBER_UNIQUE_NAME"] == "[Product].[Product].[P1]"
+    assert r["MEMBER_UNIQUE_NAME"] == "[Dimensions].[Product].[P1]"
 
 
 def test_flat_dim_without_display_attribute_is_unchanged():
@@ -731,7 +731,7 @@ def test_flat_dim_without_display_attribute_is_unchanged():
     assert r["MEMBER_KEY"] == "P1"
     assert r["MEMBER_CAPTION"] == "P1"
     assert r["MEMBER_NAME"] == "P1"
-    assert r["MEMBER_UNIQUE_NAME"] == "[Product].[Product].[P1]"
+    assert r["MEMBER_UNIQUE_NAME"] == "[Dimensions].[Product].[P1]"
 
 
 # ---------------------------------------------------------------------------

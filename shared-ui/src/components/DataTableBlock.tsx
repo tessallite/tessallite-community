@@ -20,6 +20,18 @@ import { useChatContext } from "../providers/ChatProvider";
 interface DataTableBlockProps {
   rows: Record<string, unknown>[];
   maxRows?: number;
+  compact?: boolean;
+  /**
+   * Height of the scrolling area. The Excel pop-out window has a whole screen
+   * to fill, where the inline default would strand the table in a short box.
+   */
+  maxHeight?: number | string;
+  /**
+   * Hide the built-in copy control. The pop-out window carries its own Copy,
+   * which writes both an HTML grid and TSV; two copy buttons side by side
+   * would be two controls doing visibly different things.
+   */
+  showCopy?: boolean;
 }
 
 type SortDir = "asc" | "desc";
@@ -95,6 +107,9 @@ function prettifyHeader(col: string): string {
 export function DataTableBlock({
   rows,
   maxRows = 5000,
+  compact = false,
+  maxHeight,
+  showCopy = true,
 }: DataTableBlockProps) {
   const { t } = useChatContext();
   const [page, setPage] = useState(0);
@@ -176,21 +191,23 @@ export function DataTableBlock({
 
   return (
     <ErrorBoundary>
-      <Box sx={{ mt: 1, minWidth: 0, maxWidth: "100%" }}>
-        <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 0.5 }}>
-          <Tooltip title={copied ? t("dataTable.copied") : t("dataTable.copy")}>
-            <IconButton size="small" onClick={handleCopy}>
-              <ContentCopy sx={{ fontSize: 14 }} />
-            </IconButton>
-          </Tooltip>
-        </Box>
+      <Box sx={{ mt: compact ? 0.5 : 1, minWidth: 0, maxWidth: "100%" }}>
+        {showCopy && (
+          <Box sx={{ display: "flex", justifyContent: "flex-end", mb: compact ? 0 : 0.5 }}>
+            <Tooltip title={copied ? t("dataTable.copied") : t("dataTable.copy")}>
+              <IconButton size="small" onClick={handleCopy} sx={compact ? { width: 22, height: 22, p: 0 } : undefined}>
+                <ContentCopy sx={{ fontSize: 14 }} />
+              </IconButton>
+            </Tooltip>
+          </Box>
+        )}
         <TableContainer
           sx={{
-            maxHeight: 400,
+            maxHeight: maxHeight ?? (compact ? 240 : 400),
             maxWidth: "100%",
             border: 1,
             borderColor: "divider",
-            borderRadius: 1,
+            borderRadius: compact ? 0 : 1,
           }}
         >
           <Table size="small" stickyHeader>
@@ -199,7 +216,14 @@ export function DataTableBlock({
                 {columns.map((col) => (
                   <TableCell
                     key={col}
-                    sx={{ fontWeight: 600, whiteSpace: "nowrap", fontSize: 12 }}
+                    sx={{
+                      fontWeight: 600,
+                      whiteSpace: "nowrap",
+                      fontSize: compact ? 10 : 12,
+                      py: compact ? 0.375 : undefined,
+                      px: compact ? 1 : undefined,
+                      bgcolor: compact ? "action.hover" : undefined,
+                    }}
                   >
                     <TableSortLabel
                       active={sortCol === col}
@@ -225,11 +249,13 @@ export function DataTableBlock({
                       <TableCell
                         key={col}
                         sx={{
-                          fontSize: 12,
+                          fontSize: compact ? 11 : 12,
                           maxWidth: 240,
                           overflow: "hidden",
                           textOverflow: "ellipsis",
                           whiteSpace: "nowrap",
+                          py: compact ? 0.375 : undefined,
+                          px: compact ? 1 : undefined,
                         }}
                       >
                         {display}
@@ -252,7 +278,18 @@ export function DataTableBlock({
             setPage(0);
           }}
           rowsPerPageOptions={[10, 25, 50, 100]}
-          sx={{ borderTop: 1, borderColor: "divider" }}
+          sx={{
+            borderTop: 1,
+            borderColor: "divider",
+            ...(compact
+              ? {
+                  "& .MuiTablePagination-toolbar": { minHeight: 30, px: 0.5 },
+                  "& .MuiTablePagination-selectLabel, & .MuiTablePagination-displayedRows": {
+                    fontSize: 10,
+                  },
+                }
+              : {}),
+          }}
         />
       </Box>
     </ErrorBoundary>

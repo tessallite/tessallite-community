@@ -4,10 +4,12 @@ import {
   CircularProgress,
   Collapse,
   IconButton,
+  Popover,
   Stack,
+  Tooltip,
   Typography,
 } from "@mui/material";
-import { ExpandMore, ExpandLess } from "@mui/icons-material";
+import { ExpandMore, ExpandLess, VerifiedOutlined } from "@mui/icons-material";
 import type { TurnResponse } from "../types/turn";
 import { useChatContext } from "../providers/ChatProvider";
 
@@ -36,12 +38,40 @@ const VERDICT_META: Record<string, typeof WARN_VERDICT> = {
   },
 };
 
-export function JudgeVerdictStrip({ turn }: { turn: TurnResponse }) {
+export function JudgeVerdictStrip({
+  turn,
+  compact = false,
+}: {
+  turn: TurnResponse;
+  compact?: boolean;
+}) {
   const { t } = useChatContext();
   const [open, setOpen] = useState(false);
+  const [compactAnchor, setCompactAnchor] = useState<HTMLElement | null>(null);
   const pending = turn.judge_pending && !turn.judge_verdict;
   const verdict = turn.judge_verdict;
   if (!pending && !verdict) return null;
+
+  if (compact && pending) {
+    return (
+      <Tooltip title={t("judge.evaluating")}>
+        <Box
+          component="span"
+          role="status"
+          aria-label={t("judge.evaluating")}
+          sx={{
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: 26,
+            height: 24,
+          }}
+        >
+          <CircularProgress size={12} />
+        </Box>
+      </Tooltip>
+    );
+  }
 
   if (pending) {
     return (
@@ -72,6 +102,79 @@ export function JudgeVerdictStrip({ turn }: { turn: TurnResponse }) {
   const hasDetails =
     (metrics && Object.keys(metrics).length > 0) ||
     Boolean(turn.judge_reasoning);
+
+  if (compact) {
+    const metricSummary = metrics
+      ? Object.entries(metrics).map(([key, value]) => `${key} ${Math.round(value * 5)}/5`)
+      : [];
+    const tooltip = [t(meta.key), ...metricSummary].join(" · ");
+    const color =
+      verdict === "pass"
+        ? "#2e7d32"
+        : verdict === "fail"
+          ? "#d32f2f"
+          : verdict === "warn"
+            ? "#A67C00"
+            : "#616161";
+    const background =
+      verdict === "pass"
+        ? "rgba(46,125,50,.1)"
+        : verdict === "fail"
+          ? "rgba(211,47,47,.1)"
+          : "rgba(164,124,0,.1)";
+
+    return (
+      <Box sx={{ display: "inline-flex", flexDirection: "column", alignItems: "center" }}>
+        <Tooltip title={tooltip}>
+          <IconButton
+            size="small"
+            aria-label={tooltip}
+            aria-expanded={hasDetails ? Boolean(compactAnchor) : undefined}
+            onClick={(event) =>
+              hasDetails &&
+              setCompactAnchor((current) => (current ? null : event.currentTarget))
+            }
+            sx={{
+              width: 26,
+              height: 24,
+              p: 0,
+              borderRadius: 0.5,
+              color,
+              bgcolor: background,
+            }}
+          >
+            <VerifiedOutlined sx={{ fontSize: 15 }} />
+          </IconButton>
+        </Tooltip>
+        {hasDetails && (
+          <Popover
+            open={Boolean(compactAnchor)}
+            anchorEl={compactAnchor}
+            onClose={() => setCompactAnchor(null)}
+            anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+            transformOrigin={{ vertical: "top", horizontal: "center" }}
+          >
+            <Box sx={{ px: 1, py: 0.75, minWidth: 180, maxWidth: 280 }}>
+              {metrics && Object.keys(metrics).length > 0 && (
+                <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap", mb: 0.5 }}>
+                  {Object.entries(metrics).map(([k, v]) => (
+                    <Typography key={k} component="span" sx={{ fontSize: 10, color: "text.secondary" }}>
+                      {k.replace(/_/g, " ")}: {Math.round(v * 5)}/5
+                    </Typography>
+                  ))}
+                </Box>
+              )}
+              {turn.judge_reasoning && (
+                <Typography sx={{ fontSize: 10, color: "text.secondary" }}>
+                  {turn.judge_reasoning}
+                </Typography>
+              )}
+            </Box>
+          </Popover>
+        )}
+      </Box>
+    );
+  }
 
   return (
     <Box

@@ -60,9 +60,8 @@ class TestOverlayDeployedEffectiveDescriptions:
         assert dimensions[0]["effective_description"] == "DEPLOYED dim glossary"
         assert measures[0]["effective_description"] == "DEPLOYED meas glossary"
 
-    def test_overlay_keeps_live_when_snapshot_lacks_field(self):
-        """Pre-fix snapshots have no effective_description; the overlay must
-        not clobber the live value with None."""
+    def test_bug_9829_overlay_omits_live_when_snapshot_lacks_field(self):
+        """A pre-fix snapshot must not expose mutable live draft text."""
         dim_id = _u()
         dimensions = [
             {"id": dim_id, "name": "Region", "effective_description": "LIVE text"},
@@ -73,7 +72,7 @@ class TestOverlayDeployedEffectiveDescriptions:
             ],
         }
         _overlay_deployed_effective_descriptions([], dimensions, deployed_snapshot)
-        assert dimensions[0]["effective_description"] == "LIVE text"
+        assert "effective_description" not in dimensions[0]
 
     def test_overlay_handles_empty_snapshot(self):
         dim_id = _u()
@@ -81,16 +80,15 @@ class TestOverlayDeployedEffectiveDescriptions:
             {"id": dim_id, "name": "Region", "effective_description": "LIVE text"},
         ]
         _overlay_deployed_effective_descriptions([], dimensions, {})
-        assert dimensions[0]["effective_description"] == "LIVE text"
+        assert "effective_description" not in dimensions[0]
 
     def test_overlay_handles_none_snapshot(self):
         dimensions = [{"id": _u(), "effective_description": "live"}]
         _overlay_deployed_effective_descriptions([], dimensions, None)
-        assert dimensions[0]["effective_description"] == "live"
+        assert "effective_description" not in dimensions[0]
 
-    def test_overlay_only_matches_by_id(self):
-        """A dimension present in live but absent from the deployed snapshot
-        keeps its live effective_description."""
+    def test_bug_9829_overlay_only_matches_by_id(self):
+        """An unmatched live row must not retain draft description text."""
         live_id = _u()
         snap_id = _u()
         dimensions = [
@@ -102,7 +100,7 @@ class TestOverlayDeployedEffectiveDescriptions:
             ],
         }
         _overlay_deployed_effective_descriptions([], dimensions, deployed_snapshot)
-        assert dimensions[0]["effective_description"] == "LIVE text"
+        assert "effective_description" not in dimensions[0]
 
     def test_before_deploy_stability(self):
         """Editing a glossary entry after deploy must NOT change the served
@@ -180,6 +178,103 @@ class TestOverlayDeployedEffectiveDescriptions:
 
         assert jdbc_dim_desc == xmla_dim_desc == "Deployed glossary for Region"
         assert jdbc_meas_desc == xmla_meas_desc == "Deployed glossary for Revenue"
+
+
+class TestBug9829DeployedMetadataBoundary:
+    @staticmethod
+    def _patch_live_metadata(monkeypatch, xs, counters):
+        async def measures(*_args, **_kwargs):
+            counters["live"] += 1
+            return [{
+                "id": "m1",
+                "name": "Revenue",
+                "effective_description": "LIVE DRAFT",
+            }]
+
+        async def dimensions(*_args, **_kwargs):
+            return [{
+                "id": "d1",
+                "name": "Region",
+                "effective_description": "LIVE DRAFT",
+            }]
+
+        async def hierarchies(*_args, **_kwargs):
+            return []
+
+        monkeypatch.setattr(xs, "get_model_measures", measures)
+        monkeypatch.setattr(xs, "get_model_dimensions", dimensions)
+        monkeypatch.setattr(xs, "get_model_hierarchies", hierarchies)
+
+    @pytest.mark.asyncio
+    async def test_snapshot_failure_omits_live_draft_and_safe_result_is_cached(
+        self, monkeypatch,
+    ):
+        from src.dax import xmla_server as xs
+
+        counters = {"live": 0, "snapshot": 0}
+        self._patch_live_metadata(monkeypatch, xs, counters)
+
+        async def failed_snapshot(*_args, **_kwargs):
+            counters["snapshot"] += 1
+            raise RuntimeError("snapshot unavailable")
+
+        monkeypatch.setattr(xs, "get_model_version_snapshot", failed_snapshot)
+        kwargs = dict(
+            model_id="model-bug9829",
+            project_id="project-1",
+            tenant_slug="tenant-1",
+            jwt_token="token-1",
+            deployed_version_id="version-1",
+        )
+        first = await xs._load_model_metadata_cached(**kwargs)
+        second = await xs._load_model_metadata_cached(**kwargs)
+
+        for result in (first, second):
+            measures, dimensions, _hierarchies = result
+            assert "effective_description" not in measures[0]
+            assert "effective_description" not in dimensions[0]
+        assert counters == {"live": 1, "snapshot": 1}
+
+    @pytest.mark.asyncio
+    async def test_deployed_version_is_part_of_metadata_cache_identity(
+        self, monkeypatch,
+    ):
+        from src.dax import xmla_server as xs
+
+        counters = {"live": 0, "snapshot": 0}
+        self._patch_live_metadata(monkeypatch, xs, counters)
+
+        async def snapshot(_model_id, version_id, *_args, **_kwargs):
+            counters["snapshot"] += 1
+            return {
+                "measures": [{
+                    "id": "m1",
+                    "effective_description": f"DEPLOYED {version_id}",
+                }],
+                "dimensions": [],
+            }
+
+        monkeypatch.setattr(xs, "get_model_version_snapshot", snapshot)
+        common = dict(
+            model_id="model-bug9829-version",
+            project_id="project-1",
+            tenant_slug="tenant-1",
+            jwt_token="token-1",
+        )
+        version_1 = await xs._load_model_metadata_cached(
+            **common, deployed_version_id="version-1",
+        )
+        version_1_cached = await xs._load_model_metadata_cached(
+            **common, deployed_version_id="version-1",
+        )
+        version_2 = await xs._load_model_metadata_cached(
+            **common, deployed_version_id="version-2",
+        )
+
+        assert version_1[0][0]["effective_description"] == "DEPLOYED version-1"
+        assert version_1_cached[0][0]["effective_description"] == "DEPLOYED version-1"
+        assert version_2[0][0]["effective_description"] == "DEPLOYED version-2"
+        assert counters == {"live": 2, "snapshot": 2}
 
 
 # -----------------------------------------------------------------------
@@ -304,7 +399,7 @@ class TestMdschemaSetsDiscoveryContract:
         ]
         rows = _rows_sets("TestCatalog", named_sets)
         assert len(rows) == 1
-        assert rows[0]["SET_DESCRIPTION"].startswith("[Certified]")
+        assert rows[0]["DESCRIPTION"].startswith("[Certified]")
 
     def test_every_advertised_set_is_executable(self):
         """Discovery-to-execution contract: every set returned by

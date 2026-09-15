@@ -86,6 +86,13 @@
         { "name": "kpi_id", "description": "The ID of the KPI.", "type": "string", "dimensionality": "scalar" }
       ],
       "result": { "type": "any", "dimensionality": "scalar" }
+    },
+    {
+      "id": "DIAG",
+      "name": "DIAG",
+      "description": "Diagnostic: returns the runtime and storage state as text.",
+      "parameters": [],
+      "result": { "type": "string", "dimensionality": "scalar" }
     }
   ]
 }

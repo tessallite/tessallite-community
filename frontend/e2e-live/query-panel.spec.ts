@@ -25,7 +25,12 @@ const profile = loadProfile();
 
 // Known answer: SUM(transaction_count) WHERE country_code='US' for modely = 11133
 // Source: tessallite/tests/live/test_query_gateway_live.py _KNOWN_US_TC_BY_MODEL
-const KNOWN_US_TRANSACTION_COUNT = "11133";
+// A different source fixture must supply its independently verified oracle.
+const KNOWN_US_TRANSACTION_COUNT =
+  process.env.LIVE_EXPECTED_US_TRANSACTION_COUNT ?? "11133";
+if (!/^(0|[1-9]\d*)$/.test(KNOWN_US_TRANSACTION_COUNT)) {
+  throw new Error("LIVE_EXPECTED_US_TRANSACTION_COUNT must be a non-negative integer");
+}
 
 test.describe("LIVE-FRONTEND-QUERY-PANEL-001", () => {
   test("Query Panel executes and shows known-answer result", async ({ page }) => {

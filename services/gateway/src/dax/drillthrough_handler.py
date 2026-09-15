@@ -93,7 +93,7 @@ async def handle_drillthrough(
     """
     measure_name = _extract_measure_name(parsed)
     if not measure_name:
-        raise ValueError("DRILLTHROUGH: no measure found on COLUMNS axis")
+        raise ValueError("DRILLTHROUGH: no measure found on the COLUMNS axis or in the WHERE slicer")
 
     measure_meta = _find_measure(measure_name, measures_meta)
     if not measure_meta:
@@ -319,16 +319,28 @@ def build_drillthrough_rowset(
 # MDX extraction helpers
 # ---------------------------------------------------------------------------
 
+_MEASURE_REF_RE = re.compile(r"\[Measures\]\.\[((?:[^\]]|\]\])+)\]", re.IGNORECASE)
+
+
 def _extract_measure_name(parsed: ParsedMDX) -> str | None:
-    """Extract the first measure name from the COLUMNS axis.
+    """Extract the drilled measure: first from the COLUMNS axis, then from
+    the WHERE slicer.
+
+    Native Excel's single-measure PivotTable carries its one value member in
+    the WHERE slicer (``... ON COLUMNS FROM [m] WHERE ([Measures].[x])``) and
+    the DRILLTHROUGH it sends on a double-click keeps that shape. The
+    COLUMNS-only search faulted every such drillthrough with "no measure
+    found on COLUMNS axis" (owner's ALEX session, 2026-09-04 16:49).
 
     Bug-6717: accepts ``]]`` inside bracket bodies and unescapes to the
     raw technical name.
     """
     col_expr = parsed.axis_expr("COLUMNS")
-    if not col_expr:
-        return None
-    m = re.search(r"\[Measures\]\.\[((?:[^\]]|\]\])+)\]", col_expr, re.IGNORECASE)
+    m = _MEASURE_REF_RE.search(col_expr) if col_expr else None
+    if m is None:
+        raw = getattr(parsed, "raw_mdx", "") or ""
+        where_expr = _extract_where_clause(raw) if raw else ""
+        m = _MEASURE_REF_RE.search(where_expr) if where_expr else None
     return m.group(1).replace("]]", "]") if m else None
 
 

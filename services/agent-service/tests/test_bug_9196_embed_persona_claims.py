@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
 
 import pytest
+from .result_fakes import ScalarResult
 
 from shared.auth.jwt import decode_access_token
 from shared.auth.middleware import CurrentEmbedUser, _build_user_from_payload
@@ -44,7 +45,7 @@ class _AllowListResult:
         self.model_id = model_id
 
     def scalars(self):
-        return self
+        return ScalarResult([self.model_id])
 
     def all(self):
         return [self.model_id]

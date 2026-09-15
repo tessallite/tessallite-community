@@ -2,3 +2,8 @@
 *.pfx
 *.p12
 sideload-catalog/
+manifest.test.xml
+tests-harness/.playwright/
+playwright-report/
+test-results/
+dist-test-profile/

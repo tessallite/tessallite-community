@@ -32,6 +32,7 @@ silently-wrong aggregate read.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Optional
 
 import sqlglot
@@ -749,7 +750,7 @@ def _resolve_key_physical(
     grain_keys = aggregate.grain_keys or []
     if key_id:
         for gk in grain_keys:
-            if not isinstance(gk, dict) or gk.get("key_id") != key_id:
+            if not isinstance(gk, Mapping) or gk.get("key_id") != key_id:
                 continue
             # Expression id cross-check: the stored fingerprint must agree when a
             # fingerprint was supplied (EXPRESSION plan).
@@ -761,7 +762,7 @@ def _resolve_key_physical(
     if not fingerprint:
         return None
     for gk in grain_keys:
-        if isinstance(gk, dict) and gk.get("expression_fingerprint") == fingerprint:
+        if isinstance(gk, Mapping) and gk.get("expression_fingerprint") == fingerprint:
             phys = gk.get("physical_column")
             return str(phys) if phys else None
     return None

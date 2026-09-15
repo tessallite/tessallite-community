@@ -139,6 +139,35 @@ describe('F-025-01 — Report Builder filter contract (client payload)', () => {
     );
     expect(lastBody(fetchMock).persona_id).toBe('persona-9');
   });
+
+  it('Bug-9824: emits structured measure_filters while keeping dimensions in filters', async () => {
+    const fetchMock = mockPost(PLUGIN_EXECUTE_OK);
+    const query: SemanticQuery = {
+      measures: ['fee_amount'],
+      dimensions: ['account_type'],
+      filters: [{ dimension: 'account_type', operator: 'eq', values: ['CREDIT'] }],
+      measureFilters: [{
+        measureId: 'measure-fee',
+        operator: 'gt',
+        values: ['10000'],
+        effectiveAggregation: 'sum',
+      }],
+    };
+
+    await executeQuery(query, { projectId: 'p1', modelId: 'm1' });
+
+    expect(lastBody(fetchMock).filters).toEqual([
+      { dimension: 'account_type', operator: 'eq', values: ['CREDIT'] },
+    ]);
+    expect(lastBody(fetchMock).measure_filters).toEqual([
+      {
+        measure_id: 'measure-fee',
+        operator: 'gt',
+        values: ['10000'],
+        effective_aggregation: 'sum',
+      },
+    ]);
+  });
 });
 
 describe('F-025-03 — KPI batch-evaluate request and response shapes', () => {
